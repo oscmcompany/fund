@@ -124,7 +124,7 @@ def download_and_extract_artifacts(
         logger.info("downloaded_artifact", size_bytes=temp_path.stat().st_size)
 
         with tarfile.open(temp_path, "r:gz") as tar:
-            tar.extractall(path=extract_path)  # noqa: S202
+            tar.extractall(path=extract_path, filter="data")
 
         logger.info("extracted_artifacts", extract_path=str(extract_path))
 
