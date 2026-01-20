@@ -280,8 +280,9 @@ class Model:
         Performance Notes:
             - Data validation runs once before training starts
             - Validation time scales with validation_sample_size, not total batches
-            - For datasets with 10,000 batches, validation with sample_size=10
-              typically completes in under a second (hardware dependent)
+            - For datasets with 10,000 batches, validation with
+              validation_sample_size=10 typically completes in under a second
+              (hardware dependent)
             - Increase validation_sample_size for more thorough checking or decrease
               for faster training startup
         """
