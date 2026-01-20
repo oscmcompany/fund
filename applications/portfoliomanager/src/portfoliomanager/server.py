@@ -438,7 +438,36 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
         prior_equity_bars=prior_equity_bars
     )
 
-    prior_predictions = pl.DataFrame(prior_predictions_response.json())
+    predictions_response_text = prior_predictions_response.text.strip()
+    if not predictions_response_text or predictions_response_text == "[]":
+        logger.warning(
+            "Prior predictions response is empty, returning portfolio without performance data"
+        )
+        return add_portfolio_action_column(
+            prior_portfolio=prior_portfolio,
+            current_timestamp=current_timestamp,
+        )
+
+    try:
+        prior_predictions_data = prior_predictions_response.json()
+    except (ValueError, requests.exceptions.JSONDecodeError) as error:
+        logger.exception(
+            "Failed to retrieve prior portfolio",
+            error=str(error),
+        )
+        return add_portfolio_action_column(
+            prior_portfolio=prior_portfolio,
+            current_timestamp=current_timestamp,
+        )
+
+    if not prior_predictions_data:
+        logger.warning("Prior predictions data is empty")
+        return add_portfolio_action_column(
+            prior_portfolio=prior_portfolio,
+            current_timestamp=current_timestamp,
+        )
+
+    prior_predictions = pl.DataFrame(prior_predictions_data)
 
     return add_portfolio_performance_columns(
         prior_portfolio=prior_portfolio,

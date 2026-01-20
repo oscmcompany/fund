@@ -9,7 +9,9 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
+use polars::prelude::*;
 use serde::Deserialize;
+use std::io::Cursor;
 use tracing::{info, warn};
 use urlencoding::decode;
 
@@ -93,7 +95,46 @@ pub async fn query(
     };
 
     match query_predictions_dataframe_from_s3(&state, predictions_query).await {
-        Ok(dataframe) => (StatusCode::OK, dataframe.to_string()).into_response(),
+        Ok(dataframe) => {
+            if dataframe.height() == 0 {
+                warn!("No predictions found for the requested tickers and timestamps");
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    "[]".to_string(),
+                )
+                    .into_response();
+            }
+
+            let mut buffer = Cursor::new(Vec::new());
+            match JsonWriter::new(&mut buffer)
+                .with_json_format(JsonFormat::Json)
+                .finish(&mut dataframe.clone())
+            {
+                Ok(_) => {
+                    let json_bytes = buffer.into_inner();
+                    let json_string = String::from_utf8_lossy(&json_bytes).to_string();
+                    info!(
+                        "Returning predictions as JSON with {} rows",
+                        dataframe.height()
+                    );
+                    (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        json_string,
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    warn!("Failed to serialize predictions to JSON: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to serialize predictions: {}", e),
+                    )
+                        .into_response()
+                }
+            }
+        }
         Err(err) => {
             info!("Failed to query S3 data: {}", err);
             (
