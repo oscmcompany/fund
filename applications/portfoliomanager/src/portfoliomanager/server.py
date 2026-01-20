@@ -81,13 +81,33 @@ if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET:
     )
     raise ValueError(message)
 
+try:
+    price_tolerance_percent = float(
+        os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT", "1.0"),
+    )
+    if price_tolerance_percent < 0:
+        message = (
+            "ALPACA_PRICE_TOLERANCE_PERCENT must be non-negative, "
+            f"got {price_tolerance_percent}"
+        )
+        raise ValueError(message)
+except ValueError as e:
+    logger.error(
+        "Invalid ALPACA_PRICE_TOLERANCE_PERCENT",
+        value=os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT"),
+        error=str(e),
+    )
+    message = (
+        f"Invalid ALPACA_PRICE_TOLERANCE_PERCENT: "
+        f"{os.getenv('ALPACA_PRICE_TOLERANCE_PERCENT')}"
+    )
+    raise ValueError(message) from e
+
 alpaca_client = AlpacaClient(
     api_key=ALPACA_API_KEY_ID,
     api_secret=ALPACA_API_SECRET,
     is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
-    price_tolerance_percent=float(
-        os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT", "1.0"),
-    ),
+    price_tolerance_percent=price_tolerance_percent,
 )
 
 logger.info("Portfolio manager initialized", is_paper=alpaca_client.is_paper)
