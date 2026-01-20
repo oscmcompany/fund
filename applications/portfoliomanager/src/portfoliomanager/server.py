@@ -4,6 +4,7 @@ import os
 from datetime import UTC, datetime
 from typing import cast
 
+import httpx
 import polars as pl
 import requests
 import sentry_sdk
@@ -96,7 +97,7 @@ def health_check() -> Response:
 
 
 @application.post("/portfolio")
-def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
@@ -112,7 +113,7 @@ def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        current_predictions = get_current_predictions()
+        current_predictions = await get_current_predictions()
         logger.info("Retrieved predictions", count=len(current_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
@@ -333,19 +334,19 @@ def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
     return Response(status_code=status.HTTP_200_OK)
 
 
-def get_current_predictions() -> pl.DataFrame:
-    current_predictions_response = requests.post(
-        url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
-        timeout=180,
-    )
+async def get_current_predictions() -> pl.DataFrame:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        current_predictions_response = await client.post(
+            url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
+        )
 
-    current_predictions_response.raise_for_status()
+        current_predictions_response.raise_for_status()
 
-    current_predictions = pl.DataFrame(current_predictions_response.json()["data"])
+        current_predictions = pl.DataFrame(current_predictions_response.json()["data"])
 
-    return add_predictions_zscore_ranked_columns(
-        current_predictions=current_predictions
-    )
+        return add_predictions_zscore_ranked_columns(
+            current_predictions=current_predictions
+        )
 
 
 def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: PLR0911
