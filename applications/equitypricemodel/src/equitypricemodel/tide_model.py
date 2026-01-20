@@ -281,10 +281,14 @@ class Model:
             - Data validation runs once before training starts
             - Validation time scales with validation_sample_size, not total batches
             - For datasets with 10,000 batches, validation with sample_size=10
-              typically completes in <1 second
+              typically completes in under a second (hardware dependent)
             - Increase validation_sample_size for more thorough checking or decrease
               for faster training startup
         """
+        if validation_sample_size <= 0:
+            message = "validation_sample_size must be positive"
+            raise ValueError(message)
+
         if validate_data:
             is_valid = self.validate_training_data(
                 train_batches,
