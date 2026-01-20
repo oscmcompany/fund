@@ -58,13 +58,20 @@ class AlpacaClient:
             buying_power=float(cast("str", account.buying_power)),
         )
 
-    def _get_current_price(self, ticker: str) -> float:
-        """Get current ask price for a ticker."""
+    def _get_current_price(self, ticker: str, side: TradeSide) -> float:
+        """Get current price for a ticker based on trade side.
+        
+        Uses ask price for buys (what you pay) and bid price for sells (what you receive).
+        """
         request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
         quotes = self.data_client.get_stock_latest_quote(request)
         quote = quotes[ticker.upper()]
-        # Use ask price for buys, bid price for sells - use ask as default
-        return float(quote.ask_price) if quote.ask_price > 0 else float(quote.bid_price)
+        
+        # Use ask price for buys, bid price for sells
+        if side == TradeSide.BUY:
+            return float(quote.ask_price) if quote.ask_price > 0 else float(quote.bid_price)
+        else:  # TradeSide.SELL
+            return float(quote.bid_price) if quote.bid_price > 0 else float(quote.ask_price)
 
     def open_position(
         self,
@@ -74,7 +81,7 @@ class AlpacaClient:
     ) -> None:
         # Calculate quantity from dollar amount and current price
         # Allow fractional shares where supported by the brokerage
-        current_price = self._get_current_price(ticker)
+        current_price = self._get_current_price(ticker, side)
         qty = dollar_amount / current_price
 
         if qty <= 0:
