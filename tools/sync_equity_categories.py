@@ -138,11 +138,11 @@ def sync_equity_categories(
 
 
 if __name__ == "__main__":
-    api_key = os.getenv("MASSIVE_API_KEY")
+    api_key = os.getenv("POLYGON_API_KEY")
     bucket_name = os.getenv("AWS_S3_DATA_BUCKET")
 
     if not api_key:
-        logger.error("MASSIVE_API_KEY environment variable not set")
+        logger.error("POLYGON_API_KEY environment variable not set")
         sys.exit(1)
 
     if not bucket_name:

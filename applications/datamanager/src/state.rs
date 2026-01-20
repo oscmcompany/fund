@@ -45,13 +45,13 @@ impl State {
             .expect("MASSIVE_BASE_URL must be set in environment");
         info!("Using Massive API base URL from environment: {}", massive_base);
 
-        let massive_key = match std::env::var("MASSIVE_API_KEY") {
+        let massive_key = match std::env::var("POLYGON_API_KEY") {
             Ok(key) => {
-                debug!("MASSIVE_API_KEY loaded (length: {} chars)", key.len());
+                debug!("POLYGON_API_KEY loaded (length: {} chars)", key.len());
                 key
             }
             Err(_) => {
-                warn!("MASSIVE_API_KEY not set - equity bar sync will not work");
+                warn!("POLYGON_API_KEY not set - equity bar sync will not work");
                 String::new()
             }
         };

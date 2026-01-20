@@ -516,10 +516,10 @@ export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
 cd ../
 
 # Get API key from AWS Secrets Manager
-export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
+export POLYGON_API_KEY=$(aws secretsmanager get-secret-value \
     --secret-id pocketsizefund/production/environment_variables \
     --query 'SecretString' \
-    --output text | jq -r '.MASSIVE_API_KEY')
+    --output text | jq -r '.POLYGON_API_KEY')
 
 uv run python tools/sync_equity_categories.py
 

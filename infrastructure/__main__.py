@@ -824,8 +824,8 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                     ],
                     "secrets": [
                         {
-                            "name": "MASSIVE_API_KEY",
-                            "valueFrom": f"{args[2]}:MASSIVE_API_KEY::",
+                            "name": "POLYGON_API_KEY",
+                            "valueFrom": f"{args[2]}:POLYGON_API_KEY::",
                         },
                         {
                             "name": "SENTRY_DSN",
