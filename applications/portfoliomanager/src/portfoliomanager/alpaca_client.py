@@ -1,6 +1,7 @@
 import time
 from typing import cast
 
+import structlog
 from alpaca.common.exceptions import APIError
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -14,6 +15,8 @@ from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 
 from .enums import TradeSide
 from .exceptions import AssetNotShortableError, InsufficientBuyingPowerError
+
+logger = structlog.get_logger(__name__)
 
 
 class AlpacaAccount:
@@ -62,6 +65,7 @@ class AlpacaClient:
         """Get current price for a ticker based on trade side.
         
         Uses ask price for buys (what you pay) and bid price for sells (what you receive).
+        Falls back to the opposite price if the primary price is unavailable.
         """
         request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
         quotes = self.data_client.get_stock_latest_quote(request)
@@ -69,9 +73,39 @@ class AlpacaClient:
         
         # Use ask price for buys, bid price for sells
         if side == TradeSide.BUY:
-            return float(quote.ask_price) if quote.ask_price > 0 else float(quote.bid_price)
+            primary_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
+            fallback_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
+            
+            if primary_price > 0:
+                return primary_price
+            elif fallback_price > 0:
+                logger.warning(
+                    "Ask price unavailable, using bid price as fallback",
+                    ticker=ticker,
+                    side=side.value,
+                    bid_price=fallback_price,
+                )
+                return fallback_price
+            else:
+                message = f"No valid price available for {ticker}: both ask and bid prices are 0"
+                raise ValueError(message)
         else:  # TradeSide.SELL
-            return float(quote.bid_price) if quote.bid_price > 0 else float(quote.ask_price)
+            primary_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
+            fallback_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
+            
+            if primary_price > 0:
+                return primary_price
+            elif fallback_price > 0:
+                logger.warning(
+                    "Bid price unavailable, using ask price as fallback",
+                    ticker=ticker,
+                    side=side.value,
+                    ask_price=fallback_price,
+                )
+                return fallback_price
+            else:
+                message = f"No valid price available for {ticker}: both bid and ask prices are 0"
+                raise ValueError(message)
 
     def open_position(
         self,
