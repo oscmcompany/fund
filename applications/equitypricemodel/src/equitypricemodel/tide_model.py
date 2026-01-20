@@ -451,24 +451,24 @@ class Model:
     def _combine_input_features(
         self,
         inputs: dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor, int]:
-        batch_size = inputs["encoder_continuous_features"].shape[0]
+    ) -> tuple[Tensor, Tensor | None, int]:
+        batch_size = inputs.get("encoder_continuous_features").shape[0]
 
-        encoder_cont_flat = inputs["encoder_continuous_features"].reshape(
+        encoder_cont_flat = inputs.get("encoder_continuous_features").reshape(
             batch_size, -1
         )
         encoder_cat_flat = (
-            inputs["encoder_categorical_features"]
+            inputs.get("encoder_categorical_features")
             .reshape(batch_size, -1)
             .cast("float32")
         )
         decoder_cat_flat = (
-            inputs["decoder_categorical_features"]
+            inputs.get("decoder_categorical_features")
             .reshape(batch_size, -1)
             .cast("float32")
         )
         static_cat_flat = (
-            inputs["static_categorical_features"]
+            inputs.get("static_categorical_features")
             .reshape(batch_size, -1)
             .cast("float32")
         )
