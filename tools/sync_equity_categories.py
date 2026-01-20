@@ -64,6 +64,12 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
     rows = []
     for ticker_data in tickers:
         ticker = ticker_data.get("ticker", "")
+
+        if not ticker or not ticker.strip():
+            continue
+
+        ticker = ticker.strip()
+
         # Polygon uses 'sic_description' for industry, but we can also check other fields
         # The primary_exchange and type fields help filter
         if ticker_data.get("type") not in ("CS", "ADRC"):  # Common Stock or ADR
