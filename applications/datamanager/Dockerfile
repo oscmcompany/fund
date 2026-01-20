@@ -17,9 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-RUN rustup toolchain install stable 
+RUN rustup toolchain install stable
 
 RUN rustup default stable
+
+ENV LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
 
 WORKDIR /app
 
