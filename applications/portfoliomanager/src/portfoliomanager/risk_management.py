@@ -10,11 +10,11 @@ from .exceptions import InsufficientPredictionsError
 
 logger = structlog.get_logger()
 
-_uncertainty_threshold_value = os.getenv("PSF_UNCERTAINTY_THRESHOLD")
-if _uncertainty_threshold_value is None:
+uncertainty_threshold_env = os.getenv("PSF_UNCERTAINTY_THRESHOLD")
+if uncertainty_threshold_env is None:
     message = "PSF_UNCERTAINTY_THRESHOLD environment variable is required"
     raise ValueError(message)
-UNCERTAINTY_THRESHOLD = float(_uncertainty_threshold_value)
+UNCERTAINTY_THRESHOLD = float(uncertainty_threshold_env)
 
 
 def add_portfolio_action_column(

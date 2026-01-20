@@ -1,6 +1,7 @@
 import time
 from typing import cast
 
+import structlog
 from alpaca.common.exceptions import APIError
 from alpaca.data import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -14,6 +15,8 @@ from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
 
 from .enums import TradeSide
 from .exceptions import AssetNotShortableError, InsufficientBuyingPowerError
+
+logger = structlog.get_logger(__name__)
 
 
 class AlpacaAccount:
@@ -58,13 +61,51 @@ class AlpacaClient:
             buying_power=float(cast("str", account.buying_power)),
         )
 
-    def _get_current_price(self, ticker: str) -> float:
-        """Get current ask price for a ticker."""
+    def _get_current_price(self, ticker: str, side: TradeSide) -> float:
+        """Get current price for a ticker based on trade side.
+        
+        Uses ask price for buys (what you pay) and bid price for sells (what you receive).
+        Falls back to the opposite price if the primary price is unavailable.
+        """
         request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
         quotes = self.data_client.get_stock_latest_quote(request)
         quote = quotes[ticker.upper()]
-        # Use ask price for buys, bid price for sells - use ask as default
-        return float(quote.ask_price) if quote.ask_price > 0 else float(quote.bid_price)
+        
+        # Use ask price for buys, bid price for sells
+        if side == TradeSide.BUY:
+            primary_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
+            fallback_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
+            
+            if primary_price > 0:
+                return primary_price
+            elif fallback_price > 0:
+                logger.warning(
+                    "Ask price unavailable, using bid price as fallback",
+                    ticker=ticker,
+                    side=side.value,
+                    bid_price=fallback_price,
+                )
+                return fallback_price
+            else:
+                message = f"No valid price available for {ticker}: both ask and bid prices are 0"
+                raise ValueError(message)
+        else:  # TradeSide.SELL
+            primary_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
+            fallback_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
+            
+            if primary_price > 0:
+                return primary_price
+            elif fallback_price > 0:
+                logger.warning(
+                    "Bid price unavailable, using ask price as fallback",
+                    ticker=ticker,
+                    side=side.value,
+                    ask_price=fallback_price,
+                )
+                return fallback_price
+            else:
+                message = f"No valid price available for {ticker}: both bid and ask prices are 0"
+                raise ValueError(message)
 
     def open_position(
         self,
@@ -74,7 +115,7 @@ class AlpacaClient:
     ) -> None:
         # Calculate quantity from dollar amount and current price
         # Allow fractional shares where supported by the brokerage
-        current_price = self._get_current_price(ticker)
+        current_price = self._get_current_price(ticker, side)
         qty = dollar_amount / current_price
 
         if qty <= 0:
