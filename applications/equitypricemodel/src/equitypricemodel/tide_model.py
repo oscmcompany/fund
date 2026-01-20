@@ -220,17 +220,14 @@ class Model:
         logger.info(
             "Validating training data",
             total_batches=len(train_batches),
-            sample_size=min(sample_size, len(train_batches)),
+            sample_size=sample_size,
         )
 
         all_issues: dict[str, dict] = {}
-        indices_to_check = [0, len(train_batches) - 1]
-        step = max(1, len(train_batches) // sample_size)
-        indices_to_check.extend(range(0, len(train_batches), step))
-        indices_to_check = sorted(set(indices_to_check))[:sample_size]
 
-        for idx in indices_to_check:
-            batch_issues = self._validate_batch(train_batches[idx], idx)
+        # Check all batches to ensure NaN/Inf values are detected anywhere
+        for idx, batch in enumerate(train_batches):
+            batch_issues = self._validate_batch(batch, idx)
             if batch_issues:
                 all_issues[f"batch_{idx}"] = batch_issues
 
