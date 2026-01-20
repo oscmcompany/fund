@@ -85,6 +85,9 @@ alpaca_client = AlpacaClient(
     api_key=ALPACA_API_KEY_ID,
     api_secret=ALPACA_API_SECRET,
     is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
+    price_tolerance_percent=float(
+        os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT", "1.0"),
+    ),
 )
 
 logger.info("Portfolio manager initialized", is_paper=alpaca_client.is_paper)

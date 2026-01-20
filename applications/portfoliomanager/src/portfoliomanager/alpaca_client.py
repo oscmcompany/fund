@@ -32,8 +32,10 @@ class AlpacaClient:
         api_key: str,
         api_secret: str,
         is_paper: bool,  # noqa: FBT001
+        price_tolerance_percent: float = 1.0,
     ) -> None:
         self.rate_limit_sleep = 0.5  # seconds
+        self.price_tolerance_percent = price_tolerance_percent
 
         self.trading_client = TradingClient(
             api_key=api_key,
@@ -85,14 +87,24 @@ class AlpacaClient:
             )
             raise ValueError(message)
 
+        # Calculate limit price with tolerance to prevent execution at unfavorable prices
+        # For buys, set a maximum price we're willing to pay (current price + tolerance)
+        # For sells, set a minimum price we're willing to accept (current price - tolerance)
+        tolerance = current_price * (self.price_tolerance_percent / 100.0)
+        if side == TradeSide.BUY:
+            limit_price = current_price + tolerance
+        else:
+            limit_price = current_price - tolerance
+
         try:
             self.trading_client.submit_order(
                 order_data=OrderRequest(
                     symbol=ticker.upper(),
                     qty=qty,
                     side=OrderSide(side.value.lower()),
-                    type=OrderType.MARKET,
+                    type=OrderType.LIMIT,
                     time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
                 ),
             )
         except APIError as e:
