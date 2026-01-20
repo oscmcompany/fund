@@ -12,7 +12,7 @@ COPY libraries/python/ libraries/python/
 
 RUN uv sync --no-dev 
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS trainer
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS trainer
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
