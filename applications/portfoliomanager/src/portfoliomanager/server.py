@@ -467,7 +467,9 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
             current_timestamp=current_timestamp,
         )
 
-    prior_predictions = pl.DataFrame(prior_predictions_data)
+    prior_predictions = pl.DataFrame(prior_predictions_data).with_columns(
+        pl.col("timestamp").cast(pl.Float64)
+    )
 
     return add_portfolio_performance_columns(
         prior_portfolio=prior_portfolio,
