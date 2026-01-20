@@ -72,6 +72,7 @@ predictions_schema = pa.DataFrameSchema(
     },
     coerce=True,
     checks=[
+        # Model outputs 7 days, but server.py filters to 7th day before validation
         pa.Check(
             check_fn=lambda data: check_dates_count_per_ticker(
                 data=data, dates_count=1

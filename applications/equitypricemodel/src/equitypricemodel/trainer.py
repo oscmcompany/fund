@@ -3,10 +3,9 @@ from typing import cast
 
 import polars as pl
 import structlog
-from tinygrad import Device
-
 from equitypricemodel.tide_data import Data
 from equitypricemodel.tide_model import Model
+from tinygrad import Device
 
 # Configure structlog for CloudWatch-friendly output
 structlog.configure(
@@ -27,7 +26,7 @@ logger.info("trainer_started", device=Device.DEFAULT)
 
 training_data_input_path = os.path.join(  # noqa: PTH118
     "/opt/ml/input/data/train",
-    "filtered_tft_training_data.parquet",
+    "filtered_tide_training_data.parquet",
 )
 
 model_output_path = "/opt/ml/model"

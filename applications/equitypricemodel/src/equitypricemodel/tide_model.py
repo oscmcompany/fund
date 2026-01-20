@@ -195,7 +195,7 @@ class Model:
         # stack predictions: (batch_size, output_length, num_quantiles e.g. (32, 7, 3))
         return predictions_first.stack(*predictions_rest, dim=1)
 
-    def _validate_batch(self, batch: dict[str, Tensor], batch_idx: int) -> dict:
+    def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
         """Check a batch for NaN/Inf values and return statistics."""
         issues = {}
         for key, tensor in batch.items():
@@ -248,13 +248,13 @@ class Model:
         logger.info("Training data validation passed")
         return True
 
-    def train(
+    def train(  # noqa: PLR0913
         self,
         train_batches: list,
         epochs: int = 10,
         learning_rate: float = 0.001,
         log_interval: int = 100,
-        validate_data: bool = True,
+        validate_data: bool = True,  # noqa: FBT001, FBT002
         early_stopping_patience: int | None = 3,
         early_stopping_min_delta: float = 0.001,
     ) -> list:
@@ -266,7 +266,8 @@ class Model:
             learning_rate: Learning rate for optimizer
             log_interval: Log progress every N steps
             validate_data: Whether to validate data before training
-            early_stopping_patience: Stop if no improvement for N epochs (None to disable)
+            early_stopping_patience: Stop if no improvement for N epochs
+                (None to disable)
             early_stopping_min_delta: Minimum improvement to reset patience counter
         """
         if validate_data:

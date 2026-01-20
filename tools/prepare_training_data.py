@@ -189,7 +189,7 @@ def prepare_training_data(
     model_artifacts_bucket_name: str,
     start_date: datetime,
     end_date: datetime,
-    output_key: str = "training/filtered_tft_training_data.parquet",
+    output_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Main function to prepare training data."""
     logger.info(

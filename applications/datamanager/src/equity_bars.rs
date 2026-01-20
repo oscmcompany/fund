@@ -181,7 +181,8 @@ pub async fn sync(
         }
         Err(err) => {
             warn!("Failed to parse JSON response: {}", err);
-            warn!("Raw response (first 500 chars): {}", &text_content[..text_content.len().min(500)]);
+            let truncated: String = text_content.chars().take(500).collect();
+            warn!("Raw response (first 500 chars): {}", truncated);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid JSON response from API",

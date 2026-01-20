@@ -8,12 +8,12 @@ use tracing::{debug, info, warn};
 pub struct EquityBar {
     pub ticker: String,
     pub timestamp: i64,
-    pub open_price: Option<u64>,
-    pub high_price: Option<u64>,
-    pub low_price: Option<u64>,
-    pub close_price: Option<u64>,
-    pub volume: Option<u64>,
-    pub volume_weighted_average_price: Option<u64>,
+    pub open_price: Option<f64>,
+    pub high_price: Option<f64>,
+    pub low_price: Option<f64>,
+    pub close_price: Option<f64>,
+    pub volume: Option<f64>,
+    pub volume_weighted_average_price: Option<f64>,
     pub transactions: Option<u64>,
 }
 
@@ -123,7 +123,7 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
 #[derive(Debug, Deserialize)]
 pub struct Portfolio {
     pub ticker: String,
-    pub timestamp: i64,
+    pub timestamp: f64,
     pub side: String,
     pub dollar_amount: f64,
     pub action: String,
@@ -137,7 +137,7 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
 
     let portfolio_dataframe = df!(
         "ticker" => portfolio_rows.iter().map(|p| p.ticker.as_str()).collect::<Vec<&str>>(),
-        "timestamp" => portfolio_rows.iter().map(|p| p.timestamp).collect::<Vec<i64>>(),
+        "timestamp" => portfolio_rows.iter().map(|p| p.timestamp).collect::<Vec<f64>>(),
         "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
         "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
         "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),

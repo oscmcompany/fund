@@ -18,7 +18,7 @@ uncertainty_threshold = aws.ssm.Parameter(
     "ssm_uncertainty_threshold",
     name="/pocketsizefund/portfoliomanager/uncertainty_threshold",
     type="String",
-    value="0.75",
+    value="1.5",
     description="Maximum inter-quartile range for predictions to be considered valid",
     tags=tags,
 )

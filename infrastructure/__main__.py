@@ -9,7 +9,7 @@ current_identity = aws.get_caller_identity()
 
 account_id = current_identity.account_id
 
-region = aws.get_region().region
+region = aws.get_region().name
 
 secret = aws.secretsmanager.get_secret(
     name="pocketsizefund/production/environment_variables",
@@ -25,31 +25,31 @@ tags = {
 }
 
 # S3 Data Bucket for storing equity bars, predictions, portfolios
-data_bucket = aws.s3.BucketV2(
+data_bucket = aws.s3.Bucket(
     "data_bucket",
     bucket_prefix="pocketsizefund-data-",
     tags=tags,
 )
 
-aws.s3.BucketVersioningV2(
+aws.s3.BucketVersioning(
     "data_bucket_versioning",
     bucket=data_bucket.id,
-    versioning_configuration=aws.s3.BucketVersioningV2VersioningConfigurationArgs(
+    versioning_configuration=aws.s3.BucketVersioningVersioningConfigurationArgs(
         status="Enabled",
     ),
 )
 
 # S3 Model Artifacts Bucket for storing trained model weights and checkpoints
-model_artifacts_bucket = aws.s3.BucketV2(
+model_artifacts_bucket = aws.s3.Bucket(
     "model_artifacts_bucket",
     bucket_prefix="pocketsizefund-model-artifacts-",
     tags=tags,
 )
 
-aws.s3.BucketVersioningV2(
+aws.s3.BucketVersioning(
     "model_artifacts_bucket_versioning",
     bucket=model_artifacts_bucket.id,
-    versioning_configuration=aws.s3.BucketVersioningV2VersioningConfigurationArgs(
+    versioning_configuration=aws.s3.BucketVersioningVersioningConfigurationArgs(
         status="Enabled",
     ),
 )
@@ -811,7 +811,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                     "environment": [
                         {
                             "name": "MASSIVE_BASE_URL",
-                            "value": "https://api.polygon.io",
+                            "value": "https://api.massive.io",
                         },
                         {
                             "name": "AWS_S3_DATA_BUCKET_NAME",
@@ -956,6 +956,10 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                         {
                             "name": "ENVIRONMENT",
                             "value": "production",
+                        },
+                        {
+                            "name": "DISKCACHE",
+                            "value": "0",
                         },
                     ],
                     "secrets": [

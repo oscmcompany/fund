@@ -703,23 +703,6 @@ cd ../
 uv run python tools/run_training_job.py
 ```
 
-### train-local (application_name)
-
-> Train machine learning model locally
-
-```bash
-set -euo pipefail
-
-export APPLICATION_NAME="${application_name}"
-
-cd infrastructure
-export AWS_S3_MODEL_ARTIFACTS_BUCKET="$(pulumi stack output aws_s3_model_artifacts_bucket)"
-
-cd ../
-
-uv run python tools/run_training_local.py
-```
-
 ### artifacts
 
 #### download (application_name)

@@ -3,6 +3,7 @@ import json
 import os
 import tarfile
 import tempfile
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ import polars as pl
 import requests
 import sentry_sdk
 import structlog
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -63,34 +65,42 @@ def find_latest_artifact_key(
 
     Assumes folder names contain timestamps that sort alphabetically.
     E.g., artifacts/equitypricemodel-trainer-2026-01-14-15-00-26-204/
+    Only considers folders that contain output/model.tar.gz.
     """
     logger.info("listing_artifact_folders", bucket=bucket, prefix=prefix)
 
-    # List all "folders" under the prefix
     paginator = s3_client.get_paginator("list_objects_v2")
     folders: list[str] = []
 
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
-        for common_prefix in page.get("CommonPrefixes", []):
-            folders.append(common_prefix["Prefix"])
+        folders.extend(
+            common_prefix["Prefix"] for common_prefix in page.get("CommonPrefixes", [])
+        )
 
     if not folders:
         message = f"No artifact folders found under s3://{bucket}/{prefix}"
         raise ValueError(message)
 
-    # Sort and get the latest (timestamps sort alphabetically)
-    folders.sort()
-    latest_folder = folders[-1]
+    folders.sort(reverse=True)
 
-    artifact_key = f"{latest_folder}output/model.tar.gz"
-    logger.info(
-        "found_latest_artifact",
-        folder_count=len(folders),
-        latest_folder=latest_folder,
-        artifact_key=artifact_key,
-    )
+    for folder in folders:
+        artifact_key = str(Path(folder) / "output" / "model.tar.gz")
+        try:
+            s3_client.head_object(Bucket=bucket, Key=artifact_key)
+        except ClientError:
+            logger.debug("artifact_not_found_in_folder", folder=folder)
+            continue
+        else:
+            logger.info(
+                "found_latest_artifact",
+                folder_count=len(folders),
+                latest_folder=folder,
+                artifact_key=artifact_key,
+            )
+            return artifact_key
 
-    return artifact_key
+    message = f"No model.tar.gz found in any artifact folder under s3://{bucket}/{prefix}"
+    raise ValueError(message)
 
 
 def download_and_extract_artifacts(
@@ -114,7 +124,7 @@ def download_and_extract_artifacts(
         logger.info("downloaded_artifact", size_bytes=temp_path.stat().st_size)
 
         with tarfile.open(temp_path, "r:gz") as tar:
-            tar.extractall(path=extract_path)
+            tar.extractall(path=extract_path)  # noqa: S202
 
         logger.info("extracted_artifacts", extract_path=str(extract_path))
 
@@ -123,24 +133,21 @@ def download_and_extract_artifacts(
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
-    import shutil
+    import shutil  # noqa: PLC0415
 
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET")
-    artifact_path = os.environ.get("MODEL_ARTIFACT_PATH", "artifacts/")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
     model_directory = "."
 
     if bucket:
-        # Download from S3
         s3_client = boto3.client("s3")
 
-        # Create a persistent directory for model artifacts
         model_directory = tempfile.mkdtemp(prefix="model_artifacts_")
         extract_path = Path(model_directory)
 
         try:
-            # If path ends with .tar.gz, use it directly; otherwise find latest
             if artifact_path.endswith(".tar.gz"):
                 artifact_key = artifact_path
             else:
@@ -162,7 +169,6 @@ async def lifespan(app: FastAPI):
 
         logger.info("loading_model", directory=model_directory)
     else:
-        # Fall back to local files (for local development)
         logger.info("loading_model_from_local", directory=model_directory)
 
     app.state.model_directory = model_directory
@@ -171,7 +177,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Cleanup on shutdown
     if app.state.model_directory != "." and Path(app.state.model_directory).exists():
         shutil.rmtree(app.state.model_directory, ignore_errors=True)
 
@@ -192,7 +197,7 @@ def create_predictions(request: Request) -> Response:
     end_date = datetime.now(tz=UTC)
     start_date = end_date - timedelta(
         days=70
-    )  # need 42 trading days (35 input + 7 output), ~60 calendar days + buffer
+    )  # need >= 42 trading days (35 input + 7 output), ~60 calendar days + buffer
 
     try:
         equity_bars_response = requests.get(
@@ -259,9 +264,8 @@ def create_predictions(request: Request) -> Response:
         num_batches=len(batches),
     )
 
-    # Predict on ALL batches and combine results
     all_predictions = []
-    for batch_idx, batch in enumerate(batches):
+    for batch in batches:
         raw_predictions = request.app.state.tide_model.predict(inputs=batch)
         batch_predictions = tide_data.postprocess_predictions(
             input_batch=batch,
@@ -276,7 +280,6 @@ def create_predictions(request: Request) -> Response:
         total_predictions=predictions.height,
     )
 
-    # filter to only the 7th timestep
     processed_prediction_timestamp = current_timestamp + timedelta(days=6)
     processed_predictions = predictions.filter(
         pl.col("timestamp")
@@ -323,13 +326,11 @@ def parse_responses(
 ) -> pl.DataFrame:
     equity_bars_data = pl.read_parquet(io.BytesIO(equity_bars_response.content))
 
-    # Deduplicate on (ticker, timestamp) - keep last entry
     equity_bars_data = equity_bars_data.unique(
         subset=["ticker", "timestamp"],
         keep="last",
     )
 
-    # Filter out rows with zero or invalid prices
     equity_bars_data = equity_bars_data.filter(
         (pl.col("open_price") > 0)
         & (pl.col("high_price") > 0)

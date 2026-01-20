@@ -204,6 +204,12 @@ class Data:
                     null_count=null_count,
                     inf_count=inf_count,
                 )
+                # Filter out rows with invalid values to prevent downstream errors
+                data = data.filter(
+                    pl.col(col).is_not_nan()
+                    & pl.col(col).is_not_null()
+                    & pl.col(col).is_finite()
+                )
 
         data = data_schema.validate(data)
 
@@ -365,7 +371,7 @@ class Data:
         total_tickers = len(ticker_groups)
         logger.info("batch_creation_started", total_tickers=total_tickers)
 
-        for idx, (ticker, ticker_df) in enumerate(ticker_groups.items()):
+        for idx, (_ticker, ticker_df) in enumerate(ticker_groups.items()):
             if idx % 25 == 0:
                 logger.info(
                     "batch_progress", ticker_idx=idx, total_tickers=total_tickers
@@ -373,11 +379,22 @@ class Data:
 
             # Convert to numpy once per ticker (avoid repeated DataFrame operations)
             # Use float32 for GPU compatibility (Metal doesn't support float64)
-            cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
-            cont_array = ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
-            static_array = ticker_df[self.static_categorical_columns].head(1).to_numpy().astype(np.int32)
+            cat_array = (
+                ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
+            )
+            cont_array = (
+                ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+            )
+            static_array = (
+                ticker_df[self.static_categorical_columns]
+                .head(1)
+                .to_numpy()
+                .astype(np.int32)
+            )
             target_array = (
-                ticker_df[["daily_return"]].to_numpy().astype(np.float32) if has_targets else None
+                ticker_df[["daily_return"]].to_numpy().astype(np.float32)
+                if has_targets
+                else None
             )
 
             num_rows = len(ticker_df)
@@ -501,7 +518,7 @@ class Data:
     ) -> pl.DataFrame:
         predictions_array = predictions.numpy()
 
-        batch_size, output_length, num_quantiles = predictions_array.shape
+        batch_size, output_length, _num_quantiles = predictions_array.shape
 
         ticker_reverse_mapping = {v: k for k, v in self.mappings["ticker"].items()}
 

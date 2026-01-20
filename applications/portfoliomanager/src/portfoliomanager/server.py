@@ -42,7 +42,11 @@ structlog.configure(
 )
 
 from .enums import PositionAction, PositionSide, TradeSide
-from .exceptions import InsufficientPredictionsError
+from .exceptions import (
+    AssetNotShortableError,
+    InsufficientBuyingPowerError,
+    InsufficientPredictionsError,
+)
 from .portfolio_schema import portfolio_schema
 from .risk_management import (
     UNCERTAINTY_THRESHOLD,
@@ -92,13 +96,17 @@ def health_check() -> Response:
 
 
 @application.post("/portfolio")
-def create_portfolio() -> Response:  # noqa: PLR0911, C901
+def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
     try:
         account = alpaca_client.get_account()
-        logger.info("Retrieved account", cash_amount=account.cash_amount)
+        logger.info(
+            "Retrieved account",
+            cash_amount=account.cash_amount,
+            buying_power=account.buying_power,
+        )
     except Exception as e:
         logger.exception("Failed to retrieve account", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -127,12 +135,9 @@ def create_portfolio() -> Response:  # noqa: PLR0911, C901
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
     except InsufficientPredictionsError as e:
         logger.warning(
-            "Insufficient predictions to create portfolio - no trades will be made. "
-            "This typically happens when: (1) all predictions have high uncertainty "
-            f"(inter_quartile_range > {UNCERTAINTY_THRESHOLD}), (2) not enough predictions available after "
-            "filtering, or (3) first run with limited market data. Check the filtering "
-            "breakdown logs above for details.",
+            "Insufficient predictions to create portfolio, no trades will be made",
             error=str(e),
+            uncertainty_threshold=UNCERTAINTY_THRESHOLD,
             predictions_count=len(current_predictions),
             prior_portfolio_count=len(prior_portfolio),
         )
@@ -191,44 +196,120 @@ def create_portfolio() -> Response:  # noqa: PLR0911, C901
             )
 
     open_results = []
+    remaining_buying_power = account.buying_power
+    skipped_insufficient_buying_power = 0
+    skipped_not_shortable = 0
+
     for open_position in open_positions:
+        ticker = open_position["ticker"]
+        side = open_position["side"]
+        dollar_amount = open_position["dollar_amount"]
+
+        # Check if we have enough buying power before attempting the order
+        if dollar_amount > remaining_buying_power:
+            logger.warning(
+                "Skipping position due to insufficient buying power",
+                ticker=ticker,
+                side=side,
+                dollar_amount=dollar_amount,
+                remaining_buying_power=remaining_buying_power,
+            )
+            skipped_insufficient_buying_power += 1
+            open_results.append(
+                {
+                    "ticker": ticker,
+                    "action": "open",
+                    "side": side,
+                    "dollar_amount": dollar_amount,
+                    "status": "skipped",
+                    "reason": "insufficient_buying_power",
+                }
+            )
+            continue
+
         try:
             alpaca_client.open_position(
-                ticker=open_position["ticker"],
-                side=open_position["side"],
-                dollar_amount=open_position["dollar_amount"],
+                ticker=ticker,
+                side=side,
+                dollar_amount=dollar_amount,
             )
             logger.info(
                 "Opened position",
-                ticker=open_position["ticker"],
-                side=open_position["side"],
-                dollar_amount=open_position["dollar_amount"],
+                ticker=ticker,
+                side=side,
+                dollar_amount=dollar_amount,
             )
+            # Deduct from remaining buying power on success
+            remaining_buying_power -= dollar_amount
             open_results.append(
                 {
-                    "ticker": open_position["ticker"],
+                    "ticker": ticker,
                     "action": "open",
-                    "side": open_position["side"],
-                    "dollar_amount": open_position["dollar_amount"],
+                    "side": side,
+                    "dollar_amount": dollar_amount,
                     "status": "success",
+                }
+            )
+        except InsufficientBuyingPowerError as e:
+            logger.warning(
+                "Insufficient buying power for position",
+                ticker=ticker,
+                side=side,
+                dollar_amount=dollar_amount,
+                error=str(e),
+            )
+            skipped_insufficient_buying_power += 1
+            open_results.append(
+                {
+                    "ticker": ticker,
+                    "action": "open",
+                    "side": side,
+                    "dollar_amount": dollar_amount,
+                    "status": "skipped",
+                    "reason": "insufficient_buying_power",
+                }
+            )
+        except AssetNotShortableError as e:
+            logger.warning(
+                "Asset cannot be sold short",
+                ticker=ticker,
+                side=side,
+                error=str(e),
+            )
+            skipped_not_shortable += 1
+            open_results.append(
+                {
+                    "ticker": ticker,
+                    "action": "open",
+                    "side": side,
+                    "dollar_amount": dollar_amount,
+                    "status": "skipped",
+                    "reason": "not_shortable",
                 }
             )
         except Exception as e:
             logger.exception(
                 "Failed to open position",
-                ticker=open_position["ticker"],
+                ticker=ticker,
                 error=str(e),
             )
             open_results.append(
                 {
-                    "ticker": open_position["ticker"],
+                    "ticker": ticker,
                     "action": "open",
-                    "side": open_position["side"],
-                    "dollar_amount": open_position["dollar_amount"],
+                    "side": side,
+                    "dollar_amount": dollar_amount,
                     "status": "failed",
                     "error": str(e),
                 }
             )
+
+    if skipped_insufficient_buying_power > 0 or skipped_not_shortable > 0:
+        logger.info(
+            "Some positions were skipped",
+            skipped_insufficient_buying_power=skipped_insufficient_buying_power,
+            skipped_not_shortable=skipped_not_shortable,
+        )
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -248,7 +329,7 @@ def create_portfolio() -> Response:  # noqa: PLR0911, C901
 def get_current_predictions() -> pl.DataFrame:
     current_predictions_response = requests.post(
         url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
-        timeout=60,
+        timeout=180,
     )
 
     current_predictions_response.raise_for_status()
@@ -260,7 +341,17 @@ def get_current_predictions() -> pl.DataFrame:
     )
 
 
-def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # TEMP
+def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: PLR0911
+    empty_portfolio = pl.DataFrame(
+        {
+            "ticker": [],
+            "timestamp": [],
+            "side": [],
+            "dollar_amount": [],
+            "action": [],
+        }
+    )
+
     prior_portfolio_response = requests.get(
         url=f"{DATAMANAGER_BASE_URL}/portfolios",
         timeout=60,
@@ -271,43 +362,39 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # TEMP
             "No prior portfolio found - this is expected on first run",
             status_code=prior_portfolio_response.status_code,
         )
-        return pl.DataFrame(
-            {
-                "ticker": [],
-                "timestamp": [],
-                "side": [],
-                "dollar_amount": [],
-                "action": [],
-            }
-        )
+        return empty_portfolio
 
     if prior_portfolio_response.status_code >= 400:
         logger.warning(
             "Failed to fetch prior portfolio from datamanager",
             status_code=prior_portfolio_response.status_code,
         )
-        return pl.DataFrame(
-            {
-                "ticker": [],
-                "timestamp": [],
-                "side": [],
-                "dollar_amount": [],
-                "action": [],
-            }
-        )
+        return empty_portfolio
 
-    prior_portfolio = pl.DataFrame(prior_portfolio_response.json())
+    # Handle empty or invalid JSON response
+    response_text = prior_portfolio_response.text.strip()
+    if not response_text or response_text == "[]":
+        logger.info("Prior portfolio response is empty")
+        return empty_portfolio
+
+    try:
+        prior_portfolio_data = prior_portfolio_response.json()
+    except (ValueError, requests.exceptions.JSONDecodeError) as e:
+        logger.warning(
+            "Failed to parse prior portfolio JSON",
+            error=str(e),
+            response_text=response_text[:200] if response_text else "empty",
+        )
+        return empty_portfolio
+
+    if not prior_portfolio_data:
+        logger.info("Prior portfolio data is empty")
+        return empty_portfolio
+
+    prior_portfolio = pl.DataFrame(prior_portfolio_data)
 
     if prior_portfolio.is_empty():
-        return pl.DataFrame(
-            {
-                "ticker": [],
-                "timestamp": [],
-                "side": [],
-                "dollar_amount": [],
-                "action": [],
-            }
-        )
+        return empty_portfolio
 
     tickers = prior_portfolio["ticker"].unique().to_list()
     timestamps = prior_portfolio["timestamp"].cast(pl.Float64)
