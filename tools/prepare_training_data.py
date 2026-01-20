@@ -27,8 +27,9 @@ def read_equity_bars_from_s3(
     bucket_name: str,
     start_date: datetime,
     end_date: datetime,
+    batch_size_days: int = 30,
 ) -> pl.DataFrame:
-    """Read equity bars parquet files from S3 for date range."""
+    """Read equity bars parquet files from S3 for date range in batches."""
     logger.info(
         "Reading equity bars from S3",
         bucket=bucket_name,
@@ -38,6 +39,8 @@ def read_equity_bars_from_s3(
 
     all_dataframes = []
     current_date = start_date
+    batch_dataframes = []
+    days_in_batch = 0
 
     while current_date <= end_date:
         year = current_date.strftime("%Y")
@@ -50,7 +53,7 @@ def read_equity_bars_from_s3(
             response = s3_client.get_object(Bucket=bucket_name, Key=key)
             parquet_bytes = response["Body"].read()
             dataframe = pl.read_parquet(parquet_bytes)
-            all_dataframes.append(dataframe)
+            batch_dataframes.append(dataframe)
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
         except s3_client.exceptions.NoSuchKey:
             logger.debug("No data for date", date=current_date.strftime("%Y-%m-%d"))
@@ -60,6 +63,16 @@ def read_equity_bars_from_s3(
             )
 
         current_date += timedelta(days=1)
+        days_in_batch += 1
+
+        if days_in_batch >= batch_size_days and batch_dataframes:
+            all_dataframes.append(pl.concat(batch_dataframes))
+            logger.debug("Processed batch", days=days_in_batch)
+            batch_dataframes = []
+            days_in_batch = 0
+
+    if batch_dataframes:
+        all_dataframes.append(pl.concat(batch_dataframes))
 
     if not all_dataframes:
         message = "No equity bars data found for date range"
