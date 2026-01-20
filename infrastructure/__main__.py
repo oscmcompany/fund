@@ -958,8 +958,8 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                             "value": "production",
                         },
                         {
-                            "name": "DISKCACHE",
-                            "value": "0",
+                            "name": "DISABLE_DISK_CACHE",
+                            "value": "1",
                         },
                     ],
                     "secrets": [
