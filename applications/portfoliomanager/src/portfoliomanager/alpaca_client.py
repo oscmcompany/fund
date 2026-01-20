@@ -60,13 +60,30 @@ class AlpacaClient:
             buying_power=float(cast("str", account.buying_power)),
         )
 
-    def _get_current_price(self, ticker: str) -> float:
-        """Get current ask price for a ticker."""
+    def _get_current_price(self, ticker: str, side: TradeSide) -> float:
+        """Get current price for a ticker based on trade side.
+
+        For BUY orders, returns ask price (what sellers are asking).
+        For SELL orders, returns bid price (what buyers are bidding).
+        """
         request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
         quotes = self.data_client.get_stock_latest_quote(request)
         quote = quotes[ticker.upper()]
-        # Use ask price for buys, bid price for sells - use ask as default
-        return float(quote.ask_price) if quote.ask_price > 0 else float(quote.bid_price)
+
+        if side == TradeSide.BUY:
+            # Use ask price for buys (what we'd pay)
+            return (
+                float(quote.ask_price)
+                if quote.ask_price > 0
+                else float(quote.bid_price)
+            )
+        else:
+            # Use bid price for sells (what we'd receive)
+            return (
+                float(quote.bid_price)
+                if quote.bid_price > 0
+                else float(quote.ask_price)
+            )
 
     def open_position(
         self,
@@ -76,7 +93,7 @@ class AlpacaClient:
     ) -> None:
         # Calculate quantity from dollar amount and current price
         # Allow fractional shares where supported by the brokerage
-        current_price = self._get_current_price(ticker)
+        current_price = self._get_current_price(ticker, side)
         qty = dollar_amount / current_price
 
         if qty <= 0:
@@ -88,8 +105,8 @@ class AlpacaClient:
             raise ValueError(message)
 
         # Calculate limit price with tolerance to prevent execution at unfavorable prices
-        # For buys, set a maximum price we're willing to pay (current price + tolerance)
-        # For sells, set a minimum price we're willing to accept (current price - tolerance)
+        # For buys, limit is max price we'll pay (ask + tolerance allows some slippage up)
+        # For sells, limit is min price we'll accept (bid - tolerance allows some slippage down)
         tolerance = current_price * (self.price_tolerance_percent / 100.0)
         if side == TradeSide.BUY:
             limit_price = current_price + tolerance
