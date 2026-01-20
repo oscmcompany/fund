@@ -299,6 +299,10 @@ class Model:
                         self._combine_input_features(batch)
                     )
 
+                    if targets is None:
+                        message = "Targets are required for training batches"
+                        raise ValueError(message)
+
                     # predictions shape: (batch_size, output_length, num_quantiles)
                     predictions = self.forward(combined_input_features)
 
@@ -381,6 +385,10 @@ class Model:
 
         for batch in validation_batches:
             combined_input, targets, batch_size = self._combine_input_features(batch)
+
+            if targets is None:
+                message = "Targets are required for validation batches"
+                raise ValueError(message)
 
             predictions = self.forward(combined_input)
 
