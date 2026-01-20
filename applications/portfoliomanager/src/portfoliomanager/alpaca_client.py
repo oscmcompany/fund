@@ -1,4 +1,3 @@
-import math
 import time
 from typing import cast
 
@@ -74,14 +73,15 @@ class AlpacaClient:
         dollar_amount: float,
     ) -> None:
         # Calculate quantity from dollar amount and current price
-        # This works for all securities, not just fractionable ones
+        # Allow fractional shares where supported by the brokerage
         current_price = self._get_current_price(ticker)
-        qty = math.floor(dollar_amount / current_price)
+        qty = dollar_amount / current_price
 
-        if qty < 1:
+        if qty <= 0:
             message = (
                 f"Cannot open position for {ticker}: "
-                f"dollar_amount {dollar_amount} < price {current_price}"
+                f"non-positive quantity calculated from dollar_amount {dollar_amount} "
+                f"and price {current_price}"
             )
             raise ValueError(message)
 

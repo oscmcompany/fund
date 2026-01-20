@@ -252,12 +252,12 @@ def create_optimal_portfolio(
         "composite_score",
     ).to_dicts()
 
-    logger.warning(
+    logger.info(
         "Current predictions received",
         predictions=prediction_summary,
     )
 
-    logger.warning(
+    logger.info(
         "Portfolio filtering breakdown",
         total_predictions=current_predictions.height,
         high_uncertainty_excluded=len(high_uncertainty_tickers),
@@ -272,7 +272,7 @@ def create_optimal_portfolio(
         ~pl.col("ticker").is_in(excluded_tickers)
     )
 
-    logger.warning(
+    logger.info(
         "Available predictions after filtering",
         available_count=available_predictions.height,
         required_for_full_portfolio=20,
@@ -317,7 +317,7 @@ def create_optimal_portfolio(
         new_short_positions_needed, total_available - maximum_long_candidates
     )
 
-    logger.warning(
+    logger.info(
         "Position allocation calculation",
         total_available_predictions=total_available,
         new_long_positions_needed=new_long_positions_needed,
