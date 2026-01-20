@@ -239,8 +239,15 @@ def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
                 side=side,
                 dollar_amount=dollar_amount,
             )
-            # Deduct from remaining buying power on success
-            remaining_buying_power -= dollar_amount
+            # Refresh remaining buying power from the account after a successful order
+            try:
+                account = alpaca_client.get_account()
+                # Alpaca typically returns buying_power as a string; convert to float
+                remaining_buying_power = float(account.buying_power)
+            except Exception:
+                # If refreshing from the account fails for any reason,
+                # fall back to deducting the estimated dollar_amount
+                remaining_buying_power -= dollar_amount
             open_results.append(
                 {
                     "ticker": ticker,
