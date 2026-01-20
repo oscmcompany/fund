@@ -81,10 +81,9 @@ if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET:
     )
     raise ValueError(message)
 
+tolerance_env_value = os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT", "1.0")
 try:
-    price_tolerance_percent = float(
-        os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT", "1.0"),
-    )
+    price_tolerance_percent = float(tolerance_env_value)
     if price_tolerance_percent < 0:
         message = (
             "ALPACA_PRICE_TOLERANCE_PERCENT must be non-negative, "
@@ -94,13 +93,10 @@ try:
 except ValueError as e:
     logger.error(
         "Invalid ALPACA_PRICE_TOLERANCE_PERCENT",
-        value=os.getenv("ALPACA_PRICE_TOLERANCE_PERCENT"),
+        value=tolerance_env_value,
         error=str(e),
     )
-    message = (
-        f"Invalid ALPACA_PRICE_TOLERANCE_PERCENT: "
-        f"{os.getenv('ALPACA_PRICE_TOLERANCE_PERCENT')}"
-    )
+    message = f"Invalid ALPACA_PRICE_TOLERANCE_PERCENT: {tolerance_env_value}"
     raise ValueError(message) from e
 
 alpaca_client = AlpacaClient(
