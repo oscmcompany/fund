@@ -565,7 +565,7 @@ fn execute_portfolio_query_with_action(
         .query_map([], |row| {
             Ok(Portfolio {
                 ticker: row.get::<_, String>(0)?,
-                timestamp: row.get::<_, i64>(1)? as f64,
+                timestamp: row.get::<_, f64>(1)?,
                 side: row.get::<_, String>(2)?,
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,
@@ -592,7 +592,7 @@ fn execute_portfolio_query_without_action(
         .query_map([], |row| {
             Ok(Portfolio {
                 ticker: row.get::<_, String>(0)?,
-                timestamp: row.get::<_, i64>(1)? as f64,
+                timestamp: row.get::<_, f64>(1)?,
                 side: row.get::<_, String>(2)?,
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: "UNSPECIFIED".to_string(),
