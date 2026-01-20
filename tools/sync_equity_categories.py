@@ -19,6 +19,13 @@ logger = structlog.get_logger()
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 
+# Polygon ticker types to include: Common Stock and all ADR types
+# CS = Common Stock
+# ADRC = ADR (Common)
+# ADRP = ADR (Preferred)
+# ADRS = ADR (Shares)
+EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}
+
 
 def fetch_all_tickers(api_key: str) -> list[dict]:
     """Fetch all US stock tickers from Polygon API with pagination."""
@@ -64,15 +71,8 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
     rows = []
     for ticker_data in tickers:
         ticker = ticker_data.get("ticker", "")
-
-        if not ticker or not ticker.strip():
-            continue
-
-        ticker = ticker.strip()
-
-        # Polygon uses 'sic_description' for industry, but we can also check other fields
-        # The primary_exchange and type fields help filter
-        if ticker_data.get("type") not in ("CS", "ADRC"):  # Common Stock or ADR
+        # Filter for Common Stock and all ADR types
+        if ticker_data.get("type") not in EQUITY_TYPES:
             continue
 
         # Try to get sector/industry from various fields Polygon provides
