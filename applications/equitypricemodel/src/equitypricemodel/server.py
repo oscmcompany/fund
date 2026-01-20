@@ -123,8 +123,24 @@ def download_and_extract_artifacts(
         s3_client.download_file(bucket, artifact_key, str(temp_path))
         logger.info("downloaded_artifact", size_bytes=temp_path.stat().st_size)
 
+        base_path = extract_path.resolve()
+
+        def _safe_tar_filter(member, _base_path=base_path):
+            """
+            Validate tar members to prevent path traversal outside extract_path.
+            """
+            name = member.name
+            if not name:
+                return None
+            if os.path.isabs(name):
+                raise ValueError(f"Refusing to extract absolute path from tar archive: {name!r}")
+            member_path = (Path(_base_path) / name).resolve()
+            if not str(member_path).startswith(str(_base_path)):
+                raise ValueError(f"Refusing to extract path outside target directory: {name!r}")
+            return member
+
         with tarfile.open(temp_path, "r:gz") as tar:
-            tar.extractall(path=extract_path)  # noqa: S202
+            tar.extractall(path=extract_path, filter=_safe_tar_filter)
 
         logger.info("extracted_artifacts", extract_path=str(extract_path))
 
