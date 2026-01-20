@@ -1,6 +1,6 @@
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -44,7 +44,7 @@ impl State {
             }
             Err(_) => {
                 let default_bucket = "pocketsizefund-data".to_string();
-                warn!(
+                error!(
                     "AWS_S3_DATA_BUCKET_NAME not set, using default: {}",
                     default_bucket
                 );
@@ -59,7 +59,7 @@ impl State {
             }
             Err(_) => {
                 let default_url = "https://api.massive.io".to_string();
-                warn!(
+                error!(
                     "MASSIVE_BASE_URL not set, using default: {}",
                     default_url
                 );
