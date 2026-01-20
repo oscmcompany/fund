@@ -215,8 +215,12 @@ class Model:
         self,
         train_batches: list,
         sample_size: int = 10,
-    ) -> bool:
-        """Validate training data for NaN/Inf values."""
+    ) -> None:
+        """Validate training data for NaN/Inf values.
+        
+        Raises:
+            ValueError: If training data contains NaN or Inf values
+        """
         logger.info(
             "Validating training data",
             total_batches=len(train_batches),
@@ -240,10 +244,10 @@ class Model:
                         feature=feature_key,
                         **stats,
                     )
-            return False
+            message = "Training data contains NaN or Inf values"
+            raise ValueError(message)
 
         logger.info("Training data validation passed")
-        return True
 
     def train(  # noqa: PLR0913
         self,
@@ -268,10 +272,7 @@ class Model:
             early_stopping_min_delta: Minimum improvement to reset patience counter
         """
         if validate_data:
-            is_valid = self.validate_training_data(train_batches)
-            if not is_valid:
-                message = "Training data contains NaN or Inf values"
-                raise ValueError(message)
+            self.validate_training_data(train_batches)
 
         prev_training = Tensor.training
         Tensor.training = True
