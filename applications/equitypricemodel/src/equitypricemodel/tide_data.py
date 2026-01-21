@@ -211,7 +211,12 @@ class Data:
                     & pl.col(col).is_finite()
                 )
 
-        data = data_schema.validate(data)
+        data_validated = data_schema.validate(data)
+        data = (
+            data_validated.collect()
+            if isinstance(data_validated, pl.LazyFrame)
+            else data_validated
+        )
 
         self.scaler = Scaler()
 
@@ -371,7 +376,7 @@ class Data:
         total_tickers = len(ticker_groups)
         logger.info("batch_creation_started", total_tickers=total_tickers)
 
-        for idx, (_ticker, ticker_df) in enumerate(ticker_groups.items()):
+        for idx, ticker_df in enumerate(ticker_groups.values()):
             if idx % 25 == 0:
                 logger.info(
                     "batch_progress", ticker_idx=idx, total_tickers=total_tickers
@@ -379,9 +384,7 @@ class Data:
 
             # Convert to numpy once per ticker (avoid repeated DataFrame operations)
             # Use float32 for GPU compatibility (Metal doesn't support float64)
-            cat_array = (
-                ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
-            )
+            cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
             cont_array = (
                 ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
             )
@@ -420,7 +423,7 @@ class Data:
                     "static_categorical": static_array.copy(),
                 }
 
-                if has_targets:
+                if has_targets and target_array is not None:
                     sample["targets"] = target_array[
                         i + input_length : i + input_length + output_length
                     ].copy()

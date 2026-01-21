@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import tarfile
 import tempfile
@@ -7,6 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import boto3
 import polars as pl
@@ -17,6 +19,9 @@ from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from sentry_sdk.integrations.logging import LoggingIntegration
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
 
 from .equity_details_schema import equity_details_schema
 from .predictions_schema import predictions_schema
@@ -34,7 +39,7 @@ sentry_sdk.init(
     integrations=[
         LoggingIntegration(
             level=None,
-            event_level="WARNING",
+            event_level=logging.WARNING,
         ),
     ],
 )
@@ -57,7 +62,7 @@ DATAMANAGER_BASE_URL = os.getenv("PSF_DATAMANAGER_BASE_URL", "http://datamanager
 
 
 def find_latest_artifact_key(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket: str,
     prefix: str,
 ) -> str:
@@ -99,12 +104,14 @@ def find_latest_artifact_key(
             )
             return artifact_key
 
-    message = f"No model.tar.gz found in any artifact folder under s3://{bucket}/{prefix}"
+    message = (
+        f"No model.tar.gz found in any artifact folder under s3://{bucket}/{prefix}"
+    )
     raise ValueError(message)
 
 
 def download_and_extract_artifacts(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket: str,
     artifact_key: str,
     extract_path: Path,
@@ -123,24 +130,25 @@ def download_and_extract_artifacts(
         s3_client.download_file(bucket, artifact_key, str(temp_path))
         logger.info("downloaded_artifact", size_bytes=temp_path.stat().st_size)
 
-        base_path = extract_path.resolve()
-
-        def _safe_tar_filter(member, _base_path=base_path):
-            """
-            Validate tar members to prevent path traversal outside extract_path.
-            """
+        def _safe_tar_filter(
+            member: tarfile.TarInfo, dest_path: str, /
+        ) -> tarfile.TarInfo | None:
+            """Validate tar members to prevent path traversal outside extract_path."""
+            base = Path(dest_path).resolve()
             name = member.name
             if not name:
                 return None
-            if os.path.isabs(name):
-                raise ValueError(f"Refusing to extract absolute path from tar archive: {name!r}")
-            member_path = (Path(_base_path) / name).resolve()
-            if not str(member_path).startswith(str(_base_path)):
-                raise ValueError(f"Refusing to extract path outside target directory: {name!r}")
+            if Path(name).is_absolute():
+                message = f"Refusing absolute path from tar archive: {name!r}"
+                raise ValueError(message)
+            member_path = (base / name).resolve()
+            if not str(member_path).startswith(str(base)):
+                message = f"Refusing path outside target directory: {name!r}"
+                raise ValueError(message)
             return member
 
         with tarfile.open(temp_path, "r:gz") as tar:
-            tar.extractall(path=extract_path, filter=_safe_tar_filter)
+            tar.extractall(path=extract_path, filter=_safe_tar_filter)  # noqa: S202
 
         logger.info("extracted_artifacts", extract_path=str(extract_path))
 
@@ -354,13 +362,23 @@ def parse_responses(
         & (pl.col("close_price") > 0)
     )
 
-    equity_bars_data = equity_bars_schema.validate(equity_bars_data)
+    equity_bars_validated = equity_bars_schema.validate(equity_bars_data)
+    equity_bars_data = (
+        equity_bars_validated.collect()
+        if isinstance(equity_bars_validated, pl.LazyFrame)
+        else equity_bars_validated
+    )
 
     equity_bars_data = filter_equity_bars(equity_bars_data)
 
     equity_details_data = pl.read_csv(io.BytesIO(equity_details_response.content))
 
-    equity_details_data = equity_details_schema.validate(equity_details_data)
+    equity_details_validated = equity_details_schema.validate(equity_details_data)
+    equity_details_data = (
+        equity_details_validated.collect()
+        if isinstance(equity_details_validated, pl.LazyFrame)
+        else equity_details_validated
+    )
 
     consolidated_data = equity_details_data.join(
         equity_bars_data, on="ticker", how="inner"

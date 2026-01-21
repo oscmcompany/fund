@@ -8,13 +8,19 @@ This script:
 5. Outputs consolidated parquet to S3 for SageMaker training
 """
 
+import io
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import boto3
 import polars as pl
 import structlog
+from botocore.exceptions import ClientError
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
 
 logger = structlog.get_logger()
 
@@ -23,7 +29,7 @@ MINIMUM_VOLUME = 100_000
 
 
 def read_equity_bars_from_s3(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket_name: str,
     start_date: datetime,
     end_date: datetime,
@@ -57,10 +63,8 @@ def read_equity_bars_from_s3(
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
         except s3_client.exceptions.NoSuchKey:
             logger.debug("No data for date", date=current_date.strftime("%Y-%m-%d"))
-        except Exception as e:
-            logger.warning(
-                "Failed to read parquet file", key=key, error=str(e)
-            )
+        except ClientError as e:
+            logger.warning("Failed to read parquet file", key=key, error=str(e))
 
         current_date += timedelta(days=1)
         days_in_batch += 1
@@ -85,7 +89,7 @@ def read_equity_bars_from_s3(
 
 
 def read_categories_from_s3(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket_name: str,
 ) -> pl.DataFrame:
     """Read categories CSV from S3."""
@@ -152,27 +156,29 @@ def consolidate_data(
     ]
 
     available_columns = [col for col in retained_columns if col in consolidated.columns]
-    missing_columns = [col for col in retained_columns if col not in consolidated.columns]
+    missing_columns = [
+        col for col in retained_columns if col not in consolidated.columns
+    ]
 
     if missing_columns:
         logger.warning("Missing columns in consolidated data", missing=missing_columns)
 
     result = consolidated.select(available_columns)
 
-    logger.info("Consolidated data", output_rows=result.height, columns=available_columns)
+    logger.info(
+        "Consolidated data", output_rows=result.height, columns=available_columns
+    )
 
     return result
 
 
 def write_training_data_to_s3(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket_name: str,
     data: pl.DataFrame,
     output_key: str,
 ) -> str:
     """Write consolidated training data to S3 as parquet."""
-    import io
-
     logger.info(
         "Writing training data to S3",
         bucket=bucket_name,
@@ -234,28 +240,30 @@ def prepare_training_data(
         categories=categories,
     )
 
-    s3_uri = write_training_data_to_s3(
+    return write_training_data_to_s3(
         s3_client=s3_client,
         bucket_name=model_artifacts_bucket_name,
         data=consolidated,
         output_key=output_key,
     )
 
-    return s3_uri
-
 
 if __name__ == "__main__":
-    data_bucket = os.getenv("AWS_S3_DATA_BUCKET")
-    model_artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET")
+    data_bucket: str | None = os.getenv("AWS_S3_DATA_BUCKET")
+    model_artifacts_bucket: str | None = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET")
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
 
-    if not data_bucket or not model_artifacts_bucket:
+    if data_bucket is None or model_artifacts_bucket is None:
         logger.error(
             "Missing required environment variables",
             AWS_S3_DATA_BUCKET=data_bucket,
             AWS_S3_MODEL_ARTIFACTS_BUCKET=model_artifacts_bucket,
         )
         sys.exit(1)
+
+    # Type narrowing assertions for type checker
+    assert data_bucket is not None  # noqa: S101
+    assert model_artifacts_bucket is not None  # noqa: S101
 
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)

@@ -74,10 +74,10 @@ logger.info("data_dimensions", **dimensions)
 logger.info("creating_training_batches")
 train_batches = tide_data.get_batches(
     data_type="train",
-    validation_split=configuration["validation_split"],
-    input_length=configuration["input_length"],
-    output_length=configuration["output_length"],
-    batch_size=configuration["batch_size"],
+    validation_split=float(configuration["validation_split"]),
+    input_length=int(configuration["input_length"]),
+    output_length=int(configuration["output_length"]),
+    batch_size=int(configuration["batch_size"]),
 )
 
 logger.info("training_batches_created", batch_count=len(train_batches))
@@ -114,11 +114,11 @@ logger.info("input_size_calculated", input_size=input_size)
 logger.info("creating_model")
 tide_model = Model(
     input_size=input_size,
-    hidden_size=configuration["hidden_size"],
-    num_encoder_layers=configuration["num_encoder_layers"],
-    num_decoder_layers=configuration["num_decoder_layers"],
-    output_length=configuration["output_length"],
-    dropout_rate=configuration["dropout_rate"],
+    hidden_size=int(configuration["hidden_size"]),
+    num_encoder_layers=int(configuration["num_encoder_layers"]),
+    num_decoder_layers=int(configuration["num_decoder_layers"]),
+    output_length=int(configuration["output_length"]),
+    dropout_rate=float(configuration["dropout_rate"]),
     quantiles=[0.1, 0.5, 0.9],
 )
 
@@ -126,8 +126,8 @@ logger.info("training_started", epochs=configuration["epoch_count"])
 
 losses = tide_model.train(
     train_batches=train_batches,
-    epochs=configuration["epoch_count"],
-    learning_rate=configuration["learning_rate"],
+    epochs=int(configuration["epoch_count"]),
+    learning_rate=float(configuration["learning_rate"]),
 )
 
 logger.info(

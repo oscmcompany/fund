@@ -265,7 +265,9 @@ def create_optimal_portfolio(
         closed_positions_excluded=len(closed_position_tickers),
         maintained_positions_excluded=len(maintained_position_tickers),
         total_excluded=len(excluded_tickers),
-        high_uncertainty_tickers=high_uncertainty_tickers[:10] if high_uncertainty_tickers else [],
+        high_uncertainty_tickers=high_uncertainty_tickers[:10]
+        if high_uncertainty_tickers
+        else [],
     )
 
     available_predictions = current_predictions.filter(

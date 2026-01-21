@@ -9,21 +9,21 @@ The CSV contains: ticker, sector, industry
 import os
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import boto3
 import polars as pl
 import requests
 import structlog
 
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
 logger = structlog.get_logger()
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 
-# Polygon ticker types to include: Common Stock and all ADR types
-# CS = Common Stock
-# ADRC = ADR (Common)
-# ADRP = ADR (Preferred)
-# ADRS = ADR (Shares)
+# Polygon ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
 EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}
 
 
@@ -85,11 +85,13 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
         if not industry:
             industry = "NOT AVAILABLE"
 
-        rows.append({
-            "ticker": ticker.upper(),
-            "sector": sector.upper(),
-            "industry": industry.upper(),
-        })
+        rows.append(
+            {
+                "ticker": ticker.upper(),
+                "sector": sector.upper(),
+                "industry": industry.upper(),
+            }
+        )
 
     dataframe = pl.DataFrame(rows)
     logger.info("Extracted categories", rows=dataframe.height)
@@ -98,7 +100,7 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
 
 
 def upload_categories_to_s3(
-    s3_client: boto3.client,
+    s3_client: "S3Client",
     bucket_name: str,
     categories: pl.DataFrame,
 ) -> str:
@@ -138,22 +140,24 @@ def sync_equity_categories(
     categories = extract_categories(tickers)
 
     s3_client = boto3.client("s3")
-    s3_uri = upload_categories_to_s3(s3_client, bucket_name, categories)
-
-    return s3_uri
+    return upload_categories_to_s3(s3_client, bucket_name, categories)
 
 
 if __name__ == "__main__":
-    api_key = os.getenv("MASSIVE_API_KEY")
-    bucket_name = os.getenv("AWS_S3_DATA_BUCKET")
+    api_key: str | None = os.getenv("MASSIVE_API_KEY")
+    bucket_name: str | None = os.getenv("AWS_S3_DATA_BUCKET")
 
-    if not api_key:
+    if api_key is None:
         logger.error("MASSIVE_API_KEY environment variable not set")
         sys.exit(1)
 
-    if not bucket_name:
+    if bucket_name is None:
         logger.error("AWS_S3_DATA_BUCKET environment variable not set")
         sys.exit(1)
+
+    # Type narrowing assertions for type checker
+    assert api_key is not None  # noqa: S101
+    assert bucket_name is not None  # noqa: S101
 
     try:
         output_uri = sync_equity_categories(

@@ -1,9 +1,8 @@
 import json
 
+import parameters
 import pulumi
 import pulumi_aws as aws
-
-import parameters
 
 current_identity = aws.get_caller_identity()
 
@@ -97,10 +96,20 @@ equitypricemodel_trainer_repository = aws.ecr.Repository(
 
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
-datamanager_image_uri = datamanager_repository.repository_url.apply(lambda url: f"{url}:latest")
-portfoliomanager_image_uri = portfoliomanager_repository.repository_url.apply(lambda url: f"{url}:latest")
-equitypricemodel_image_uri = equitypricemodel_repository.repository_url.apply(lambda url: f"{url}:latest")
-equitypricemodel_trainer_image_uri = equitypricemodel_trainer_repository.repository_url.apply(lambda url: f"{url}:latest")
+datamanager_image_uri = datamanager_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+portfoliomanager_image_uri = portfoliomanager_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+equitypricemodel_image_uri = equitypricemodel_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+equitypricemodel_trainer_image_uri = (
+    equitypricemodel_trainer_repository.repository_url.apply(
+        lambda url: f"{url}:latest"
+    )
+)
 
 vpc = aws.ec2.Vpc(
     "vpc",
@@ -658,7 +667,9 @@ aws.iam.RolePolicy(
                 {
                     "Effect": "Allow",
                     "Action": ["ssm:GetParameter", "ssm:GetParameters"],
-                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/pocketsizefund/*",
+                    "Resource": (
+                        f"arn:aws:ssm:{region}:{account_id}:parameter/pocketsizefund/*"
+                    ),
                 }
             ],
         }
@@ -1122,12 +1133,21 @@ pulumi.export("aws_ecr_datamanager_image", datamanager_image_uri)
 pulumi.export("aws_ecr_portfoliomanager_image", portfoliomanager_image_uri)
 pulumi.export("aws_ecr_equitypricemodel_image", equitypricemodel_image_uri)
 pulumi.export("aws_ecr_datamanager_repository", datamanager_repository.repository_url)
-pulumi.export("aws_ecr_portfoliomanager_repository", portfoliomanager_repository.repository_url)
-pulumi.export("aws_ecr_equitypricemodel_repository", equitypricemodel_repository.repository_url)
+pulumi.export(
+    "aws_ecr_portfoliomanager_repository", portfoliomanager_repository.repository_url
+)
+pulumi.export(
+    "aws_ecr_equitypricemodel_repository", equitypricemodel_repository.repository_url
+)
 pulumi.export("aws_s3_data_bucket", data_bucket.bucket)
 pulumi.export("aws_s3_model_artifacts_bucket", model_artifacts_bucket.bucket)
-pulumi.export("aws_ecr_equitypricemodel_trainer_repository", equitypricemodel_trainer_repository.repository_url)
-pulumi.export("aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri)
+pulumi.export(
+    "aws_ecr_equitypricemodel_trainer_repository",
+    equitypricemodel_trainer_repository.repository_url,
+)
+pulumi.export(
+    "aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri
+)
 pulumi.export("aws_iam_sagemaker_role_arn", sagemaker_execution_role.arn)
 pulumi.export("psf_base_url", psf_base_url)
 pulumi.export("readme", pulumi.Output.format(readme_content, psf_base_url))

@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from typing import cast
@@ -25,7 +26,7 @@ sentry_sdk.init(
     integrations=[
         LoggingIntegration(
             level=None,
-            event_level="WARNING",
+            event_level=logging.WARNING,
         ),
     ],
 )
@@ -42,14 +43,14 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
-from .enums import PositionAction, PositionSide, TradeSide
-from .exceptions import (
+from .enums import PositionAction, PositionSide, TradeSide  # noqa: E402
+from .exceptions import (  # noqa: E402
     AssetNotShortableError,
     InsufficientBuyingPowerError,
     InsufficientPredictionsError,
 )
-from .portfolio_schema import portfolio_schema
-from .risk_management import (
+from .portfolio_schema import portfolio_schema  # noqa: E402
+from .risk_management import (  # noqa: E402
     UNCERTAINTY_THRESHOLD,
     add_equity_bars_returns_and_realized_volatility_columns,
     add_portfolio_action_column,
@@ -63,6 +64,8 @@ logger = structlog.get_logger()
 application: FastAPI = FastAPI()
 
 DATAMANAGER_BASE_URL = os.getenv("PSF_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+HTTP_NOT_FOUND = 404
+HTTP_BAD_REQUEST = 400
 EQUITYPRICEMODEL_BASE_URL = os.getenv(
     "PSF_EQUITYPRICEMODEL_BASE_URL",
     "http://equitypricemodel:8080",
@@ -243,11 +246,13 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             # Refresh remaining buying power from the account after a successful order
             try:
                 account = alpaca_client.get_account()
-                # Alpaca typically returns buying_power as a string; convert to float
-                remaining_buying_power = float(account.buying_power)
+                remaining_buying_power = account.buying_power
             except Exception:
-                # If refreshing from the account fails for any reason,
-                # fall back to deducting the estimated dollar_amount
+                logger.exception(
+                    "Failed to refresh buying power from account, using estimate",
+                    ticker=ticker,
+                    deducting=dollar_amount,
+                )
                 remaining_buying_power -= dollar_amount
             open_results.append(
                 {
@@ -365,14 +370,14 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
         timeout=60,
     )
 
-    if prior_portfolio_response.status_code == 404:
+    if prior_portfolio_response.status_code == HTTP_NOT_FOUND:
         logger.info(
             "No prior portfolio found - this is expected on first run",
             status_code=prior_portfolio_response.status_code,
         )
         return empty_portfolio
 
-    if prior_portfolio_response.status_code >= 400:
+    if prior_portfolio_response.status_code >= HTTP_BAD_REQUEST:
         logger.warning(
             "Failed to fetch prior portfolio from datamanager",
             status_code=prior_portfolio_response.status_code,
@@ -440,7 +445,12 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
 
     prior_equity_bars = pl.read_parquet(io.BytesIO(prior_equity_bars_response.content))
 
-    prior_equity_bars = equity_bars_schema.validate(prior_equity_bars)
+    prior_equity_bars_validated = equity_bars_schema.validate(prior_equity_bars)
+    prior_equity_bars = (
+        prior_equity_bars_validated.collect()
+        if isinstance(prior_equity_bars_validated, pl.LazyFrame)
+        else prior_equity_bars_validated
+    )
 
     prior_equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
         prior_equity_bars=prior_equity_bars
@@ -449,7 +459,7 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
     predictions_response_text = prior_predictions_response.text.strip()
     if not predictions_response_text or predictions_response_text == "[]":
         logger.warning(
-            "Prior predictions response is empty, returning portfolio without performance data"
+            "Prior predictions empty, returning portfolio without performance"
         )
         return add_portfolio_action_column(
             prior_portfolio=prior_portfolio,

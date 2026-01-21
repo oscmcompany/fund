@@ -43,7 +43,13 @@
                      "mcp__sentry__search_issues",
                      "mcp__sentry__find_projects",
                      "mcp__sentry__get_issue_details",
-                     "Bash(gh pr list:*)"
+                     "Bash(gh pr list:*)",
+                     "Bash(git pull:*)",
+                     "Bash(git stash:*)",
+                     "Bash(git stash pop:*)",
+                     "Bash(gh pr view:*)",
+                     "Bash(gh api:*)",
+                     "Bash(uvx ty:*)"
               ],
               "deny": [],
               "defaultMode": "acceptEdits"

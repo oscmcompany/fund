@@ -11,7 +11,7 @@ use duckdb::Connection;
 use polars::prelude::*;
 use serde::Deserialize;
 use std::io::Cursor;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
@@ -104,7 +104,7 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
     debug!("Loading AWS configuration for DuckDB S3 access");
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let provider = config.credentials_provider().ok_or_else(|| {
-        warn!("No AWS credentials provider found");
+        error!("No AWS credentials provider found");
         Error::Other("No AWS credentials provider found".into())
     })?;
 
@@ -114,9 +114,9 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
     let region = config
         .region()
         .map(|r| r.as_ref().to_string())
-        .unwrap_or_else(|| {
-            warn!("AWS region not configured, defaulting to us-east-1");
-            "us-east-1".to_string()
+        .ok_or_else(|| {
+            error!("AWS region not configured, defaulting to us-east-1");
+            Error::Other("AWS region not configured".into())
         });
 
     let has_session_token = credentials.session_token().is_some();
@@ -309,7 +309,10 @@ pub async fn query_predictions_dataframe_from_s3(
     let mut tickers = Vec::new();
 
     for prediction_query in predictions_query.iter() {
-        let timestamp = DateTime::from_timestamp(prediction_query.timestamp as i64, 0)
+        let timestamp_seconds = prediction_query.timestamp;
+        let seconds = timestamp_seconds.trunc() as i64;
+        let nanos = ((timestamp_seconds.fract()) * 1_000_000_000_f64).round() as u32;
+        let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos)
             .ok_or_else(|| Error::Other("Invalid timestamp".into()))?;
         let year = timestamp.format("%Y");
         let month = timestamp.format("%m");

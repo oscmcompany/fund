@@ -46,7 +46,7 @@ echo "Development environment setup completed successfully"
 
 ## infrastructure
 
-> Manage infrastructure resources 
+> Manage infrastructure resources
 
 ### images
 
@@ -299,7 +299,7 @@ esac
 
 ## development
 
-> Python development tools and code quality checks
+> Python and Rust development tools and code quality checks
 
 ### rust
 
@@ -360,6 +360,7 @@ cargo clippy
 
 echo "Rust linting completed successfully"
 ```
+
 #### test
 
 > Run Rust tests
@@ -461,6 +462,17 @@ ruff check \
 echo "Python linting completed successfully"
 ```
 
+#### type-check
+
+> Run Python type checks
+
+```bash
+set -euo pipefail
+
+echo "Running Python type checks"
+
+uvx ty check
+
 #### test
 
 > Run Python tests using coverage reporting
@@ -489,6 +501,8 @@ mask development python install
 mask development python format
 
 mask development python lint
+
+mask development python type-check
 
 mask development python dead-code
 
@@ -790,4 +804,3 @@ echo
 echo "Done. Current MCP status:"
 claude mcp list
 ```
-
