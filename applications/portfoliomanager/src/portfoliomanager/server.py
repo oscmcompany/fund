@@ -2,7 +2,7 @@ import io
 import json
 import logging
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import httpx
@@ -440,7 +440,15 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
 
     tickers = prior_portfolio["ticker"].unique().to_list()
     timestamps = prior_portfolio["timestamp"].cast(pl.Float64)
-    start_timestamp = datetime.fromtimestamp(cast("float", timestamps.min()), tz=UTC)
+    position_start_timestamp = datetime.fromtimestamp(
+        cast("float", timestamps.min()), tz=UTC
+    )
+
+    # Volatility calculation requires 30 trading days of data.
+    # Fetch at least 45 calendar days to account for weekends and holidays.
+    minimum_history_days = 45
+    minimum_start_timestamp = current_timestamp - timedelta(days=minimum_history_days)
+    start_timestamp = min(position_start_timestamp, minimum_start_timestamp)
 
     prior_equity_bars_response = requests.get(
         url=f"{DATAMANAGER_BASE_URL}/equity-bars",
