@@ -11,7 +11,7 @@ use duckdb::Connection;
 use polars::prelude::*;
 use serde::Deserialize;
 use std::io::Cursor;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
@@ -115,9 +115,9 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
         .region()
         .map(|r| r.as_ref().to_string())
         .ok_or_else(|| {
-            error!("AWS region not configured, defaulting to us-east-1");
+            error!("AWS region not configured");
             Error::Other("AWS region not configured".into())
-        });
+        })?;
 
     let has_session_token = credentials.session_token().is_some();
     debug!(
@@ -174,16 +174,21 @@ pub async fn query_equity_bars_parquet_from_s3(
     );
 
     // Use glob pattern with hive partitioning to handle missing files gracefully
-    let s3_glob = format!(
-        "s3://{}/equity/bars/daily/**/*.parquet",
-        state.bucket_name
-    );
+    let s3_glob = format!("s3://{}/equity/bars/daily/**/*.parquet", state.bucket_name);
 
     info!("Using S3 glob pattern: {}", s3_glob);
 
     // Build date filter for hive partitions
-    let start_date_int = start_timestamp.format("%Y%m%d").to_string().parse::<i32>().unwrap_or(0);
-    let end_date_int = end_timestamp.format("%Y%m%d").to_string().parse::<i32>().unwrap_or(99999999);
+    let start_date_int = start_timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(0);
+    let end_date_int = end_timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(99999999);
 
     debug!(
         "Date range filter: {} to {} (as integers)",
@@ -338,7 +343,11 @@ pub async fn query_predictions_dataframe_from_s3(
         return Err(Error::Other("No positions provided".into()));
     }
 
-    info!("Querying {} S3 files for tickers: {:?}", s3_paths.len(), tickers);
+    info!(
+        "Querying {} S3 files for tickers: {:?}",
+        s3_paths.len(),
+        tickers
+    );
 
     let s3_paths_query = s3_paths
         .iter()
@@ -535,7 +544,9 @@ pub async fn query_portfolio_dataframe_from_s3(
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("action") && err_str.contains("not found") {
-                info!("Action column not found in parquet, using fallback query with default action");
+                info!(
+                    "Action column not found in parquet, using fallback query with default action"
+                );
                 execute_portfolio_query_without_action(&connection, &query_without_action)?
             } else {
                 return Err(e);

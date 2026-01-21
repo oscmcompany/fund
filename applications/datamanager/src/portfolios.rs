@@ -75,11 +75,7 @@ pub async fn get(
         Ok(dataframe) => {
             if dataframe.height() == 0 {
                 warn!("No portfolio data found - this is expected on first run");
-                return (
-                    StatusCode::NOT_FOUND,
-                    "No portfolio data found",
-                )
-                    .into_response();
+                return (StatusCode::NOT_FOUND, "No portfolio data found").into_response();
             }
 
             // Convert DataFrame to JSON array
@@ -91,7 +87,10 @@ pub async fn get(
                 Ok(_) => {
                     let json_bytes = buffer.into_inner();
                     let json_string = String::from_utf8_lossy(&json_bytes).to_string();
-                    info!("Returning portfolio as JSON with {} rows", dataframe.height());
+                    info!(
+                        "Returning portfolio as JSON with {} rows",
+                        dataframe.height()
+                    );
                     (
                         StatusCode::OK,
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -121,10 +120,7 @@ pub async fn get(
                     "No portfolio files in S3 - this is expected on first run: {}",
                     err
                 );
-                return (
-                    StatusCode::NOT_FOUND,
-                    "No portfolio data found - first run",
-                )
+                return (StatusCode::NOT_FOUND, "No portfolio data found - first run")
                     .into_response();
             }
             warn!("Failed to fetch portfolio from S3: {}", err);

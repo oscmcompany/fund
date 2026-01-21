@@ -59,10 +59,7 @@ impl State {
             }
             Err(_) => {
                 let default_url = "https://api.massive.io".to_string();
-                error!(
-                    "MASSIVE_BASE_URL not set, using default: {}",
-                    default_url
-                );
+                error!("MASSIVE_BASE_URL not set, using default: {}", default_url);
                 default_url
             }
         };

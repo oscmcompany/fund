@@ -139,7 +139,10 @@ pub async fn sync(
         .await
     {
         Ok(resp) => {
-            info!("Received response from Massive API, status: {}", resp.status());
+            info!(
+                "Received response from Massive API, status: {}",
+                resp.status()
+            );
             resp
         }
         Err(err) => {
@@ -206,7 +209,12 @@ pub async fn sync(
         }
         None => {
             warn!("No results field found in response");
-            debug!("Response keys: {:?}", json_content.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+            debug!(
+                "Response keys: {:?}",
+                json_content
+                    .as_object()
+                    .map(|o| o.keys().collect::<Vec<_>>())
+            );
             return (
                 StatusCode::NO_CONTENT,
                 "No market data available for this date",
