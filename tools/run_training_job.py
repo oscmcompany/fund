@@ -10,7 +10,7 @@ from sagemaker.session import Session
 logger = structlog.get_logger()
 
 
-def run_training_job(  # noqa: PLR0913
+def run_training_job(
     application_name: str,
     trainer_image_uri: str,
     s3_data_path: str,
