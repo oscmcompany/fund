@@ -17,8 +17,8 @@ def test_filter_equity_bars_above_thresholds() -> None:
 
     result = filter_equity_bars(data)
 
-    assert len(result) == 1
-    assert result["ticker"][0] == "AAPL"
+    assert len(result) == 3  # noqa: PLR2004 all rows for AAPL returned
+    assert result["ticker"].unique().to_list() == ["AAPL"]
 
 
 def test_filter_equity_bars_below_price_threshold() -> None:
@@ -104,8 +104,8 @@ def test_filter_equity_bars_just_above_thresholds() -> None:
 
     result = filter_equity_bars(data)
 
-    assert len(result) == 1
-    assert result["ticker"][0] == "AAPL"
+    assert len(result) == 3  # noqa: PLR2004 all rows for AAPL returned
+    assert result["ticker"].unique().to_list() == ["AAPL"]
 
 
 def test_filter_equity_bars_empty_dataframe() -> None:
@@ -181,8 +181,8 @@ def test_filter_equity_bars_multiple_tickers() -> None:
 
     result = filter_equity_bars(data)
 
-    assert len(result) == 1
-    assert result["ticker"][0] == "AAPL"
+    assert len(result) == 3  # noqa: PLR2004 all 3 AAPL rows returned
+    assert result["ticker"].unique().to_list() == ["AAPL"]
 
 
 def test_filter_equity_bars_data_immutability() -> None:

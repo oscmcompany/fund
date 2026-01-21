@@ -63,7 +63,7 @@ predictions_schema = pa.DataFrameSchema(
             ],
         ),
         "timestamp": pa.Column(
-            dtype=pl.Float64,
+            dtype=pl.Int64,
             checks=[pa.Check.greater_than(0)],
         ),
         "quantile_10": pa.Column(dtype=float),
@@ -72,9 +72,10 @@ predictions_schema = pa.DataFrameSchema(
     },
     coerce=True,
     checks=[
+        # Model outputs 7 days, but server.py filters to 7th day before validation
         pa.Check(
             check_fn=lambda data: check_dates_count_per_ticker(
-                data=data, dates_count=7
+                data=data, dates_count=1
             ),
             name="check_dates_count_per_ticker",
             error="Each ticker must have expected date count",

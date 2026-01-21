@@ -33,6 +33,9 @@
         "pkg-path": "clippy",
         "pkg-group": "rust-toolchain"
       },
+      "direnv": {
+        "pkg-path": "direnv"
+      },
       "duckdb": {
         "pkg-path": "duckdb"
       },
@@ -933,6 +936,7 @@
       "version": "2.31.39",
       "outputs_to_install": [
         "out",
+        "out",
         "out"
       ],
       "outputs": {
@@ -1427,6 +1431,7 @@
       "unfree": false,
       "version": "21.1.2",
       "outputs_to_install": [
+        "out",
         "out"
       ],
       "outputs": {
@@ -1456,12 +1461,129 @@
       "unfree": false,
       "version": "21.1.2",
       "outputs_to_install": [
+        "out",
         "out"
       ],
       "outputs": {
         "out": "/nix/store/fvj17s7clsf2n4rhyq0qqcrqhzybdqrz-clang-wrapper-21.1.2"
       },
       "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "direnv",
+      "broken": false,
+      "derivation": "/nix/store/ki5rrkyibf4qm36qlk4jmqdw9rakwn1h-direnv-2.37.1.drv",
+      "description": "Shell extension that manages your environment",
+      "install_id": "direnv",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "direnv-2.37.1",
+      "pname": "direnv",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T02:54:47.241318Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.37.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/jvqli6w4plrjipvq1zs2k096rmiq5a3j-direnv-2.37.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "direnv",
+      "broken": false,
+      "derivation": "/nix/store/ahw8cxdjagl8lbb5xwiw6s2lf26q8y97-direnv-2.37.1.drv",
+      "description": "Shell extension that manages your environment",
+      "install_id": "direnv",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "direnv-2.37.1",
+      "pname": "direnv",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:04:25.257999Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.37.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/bimg3r15l5y511f0nwsbj05za20h682y-direnv-2.37.1"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "direnv",
+      "broken": false,
+      "derivation": "/nix/store/j3w24a6w894687jl5vbpark6f70rvqqp-direnv-2.37.1.drv",
+      "description": "Shell extension that manages your environment",
+      "install_id": "direnv",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "direnv-2.37.1",
+      "pname": "direnv",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:14:45.368589Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.37.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/likv1z3frckgb92yzj92d8lbc3ahzpq0-direnv-2.37.1"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "direnv",
+      "broken": false,
+      "derivation": "/nix/store/b3gm5x576chyzia8m36fjl117nfp31fq-direnv-2.37.1.drv",
+      "description": "Shell extension that manages your environment",
+      "install_id": "direnv",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "direnv-2.37.1",
+      "pname": "direnv",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:23:59.788149Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "2.37.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/wpj4la1jgf0p8aimfzx49gfr3228vk8f-direnv-2.37.1"
+      },
+      "system": "x86_64-linux",
       "group": "toplevel",
       "priority": 5
     },
@@ -1727,6 +1849,7 @@
       "outputs_to_install": [
         "man",
         "out",
+        "out",
         "out"
       ],
       "outputs": {
@@ -1759,6 +1882,7 @@
       "version": "14.3.0",
       "outputs_to_install": [
         "man",
+        "out",
         "out",
         "out"
       ],
@@ -2023,6 +2147,8 @@
       "unfree": false,
       "version": "109.100.2",
       "outputs_to_install": [
+        "out",
+        "out",
         "out"
       ],
       "outputs": {
@@ -2053,6 +2179,7 @@
       "unfree": false,
       "version": "109.100.2",
       "outputs_to_install": [
+        "out",
         "out"
       ],
       "outputs": {
@@ -2316,6 +2443,7 @@
       "version": "3.6.0",
       "outputs_to_install": [
         "bin",
+        "bin",
         "man"
       ],
       "outputs": {
@@ -2349,6 +2477,7 @@
       "unfree": false,
       "version": "3.6.0",
       "outputs_to_install": [
+        "bin",
         "bin",
         "bin",
         "man"
@@ -2386,6 +2515,7 @@
       "version": "3.6.0",
       "outputs_to_install": [
         "bin",
+        "bin",
         "man"
       ],
       "outputs": {
@@ -2419,6 +2549,8 @@
       "unfree": false,
       "version": "3.6.0",
       "outputs_to_install": [
+        "bin",
+        "bin",
         "bin",
         "bin",
         "bin",

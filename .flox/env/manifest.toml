@@ -39,6 +39,7 @@ clang.systems = ["aarch64-darwin", "x86_64-darwin"]
 duckdb.pkg-path = "duckdb"
 openssl.pkg-path = "openssl"
 pkgconf.pkg-path = "pkgconf"
+direnv.pkg-path = "direnv"
 
 [hook]
 on-activate = '''

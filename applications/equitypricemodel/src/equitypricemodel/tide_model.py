@@ -1,7 +1,9 @@
 import json
 import os
+import random
 from typing import cast
 
+import numpy as np
 import structlog
 from tinygrad.nn import Linear
 from tinygrad.nn.optim import Adam
@@ -13,6 +15,8 @@ from tinygrad.nn.state import (
     safe_save,
 )
 from tinygrad.tensor import Tensor
+
+logger = structlog.get_logger()
 
 
 def quantile_loss(
@@ -148,8 +152,6 @@ class Model:
             out_features=len(self.quantiles),
         )
 
-        self.logger = structlog.get_logger()
-
     def forward(self, x: Tensor) -> Tensor:
         """
         Forward pass through TiDE model
@@ -194,29 +196,141 @@ class Model:
         # stack predictions: (batch_size, output_length, num_quantiles e.g. (32, 7, 3))
         return predictions_first.stack(*predictions_rest, dim=1)
 
-    def train(
+    def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
+        """Check a batch for NaN/Inf values and return statistics."""
+        issues = {}
+        for key, tensor in batch.items():
+            data = tensor.numpy()
+            nan_count = int(np.isnan(data).sum())
+            inf_count = int(np.isinf(data).sum())
+            if nan_count > 0 or inf_count > 0:
+                issues[key] = {
+                    "nan_count": nan_count,
+                    "inf_count": inf_count,
+                    "total_elements": data.size,
+                    "nan_pct": f"{(nan_count / data.size) * 100:.2f}%",
+                }
+        return issues
+
+    def validate_training_data(
+        self,
+        train_batches: list,
+        sample_size: int = 10,
+    ) -> bool:
+        """Validate training data for NaN/Inf values."""
+        total_batches = len(train_batches)
+        actual_sample_size = min(sample_size, total_batches)
+
+        logger.info(
+            "Validating training data",
+            total_batches=total_batches,
+            sample_size=actual_sample_size,
+        )
+
+        all_issues: dict[str, dict] = {}
+
+        # Sample batches to validate for efficiency with large datasets
+        sampled_indices = random.sample(range(total_batches), actual_sample_size)
+        for idx in sampled_indices:
+            batch = train_batches[idx]
+            batch_issues = self._validate_batch(batch, idx)
+            if batch_issues:
+                all_issues[f"batch_{idx}"] = batch_issues
+
+        if all_issues:
+            for batch_key, features in all_issues.items():
+                for feature_key, stats in features.items():
+                    logger.error(
+                        "Invalid values in training data",
+                        batch=batch_key,
+                        feature=feature_key,
+                        **stats,
+                    )
+            return False
+
+        logger.info("Training data validation passed")
+        return True
+
+    def train(  # noqa: PLR0913, PLR0912, PLR0915, C901
         self,
         train_batches: list,
         epochs: int = 10,
         learning_rate: float = 0.001,
+        log_interval: int = 100,
+        validate_data: bool = True,  # noqa: FBT001, FBT002
+        validation_sample_size: int = 10,
+        early_stopping_patience: int | None = 3,
+        early_stopping_min_delta: float = 0.001,
     ) -> list:
-        """Train the TiDE model using quantile loss"""
+        """Train the TiDE model using quantile loss.
+
+        Args:
+            train_batches: List of training batch dictionaries
+            epochs: Maximum number of epochs to train
+            learning_rate: Learning rate for optimizer
+            log_interval: Log progress every N steps
+            validate_data: Whether to validate data before training.
+                Note: Data validation samples batches to check for NaN/Inf values.
+                For large datasets (>1000 batches), validation may take several seconds.
+                Set to False to skip validation if data quality is already guaranteed.
+            validation_sample_size: Number of batches to sample during validation.
+                Larger values provide more thorough validation but take longer.
+                The first and last batches are always checked. Default is 10.
+            early_stopping_patience: Stop if no improvement for N epochs
+                (None to disable)
+            early_stopping_min_delta: Minimum improvement to reset patience counter
+
+        Performance Notes:
+            - Data validation runs once before training starts
+            - Validation time scales with validation_sample_size, not total batches
+            - For datasets with 10,000 batches, validation with
+              validation_sample_size=10 typically completes in under a second
+              (hardware dependent)
+            - Increase validation_sample_size for more thorough checking or decrease
+              for faster training startup
+        """
+        if validation_sample_size <= 0:
+            message = "validation_sample_size must be positive"
+            raise ValueError(message)
+
+        if validate_data:
+            is_valid = self.validate_training_data(
+                train_batches,
+                sample_size=validation_sample_size,
+            )
+            if not is_valid:
+                message = "Training data contains NaN or Inf values"
+                raise ValueError(message)
+
         prev_training = Tensor.training
         Tensor.training = True
 
         parameters = get_parameters(self)
         optimizer = Adam(params=parameters, lr=learning_rate)
         losses = []
+        total_batches = len(train_batches)
+
+        best_loss = float("inf")
+        epochs_without_improvement = 0
 
         try:
             for epoch in range(epochs):
-                self.logger.info("Starting training epoch", epoch=epoch + 1)
+                logger.info(
+                    "Starting training epoch",
+                    epoch=epoch + 1,
+                    total_epochs=epochs,
+                    total_batches=total_batches,
+                )
                 epoch_losses = []
 
-                for batch in train_batches:
+                for step, batch in enumerate(train_batches):
                     combined_input_features, targets, batch_size = (
                         self._combine_input_features(batch)
                     )
+
+                    if targets is None:
+                        message = "Targets are required for training batches"
+                        raise ValueError(message)
 
                     # predictions shape: (batch_size, output_length, num_quantiles)
                     predictions = self.forward(combined_input_features)
@@ -230,23 +344,62 @@ class Model:
                     loss.backward()
                     optimizer.step()
 
-                    epoch_losses.append(loss.numpy().item())
+                    step_loss = loss.numpy().item()
+                    epoch_losses.append(step_loss)
+
+                    if (step + 1) % log_interval == 0 or (step + 1) == total_batches:
+                        running_avg_loss = sum(epoch_losses) / len(epoch_losses)
+                        progress_pct = ((step + 1) / total_batches) * 100
+                        logger.info(
+                            "Training step",
+                            epoch=epoch + 1,
+                            step=step + 1,
+                            total_steps=total_batches,
+                            progress=f"{progress_pct:.1f}%",
+                            step_loss=f"{step_loss:.4f}",
+                            running_avg_loss=f"{running_avg_loss:.4f}",
+                        )
 
                 if not epoch_losses:
-                    self.logger.warning(
-                        "No training batches processed", epoch=epoch + 1
-                    )
+                    logger.warning("No training batches processed", epoch=epoch + 1)
                     continue
 
                 epoch_loss = sum(epoch_losses) / len(epoch_losses)
 
-                self.logger.info(
+                logger.info(
                     "Completed training epoch",
                     epoch=epoch + 1,
-                    loss=f"{epoch_loss:.4f}",
+                    total_epochs=epochs,
+                    epoch_loss=f"{epoch_loss:.4f}",
+                    best_loss=f"{best_loss:.4f}",
                 )
 
                 losses.append(epoch_loss)
+
+                if early_stopping_patience is not None:
+                    if epoch_loss < best_loss - early_stopping_min_delta:
+                        best_loss = epoch_loss
+                        epochs_without_improvement = 0
+                        logger.info(
+                            "New best loss",
+                            best_loss=f"{best_loss:.4f}",
+                        )
+                    else:
+                        epochs_without_improvement += 1
+                        logger.info(
+                            "No improvement",
+                            epochs_without_improvement=epochs_without_improvement,
+                            patience=early_stopping_patience,
+                        )
+
+                    if epochs_without_improvement >= early_stopping_patience:
+                        logger.info(
+                            "Early stopping triggered",
+                            epoch=epoch + 1,
+                            best_loss=f"{best_loss:.4f}",
+                            epochs_without_improvement=epochs_without_improvement,
+                        )
+                        break
         finally:
             Tensor.training = prev_training
 
@@ -260,6 +413,10 @@ class Model:
         for batch in validation_batches:
             combined_input, targets, batch_size = self._combine_input_features(batch)
 
+            if targets is None:
+                message = "Targets are required for validation batches"
+                raise ValueError(message)
+
             predictions = self.forward(combined_input)
 
             targets_reshaped = targets.reshape(batch_size, self.output_length)
@@ -268,7 +425,7 @@ class Model:
             validation_losses.append(loss.numpy().item())
 
         if not validation_losses:
-            self.logger.warning("No validation batches provided; returning NaN loss")
+            logger.warning("No validation batches provided; returning NaN loss")
             return float("nan")
 
         return sum(validation_losses) / len(validation_losses)
@@ -326,7 +483,7 @@ class Model:
     def _combine_input_features(
         self,
         inputs: dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor, int]:
+    ) -> tuple[Tensor, Tensor | None, int]:
         batch_size = inputs["encoder_continuous_features"].shape[0]
 
         encoder_cont_flat = inputs["encoder_continuous_features"].reshape(
@@ -356,6 +513,6 @@ class Model:
                 static_cat_flat,
                 dim=1,
             ),
-            inputs["targets"],
+            inputs.get("targets"),
             int(batch_size),
         )

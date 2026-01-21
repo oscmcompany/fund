@@ -119,7 +119,7 @@ def sync_equity_bars_data(
 
         if current_date <= end_date:
             logger.info("Waiting 15 seconds before next request")
-            time.sleep(15)  # Massive API rate limit
+            time.sleep(15)
 
     logger.info("All dates processed", total_requests=request_count)
 

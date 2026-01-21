@@ -6,9 +6,7 @@ def filter_equity_bars(
     minimum_average_close_price: float = 10.0,
     minimum_average_volume: float = 1_000_000.0,
 ) -> pl.DataFrame:
-    data = data.clone()
-
-    return (
+    valid_tickers = (
         data.group_by("ticker")
         .agg(
             average_close_price=pl.col("close_price").mean(),
@@ -18,5 +16,7 @@ def filter_equity_bars(
             (pl.col("average_close_price") > minimum_average_close_price)
             & (pl.col("average_volume") > minimum_average_volume)
         )
-        .drop(["average_close_price", "average_volume"])
+        .select("ticker")
     )
+
+    return data.join(valid_tickers, on="ticker", how="semi")

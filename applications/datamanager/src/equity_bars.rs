@@ -9,7 +9,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Deserialize)]
 pub struct DailySync {
@@ -27,14 +27,14 @@ pub struct QueryParameters {
 struct BarResult {
     #[serde(rename = "T")]
     ticker: String,
-    c: Option<u64>,
-    h: Option<u64>,
-    l: Option<u64>,
+    c: Option<f64>,
+    h: Option<f64>,
+    l: Option<f64>,
     n: Option<u64>,
-    o: Option<u64>,
+    o: Option<f64>,
     t: u64,
-    v: Option<u64>,
-    vw: Option<u64>,
+    v: Option<f64>,
+    vw: Option<f64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -54,7 +54,10 @@ pub async fn query(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<QueryParameters>,
 ) -> impl IntoResponse {
-    info!("Querying equity data from S3 partitioned files");
+    info!(
+        "Querying equity data from S3 partitioned files, tickers: {:?}, start: {:?}, end: {:?}",
+        parameters.tickers, parameters.start_timestamp, parameters.end_timestamp
+    );
 
     let tickers: Option<Vec<String>> = match &parameters.tickers {
         Some(tickers_str) if !tickers_str.is_empty() => {
@@ -63,12 +66,17 @@ pub async fn query(
                 .map(|s| s.trim().to_uppercase())
                 .collect();
             if vec.is_empty() {
+                debug!("Ticker list was empty after parsing");
                 None
             } else {
+                debug!("Parsed {} tickers: {:?}", vec.len(), vec);
                 Some(vec)
             }
         }
-        _ => None,
+        _ => {
+            debug!("No tickers specified, querying all");
+            None
+        }
     };
 
     match query_equity_bars_parquet_from_s3(
@@ -80,6 +88,10 @@ pub async fn query(
     .await
     {
         Ok(parquet_data) => {
+            info!(
+                "Query successful, returning {} bytes of parquet data",
+                parquet_data.len()
+            );
             let mut response = Response::new(Body::from(parquet_data));
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -95,7 +107,7 @@ pub async fn query(
             response
         }
         Err(err) => {
-            info!("Failed to query S3 data: {}", err);
+            warn!("Failed to query S3 data: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Query failed: {}", err),
@@ -117,17 +129,24 @@ pub async fn sync(
     );
 
     info!("url: {}", url);
+    info!("Sending request to Massive API");
     let response = match state
         .http_client
-        .get(url)
+        .get(&url)
         .header("accept", "application/json")
         .query(&[("adjusted", "true"), ("apiKey", state.massive.key.as_str())])
         .send()
         .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            info!(
+                "Received response from Massive API, status: {}",
+                resp.status()
+            );
+            resp
+        }
         Err(err) => {
-            info!("Failed to send request: {}", err);
+            warn!("Failed to send request to Massive API: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to send API request",
@@ -138,9 +157,12 @@ pub async fn sync(
 
     let text_content = match response.error_for_status() {
         Ok(response) => match response.text().await {
-            Ok(text) => text,
+            Ok(text) => {
+                info!("Received response body, length: {} bytes", text.len());
+                text
+            }
             Err(err) => {
-                info!("Failed to read response text: {}", err);
+                warn!("Failed to read response text: {}", err);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to read API response",
@@ -149,15 +171,21 @@ pub async fn sync(
             }
         },
         Err(err) => {
-            info!("API request failed: {}", err);
+            warn!("API request failed with error status: {}", err);
             return (StatusCode::INTERNAL_SERVER_ERROR, "API request failed").into_response();
         }
     };
 
+    info!("Parsing JSON response");
     let json_content: serde_json::Value = match serde_json::from_str(&text_content) {
-        Ok(value) => value,
+        Ok(value) => {
+            debug!("JSON parsed successfully");
+            value
+        }
         Err(err) => {
-            info!("Failed to parse JSON response: {}", err);
+            warn!("Failed to parse JSON response: {}", err);
+            let truncated: String = text_content.chars().take(500).collect();
+            warn!("Raw response (first 500 chars): {}", truncated);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Invalid JSON response from API",
@@ -166,10 +194,27 @@ pub async fn sync(
         }
     };
 
+    // Log the status field if present
+    if let Some(status) = json_content.get("status") {
+        info!("API response status field: {}", status);
+    }
+    if let Some(results_count) = json_content.get("resultsCount") {
+        info!("API response resultsCount: {}", results_count);
+    }
+
     let results = match json_content.get("results") {
-        Some(results) => results,
+        Some(results) => {
+            info!("Found results field in response");
+            results
+        }
         None => {
-            info!("No results field found in response");
+            warn!("No results field found in response");
+            debug!(
+                "Response keys: {:?}",
+                json_content
+                    .as_object()
+                    .map(|o| o.keys().collect::<Vec<_>>())
+            );
             return (
                 StatusCode::NO_CONTENT,
                 "No market data available for this date",
@@ -178,22 +223,29 @@ pub async fn sync(
         }
     };
 
-    let bars: Vec<BarResult> = match serde_json::from_value(results.clone()) {
-        Ok(bars) => bars,
+    info!("Parsing results into BarResult structs");
+    let bars: Vec<BarResult> = match serde_json::from_value::<Vec<BarResult>>(results.clone()) {
+        Ok(bars) => {
+            info!("Successfully parsed {} bar results", bars.len());
+            bars
+        }
         Err(err) => {
-            info!("Failed to parse results into BarResult structs: {}", err);
+            warn!("Failed to parse results into BarResult structs: {}", err);
+            warn!("Results type: {:?}", results.as_array().map(|a| a.len()));
+            if let Some(first_result) = results.as_array().and_then(|a| a.first()) {
+                warn!("First result sample: {}", first_result);
+            }
             return (StatusCode::BAD_GATEWAY, text_content).into_response();
         }
     };
 
     let tickers: Vec<String> = bars.iter().map(|b| b.ticker.clone()).collect();
-    let volumes: Vec<Option<u64>> = bars.iter().map(|b| b.v).collect();
-    let volume_weighted_average_prices: Vec<Option<f64>> =
-        bars.iter().map(|b| b.vw.map(|vw| vw as f64)).collect();
-    let open_prices: Vec<Option<f64>> = bars.iter().map(|b| b.o.map(|o| o as f64)).collect();
-    let close_prices: Vec<Option<f64>> = bars.iter().map(|b| b.c.map(|c| c as f64)).collect();
-    let high_prices: Vec<Option<f64>> = bars.iter().map(|b| b.h.map(|h| h as f64)).collect();
-    let low_prices: Vec<Option<f64>> = bars.iter().map(|b| b.l.map(|l| l as f64)).collect();
+    let volumes: Vec<Option<f64>> = bars.iter().map(|b| b.v).collect();
+    let volume_weighted_average_prices: Vec<Option<f64>> = bars.iter().map(|b| b.vw).collect();
+    let open_prices: Vec<Option<f64>> = bars.iter().map(|b| b.o).collect();
+    let close_prices: Vec<Option<f64>> = bars.iter().map(|b| b.c).collect();
+    let high_prices: Vec<Option<f64>> = bars.iter().map(|b| b.h).collect();
+    let low_prices: Vec<Option<f64>> = bars.iter().map(|b| b.l).collect();
     let timestamps: Vec<i64> = bars.iter().map(|b| b.t as i64).collect();
     let transactions: Vec<Option<u64>> = bars.iter().map(|b| b.n).collect();
 
@@ -209,6 +261,7 @@ pub async fn sync(
         "transactions" => transactions,
     };
 
+    info!("Creating DataFrame from bar data");
     match bars_data {
         Ok(data) => {
             info!(
@@ -218,6 +271,7 @@ pub async fn sync(
             );
             debug!("DataFrame schema: {:?}", data.schema());
 
+            info!("Uploading DataFrame to S3");
             match write_equity_bars_dataframe_to_s3(&state, &data, &payload.date).await {
                 Ok(s3_key) => {
                     info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
@@ -229,7 +283,7 @@ pub async fn sync(
                     (StatusCode::OK, response_message).into_response()
                 }
                 Err(err) => {
-                    info!("Failed to upload to S3: {}", err);
+                    warn!("Failed to upload to S3: {}", err);
                     let json_output = data.to_string();
                     (
                         StatusCode::BAD_GATEWAY,
@@ -243,7 +297,7 @@ pub async fn sync(
             }
         }
         Err(err) => {
-            info!("Failed to create DataFrame: {}", err);
+            warn!("Failed to create DataFrame: {}", err);
             (StatusCode::INTERNAL_SERVER_ERROR, text_content).into_response()
         }
     }

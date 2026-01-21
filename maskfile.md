@@ -46,7 +46,7 @@ echo "Development environment setup completed successfully"
 
 ## infrastructure
 
-> Manage infrastructure resources 
+> Manage infrastructure resources
 
 ### images
 
@@ -125,7 +125,7 @@ image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/pocketsiz
 echo "Logging into ECR"
 aws ecr get-login-password --region ${aws_region} | docker login \
     --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
 
 echo "Pushing image"
 docker push ${image_reference}:latest
@@ -299,7 +299,7 @@ esac
 
 ## development
 
-> Python development tools and code quality checks
+> Python and Rust development tools and code quality checks
 
 ### rust
 
@@ -360,6 +360,7 @@ cargo clippy
 
 echo "Rust linting completed successfully"
 ```
+
 #### test
 
 > Run Rust tests
@@ -440,7 +441,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    .
+    . vulture_whitelist.py
 
 echo "Dead code check completed"
 ```
@@ -459,6 +460,18 @@ ruff check \
     .
 
 echo "Python linting completed successfully"
+```
+
+#### type-check
+
+> Run Python type checks
+
+```bash
+set -euo pipefail
+
+echo "Running Python type checks"
+
+uvx ty check
 ```
 
 #### test
@@ -490,6 +503,8 @@ mask development python format
 
 mask development python lint
 
+mask development python type-check
+
 mask development python dead-code
 
 mask development python test
@@ -497,18 +512,208 @@ mask development python test
 echo "Python development checks completed successfully"
 ```
 
+## data
+
+> Data management commands
+
+### sync-categories
+
+> Sync equity categories (sector/industry) from Polygon API to S3
+
+```bash
+set -euo pipefail
+
+echo "Syncing equity categories from Polygon API"
+
+cd infrastructure
+export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
+
+cd ../
+
+# Get API key from AWS Secrets Manager
+export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
+    --secret-id pocketsizefund/production/environment_variables \
+    --query 'SecretString' \
+    --output text | jq -r '.MASSIVE_API_KEY')
+
+uv run python tools/sync_equity_categories.py
+
+echo "Categories sync complete"
+```
+
 ## models
 
 > Model management commands
 
-### train (application_name)
+### prepare (application_name)
 
-> Train machine learning model
+> Prepare training data by consolidating equity bars with categories
 
 ```bash
 set -euo pipefail
 
 export APPLICATION_NAME="${application_name}"
+
+cd infrastructure
+export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET="$(pulumi stack output aws_s3_model_artifacts_bucket)"
+export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+
+cd ../
+
+uv run python tools/prepare_training_data.py
+```
+
+### trainer
+
+> Manage trainer Docker images
+
+#### build (application_name)
+
+> Build trainer Docker image
+
+```bash
+set -euo pipefail
+
+echo "Building ${application_name} trainer image"
+
+aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+aws_region=${AWS_REGION}
+if [ -z "$aws_region" ]; then
+    echo "AWS_REGION environment variable is not set"
+    exit 1
+fi
+
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/pocketsizefund/${application_name}-trainer"
+cache_reference="${image_reference}:buildcache"
+
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "Running in GitHub Actions - using hybrid cache (gha + registry)"
+    cache_from_arguments="--cache-from type=gha --cache-from type=registry,ref=${cache_reference}"
+    cache_to_arguments="--cache-to type=gha,mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
+else
+    echo "Running locally - using registry cache only"
+    cache_from_arguments="--cache-from type=registry,ref=${cache_reference}"
+    cache_to_arguments="--cache-to type=registry,ref=${cache_reference},mode=max"
+fi
+
+echo "Setting up Docker Buildx"
+docker buildx create --use --name psf-builder 2>/dev/null || docker buildx use psf-builder || (echo "Using default buildx builder" && docker buildx use default)
+
+echo "Logging into ECR (to pull cache if available)"
+aws ecr get-login-password --region ${aws_region} | docker login \
+    --username AWS \
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR for cache (will build without cache)"
+
+echo "Building with caching (will continue if cache doesn't exist)"
+docker buildx build \
+    --platform linux/amd64 \
+    --target trainer \
+    --file applications/${application_name}/Dockerfile \
+    --tag ${image_reference}:latest \
+    ${cache_from_arguments} \
+    ${cache_to_arguments} \
+    --load \
+    .
+
+echo "Trainer image built: ${application_name}"
+```
+
+#### push (application_name)
+
+> Push trainer Docker image to ECR
+
+```bash
+set -euo pipefail
+
+echo "Pushing ${application_name} trainer image to ECR"
+
+aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+aws_region=${AWS_REGION}
+if [ -z "$aws_region" ]; then
+    echo "AWS_REGION environment variable is not set"
+    exit 1
+fi
+
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/pocketsizefund/${application_name}-trainer"
+
+echo "Logging into ECR"
+aws ecr get-login-password --region ${aws_region} | docker login \
+    --username AWS \
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
+
+echo "Pushing image"
+docker push ${image_reference}:latest
+
+echo "Trainer image pushed: ${application_name}"
+```
+
+### train (application_name) [instance_preset]
+
+> Train model on SageMaker. Presets: testing, standard (default), performance, or custom instance type
+
+```bash
+set -euo pipefail
+
+export APPLICATION_NAME="${application_name}"
+
+preset="${instance_preset:-standard}"
+
+case "$preset" in
+    testing)
+        instance_type="ml.t3.xlarge"
+        echo "================================================"
+        echo "Training with TESTING architecture (CPU)"
+        echo "Instance: ml.t3.xlarge (~\$0.23/hr)"
+        echo "Use for: Quick iteration, debugging"
+        echo "================================================"
+        ;;
+    standard)
+        instance_type="ml.g5.xlarge"
+        echo "================================================"
+        echo "Training with STANDARD architecture (GPU)"
+        echo "Instance: ml.g5.xlarge - 1x A10G (~\$1.41/hr)"
+        echo "Use for: Regular training runs"
+        echo "================================================"
+        ;;
+    performance)
+        instance_type="ml.p3.2xlarge"
+        echo "================================================"
+        echo "Training with PERFORMANCE architecture (GPU)"
+        echo "Instance: ml.p3.2xlarge - 1x V100 (~\$3.82/hr)"
+        echo "Use for: Large datasets, faster training"
+        echo "================================================"
+        ;;
+    ml.*)
+        instance_type="$preset"
+        echo "================================================"
+        echo "Training with CUSTOM architecture"
+        echo "Instance: ${instance_type}"
+        echo "================================================"
+        ;;
+    *)
+        echo "Unknown preset: $preset"
+        echo ""
+        echo "Available presets:"
+        echo "  testing     - ml.t3.xlarge (CPU, ~\$0.23/hr)"
+        echo "  standard    - ml.g5.xlarge (GPU, ~\$1.41/hr) [default]"
+        echo "  performance - ml.p3.2xlarge (GPU, ~\$3.82/hr)"
+        echo ""
+        echo "Or specify a custom instance type: ml.g4dn.xlarge"
+        exit 1
+        ;;
+esac
+
+export SAGEMAKER_INSTANCE_TYPE="${instance_type}"
+
+cd infrastructure
+export AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN="$(pulumi stack output aws_ecr_equitypricemodel_trainer_image)"
+export AWS_IAM_SAGEMAKER_ROLE_ARN="$(pulumi stack output aws_iam_sagemaker_role_arn)"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET="$(pulumi stack output aws_s3_model_artifacts_bucket)"
+export AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET}/artifacts"
+export AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET}/training"
+
+cd ../
 
 uv run python tools/run_training_job.py
 ```
@@ -527,3 +732,76 @@ export APPLICATION_NAME="${application_name}"
 uv run python tools/download_model_artifacts.py
 ```
 
+## mcp
+
+> MCP server management
+
+### setup
+
+> Set up MCP servers for Claude Code
+
+```bash
+set -euo pipefail
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }; }
+
+need claude
+need uvx
+
+: "${AWS_PROFILE:?AWS_PROFILE is not set}"
+: "${AWS_REGION:?AWS_REGION is not set}"
+
+UVX_PATH="$(command -v uvx)"
+
+detect_uvx_exe() {
+  local pkg="$1"
+
+  # AWS Labs MCP servers follow a predictable naming convention:
+  # awslabs.ecs-mcp-server -> awslabs_ecs_mcp_server
+  # awslabs.cloudwatch-mcp-server -> awslabs_cloudwatch_mcp_server
+  local base_name="${pkg%@*}"  # Remove @latest suffix
+  local exe_name="${base_name//./_}"  # Replace . with _
+  exe_name="${exe_name//-/_}"  # Replace - with _
+
+  echo "$exe_name"
+}
+
+remove_if_present() {
+  local name="$1"
+  claude mcp remove "$name" >/dev/null 2>&1 || true
+}
+
+echo "Removing existing MCP entries (ignore errors if not present)..."
+remove_if_present awslabs-ecs-mcp-server
+remove_if_present awslabs-cloudwatch-logs-mcp-server
+remove_if_present awslabs-cloudwatch-mcp-server
+
+ECS_PKG="awslabs.ecs-mcp-server@latest"
+CW_PKG="awslabs.cloudwatch-mcp-server@latest"
+
+echo "Detecting uvx executable for ECS package: $ECS_PKG"
+ECS_EXE="$(detect_uvx_exe "$ECS_PKG")"
+echo "  -> ECS executable: $ECS_EXE"
+
+echo "Detecting uvx executable for CloudWatch package: $CW_PKG"
+CW_EXE="$(detect_uvx_exe "$CW_PKG")"
+echo "  -> CloudWatch executable: $CW_EXE"
+
+echo "Adding ECS MCP server..."
+claude mcp add awslabs-ecs-mcp-server -s project \
+  -e FASTMCP_LOG_LEVEL="${FASTMCP_LOG_LEVEL:-info}" \
+  -e AWS_PROFILE="$AWS_PROFILE" \
+  -e AWS_REGION="$AWS_REGION" \
+  -- "$UVX_PATH" --from "$ECS_PKG" "$ECS_EXE"
+
+echo "Adding CloudWatch MCP server..."
+claude mcp add awslabs-cloudwatch-mcp-server -s project \
+  -e FASTMCP_LOG_LEVEL="${FASTMCP_LOG_LEVEL:-info}" \
+  -e AWS_PROFILE="$AWS_PROFILE" \
+  -e AWS_REGION="$AWS_REGION" \
+  -- "$UVX_PATH" --from "$CW_PKG" "$CW_EXE"
+
+echo
+echo "Done. Current MCP status:"
+claude mcp list
+```

@@ -11,7 +11,7 @@ use duckdb::Connection;
 use polars::prelude::*;
 use serde::Deserialize;
 use std::io::Cursor;
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
@@ -95,19 +95,36 @@ async fn write_dataframe_to_s3(
 }
 
 async fn create_duckdb_connection() -> Result<Connection, Error> {
+    debug!("Opening in-memory DuckDB connection");
     let connection = Connection::open_in_memory()?;
 
+    debug!("Installing and loading httpfs extension");
     connection.execute_batch("INSTALL httpfs; LOAD httpfs;")?;
 
+    debug!("Loading AWS configuration for DuckDB S3 access");
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let provider = config
-        .credentials_provider()
-        .ok_or_else(|| Error::Other("No AWS credentials provider found".into()))?;
+    let provider = config.credentials_provider().ok_or_else(|| {
+        error!("No AWS credentials provider found");
+        Error::Other("No AWS credentials provider found".into())
+    })?;
+
+    debug!("Fetching AWS credentials");
     let credentials = provider.provide_credentials().await?;
+
     let region = config
         .region()
         .map(|r| r.as_ref().to_string())
-        .unwrap_or_else(|| "us-east-1".to_string());
+        .ok_or_else(|| {
+            error!("AWS region not configured");
+            Error::Other("AWS region not configured".into())
+        })?;
+
+    let has_session_token = credentials.session_token().is_some();
+    debug!(
+        "AWS credentials loaded: region={}, has_session_token={}",
+        region, has_session_token
+    );
+
     let session_token = credentials.session_token().unwrap_or_default();
     let s3_config = format!(
         "
@@ -123,8 +140,10 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
         session_token
     );
 
+    debug!("Configuring DuckDB S3 settings");
     connection.execute_batch(&s3_config)?;
 
+    info!("DuckDB connection established with S3 access");
     Ok(connection)
 }
 
@@ -141,65 +160,66 @@ pub async fn query_equity_bars_parquet_from_s3(
         _ => {
             let end_date = chrono::Utc::now();
             let start_date = end_date - chrono::Duration::days(7);
+            info!(
+                "No date range specified, using default: {} to {}",
+                start_date, end_date
+            );
             (start_date, end_date)
         }
     };
 
     info!(
-        "Querying data from {} to {}",
-        start_timestamp, end_timestamp
+        "Querying equity bars from {} to {}, bucket: {}",
+        start_timestamp, end_timestamp, state.bucket_name
     );
 
-    let mut s3_paths = Vec::new();
-    let mut current_timestamp = start_timestamp;
+    // Use glob pattern with hive partitioning to handle missing files gracefully
+    let s3_glob = format!("s3://{}/equity/bars/daily/**/*.parquet", state.bucket_name);
 
-    while current_timestamp <= end_timestamp {
-        let year = current_timestamp.format("%Y");
-        let month = current_timestamp.format("%m");
-        let day = current_timestamp.format("%d");
+    info!("Using S3 glob pattern: {}", s3_glob);
 
-        let s3_path = format!(
-            "s3://{}/equity/bars/daily/year={}/month={}/day={}/data.parquet",
-            state.bucket_name, year, month, day
-        );
-        s3_paths.push(s3_path);
+    // Build date filter for hive partitions
+    let start_date_int = start_timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(0);
+    let end_date_int = end_timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(99999999);
 
-        current_timestamp += chrono::Duration::days(1);
-    }
+    debug!(
+        "Date range filter: {} to {} (as integers)",
+        start_date_int, end_date_int
+    );
 
-    if s3_paths.is_empty() {
-        return Err(Error::Other(
-            "No files to query for the given date range".to_string(),
-        ));
-    }
-
-    info!("Querying {} S3 files", s3_paths.len());
-
-    let s3_paths_str = s3_paths
-        .iter()
-        .map(|path| format!("SELECT * FROM '{}'", path))
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ");
-
+    // Build ticker filter
     let ticker_filter = match &tickers {
         Some(ticker_list) if !ticker_list.is_empty() => {
-            // Validate ticker format to prevent SQL injection
+            debug!("Validating {} tickers for query filter", ticker_list.len());
             for ticker in ticker_list {
                 if !ticker
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
                 {
+                    warn!("Invalid ticker format rejected: {}", ticker);
                     return Err(Error::Other(format!("Invalid ticker format: {}", ticker)));
                 }
             }
+            debug!("Ticker validation passed: {:?}", ticker_list);
             let ticker_values = ticker_list
                 .iter()
                 .map(|t| format!("'{}'", t.replace('\'', "''")))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("WHERE ticker IN ({})", ticker_values)
+            format!("AND ticker IN ({})", ticker_values)
         }
-        _ => String::new(),
+        _ => {
+            debug!("No ticker filter applied, querying all tickers");
+            String::new()
+        }
     };
 
     let query_sql = format!(
@@ -214,16 +234,20 @@ pub async fn query_equity_bars_parquet_from_s3(
             volume,
             volume_weighted_average_price,
             transactions
-        FROM ({})
+        FROM read_parquet('{}', hive_partitioning = true)
+        WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
         {}
         ORDER BY timestamp, ticker
         ",
-        s3_paths_str, ticker_filter
+        s3_glob, start_date_int, end_date_int, ticker_filter
     );
 
     debug!("Executing query SQL: {}", query_sql);
 
+    info!("Preparing DuckDB statement");
     let mut statement = connection.prepare(&query_sql)?;
+
+    info!("Executing query and mapping results");
     let equity_bars: Vec<EquityBar> = statement
         .query_map([], |row| {
             Ok(EquityBar {
@@ -239,8 +263,21 @@ pub async fn query_equity_bars_parquet_from_s3(
             })
         })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Error::Other(format!("Failed to map query results: {}", e)))?;
+        .map_err(|e| {
+            warn!("Failed to map query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
 
+    info!("Query returned {} equity bar records", equity_bars.len());
+
+    if equity_bars.is_empty() {
+        warn!(
+            "No equity bar data found for date range {} to {}",
+            start_timestamp, end_timestamp
+        );
+    }
+
+    debug!("Creating DataFrame from equity bars");
     let equity_bars_dataframe = create_equity_bar_dataframe(equity_bars);
 
     let mut buffer = Vec::new();
@@ -260,26 +297,40 @@ pub async fn query_equity_bars_parquet_from_s3(
 #[derive(Deserialize)]
 pub struct PredictionQuery {
     pub ticker: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: f64, // Unix timestamp as float
 }
 
 pub async fn query_predictions_dataframe_from_s3(
     state: &State,
     predictions_query: Vec<PredictionQuery>,
 ) -> Result<DataFrame, Error> {
+    info!(
+        "Querying predictions for {} ticker/timestamp pairs",
+        predictions_query.len()
+    );
     let connection = create_duckdb_connection().await?;
 
     let mut s3_paths = Vec::new();
     let mut tickers = Vec::new();
 
     for prediction_query in predictions_query.iter() {
-        let year = prediction_query.timestamp.format("%Y");
-        let month = prediction_query.timestamp.format("%m");
-        let day = prediction_query.timestamp.format("%d");
+        let timestamp_seconds = prediction_query.timestamp;
+        let seconds = timestamp_seconds.trunc() as i64;
+        let nanos = ((timestamp_seconds.fract()) * 1_000_000_000_f64).round() as u32;
+        let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos)
+            .ok_or_else(|| Error::Other("Invalid timestamp".into()))?;
+        let year = timestamp.format("%Y");
+        let month = timestamp.format("%m");
+        let day = timestamp.format("%d");
 
         let s3_path = format!(
             "s3://{}/equity/predictions/daily/year={}/month={}/day={}/data.parquet",
             state.bucket_name, year, month, day
+        );
+
+        debug!(
+            "Adding S3 path for ticker {} at {}/{}/{}: {}",
+            prediction_query.ticker, year, month, day, s3_path
         );
 
         s3_paths.push(s3_path);
@@ -288,10 +339,15 @@ pub async fn query_predictions_dataframe_from_s3(
     }
 
     if s3_paths.is_empty() {
+        warn!("No prediction query positions provided");
         return Err(Error::Other("No positions provided".into()));
     }
 
-    info!("Querying {} S3 files", s3_paths.len());
+    info!(
+        "Querying {} S3 files for tickers: {:?}",
+        s3_paths.len(),
+        tickers
+    );
 
     let s3_paths_query = s3_paths
         .iter()
@@ -322,8 +378,10 @@ pub async fn query_predictions_dataframe_from_s3(
 
     debug!("Executing export SQL: {}", query);
 
+    info!("Preparing predictions query statement");
     let mut statement = connection.prepare(&query)?;
 
+    info!("Executing predictions query and mapping results");
     let predictions: Vec<Prediction> = statement
         .query_map([], |row| {
             Ok(Prediction {
@@ -335,9 +393,20 @@ pub async fn query_predictions_dataframe_from_s3(
             })
         })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Error::Other(format!("Failed to map query results: {}", e)))?;
+        .map_err(|e| {
+            warn!("Failed to map predictions query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
 
+    info!("Query returned {} prediction records", predictions.len());
+
+    debug!("Creating predictions DataFrame");
     let predictions_dataframe = create_predictions_dataframe(predictions)?;
+
+    info!(
+        "Predictions DataFrame created with {} rows",
+        predictions_dataframe.height()
+    );
 
     Ok(predictions_dataframe)
 }
@@ -346,9 +415,13 @@ pub async fn query_portfolio_dataframe_from_s3(
     state: &State,
     timestamp: Option<DateTime<Utc>>,
 ) -> Result<DataFrame, Error> {
+    info!(
+        "Querying portfolio data, timestamp filter: {:?}",
+        timestamp.map(|ts| ts.to_string())
+    );
     let connection = create_duckdb_connection().await?;
 
-    let query = match timestamp {
+    let (query_with_action, query_without_action) = match timestamp {
         Some(ts) => {
             let year = ts.format("%Y");
             let month = ts.format("%m");
@@ -362,7 +435,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                 year, month, day
             );
 
-            format!(
+            let with_action = format!(
                 "
                 SELECT
                     ticker,
@@ -374,16 +447,34 @@ pub async fn query_portfolio_dataframe_from_s3(
                 ORDER BY timestamp, ticker
                 ",
                 s3_path
-            )
+            );
+
+            let without_action = format!(
+                "
+                SELECT
+                    ticker,
+                    timestamp,
+                    side,
+                    dollar_amount
+                FROM '{}'
+                ORDER BY timestamp, ticker
+                ",
+                s3_path
+            );
+
+            (with_action, without_action)
         }
         None => {
             let s3_wildcard = format!(
                 "s3://{}/equity/portfolios/daily/**/*.parquet",
                 state.bucket_name
             );
-            info!("Querying most recent portfolio from all files");
+            info!(
+                "Querying most recent portfolio using hive partitioning: {}",
+                s3_wildcard
+            );
 
-            format!(
+            let with_action = format!(
                 "
                 WITH partitioned_data AS (
                     SELECT
@@ -391,10 +482,11 @@ pub async fn query_portfolio_dataframe_from_s3(
                         timestamp,
                         side,
                         dollar_amount,
+                        action,
                         year,
                         month,
                         day
-                    FROM read_parquet('{}', hive_partitioning=1)
+                    FROM read_parquet('{}', hive_partitioning = true)
                 ),
                 max_date AS (
                     SELECT MAX(year::int * 10000 + month::int * 100 + day::int) as date_int
@@ -411,30 +503,122 @@ pub async fn query_portfolio_dataframe_from_s3(
                 ORDER BY timestamp, ticker
                 ",
                 s3_wildcard
-            )
+            );
+
+            let without_action = format!(
+                "
+                WITH partitioned_data AS (
+                    SELECT
+                        ticker,
+                        timestamp,
+                        side,
+                        dollar_amount,
+                        year,
+                        month,
+                        day
+                    FROM read_parquet('{}', hive_partitioning = true)
+                ),
+                max_date AS (
+                    SELECT MAX(year::int * 10000 + month::int * 100 + day::int) as date_int
+                    FROM partitioned_data
+                )
+                SELECT
+                    ticker,
+                    timestamp,
+                    side,
+                    dollar_amount
+                FROM partitioned_data
+                WHERE (year::int * 10000 + month::int * 100 + day::int) = (SELECT date_int FROM max_date)
+                ORDER BY timestamp, ticker
+                ",
+                s3_wildcard
+            );
+
+            (with_action, without_action)
         }
     };
 
-    debug!("Executing query SQL: {}", query);
+    // Try query with action column first, fall back to query without if column doesn't exist
+    let portfolios = match execute_portfolio_query_with_action(&connection, &query_with_action) {
+        Ok(portfolios) => portfolios,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("action") && err_str.contains("not found") {
+                info!(
+                    "Action column not found in parquet, using fallback query with default action"
+                );
+                execute_portfolio_query_without_action(&connection, &query_without_action)?
+            } else {
+                return Err(e);
+            }
+        }
+    };
 
-    let mut statement = connection.prepare(&query)?;
+    info!("Query returned {} portfolio records", portfolios.len());
+
+    debug!("Creating portfolio DataFrame");
+    let portfolio_dataframe = create_portfolio_dataframe(portfolios)?;
+
+    info!(
+        "Portfolio DataFrame created with {} rows",
+        portfolio_dataframe.height()
+    );
+
+    Ok(portfolio_dataframe)
+}
+
+fn execute_portfolio_query_with_action(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<Portfolio>, Error> {
+    debug!("Executing query with action column: {}", query);
+
+    let mut statement = connection.prepare(query)?;
 
     let portfolios: Vec<Portfolio> = statement
         .query_map([], |row| {
             Ok(Portfolio {
                 ticker: row.get::<_, String>(0)?,
-                timestamp: row.get::<_, i64>(1)?,
+                timestamp: row.get::<_, f64>(1)?,
                 side: row.get::<_, String>(2)?,
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Error::Other(format!("Failed to map query results: {}", e)))?;
+        .map_err(|e| {
+            warn!("Failed to map portfolio query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
 
-    let portfolio_dataframe = create_portfolio_dataframe(portfolios)?;
+    Ok(portfolios)
+}
 
-    Ok(portfolio_dataframe)
+fn execute_portfolio_query_without_action(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<Portfolio>, Error> {
+    debug!("Executing query without action column: {}", query);
+
+    let mut statement = connection.prepare(query)?;
+
+    let portfolios: Vec<Portfolio> = statement
+        .query_map([], |row| {
+            Ok(Portfolio {
+                ticker: row.get::<_, String>(0)?,
+                timestamp: row.get::<_, f64>(1)?,
+                side: row.get::<_, String>(2)?,
+                dollar_amount: row.get::<_, f64>(3)?,
+                action: "UNSPECIFIED".to_string(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            warn!("Failed to map portfolio query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
+
+    Ok(portfolios)
 }
 
 pub async fn read_equity_details_dataframe_from_s3(state: &State) -> Result<DataFrame, Error> {

@@ -122,6 +122,14 @@ unresolved-import = "ignore"
 invalid-return-type = "error"
 invalid-argument-type = "error"
 unresolved-reference = "error"
+missing-argument = "ignore"
+
+[[tool.ty.overrides]]
+# Pulumi infrastructure has complex generics that type checkers struggle with
+include = ["infrastructure/**"]
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+missing-argument = "ignore"
 
 [tool.pyright]
 reportMissingImports = "none"

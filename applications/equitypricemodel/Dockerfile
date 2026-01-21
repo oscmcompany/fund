@@ -12,17 +12,27 @@ COPY libraries/python/ libraries/python/
 
 RUN uv sync --no-dev 
 
-FROM python:3.12.10-slim AS trainer
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS trainer
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential clang && \
-    rm -rf /var/lib/apt/lists/* 
+    apt-get install -y --no-install-recommends \
+    software-properties-common && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3.12-dev \
+    build-essential clang curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python
 
-ENV CPU=1
+ENV CUDA=1
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 COPY --from=builder /app /app
 
@@ -43,16 +53,6 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
 COPY --from=builder /app /app
-
-# pre-downloaded model artifacts for image building
-
-COPY applications/equitypricemodel/src/equitypricemodel/tide_states.safetensor /app/tide_states.safetensor
-
-COPY applications/equitypricemodel/src/equitypricemodel/tide_parameters.json /app/tide_parameters.json
-
-COPY applications/equitypricemodel/src/equitypricemodel/tide_data_mappings.json /app/tide_data_mappings.json
-
-COPY applications/equitypricemodel/src/equitypricemodel/tide_data_scaler.json /app/tide_data_scaler.json
 
 EXPOSE 8080
 

@@ -5,7 +5,10 @@ from datetime import date, datetime, timedelta
 import numpy as np
 import pandera.polars as pa
 import polars as pl
+import structlog
 from tinygrad.tensor import Tensor
+
+logger = structlog.get_logger()
 
 
 class Scaler:
@@ -182,16 +185,53 @@ class Data:
         data = data.filter(pl.col("ticker") != "UNKNOWN")
 
         data = data.filter(
-            pl.col("daily_return").is_not_null() & pl.col("daily_return").is_not_nan()
+            pl.col("daily_return").is_not_null()
+            & pl.col("daily_return").is_not_nan()
+            & pl.col("daily_return").is_finite()
         )
 
         data = data.unique(subset=["ticker", "timestamp"])
 
-        data = data_schema.validate(data)
+        for col in self.continuous_columns:
+            nan_count = data.filter(pl.col(col).is_nan()).height
+            null_count = data.filter(pl.col(col).is_null()).height
+            inf_count = data.filter(~pl.col(col).is_finite()).height
+            if nan_count > 0 or null_count > 0 or inf_count > 0:
+                logger.warning(
+                    "Invalid values in continuous column before scaling",
+                    column=col,
+                    nan_count=nan_count,
+                    null_count=null_count,
+                    inf_count=inf_count,
+                )
+                # Filter out rows with invalid values to prevent downstream errors
+                data = data.filter(
+                    pl.col(col).is_not_nan()
+                    & pl.col(col).is_not_null()
+                    & pl.col(col).is_finite()
+                )
+
+        data_validated = data_schema.validate(data)
+        data = (
+            data_validated.collect()
+            if isinstance(data_validated, pl.LazyFrame)
+            else data_validated
+        )
 
         self.scaler = Scaler()
 
         self.scaler.fit(data[self.continuous_columns])
+
+        for col in self.continuous_columns:
+            mean_val = self.scaler.means[col].item()
+            std_val = self.scaler.standard_deviations[col].item()
+            if np.isnan(mean_val) or np.isnan(std_val):
+                logger.error(
+                    "Scaler has NaN values",
+                    column=col,
+                    mean=mean_val,
+                    std=std_val,
+                )
 
         data = data.with_columns(  # scale continuous columns
             *[
@@ -200,6 +240,16 @@ class Data:
                 for col in self.continuous_columns
             ]
         )
+
+        for col in self.continuous_columns:
+            nan_count = data.filter(pl.col(col).is_nan()).height
+            if nan_count > 0:
+                logger.error(
+                    "NaN values after scaling",
+                    column=col,
+                    nan_count=nan_count,
+                    total_rows=data.height,
+                )
 
         mapping_columns = [
             "ticker",
@@ -316,40 +366,74 @@ class Data:
 
         # collect all samples first
         samples = []
-        for ticker in self.batch_data["ticker"].unique():
-            ticker_data = self.batch_data.filter(pl.col("ticker") == ticker).sort(
-                "time_idx"
+        has_targets = data_type in {"train", "validate"}
+
+        # Partition by ticker once upfront (much faster than filtering per ticker)
+        logger.info("partitioning_data_by_ticker")
+        ticker_groups = self.batch_data.sort("time_idx").partition_by(
+            "ticker", as_dict=True
+        )
+        total_tickers = len(ticker_groups)
+        logger.info("batch_creation_started", total_tickers=total_tickers)
+
+        for idx, ticker_df in enumerate(ticker_groups.values()):
+            if idx % 25 == 0:
+                logger.info(
+                    "batch_progress", ticker_idx=idx, total_tickers=total_tickers
+                )
+
+            # Convert to numpy once per ticker (avoid repeated DataFrame operations)
+            # Use float32 for GPU compatibility (Metal doesn't support float64)
+            cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
+            cont_array = (
+                ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+            )
+            static_array = (
+                ticker_df[self.static_categorical_columns]
+                .head(1)
+                .to_numpy()
+                .astype(np.int32)
+            )
+            target_array = (
+                ticker_df[["daily_return"]].to_numpy().astype(np.float32)
+                if has_targets
+                else None
             )
 
-            for i in range(len(ticker_data) - input_length - output_length + 1):
-                encoder_slice = ticker_data[i : i + input_length]
-                decoder_slice = ticker_data[
-                    i + input_length : i + input_length + output_length
-                ]
+            num_rows = len(ticker_df)
+            num_windows = num_rows - input_length - output_length + 1
 
-                static_data = ticker_data[self.static_categorical_columns].head(1)
+            if num_windows <= 0:
+                continue
 
+            # For prediction, only use the last window (most recent data)
+            # For training/validation, use all windows
+            window_indices = (
+                [num_windows - 1] if data_type == "predict" else range(num_windows)
+            )
+
+            # Use numpy slicing (much faster than DataFrame slicing)
+            for i in window_indices:
                 sample = {
-                    "encoder_categorical": encoder_slice[
-                        self.categorical_columns
-                    ].to_numpy(writable=True),
-                    "encoder_continuous": encoder_slice[
-                        self.continuous_columns
-                    ].to_numpy(writable=True),
-                    "decoder_categorical": decoder_slice[
-                        self.categorical_columns
-                    ].to_numpy(writable=True),
-                    "static_categorical": static_data.to_numpy(writable=True),
+                    "encoder_categorical": cat_array[i : i + input_length].copy(),
+                    "encoder_continuous": cont_array[i : i + input_length].copy(),
+                    "decoder_categorical": cat_array[
+                        i + input_length : i + input_length + output_length
+                    ].copy(),
+                    "static_categorical": static_array.copy(),
                 }
 
-                if data_type in {"train", "validate"}:
-                    sample["targets"] = decoder_slice[["daily_return"]].to_numpy(
-                        writable=True
-                    )
+                if has_targets and target_array is not None:
+                    sample["targets"] = target_array[
+                        i + input_length : i + input_length + output_length
+                    ].copy()
 
                 samples.append(sample)
 
+        logger.info("sample_collection_complete", total_samples=len(samples))
+
         # now batch the samples
+        logger.info("batching_samples", batch_size=batch_size)
         batches = []
         for i in range(0, len(samples), batch_size):
             batch_samples = samples[i : i + batch_size]
@@ -376,6 +460,7 @@ class Data:
 
             batches.append(batch)
 
+        logger.info("batch_creation_complete", total_batches=len(batches))
         return batches
 
     def save(self, directory_path: str) -> None:
@@ -436,7 +521,7 @@ class Data:
     ) -> pl.DataFrame:
         predictions_array = predictions.numpy()
 
-        batch_size, output_length, _, _ = predictions_array.shape
+        batch_size, output_length, _num_quantiles = predictions_array.shape
 
         ticker_reverse_mapping = {v: k for k, v in self.mappings["ticker"].items()}
 
@@ -459,12 +544,12 @@ class Data:
                     .timestamp()
                 )
 
-                quantile_values = predictions_array[batch_idx, time_idx, 0, :]
+                quantile_values = predictions_array[batch_idx, time_idx, :]
 
-                daily_return_mean = self.scaler.means["daily_return"]
+                daily_return_mean = self.scaler.means["daily_return"].item()
                 daily_return_standard_deviation = self.scaler.standard_deviations[
                     "daily_return"
-                ]
+                ].item()
 
                 unscaled_quantiles = (
                     quantile_values * daily_return_standard_deviation

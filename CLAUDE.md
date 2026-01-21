@@ -26,6 +26,9 @@
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
 - When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
+- Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
+- When debugging or fixing bugs, check Sentry errors, ECS logs, and Alpaca account status to understand what happened
+- After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
 - `tools/` folder contains development utilities and scripts
 - `applications/` folder contains deployable services and training workflows
 - `libraries/` folder contains shared code resources

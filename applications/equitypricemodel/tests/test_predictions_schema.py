@@ -11,18 +11,16 @@ def test_predictions_schema_valid_data() -> None:
 
     valid_data = pl.DataFrame(
         {
-            "ticker": ["AAPL"] * 7,
-            "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(7)
-            ],
-            "quantile_10": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0],
-            "quantile_50": [150.0, 151.0, 152.0, 153.0, 154.0, 155.0, 156.0],
-            "quantile_90": [200.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0],
+            "ticker": ["AAPL"],
+            "timestamp": [base_date.timestamp()],
+            "quantile_10": [100.0],
+            "quantile_50": [150.0],
+            "quantile_90": [200.0],
         }
     )
 
     validated_df = predictions_schema.validate(valid_data)
-    assert validated_df.shape == (7, 5)
+    assert validated_df.shape == (1, 5)
 
 
 def test_predictions_schema_ticker_lowercase_fails() -> None:
@@ -30,13 +28,11 @@ def test_predictions_schema_ticker_lowercase_fails() -> None:
 
     data = pl.DataFrame(
         {
-            "ticker": ["aapl"] * 7,  # lowercase should fail
-            "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(7)
-            ],
-            "quantile_10": [100.0] * 7,
-            "quantile_50": [150.0] * 7,
-            "quantile_90": [200.0] * 7,
+            "ticker": ["aapl"],  # lowercase should fail
+            "timestamp": [base_date.timestamp()],
+            "quantile_10": [100.0],
+            "quantile_50": [150.0],
+            "quantile_90": [200.0],
         }
     )
 
@@ -45,21 +41,15 @@ def test_predictions_schema_ticker_lowercase_fails() -> None:
 
 
 def test_predictions_schema_negative_timestamp_fails() -> None:
-    base_date = datetime(2024, 1, 1, tzinfo=UTC)
-
     data = pl.DataFrame(
         {
-            "ticker": ["AAPL"] * 7,
-            "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(7)
-            ],
-            "quantile_10": [100.0] * 7,
-            "quantile_50": [150.0] * 7,
-            "quantile_90": [200.0] * 7,
+            "ticker": ["AAPL"],
+            "timestamp": [-1.0],  # negative timestamp should fail
+            "quantile_10": [100.0],
+            "quantile_50": [150.0],
+            "quantile_90": [200.0],
         }
     )
-
-    data[1, "timestamp"] = -1.0  # introduce a negative timestamp
 
     with pytest.raises(SchemaError):
         predictions_schema.validate(data)
@@ -70,12 +60,11 @@ def test_predictions_schema_duplicate_ticker_timestamp_fails() -> None:
 
     data = pl.DataFrame(
         {
-            "ticker": ["AAPL"] * 8,  # 8 rows but duplicate timestamp
-            "timestamp": [(base_date + timedelta(days=i)).timestamp() for i in range(7)]
-            + [(base_date + timedelta(days=0)).timestamp()],  # duplicate timestamp
-            "quantile_10": [100.0] * 8,
-            "quantile_50": [150.0] * 8,
-            "quantile_90": [200.0] * 8,
+            "ticker": ["AAPL", "AAPL"],  # duplicate ticker + timestamp
+            "timestamp": [base_date.timestamp(), base_date.timestamp()],
+            "quantile_10": [100.0, 100.0],
+            "quantile_50": [150.0, 150.0],
+            "quantile_90": [200.0, 200.0],
         }
     )
 
@@ -88,17 +77,16 @@ def test_predictions_schema_multiple_tickers_same_dates() -> None:
 
     valid_data = pl.DataFrame(
         {
-            "ticker": (["AAPL"] * 7) + (["GOOGL"] * 7),
-            "timestamp": [(base_date + timedelta(days=i)).timestamp() for i in range(7)]
-            * 2,  # same timestamps for both tickers
-            "quantile_10": [100.0] * 14,
-            "quantile_50": [150.0] * 14,
-            "quantile_90": [200.0] * 14,
+            "ticker": ["AAPL", "GOOGL"],
+            "timestamp": [base_date.timestamp(), base_date.timestamp()],
+            "quantile_10": [100.0, 100.0],
+            "quantile_50": [150.0, 150.0],
+            "quantile_90": [200.0, 200.0],
         }
     )
 
     validated_df = predictions_schema.validate(valid_data)
-    assert validated_df.shape == (14, 5)
+    assert validated_df.shape == (2, 5)
 
 
 def test_predictions_schema_multiple_tickers_different_dates_fails() -> None:
@@ -106,13 +94,14 @@ def test_predictions_schema_multiple_tickers_different_dates_fails() -> None:
 
     data = pl.DataFrame(
         {
-            "ticker": (["AAPL"] * 7) + (["GOOGL"] * 7),
+            "ticker": ["AAPL", "GOOGL"],
             "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(14)
+                base_date.timestamp(),
+                (base_date + timedelta(days=1)).timestamp(),  # different date
             ],
-            "quantile_10": [100.0] * 14,
-            "quantile_50": [150.0] * 14,
-            "quantile_90": [200.0] * 14,
+            "quantile_10": [100.0, 100.0],
+            "quantile_50": [150.0, 150.0],
+            "quantile_90": [200.0, 200.0],
         }
     )
 
@@ -127,19 +116,18 @@ def test_predictions_schema_wrong_date_count_per_ticker_fails() -> None:
 
     data = pl.DataFrame(
         {
-            "ticker": ["AAPL"] * 5,  # only 5 dates instead of 7
+            "ticker": ["AAPL"] * 2,  # 2 dates instead of 1
             "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(5)
+                base_date.timestamp(),
+                (base_date + timedelta(days=1)).timestamp(),
             ],
-            "quantile_10": [100.0] * 5,
-            "quantile_50": [150.0] * 5,
-            "quantile_90": [200.0] * 5,
+            "quantile_10": [100.0, 100.0],
+            "quantile_50": [150.0, 150.0],
+            "quantile_90": [200.0, 200.0],
         }
     )
 
-    with pytest.raises(
-        SchemaError, match="Each ticker must have exactly 7 unique dates"
-    ):
+    with pytest.raises(SchemaError, match="Each ticker must have exactly"):
         predictions_schema.validate(data)
 
 
@@ -148,15 +136,13 @@ def test_predictions_schema_float_quantile_values() -> None:
 
     valid_data = pl.DataFrame(
         {
-            "ticker": ["AAPL"] * 7,
-            "timestamp": [
-                (base_date + timedelta(days=i)).timestamp() for i in range(7)
-            ],
-            "quantile_10": [100.5, 101.7, 102.3, 103.8, 104.2, 105.9, 106.1],
-            "quantile_50": [150.1, 151.4, 152.6, 153.2, 154.8, 155.3, 156.7],
-            "quantile_90": [200.9, 201.2, 202.5, 203.7, 204.4, 205.6, 206.8],
+            "ticker": ["AAPL"],
+            "timestamp": [base_date.timestamp()],
+            "quantile_10": [100.5],
+            "quantile_50": [150.1],
+            "quantile_90": [200.9],
         }
     )
 
     validated_df = predictions_schema.validate(valid_data)
-    assert validated_df.shape == (7, 5)
+    assert validated_df.shape == (1, 5)
