@@ -10,7 +10,7 @@ import polars as pl
 import requests
 import sentry_sdk
 import structlog
-from fastapi import FastAPI, Response, status
+from fastapi import BackgroundTasks, FastAPI, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from sentry_sdk.integrations.logging import LoggingIntegration
 
@@ -100,8 +100,30 @@ def health_check() -> Response:
 
 
 @application.post("/portfolio")
-async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+async def create_portfolio(background_tasks: BackgroundTasks) -> Response:
+    """Queue a portfolio rebalance task and return immediately.
+
+    Returns 202 Accepted to indicate the rebalance has been queued.
+    Errors during the background task are logged to Sentry.
+    """
     current_timestamp = datetime.now(tz=UTC)
+    logger.info(
+        "Queueing portfolio rebalance",
+        timestamp=current_timestamp.isoformat(),
+    )
+
+    background_tasks.add_task(run_portfolio_rebalance, current_timestamp)
+
+    return Response(status_code=status.HTTP_202_ACCEPTED)
+
+
+async def run_portfolio_rebalance(  # noqa: PLR0912, PLR0915, C901
+    current_timestamp: datetime,
+) -> None:
+    """Execute the portfolio rebalance in the background.
+
+    Errors are logged via structlog which sends to Sentry.
+    """
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
     try:
@@ -113,21 +135,21 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         )
     except Exception as e:
         logger.exception("Failed to retrieve account", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return
 
     try:
         current_predictions = await get_current_predictions()
         logger.info("Retrieved predictions", count=len(current_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return
 
     try:
         prior_portfolio = get_prior_portfolio(current_timestamp=current_timestamp)
         logger.info("Retrieved prior portfolio", count=len(prior_portfolio))
     except Exception as e:
         logger.exception("Failed to retrieve prior portfolio", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return
 
     try:
         optimal_portfolio = get_optimal_portfolio(
@@ -145,13 +167,10 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             predictions_count=len(current_predictions),
             prior_portfolio_count=len(prior_portfolio),
         )
-        return Response(
-            status_code=status.HTTP_204_NO_CONTENT,
-            headers={"X-Portfolio-Status": "insufficient-predictions"},
-        )
+        return
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return
 
     try:
         open_positions, close_positions = get_positions(
@@ -168,7 +187,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             "Failed to determine positions to open and close",
             error=str(e),
         )
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return
 
     close_results = []
     for close_position in close_positions:
@@ -347,14 +366,10 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         failed_trades=len(failed_trades),
     )
 
-    if failed_trades:
-        return Response(status_code=status.HTTP_207_MULTI_STATUS)
-
-    return Response(status_code=status.HTTP_200_OK)
-
 
 async def get_current_predictions() -> pl.DataFrame:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    # Predictions can take several minutes due to ML model inference
+    async with httpx.AsyncClient(timeout=300.0) as client:
         current_predictions_response = await client.post(
             url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
         )
