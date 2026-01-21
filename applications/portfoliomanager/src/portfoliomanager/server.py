@@ -173,17 +173,31 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     close_results = []
     for close_position in close_positions:
         try:
-            alpaca_client.close_position(
+            was_closed = alpaca_client.close_position(
                 ticker=close_position["ticker"],
             )
-            logger.info("Closed position", ticker=close_position["ticker"])
-            close_results.append(
-                {
-                    "ticker": close_position["ticker"],
-                    "action": "close",
-                    "status": "success",
-                }
-            )
+            if was_closed:
+                logger.info("Closed position", ticker=close_position["ticker"])
+                close_results.append(
+                    {
+                        "ticker": close_position["ticker"],
+                        "action": "close",
+                        "status": "success",
+                    }
+                )
+            else:
+                logger.info(
+                    "Position already closed or did not exist",
+                    ticker=close_position["ticker"],
+                )
+                close_results.append(
+                    {
+                        "ticker": close_position["ticker"],
+                        "action": "close",
+                        "status": "skipped",
+                        "reason": "position_not_found",
+                    }
+                )
         except Exception as e:
             logger.exception(
                 "Failed to close position",

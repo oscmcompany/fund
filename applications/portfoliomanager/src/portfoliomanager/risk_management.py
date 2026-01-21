@@ -83,6 +83,15 @@ def add_portfolio_performance_columns(
     prior_predictions = prior_predictions.clone()
     prior_equity_bars = prior_equity_bars.clone()
 
+    # Ensure timestamp columns have matching types for joins and comparisons
+    prior_portfolio = prior_portfolio.with_columns(pl.col("timestamp").cast(pl.Float64))
+    prior_predictions = prior_predictions.with_columns(
+        pl.col("timestamp").cast(pl.Float64)
+    )
+    prior_equity_bars = prior_equity_bars.with_columns(
+        pl.col("timestamp").cast(pl.Float64)
+    )
+
     prior_portfolio_predictions = prior_portfolio.join(
         other=prior_predictions,
         on=["ticker", "timestamp"],

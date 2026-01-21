@@ -160,12 +160,30 @@ class AlpacaClient:
     def close_position(
         self,
         ticker: str,
-    ) -> None:
-        self.trading_client.close_position(
-            symbol_or_asset_id=ticker.upper(),
-            close_options=ClosePositionRequest(
-                percentage="100",
-            ),
-        )
+    ) -> bool:
+        """Close a position for the given ticker.
 
-        time.sleep(self.rate_limit_sleep)
+        Returns True if position was closed, False if position didn't exist.
+        """
+        try:
+            self.trading_client.close_position(
+                symbol_or_asset_id=ticker.upper(),
+                close_options=ClosePositionRequest(
+                    percentage="100",
+                ),
+            )
+            time.sleep(self.rate_limit_sleep)
+        except APIError as e:
+            error_str = str(e).lower()
+            position_not_found = (
+                "position not found" in error_str
+                or "position does not exist" in error_str
+            )
+            if position_not_found:
+                logger.info(
+                    "Position already closed or does not exist",
+                    ticker=ticker,
+                )
+                return False
+            raise
+        return True
