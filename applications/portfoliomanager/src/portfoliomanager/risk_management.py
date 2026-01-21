@@ -282,6 +282,24 @@ def create_optimal_portfolio(
         ~pl.col("ticker").is_in(excluded_tickers)
     )
 
+    # Log IQR statistics to help diagnose filtering issues
+    if current_predictions.height > 0:
+        iqr_stats = current_predictions.select(
+            pl.col("inter_quartile_range").min().alias("iqr_min"),
+            pl.col("inter_quartile_range").max().alias("iqr_max"),
+            pl.col("inter_quartile_range").mean().alias("iqr_mean"),
+            pl.col("inter_quartile_range").median().alias("iqr_median"),
+        ).row(0, named=True)
+
+        logger.info(
+            "Prediction IQR statistics",
+            iqr_min=iqr_stats["iqr_min"],
+            iqr_max=iqr_stats["iqr_max"],
+            iqr_mean=iqr_stats["iqr_mean"],
+            iqr_median=iqr_stats["iqr_median"],
+            threshold=UNCERTAINTY_THRESHOLD,
+        )
+
     logger.info(
         "Available predictions after filtering",
         available_count=available_predictions.height,
