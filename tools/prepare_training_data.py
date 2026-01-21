@@ -262,8 +262,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Type narrowing assertions for type checker
-    assert data_bucket is not None  # noqa: S101
-    assert model_artifacts_bucket is not None  # noqa: S101
+    assert data_bucket is not None
+    assert model_artifacts_bucket is not None
 
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)
