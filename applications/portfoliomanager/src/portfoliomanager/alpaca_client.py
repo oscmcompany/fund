@@ -160,12 +160,46 @@ class AlpacaClient:
     def close_position(
         self,
         ticker: str,
-    ) -> None:
-        self.trading_client.close_position(
-            symbol_or_asset_id=ticker.upper(),
-            close_options=ClosePositionRequest(
-                percentage="100",
-            ),
-        )
+    ) -> bool:
+        """Close a position for the given ticker.
 
-        time.sleep(self.rate_limit_sleep)
+        Returns True if position was closed, False if position didn't exist.
+        """
+        try:
+            self.trading_client.close_position(
+                symbol_or_asset_id=ticker.upper(),
+                close_options=ClosePositionRequest(
+                    percentage="100",
+                ),
+            )
+            time.sleep(self.rate_limit_sleep)
+        except APIError as e:
+            # Prefer structured information from the Alpaca API when available,
+            # and fall back to matching documented error message fragments for
+            # backwards compatibility.
+            status_code = getattr(e, "status_code", None)
+            error_code = getattr(e, "code", None)
+            error_message = getattr(e, "message", None)
+            error_str = (
+                str(error_message) if error_message is not None else str(e)
+            ).lower()
+
+            # Known Alpaca behaviours when closing a non-existent position:
+            # - HTTP 404 Not Found
+            # - Specific error_code values (e.g. "position_not_found")
+            # - Error messages containing "position not found"
+            http_not_found = 404
+            position_not_found = (
+                status_code == http_not_found
+                or error_code in {"position_not_found"}
+                or "position not found" in error_str
+                or "position does not exist" in error_str
+            )
+            if position_not_found:
+                logger.info(
+                    "Position already closed or does not exist",
+                    ticker=ticker,
+                )
+                return False
+            raise
+        return True

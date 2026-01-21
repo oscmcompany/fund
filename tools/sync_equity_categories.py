@@ -73,6 +73,9 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
     rows = []
     for ticker_data in tickers:
         ticker = ticker_data.get("ticker", "")
+        # Skip entries with empty or missing ticker values
+        if not ticker:
+            continue
         # Filter for Common Stock and all ADR types
         if ticker_data.get("type") not in EQUITY_TYPES:
             continue
