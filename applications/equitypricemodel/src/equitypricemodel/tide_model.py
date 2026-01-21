@@ -1,5 +1,6 @@
 import json
 import os
+import random
 from typing import cast
 
 import numpy as np
@@ -217,16 +218,21 @@ class Model:
         sample_size: int = 10,
     ) -> bool:
         """Validate training data for NaN/Inf values."""
+        total_batches = len(train_batches)
+        actual_sample_size = min(sample_size, total_batches)
+
         logger.info(
             "Validating training data",
-            total_batches=len(train_batches),
-            sample_size=sample_size,
+            total_batches=total_batches,
+            sample_size=actual_sample_size,
         )
 
         all_issues: dict[str, dict] = {}
 
-        # Check all batches to ensure NaN/Inf values are detected anywhere
-        for idx, batch in enumerate(train_batches):
+        # Sample batches to validate for efficiency with large datasets
+        sampled_indices = random.sample(range(total_batches), actual_sample_size)
+        for idx in sampled_indices:
+            batch = train_batches[idx]
             batch_issues = self._validate_batch(batch, idx)
             if batch_issues:
                 all_issues[f"batch_{idx}"] = batch_issues
