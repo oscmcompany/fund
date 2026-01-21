@@ -82,6 +82,24 @@ train_batches = tide_data.get_batches(
 
 logger.info("training_batches_created", batch_count=len(train_batches))
 
+if not train_batches:
+    logger.error(
+        "No training batches created",
+        validation_split=configuration["validation_split"],
+        input_length=configuration["input_length"],
+        output_length=configuration["output_length"],
+        batch_size=configuration["batch_size"],
+        training_data_rows=training_data.height,
+    )
+    message = (
+        "No training batches created - check input data and configuration. "
+        f"Training data has {training_data.height} rows, "
+        f"input_length={configuration['input_length']}, "
+        f"output_length={configuration['output_length']}, "
+        f"batch_size={configuration['batch_size']}"
+    )
+    raise ValueError(message)
+
 sample_batch = train_batches[0]
 
 batch_size = sample_batch["encoder_continuous_features"].shape[0]
