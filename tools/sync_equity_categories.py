@@ -6,10 +6,12 @@ a categories CSV to S3 for use in training data preparation.
 The CSV contains: ticker, sector, industry
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import boto3
 import polars as pl
@@ -100,7 +102,7 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
 
 
 def upload_categories_to_s3(
-    s3_client: "S3Client",
+    s3_client: S3Client,
     bucket_name: str,
     categories: pl.DataFrame,
 ) -> str:
@@ -155,14 +157,10 @@ if __name__ == "__main__":
         logger.error("AWS_S3_DATA_BUCKET environment variable not set")
         sys.exit(1)
 
-    # Type narrowing assertions for type checker
-    assert api_key is not None
-    assert bucket_name is not None
-
     try:
         output_uri = sync_equity_categories(
-            api_key=api_key,
-            bucket_name=bucket_name,
+            api_key=cast("str", api_key),
+            bucket_name=cast("str", bucket_name),
         )
         logger.info("Sync complete", output_uri=output_uri)
 

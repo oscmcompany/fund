@@ -10,7 +10,7 @@ from sagemaker.session import Session
 logger = structlog.get_logger()
 
 
-def run_training_job(
+def run_training_job(  # noqa: PLR0913
     application_name: str,
     trainer_image_uri: str,
     s3_data_path: str,
@@ -68,7 +68,12 @@ if __name__ == "__main__":
     s3_data_path = os.getenv("AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH", "")
     iam_sagemaker_role_arn = os.getenv("AWS_IAM_SAGEMAKER_ROLE_ARN", "")
     s3_artifact_path = os.getenv("AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH", "")
-    instance_type = os.getenv("SAGEMAKER_INSTANCE_TYPE", "ml.g5.xlarge")
+    instance_type_raw = os.getenv("SAGEMAKER_INSTANCE_TYPE")
+    instance_type = (
+        instance_type_raw.strip()
+        if instance_type_raw and instance_type_raw.strip()
+        else "ml.g5.xlarge"
+    )
 
     environment_variables = {
         "APPLICATION_NAME": application_name,

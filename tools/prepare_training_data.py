@@ -12,7 +12,7 @@ import io
 import os
 import sys
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import boto3
 import polars as pl
@@ -253,25 +253,21 @@ if __name__ == "__main__":
     model_artifacts_bucket: str | None = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET")
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
 
-    if data_bucket is None or model_artifacts_bucket is None:
-        logger.error(
-            "Missing required environment variables",
-            AWS_S3_DATA_BUCKET=data_bucket,
-            AWS_S3_MODEL_ARTIFACTS_BUCKET=model_artifacts_bucket,
-        )
+    if data_bucket is None:
+        logger.error("AWS_S3_DATA_BUCKET environment variable not set")
         sys.exit(1)
 
-    # Type narrowing assertions for type checker
-    assert data_bucket is not None
-    assert model_artifacts_bucket is not None
+    if model_artifacts_bucket is None:
+        logger.error("AWS_S3_MODEL_ARTIFACTS_BUCKET environment variable not set")
+        sys.exit(1)
 
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)
 
     try:
         output_uri = prepare_training_data(
-            data_bucket_name=data_bucket,
-            model_artifacts_bucket_name=model_artifacts_bucket,
+            data_bucket_name=cast("str", data_bucket),
+            model_artifacts_bucket_name=cast("str", model_artifacts_bucket),
             start_date=start_date,
             end_date=end_date,
         )

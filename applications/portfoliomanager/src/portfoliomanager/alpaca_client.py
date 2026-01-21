@@ -69,38 +69,47 @@ class AlpacaClient:
         """
         request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
         quotes = self.data_client.get_stock_latest_quote(request)
-        quote = quotes[ticker.upper()]
+        quote = quotes.get(ticker.upper())
+
+        if quote is None:
+            message = f"No quote returned for {ticker}"
+            raise ValueError(message)
+
+        ask_price = (
+            float(quote.ask_price)
+            if quote.ask_price is not None and quote.ask_price > 0
+            else 0.0
+        )
+        bid_price = (
+            float(quote.bid_price)
+            if quote.bid_price is not None and quote.bid_price > 0
+            else 0.0
+        )
 
         if side == TradeSide.BUY:
-            primary_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
-            fallback_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
-
-            if primary_price > 0:
-                return primary_price
-            if fallback_price > 0:
+            if ask_price > 0:
+                return ask_price
+            if bid_price > 0:
                 logger.warning(
                     "Ask price unavailable, using bid price as fallback",
                     ticker=ticker,
                     side=side.value,
-                    bid_price=fallback_price,
+                    bid_price=bid_price,
                 )
-                return fallback_price
+                return bid_price
             message = f"No valid price for {ticker}: ask and bid are 0"
             raise ValueError(message)
 
-        primary_price = float(quote.bid_price) if quote.bid_price > 0 else 0.0
-        fallback_price = float(quote.ask_price) if quote.ask_price > 0 else 0.0
-
-        if primary_price > 0:
-            return primary_price
-        if fallback_price > 0:
+        if bid_price > 0:
+            return bid_price
+        if ask_price > 0:
             logger.warning(
                 "Bid price unavailable, using ask price as fallback",
                 ticker=ticker,
                 side=side.value,
-                ask_price=fallback_price,
+                ask_price=ask_price,
             )
-            return fallback_price
+            return ask_price
         message = f"No valid price for {ticker}: bid and ask are 0"
         raise ValueError(message)
 
