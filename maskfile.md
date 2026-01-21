@@ -472,6 +472,7 @@ set -euo pipefail
 echo "Running Python type checks"
 
 uvx ty check
+```
 
 #### test
 
