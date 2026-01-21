@@ -83,7 +83,11 @@ def add_portfolio_performance_columns(
     prior_predictions = prior_predictions.clone()
     prior_equity_bars = prior_equity_bars.clone()
 
-    # Ensure timestamp columns have matching types for joins and comparisons
+    # Ensure timestamp columns have matching types for joins and comparisons.
+    # Timestamps may arrive as i64 (from JSON integer serialization) or f64 (from
+    # Python float conversion). Unconditional casting to Float64 is simpler and
+    # more robust than checking dtypes, and the performance cost is negligible.
+    # This fixes PYTHON-FASTAPI-1E where mismatched types caused join failures.
     prior_portfolio = prior_portfolio.with_columns(pl.col("timestamp").cast(pl.Float64))
     prior_predictions = prior_predictions.with_columns(
         pl.col("timestamp").cast(pl.Float64)

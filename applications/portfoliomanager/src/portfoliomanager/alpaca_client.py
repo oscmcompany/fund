@@ -174,9 +174,25 @@ class AlpacaClient:
             )
             time.sleep(self.rate_limit_sleep)
         except APIError as e:
-            error_str = str(e).lower()
+            # Prefer structured information from the Alpaca API when available,
+            # and fall back to matching documented error message fragments for
+            # backwards compatibility.
+            status_code = getattr(e, "status_code", None)
+            error_code = getattr(e, "code", None)
+            error_message = getattr(e, "message", None)
+            error_str = (
+                str(error_message) if error_message is not None else str(e)
+            ).lower()
+
+            # Known Alpaca behaviours when closing a non-existent position:
+            # - HTTP 404 Not Found
+            # - Specific error_code values (e.g. "position_not_found")
+            # - Error messages containing "position not found"
+            http_not_found = 404
             position_not_found = (
-                "position not found" in error_str
+                status_code == http_not_found
+                or error_code in {"position_not_found"}
+                or "position not found" in error_str
                 or "position does not exist" in error_str
             )
             if position_not_found:
