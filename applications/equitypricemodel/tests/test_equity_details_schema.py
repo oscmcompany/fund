@@ -7,18 +7,20 @@ from pandera.errors import SchemaError
 def test_equity_details_schema_valid_data() -> None:
     valid_data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TECHNOLOGY"],
             "industry": ["SOFTWARE"],
         }
     )
 
     validated_df = equity_details_schema.validate(valid_data)
-    assert validated_df.shape == (1, 2)
+    assert validated_df.shape == (1, 3)
 
 
 def test_equity_details_schema_sector_lowercase_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["technology"],
             "industry": ["SOFTWARE"],
         }
@@ -31,6 +33,7 @@ def test_equity_details_schema_sector_lowercase_fails() -> None:
 def test_equity_details_schema_industry_lowercase_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TECHNOLOGY"],
             "industry": ["software"],
         }
@@ -43,6 +46,7 @@ def test_equity_details_schema_industry_lowercase_fails() -> None:
 def test_equity_details_schema_both_fields_uppercase_passes() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["JNJ"],
             "sector": ["HEALTHCARE"],
             "industry": ["PHARMACEUTICALS"],
         }
@@ -56,6 +60,7 @@ def test_equity_details_schema_both_fields_uppercase_passes() -> None:
 def test_equity_details_schema_whitespace_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["  TECHNOLOGY  "],
             "industry": ["SOFTWARE"],
         }
@@ -68,6 +73,7 @@ def test_equity_details_schema_whitespace_fails() -> None:
 def test_equity_details_schema_industry_whitespace_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TECHNOLOGY"],
             "industry": ["  SOFTWARE  "],
         }
@@ -80,6 +86,7 @@ def test_equity_details_schema_industry_whitespace_fails() -> None:
 def test_equity_details_schema_no_whitespace_passes() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["JNJ"],
             "sector": ["HEALTHCARE"],
             "industry": ["PHARMACEUTICALS"],
         }
@@ -93,6 +100,7 @@ def test_equity_details_schema_no_whitespace_passes() -> None:
 def test_equity_details_schema_null_sector() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": [None],
             "industry": ["SOFTWARE"],
         }
@@ -106,6 +114,7 @@ def test_equity_details_schema_null_sector() -> None:
 def test_equity_details_schema_null_industry() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TECHNOLOGY"],
             "industry": [None],
         }
@@ -119,6 +128,7 @@ def test_equity_details_schema_null_industry() -> None:
 def test_equity_details_schema_missing_sector_column() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "industry": ["SOFTWARE"],
         }
     )
@@ -130,6 +140,7 @@ def test_equity_details_schema_missing_sector_column() -> None:
 def test_equity_details_schema_missing_industry_column() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TECHNOLOGY"],
         }
     )
@@ -141,6 +152,7 @@ def test_equity_details_schema_missing_industry_column() -> None:
 def test_equity_details_schema_type_coercion() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": [123],  # coerced to string
             "industry": [456],  # coerced to string
         }
@@ -156,13 +168,14 @@ def test_equity_details_schema_type_coercion() -> None:
 def test_equity_details_schema_multiple_rows() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL", "JNJ", "JPM"],
             "sector": ["TECHNOLOGY", "HEALTHCARE", "FINANCE"],
             "industry": ["SOFTWARE", "PHARMACEUTICALS", "BANKING"],
         }
     )
 
     validated_df = equity_details_schema.validate(data)
-    assert validated_df.shape == (3, 2)
+    assert validated_df.shape == (3, 3)
     assert validated_df["sector"].to_list() == ["TECHNOLOGY", "HEALTHCARE", "FINANCE"]
     assert validated_df["industry"].to_list() == [
         "SOFTWARE",
@@ -174,6 +187,7 @@ def test_equity_details_schema_multiple_rows() -> None:
 def test_equity_details_schema_mixed_case_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["TeChnOlOgY"],
             "industry": ["SOFTWARE"],
         }
@@ -186,6 +200,7 @@ def test_equity_details_schema_mixed_case_fails() -> None:
 def test_equity_details_schema_empty_string() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": [""],
             "industry": ["SOFTWARE"],
         }
@@ -198,6 +213,7 @@ def test_equity_details_schema_empty_string() -> None:
 def test_equity_details_schema_whitespace_only_fails() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL"],
             "sector": ["   "],
             "industry": ["SOFTWARE"],
         }
@@ -211,6 +227,7 @@ def test_equity_details_schema_whitespace_only_fails() -> None:
 def test_equity_details_schema_special_characters() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["BRK.A"],
             "sector": ["REAL-ESTATE"],
             "industry": ["RETAIL & WHOLESALE"],
         }

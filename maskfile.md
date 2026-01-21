@@ -441,7 +441,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    .
+    . vulture_whitelist.py
 
 echo "Dead code check completed"
 ```

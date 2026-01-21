@@ -505,6 +505,9 @@ def test_create_optimal_portfolio_fresh_start_no_existing_positions() -> None:
     predictions = pl.DataFrame(
         {
             "ticker": [f"STOCK{i}" for i in range(25)],
+            "quantile_10": [0.0] * 25,
+            "quantile_50": [0.1] * 25,
+            "quantile_90": [0.2] * 25,
             "composite_score": list(range(25, 0, -1)),  # descending scores
             "inter_quartile_range": [0.1] * 25,  # low uncertainty
         }
@@ -537,6 +540,9 @@ def test_create_optimal_portfolio_some_maintained_positions() -> None:
     predictions = pl.DataFrame(
         {
             "ticker": [f"STOCK{i}" for i in range(25)],
+            "quantile_10": [0.0] * 25,
+            "quantile_50": [0.1] * 25,
+            "quantile_90": [0.2] * 25,
             "composite_score": list(range(25, 0, -1)),
             "inter_quartile_range": [0.1] * 25,
         }
@@ -570,6 +576,9 @@ def test_create_optimal_portfolio_high_uncertainty_exclusions() -> None:
     predictions = pl.DataFrame(
         {
             "ticker": ["HIGH_UNCERT", "LOW_UNCERT1", "LOW_UNCERT2"],
+            "quantile_10": [0.0, 0.0, 0.0],
+            "quantile_50": [0.1, 0.1, 0.1],
+            "quantile_90": [0.2, 0.2, 0.2],
             "composite_score": [10.0, 5.0, 1.0],
             "inter_quartile_range": [0.8, 0.1, 0.1],  # first one too uncertain
         }
@@ -597,6 +606,9 @@ def test_create_optimal_portfolio_all_positions_maintained_no_new_needed() -> No
     predictions = pl.DataFrame(
         {
             "ticker": [f"STOCK{i}" for i in range(25)],
+            "quantile_10": [0.0] * 25,
+            "quantile_50": [0.1] * 25,
+            "quantile_90": [0.2] * 25,
             "composite_score": list(range(25, 0, -1)),
             "inter_quartile_range": [0.1] * 25,
         }
@@ -625,6 +637,9 @@ def test_create_optimal_portfolio_capital_rebalancing_with_closed_positions() ->
     predictions = pl.DataFrame(
         {
             "ticker": [f"NEW{i}" for i in range(15)],
+            "quantile_10": [0.0] * 15,
+            "quantile_50": [0.1] * 15,
+            "quantile_90": [0.2] * 15,
             "composite_score": list(range(15, 0, -1)),
             "inter_quartile_range": [0.1] * 15,
         }
@@ -677,8 +692,12 @@ def test_create_optimal_portfolio_mixed_closed_and_maintained_positions() -> Non
     predictions = pl.DataFrame(
         {
             "ticker": [f"STOCK{i:02d}" for i in range(30)],
+            "quantile_10": [0.0] * 30,
+            "quantile_50": [0.05] * 30,
+            "quantile_90": [0.1] * 30,
             "composite_score": list(range(30, 0, -1)),
-            "inter_quartile_range": [0.2] * 30,  # all acceptable uncertainty
+            "inter_quartile_range": [0.05]
+            * 30,  # all acceptable uncertainty (below 0.1 threshold)
         }
     )
 
