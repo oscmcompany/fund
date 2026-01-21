@@ -21,6 +21,3 @@ data/
 **/*.json
 notes.md
 etc/
-
-# Claude Code local settings (contains user-specific permissions)
-.claude/settings.local.json
