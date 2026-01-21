@@ -156,8 +156,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Type narrowing assertions for type checker
-    assert api_key is not None  # noqa: S101
-    assert bucket_name is not None  # noqa: S101
+    assert api_key is not None
+    assert bucket_name is not None
 
     try:
         output_uri = sync_equity_categories(
