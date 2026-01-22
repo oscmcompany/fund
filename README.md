@@ -1,14 +1,12 @@
-# pocketsizefund
+# fund 
 
-> Open source capital management  
+> The open source capital management company  
 
-[![Python code checks](https://github.com/pocketsizefund/pocketsizefund/actions/workflows/run_python_code_checks.yaml/badge.svg)](https://github.com/pocketsizefund/pocketsizefund/actions/workflows/run_python_code_checks.yaml) [![Rust code checks](https://github.com/pocketsizefund/pocketsizefund/actions/workflows/run_rust_code_checks.yaml/badge.svg)](https://github.com/pocketsizefund/pocketsizefund/actions/workflows/run_rust_code_checks.yaml)  
+[![Python code checks](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml) [![Rust code checks](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml)  
 
 ## About
 
-**Pocket Size Fund** is an open source quantitative hedge fund.  
-
-This repository holds the resources for the fund platform.
+The **fund** repository holds the resources for the Open Source Capital Management platform.
 
 The project is actively a work-in-progress.  
 
@@ -41,4 +39,4 @@ An unordered and non-exhaustive list we work towards:
 
 ### Links
 
-Check out [our tasks](https://github.com/orgs/pocketsizefund/projects/11) to see what we're working on or ping [either](https://x.com/forstmeier) of [us](https://x.com/hyperpriorai) for anything else.  
+Check out [our tasks](https://github.com/orgs/oscmcompany/projects/1) to see what we're working on or ping [either](https://x.com/forstmeier) of [us](https://x.com/hyperpriorai) for anything else.  
