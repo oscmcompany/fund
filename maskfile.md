@@ -54,12 +54,12 @@ echo "Development environment setup completed successfully"
 
 #### build (application_name) (stage_name)
 
-> Build application Docker images with optional cache pull
+> Build Docker images with optional cache pull
 
 ```bash
 set -euo pipefail
 
-echo "Building application image"
+echo "Building image"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
 aws_region=${AWS_REGION}
@@ -101,17 +101,17 @@ docker buildx build \
     --load \
     .
 
-echo "Application image built: ${application_name} ${stage_name}"
+echo "Image built: ${application_name} ${stage_name}"
 ```
 
 #### push (application_name) (stage_name)
 
-> Push application Docker image to ECR
+> Push Docker image to ECR
 
 ```bash
 set -euo pipefail
 
-echo "Pushing application image to ECR"
+echo "Pushing image to ECR"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
 aws_region=${AWS_REGION}
@@ -130,7 +130,7 @@ aws ecr get-login-password --region ${aws_region} | docker login \
 echo "Pushing image"
 docker push ${image_reference}:latest
 
-echo "Application image pushed: ${application_name} ${stage_name}"
+echo "Image pushed: ${application_name} ${stage_name}"
 ```
 
 ### stack
@@ -441,7 +441,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    . vulture_whitelist.py
+    . tools/vulture_whitelist.py
 
 echo "Dead code check completed"
 ```
@@ -516,29 +516,40 @@ echo "Python development checks completed successfully"
 
 > Data management commands
 
-### sync-categories
+### sync
 
-> Sync equity categories (sector/industry) from Polygon API to S3
+> Update data in cloud storage
+
+#### equity (data_type)
+
+> Sync equity data to S3
 
 ```bash
 set -euo pipefail
 
-echo "Syncing equity categories from Polygon API"
+echo "Syncing equity data: ${data_type}"
 
 cd infrastructure
 export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
 
 cd ../
 
-# Get API key from AWS Secrets Manager
-export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
-    --secret-id pocketsizefund/production/environment_variables \
-    --query 'SecretString' \
-    --output text | jq -r '.MASSIVE_API_KEY')
+if [ "${data_type}" = "categories" ]; then
+    echo "Syncing equity categories"
 
-uv run python tools/sync_equity_categories.py
+    export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
+        --secret-id pocketsizefund/production/environment_variables \
+        --query 'SecretString' \
+        --output text | jq -r '.MASSIVE_API_KEY')
 
-echo "Categories sync complete"
+    uv run python tools/sync_equity_categories.py
+else
+    echo "Unknown data type: ${data_type}"
+    echo "Valid options: categories"
+    exit 1
+fi
+
+echo "Equity data sync complete"
 ```
 
 ## models
@@ -562,90 +573,6 @@ export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 cd ../
 
 uv run python tools/prepare_training_data.py
-```
-
-### trainer
-
-> Manage trainer Docker images
-
-#### build (application_name)
-
-> Build trainer Docker image
-
-```bash
-set -euo pipefail
-
-echo "Building ${application_name} trainer image"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region=${AWS_REGION}
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
-fi
-
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/pocketsizefund/${application_name}-trainer"
-cache_reference="${image_reference}:buildcache"
-
-if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "Running in GitHub Actions - using hybrid cache (gha + registry)"
-    cache_from_arguments="--cache-from type=gha --cache-from type=registry,ref=${cache_reference}"
-    cache_to_arguments="--cache-to type=gha,mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
-else
-    echo "Running locally - using registry cache only"
-    cache_from_arguments="--cache-from type=registry,ref=${cache_reference}"
-    cache_to_arguments="--cache-to type=registry,ref=${cache_reference},mode=max"
-fi
-
-echo "Setting up Docker Buildx"
-docker buildx create --use --name psf-builder 2>/dev/null || docker buildx use psf-builder || (echo "Using default buildx builder" && docker buildx use default)
-
-echo "Logging into ECR (to pull cache if available)"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR for cache (will build without cache)"
-
-echo "Building with caching (will continue if cache doesn't exist)"
-docker buildx build \
-    --platform linux/amd64 \
-    --target trainer \
-    --file applications/${application_name}/Dockerfile \
-    --tag ${image_reference}:latest \
-    ${cache_from_arguments} \
-    ${cache_to_arguments} \
-    --load \
-    .
-
-echo "Trainer image built: ${application_name}"
-```
-
-#### push (application_name)
-
-> Push trainer Docker image to ECR
-
-```bash
-set -euo pipefail
-
-echo "Pushing ${application_name} trainer image to ECR"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region=${AWS_REGION}
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
-fi
-
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/pocketsizefund/${application_name}-trainer"
-
-echo "Logging into ECR"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
-
-echo "Pushing image"
-docker push ${image_reference}:latest
-
-echo "Trainer image pushed: ${application_name}"
 ```
 
 ### train (application_name) [instance_preset]
@@ -720,9 +647,11 @@ uv run python tools/run_training_job.py
 
 ### artifacts
 
+> Manage model artifacts
+
 #### download (application_name)
 
-> Manage model artifacts
+> Download model artifacts
 
 ```bash
 set -euo pipefail
