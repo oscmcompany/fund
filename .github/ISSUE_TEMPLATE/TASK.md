@@ -1,9 +1,9 @@
 ---
-name: Feature
-about: Create a feature request
+name: Task 
+about: Create a task item 
 title: ''
 projects: ["oscmcompany/1"]
-type: feature
+type: task 
 ---
 
 # Overview
@@ -11,13 +11,12 @@ type: feature
 ## Context 
 
 <!-- 
-Provide additional information on the proposal.
+Provide additional information on the work.
 Include examples, links, and other relevant details.
 -->
 
 ## Changes 
 
 <!-- 
-Provide bullet point summary.
+Provide a bullet point summary.
 -->
-

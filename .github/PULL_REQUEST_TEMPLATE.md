@@ -7,9 +7,8 @@ Provide bullet point details.
 Include "- fixes <#issue_number>" to link to an outstanding issue.
 -->
 
-## Comments
+## Context 
 
 <!-- 
 Provide additional information as needed.
-Delete header if it isn't used.
 -->

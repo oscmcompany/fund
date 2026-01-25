@@ -2,17 +2,22 @@
 name: Bug
 about: Create a bug report
 title: ''
-labels: ["bug"]
-projects: ["pocketsizefund/11"]
-
+projects: ["oscmcompany/1"]
+type: bug
 ---
 
 # Overview
 
-## Description
+## Context 
 
-<!-- Write a few sentences for context of what is happening versus the expected behavior. -->
+<!--
+Provide context on received versus expected behavior.
+Include bullet points on steps to reproduce if applicable.
+-->
 
-## Specifics
+## Changes 
 
-<!-- Provide bullet point details and steps to reproduce. -->
+<!--
+Provide solution(s) or recommendation(s).
+-->
+
