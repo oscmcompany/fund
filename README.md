@@ -35,6 +35,7 @@ An unordered and non-exhaustive list we work towards:
 > Systems over process  
 > No code is good code  
 > Never write documentation  
+> Be explicit  
 > Git is truth  
 
 ### Links
