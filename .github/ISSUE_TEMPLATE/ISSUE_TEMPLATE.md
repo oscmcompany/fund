@@ -1,13 +1,12 @@
 ---
-name: Issue 
-about: Create an issue 
+name: Issue
+about: Create an issue
 title: ''
 projects: ["oscmcompany/1"]
 ---
-
 # Overview
 
-## Context 
+## Context
 
 <!--
 For bugs, provide additional information on the problem.
@@ -16,7 +15,7 @@ For tasks, provide additional information on the work.
 Apply relevant labels currently available on the repository.
 -->
 
-## Changes 
+## Changes
 
 <!--
 Provide solution(s) or recommendation(s) as bullet points.
