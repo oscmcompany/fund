@@ -13,7 +13,7 @@
 - AWS is the target cloud provider
 - Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
 - Python servers primarily use [FastAPI](https://fastapi.tiangolo.com/)
-- Use `mask development python all` for comprehensive Python checks 
+- Use `mask development python all` for comprehensive Python checks
 - Use `mask development rust all` for comprehensive Rust checks
 - Add in-line code comments only where necessary for clarity
 - Use full word variables in code whenever possible
@@ -27,7 +27,8 @@
 - Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
 - Write `pytest` functions for Python tests
-- Ensure Rust and Python test coverage are both at least 90%
+- Ensure Rust and Python automated test suites achieve at least 90% line or statement coverage per service or library
+- Exclude generated code, third‑party code, tooling boilerplate, and anything explicitly excluded in this repository from test coverage calculations
 - Check that DataFrame definitions in both Python and Rust match expected schemas defined in `pandera` resources
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
 - When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
