@@ -12,7 +12,7 @@ The project is actively a work-in-progress.
 
 ## Project
 
-Below are resources for the project and repository.  
+Below are resources for the project and repository.
 
 ### Setup
 
