@@ -1005,8 +1005,10 @@ CHECKBOX UPDATE:
 - Update checkboxes BEFORE exiting to preserve progress
 
 GIT:
-- Commit frequently with meaningful messages
-- Pre-commit hooks will run all tests and linting
+- ALWAYS attempt git commit after implementing a requirement
+- The commit triggers pre-commit hooks which verify the change
+- If commit fails, fix the issues and retry
+- If commit succeeds, the requirement is verified - check it off
 
 IMPORTANT:
 - Start with planning before any code changes
@@ -1274,6 +1276,7 @@ IMPORTANT:
 
 report=$(claude \
     --print \
+    --dangerously-skip-permissions \
     --system-prompt "${system_prompt}" \
     "Analyze this issue backlog and generate a report:
 
@@ -1531,7 +1534,7 @@ result=$(claude \
     --system-prompt "${system_prompt}" \
     "Implement the suggestions in the plan. Output results JSON when done.")
 
-results_json=$(echo "$result" | sed -n 's/.*<results>\(.*\)<\/results>.*/\1/p' | tr -d '\n')
+results_json=$(echo "$result" | awk '/<results>/,/<\/results>/' | sed '1s/.*<results>//; $s/<\/results>.*//' | tr -d '\n')
 
 if [ -z "$results_json" ]; then
     echo "Warning: Could not parse results from Claude output"
