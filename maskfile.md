@@ -875,6 +875,12 @@ echo "Starting Ralph loop for issue #${issue_number}"
 
 echo "Running pre-flight checks"
 
+if ! command -v jq &> /dev/null; then
+    echo "jq is required"
+    exit 1
+fi
+echo "  jq available"
+
 if [ -n "$(git status --porcelain)" ]; then
     echo "Error: Working directory has uncommitted changes"
     echo "Commit or stash changes before running ralph loop"
@@ -942,6 +948,23 @@ git checkout -b "${branch_name}"
 
 echo "Updating labels: removing 'ready', adding 'in-progress'"
 gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress"
+
+cleanup_on_error() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo ""
+        echo "Error: Script failed unexpectedly (exit code: $exit_code)"
+        gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention" 2>/dev/null || true
+        gh issue comment "${issue_number}" --body "## Ralph Loop Error
+
+The loop exited unexpectedly with code $exit_code.
+
+**Branch:** \`${branch_name}\`
+
+Check the terminal output for details. The branch may have partial progress." 2>/dev/null || true
+    fi
+}
+trap cleanup_on_error EXIT
 
 system_prompt="You are executing an autonomous development loop for GitHub issue #${issue_number}.
 
@@ -1053,6 +1076,7 @@ EOF
 
         echo "Pull request created: ${pr_url}"
         echo "Issue will auto-close on merge"
+        trap - EXIT
         exit 0
     fi
 
@@ -1113,6 +1137,7 @@ gh issue comment "${issue_number}" --body "$failure_comment"
 
 echo "Failure comment posted to issue #${issue_number}"
 echo "Label changed to 'needs-attention'"
+trap - EXIT
 exit 1
 ```
 
@@ -1132,6 +1157,11 @@ fi
 
 if ! command -v claude &> /dev/null; then
     echo "Claude CLI is required"
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "jq is required"
     exit 1
 fi
 
