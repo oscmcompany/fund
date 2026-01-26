@@ -1189,3 +1189,259 @@ echo ""
 echo "Backlog review complete"
 echo "Report posted to: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/issues/${existing_issue}"
 ```
+
+### pr
+
+> Process PR review feedback interactively
+
+**OPTIONS**
+* pr_number
+    * flags: --pr
+    * type: string
+    * desc: PR number (auto-detects from branch if not provided)
+
+```bash
+set -euo pipefail
+
+echo "Starting Ralph PR review"
+
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI (gh) is required"
+    exit 1
+fi
+
+if ! command -v claude &> /dev/null; then
+    echo "Claude CLI is required"
+    exit 1
+fi
+
+if ! command -v jq &> /dev/null; then
+    echo "jq is required"
+    exit 1
+fi
+
+if ! gh auth status &> /dev/null; then
+    echo "GitHub CLI not authenticated"
+    echo "Run: gh auth login"
+    exit 1
+fi
+
+if [ -n "${pr_number:-}" ]; then
+    pr_num="$pr_number"
+    echo "Using PR #${pr_num}"
+else
+    echo "Auto-detecting PR from current branch"
+    pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
+    if [ -z "$pr_num" ]; then
+        echo "Error: No PR found for current branch"
+        echo "Use --pr <number> to specify a PR"
+        exit 1
+    fi
+    echo "Found PR #${pr_num}"
+fi
+
+repo_info=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+owner=$(echo "$repo_info" | cut -d'/' -f1)
+repo=$(echo "$repo_info" | cut -d'/' -f2)
+
+echo "Fetching review comments"
+
+review_threads=$(gh api graphql -f query='
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          path
+          line
+          comments(first: 10) {
+            nodes {
+              id
+              body
+              author { login }
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}' -f owner="$owner" -f repo="$repo" -F pr="$pr_num")
+
+unresolved_threads=$(echo "$review_threads" | jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]')
+thread_count=$(echo "$unresolved_threads" | jq 'length')
+
+if [ "$thread_count" -eq 0 ]; then
+    echo "No unresolved review conversations found"
+    exit 0
+fi
+
+echo "Found ${thread_count} unresolved conversation(s)"
+echo ""
+
+plan_file=$(mktemp)
+trap "rm -f $plan_file" EXIT
+echo "[]" > "$plan_file"
+
+index=0
+while [ $index -lt "$thread_count" ]; do
+    thread=$(echo "$unresolved_threads" | jq ".[$index]")
+    thread_id=$(echo "$thread" | jq -r '.id')
+    path=$(echo "$thread" | jq -r '.path // "unknown"')
+    line=$(echo "$thread" | jq -r '.line // "?"')
+    first_comment=$(echo "$thread" | jq '.comments.nodes[0]')
+    author=$(echo "$first_comment" | jq -r '.author.login // "unknown"')
+    body=$(echo "$first_comment" | jq -r '.body')
+
+    display_num=$((index + 1))
+    echo "============================================"
+    echo "[${display_num}/${thread_count}] @${author} on ${path}:${line}"
+    echo "============================================"
+    echo ""
+    echo "$body" | head -20
+    if [ $(echo "$body" | wc -l) -gt 20 ]; then
+        echo "... (truncated)"
+    fi
+    echo ""
+
+    while true; do
+        printf "[A]ccept / [S]kip / [M]odify / [Q]uit: "
+        read -r choice < /dev/tty
+
+        case "$choice" in
+            [Aa])
+                jq --arg tid "$thread_id" --arg path "$path" --arg line "$line" --arg body "$body" --arg author "$author" \
+                    '. += [{"thread_id": $tid, "path": $path, "line": $line, "suggestion": $body, "author": $author, "action": "accept", "modification": null}]' \
+                    "$plan_file" > "${plan_file}.tmp" && mv "${plan_file}.tmp" "$plan_file"
+                echo "Added to plan"
+                break
+                ;;
+            [Ss])
+                echo "Skipped"
+                break
+                ;;
+            [Mm])
+                echo "Enter your modification (end with empty line):"
+                modification=""
+                while IFS= read -r mod_line < /dev/tty; do
+                    [ -z "$mod_line" ] && break
+                    modification="${modification}${mod_line}\n"
+                done
+                jq --arg tid "$thread_id" --arg path "$path" --arg line "$line" --arg body "$body" --arg author "$author" --arg mod "$modification" \
+                    '. += [{"thread_id": $tid, "path": $path, "line": $line, "suggestion": $body, "author": $author, "action": "modify", "modification": $mod}]' \
+                    "$plan_file" > "${plan_file}.tmp" && mv "${plan_file}.tmp" "$plan_file"
+                echo "Added to plan with modification"
+                break
+                ;;
+            [Qq])
+                echo "Quitting planning phase"
+                break 2
+                ;;
+            *)
+                echo "Invalid choice. Use A/S/M/Q"
+                ;;
+        esac
+    done
+
+    echo ""
+    index=$((index + 1))
+done
+
+plan_count=$(jq 'length' "$plan_file")
+
+if [ "$plan_count" -eq 0 ]; then
+    echo "No suggestions accepted. Nothing to do."
+    exit 0
+fi
+
+echo "============================================"
+echo "Plan Summary"
+echo "============================================"
+echo "Accepted: ${plan_count} suggestion(s)"
+echo ""
+jq -r '.[] | "- \(.path):\(.line) (\(.action))"' "$plan_file"
+echo ""
+
+printf "Proceed with execution? [Y/n]: "
+read -r confirm < /dev/tty
+
+if [ "$confirm" = "n" ] || [ "$confirm" = "N" ]; then
+    echo "Aborted"
+    exit 0
+fi
+
+echo ""
+echo "Starting execution phase"
+
+plan_json=$(cat "$plan_file")
+
+system_prompt="You are implementing approved PR review suggestions.
+
+TASK:
+For each suggestion in the plan, implement the requested change.
+
+PLAN:
+${plan_json}
+
+WORKFLOW:
+1. For each item in the plan:
+   - Read the file at the specified path
+   - Implement the suggestion (or the modification if provided)
+   - The 'suggestion' field contains the reviewer's comment
+   - The 'modification' field (if present) contains the user's adjusted approach
+2. After implementing, commit with a message like: 'Address review: <brief description>'
+3. Output a JSON array of results for posting replies, format:
+   [{\"thread_id\": \"...\", \"reply\": \"Fixed in <commit>. <brief explanation>\"}]
+
+IMPORTANT:
+- Make minimal, focused changes
+- Don't refactor beyond what's requested
+- If a suggestion doesn't make sense, skip it and note why in the reply
+- Output the JSON results array at the end, wrapped in <results>...</results> tags"
+
+result=$(claude \
+    --print \
+    --dangerously-skip-permissions \
+    --system-prompt "${system_prompt}" \
+    "Implement the suggestions in the plan. Output results JSON when done.")
+
+results_json=$(echo "$result" | sed -n 's/.*<results>\(.*\)<\/results>.*/\1/p' | tr -d '\n')
+
+if [ -z "$results_json" ]; then
+    echo "Warning: Could not parse results from Claude output"
+    echo "Changes may have been made but replies were not posted"
+    exit 1
+fi
+
+echo "Posting replies and resolving conversations"
+
+echo "$results_json" | jq -c '.[]' | while read -r item; do
+    thread_id=$(echo "$item" | jq -r '.thread_id')
+    reply=$(echo "$item" | jq -r '.reply')
+
+    echo "Replying to thread ${thread_id}"
+
+    gh api graphql -f query='
+    mutation($threadId: ID!, $body: String!) {
+      addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+        comment { id }
+      }
+    }' -f threadId="$thread_id" -f body="$reply" > /dev/null 2>&1 || echo "Warning: Failed to post reply"
+
+    gh api graphql -f query='
+    mutation($threadId: ID!) {
+      resolveReviewThread(input: {threadId: $threadId}) {
+        thread { isResolved }
+      }
+    }' -f threadId="$thread_id" > /dev/null 2>&1 || echo "Warning: Failed to resolve thread"
+done
+
+echo "Pushing changes"
+git push
+
+echo ""
+echo "PR review complete"
+echo "View PR: https://github.com/${repo_info}/pull/${pr_num}"
+```
