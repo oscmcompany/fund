@@ -804,6 +804,11 @@ if ! command -v claude &> /dev/null; then
     exit 1
 fi
 
+if ! command -v jq &> /dev/null; then
+    echo "jq is required"
+    exit 1
+fi
+
 if ! gh auth status &> /dev/null; then
     echo "GitHub CLI not authenticated"
     echo "Run: gh auth login"
@@ -1455,8 +1460,8 @@ while [ $index -lt "$thread_count" ]; do
                 break
                 ;;
             [Qq])
-                echo "Quitting planning phase"
-                break 2
+                echo "Quitting"
+                exit 0
                 ;;
             *)
                 echo "Invalid choice. Use A/S/M/Q"
@@ -1534,6 +1539,13 @@ if [ -z "$results_json" ]; then
     exit 1
 fi
 
+echo "Pushing changes"
+if ! git push; then
+    echo "Error: Failed to push changes"
+    echo "Replies will not be posted until push succeeds"
+    exit 1
+fi
+
 echo "Posting replies and resolving conversations"
 
 echo "$results_json" | jq -c '.[]' | while read -r item; do
@@ -1556,9 +1568,6 @@ echo "$results_json" | jq -c '.[]' | while read -r item; do
       }
     }' -f threadId="$thread_id" > /dev/null 2>&1 || echo "Warning: Failed to resolve thread"
 done
-
-echo "Pushing changes"
-git push
 
 echo ""
 echo "PR review complete"
