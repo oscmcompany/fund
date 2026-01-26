@@ -88,7 +88,7 @@ After implementing requirements, ALWAYS attempt `git commit`. The commit trigger
 - If commit succeeds → requirement is verified, check it off in issue
 - Do not skip this step or run tests separately
 
-### Wiggum Learnings
+### Ralph Learnings
 
 Document failure patterns here after Ralph loops to prevent recurrence:
 
