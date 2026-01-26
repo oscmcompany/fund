@@ -875,11 +875,21 @@ echo "Starting Ralph loop for issue #${issue_number}"
 
 echo "Running pre-flight checks"
 
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI (gh) is required"
+    exit 1
+fi
+
+if ! command -v claude &> /dev/null; then
+    echo "Claude CLI is required"
+    exit 1
+fi
+
 if ! command -v jq &> /dev/null; then
     echo "jq is required"
     exit 1
 fi
-echo "  jq available"
+echo "  Required tools available"
 
 if [ -n "$(git status --porcelain)" ]; then
     echo "Error: Working directory has uncommitted changes"
