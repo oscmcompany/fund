@@ -3,6 +3,7 @@ name: Spec
 about: Create a specification for Ralph autonomous implementation
 title: ''
 labels: ["feature", "refining"]
+projects: ["oscmcompany/1"]
 
 ---
 

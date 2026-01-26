@@ -3,6 +3,7 @@ name: Bug
 about: Create a bug report
 title: ''
 labels: ["bug"]
+projects: ["oscmcompany/1"]
 
 ---
 
