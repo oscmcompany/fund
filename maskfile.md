@@ -739,6 +739,52 @@ claude mcp list
 
 > Ralph autonomous development workflow
 
+### setup
+
+> Create required labels for Ralph workflow
+
+```bash
+set -euo pipefail
+
+echo "Setting up Ralph labels"
+
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI (gh) is required"
+    exit 1
+fi
+
+if ! gh auth status &> /dev/null; then
+    echo "GitHub CLI not authenticated"
+    echo "Run: gh auth login"
+    exit 1
+fi
+
+labels='[
+  {"name": "refining", "color": "ba3eb2", "description": "Spec being built or discussed"},
+  {"name": "ready", "color": "0e8a16", "description": "Spec complete, ready for implementation"},
+  {"name": "in-progress", "color": "fbca04", "description": "Ralph loop actively working"},
+  {"name": "needs-attention", "color": "d93f0b", "description": "Loop hit max iterations or got stuck"},
+  {"name": "backlog-review", "color": "7057ff", "description": "Backlog review tracking"}
+]'
+
+existing=$(gh label list --json name --jq '.[].name')
+
+echo "$labels" | jq -c '.[]' | while read -r label; do
+    name=$(echo "$label" | jq -r '.name')
+    color=$(echo "$label" | jq -r '.color')
+    desc=$(echo "$label" | jq -r '.description')
+
+    if echo "$existing" | grep -qx "$name"; then
+        echo "  Label '$name' already exists"
+    else
+        gh label create "$name" --color "$color" --description "$desc"
+        echo "  Created label '$name'"
+    fi
+done
+
+echo "Setup complete"
+```
+
 ### spec [issue_number]
 
 > Build or refine a spec through interactive conversation

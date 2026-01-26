@@ -50,6 +50,7 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 
 ### Commands
 
+- `mask ralph setup` - Create required labels (run once before first use)
 - `mask ralph spec [issue]` - Interactive spec refinement (creates new issue if no number provided)
 - `mask ralph loop <issue>` - Run autonomous loop on a ready spec
 - `mask ralph backlog` - Review open issues for duplicates, overlaps, and staleness
