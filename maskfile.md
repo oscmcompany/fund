@@ -1308,9 +1308,34 @@ while [ $index -lt "$thread_count" ]; do
     echo "[${display_num}/${thread_count}] @${author} on ${path}:${line}"
     echo "============================================"
     echo ""
-    echo "$body" | head -20
-    if [ $(echo "$body" | wc -l) -gt 20 ]; then
-        echo "... (truncated)"
+
+    # Truncate for display: show text before code blocks, summarize code blocks
+    display_body=$(echo "$body" | awk '
+        BEGIN { in_code=0; code_lines=0; shown_code=0 }
+        /^```/ {
+            if (in_code) {
+                if (code_lines > 3) printf "  ... (%d lines)\n", code_lines
+                print "```"
+                in_code=0; code_lines=0; shown_code=0
+            } else {
+                print
+                in_code=1
+            }
+            next
+        }
+        in_code {
+            code_lines++
+            if (shown_code < 3) { print; shown_code++ }
+            next
+        }
+        { print }
+    ' | head -25)
+
+    echo "$display_body"
+
+    total_lines=$(echo "$body" | wc -l | tr -d ' ')
+    if [ "$total_lines" -gt 25 ]; then
+        echo "... (${total_lines} lines total)"
     fi
     echo ""
 
