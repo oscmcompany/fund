@@ -836,21 +836,22 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 echo "  Working directory is clean"
 
+default_branch=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
 current_branch=$(git rev-parse --abbrev-ref HEAD)
-if [ "$current_branch" != "master" ]; then
-    echo "Error: Not on master branch (currently on: ${current_branch})"
-    echo "Run: git checkout master"
+if [ "$current_branch" != "$default_branch" ]; then
+    echo "Error: Not on default branch ${default_branch} (currently on: ${current_branch})"
+    echo "Run: git checkout ${default_branch}"
     exit 1
 fi
-echo "  On master branch"
+echo "  On default branch (${default_branch})"
 
-echo "  Pulling latest master"
-if ! git pull --ff-only origin master; then
-    echo "Error: Could not pull latest master"
+echo "  Pulling latest ${default_branch}"
+if ! git pull --ff-only origin "$default_branch"; then
+    echo "Error: Could not pull latest ${default_branch}"
     echo "Resolve conflicts or check network/auth"
     exit 1
 fi
-echo "  Master is up to date"
+echo "  ${default_branch} is up to date"
 
 if ! gh auth status &> /dev/null; then
     echo "Error: GitHub CLI not authenticated"
