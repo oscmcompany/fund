@@ -1075,7 +1075,7 @@ fi
 
 gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention"
 
-modified_files=$(git diff --name-only origin/master 2>/dev/null || echo "none")
+modified_files=$(git diff --name-only "origin/${default_branch}" 2>/dev/null || echo "none")
 
 if [ "$branch_pushed" = "true" ]; then
     branch_info="**Branch:** [\`${branch_name}\`](../../tree/${branch_name}) (pushed to remote)"
