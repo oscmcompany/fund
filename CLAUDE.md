@@ -78,6 +78,21 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 
 Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked to signal task completion.
 
+### Commit as Verification
+
+After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which run all tests/linting. This IS the verification step:
+- If commit fails → fix issues and retry
+- If commit succeeds → requirement is verified, check it off in issue
+- Do not skip this step or run tests separately
+
 ### Wiggum Learnings
 
 Document failure patterns here after Ralph loops to prevent recurrence:
+
+#### 2026-01-26: #723 (spec: commit-as-verification not explicit)
+
+**Issue:** Loop implemented requirements but didn't attempt git commit to verify.
+
+**Root cause:** Spec said "commit is the verification gate" but didn't explicitly say to always attempt commit after implementing.
+
+**Fix:** Added explicit "Commit-as-Verification" section requiring commit attempt after every implementation.
