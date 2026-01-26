@@ -43,3 +43,41 @@
 - `libraries/` folder contains shared code resources
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
+
+## Ralph Workflow
+
+Ralph is an autonomous development loop for implementing GitHub issue specs.
+
+### Commands
+
+- `mask ralph spec [issue]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph loop <issue>` - Run autonomous loop on a ready spec
+
+### Labels
+
+- `refining` - Spec being built or discussed
+- `ready` - Spec complete, ready for implementation
+- `in-progress` - Ralph loop actively working
+- `needs-attention` - Loop hit max iterations or got stuck
+
+### Workflow
+
+1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue>`
+2. When spec is complete, human adds `ready` label
+3. Run autonomous loop: `mask ralph loop <issue>`
+4. Loop creates PR with `Closes #<issue>` on completion
+5. PR merge auto-closes issue
+
+### Context Rotation
+
+- Complete logically related requirements together (same files, same concepts)
+- Exit after meaningful progress to allow fresh context on next iteration
+- Judgment factors: relatedness, complexity, context size, dependencies
+
+### Completion Signal
+
+Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked to signal task completion.
+
+### Wiggum Learnings
+
+Document failure patterns here after Ralph loops to prevent recurrence:

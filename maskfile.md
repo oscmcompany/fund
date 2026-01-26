@@ -734,3 +734,331 @@ echo
 echo "Done. Current MCP status:"
 claude mcp list
 ```
+
+## ralph
+
+> Ralph autonomous development workflow
+
+### spec [issue_number]
+
+> Build or refine a spec through interactive conversation
+
+```bash
+set -euo pipefail
+
+echo "Starting Ralph spec refinement"
+
+if ! command -v gh &> /dev/null; then
+    echo "GitHub CLI (gh) is required"
+    exit 1
+fi
+
+if ! command -v claude &> /dev/null; then
+    echo "Claude CLI is required"
+    exit 1
+fi
+
+if ! gh auth status &> /dev/null; then
+    echo "GitHub CLI not authenticated"
+    echo "Run: gh auth login"
+    exit 1
+fi
+
+if [ -z "${issue_number:-}" ]; then
+    echo "Creating new spec issue"
+
+    template_body=$(cat <<'TEMPLATE'
+# Title
+
+**Created:** $(date +%Y-%m-%d)
+**Last discussed:** $(date +%Y-%m-%d)
+
+## Problem
+
+<Context: why this work matters, background needed>
+
+**Goal:** <Single clear statement of what we're trying to achieve>
+
+## Requirements
+
+### Category 1
+- [ ] Requirement (testable/verifiable)
+- [ ] Another requirement
+
+### Category 2
+- [ ] Requirement
+- [ ] Requirement
+
+## Open Questions
+
+- [ ] Question that needs resolution before ready?
+- [ ] Another question?
+
+## Decisions
+
+- [ ] **Decision name:** Choice made and rationale
+
+## Specification
+
+<Detailed design, diagrams, formats - filled in as decisions are made>
+
+## Implementation Notes
+
+<Filled after implementation - gotchas, learnings>
+TEMPLATE
+)
+
+    issue_number=$(gh issue create \
+        --title "New Spec: [TITLE]" \
+        --body "$template_body" \
+        --label "refining" \
+        --label "feature" | grep -oE '[0-9]+$')
+
+    echo "Created issue #${issue_number}"
+    echo "Opening issue in browser"
+    gh issue view "${issue_number}" --web &
+fi
+
+echo "Refining issue #${issue_number}"
+
+issue_content=$(gh issue view "${issue_number}" --json title,body,labels)
+issue_title=$(echo "$issue_content" | jq -r '.title')
+issue_body=$(echo "$issue_content" | jq -r '.body')
+
+system_prompt="You are helping refine a technical specification in GitHub issue #${issue_number}.
+
+CURRENT SPEC:
+Title: ${issue_title}
+
+${issue_body}
+
+YOUR ROLE:
+1. Probe the user with questions to refine this spec
+2. Ask about: problem clarity, requirements completeness, performance, security, testing, edge cases, dependencies
+3. When decisions are made, update the issue incrementally using: gh issue edit ${issue_number} --body \"...\"
+4. Keep Open Questions section updated as questions are resolved
+5. Move resolved questions to Decisions section with rationale
+
+IMPORTANT:
+- You do NOT add the 'ready' label - the human decides when the spec is complete
+- Update the issue body incrementally as decisions are made
+- Use the spec template format (Problem, Requirements, Open Questions, Decisions, Specification)
+- Be thorough but conversational
+
+Start by reviewing the current spec and asking clarifying questions."
+
+claude --system-prompt "$system_prompt"
+
+echo ""
+echo "Spec refinement session ended"
+echo "When ready, add the 'ready' label:"
+echo "  gh issue edit ${issue_number} --add-label ready --remove-label refining"
+```
+
+### loop (issue_number)
+
+> Run autonomous loop on a ready spec
+
+```bash
+set -euo pipefail
+
+max_iterations="${RALPH_MAX_ITERATIONS:-10}"
+
+echo "Starting Ralph loop for issue #${issue_number}"
+
+echo "Running pre-flight checks"
+
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: Working directory has uncommitted changes"
+    echo "Commit or stash changes before running ralph loop"
+    exit 1
+fi
+echo "  Working directory is clean"
+
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$current_branch" != "master" ]; then
+    echo "Error: Not on master branch (currently on: ${current_branch})"
+    echo "Run: git checkout master"
+    exit 1
+fi
+echo "  On master branch"
+
+echo "  Pulling latest master"
+if ! git pull --ff-only origin master; then
+    echo "Error: Could not pull latest master"
+    echo "Resolve conflicts or check network/auth"
+    exit 1
+fi
+echo "  Master is up to date"
+
+labels=$(gh issue view "${issue_number}" --json labels --jq '.labels[].name' 2>/dev/null || echo "")
+if ! echo "$labels" | grep -q "^ready$"; then
+    echo "Error: Issue #${issue_number} does not have 'ready' label"
+    echo "Current labels: ${labels:-none}"
+    exit 1
+fi
+echo "  Issue has 'ready' label"
+
+issue_title=$(gh issue view "${issue_number}" --json title --jq '.title')
+short_desc=$(echo "$issue_title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+branch_name="ralph/${issue_number}-${short_desc}"
+
+if git show-ref --verify --quiet "refs/heads/${branch_name}" 2>/dev/null; then
+    echo "Error: Local branch '${branch_name}' already exists"
+    echo "Delete with: git branch -d ${branch_name}"
+    exit 1
+fi
+
+if git ls-remote --heads origin "${branch_name}" 2>/dev/null | grep -q .; then
+    echo "Error: Remote branch '${branch_name}' already exists"
+    echo "Delete with: git push origin --delete ${branch_name}"
+    exit 1
+fi
+echo "  Branch '${branch_name}' does not exist"
+
+echo "Pre-flight checks passed"
+
+echo "Creating branch: ${branch_name}"
+git checkout -b "${branch_name}"
+
+echo "Updating labels: removing 'ready', adding 'in-progress'"
+gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress"
+
+system_prompt="You are executing an autonomous development loop for GitHub issue #${issue_number}.
+
+WORKFLOW:
+1. Read the spec: gh issue view ${issue_number}
+2. PLAN: Identify unchecked requirements, group logically related ones
+3. EXECUTE: Implement the grouped requirements
+4. TEST: Run pre-commit hooks (they run mask development python/rust all)
+5. UPDATE: Check off completed requirements in the issue
+6. DECIDE: If more unchecked requirements remain AND you've completed a logical group, exit to rotate context
+
+COMPLETION:
+- When ALL requirement checkboxes are checked, output <promise>COMPLETE</promise>
+- This signals the loop is done and triggers PR creation
+
+CONTEXT ROTATION:
+- Complete logically related requirements together (same files, same concepts)
+- Exit after meaningful progress to allow fresh context on next iteration
+- Don't try to do everything in one pass
+
+CHECKBOX UPDATE:
+- Use gh issue edit to update the issue body with checked boxes
+- Update checkboxes BEFORE exiting to preserve progress
+
+GIT:
+- Commit frequently with meaningful messages
+- Pre-commit hooks will run all tests and linting
+
+IMPORTANT:
+- Start with planning before any code changes
+- Be thorough but exit after completing related requirements
+- The commit gate is the verification (pre-commit = mask development all)"
+
+stream_text='select(.type == "assistant").message.content[]? | select(.type == "text").text // empty | gsub("\n"; "\r\n") | . + "\r\n\n"'
+final_result='select(.type == "result").result // empty'
+
+iteration=1
+while [ $iteration -le $max_iterations ]; do
+    echo ""
+    echo "============================================"
+    echo "ITERATION ${iteration}/${max_iterations}"
+    echo "============================================"
+
+    spec=$(gh issue view "${issue_number}" --json body --jq '.body')
+
+    tmpfile=$(mktemp)
+    trap "rm -f $tmpfile" EXIT
+
+    claude \
+        --print \
+        --output-format stream-json \
+        --system-prompt "${system_prompt}" \
+        --dangerously-skip-permissions \
+        "Current spec state:\n\n${spec}\n\nBegin iteration ${iteration}. Start with planning." \
+    | grep --line-buffered '^{' \
+    | tee "$tmpfile" \
+    | jq --unbuffered -rj "$stream_text"
+
+    result=$(jq -r "$final_result" "$tmpfile")
+
+    if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
+        echo ""
+        echo "============================================"
+        echo "RALPH COMPLETE after ${iteration} iterations"
+        echo "============================================"
+
+        echo "Pushing branch"
+        git push -u origin "${branch_name}"
+
+        echo "Creating pull request"
+        pr_body=$(cat <<EOF
+## Summary
+
+Autonomous implementation of issue #${issue_number}
+
+Closes #${issue_number}
+
+## Implementation
+
+See linked issue for full spec and requirements checklist.
+
+---
+
+Generated by Ralph loop in ${iteration} iteration(s)
+EOF
+)
+        pr_url=$(gh pr create \
+            --title "${issue_title}" \
+            --body "$pr_body")
+
+        echo "Pull request created: ${pr_url}"
+        echo "Issue will auto-close on merge"
+        exit 0
+    fi
+
+    iteration=$((iteration + 1))
+done
+
+echo ""
+echo "============================================"
+echo "MAX ITERATIONS REACHED (${max_iterations})"
+echo "============================================"
+
+gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention"
+
+modified_files=$(git diff --name-only origin/master 2>/dev/null || echo "none")
+
+failure_comment=$(cat <<EOF
+## Ralph Loop Failed
+
+**Iterations:** ${max_iterations}/${max_iterations}
+**Branch:** ${branch_name}
+
+### Current State
+Review the branch to see partial progress.
+
+### Files Modified
+${modified_files:-none}
+
+### Next Steps
+1. Review the branch: \`git checkout ${branch_name}\`
+2. Check what requirements remain unchecked
+3. Manually complete or debug the issue
+4. Consider breaking down remaining requirements into smaller tasks
+
+### To Resume
+1. Fix the blocking issue
+2. Update the spec if needed
+3. Delete the branch: \`git branch -D ${branch_name} && git push origin --delete ${branch_name}\`
+4. Re-add the \`ready\` label and run \`mask ralph loop ${issue_number}\` again
+EOF
+)
+
+gh issue comment "${issue_number}" --body "$failure_comment"
+
+echo "Failure comment posted to issue #${issue_number}"
+echo "Label changed to 'needs-attention'"
+exit 1
+```
