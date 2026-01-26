@@ -3,7 +3,6 @@ name: Bug
 about: Create a bug report
 title: ''
 labels: ["bug"]
-projects: ["pocketsizefund/11"]
 
 ---
 

@@ -3,14 +3,10 @@ name: Spec
 about: Create a specification for Ralph autonomous implementation
 title: ''
 labels: ["feature", "refining"]
-projects: ["pocketsizefund/11"]
 
 ---
 
 # Title
-
-**Created:** YYYY-MM-DD
-**Last discussed:** YYYY-MM-DD
 
 ## Problem
 

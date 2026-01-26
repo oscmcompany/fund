@@ -40,6 +40,7 @@ duckdb.pkg-path = "duckdb"
 openssl.pkg-path = "openssl"
 pkgconf.pkg-path = "pkgconf"
 direnv.pkg-path = "direnv"
+jq.pkg-path = "jq"
 
 [hook]
 on-activate = '''
