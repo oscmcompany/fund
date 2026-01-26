@@ -783,9 +783,8 @@ fi
 
 echo "Refining issue #${issue_number}"
 
-issue_content=$(gh issue view "${issue_number}" --json title,body,labels)
-issue_title=$(echo "$issue_content" | jq -r '.title')
-issue_body=$(echo "$issue_content" | jq -r '.body')
+issue_title=$(gh issue view "${issue_number}" --json title --jq '.title')
+issue_body=$(gh issue view "${issue_number}" --json body --jq '.body')
 
 system_prompt="You are helping refine a technical specification in GitHub issue #${issue_number}.
 
