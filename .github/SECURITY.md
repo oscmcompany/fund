@@ -1,5 +1,5 @@
 # Security
 
-> Securing the platform 🔒
+> The open source capital management company 
 
-The **Security** guidelines for **pocketsizefund** are to [contact the project maintainers](https://x.com/pocketsizefund) with questions or concerns.  
+The **Security** guidelines for **fund** are to [contact the project maintainers](https://x.com/oscmcompany) with questions or concerns.  
