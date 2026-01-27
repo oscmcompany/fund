@@ -794,7 +794,7 @@ if [ -z "${issue_number:-}" ]; then
     echo "Creating new spec issue"
 
     issue_json=$(gh issue create \
-        --template "SPEC.md" \
+        --template "ISSUE_TEMPLATE.md" \
         --title "New Spec: [TITLE]" \
         --label "in-refinement" \
         --label "feature" \
