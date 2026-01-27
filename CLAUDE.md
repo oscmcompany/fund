@@ -51,24 +51,28 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 ### Commands
 
 - `mask ralph setup` - Create required labels (run once before first use)
-- `mask ralph spec [issue]` - Interactive spec refinement (creates new issue if no number provided)
-- `mask ralph loop <issue>` - Run autonomous loop on a ready spec
+- `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
 - `mask ralph backlog` - Review open issues for duplicates, overlaps, and staleness
 - `mask ralph pr [--pr <number>]` - Process PR review feedback interactively
 
 ### Labels
 
-- `refining` - Spec being built or discussed
+**Status labels:**
+- `in-refinement` - Spec being built or discussed
 - `ready` - Spec complete, ready for implementation
-- `in-progress` - Ralph loop actively working
-- `needs-attention` - Loop hit max iterations or got stuck
+- `in-progress` - Work actively in progress
+- `attention-needed` - Blocked or needs human intervention
 - `backlog-review` - Backlog review tracking issue
+
+**Actor label:**
+- `ralph` - Ralph is actively working on this (remove to hand off to human)
 
 ### Workflow
 
-1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue>`
+1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
 2. When spec is complete, human adds `ready` label
-3. Run autonomous loop: `mask ralph loop <issue>`
+3. Run autonomous loop: `mask ralph loop <issue_number>`
 4. Loop creates PR with `Closes #<issue>` on completion
 5. PR merge auto-closes issue
 

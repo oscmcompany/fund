@@ -2,7 +2,7 @@
 name: Feature
 about: Create a feature request
 title: ''
-labels: ["feature", "refining"]
+labels: ["feature", "in-refinement"]
 projects: ["oscmcompany/1"]
 
 ---

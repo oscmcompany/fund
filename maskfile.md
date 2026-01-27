@@ -760,11 +760,12 @@ if ! gh auth status &> /dev/null; then
 fi
 
 labels='[
-  {"name": "refining", "color": "ba3eb2", "description": "Spec being built or discussed"},
+  {"name": "ralph", "color": "6f42c1", "description": "Ralph is actively working on this"},
+  {"name": "in-refinement", "color": "d93f0b", "description": "Spec being built or discussed"},
   {"name": "ready", "color": "0e8a16", "description": "Spec complete, ready for implementation"},
-  {"name": "in-progress", "color": "fbca04", "description": "Ralph loop actively working"},
-  {"name": "needs-attention", "color": "d93f0b", "description": "Loop hit max iterations or got stuck"},
-  {"name": "backlog-review", "color": "7057ff", "description": "Backlog review tracking"}
+  {"name": "in-progress", "color": "fbca04", "description": "Work actively in progress"},
+  {"name": "attention-needed", "color": "b60205", "description": "Blocked or needs human intervention"},
+  {"name": "backlog-review", "color": "0052cc", "description": "Backlog review tracking"}
 ]'
 
 existing=$(gh label list --json name --jq '.[].name')
@@ -821,7 +822,7 @@ if [ -z "${issue_number:-}" ]; then
     issue_json=$(gh issue create \
         --template "SPEC.md" \
         --title "New Spec: [TITLE]" \
-        --label "refining" \
+        --label "in-refinement" \
         --label "feature" \
         --json number)
 
@@ -864,7 +865,7 @@ claude --system-prompt "$system_prompt"
 echo ""
 echo "Spec refinement session ended"
 echo "When ready, add the 'ready' label:"
-echo "  gh issue edit ${issue_number} --add-label ready --remove-label refining"
+echo "  gh issue edit ${issue_number} --add-label ready --remove-label in-refinement"
 ```
 
 ### loop (issue_number)
@@ -961,15 +962,15 @@ echo "Pre-flight checks passed"
 echo "Creating branch: ${branch_name}"
 git checkout -b "${branch_name}"
 
-echo "Updating labels: removing 'ready', adding 'in-progress'"
-gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress"
+echo "Updating labels: removing 'ready', adding 'in-progress' and 'ralph'"
+gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress" --add-label "ralph"
 
 cleanup_on_error() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo ""
         echo "Error: Script failed unexpectedly (exit code: $exit_code)"
-        gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention" 2>/dev/null || true
+        gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed" 2>/dev/null || true
         gh issue comment "${issue_number}" --body "## Ralph Loop Error
 
 The loop exited unexpectedly with code $exit_code.
@@ -1026,7 +1027,7 @@ cleanup_and_fail() {
     echo "============================================"
     echo "UNEXPECTED ERROR - cleaning up"
     echo "============================================"
-    gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention" 2>/dev/null || true
+    gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed" 2>/dev/null || true
     gh issue comment "${issue_number}" --body "## Ralph Loop Error
 
 The loop exited unexpectedly. Branch: \`${branch_name}\`
@@ -1064,6 +1065,9 @@ while [ $iteration -le $max_iterations ]; do
         echo "============================================"
         echo "RALPH COMPLETE after ${iteration} iterations"
         echo "============================================"
+
+        echo "Updating labels: removing 'in-progress' and 'ralph'"
+        gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph"
 
         echo "Pushing branch"
         git push -u origin "${branch_name}"
@@ -1114,7 +1118,7 @@ else
     echo "Warning: Could not push branch (progress is local only)"
 fi
 
-gh issue edit "${issue_number}" --remove-label "in-progress" --add-label "needs-attention"
+gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed"
 
 modified_files=$(git diff --name-only "origin/${default_branch}" 2>/dev/null || echo "none")
 
@@ -1153,7 +1157,7 @@ EOF
 gh issue comment "${issue_number}" --body "$failure_comment"
 
 echo "Failure comment posted to issue #${issue_number}"
-echo "Label changed to 'needs-attention'"
+echo "Label changed to 'attention-needed'"
 trap - EXIT
 exit 1
 ```
@@ -1292,15 +1296,16 @@ echo "Backlog review complete"
 echo "Report posted to: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/issues/${existing_issue}"
 ```
 
-### pr
+### pull-request
 
 > Process PR review feedback interactively
 
 **OPTIONS**
+
 * pr_number
-    * flags: --pr
-    * type: string
-    * desc: PR number (auto-detects from branch if not provided)
+  * flags: --pr
+  * type: string
+  * desc: PR number (auto-detects from branch if not provided)
 
 ```bash
 set -euo pipefail

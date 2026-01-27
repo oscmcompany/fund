@@ -2,14 +2,12 @@
 name: Spec
 about: Create a specification for Ralph autonomous implementation
 title: ''
-labels: ["feature", "refining"]
+labels: ["feature", "in-refinement"]
 projects: ["oscmcompany/1"]
 
 ---
 
-# Title
-
-## Problem
+# Description
 
 <Context: why this work matters, background needed>
 
@@ -18,10 +16,12 @@ projects: ["oscmcompany/1"]
 ## Requirements
 
 ### Category 1
+
 - [ ] Requirement (testable/verifiable)
 - [ ] Another requirement
 
 ### Category 2
+
 - [ ] Requirement
 - [ ] Requirement
 

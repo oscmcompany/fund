@@ -2,7 +2,7 @@
 name: Bug
 about: Create a bug report
 title: ''
-labels: ["bug", "refining"]
+labels: ["bug", "in-refinement"]
 projects: ["oscmcompany/1"]
 
 ---

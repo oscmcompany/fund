@@ -1,5 +1,5 @@
 # Contributing
 
-> Working on the code 💻
+> The open source capital management company  
 
-The **Contributing** guidelines for **pocketsizefund** are to write code that passes all project checks. [Contact the project maintainers](https://x.com/pocketsizefund) with questions or concerns.  
+The contributing guidelines for Open Source Capital Management are to write code that passes all project checks. [Contact the project maintainers](https://x.com/oscmcompany) with questions or concerns.  
