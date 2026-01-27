@@ -5,11 +5,11 @@
 <!-- 
 Provide bullet point details.
 Include "- fixes <#issue_number>" to link to an outstanding issue.
+Apply relevant labels currently available on the repository.
 -->
 
-## Comments
+## Context
 
 <!-- 
 Provide additional information as needed.
-Delete header if it isn't used.
 -->
