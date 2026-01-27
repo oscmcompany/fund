@@ -52,8 +52,9 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 
 - `mask ralph setup` - Create required labels (run once before first use)
 - `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
 - `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
-- `mask ralph backlog` - Review open issues for duplicates, overlaps, and staleness
+- `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
 - `mask ralph pr [--pr <number>]` - Process PR review feedback interactively
 
 ### Labels
@@ -71,10 +72,11 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 ### Workflow
 
 1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
-2. When spec is complete, human adds `ready` label
+2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
 3. Run autonomous loop: `mask ralph loop <issue_number>`
-4. Loop creates PR with `Closes #<issue>` on completion
-5. PR merge auto-closes issue
+4. Loop assigns the issue and resulting PR to the current GitHub user
+5. Loop creates PR with `Closes #<issue_number>` on completion
+6. PR merge auto-closes issue
 
 ### Context Rotation
 
@@ -95,7 +97,7 @@ After implementing requirements, ALWAYS attempt `git commit`. The commit trigger
 
 ### Ralph Learnings
 
-Document failure patterns here after Ralph loops to prevent recurrence:
+Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
 
 #### 2026-01-26: #723 (spec: commit-as-verification not explicit)
 

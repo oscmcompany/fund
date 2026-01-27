@@ -746,18 +746,10 @@ claude mcp list
 ```bash
 set -euo pipefail
 
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight
+
 echo "Setting up Ralph labels"
-
-if ! command -v gh &> /dev/null; then
-    echo "GitHub CLI (gh) is required"
-    exit 1
-fi
-
-if ! gh auth status &> /dev/null; then
-    echo "GitHub CLI not authenticated"
-    echo "Run: gh auth login"
-    exit 1
-fi
 
 labels='[
   {"name": "ralph", "color": "6f42c1", "description": "Ralph is actively working on this"},
@@ -793,28 +785,10 @@ echo "Setup complete"
 ```bash
 set -euo pipefail
 
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight --claude --jq
+
 echo "Starting Ralph spec refinement"
-
-if ! command -v gh &> /dev/null; then
-    echo "GitHub CLI (gh) is required"
-    exit 1
-fi
-
-if ! command -v claude &> /dev/null; then
-    echo "Claude CLI is required"
-    exit 1
-fi
-
-if ! command -v jq &> /dev/null; then
-    echo "jq is required"
-    exit 1
-fi
-
-if ! gh auth status &> /dev/null; then
-    echo "GitHub CLI not authenticated"
-    echo "Run: gh auth login"
-    exit 1
-fi
 
 if [ -z "${issue_number:-}" ]; then
     echo "Creating new spec issue"
@@ -864,8 +838,31 @@ claude --system-prompt "$system_prompt"
 
 echo ""
 echo "Spec refinement session ended"
-echo "When ready, add the 'ready' label:"
-echo "  gh issue edit ${issue_number} --add-label ready --remove-label in-refinement"
+echo "When ready, mark the spec as ready:"
+echo "  mask ralph ready ${issue_number}"
+```
+
+### ready (issue_number)
+
+> Mark a spec as ready for implementation
+
+```bash
+set -euo pipefail
+
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight
+
+echo "Marking issue #${issue_number} as ready"
+
+if ! gh issue view "${issue_number}" &> /dev/null; then
+    echo "Error: Issue #${issue_number} not found"
+    exit 1
+fi
+
+gh issue edit "${issue_number}" --add-label "ready" --remove-label "in-refinement"
+
+echo "Issue #${issue_number} marked as ready"
+echo "Run the loop with: mask ralph loop ${issue_number}"
 ```
 
 ### loop (issue_number)
@@ -875,27 +872,14 @@ echo "  gh issue edit ${issue_number} --add-label ready --remove-label in-refine
 ```bash
 set -euo pipefail
 
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight --claude --jq
+
 max_iterations="${RALPH_MAX_ITERATIONS:-10}"
 
 echo "Starting Ralph loop for issue #${issue_number}"
 
 echo "Running pre-flight checks"
-
-if ! command -v gh &> /dev/null; then
-    echo "GitHub CLI (gh) is required"
-    exit 1
-fi
-
-if ! command -v claude &> /dev/null; then
-    echo "Claude CLI is required"
-    exit 1
-fi
-
-if ! command -v jq &> /dev/null; then
-    echo "jq is required"
-    exit 1
-fi
-echo "  Required tools available"
 
 if [ -n "$(git status --porcelain)" ]; then
     echo "Error: Working directory has uncommitted changes"
@@ -920,13 +904,6 @@ if ! git pull --ff-only origin "$default_branch"; then
     exit 1
 fi
 echo "  ${default_branch} is up to date"
-
-if ! gh auth status &> /dev/null; then
-    echo "Error: GitHub CLI not authenticated"
-    echo "Run: gh auth login"
-    exit 1
-fi
-echo "  GitHub CLI authenticated"
 
 if ! labels=$(gh issue view "${issue_number}" --json labels --jq '.labels[].name'); then
     echo "Error: Could not fetch issue #${issue_number}"
@@ -965,11 +942,21 @@ git checkout -b "${branch_name}"
 echo "Updating labels: removing 'ready', adding 'in-progress' and 'ralph'"
 gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress" --add-label "ralph"
 
+current_user=$(gh api user --jq '.login' 2>/dev/null || echo "")
+if [ -n "$current_user" ]; then
+    echo "Assigning issue to ${current_user}"
+    gh issue edit "${issue_number}" --add-assignee "${current_user}" 2>/dev/null || echo "Warning: Could not assign issue"
+fi
+
 cleanup_on_error() {
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
         echo ""
         echo "Error: Script failed unexpectedly (exit code: $exit_code)"
+
+        local git_status=$(git status --short 2>/dev/null | head -20 || echo "unavailable")
+        local recent_commits=$(git log --oneline -5 2>/dev/null || echo "unavailable")
+
         gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed" 2>/dev/null || true
         gh issue comment "${issue_number}" --body "## Ralph Loop Error
 
@@ -977,7 +964,17 @@ The loop exited unexpectedly with code $exit_code.
 
 **Branch:** \`${branch_name}\`
 
-Check the terminal output for details. The branch may have partial progress." 2>/dev/null || true
+### Git Status
+\`\`\`
+${git_status}
+\`\`\`
+
+### Recent Commits
+\`\`\`
+${recent_commits}
+\`\`\`
+
+Check the terminal output for full details." 2>/dev/null || true
     fi
 }
 trap cleanup_on_error EXIT
@@ -1024,15 +1021,27 @@ tmpfile=$(mktemp)
 cleanup_and_fail() {
     rm -f "$tmpfile"
     echo ""
-    echo "============================================"
-    echo "UNEXPECTED ERROR - cleaning up"
-    echo "============================================"
+    echo "Unexpected error - cleaning up"
+
+    local git_status=$(git status --short 2>/dev/null | head -20 || echo "unavailable")
+    local recent_commits=$(git log --oneline -5 2>/dev/null || echo "unavailable")
+
     gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed" 2>/dev/null || true
     gh issue comment "${issue_number}" --body "## Ralph Loop Error
 
 The loop exited unexpectedly. Branch: \`${branch_name}\`
 
-Check the logs and retry with: \`mask ralph loop ${issue_number}\`" 2>/dev/null || true
+### Git Status
+\`\`\`
+${git_status}
+\`\`\`
+
+### Recent Commits
+\`\`\`
+${recent_commits}
+\`\`\`
+
+Retry with: \`mask ralph loop ${issue_number}\`" 2>/dev/null || true
     exit 1
 }
 
@@ -1042,9 +1051,7 @@ trap cleanup_and_fail ERR
 iteration=1
 while [ $iteration -le $max_iterations ]; do
     echo ""
-    echo "============================================"
-    echo "ITERATION ${iteration}/${max_iterations}"
-    echo "============================================"
+    echo "Iteration ${iteration}/${max_iterations}"
 
     spec=$(gh issue view "${issue_number}" --json body --jq '.body')
 
@@ -1062,9 +1069,7 @@ while [ $iteration -le $max_iterations ]; do
 
     if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
         echo ""
-        echo "============================================"
-        echo "RALPH COMPLETE after ${iteration} iterations"
-        echo "============================================"
+        echo "Ralph complete after ${iteration} iterations"
 
         echo "Updating labels: removing 'in-progress' and 'ralph'"
         gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph"
@@ -1093,7 +1098,8 @@ EOF
 )
         pr_url=$(gh pr create \
             --title "${issue_title}" \
-            --body "$pr_body")
+            --body "$pr_body" \
+            --assignee "${current_user:-}")
 
         echo "Pull request created: ${pr_url}"
         echo "Issue will auto-close on merge"
@@ -1105,9 +1111,7 @@ EOF
 done
 
 echo ""
-echo "============================================"
-echo "MAX ITERATIONS REACHED (${max_iterations})"
-echo "============================================"
+echo "Max iterations reached (${max_iterations})"
 
 echo "Pushing branch for review"
 branch_pushed="false"
@@ -1164,35 +1168,16 @@ exit 1
 
 ### backlog
 
-> Review open issues for duplicates, overlaps, and staleness
+> Review open issues for duplicates, overlaps, and implementation status
 
 ```bash
 set -euo pipefail
 
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight --claude --jq
+
 echo "Starting Ralph backlog review"
 
-if ! command -v gh &> /dev/null; then
-    echo "GitHub CLI (gh) is required"
-    exit 1
-fi
-
-if ! command -v claude &> /dev/null; then
-    echo "Claude CLI is required"
-    exit 1
-fi
-
-if ! command -v jq &> /dev/null; then
-    echo "jq is required"
-    exit 1
-fi
-
-if ! gh auth status &> /dev/null; then
-    echo "GitHub CLI not authenticated"
-    echo "Run: gh auth login"
-    exit 1
-fi
-
-staleness_days=60
 tracking_issue_title="Backlog Review"
 
 echo "Checking for existing tracking issue"
@@ -1208,9 +1193,10 @@ This issue tracks periodic backlog review reports generated by `mask ralph backl
 
 Each comment contains an analysis of open issues looking for:
 - Potential duplicates or overlapping issues
-- Stale issues (no activity for 60+ days)
 - Issues that may already be implemented
 - Consolidation opportunities
+
+Staleness is handled separately by the stale workflow action.
 
 Run `mask ralph backlog` to generate a new report.
 TRACKING_TEMPLATE
@@ -1234,20 +1220,17 @@ echo "Found ${issue_count} open issues"
 
 echo "Analyzing backlog with Claude"
 
-staleness_date=$(date -v-${staleness_days}d +%Y-%m-%d 2>/dev/null || date -d "-${staleness_days} days" +%Y-%m-%d)
 today=$(date +%Y-%m-%d)
 
 system_prompt="You are analyzing a GitHub issue backlog for consolidation opportunities.
 
 TODAY'S DATE: ${today}
-STALENESS THRESHOLD: ${staleness_days} days (issues not updated since ${staleness_date} are stale)
 TRACKING ISSUE: #${existing_issue} (do NOT include this in analysis)
 
 ANALYSIS TASKS:
 1. DUPLICATES: Find issues with similar titles/descriptions that might be duplicates
 2. OVERLAPS: Find issues that cover related functionality and could be consolidated
-3. STALE: Find issues with updatedAt older than ${staleness_date} (exclude issues with 'ready' or 'in-progress' labels)
-4. IMPLEMENTED: Search the codebase for keywords that suggest an issue might already be done
+3. IMPLEMENTED: Search the codebase for keywords that suggest an issue might already be done
 
 OUTPUT FORMAT:
 Generate a markdown report following this exact structure:
@@ -1255,21 +1238,16 @@ Generate a markdown report following this exact structure:
 ## Backlog Review - ${today}
 
 ### Potential Duplicates
-(List pairs/groups with confidence level and reasoning, or 'None found')
-
-### Stale Issues (60+ days)
-(List issue numbers with last activity date, or 'None found')
+<!-- List pairs/groups with confidence level and reasoning, or 'None found' -->
 
 ### Potentially Implemented
-(List issues where codebase search found relevant matches, or 'None found')
+<!-- List issues where codebase search found relevant matches, or 'None found' -->
 
 ### Consolidation Suggestions
-(Suggest which issues could be merged and why, or 'None')
+<!-- Suggest which issues could be merged and why, or 'None' -->
 
 ### Summary
-- X open issues reviewed
-- Y potential duplicates found
-- Z stale issues identified
+<!-- X open issues reviewed, Y potential duplicates found -->
 
 IMPORTANT:
 - Be conservative with duplicate detection - only flag clear matches
@@ -1310,28 +1288,10 @@ echo "Report posted to: https://github.com/$(gh repo view --json nameWithOwner -
 ```bash
 set -euo pipefail
 
+source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+ralph_preflight --claude --jq
+
 echo "Starting Ralph PR review"
-
-if ! command -v gh &> /dev/null; then
-    echo "GitHub CLI (gh) is required"
-    exit 1
-fi
-
-if ! command -v claude &> /dev/null; then
-    echo "Claude CLI is required"
-    exit 1
-fi
-
-if ! command -v jq &> /dev/null; then
-    echo "jq is required"
-    exit 1
-fi
-
-if ! gh auth status &> /dev/null; then
-    echo "GitHub CLI not authenticated"
-    echo "Run: gh auth login"
-    exit 1
-fi
 
 if [ -n "${pr_number:-}" ]; then
     pr_num="$pr_number"
@@ -1403,9 +1363,8 @@ while [ $index -lt "$thread_count" ]; do
     body=$(echo "$first_comment" | jq -r '.body')
 
     display_num=$((index + 1))
-    echo "============================================"
+    echo ""
     echo "[${display_num}/${thread_count}] @${author} on ${path}:${line}"
-    echo "============================================"
     echo ""
 
     # Truncate for display: show text before code blocks, summarize code blocks
@@ -1488,10 +1447,8 @@ if [ "$plan_count" -eq 0 ]; then
     exit 0
 fi
 
-echo "============================================"
-echo "Plan Summary"
-echo "============================================"
-echo "Accepted: ${plan_count} suggestion(s)"
+echo ""
+echo "Plan summary: ${plan_count} suggestion(s) accepted"
 echo ""
 jq -r '.[] | "- \(.path):\(.line) (\(.action))"' "$plan_file"
 echo ""
