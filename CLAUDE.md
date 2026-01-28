@@ -43,3 +43,66 @@
 - `libraries/` folder contains shared code resources
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
+
+## Ralph Workflow
+
+Ralph is an autonomous development loop for implementing GitHub issue specs.
+
+### Commands
+
+- `mask ralph setup` - Create required labels (run once before first use)
+- `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
+- `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
+- `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
+- `mask ralph pr [--pr <number>]` - Process PR review feedback interactively
+
+### Labels
+
+**Status labels:**
+- `in-refinement` - Spec being built or discussed
+- `ready` - Spec complete, ready for implementation
+- `in-progress` - Work actively in progress
+- `attention-needed` - Blocked or needs human intervention
+- `backlog-review` - Backlog review tracking issue
+
+**Actor label:**
+- `ralph` - Ralph is actively working on this (remove to hand off to human)
+
+### Workflow
+
+1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
+2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
+3. Run autonomous loop: `mask ralph loop <issue_number>`
+4. Loop assigns the issue and resulting PR to the current GitHub user
+5. Loop creates PR with `Closes #<issue_number>` on completion
+6. PR merge auto-closes issue
+
+### Context Rotation
+
+- Complete logically related requirements together (same files, same concepts)
+- Exit after meaningful progress to allow fresh context on next iteration
+- Judgment factors: relatedness, complexity, context size, dependencies
+
+### Completion Signal
+
+Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked to signal task completion.
+
+### Commit as Verification
+
+After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which run all tests/linting. This IS the verification step:
+- If commit fails → fix issues and retry
+- If commit succeeds → requirement is verified, check it off in issue
+- Do not skip this step or run tests separately
+
+### Ralph Learnings
+
+Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
+
+#### 2026-01-26: #723 (spec: commit-as-verification not explicit)
+
+**Issue:** Loop implemented requirements but didn't attempt git commit to verify.
+
+**Root cause:** Spec said "commit is the verification gate" but didn't explicitly say to always attempt commit after implementing.
+
+**Fix:** Added explicit "Commit-as-Verification" section requiring commit attempt after every implementation.

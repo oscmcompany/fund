@@ -1,24 +1,43 @@
 ---
-name: Issue
-about: Create an issue
+name: Spec
+about: Create a specification for Ralph autonomous implementation
 title: ''
+labels: ["feature", "in-refinement"]
 projects: ["oscmcompany/1"]
+
 ---
-# Overview
 
-## Context
+# Description
 
-<!--
-For bugs, provide additional information on the problem.
-For features, provide additional information on the proposal.
-For tasks, provide additional information on the work.
-Apply relevant labels currently available on the repository.
--->
+<Context: why this work matters, background needed>
 
-## Changes
+**Goal:** <Single clear statement of what we're trying to achieve>
 
-<!--
-Provide solution(s) or recommendation(s) as bullet points.
-Provide specific work items as checkboxes.
--->
+## Requirements
 
+### Category 1
+
+- [ ] Requirement (testable/verifiable)
+- [ ] Another requirement
+
+### Category 2
+
+- [ ] Requirement
+- [ ] Requirement
+
+## Open Questions
+
+- [ ] Question that needs resolution before ready?
+- [ ] Another question?
+
+## Decisions
+
+- [ ] **Decision name:** Choice made and rationale
+
+## Specification
+
+<Detailed design, diagrams, formats - filled in as decisions are made>
+
+## Implementation Notes
+
+<Filled after implementation - gotchas, learnings>
