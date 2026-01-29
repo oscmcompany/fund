@@ -1326,7 +1326,7 @@ else
     pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
     if [ -z "$pr_num" ]; then
         echo "Error: No pull request found for current branch"
-        echo "Include a pull request number positional argument \"mask ralph pull-request <pull_request_number>\" to specify a pull request"
+        echo "Use: mask ralph pull-request <pull_request_number>"
         exit 1
     fi
     echo "Found pull request #${pr_num}"
