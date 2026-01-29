@@ -41,6 +41,7 @@ openssl.pkg-path = "openssl"
 pkgconf.pkg-path = "pkgconf"
 direnv.pkg-path = "direnv"
 jq.pkg-path = "jq"
+markdownlint-cli.pkg-path = "markdownlint-cli"
 
 [hook]
 on-activate = '''

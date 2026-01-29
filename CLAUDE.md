@@ -1,4 +1,4 @@
-# claude 
+# claude
 
 > Agentic tooling context
 
@@ -24,11 +24,13 @@
 - Introduce new dependencies only after approval
 - Include type hints on all Python function parameters and return types
 - Rust servers primarily use [Axum](https://docs.rs/axum/latest/axum/)
-- Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and [Rust](https://docs.rs/polars/latest/polars/) dataframes
+- Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and
+  [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
 - Write `pytest` functions for Python tests
 - Ensure Rust and Python automated test suites achieve at least 90% line or statement coverage per service or library
-- Exclude generated code, third‑party code, tooling boilerplate, and anything explicitly excluded in this repository from test coverage calculations
+- Exclude generated code, third‑party code, tooling boilerplate, and anything explicitly excluded in this repository
+  from test coverage calculations
 - Check that DataFrame definitions in both Python and Rust match expected schemas defined in `pandera` resources
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
 - When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
@@ -60,6 +62,7 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 ### Labels
 
 **Status labels:**
+
 - `in-refinement` - Spec being built or discussed
 - `ready` - Spec complete, ready for implementation
 - `in-progress` - Work actively in progress
@@ -67,6 +70,7 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 - `backlog-review` - Backlog review tracking issue
 
 **Actor label:**
+
 - `ralph` - Ralph is actively working on this (remove to hand off to human)
 
 ### Workflow
@@ -90,14 +94,17 @@ Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked
 
 ### Commit as Verification
 
-After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which run all tests/linting. This IS the verification step:
+After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which
+run all tests/linting. This IS the verification step:
+
 - If commit fails → fix issues and retry
 - If commit succeeds → requirement is verified, check it off in issue
 - Do not skip this step or run tests separately
 
 ### Ralph Learnings
 
-Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
+Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section
+by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
 
 #### 2026-01-26: #723 (spec: commit-as-verification not explicit)
 
