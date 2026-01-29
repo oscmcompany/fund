@@ -525,7 +525,7 @@ set -euo pipefail
 
 echo "Running Markdown lint checks"
 
-markdownlint "**/*.md" "#.flox" "#.venv" "#target"
+markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" --ignore "target"
 
 echo "Markdown linting completed successfully"
 ```
@@ -1326,7 +1326,7 @@ else
     pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
     if [ -z "$pr_num" ]; then
         echo "Error: No pull request found for current branch"
-        echo "Use --pr <number> to specify a pull request"
+        echo "Include a pull request number positional argument \"mask ralph pull-request <pull_request_number>\" to specify a pull request"
         exit 1
     fi
     echo "Found pull request #${pr_num}"
