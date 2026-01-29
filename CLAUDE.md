@@ -57,7 +57,7 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 - `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
 - `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
 - `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
-- `mask ralph pr [--pr <number>]` - Process PR review feedback interactively
+- `mask ralph pull-request [pull_request_number]` - Process pull request review feedback interactively
 
 ### Labels
 
@@ -78,9 +78,9 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
 2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
 3. Run autonomous loop: `mask ralph loop <issue_number>`
-4. Loop assigns the issue and resulting PR to the current GitHub user
-5. Loop creates PR with `Closes #<issue_number>` on completion
-6. PR merge auto-closes issue
+4. Loop assigns the issue and resulting pull request to the current GitHub user
+5. Loop creates pull request with `Closes #<issue_number>` on completion
+6. Pull request merge auto-closes issue
 
 ### Context Rotation
 
