@@ -29,7 +29,7 @@
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
 - Write `pytest` functions for Python tests
 - Ensure Rust and Python automated test suites achieve at least 90% line or statement coverage per service or library
-- Exclude generated code, third‑party code, tooling boilerplate, and anything explicitly excluded in this repository
+- Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations
 - Check that DataFrame definitions in both Python and Rust match expected schemas defined in `pandera` resources
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
