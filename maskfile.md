@@ -22,7 +22,7 @@ if [[ ${#missing_deps[@]} -gt 0 ]]; then
     for dep in "${missing_deps[@]}"; do
         case $dep in
             "Docker")
-                echo "  - Docker: https://docs.docker.com/get-docker/"
+                echo "- Docker: https://docs.docker.com/get-docker/"
                 ;;
         esac
     done
@@ -512,6 +512,38 @@ mask development python test
 echo "Python development checks completed successfully"
 ```
 
+### markdown
+
+> Markdown development workflow commands
+
+#### lint
+
+> Run Markdown lint checks
+
+```bash
+set -euo pipefail
+
+echo "Running Markdown lint checks"
+
+markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" --ignore "target"
+
+echo "Markdown linting completed successfully"
+```
+
+#### all
+
+> Full Markdown development checks
+
+```bash
+set -euo pipefail
+
+echo "Running Markdown development checks"
+
+mask development markdown lint
+
+echo "Markdown development checks completed successfully"
+```
+
 ## data
 
 > Data management commands
@@ -622,9 +654,9 @@ case "$preset" in
         echo "Unknown preset: $preset"
         echo ""
         echo "Available presets:"
-        echo "  testing     - ml.t3.xlarge (CPU, ~\$0.23/hr)"
-        echo "  standard    - ml.g5.xlarge (GPU, ~\$1.41/hr) [default]"
-        echo "  performance - ml.p3.2xlarge (GPU, ~\$3.82/hr)"
+        echo "testing     - ml.t3.xlarge (CPU, ~\$0.23/hr)"
+        echo "standard    - ml.g5.xlarge (GPU, ~\$1.41/hr) [default]"
+        echo "performance - ml.p3.2xlarge (GPU, ~\$3.82/hr)"
         echo ""
         echo "Or specify a custom instance type: ml.g4dn.xlarge"
         exit 1
@@ -710,11 +742,11 @@ CW_PKG="awslabs.cloudwatch-mcp-server@latest"
 
 echo "Detecting uvx executable for ECS package: $ECS_PKG"
 ECS_EXE="$(detect_uvx_exe "$ECS_PKG")"
-echo "  -> ECS executable: $ECS_EXE"
+echo "-> ECS executable: $ECS_EXE"
 
 echo "Detecting uvx executable for CloudWatch package: $CW_PKG"
 CW_EXE="$(detect_uvx_exe "$CW_PKG")"
-echo "  -> CloudWatch executable: $CW_EXE"
+echo "-> CloudWatch executable: $CW_EXE"
 
 echo "Adding ECS MCP server..."
 claude mcp add awslabs-ecs-mcp-server -s project \
@@ -746,13 +778,13 @@ claude mcp list
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight
 
 echo "Setting up Ralph labels"
 
 labels='[
-  {"name": "ralph", "color": "6f42c1", "description": "Ralph is actively working on this"},
+  {"name": "ralph", "color": "5319e7", "description": "Ralph is actively working on this"},
   {"name": "in-refinement", "color": "d93f0b", "description": "Spec being built or discussed"},
   {"name": "ready", "color": "0e8a16", "description": "Spec complete, ready for implementation"},
   {"name": "in-progress", "color": "fbca04", "description": "Work actively in progress"},
@@ -768,10 +800,10 @@ echo "$labels" | jq -c '.[]' | while read -r label; do
     desc=$(echo "$label" | jq -r '.description')
 
     if echo "$existing" | grep -qx "$name"; then
-        echo "  Label '$name' already exists"
+        echo "Label '$name' already exists"
     else
         gh label create "$name" --color "$color" --description "$desc"
-        echo "  Created label '$name'"
+        echo "Created label '$name'"
     fi
 done
 
@@ -785,7 +817,7 @@ echo "Setup complete"
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight --claude --jq
 
 echo "Starting Ralph spec refinement"
@@ -839,7 +871,7 @@ claude --system-prompt "$system_prompt"
 echo ""
 echo "Spec refinement session ended"
 echo "When ready, mark the spec as ready:"
-echo "  mask ralph ready ${issue_number}"
+echo "mask ralph ready ${issue_number}"
 ```
 
 ### ready (issue_number)
@@ -849,7 +881,7 @@ echo "  mask ralph ready ${issue_number}"
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight
 
 echo "Marking issue #${issue_number} as ready"
@@ -872,7 +904,7 @@ echo "Run the loop with: mask ralph loop ${issue_number}"
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight --claude --jq
 
 max_iterations="${RALPH_MAX_ITERATIONS:-10}"
@@ -886,7 +918,7 @@ if [ -n "$(git status --porcelain)" ]; then
     echo "Commit or stash changes before running ralph loop"
     exit 1
 fi
-echo "  Working directory is clean"
+echo "Working directory is clean"
 
 default_branch=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
 current_branch=$(git rev-parse --abbrev-ref HEAD)
@@ -895,15 +927,15 @@ if [ "$current_branch" != "$default_branch" ]; then
     echo "Run: git checkout ${default_branch}"
     exit 1
 fi
-echo "  On default branch (${default_branch})"
+echo "On default branch (${default_branch})"
 
-echo "  Pulling latest ${default_branch}"
+echo "Pulling latest ${default_branch}"
 if ! git pull --ff-only origin "$default_branch"; then
     echo "Error: Could not pull latest ${default_branch}"
     echo "Resolve conflicts or check network/auth"
     exit 1
 fi
-echo "  ${default_branch} is up to date"
+echo "${default_branch} is up to date"
 
 if ! labels=$(gh issue view "${issue_number}" --json labels --jq '.labels[].name'); then
     echo "Error: Could not fetch issue #${issue_number}"
@@ -915,7 +947,7 @@ if ! echo "$labels" | grep -q "^ready$"; then
     echo "Current labels: ${labels:-none}"
     exit 1
 fi
-echo "  Issue has 'ready' label"
+echo "Issue has 'ready' label"
 
 issue_title=$(gh issue view "${issue_number}" --json title --jq '.title')
 short_desc=$(echo "$issue_title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
@@ -932,7 +964,7 @@ if git ls-remote --heads origin "${branch_name}" 2>/dev/null | grep -q .; then
     echo "Delete with: git push origin --delete ${branch_name}"
     exit 1
 fi
-echo "  Branch '${branch_name}' does not exist"
+echo "Branch '${branch_name}' does not exist"
 
 echo "Pre-flight checks passed"
 
@@ -991,7 +1023,7 @@ WORKFLOW:
 
 COMPLETION:
 - When ALL requirement checkboxes are checked, output <promise>COMPLETE</promise>
-- This signals the loop is done and triggers PR creation
+- This signals the loop is done and triggers pull request creation
 
 CONTEXT ROTATION:
 - Complete logically related requirements together (same files, same concepts)
@@ -1173,7 +1205,7 @@ exit 1
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight --claude --jq
 
 echo "Starting Ralph backlog review"
@@ -1274,37 +1306,30 @@ echo "Backlog review complete"
 echo "Report posted to: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/issues/${existing_issue}"
 ```
 
-### pull-request
+### pull-request [pull_request_number]
 
-> Process PR review feedback interactively
-
-**OPTIONS**
-
-* pr_number
-  * flags: --pr
-  * type: string
-  * desc: PR number (auto-detects from branch if not provided)
+> Process pull request review feedback interactively
 
 ```bash
 set -euo pipefail
 
-source "${MASKFILE_DIR}/tools/ralph-preflight.sh"
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
 ralph_preflight --claude --jq
 
-echo "Starting Ralph PR review"
+echo "Starting Ralph pull request review"
 
-if [ -n "${pr_number:-}" ]; then
-    pr_num="$pr_number"
-    echo "Using PR #${pr_num}"
+if [ -n "${pull_request_number:-}" ]; then
+    pr_num="$pull_request_number"
+    echo "Using pull request #${pr_num}"
 else
-    echo "Auto-detecting PR from current branch"
+    echo "Auto-detecting pull request from current branch"
     pr_num=$(gh pr view --json number --jq '.number' 2>/dev/null || echo "")
     if [ -z "$pr_num" ]; then
-        echo "Error: No PR found for current branch"
-        echo "Use --pr <number> to specify a PR"
+        echo "Error: No pull request found for current branch"
+        echo "Use: mask ralph pull-request <pull_request_number>"
         exit 1
     fi
-    echo "Found PR #${pr_num}"
+    echo "Found pull request #${pr_num}"
 fi
 
 repo_info=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
@@ -1466,7 +1491,7 @@ echo "Starting execution phase"
 
 plan_json=$(cat "$plan_file")
 
-system_prompt="You are implementing approved PR review suggestions.
+system_prompt="You are implementing approved pull request review suggestions.
 
 TASK:
 For each suggestion in the plan, implement the requested change.
@@ -1535,6 +1560,6 @@ echo "$results_json" | jq -c '.[]' | while read -r item; do
 done
 
 echo ""
-echo "PR review complete"
-echo "View PR: https://github.com/${repo_info}/pull/${pr_num}"
+echo "Pull request review complete"
+echo "View pull request: https://github.com/${repo_info}/pull/${pr_num}"
 ```
