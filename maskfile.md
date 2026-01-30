@@ -1563,3 +1563,190 @@ echo ""
 echo "Pull request review complete"
 echo "View pull request: https://github.com/${repo_info}/pull/${pr_num}"
 ```
+
+### marketplace
+
+> Marketplace-based autonomous development loop with competing smart bots
+
+#### setup
+
+> Initialize marketplace state and bot configurations
+
+```bash
+set -euo pipefail
+
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
+ralph_preflight --jq
+
+echo "Initializing Ralph marketplace"
+
+uv run python tools/ralph_marketplace_orchestrator.py setup
+
+echo "Marketplace initialized successfully"
+```
+
+#### loop (issue_number)
+
+> Run marketplace competition loop on a ready spec
+
+```bash
+set -euo pipefail
+
+source "${MASKFILE_DIR}/tools/ralph_preflight.sh"
+ralph_preflight --claude --jq
+
+max_iterations="${RALPH_MAX_ITERATIONS:-10}"
+
+echo "Starting Ralph marketplace loop for issue #${issue_number}"
+
+echo "Running pre-flight checks"
+
+if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: Working directory has uncommitted changes"
+    echo "Commit or stash changes before running ralph marketplace loop"
+    exit 1
+fi
+echo "Working directory is clean"
+
+default_branch=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$current_branch" != "$default_branch" ]; then
+    echo "Error: Not on default branch ${default_branch} (currently on: ${current_branch})"
+    echo "Run: git checkout ${default_branch}"
+    exit 1
+fi
+echo "On default branch (${default_branch})"
+
+echo "Pulling latest ${default_branch}"
+if ! git pull --ff-only origin "$default_branch"; then
+    echo "Error: Could not pull latest ${default_branch}"
+    echo "Resolve conflicts or check network/auth"
+    exit 1
+fi
+echo "${default_branch} is up to date"
+
+if ! labels=$(gh issue view "${issue_number}" --json labels --jq '.labels[].name'); then
+    echo "Error: Could not fetch issue #${issue_number}"
+    echo "Check network connectivity and issue existence"
+    exit 1
+fi
+if ! echo "$labels" | grep -q "^ready$"; then
+    echo "Error: Issue #${issue_number} does not have 'ready' label"
+    echo "Current labels: ${labels:-none}"
+    exit 1
+fi
+echo "Issue has 'ready' label"
+
+issue_title=$(gh issue view "${issue_number}" --json title --jq '.title')
+short_desc=$(echo "$issue_title" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-' | cut -c1-30)
+branch_name="ralph/${issue_number}-${short_desc}"
+
+if git show-ref --verify --quiet "refs/heads/${branch_name}" 2>/dev/null; then
+    echo "Error: Local branch '${branch_name}' already exists"
+    echo "Delete with: git branch -d ${branch_name}"
+    exit 1
+fi
+
+if git ls-remote --heads origin "${branch_name}" 2>/dev/null | grep -q .; then
+    echo "Error: Remote branch '${branch_name}' already exists"
+    echo "Delete with: git push origin --delete ${branch_name}"
+    exit 1
+fi
+echo "Branch '${branch_name}' does not exist"
+
+echo "Pre-flight checks passed"
+
+echo "Creating branch: ${branch_name}"
+git checkout -b "${branch_name}"
+
+echo "Updating labels: removing 'ready', adding 'in-progress' and 'ralph'"
+gh issue edit "${issue_number}" --remove-label "ready" --add-label "in-progress" --add-label "ralph"
+
+current_user=$(gh api user --jq '.login' 2>/dev/null || echo "")
+if [ -n "$current_user" ]; then
+    echo "Assigning issue to ${current_user}"
+    gh issue edit "${issue_number}" --add-assignee "${current_user}" 2>/dev/null || echo "Warning: Could not assign issue"
+fi
+
+cleanup_on_error() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo ""
+        echo "Error: Marketplace loop failed unexpectedly (exit code: $exit_code)"
+
+        local git_status=$(git status --short 2>/dev/null | head -20 || echo "unavailable")
+        local recent_commits=$(git log --oneline -5 2>/dev/null || echo "unavailable")
+
+        gh issue edit "${issue_number}" --remove-label "in-progress" --remove-label "ralph" --add-label "attention-needed" 2>/dev/null || true
+        gh issue comment "${issue_number}" --body "## Ralph Marketplace Loop Error
+
+The marketplace loop exited unexpectedly with code $exit_code.
+
+**Branch:** \`${branch_name}\`
+
+### Git Status
+\`\`\`
+${git_status}
+\`\`\`
+
+### Recent Commits
+\`\`\`
+${recent_commits}
+\`\`\`
+
+Check the terminal output for full details." 2>/dev/null || true
+    fi
+}
+trap cleanup_on_error EXIT
+
+echo "Delegating to marketplace orchestrator"
+uv run python tools/ralph_marketplace_orchestrator.py loop "${issue_number}" "${branch_name}"
+
+echo ""
+echo "Marketplace loop execution delegated to orchestrator"
+echo "Note: Full integration with Claude CLI arbiter agent is pending"
+echo "This establishes the command structure and state management"
+
+trap - EXIT
+```
+
+#### status
+
+> Show marketplace state including bot weights, efficiency, and recent rounds
+
+```bash
+set -euo pipefail
+
+echo "Fetching Ralph marketplace status"
+
+uv run python tools/ralph_marketplace_orchestrator.py status
+```
+
+#### reset
+
+> Reset all bot weights to equal (use with caution)
+
+```bash
+set -euo pipefail
+
+echo "Resetting Ralph marketplace to equal bot weights"
+echo ""
+echo "WARNING: This will:"
+echo "  - Remove all event history"
+echo "  - Reset bot weights to equal"
+echo "  - Clear cached state"
+echo "  - Keep configuration unchanged"
+echo ""
+
+read -p "Are you sure? This will erase learning history. [y/N]: " confirm < /dev/tty
+if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo "Aborted"
+    exit 0
+fi
+
+uv run python tools/ralph_marketplace_orchestrator.py reset
+
+echo ""
+echo "Marketplace reset complete"
+echo "Run 'mask ralph marketplace status' to verify"
+```
