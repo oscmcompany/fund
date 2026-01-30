@@ -1,7 +1,8 @@
-# fund 
+# fund
 
 > The open source capital management company  
 
+<!-- markdownlint-disable-next-line MD013 -->
 [![Python code checks](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml) [![Rust code checks](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml)  
 
 ## About
@@ -42,4 +43,5 @@ An unordered and non-exhaustive list we work towards:
 
 ### Links
 
-Check out [our tasks](https://github.com/orgs/oscmcompany/projects/1) to see what we're working on or ping [either](https://x.com/forstmeier) of [us](https://x.com/hyperpriorai) for anything else.  
+Check out [our tasks](https://github.com/orgs/oscmcompany/projects/1) to see what we're working on or
+ping [either](https://x.com/forstmeier) of [us](https://x.com/hyperpriorai) for anything else.  

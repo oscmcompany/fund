@@ -20,3 +20,12 @@ repos:
           - rust
         language: system
         fail_fast: true
+      - id: markdown
+        name: Check all Markdown code
+        entry: mask development markdown all
+        pass_filenames: false
+        types:
+          - file
+          - markdown
+        language: system
+        fail_fast: true
