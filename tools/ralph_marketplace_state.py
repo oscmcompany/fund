@@ -5,7 +5,7 @@ Handles loading, saving, and computing marketplace state from append-only event 
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +74,7 @@ class MarketplaceStateManager:
                 "weight_constraints": {"min": 0.05, "max": 0.60},
             }
 
-        with open(self.config_file) as f:
+        with open(self.config_file, encoding="utf-8") as f:
             return json.load(f)
 
     def save_config(self, config: dict[str, Any]) -> None:
@@ -83,7 +83,7 @@ class MarketplaceStateManager:
         Args:
             config: Configuration dictionary
         """
-        with open(self.config_file, "w") as f:
+        with open(self.config_file, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
 
     def load_events(self) -> list[dict[str, Any]]:
@@ -97,9 +97,14 @@ class MarketplaceStateManager:
             return events
 
         for event_file in self.events_dir.glob("*.json"):
-            with open(event_file) as f:
-                event = json.load(f)
-                events.append(event)
+            try:
+                with open(event_file, encoding="utf-8") as f:
+                    event = json.load(f)
+                    events.append(event)
+            except json.JSONDecodeError as e:
+                # Log warning and skip corrupted file
+                print(f"Warning: Skipping corrupted event file {event_file.name}: {e}")
+                continue
 
         # Sort by timestamp
         events.sort(key=lambda e: e["timestamp"])
@@ -141,14 +146,24 @@ class MarketplaceStateManager:
             weight_delta = event.get("weight_delta", 0.0)
 
             if bot_id not in bots:
+                print(
+                    f"Warning: Event for unknown bot '{bot_id}' "
+                    f"(outcome: {outcome}, weight_delta: {weight_delta})"
+                )
                 continue
 
             bot = bots[bot_id]
 
             # Update based on outcome
-            if outcome in ["success", "replan_success"]:
+            # Check for success outcomes (ends with _success)
+            if isinstance(outcome, str) and (
+                outcome.endswith("_success") or outcome == "success"
+            ):
                 bot.implementations_succeeded += 1
-            elif outcome in ["failure", "replan_failure"]:
+            # Check for failure outcomes (contains "failure" or "failed")
+            elif isinstance(outcome, str) and (
+                "failure" in outcome or "failed" in outcome
+            ):
                 bot.implementations_failed += 1
 
             # Update weight
@@ -159,15 +174,18 @@ class MarketplaceStateManager:
 
             # Update accuracy tracking
             if "accuracy" in event:
-                # Running average
-                total_implementations = (
-                    bot.implementations_succeeded + bot.implementations_failed
-                )
-                if total_implementations > 0:
+                # Running average (only count events with accuracy)
+                # Count how many events with accuracy we've seen so far
+                accuracy_count = 0
+                for prev_event in events[: events.index(event) + 1]:
+                    if prev_event["bot_id"] == bot_id and "accuracy" in prev_event:
+                        accuracy_count += 1
+
+                if accuracy_count > 0:
+                    # Update running average considering only events with accuracy
                     bot.average_accuracy = (
-                        bot.average_accuracy * (total_implementations - 1)
-                        + event["accuracy"]
-                    ) / total_implementations
+                        bot.average_accuracy * (accuracy_count - 1) + event["accuracy"]
+                    ) / accuracy_count
 
         # Normalize weights to sum to 1.0
         total_weight = sum(bot.weight for bot in bots.values())
@@ -199,7 +217,7 @@ class MarketplaceStateManager:
             bots=bots,
             total_budget_pool=config["num_bots"] * config["base_budget_per_bot"],
             rounds_completed=len(events),
-            last_updated=datetime.now().isoformat(),
+            last_updated=datetime.now(timezone.utc).isoformat(),
         )
 
     def load_state(self) -> MarketplaceState:
@@ -218,7 +236,7 @@ class MarketplaceStateManager:
 
         if self.state_file.exists() and cached_version == len(events):
             # Cache is current, load it
-            with open(self.state_file) as f:
+            with open(self.state_file, encoding="utf-8") as f:
                 state_dict = json.load(f)
                 bots = {
                     bot_id: BotState(**bot_data)
@@ -264,7 +282,7 @@ class MarketplaceStateManager:
             "last_updated": state.last_updated,
         }
 
-        with open(self.state_file, "w") as f:
+        with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(state_dict, f, indent=2)
 
         # Update version file
@@ -278,7 +296,7 @@ class MarketplaceStateManager:
             event: Event dictionary containing outcome details
         """
         if "timestamp" not in event:
-            event["timestamp"] = datetime.now().isoformat()
+            event["timestamp"] = datetime.now(timezone.utc).isoformat()
 
         # Create event filename
         timestamp_str = event["timestamp"].replace(":", "-").replace(".", "-")
@@ -288,7 +306,7 @@ class MarketplaceStateManager:
 
         # Write event file
         event_file = self.events_dir / filename
-        with open(event_file, "w") as f:
+        with open(event_file, "w", encoding="utf-8") as f:
             json.dump(event, f, indent=2)
 
     def reset_state(self) -> None:

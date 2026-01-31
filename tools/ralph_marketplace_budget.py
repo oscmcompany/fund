@@ -3,14 +3,14 @@
 Handles iteration budget allocation across smart bots based on weights and efficiency.
 """
 
-from tools.ralph_marketplace_state import BotState, MarketplaceState
+from tools.ralph_marketplace_state import MarketplaceState
 
 
 def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
     """Allocate iteration budgets to bots using fixed pool with efficiency rewards.
 
     The total budget pool is fixed at (num_bots * base_budget_per_bot).
-    Allocation is based on combined score: weight × efficiency.
+    Allocation is based on combined score: weight * efficiency.
     This creates zero-sum competition where high performers take from low performers.
 
     Args:
@@ -21,7 +21,7 @@ def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
     """
     total_budget = state.total_budget_pool
 
-    # Calculate combined scores (weight × efficiency)
+    # Calculate combined scores (weight * efficiency)
     combined_scores = {}
     for bot_id, bot in state.bots.items():
         combined_scores[bot_id] = bot.weight * bot.efficiency
@@ -48,12 +48,12 @@ def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
     total_allocated = 0
 
     # Sort by fractional part descending to prioritize rounding up
-    items = sorted(
-        allocations.items(), key=lambda x: x[1] - int(x[1]), reverse=True
-    )
+    items = sorted(allocations.items(), key=lambda x: x[1] - int(x[1]), reverse=True)
 
     for bot_id, allocation in items:
         integer_allocation = int(allocation)
+        # Ensure minimum of 1 iteration per bot
+        integer_allocation = max(1, integer_allocation)
         integer_allocations[bot_id] = integer_allocation
         total_allocated += integer_allocation
 
@@ -61,17 +61,18 @@ def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
     remaining = total_budget - total_allocated
     if remaining > 0:
         # Give remaining iterations to highest-scoring bots
-        sorted_bots = sorted(
-            combined_scores.items(), key=lambda x: x[1], reverse=True
-        )
+        sorted_bots = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
         for i in range(remaining):
             bot_id = sorted_bots[i % len(sorted_bots)][0]
             integer_allocations[bot_id] += 1
-
-    # Ensure minimum allocation of 1 iteration per bot (can participate)
-    for bot_id in integer_allocations:
-        if integer_allocations[bot_id] < 1:
-            integer_allocations[bot_id] = 1
+    elif remaining < 0:
+        # Need to reduce allocations to fit budget
+        # Take from lowest-scoring bots first
+        sorted_bots = sorted(combined_scores.items(), key=lambda x: x[1], reverse=False)
+        for i in range(abs(remaining)):
+            bot_id = sorted_bots[i % len(sorted_bots)][0]
+            if integer_allocations[bot_id] > 1:
+                integer_allocations[bot_id] -= 1
 
     return integer_allocations
 
@@ -98,9 +99,7 @@ def format_budget_allocation(
     ]
 
     # Sort by allocation descending
-    sorted_bots = sorted(
-        allocations.items(), key=lambda x: x[1], reverse=True
-    )
+    sorted_bots = sorted(allocations.items(), key=lambda x: x[1], reverse=True)
 
     for bot_id, budget in sorted_bots:
         bot = state.bots[bot_id]
@@ -111,9 +110,12 @@ def format_budget_allocation(
     # Verify total
     total_allocated = sum(allocations.values())
     lines.append("-" * 60)
-    lines.append(f"{'Total Allocated':<15} {' '*18} {total_allocated:>10}")
+    lines.append(f"{'Total Allocated':<15} {' ' * 18} {total_allocated:>10}")
 
     if total_allocated != state.total_budget_pool:
-        lines.append(f"WARNING: Total allocated ({total_allocated}) != pool ({state.total_budget_pool})")
+        lines.append(
+            f"WARNING: Total allocated ({total_allocated}) "
+            f"!= pool ({state.total_budget_pool})"
+        )
 
     return "\n".join(lines)

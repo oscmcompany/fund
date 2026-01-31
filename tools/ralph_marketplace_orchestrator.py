@@ -9,7 +9,6 @@ from pathlib import Path
 
 from tools.ralph_marketplace_budget import allocate_budgets, format_budget_allocation
 from tools.ralph_marketplace_state import MarketplaceStateManager
-from tools.ralph_marketplace_weights import format_weight_update_summary
 
 
 def setup_marketplace() -> None:
@@ -23,14 +22,14 @@ def setup_marketplace() -> None:
     config = state_manager.load_config()
     state_manager.save_config(config)
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  Number of bots: {config['num_bots']}")
     print(f"  Base budget per bot: {config['base_budget_per_bot']}")
     print(f"  Total budget pool: {config['num_bots'] * config['base_budget_per_bot']}")
-    print(f"\nScoring weights:")
+    print("\nScoring weights:")
     for dimension, weight in config["scoring_weights"].items():
         print(f"  {dimension}: {weight:.2f}")
-    print(f"\nWeight constraints:")
+    print("\nWeight constraints:")
     print(f"  Min: {config['weight_constraints']['min']:.2f}")
     print(f"  Max: {config['weight_constraints']['max']:.2f}")
 
@@ -163,7 +162,7 @@ def run_marketplace_loop(issue_number: str, branch_name: str) -> None:
         sys.exit(1)
 
     # Load arbiter prompt template
-    with open(arbiter_prompt_path) as f:
+    with open(arbiter_prompt_path, encoding="utf-8") as f:
         arbiter_prompt = f.read()
 
     # Inject context variables
@@ -182,12 +181,12 @@ def run_marketplace_loop(issue_number: str, branch_name: str) -> None:
     print("MARKETPLACE LOOP")
     print("=" * 80)
     print()
-    print(f"The arbiter will now orchestrate the competition:")
+    print("The arbiter will now orchestrate the competition:")
     print(f"  1. Extract requirements from issue #{issue_number}")
     print(f"  2. Spawn {config['num_bots']} smart bots to submit proposals")
-    print(f"  3. Evaluate and rank proposals")
-    print(f"  4. Implement top-ranked proposal")
-    print(f"  5. Update marketplace state based on outcome")
+    print("  3. Evaluate and rank proposals")
+    print("  4. Implement top-ranked proposal")
+    print("  5. Update marketplace state based on outcome")
     print()
     print("Note: The actual loop execution requires integration with Claude CLI")
     print("This placeholder demonstrates the orchestration structure")
@@ -226,7 +225,9 @@ def main() -> None:
         reset_marketplace()
     elif command == "loop":
         if len(sys.argv) < 4:
-            print("Usage: python ralph_marketplace_orchestrator.py loop <issue_number> <branch_name>")
+            print(
+                "Usage: python ralph_marketplace_orchestrator.py loop <issue_number> <branch_name>"
+            )
             sys.exit(1)
         issue_number = sys.argv[2]
         branch_name = sys.argv[3]

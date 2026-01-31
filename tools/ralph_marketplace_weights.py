@@ -50,7 +50,8 @@ def calculate_weight_delta(
     # Add accuracy bonus for successful outcomes
     if (
         accuracy is not None
-        and outcome in ["ranked_first_success", "ranked_second_plus_success", "replan_new_success"]
+        and outcome
+        in ["ranked_first_success", "ranked_second_plus_success", "replan_new_success"]
         and accuracy <= ACCURACY_BONUS_THRESHOLD
     ):
         return base_delta + ACCURACY_BONUS
@@ -62,6 +63,7 @@ def determine_outcome_type(
     bot_id: str,
     rankings: list[tuple[str, float]],
     implementation_result: str,
+    *,
     is_replan: bool = False,
     resubmitted_same: bool = False,
 ) -> OutcomeType:
@@ -85,7 +87,8 @@ def determine_outcome_type(
             break
 
     if bot_rank is None:
-        raise ValueError(f"Bot {bot_id} not found in rankings")
+        message = f"Bot {bot_id} not found in rankings"
+        raise ValueError(message)
 
     # Replan scenarios
     if is_replan:
