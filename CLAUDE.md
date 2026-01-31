@@ -206,6 +206,7 @@ Proposals and implementations scored on 6 unified dimensions:
 - Cache: regenerated automatically when stale (gitignored)
 
 **Event schema:**
+
 ```json
 {
   "timestamp": "2026-01-29T10:15:00Z",

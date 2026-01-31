@@ -240,7 +240,7 @@ total_score = (
    - Verified all requirements
    - All quality checks passed
 
-   Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>"
+   Co-Authored-By: Claude Sonnet <noreply@anthropic.com>"
 
    # Update marketplace state
    # - Reward winning bot: +0.10 weight
@@ -312,33 +312,40 @@ Check branch: \`{{branch_name}}\`"
 
 ## Marketplace State Updates
 
-After each round, update `.ralph/events/` with new event:
+After each round, record a new marketplace event using `MarketplaceStateManager.record_event()`:
 
-```bash
-timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-bot_id="smart_bot_2"  # Revealed after implementation
-outcome="success"  # or "failure", "replan_success", "replan_failure"
+```python
+from datetime import datetime, timezone
+from tools.ralph_marketplace_state import MarketplaceStateManager
 
-cat > .ralph/events/${timestamp}-${bot_id}-${outcome}.json <<EOF
-{
-  "timestamp": "${timestamp}",
-  "issue_number": {{issue_number}},
-  "bot_id": "${bot_id}",
-  "outcome": "${outcome}",
-  "proposal_score": 0.87,
-  "implementation_score": 0.85,
-  "accuracy": 0.98,
-  "weight_delta": 0.15,
-  "iteration_count": 3,
-  "metrics": {
-    "tests_passed": true,
-    "code_quality_passed": true,
-    "coverage_delta": 2.5,
-    "lines_changed": 45,
-    "files_affected": 3
-  }
+manager = MarketplaceStateManager()
+
+# Revealed after implementation
+bot_id = "smart_bot_2"
+# One of the OutcomeType variants from ralph_marketplace_weights.py
+outcome = "ranked_first_success"
+
+event = {
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+    "issue_number": {{issue_number}},
+    "bot_id": bot_id,
+    "outcome": outcome,
+    "proposal_score": 0.87,
+    "implementation_score": 0.85,
+    "accuracy": 0.98,
+    "weight_delta": 0.15,
+    "iteration_count": 3,
+    "metrics": {
+        "tests_passed": True,
+        "code_quality_passed": True,
+        "coverage_delta": 2.5,
+        "lines_changed": 45,
+        "files_affected": 3,
+    },
 }
-EOF
+
+# Delegate persistence and file naming to the marketplace state manager
+manager.record_event(event)
 ```
 
 ## Important Notes

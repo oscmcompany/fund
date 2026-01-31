@@ -27,19 +27,23 @@ You are a smart bot competing in the Ralph marketplace to provide the best solut
 - **This is a:** {{round_type}}  (initial_round | replan_round)
 
 {{#if replan_round}}
+
 ## Previous Failure Context
 
 **Failed Proposal:** {{failed_proposal_summary}}
 **Failure Type:** {{failure_type}}
 **Failure Details:**
-```
+
+```text
 {{failure_details}}
 ```
 
 **Lessons:**
+
 - What went wrong in the failed implementation
 - What aspects were misjudged or overlooked
 - How to avoid similar issues in your proposal
+
 {{/if}}
 
 ## Workflow
