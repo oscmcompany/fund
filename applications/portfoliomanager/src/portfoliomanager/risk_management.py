@@ -2,6 +2,7 @@ import math
 import os
 from datetime import UTC, datetime
 
+import numpy as np
 import polars as pl
 import structlog
 
@@ -11,6 +12,7 @@ from .exceptions import InsufficientPredictionsError
 logger = structlog.get_logger()
 
 UNCERTAINTY_THRESHOLD = float(os.getenv("PSF_UNCERTAINTY_THRESHOLD", "0.1"))
+UNCERTAINTY_PERCENTILE = float(os.getenv("PSF_UNCERTAINTY_PERCENTILE", "0.5"))
 
 
 def add_portfolio_action_column(
@@ -231,9 +233,19 @@ def create_optimal_portfolio(
     current_predictions = current_predictions.clone()
     prior_portfolio = prior_portfolio.clone()
 
+    # Use percentile-based filtering: keep predictions with IQR below the cutoff
+    # This is more robust than absolute thresholds when model calibration varies
+    iqr_percentile_cutoff = current_predictions.select(
+        pl.col("inter_quartile_range").quantile(UNCERTAINTY_PERCENTILE)
+    ).item()
+
+    # Fall back to absolute threshold if percentile cutoff is None or infinite
+    if iqr_percentile_cutoff is None or not np.isfinite(iqr_percentile_cutoff):
+        iqr_percentile_cutoff = UNCERTAINTY_THRESHOLD
+
     high_uncertainty_tickers = (
         current_predictions.filter(
-            pl.col("inter_quartile_range") > UNCERTAINTY_THRESHOLD
+            pl.col("inter_quartile_range") > iqr_percentile_cutoff
         )
         .select("ticker")
         .to_series()
@@ -269,7 +281,8 @@ def create_optimal_portfolio(
         "Portfolio filtering breakdown",
         total_predictions=current_predictions.height,
         high_uncertainty_excluded=len(high_uncertainty_tickers),
-        high_uncertainty_threshold=UNCERTAINTY_THRESHOLD,
+        iqr_percentile_cutoff=iqr_percentile_cutoff,
+        uncertainty_percentile=UNCERTAINTY_PERCENTILE,
         closed_positions_excluded=len(closed_position_tickers),
         maintained_positions_excluded=len(maintained_position_tickers),
         total_excluded=len(excluded_tickers),
@@ -281,6 +294,24 @@ def create_optimal_portfolio(
     available_predictions = current_predictions.filter(
         ~pl.col("ticker").is_in(excluded_tickers)
     )
+
+    # Log IQR statistics to help diagnose filtering issues
+    if current_predictions.height > 0:
+        iqr_stats = current_predictions.select(
+            pl.col("inter_quartile_range").min().alias("iqr_min"),
+            pl.col("inter_quartile_range").max().alias("iqr_max"),
+            pl.col("inter_quartile_range").mean().alias("iqr_mean"),
+            pl.col("inter_quartile_range").median().alias("iqr_median"),
+        ).row(0, named=True)
+
+        logger.info(
+            "Prediction IQR statistics",
+            iqr_min=iqr_stats["iqr_min"],
+            iqr_max=iqr_stats["iqr_max"],
+            iqr_mean=iqr_stats["iqr_mean"],
+            iqr_median=iqr_stats["iqr_median"],
+            threshold=UNCERTAINTY_THRESHOLD,
+        )
 
     logger.info(
         "Available predictions after filtering",
