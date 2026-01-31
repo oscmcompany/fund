@@ -1738,10 +1738,16 @@ echo "  - Clear cached state"
 echo "  - Keep configuration unchanged"
 echo ""
 
-read -p "Are you sure? This will erase learning history. [y/N]: " confirm < /dev/tty
-if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo "Aborted"
-    exit 0
+if [ -t 0 ]; then
+    read -r -p "Are you sure? This will erase learning history. [y/N]: " confirm < /dev/tty
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "Aborted"
+        exit 0
+    fi
+else
+    echo "Error: Non-interactive environment detected; cannot confirm destructive reset."
+    echo "Please run this command in an interactive terminal to proceed."
+    exit 1
 fi
 
 uv run python tools/ralph_marketplace_orchestrator.py reset

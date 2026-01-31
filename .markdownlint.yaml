@@ -15,6 +15,7 @@ MD033:
     - br
     - details
     - summary
+    # Custom XML-like tag used by Ralph workflow (maskfile.md) to signal task completion
     - promise
 # MD041 - First line in file should be top-level heading
 MD041: false
