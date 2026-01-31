@@ -4,3 +4,13 @@ version = "0.1.0"
 description = "Project tools and scripts"
 requires-python = "==3.12.10"
 dependencies = ["boto3>=1.40.74", "massive>=2.0.2"]
+
+[tool.ruff]
+lint.ignore = [
+    "T201",      # print statements are appropriate for CLI tools
+    "PTH123",    # open() vs Path.open() is stylistic preference
+    "C901",      # complexity warnings acceptable for orchestration logic
+    "PLR0912",   # too many branches acceptable for state computation
+    "PLR0911",   # too many returns acceptable for decision trees
+    "PLR2004",   # magic values acceptable for CLI argument counts
+]

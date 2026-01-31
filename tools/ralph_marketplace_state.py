@@ -5,7 +5,7 @@ Handles loading, saving, and computing marketplace state from append-only event 
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -217,7 +217,7 @@ class MarketplaceStateManager:
             bots=bots,
             total_budget_pool=config["num_bots"] * config["base_budget_per_bot"],
             rounds_completed=len(events),
-            last_updated=datetime.now(timezone.utc).isoformat(),
+            last_updated=datetime.now(UTC).isoformat(),
         )
 
     def load_state(self) -> MarketplaceState:
@@ -296,7 +296,7 @@ class MarketplaceStateManager:
             event: Event dictionary containing outcome details
         """
         if "timestamp" not in event:
-            event["timestamp"] = datetime.now(timezone.utc).isoformat()
+            event["timestamp"] = datetime.now(UTC).isoformat()
 
         # Create event filename
         timestamp_str = event["timestamp"].replace(":", "-").replace(".", "-")

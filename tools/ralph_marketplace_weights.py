@@ -20,7 +20,7 @@ OutcomeType = Literal[
 WEIGHT_DELTAS = {
     "ranked_first_success": 0.10,  # Proposal ranked #1, implemented successfully
     "ranked_first_failure": -0.15,  # Proposal ranked #1, implementation failed
-    "ranked_second_plus_success": 0.08,  # Ranked #2+, succeeded after higher rank failed
+    "ranked_second_plus_success": 0.08,  # Ranked #2+, succeeded after #1 failed
     "ranked_not_tried": -0.02,  # Ranked but not tried (another succeeded)
     "replan_new_success": 0.12,  # Replan with new proposal succeeded
     "replan_failed_again": -0.20,  # Replan failed again
@@ -39,8 +39,8 @@ def calculate_weight_delta(
 
     Args:
         outcome: Type of outcome
-        accuracy: Proposal accuracy (difference between proposal and implementation scores)
-                 Only applicable for success outcomes
+        accuracy: Proposal accuracy (difference between proposal and implementation
+                 scores). Only applicable for success outcomes
 
     Returns:
         Weight delta to apply

@@ -50,7 +50,6 @@ def display_marketplace_status() -> None:
 
     try:
         state = state_manager.load_state()
-        config = state_manager.load_config()
     except FileNotFoundError:
         print("Error: Marketplace not initialized")
         print("Run: mask ralph marketplace setup")
@@ -226,7 +225,8 @@ def main() -> None:
     elif command == "loop":
         if len(sys.argv) < 4:
             print(
-                "Usage: python ralph_marketplace_orchestrator.py loop <issue_number> <branch_name>"
+                "Usage: python ralph_marketplace_orchestrator.py loop "
+                "<issue_number> <branch_name>"
             )
             sys.exit(1)
         issue_number = sys.argv[2]
