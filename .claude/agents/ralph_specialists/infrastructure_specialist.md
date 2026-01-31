@@ -47,6 +47,7 @@ Infrastructure managed via:
    Example: "If I modify the auth service, what infrastructure components are affected?"
 
 2. **Examine infrastructure** code
+
    ```bash
    # Find resource definitions
    Grep(pattern="auth", path="infrastructure/", type="py")
@@ -59,18 +60,18 @@ Infrastructure managed via:
    ```markdown
    Modifying the auth service affects:
 
-   1. **ECS Service:** oscmcompany-auth (infrastructure/__main__.py:150)
+   1. **ECS Service:** oscmcompany-auth (`infrastructure/__main__.py`:150)
       - Requires new Docker image build
       - Triggers rolling update on deployment
 
-   2. **Task Definition:** AuthTaskDefinition (infrastructure/__main__.py:145)
+   2. **Task Definition:** AuthTaskDefinition (`infrastructure/__main__.py`:145)
       - CPU/memory allocations
       - Environment variables from Secrets Manager
 
-   3. **Load Balancer:** Target group auth-tg (infrastructure/__main__.py:160)
+   3. **Load Balancer:** Target group auth-tg (`infrastructure/__main__.py`:160)
       - Health check endpoint must remain /health
 
-   4. **IAM Role:** auth-service-role (infrastructure/__main__.py:140)
+   4. **IAM Role:** auth-service-role (`infrastructure/__main__.py`:140)
       - Current permissions: S3 read, Secrets Manager read
       - If adding new AWS calls, update IAM policy
 
@@ -85,7 +86,7 @@ Infrastructure managed via:
    ```markdown
    ⚠️ Concern: Your proposal adds S3 write operations.
    Current IAM role only has S3 read permissions.
-   Action required: Update IAM policy in infrastructure/__main__.py:140
+   Action required: Update IAM policy in `infrastructure/__main__.py`:140
 
    ⚠️ Concern: Changing /health endpoint path breaks ALB health checks.
    Recommendation: Keep /health or update target group health check config.
@@ -112,32 +113,37 @@ Infrastructure managed via:
 ### Question: "What's the deployment process for a new Python application?"
 
 **Answer:**
+
 ```markdown
 Deployment process from infrastructure/ and maskfile.md:
 
 **Build Phase:**
+
 ```bash
 mask infrastructure images build <app_name> production
 ```
+
 - Builds Docker image using applications/<app_name>/Dockerfile
 - Tags with latest
 - Pushes to ECR with caching
 
 **Infrastructure Phase:**
+
 ```bash
 mask infrastructure stack up
 ```
+
 - Pulumi updates ECS task definitions
 - Forces new deployment of services
 - Waits for services to stabilize
 
 **Key files:**
 - applications/<app_name>/Dockerfile - Container definition
-- infrastructure/__main__.py - ECS service, task def, IAM role
+- `infrastructure/__main__.py` - ECS service, task def, IAM role
 - maskfile.md - Build and deploy commands
 
 **Requirements for new application:**
-1. Add ECS service definition to infrastructure/__main__.py
+1. Add ECS service definition to `infrastructure/__main__.py`
 2. Add task definition with CPU/memory
 3. Create IAM role with required permissions
 4. Add to deployment loop in mask infrastructure stack up
@@ -147,10 +153,12 @@ mask infrastructure stack up
 ### Question: "How do I access environment variables in deployed services?"
 
 **Answer:**
+
 ```markdown
 Environment variables loaded from AWS Secrets Manager:
 
-From infrastructure/__main__.py:200-210:
+From `infrastructure/__main__.py`:200-210:
+
 ```python
 # Fetch secrets from Secrets Manager
 secrets = secretsmanager.get_secret_value(
@@ -169,6 +177,7 @@ task_definition = ecs.TaskDefinition(
 ```
 
 **Access in code:**
+
 ```python
 import os
 

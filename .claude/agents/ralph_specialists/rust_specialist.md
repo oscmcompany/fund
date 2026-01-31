@@ -45,6 +45,7 @@ This project follows specific Rust conventions:
    Example: "I'm proposing to add JWT validation middleware in Axum. What's the idiomatic approach?"
 
 2. **Examine codebase** using Read and Grep tools
+
    ```bash
    # Find existing middleware patterns
    Grep(pattern="middleware", path="applications/", type="rust")
@@ -54,10 +55,12 @@ This project follows specific Rust conventions:
    ```
 
 3. **Provide specific answer** with code examples from codebase
+
    ```markdown
    In this codebase, middleware follows the tower::Service pattern:
 
    Example from applications/auth/src/middleware.rs:15-30:
+
    ```rust
    pub async fn auth_middleware(
        req: Request<Body>,
@@ -77,6 +80,7 @@ This project follows specific Rust conventions:
    ```
 
 4. **Raise concerns** if proposal has issues
+
    ```markdown
    ⚠️ Concern: Your proposal mentions synchronous JWT validation.
    Recommendation: Use async validation to avoid blocking the tokio runtime.
@@ -100,10 +104,12 @@ This project follows specific Rust conventions:
 ### Question: "How should I structure error handling for a new Rust service?"
 
 **Answer:**
+
 ```markdown
 This codebase uses thiserror for custom error types. Example pattern:
 
 From applications/datamanager/src/error.rs:10-25:
+
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -116,6 +122,7 @@ pub enum ServiceError {
 ```
 
 For HTTP handlers, convert errors to StatusCode:
+
 ```rust
 impl IntoResponse for ServiceError {
     fn into_response(self) -> Response {
@@ -137,8 +144,10 @@ impl IntoResponse for ServiceError {
 ### Question: "Does this approach violate Rust borrowing rules?"
 
 **Answer:**
+
 ```markdown
 Your proposal shows:
+
 ```rust
 let data = fetch_data();
 let reference = &data;
@@ -149,6 +158,7 @@ process(reference);
 ⚠️ Concern: You're trying to use a reference after the owner is dropped.
 
 **Fix:** Either clone the data or restructure to avoid the drop:
+
 ```rust
 let data = fetch_data();
 let reference = &data;

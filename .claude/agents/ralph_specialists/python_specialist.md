@@ -62,10 +62,12 @@ This project follows specific Python conventions (from CLAUDE.md):
    ```
 
 3. **Provide specific answer** with code examples from codebase
-   ```markdown
+
+   ````markdown
    FastAPI endpoints in this codebase follow this pattern:
 
    Example from applications/datamanager/src/main.py:45-60:
+
    ```python
    @app.post("/equity-bars")
    async def sync_equity_bars(
@@ -88,7 +90,7 @@ This project follows specific Python conventions (from CLAUDE.md):
    4. ValueError for expected errors
    5. logger.exception for error cases (captures stack trace)
    6. HTTPException for HTTP errors
-   ```
+   ````
 
 4. **Raise concerns** if proposal has issues
    ```markdown

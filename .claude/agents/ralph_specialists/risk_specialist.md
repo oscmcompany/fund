@@ -209,9 +209,9 @@ async def login(username: str, password: str):
    - Risk: check_password timing varies → attacker can detect valid usernames
    - Mitigation: Use constant-time comparison: `secrets.compare_digest()`
 
-2. **Rate limiting missing**
+2. **Rate-limiting missing**
    - Risk: Brute force attacks
-   - Mitigation: Add rate limiting middleware (X requests per minute)
+   - Mitigation: Add rate-limiting middleware (X requests per minute)
 
 3. **No logging of failed attempts**
    - Risk: Can't detect attack patterns
