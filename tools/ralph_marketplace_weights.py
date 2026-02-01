@@ -10,6 +10,7 @@ OutcomeType = Literal[
     "ranked_first_success",
     "ranked_first_failure",
     "ranked_second_plus_success",
+    "ranked_second_plus_failure",
     "ranked_not_tried",
     "replan_new_success",
     "replan_failed_again",
@@ -21,6 +22,7 @@ WEIGHT_DELTAS = {
     "ranked_first_success": 0.10,  # Proposal ranked #1, implemented successfully
     "ranked_first_failure": -0.15,  # Proposal ranked #1, implementation failed
     "ranked_second_plus_success": 0.08,  # Ranked #2+, succeeded after #1 failed
+    "ranked_second_plus_failure": -0.18,  # Ranked #2+, tried after #1 failed, also failed
     "ranked_not_tried": -0.02,  # Ranked but not tried (another succeeded)
     "replan_new_success": 0.12,  # Replan with new proposal succeeded
     "replan_failed_again": -0.20,  # Replan failed again
@@ -52,7 +54,7 @@ def calculate_weight_delta(
         accuracy is not None
         and outcome
         in ["ranked_first_success", "ranked_second_plus_success", "replan_new_success"]
-        and accuracy <= ACCURACY_BONUS_THRESHOLD
+        and abs(accuracy) <= ACCURACY_BONUS_THRESHOLD
     ):
         return base_delta + ACCURACY_BONUS
 
@@ -66,6 +68,7 @@ def determine_outcome_type(
     *,
     is_replan: bool = False,
     resubmitted_same: bool = False,
+    was_implemented: bool = False,
 ) -> OutcomeType:
     """Determine outcome type for weight calculation.
 
@@ -75,6 +78,7 @@ def determine_outcome_type(
         implementation_result: "success" or "failure"
         is_replan: Whether this is a replan round
         resubmitted_same: Whether bot resubmitted same proposal (replan only)
+        was_implemented: Whether this bot's proposal was actually implemented
 
     Returns:
         Outcome type for weight calculation
@@ -106,14 +110,13 @@ def determine_outcome_type(
         return "ranked_first_failure"
 
     # Lower-ranked bots
-    # Note: In current design, only top proposal is implemented
-    # So if we're calculating for rank 2+, it means either:
-    # 1. Rank 1 failed and we tried this one (success case)
-    # 2. Another bot succeeded (not tried case)
+    if was_implemented:
+        # This bot was actually tried (because higher ranks failed)
+        if implementation_result == "success":
+            return "ranked_second_plus_success"
+        return "ranked_second_plus_failure"
 
-    if implementation_result == "success":
-        return "ranked_second_plus_success"
-
+    # Not tried (another bot succeeded)
     return "ranked_not_tried"
 
 
@@ -140,6 +143,7 @@ def format_weight_update_summary(
         "ranked_first_success": "Ranked #1, implementation succeeded",
         "ranked_first_failure": "Ranked #1, implementation failed",
         "ranked_second_plus_success": "Ranked #2+, succeeded after higher rank failed",
+        "ranked_second_plus_failure": "Ranked #2+, tried after higher rank failed, also failed",
         "ranked_not_tried": "Ranked but not tried (another succeeded)",
         "replan_new_success": "Replan with new proposal succeeded",
         "replan_failed_again": "Replan failed again",

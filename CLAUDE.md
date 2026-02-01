@@ -46,18 +46,18 @@
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
 
-## Ralph Workflow
+## Ralph Simple Workflow
 
 Ralph is an autonomous development loop for implementing GitHub issue specs.
 
 ### Commands
 
-- `mask ralph setup` - Create required labels (run once before first use)
-- `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
-- `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
-- `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
-- `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
-- `mask ralph pull-request [pull_request_number]` - Process pull request review feedback interactively
+- `mask ralph simple setup` - Create required labels (run once before first use)
+- `mask ralph simple spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph simple ready <issue_number>` - Mark a spec as ready for implementation
+- `mask ralph simple loop <issue_number>` - Run autonomous loop on a ready spec
+- `mask ralph simple backlog` - Review open issues for duplicates, overlaps, and implementation status
+- `mask ralph simple pull-request [pull_request_number]` - Process pull request review feedback interactively
 
 ### Labels
 
@@ -75,9 +75,9 @@ Ralph is an autonomous development loop for implementing GitHub issue specs.
 
 ### Workflow
 
-1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
-2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
-3. Run autonomous loop: `mask ralph loop <issue_number>`
+1. Create or refine spec: `mask ralph simple spec` or `mask ralph simple spec <issue_number>`
+2. When spec is complete, mark as ready: `mask ralph simple ready <issue_number>`
+3. Run autonomous loop: `mask ralph simple loop <issue_number>`
 4. Loop assigns the issue and resulting pull request to the current GitHub user
 5. Loop creates pull request with `Closes #<issue_number>` on completion
 6. Pull request merge auto-closes issue
@@ -115,49 +115,51 @@ by merging similar learnings and removing entries that have been incorporated in
 **Fix:** Added explicit "Commit-as-Verification" section requiring commit attempt after every implementation.
 
 
-## Ralph Marketplace
+## Ralph Marketplace Workflow
 
-The marketplace is an advanced Ralph workflow where multiple smart bots compete to provide the best solution.
+The marketplace is an advanced Ralph workflow where multiple bidders compete to provide the best solution.
 
 ### Architecture
 
 **Actors:**
-- **Arbiter** - Orchestrates competition, evaluates proposals, implements winner
-- **Smart Bots (3)** - Submit lightweight proposals, compete for selection
-- **Dumb Bots** - Specialists consulted by smart bots (Rust, Python, Infrastructure, Risk, Codebase Explorer)
+- **Broker** - Orchestrates competition, evaluates proposals, implements winner
+- **Bidders (3)** - Submit lightweight proposals, compete for selection. Each bidder has deep expertise across languages (Rust, Python), tools (Axum, FastAPI, Polars), infrastructure (Pulumi, AWS), and risk assessment.
 
 **Agent Definitions:**
 - Agent system prompts in `.claude/agents/`
-- Specialist bots in `.claude/agents/ralph_specialists/`
 - Runtime state in `.ralph/`
 - Orchestration code in `tools/ralph_marketplace_*.py`
 
 ### Commands
 
-- `mask ralph marketplace setup` - Initialize marketplace state and bot configurations
+- `mask ralph marketplace setup` - Initialize marketplace state and bidder configurations
+- `mask ralph marketplace spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
+- `mask ralph marketplace ready <issue_number>` - Mark a spec as ready for implementation
 - `mask ralph marketplace loop <issue_number>` - Run marketplace competition on a ready spec
-- `mask ralph marketplace status` - Show bot weights, efficiency, recent rounds
-- `mask ralph marketplace reset` - Reset bot weights to equal (erases learning history)
+- `mask ralph marketplace backlog` - Review open issues for duplicates, overlaps, and implementation status
+- `mask ralph marketplace pull-request [pull_request_number]` - Process pull request review feedback interactively
+- `mask ralph marketplace status` - Show bidder weights, efficiency, recent rounds
+- `mask ralph marketplace reset` - Reset bidder weights to equal (erases learning history)
 
 ### Workflow
 
 1. Issue marked "ready" → `mask ralph marketplace loop <issue_number>`
-2. Arbiter spawned, reads spec, extracts requirements
-3. Arbiter spawns 3 smart bots in parallel (identities hidden)
-4. Smart bots consult specialist dumb bots, submit lightweight proposals
-5. Arbiter scores proposals on 6 dimensions (spec alignment, technical quality, innovation, risk, efficiency, specialist validation)
-6. Arbiter ranks proposals, selects top scorer (tie-break: earlier timestamp wins)
-7. Arbiter implements ONLY top proposal
-8. Arbiter runs comprehensive checks (format, lint, type-check, dead-code, tests individually)
-9. **Success:** Update weights (+), check completeness, continue or finish
-10. **Failure:** Replan round (all bots see failure, submit new proposals)
-11. Repeat until complete or max iterations → PR creation or attention-needed
+2. Broker spawned, reads spec, extracts requirements
+3. Broker spawns 3 bidders in parallel (identities hidden)
+4. Bidders apply domain expertise directly, submit lightweight proposals
+5. Broker scores proposals on 5 dimensions (spec alignment, technical quality, innovation, risk, efficiency)
+6. Broker ranks proposals, selects top scorer (tie-break: earlier timestamp wins)
+7. Broker implements ONLY top proposal
+8. Broker runs comprehensive checks (format, lint, type-check, dead-code, complex, tests individually)
+9. **Success:** Update weights (+), check completeness or rotate context after logical groupings
+10. **Failure:** Replan round (all bidders see failure, submit new proposals)
+11. Repeat until complete or max iterations → pull request creation or attention-needed
 
 ### Budget Model
 
 **Fixed pool with efficiency rewards:**
-- Total pool = 10 iterations × number of bots (default: 30)
-- Allocation = (bot_weight × bot_efficiency) / sum(all bot scores) × total_pool
+- Total pool = 10 iterations × number of bidders (default: 30)
+- Allocation = (bidder_weight × bidder_efficiency) / sum(all bidder scores) × total_pool
 - Zero-sum competition: high performers take budget from low performers
 - Mathematical guarantee: allocations always sum to exactly total_pool
 
@@ -169,6 +171,7 @@ Immediate updates after each round:
 - Ranked #1, implementation succeeds: **+0.10**
 - Ranked #1, implementation fails: **-0.15**
 - Ranked #2+, tried after #1 failed, succeeds: **+0.08**
+- Ranked #2+, tried after #1 failed, also fails: **-0.18**
 - Ranked but not tried (another succeeded): **-0.02**
 
 **Replan Round:**
@@ -177,24 +180,24 @@ Immediate updates after each round:
 - Resubmitted same proposal: **-0.05** (not adapting)
 
 **Accuracy Bonus:**
-- If proposal score matches implementation score (±0.15): **+0.05** bonus
-- Rewards accurate prediction
+- If absolute difference between proposal and implementation score ≤ 0.15: **+0.05** bonus
+- Rewards accurate prediction (applies only to success outcomes)
 
 **Constraints:**
 - Weights normalized to sum to 1.0 after each update
 - Min weight: 0.05 (maintains diversity)
 - Max weight: 0.60 (prevents monopoly)
+- Constraints enforced iteratively to maintain normalized sum
 
 ### Scoring Dimensions
 
-Proposals and implementations scored on 6 unified dimensions:
+Proposals and implementations scored on 5 unified dimensions:
 
-1. **Spec Alignment (30%)** - Checkbox coverage, component coverage, implicit requirements
-2. **Technical Quality (20%)** - Pattern conformance, code quality checks pass
+1. **Spec Alignment (32%)** - Checkbox coverage, component coverage, implicit requirements
+2. **Technical Quality (22%)** - Pattern conformance, code quality checks pass
 3. **Innovation (15%)** - Novel approach, elegance, simplicity
-4. **Risk (20%)** - Files affected, breaking changes, test coverage
+4. **Risk (21%)** - Files affected, breaking changes, test coverage
 5. **Efficiency (10%)** - Estimated vs. actual complexity, diff size
-6. **Specialist Validation (5%)** - Quality of specialist consultations
 
 ### State Management
 
@@ -211,7 +214,7 @@ Proposals and implementations scored on 6 unified dimensions:
 {
   "timestamp": "2026-01-29T10:15:00Z",
   "issue_number": 123,
-  "bot_id": "smart_bot_2",
+  "bot_id": "bidder_2",
   "outcome": "success",
   "proposal_score": 0.87,
   "implementation_score": 0.85,
@@ -222,35 +225,13 @@ Proposals and implementations scored on 6 unified dimensions:
 }
 ```
 
-### Specialist Bots
-
-**Rust Specialist:**
-- Idiomatic Rust patterns, Axum framework, Polars usage
-- Consult for: Rust implementations, error handling, middleware patterns
-
-**Python Specialist:**
-- Python 3.12.10, FastAPI, type hints, Polars, pytest
-- Consult for: Python implementations, endpoint patterns, testing strategies
-
-**Infrastructure Specialist:**
-- Pulumi, AWS (ECS, ECR, S3, IAM), Docker, deployment processes
-- Consult for: Infrastructure impacts, deployment requirements, IAM permissions
-
-**Risk Specialist:**
-- Security (OWASP Top 10), test coverage, failure modes, breaking changes
-- Consult for: Security implications, required tests, risk assessment
-
-**Codebase Explorer:**
-- Finding files, searching patterns, understanding structure
-- Consult for: Existing implementations, pattern discovery, dependencies
-
 ### Replan Rounds
 
 Triggered when top proposal's implementation fails:
 
-1. Post failure context to all smart bots (failed proposal, error details)
-2. Failed bot MUST submit new proposal (cannot resubmit)
-3. Other bots CAN resubmit or submit new proposals
+1. Post failure context to all bidders (failed proposal, error details)
+2. Failed bidder MUST submit new proposal (cannot resubmit)
+3. Other bidders CAN resubmit or submit new proposals
 4. Return to evaluation phase with new proposals
 5. If replan fails → human intervention (attention-needed label)
 
@@ -262,27 +243,27 @@ Triggered when top proposal's implementation fails:
 - Low efficiency → reduced budget
 
 **Weight evolution:**
-- Successful bots gain weight over time
+- Successful bidders gain weight over time
 - Failed predictions lose weight
 - Accurate predictions get bonus
 
 **Long-term outcome:**
-- Bots specialize based on success patterns
+- Bidders specialize based on success patterns
 - High performers dominate budget allocation
 - Maintains minimum diversity (5% min weight)
 
 ### Future Enhancements
 
 See `proposal_followups.md` for detailed future considerations:
-- Meta-arbiter for dynamic weight tuning (Phase 2)
+- Meta-broker for dynamic weight tuning (Phase 2)
 - Post-merge health tracking (Phase 3)
-- Smart bot hobbies and token rewards (Phase 4)
-- External system access for dumb bots (Phase 5)
+- Bidder hobbies and token rewards (Phase 4)
+- External system access for bidders (Phase 5)
 - Multi-user concurrency improvements (Phase 6)
 
 ### Comparison to Standard Ralph Loop
 
-**Standard Ralph (`mask ralph loop`):**
+**Standard Ralph (`mask ralph simple loop`):**
 - Single agent implements entire issue
 - Iterative: plan → implement → commit → repeat
 - Max 10 iterations
@@ -290,11 +271,12 @@ See `proposal_followups.md` for detailed future considerations:
 - No competition, no learning
 
 **Marketplace Ralph (`mask ralph marketplace loop`):**
-- 3 smart bots compete with proposals
-- Arbiter selects and implements best proposal
+- 3 bidders compete with proposals
+- Broker selects and implements best proposal
 - Budget allocated by weight × efficiency
-- Bots learn and improve over time
+- Bidders learn and improve over time
 - Zero-sum competition for resources
+- Context rotation after logical groupings
 
 **When to use:**
 - **Standard:** Simple issues, single approach obvious, quick iteration

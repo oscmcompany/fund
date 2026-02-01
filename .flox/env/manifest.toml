@@ -7,7 +7,7 @@ pulumi-python.pkg-path = "pulumiPackages.pulumi-python"
 ruff.pkg-path = "ruff"
 ruff.version = "0.14.7"
 uv.pkg-path = "uv"
-vulture.pkg-path = "python313Packages.vulture"
+vulture.pkg-path = "python312Packages.vulture"
 yamllint.pkg-path = "yamllint"
 nushell.pkg-path = "nushell"
 fselect.pkg-path = "fselect"
@@ -42,6 +42,7 @@ pkgconf.pkg-path = "pkgconf"
 direnv.pkg-path = "direnv"
 jq.pkg-path = "jq"
 markdownlint-cli.pkg-path = "markdownlint-cli"
+radon.pkg-path = "python312Packages.radon"
 
 [hook]
 on-activate = '''

@@ -86,6 +86,9 @@
       "pulumi-python": {
         "pkg-path": "pulumiPackages.pulumi-python"
       },
+      "radon": {
+        "pkg-path": "python312Packages.radon"
+      },
       "ruff": {
         "pkg-path": "ruff",
         "version": "0.14.7"
@@ -110,7 +113,7 @@
         "pkg-path": "uv"
       },
       "vulture": {
-        "pkg-path": "python313Packages.vulture"
+        "pkg-path": "python312Packages.vulture"
       },
       "yamllint": {
         "pkg-path": "yamllint"
@@ -3200,6 +3203,126 @@
       "priority": 5
     },
     {
+      "attr_path": "python312Packages.radon",
+      "broken": false,
+      "derivation": "/nix/store/86lygqq0nlm3fnnsax8cnzh1n4cbvyk3-python3.12-radon-6.0.1.drv",
+      "description": "Various code metrics for Python code",
+      "install_id": "radon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "python3.12-radon-6.0.1",
+      "pname": "radon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T02:55:40.103993Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "6.0.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/pg8rlshzwk6vz4jwgl4xjhzxm4gd4m98-python3.12-radon-6.0.1-dist",
+        "out": "/nix/store/b5d9nyg9z49qgldh3fr91dgavxf31wka-python3.12-radon-6.0.1"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python312Packages.radon",
+      "broken": false,
+      "derivation": "/nix/store/ys8razjdw25ssl5wk2s9rch9n39xrsi4-python3.12-radon-6.0.1.drv",
+      "description": "Various code metrics for Python code",
+      "install_id": "radon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "python3.12-radon-6.0.1",
+      "pname": "radon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:05:41.297827Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "6.0.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/3a8xr07irz30hj3nfs8jdy30ryg9n1xk-python3.12-radon-6.0.1-dist",
+        "out": "/nix/store/rcmddxivs40grapbf7k0xw3iv7dfy8yx-python3.12-radon-6.0.1"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python312Packages.radon",
+      "broken": false,
+      "derivation": "/nix/store/i7sdpvyblvw5hrklvgrg59m15z72bppy-python3.12-radon-6.0.1.drv",
+      "description": "Various code metrics for Python code",
+      "install_id": "radon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "python3.12-radon-6.0.1",
+      "pname": "radon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:15:36.248613Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "6.0.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/pvqhrja5kbkc8gk8rcczkxwwg8pn7c7r-python3.12-radon-6.0.1-dist",
+        "out": "/nix/store/gdk5pdk3lhwrnxhqjk7bjiybsn4rpczc-python3.12-radon-6.0.1"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "python312Packages.radon",
+      "broken": false,
+      "derivation": "/nix/store/3knqk5vay8d94hq74xxqg3b1nnjxx3dx-python3.12-radon-6.0.1.drv",
+      "description": "Various code metrics for Python code",
+      "install_id": "radon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "python3.12-radon-6.0.1",
+      "pname": "radon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:25:18.465806Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "6.0.1",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/r8z5asd2r1whffvfhb8f5wf2amkichqz-python3.12-radon-6.0.1-dist",
+        "out": "/nix/store/1qmwv94p3ljxdvz1dbf6mq99lx9nq7y1-python3.12-radon-6.0.1"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
       "attr_path": "ruff",
       "broken": false,
       "derivation": "/nix/store/vk2sc95dqy0gl5dfzx13v8x65b4kmxwm-ruff-0.14.7.drv",
@@ -3432,19 +3555,19 @@
       "priority": 5
     },
     {
-      "attr_path": "python313Packages.vulture",
+      "attr_path": "python312Packages.vulture",
       "broken": false,
-      "derivation": "/nix/store/6rp823v7s40fqscx1j8dp5m0m7v9vi4r-python3.13-vulture-2.14.drv",
+      "derivation": "/nix/store/9114gkd7g53hxhz7m1bylz9yd7fc426h-python3.12-vulture-2.14.drv",
       "description": "Finds unused code in Python programs",
       "install_id": "vulture",
       "license": "MIT",
       "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "python3.13-vulture-2.14",
+      "name": "python3.12-vulture-2.14",
       "pname": "vulture",
       "rev": "f61125a668a320878494449750330ca58b78c557",
       "rev_count": 907002,
       "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T02:56:08.936314Z",
+      "scrape_date": "2025-12-07T02:55:44.875335Z",
       "stabilities": [
         "unstable"
       ],
@@ -3454,27 +3577,27 @@
         "out"
       ],
       "outputs": {
-        "dist": "/nix/store/jr2vfc6h5d2haplqmg0pjxli287ija62-python3.13-vulture-2.14-dist",
-        "out": "/nix/store/58qgn7q850qrimkw4gmxxbcd0yxzsmdf-python3.13-vulture-2.14"
+        "dist": "/nix/store/bdshb85zpxppz46pydjxkgclasq0yyri-python3.12-vulture-2.14-dist",
+        "out": "/nix/store/zhp5z4rk8xvgf80xw6jmh8f312qd954q-python3.12-vulture-2.14"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
       "priority": 5
     },
     {
-      "attr_path": "python313Packages.vulture",
+      "attr_path": "python312Packages.vulture",
       "broken": false,
-      "derivation": "/nix/store/fydfhidy6snq18gcrwkgmzs8byxyd8n5-python3.13-vulture-2.14.drv",
+      "derivation": "/nix/store/chp666kk074lyjdjhrszfmwrkksg685p-python3.12-vulture-2.14.drv",
       "description": "Finds unused code in Python programs",
       "install_id": "vulture",
       "license": "MIT",
       "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "python3.13-vulture-2.14",
+      "name": "python3.12-vulture-2.14",
       "pname": "vulture",
       "rev": "f61125a668a320878494449750330ca58b78c557",
       "rev_count": 907002,
       "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:06:15.917900Z",
+      "scrape_date": "2025-12-07T03:05:47.101114Z",
       "stabilities": [
         "unstable"
       ],
@@ -3484,27 +3607,27 @@
         "out"
       ],
       "outputs": {
-        "dist": "/nix/store/r034gyxcdwwagh6jsfc72hybb3jxiai0-python3.13-vulture-2.14-dist",
-        "out": "/nix/store/7vr41jnwznkwlvskdi28c4k9brjcpwz4-python3.13-vulture-2.14"
+        "dist": "/nix/store/v2hl6w0zyi72lsz5gc89g0xxrpjmwmwv-python3.12-vulture-2.14-dist",
+        "out": "/nix/store/0l40s5a0n79m0dbwqv7am96hpswvs0d9-python3.12-vulture-2.14"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
       "priority": 5
     },
     {
-      "attr_path": "python313Packages.vulture",
+      "attr_path": "python312Packages.vulture",
       "broken": false,
-      "derivation": "/nix/store/0hnax5inwn7swy0jfbpnlab1jdm9pgs8-python3.13-vulture-2.14.drv",
+      "derivation": "/nix/store/rrk2s4n9fbpclxawacrhs1h82br0kgn3-python3.12-vulture-2.14.drv",
       "description": "Finds unused code in Python programs",
       "install_id": "vulture",
       "license": "MIT",
       "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "python3.13-vulture-2.14",
+      "name": "python3.12-vulture-2.14",
       "pname": "vulture",
       "rev": "f61125a668a320878494449750330ca58b78c557",
       "rev_count": 907002,
       "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:16:02.603893Z",
+      "scrape_date": "2025-12-07T03:15:40.617644Z",
       "stabilities": [
         "unstable"
       ],
@@ -3514,27 +3637,27 @@
         "out"
       ],
       "outputs": {
-        "dist": "/nix/store/8hds3dm0ha3figidiadrrw1qgf8dp4vh-python3.13-vulture-2.14-dist",
-        "out": "/nix/store/3yas5bqdwk3z7f0nrx68cc1lr5p6gg18-python3.13-vulture-2.14"
+        "dist": "/nix/store/1hm0s2yrw9f3h40kp1ijsqxb9n5s8q7q-python3.12-vulture-2.14-dist",
+        "out": "/nix/store/va0zb5zab6xnkjhk15k0a69p62i20xq7-python3.12-vulture-2.14"
       },
       "system": "x86_64-darwin",
       "group": "toplevel",
       "priority": 5
     },
     {
-      "attr_path": "python313Packages.vulture",
+      "attr_path": "python312Packages.vulture",
       "broken": false,
-      "derivation": "/nix/store/k29xbyn1in0wlypzj8976jpmp3fk8dk0-python3.13-vulture-2.14.drv",
+      "derivation": "/nix/store/2pa24ibjdcsxb5nh1zxbx1i80mvmhj6p-python3.12-vulture-2.14.drv",
       "description": "Finds unused code in Python programs",
       "install_id": "vulture",
       "license": "MIT",
       "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "python3.13-vulture-2.14",
+      "name": "python3.12-vulture-2.14",
       "pname": "vulture",
       "rev": "f61125a668a320878494449750330ca58b78c557",
       "rev_count": 907002,
       "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:25:52.611390Z",
+      "scrape_date": "2025-12-07T03:25:24.252039Z",
       "stabilities": [
         "unstable"
       ],
@@ -3544,8 +3667,8 @@
         "out"
       ],
       "outputs": {
-        "dist": "/nix/store/52a4fn7fjp49vfwjrp1wn78qxgg5d0h1-python3.13-vulture-2.14-dist",
-        "out": "/nix/store/pq7bmragdlpm8p5qb2k3qhk9qrpx24k5-python3.13-vulture-2.14"
+        "dist": "/nix/store/wf2fjr0w25d4lkxl0d21v23kllbl81gk-python3.12-vulture-2.14-dist",
+        "out": "/nix/store/nam3pwdp9wvaqyjzj5gfdii3dcq7708w-python3.12-vulture-2.14"
       },
       "system": "x86_64-linux",
       "group": "toplevel",

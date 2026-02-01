@@ -12,7 +12,7 @@ from typing import Any
 
 @dataclass
 class BotState:
-    """State for a single smart bot."""
+    """State for a single bidder."""
 
     bot_id: str
     weight: float
@@ -64,12 +64,11 @@ class MarketplaceStateManager:
                 "num_bots": 3,
                 "base_budget_per_bot": 10,
                 "scoring_weights": {
-                    "spec_alignment": 0.30,
-                    "technical_quality": 0.20,
+                    "spec_alignment": 0.32,
+                    "technical_quality": 0.22,
                     "innovation": 0.15,
-                    "risk": 0.20,
+                    "risk": 0.21,
                     "efficiency": 0.10,
-                    "specialist_validation": 0.05,
                 },
                 "weight_constraints": {"min": 0.05, "max": 0.60},
             }
@@ -127,7 +126,7 @@ class MarketplaceStateManager:
         # Initialize bot states with equal weights
         bots = {}
         for i in range(1, num_bots + 1):
-            bot_id = f"smart_bot_{i}"
+            bot_id = f"bidder_{i}"
             bots[bot_id] = BotState(
                 bot_id=bot_id,
                 weight=1.0 / num_bots,  # Equal initial weights
@@ -138,6 +137,9 @@ class MarketplaceStateManager:
                 total_iterations_used=0,
                 average_accuracy=0.0,
             )
+
+        # Track accuracy counts per bot for O(n) calculation
+        accuracy_counts = {bot_id: 0 for bot_id in bots}
 
         # Apply events to update state
         for event in events:
@@ -172,20 +174,14 @@ class MarketplaceStateManager:
             # Update iteration count
             bot.total_iterations_used += event.get("iteration_count", 0)
 
-            # Update accuracy tracking
+            # Update accuracy tracking with O(n) running average
             if "accuracy" in event:
-                # Running average (only count events with accuracy)
-                # Count how many events with accuracy we've seen so far
-                accuracy_count = 0
-                for prev_event in events[: events.index(event) + 1]:
-                    if prev_event["bot_id"] == bot_id and "accuracy" in prev_event:
-                        accuracy_count += 1
-
-                if accuracy_count > 0:
-                    # Update running average considering only events with accuracy
-                    bot.average_accuracy = (
-                        bot.average_accuracy * (accuracy_count - 1) + event["accuracy"]
-                    ) / accuracy_count
+                accuracy_counts[bot_id] += 1
+                count = accuracy_counts[bot_id]
+                # Update running average: new_avg = old_avg * (n-1)/n + new_value/n
+                bot.average_accuracy = (
+                    bot.average_accuracy * (count - 1) + event["accuracy"]
+                ) / count
 
         # Normalize weights to sum to 1.0
         total_weight = sum(bot.weight for bot in bots.values())
@@ -193,13 +189,62 @@ class MarketplaceStateManager:
             for bot in bots.values():
                 bot.weight = bot.weight / total_weight
 
-        # Apply weight constraints
+        # Apply weight constraints with iterative adjustment to maintain sum=1.0
         min_weight = config["weight_constraints"]["min"]
         max_weight = config["weight_constraints"]["max"]
-        for bot in bots.values():
-            bot.weight = max(min_weight, min(max_weight, bot.weight))
 
-        # Renormalize after constraints
+        # Iteratively enforce constraints while maintaining normalized sum
+        max_iterations = 10
+        for _ in range(max_iterations):
+            # Apply constraints
+            clamped = {}
+            excess = 0.0
+            deficit = 0.0
+
+            for bot_id, bot in bots.items():
+                original = bot.weight
+                clamped[bot_id] = max(min_weight, min(max_weight, original))
+
+                if clamped[bot_id] > original:
+                    deficit += clamped[bot_id] - original
+                elif clamped[bot_id] < original:
+                    excess += original - clamped[bot_id]
+
+            # If no changes needed, we're done
+            if excess == 0 and deficit == 0:
+                break
+
+            # Distribute excess to bots that need it (below min) or have room (below max)
+            if deficit > 0:
+                # Find bots that can absorb the deficit (not at max constraint)
+                can_absorb = [
+                    (bot_id, bot)
+                    for bot_id, bot in bots.items()
+                    if clamped[bot_id] < max_weight
+                ]
+
+                if can_absorb:
+                    # Distribute proportionally among bots that can absorb
+                    absorb_weights = {bot_id: bot.weight for bot_id, bot in can_absorb}
+                    total_absorb = sum(absorb_weights.values())
+
+                    if total_absorb > 0:
+                        for bot_id, _ in can_absorb:
+                            proportion = absorb_weights[bot_id] / total_absorb
+                            clamped[bot_id] = min(
+                                max_weight, clamped[bot_id] - deficit * proportion
+                            )
+
+            # Apply clamped values
+            for bot_id, bot in bots.items():
+                bot.weight = clamped[bot_id]
+
+            # Check if sum is close enough to 1.0
+            total = sum(bot.weight for bot in bots.values())
+            if abs(total - 1.0) < 1e-10:
+                break
+
+        # Final normalization to ensure exact sum of 1.0
         total_weight = sum(bot.weight for bot in bots.values())
         if total_weight > 0:
             for bot in bots.values():

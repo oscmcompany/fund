@@ -114,6 +114,12 @@ Reset to initial state (erase history):
 mask ralph marketplace reset
 ```
 
+For simple (single-agent) workflow, use:
+```bash
+mask ralph simple setup
+mask ralph simple loop <issue_number>
+```
+
 ## Learning Persistence
 
 Bot weights and efficiency evolve over time based on events:

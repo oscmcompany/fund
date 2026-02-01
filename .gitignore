@@ -20,5 +20,7 @@ data/
 **/model.tar.gz
 **/*.safetensor
 **/*.json
-notes.md
 etc/
+./ralph/marketplace.json
+./ralph/.state_version
+.scratchpad/

@@ -1,9 +1,9 @@
 """Ralph marketplace budget allocation.
 
-Handles iteration budget allocation across smart bots based on weights and efficiency.
+Handles iteration budget allocation across bidders based on weights and efficiency.
 """
 
-from tools.ralph_marketplace_state import MarketplaceState
+from ralph_marketplace_state import MarketplaceState
 
 
 def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
@@ -43,36 +43,49 @@ def allocate_budgets(state: MarketplaceState) -> dict[str, int]:
     }
 
     # Round to integers while maintaining total sum
-    # Use banker's rounding for fairness
     integer_allocations = {}
-    total_allocated = 0
 
-    # Sort by fractional part descending to prioritize rounding up
-    items = sorted(allocations.items(), key=lambda x: x[1] - int(x[1]), reverse=True)
+    # First pass: floor all allocations (without minimum enforcement yet)
+    for bot_id, allocation in allocations.items():
+        integer_allocations[bot_id] = int(allocation)
 
-    for bot_id, allocation in items:
-        integer_allocation = int(allocation)
-        # Ensure minimum of 1 iteration per bot
-        integer_allocation = max(1, integer_allocation)
-        integer_allocations[bot_id] = integer_allocation
-        total_allocated += integer_allocation
-
-    # Distribute remaining budget due to rounding
+    # Calculate remaining budget to distribute
+    total_allocated = sum(integer_allocations.values())
     remaining = total_budget - total_allocated
-    if remaining > 0:
-        # Give remaining iterations to highest-scoring bots
+
+    # Distribute remaining iterations to highest-scoring bots
+    # Sort by fractional part descending (who "deserves" rounding up most)
+    fractional_parts = [
+        (bot_id, allocations[bot_id] - integer_allocations[bot_id])
+        for bot_id in allocations
+    ]
+    sorted_by_fraction = sorted(fractional_parts, key=lambda x: x[1], reverse=True)
+
+    # Give remaining iterations based on fractional parts
+    for i in range(remaining):
+        bot_id = sorted_by_fraction[i % len(sorted_by_fraction)][0]
+        integer_allocations[bot_id] += 1
+
+    # Enforce minimum of 1 iteration per bot while maintaining zero-sum
+    # Identify bots with 0 allocations
+    zero_bots = [bot_id for bot_id, alloc in integer_allocations.items() if alloc == 0]
+
+    if zero_bots:
+        # Need to reallocate from high-scoring bots to ensure minimum
+        # Sort by score to take from highest scorers
         sorted_bots = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
-        for i in range(remaining):
-            bot_id = sorted_bots[i % len(sorted_bots)][0]
-            integer_allocations[bot_id] += 1
-    elif remaining < 0:
-        # Need to reduce allocations to fit budget
-        # Take from lowest-scoring bots first
-        sorted_bots = sorted(combined_scores.items(), key=lambda x: x[1], reverse=False)
-        for i in range(abs(remaining)):
-            bot_id = sorted_bots[i % len(sorted_bots)][0]
-            if integer_allocations[bot_id] > 1:
-                integer_allocations[bot_id] -= 1
+
+        for zero_bot in zero_bots:
+            # Find a bot with >1 allocation to take from
+            for donor_bot_id, _ in sorted_bots:
+                if integer_allocations[donor_bot_id] > 1:
+                    integer_allocations[donor_bot_id] -= 1
+                    integer_allocations[zero_bot] += 1
+                    break
+            else:
+                # No bot has >1, cannot enforce minimum without breaking zero-sum
+                # Give 1 to this bot anyway (will slightly exceed budget)
+                integer_allocations[zero_bot] = 1
 
     return integer_allocations
 

@@ -1,14 +1,13 @@
 """Ralph marketplace orchestrator.
 
-Main entry point for marketplace commands: setup, loop, status, reset.
+Main entry point for marketplace commands: setup, status, reset.
 """
 
-import json
 import sys
 from pathlib import Path
 
-from tools.ralph_marketplace_budget import allocate_budgets, format_budget_allocation
-from tools.ralph_marketplace_state import MarketplaceStateManager
+from ralph_marketplace_budget import allocate_budgets, format_budget_allocation
+from ralph_marketplace_state import MarketplaceStateManager
 
 
 def setup_marketplace() -> None:
@@ -35,7 +34,7 @@ def setup_marketplace() -> None:
 
     # Initialize state
     state = state_manager.load_state()
-    print(f"\nInitialized {len(state.bots)} smart bots with equal weights:")
+    print(f"\nInitialized {len(state.bots)} bidders with equal weights:")
     for bot_id, bot in state.bots.items():
         print(f"  {bot_id}: weight={bot.weight:.3f}, efficiency={bot.efficiency:.2%}")
 
@@ -63,7 +62,7 @@ def display_marketplace_status() -> None:
     print()
 
     # Bot statistics
-    print("Smart Bot Statistics")
+    print("Bidder Statistics")
     print("-" * 80)
     print(
         f"{'Bot ID':<15} {'Weight':>8} {'Efficiency':>10} {'Succeeded':>10} {'Failed':>8} {'Accuracy':>10}"
@@ -112,7 +111,7 @@ def reset_marketplace() -> None:
     print("Resetting marketplace state")
     print("This will:")
     print("  - Remove all event history")
-    print("  - Reset bot weights to equal")
+    print("  - Reset bidder weights to equal")
     print("  - Clear cached state")
     print("  - Keep configuration unchanged")
     print()
@@ -120,87 +119,8 @@ def reset_marketplace() -> None:
     state_manager.reset_state()
 
     print("Marketplace reset complete")
-    print("All bots now have equal weights")
+    print("All bidders now have equal weights")
     print("Run 'mask ralph marketplace status' to verify")
-
-
-def run_marketplace_loop(issue_number: str, branch_name: str) -> None:
-    """Run marketplace competition loop.
-
-    This is a placeholder for the main loop logic. The actual implementation
-    will be handled by the arbiter agent via Claude CLI.
-
-    Args:
-        issue_number: GitHub issue number
-        branch_name: Git branch name
-    """
-    ralph_dir = Path(".ralph")
-    state_manager = MarketplaceStateManager(ralph_dir)
-
-    try:
-        state = state_manager.load_state()
-        config = state_manager.load_config()
-    except FileNotFoundError:
-        print("Error: Marketplace not initialized")
-        print("Run: mask ralph marketplace setup")
-        sys.exit(1)
-
-    print(f"Starting marketplace loop for issue #{issue_number}")
-    print(f"Branch: {branch_name}")
-    print()
-
-    # Allocate budgets
-    allocations = allocate_budgets(state)
-    print(format_budget_allocation(state, allocations))
-    print()
-
-    print("Loading arbiter agent...")
-    arbiter_prompt_path = Path(".claude/agents/ralph_arbiter.md")
-    if not arbiter_prompt_path.exists():
-        print(f"Error: Arbiter agent not found at {arbiter_prompt_path}")
-        sys.exit(1)
-
-    # Load arbiter prompt template
-    with open(arbiter_prompt_path, encoding="utf-8") as f:
-        arbiter_prompt = f.read()
-
-    # Inject context variables
-    arbiter_prompt = arbiter_prompt.replace("{{issue_number}}", issue_number)
-    arbiter_prompt = arbiter_prompt.replace("{{num_bots}}", str(config["num_bots"]))
-    arbiter_prompt = arbiter_prompt.replace(
-        "{{bot_budgets}}", json.dumps(allocations, indent=2)
-    )
-    arbiter_prompt = arbiter_prompt.replace(
-        "{{total_budget}}", str(state.total_budget_pool)
-    )
-
-    print("Arbiter agent loaded and configured")
-    print()
-    print("=" * 80)
-    print("MARKETPLACE LOOP")
-    print("=" * 80)
-    print()
-    print("The arbiter will now orchestrate the competition:")
-    print(f"  1. Extract requirements from issue #{issue_number}")
-    print(f"  2. Spawn {config['num_bots']} smart bots to submit proposals")
-    print("  3. Evaluate and rank proposals")
-    print("  4. Implement top-ranked proposal")
-    print("  5. Update marketplace state based on outcome")
-    print()
-    print("Note: The actual loop execution requires integration with Claude CLI")
-    print("This placeholder demonstrates the orchestration structure")
-    print()
-
-    # TODO: Actual implementation would spawn arbiter via Claude CLI:
-    # result = subprocess.run([
-    #     "claude",
-    #     "--system-prompt", arbiter_prompt,
-    #     "--dangerously-skip-permissions",
-    #     "Begin marketplace loop for issue #{issue_number}"
-    # ], capture_output=True)
-    #
-    # Parse result, update state, record event
-    # For now, this is a placeholder showing the structure
 
 
 def main() -> None:
@@ -211,7 +131,6 @@ def main() -> None:
         print("  setup                    - Initialize marketplace")
         print("  status                   - Show marketplace state")
         print("  reset                    - Reset marketplace to initial state")
-        print("  loop <issue> <branch>    - Run marketplace loop")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -222,16 +141,6 @@ def main() -> None:
         display_marketplace_status()
     elif command == "reset":
         reset_marketplace()
-    elif command == "loop":
-        if len(sys.argv) < 4:
-            print(
-                "Usage: python ralph_marketplace_orchestrator.py loop "
-                "<issue_number> <branch_name>"
-            )
-            sys.exit(1)
-        issue_number = sys.argv[2]
-        branch_name = sys.argv[3]
-        run_marketplace_loop(issue_number, branch_name)
     else:
         print(f"Unknown command: {command}")
         sys.exit(1)

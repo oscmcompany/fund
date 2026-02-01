@@ -19,3 +19,6 @@ MD033:
     - promise
 # MD041 - First line in file should be top-level heading
 MD041: false
+MD022:
+  lines_below: 1
+  lines_above: 1
