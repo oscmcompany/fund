@@ -4,6 +4,8 @@
 
 ## Notes
 
+This is a collection of guidelines and references.
+
 - Rust and Python are the primary project languages
 - [Flox](https://flox.dev/) manages project environment and packages
 - [Mask](https://github.com/jacobdeichert/mask) is used for command management
@@ -19,6 +21,8 @@
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
+- Folder names under the `applications/` directory should have a `*model` suffix for machine learning serivces
+  and `*manager` for all others
 - Scan and remove unused dependencies from `pyproject.toml` files
 - Move duplicate dependencies into root workspace `pyproject.toml`
 - Introduce new dependencies only after approval
@@ -46,70 +50,60 @@
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
 
-## Ralph Workflow
+## Workflow Orchestration
 
-Ralph is an autonomous development loop for implementing GitHub issue specs.
+This is a set of instructions for tasks and projects.
 
-### Commands
+### Specifics
 
-- `mask ralph setup` - Create required labels (run once before first use)
-- `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
-- `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
-- `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
-- `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
-- `mask ralph pull-request [pull_request_number]` - Process pull request review feedback interactively
+1. Plan Mode Default
 
-### Labels
+- Enter plan mode for any task with more than one step or architectural decisions
+- If something goes wrong, stop and re-plan immediately - don't continue working 
+- Use plan mode for verification steps, not just building steps
+- Write detailed specfications upfront to reduce ambiguity
 
-**Status labels:**
+2. Subagent Strategy
 
-- `in-refinement` - Spec being built or discussed
-- `ready` - Spec complete, ready for implementation
-- `in-progress` - Work actively in progress
-- `attention-needed` - Blocked or needs human intervention
-- `backlog-review` - Backlog review tracking issue
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, deploy additional subagents
+- One task per subagent for focused execution
 
-**Actor label:**
+3. Self-Improvement Loop
 
-- `ralph` - Ralph is actively working on this (remove to hand off to human)
+- After any correction from the user: update `.claude/tasks/lessons.m`d with the pattern
+- Write rules for yourself that prevent the same mistake and include a timestamp when added
+- Iterate on these rules until mistake rate drops
+- Review rules at session start for relevant project
 
-### Workflow
+4. Verification Before Done
 
-1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
-2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
-3. Run autonomous loop: `mask ralph loop <issue_number>`
-4. Loop assigns the issue and resulting pull request to the current GitHub user
-5. Loop creates pull request with `Closes #<issue_number>` on completion
-6. Pull request merge auto-closes issue
+- Do not mark a task complete without proving it works
+- Compare behavior between the `master` branch and your changes when relevant
+- Ask yourself: "Would these changes be approved to merge to `master`?"
+- Run `mask development python/rust all` commands, check logs, demonstrate correctness
 
-### Context Rotation
+5. Demand Elegance
 
-- Complete logically related requirements together (same files, same concepts)
-- Exit after meaningful progress to allow fresh context on next iteration
-- Judgment factors: relatedness, complexity, context size, dependencies
+- For non-trivial changes: pause and ask "Is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple fixes - don't over-engineer solutions
+- Challenge your own work before presenting it
 
-### Completion Signal
+### Task Management
 
-Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked to signal task completion.
+Remove all content from `.claude/tasks/todos.md` and start fresh for each new task.
 
-### Commit as Verification
+1. Plan First: Write plan to `.claude/tasks/todos.md` with checkable items
+2. Verify Plans: Check in before starting implementation
+3. Track Progress: Mark items complete as you go
+4. Explain Changes: High-level summary at each step
+5. Document Results: Add review section to `.claude/tasks/todos.md`
+6. Capture Lessons: Update `.claude/tasks/lessons.md` after corrections
 
-After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which
-run all tests/linting. This IS the verification step:
+### Core Principles
 
-- If commit fails → fix issues and retry
-- If commit succeeds → requirement is verified, check it off in issue
-- Do not skip this step or run tests separately
-
-### Ralph Learnings
-
-Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section
-by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
-
-#### 2026-01-26: #723 (spec: commit-as-verification not explicit)
-
-**Issue:** Loop implemented requirements but didn't attempt git commit to verify.
-
-**Root cause:** Spec said "commit is the verification gate" but didn't explicitly say to always attempt commit after implementing.
-
-**Fix:** Added explicit "Commit-as-Verification" section requiring commit attempt after every implementation.
+- Simplicity First: Make every change as simple as possible. Impact minimal code.
+- No Laziness: Find root causes. No temporary fixes. Senior developer standards.
+- Minimal Impact: Changes should only touch what's necessary. Avoid introducing bugs.
