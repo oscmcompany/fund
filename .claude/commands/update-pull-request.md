@@ -17,11 +17,11 @@ Follow these steps:
   - `gh api repos/:owner/:repo/pulls/$ARGUMENTS/comments` for review comments (code-level feedback)
   - `gh api repos/:owner/:repo/issues/$ARGUMENTS/comments` for issue comments (PR-level conversation)
   - `gh api repos/:owner/:repo/pulls/$ARGUMENTS/reviews` for full reviews with approval states
-  - `gh api repos/:owner/:repo/commits/{commit_sha}/check-runs` for CI check statuses (get commit_sha from PR metadata)
+  - `gh api repos/:owner/:repo/commits/{commit_sha}/check-runs` for CI check statuses (extract commit_sha from PR metadata's `head.sha` field)
 
 ### 2. Analyze Check Failures
 
-- Identify failing checks (Python or Rust checks specifically) and attempt to fetch logs using `gh api repos/:owner/:repo/actions/runs/{run_id}/logs`.
+- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/:owner/:repo/actions/runs/{run_id}/logs`.
 - If logs are not accessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors and capture the failure details.
 - Add check failures to the list of items that need fixes.
 
@@ -75,7 +75,7 @@ Follow these steps:
   - Use `gh api repos/:owner/:repo/pulls/comments/{comment_id}/replies -f body="..."` for review comments (code-level).
   - Use `gh api repos/:owner/:repo/issues/comments -f body="..."` for issue comments (PR-level).
 - Auto-resolve all comment threads using the appropriate GitHub mechanism for each comment type:
-  - For review comments, use GraphQL API to resolve threads: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "..."}) { thread { isResolved } } }'`.
+  - For review comments, first extract the thread ID from the comment's `pull_request_review_id` field or query review threads to map comments to thread IDs, then use GraphQL API to resolve threads: `gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: "..."}) { thread { isResolved } } }'`.
   - Resolve both addressed feedback and rejected feedback (since rejected feedback includes explanation in response).
 
 ### 10. Final Summary

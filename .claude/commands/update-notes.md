@@ -15,6 +15,6 @@ Follow these steps:
 - For each rule older than 7 days, draft a consolidated bullet point suitable for the `CLAUDE.md` "## Notes" section following the existing style and conventions in that file.
 - Present the consolidation plan to the user showing: (1) rules to be consolidated with their timestamps, (2) proposed consolidated text for CLAUDE.md, (3) confirmation that these will be removed from lessons.md.
 - Wait for user approval before proceeding.
-- After approval, append the consolidated bullet points to the `CLAUDE.md` "## Notes" section maintaining alphabetical or logical grouping with existing notes.
+- After approval, append the consolidated bullet points to the `CLAUDE.md` "## Notes" section maintaining logical grouping with existing notes.
 - Remove the consolidated rules from `.claude/tasks/lessons.md`, preserving any rules newer than 7 days.
 - Provide a summary of how many rules were consolidated and how many remain in lessons.md for future consolidation.

@@ -19,5 +19,5 @@ Follow these steps:
 - Once all sections are complete, present the full issue content for user review and approval.
 - After approval, determine repository owner and name from git remote, then either create a new issue using `gh api repos/:owner/:repo/issues -f title="..." -f body="..."` or update existing using `gh api repos/:owner/:repo/issues/$ARGUMENTS -X PATCH -f body="..."`.
 - When updating existing issues, preserve any existing labels by fetching them first and including them in the update.
-- Add the issue to the project specified in template frontmatter (oscmcompany/1) using GraphQL API: first get the project and issue node IDs, then use the addProjectV2ItemById mutation.
+- Add the issue to the project specified in template frontmatter (oscmcompany/1) using GraphQL API: first get the project node ID with `query { organization(login: "oscmcompany") { projectV2(number: 1) { id } } }` and the issue node ID, then use the addProjectV2ItemById mutation.
 - Provide the final issue URL to the user and summarize what was created/updated.

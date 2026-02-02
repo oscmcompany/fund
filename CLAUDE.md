@@ -21,7 +21,7 @@ This is a collection of guidelines and references.
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
-- Folder names under the `applications/` directory should have a `*model` suffix for machine learning serivces
+- Folder names under the `applications/` directory should have a `*model` suffix for machine learning services
   and `*manager` for all others
 - Scan and remove unused dependencies from `pyproject.toml` files
 - Move duplicate dependencies into root workspace `pyproject.toml`
@@ -59,9 +59,9 @@ This is a set of instructions for tasks and projects.
 1. Plan Mode Default
 
 - Enter plan mode for any task with more than one step or architectural decisions
-- If something goes wrong, stop and re-plan immediately - don't continue working 
+- If something goes wrong, stop and re-plan immediately - don't continue working
 - Use plan mode for verification steps, not just building steps
-- Write detailed specfications upfront to reduce ambiguity
+- Write detailed specifications upfront to reduce ambiguity
 
 2. Subagent Strategy
 
@@ -72,7 +72,7 @@ This is a set of instructions for tasks and projects.
 
 3. Self-Improvement Loop
 
-- After any correction from the user: update `.claude/tasks/lessons.m`d with the pattern
+- After any correction from the user: update `.claude/tasks/lessons.md` with the pattern
 - Write rules for yourself that prevent the same mistake and include a timestamp when added
 - Iterate on these rules until mistake rate drops
 - Review rules at session start for relevant project
