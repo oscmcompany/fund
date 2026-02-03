@@ -12,7 +12,9 @@ Follow these steps:
 
 - Accept the pull request ID from $ARGUMENTS; error if no argument is provided with a clear message that a PR number is required.
 - Determine the scratchpad directory path from the system reminder message (shown at session start, format: `/private/tmp/claude-*/scratchpad`). Use this for all temporary file storage instead of `/tmp/` to ensure session isolation and automatic cleanup.
-- Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`).
+- Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`) and export variables:
+  - `OWNER=<extracted_owner>`
+  - `REPO=<extracted_repo>`
 - Fetch comprehensive PR data using a single GraphQL query, saving to a file to avoid token limit issues:
 
   ```bash
@@ -71,6 +73,10 @@ Follow these steps:
               commit {
                 checkSuites(first: 50) {
                   nodes {
+                    workflowRun {
+                      id
+                      databaseId
+                    }
                     checkRuns(first: 50) {
                       nodes {
                         name
@@ -132,7 +138,11 @@ Follow these steps:
 - Before processing feedback, auto-resolve all outdated threads that are still unresolved:
 
   ```bash
-  # Extract outdated thread IDs
+  # Log outdated threads before resolution for verification
+  echo "=== Auto-resolving outdated threads ==="
+  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | "\(.id) | \(.comments.nodes[0].path) | \(.comments.nodes[0].author.login) | \(.comments.nodes[0].body[:80])"' $SCRATCHPAD/pr_data.json
+
+  # Extract outdated thread IDs and resolve
   jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' $SCRATCHPAD/pr_data.json | while read thread_id; do
     gh api graphql -f query="
       mutation {
@@ -146,7 +156,7 @@ Follow these steps:
 
 - Log which threads were auto-resolved as outdated for the final summary.
 
-### 4. Enter Plan Mode (CLAUDE.md: "Plan Mode Default")
+### 4. Enter Plan Mode
 
 - Enter plan mode to organize the work.
 - Present a high-level overview showing: (1) total number of feedback groups identified, (2) brief description of each group, (3) which groups are independent vs interdependent, (4) check failures that need fixes.
@@ -158,21 +168,21 @@ Follow these steps:
 
 - For each feedback group:
   - Present a detailed plan including: grouped feedback items with metadata (comment IDs, commenters, file/line), recommended actions (address vs reject with reasoning), and implementation approach for fixes.
-  - Apply "Demand Elegance" principle (CLAUDE.md): pause and ask "Is there a more elegant solution?" for non-trivial changes.
+  - For non-trivial changes, pause and ask "Is there a more elegant solution?" before implementing.
   - Wait for user approval of this group's plan before proceeding.
 
 - Only when explicitly grouping truly independent work that benefits from simultaneous execution:
-  - Note: "The following groups are independent and will be implemented in parallel using subagents per CLAUDE.md 'Subagent Strategy'."
+  - Note: "The following groups are independent and will be implemented in parallel using subagents to keep main context clean."
   - Wait for user approval before spawning parallel subagents.
 
 ### 6. Implement Fixes
 
 - After plan approval for a group (or parallel groups):
-  - For independent groups, spawn parallel subagents (CLAUDE.md: "Subagent Strategy") to implement solutions simultaneously, keeping main context clean.
+  - For independent groups, spawn parallel subagents to implement solutions simultaneously, keeping main context clean.
   - For interdependent groups, implement sequentially.
   - Implement all fixes for feedback being addressed and for check failures in this group.
 
-### 7. Verify Changes (CLAUDE.md: "Verification Before Done")
+### 7. Verify Changes
 
 - After implementing each group's fixes, run verification checks locally:
   - Run `mask development python all` if any Python files were modified.
@@ -262,7 +272,7 @@ Follow these steps:
   - Create commit with descriptive message following CLAUDE.md conventions:
     - Include detailed summary of what was fixed and why
     - Reference PR number
-    - Add co-author line: `Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>`
+    - Add co-author line: extract model name from system context (format: "You are powered by the model named X") and use `Co-Authored-By: Claude X <noreply@anthropic.com>`
   - Example:
 
     ```bash
@@ -272,7 +282,7 @@ Follow these steps:
 
     <Detailed explanation of changes made>
 
-    Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>
+    Co-Authored-By: Claude <model_name> <noreply@anthropic.com>
     EOF
     )"
     ```

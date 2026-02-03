@@ -49,62 +49,11 @@ This is a collection of guidelines and references.
 - `libraries/` folder contains shared code resources
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
-
-## Workflow Orchestration
-
-This is a set of instructions for tasks and projects.
-
-### Specifics
-
-1. Plan Mode Default
-
-- Enter plan mode for any task with more than one step or architectural decisions
-- If something goes wrong, stop and re-plan immediately - don't continue working
-- Use plan mode for verification steps, not just building steps
-- Write detailed specifications upfront to reduce ambiguity
-
-2. Subagent Strategy
-
-- Use subagents liberally to keep main context window clean
-- Offload research, exploration, and parallel analysis to subagents
-- For complex problems, deploy additional subagents
-- One task per subagent for focused execution
-
-3. Self-Improvement Loop
-
-- After any correction from the user: update `.claude/tasks/lessons.md` with the pattern
-- Write rules for yourself that prevent the same mistake and include a timestamp when added
-- Iterate on these rules until mistake rate drops
-- Review rules at session start for relevant project
-
-4. Verification Before Done
-
-- Do not mark a task complete without proving it works
-- Compare behavior between the `master` branch and your changes when relevant
-- Ask yourself: "Would these changes be approved to merge to `master`?"
-- Run `mask development python/rust all` commands, check logs, demonstrate correctness
-
-5. Demand Elegance
-
-- For non-trivial changes: pause and ask "Is there a more elegant way?"
-- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
-- Skip this for simple fixes - don't over-engineer solutions
-- Challenge your own work before presenting it
-
-### Task Management
-
-Use `.claude/tasks/todos.md` for general task tracking when working on non-command tasks. For command-specific workflows (like `/update-pull-request`), plan mode handles organization.
-
-When using todos.md:
-1. Plan First: Write plan to `.claude/tasks/todos.md` with checkable items
-2. Track Progress: Mark items complete as you go
-3. Document Results: Add review section to `.claude/tasks/todos.md`
-4. Capture Lessons: Update `.claude/tasks/lessons.md` after corrections
-
-Note: Read the file before writing if it already exists to avoid write errors.
-
-### Core Principles
-
-- Simplicity First: Make every change as simple as possible. Impact minimal code.
-- No Laziness: Find root causes. No temporary fixes. Senior developer standards.
-- Minimal Impact: Changes should only touch what's necessary. Avoid introducing bugs.
+- If something goes wrong during a task, stop immediately and re-plan rather than continuing
+- Use subagents to keep main context window clean and offload research, exploration, and analysis work
+- After user corrections, update `.claude/tasks/lessons.md` with timestamp to prevent repeating mistakes
+- Prove changes work before marking tasks complete - run `mask` checks, compare behavior, demonstrate correctness
+- For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
+- Make every change as simple as possible and impact minimal code
+- Find root causes and avoid temporary fixes - maintain high standards
+- Changes should only touch what's necessary to avoid introducing bugs
