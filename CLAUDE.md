@@ -93,14 +93,15 @@ This is a set of instructions for tasks and projects.
 
 ### Task Management
 
-Remove all content from `.claude/tasks/todos.md` and start fresh for each new task.
+Use `.claude/tasks/todos.md` for general task tracking when working on non-command tasks. For command-specific workflows (like `/update-pull-request`), plan mode handles organization.
 
+When using todos.md:
 1. Plan First: Write plan to `.claude/tasks/todos.md` with checkable items
-2. Verify Plans: Check in before starting implementation
-3. Track Progress: Mark items complete as you go
-4. Explain Changes: High-level summary at each step
-5. Document Results: Add review section to `.claude/tasks/todos.md`
-6. Capture Lessons: Update `.claude/tasks/lessons.md` after corrections
+2. Track Progress: Mark items complete as you go
+3. Document Results: Add review section to `.claude/tasks/todos.md`
+4. Capture Lessons: Update `.claude/tasks/lessons.md` after corrections
+
+Note: Read the file before writing if it already exists to avoid write errors.
 
 ### Core Principles
 
