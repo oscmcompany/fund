@@ -21,8 +21,8 @@ This is a collection of guidelines and references.
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
-- Folder names under the `applications/` directory should have a `*model` suffix for machine learning services
-  and `*manager` for all others
+- Folder names under the `applications/` directory should end with `model` for machine learning services
+  and end with `manager` for all others
 - Scan and remove unused dependencies from `pyproject.toml` files
 - Move duplicate dependencies into root workspace `pyproject.toml`
 - Introduce new dependencies only after approval

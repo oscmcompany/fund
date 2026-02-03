@@ -12,8 +12,11 @@ Follow these steps:
 
 - Accept the pull request ID from $ARGUMENTS; error if no argument is provided with a clear message that a PR number is required.
 - Clear any existing content from `.claude/tasks/todos.md` to start fresh for this PR work.
+- Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`).
 - Fetch comprehensive PR data using a single GraphQL query, saving to a file to avoid token limit issues:
+
   ```bash
+
   gh api graphql -f query='
     query($owner: String!, $repo: String!, $number: Int!) {
       repository(owner: $owner, name: $repo) {
@@ -84,15 +87,16 @@ Follow these steps:
         }
       }
     }
-  ' -f owner="oscmcompany" -f repo="fund" -F number=$ARGUMENTS > /tmp/pr_data.json
+  ' -f owner="$OWNER" -f repo="$REPO" -F number=$ARGUMENTS > /tmp/pr_data.json
   ```
+
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
 - **Important**: Save output to a file (`/tmp/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
 
 ### 2. Analyze Check Failures
 
-- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/:owner/:repo/actions/runs/{run_id}/logs`.
-- If logs are not accessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors and capture the failure details.
+- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/$OWNER/$REPO/actions/runs/{run_id}/logs` (replacing `{run_id}` with the actual run ID).
+- If logs are inaccessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors and capture the failure details.
 - Add check failures to the list of items that need fixes.
 
 ### 3. Group and Analyze Feedback
@@ -125,6 +129,7 @@ Follow these steps:
 ### 3a. Resolve Outdated Threads
 
 - Before processing feedback, auto-resolve all outdated threads that are still unresolved:
+
   ```bash
   # Extract outdated thread IDs
   jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' /tmp/pr_data.json | while read thread_id; do
@@ -137,6 +142,7 @@ Follow these steps:
     "
   done
   ```
+
 - Log which threads were auto-resolved as outdated for the final summary.
 
 ### 4. Enter Plan Mode (CLAUDE.md: "Plan Mode Default")
@@ -171,7 +177,8 @@ Follow these steps:
   - Run `mask development python all` if any Python files were modified.
   - Run `mask development rust all` if any Rust files were modified.
   - Skip redundant checks if the next group will touch the same language files (batch them), but always run comprehensive checks at the end.
-- If checks fail, fix issues and re-run until passing before moving to the next group.
+  - **Note**: Local verification confirms fixes work in the development environment, but remote CI on the PR will not re-run or reflect these results until changes are pushed in Section 10.
+- If checks fail, resolve issues and re-run until passing before moving to the next group.
 - Do not proceed to the next feedback group until current group's changes pass verification.
 
 ### 8. Iterate Through All Groups
@@ -184,6 +191,7 @@ Follow these steps:
 - For each piece of feedback (both addressed and rejected), draft a response comment explaining what was done or why it was rejected, using the commenter name for personalization.
 - Post all response comments to their respective threads:
   - For review comments (code-level), use GraphQL `addPullRequestReviewComment` mutation:
+
     ```bash
     # IMPORTANT: Keep response text simple - avoid newlines, code blocks, and special characters
     # GraphQL string literals cannot contain raw newlines; use spaces or simple sentences
@@ -201,6 +209,7 @@ Follow these steps:
       }
     '
     ```
+
     Use the PR's node ID from step 1's query (`data.repository.pullRequest.id`) for `pullRequestId`.
     Use the comment's node ID (format: `PRRC_*`) for `inReplyTo` parameter.
 
@@ -211,8 +220,9 @@ Follow these steps:
     - For longer responses, reference line numbers or file paths instead of quoting code
 
   - For issue comments (PR-level), use REST API:
+
     ```bash
-    gh api repos/:owner/:repo/issues/<pr_number>/comments -f body="<response_text>"
+    gh api repos/$OWNER/$REPO/issues/$ARGUMENTS/comments -f body="<response_text>"
     ```
 
 - For each response posted, capture the returned comment ID for verification.
@@ -220,6 +230,7 @@ Follow these steps:
   - For review comment threads:
     - Use the thread ID (format: `PRRT_*`) captured during parsing from GraphQL response's `reviewThreads.nodes[].id` field.
     - Resolve thread using GraphQL mutation:
+
       ```bash
       gh api graphql -f query='
         mutation {
@@ -232,8 +243,10 @@ Follow these steps:
         }
       '
       ```
+
     - Map each comment back to its parent thread using the data structure from step 3 parsing.
     - Resolve both addressed and rejected feedback threads (explanation provided in response).
+    - **Note**: Threads are resolved based on local verification. The fixes will not appear on the remote PR branch until Section 10's commit and push. Remote CI will not re-run until changes are pushed.
 
   - For issue comments (PR-level):
     - No resolution mechanism (issue comments don't have thread states).
@@ -250,6 +263,7 @@ Follow these steps:
     - Reference PR number
     - Add co-author line: `Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>`
   - Example:
+
     ```bash
     git add file1.py file2.md
     git commit -m "$(cat <<'EOF'
@@ -261,7 +275,8 @@ Follow these steps:
     EOF
     )"
     ```
-- Ask user: "Would you like me to push these changes to the remote branch?"
+
+- Ask user: "Ready to push these changes to the remote branch to update the PR? This will trigger remote CI to re-run and make the fixes visible to other reviewers."
 
 ### 11. Final Summary
 
@@ -270,5 +285,5 @@ Follow these steps:
   - Total feedback items processed (with count of addressed vs rejected).
   - Which checks were fixed.
   - Confirmation that all comments have been responded to and resolved.
-  - Final verification status (all checks passing).
-- For check failures that were fixed, note that no comments were posted - the fixes will be reflected in re-run checks.
+  - Final verification status (all local checks passing; note that remote CI status will update after pushing changes).
+- For check failures that were fixed, note that no comments were posted - the fixes will be reflected in re-run checks after pushing to the remote branch.
