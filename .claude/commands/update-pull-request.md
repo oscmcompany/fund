@@ -11,7 +11,7 @@ Follow these steps:
 ### 1. Fetch PR Data
 
 - Accept the pull request ID from $ARGUMENTS; error if no argument is provided with a clear message that a PR number is required.
-- Clear any existing content from `.claude/tasks/todos.md` to start fresh for this PR work.
+- Determine the scratchpad directory path from the system reminder message (shown at session start, format: `/private/tmp/claude-*/scratchpad`). Use this for all temporary file storage instead of `/tmp/` to ensure session isolation and automatic cleanup.
 - Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`).
 - Fetch comprehensive PR data using a single GraphQL query, saving to a file to avoid token limit issues:
 
@@ -87,11 +87,12 @@ Follow these steps:
         }
       }
     }
-  ' -f owner="$OWNER" -f repo="$REPO" -F number=$ARGUMENTS > /tmp/pr_data.json
+  ' -f owner="$OWNER" -f repo="$REPO" -F number=$ARGUMENTS > $SCRATCHPAD/pr_data.json
   ```
 
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
-- **Important**: Save output to a file (`/tmp/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
+- **Important**: Save output to a file (`$SCRATCHPAD/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
+- **Critical**: The PR data file will be too large to read directly with the Read tool. Always use `jq` to parse and extract specific fields. Never attempt to read the entire file.
 
 ### 2. Analyze Check Failures
 
@@ -101,7 +102,7 @@ Follow these steps:
 
 ### 3. Group and Analyze Feedback
 
-- Parse the saved PR data from `/tmp/pr_data.json` using these extraction rules:
+- Parse the saved PR data from `$SCRATCHPAD/pr_data.json` using these extraction rules:
   - From `data.repository.pullRequest.reviewThreads.nodes[]`:
     - **First, identify outdated threads**: Filter for `isResolved: false` AND `isOutdated: true`
       - Auto-resolve these immediately (see step 3a below) since they're no longer relevant to current code
@@ -132,7 +133,7 @@ Follow these steps:
 
   ```bash
   # Extract outdated thread IDs
-  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' /tmp/pr_data.json | while read thread_id; do
+  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' $SCRATCHPAD/pr_data.json | while read thread_id; do
     gh api graphql -f query="
       mutation {
         resolveReviewThread(input: {threadId: \"$thread_id\"}) {
