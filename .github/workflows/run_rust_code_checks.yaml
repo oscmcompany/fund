@@ -3,12 +3,25 @@ name: Rust code checks
 run-name: Rust code checks
 on:
   pull_request:
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
 jobs:
+  detect_changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
   run_rust_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.rust == 'true' }}
     name: Run Rust code checks
     runs-on: ubuntu-latest
     steps:

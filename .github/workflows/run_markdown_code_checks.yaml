@@ -3,11 +3,24 @@ name: Markdown code checks
 run-name: Markdown code checks
 on:
   pull_request:
-    paths:
-      - '**/*.md'
-      - '**/*.markdown'
 jobs:
+  detect_changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      markdown: ${{ steps.filter.outputs.markdown }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            markdown:
+              - '**/*.md'
+              - '**/*.markdown'
   run_markdown_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.markdown == 'true' }}
     name: Run Markdown code checks
     runs-on: ubuntu-latest
     steps:
