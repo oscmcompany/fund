@@ -1,36 +1,35 @@
 ---
-name: Rust code checks
-run-name: Rust code checks
+name: Markdown code checks
+run-name: Markdown code checks
 on:
   pull_request:
 jobs:
   detect_changes:
     runs-on: ubuntu-latest
-    name: Detect Rust code changes
+    name: Detect changes in Markdown files
     permissions:
       pull-requests: read
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+      markdown: ${{ steps.filter.outputs.markdown }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-  run_rust_code_checks:
+            markdown:
+              - '**/*.md'
+              - '**/*.markdown'
+  run_markdown_code_checks:
     needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.rust == 'true' }}
-    name: Run Rust code checks
+    if: ${{ needs.detect_changes.outputs.markdown == 'true' }}
+    name: Run Markdown code checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install Flox
         uses: flox/install-flox-action@v2
-      - name: Run Rust code checks
+      - name: Run Markdown code checks
         uses: flox/activate-action@v1
         with:
-          command: mask development rust all
+          command: mask development markdown all

@@ -4,7 +4,26 @@ run-name: Python code checks
 on:
   pull_request:
 jobs:
+  detect_changes:
+    runs-on: ubuntu-latest
+    name: Detect changes in Python files
+    permissions:
+      pull-requests: read
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            python:
+              - '**/*.py'
+              - '**/*.pyi'
+              - '**/pyproject.toml'
+              - '**/uv.lock'
   run_python_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.python == 'true' }}
     name: Run Python code checks
     runs-on: ubuntu-latest
     steps:
