@@ -46,33 +46,9 @@ markdownlint-cli.pkg-path = "markdownlint-cli"
 [hook]
 on-activate = '''
 if [[ -f .env ]]; then
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ -z "${line// /}" ]]; then
-      continue
-    fi
-
-    if [[ "$line" =~ ^[[:space:]]*# ]]; then
-      continue
-    fi
-
-    line="${line%%[[:space:]]*#*}"
-
-    if [[ "$line" =~ = ]]; then
-      key="${line%%=*}"
-      value="${line#*=}"
-
-      key="${key#"${key%%[![:space:]]*}"}"  # trim leading
-      key="${key%"${key##*[![:space:]]}"}"  # trim trailing
-
-      if [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
-        export "$key=$value"
-      else
-        echo "Skipping invalid key '$key' in .env" >&2
-      fi
-    fi
-  done < .env
-else
-  echo ".env file not found, skipping environment variable loading" >&2
+  set -a
+  source .env
+  set +a
 fi
 '''
 
