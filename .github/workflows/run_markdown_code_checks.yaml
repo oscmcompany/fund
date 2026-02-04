@@ -7,7 +7,7 @@ on:
       - '**/*.md'
       - '**/*.markdown'
 jobs:
-  run_rust_code_checks:
+  run_markdown_code_checks:
     name: Run Markdown code checks
     runs-on: ubuntu-latest
     steps:
@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Flox
         uses: flox/install-flox-action@v2
-      - name: Run Rust code checks
+      - name: Run Markdown code checks
         uses: flox/activate-action@v1
         with:
           command: mask development markdown all
