@@ -27,11 +27,11 @@ tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
-aws-config = "1.5.8"
-aws-sdk-s3 = "1.48.0"
+aws-config = "1.5"
+aws-sdk-s3 = "1.112"
 aws-credential-types = "1.2.6"
 duckdb = { version = "1.4.3", features = ["r2d2", "chrono"] }
-validator = { version = "0.18", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
 thiserror = "2.0.3"
 sentry = { version = "0.35", features = ["tracing", "reqwest", "rustls"] }
 sentry-tower = { version = "0.35", features = ["http"] }
