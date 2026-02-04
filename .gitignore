@@ -20,6 +20,5 @@ data/
 **/model.tar.gz
 **/*.safetensor
 **/*.json
-notes.md
-etc/
 .claude/tasks/
+.scratchpad/
