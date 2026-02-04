@@ -3,6 +3,11 @@ name: Python code checks
 run-name: Python code checks
 on:
   pull_request:
+    paths:
+      - '**/*.py'
+      - '**/*.pyi'
+      - '**/pyproject.toml'
+      - '**/uv.lock'
 jobs:
   run_python_code_checks:
     name: Run Python code checks

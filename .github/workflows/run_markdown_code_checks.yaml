@@ -1,15 +1,14 @@
 ---
-name: Rust code checks
-run-name: Rust code checks
+name: Markdown code checks
+run-name: Markdown code checks
 on:
   pull_request:
     paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
+      - '**/*.md'
+      - '**/*.markdown'
 jobs:
   run_rust_code_checks:
-    name: Run Rust code checks
+    name: Run Markdown code checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -19,4 +18,4 @@ jobs:
       - name: Run Rust code checks
         uses: flox/activate-action@v1
         with:
-          command: mask development rust all
+          command: mask development markdown all
