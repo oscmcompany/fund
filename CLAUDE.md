@@ -4,6 +4,8 @@
 
 ## Notes
 
+This is a collection of guidelines and references.
+
 - Rust and Python are the primary project languages
 - [Flox](https://flox.dev/) manages project environment and packages
 - [Mask](https://github.com/jacobdeichert/mask) is used for command management
@@ -19,6 +21,8 @@
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
+- Folder names under the `applications/` directory should end with `model` for machine learning services
+  and end with `manager` for all others
 - Scan and remove unused dependencies from `pyproject.toml` files
 - Move duplicate dependencies into root workspace `pyproject.toml`
 - Introduce new dependencies only after approval
@@ -45,71 +49,11 @@
 - `libraries/` folder contains shared code resources
 - `infrastructure/` folder contains Pulumi infrastructure as code
 - See `README.md` "Principles" section for developer philosophy
-
-## Ralph Workflow
-
-Ralph is an autonomous development loop for implementing GitHub issue specs.
-
-### Commands
-
-- `mask ralph setup` - Create required labels (run once before first use)
-- `mask ralph spec [issue_number]` - Interactive spec refinement (creates new issue if no number provided)
-- `mask ralph ready <issue_number>` - Mark a spec as ready for implementation
-- `mask ralph loop <issue_number>` - Run autonomous loop on a ready spec
-- `mask ralph backlog` - Review open issues for duplicates, overlaps, and implementation status
-- `mask ralph pull-request [pull_request_number]` - Process pull request review feedback interactively
-
-### Labels
-
-**Status labels:**
-
-- `in-refinement` - Spec being built or discussed
-- `ready` - Spec complete, ready for implementation
-- `in-progress` - Work actively in progress
-- `attention-needed` - Blocked or needs human intervention
-- `backlog-review` - Backlog review tracking issue
-
-**Actor label:**
-
-- `ralph` - Ralph is actively working on this (remove to hand off to human)
-
-### Workflow
-
-1. Create or refine spec: `mask ralph spec` or `mask ralph spec <issue_number>`
-2. When spec is complete, mark as ready: `mask ralph ready <issue_number>`
-3. Run autonomous loop: `mask ralph loop <issue_number>`
-4. Loop assigns the issue and resulting pull request to the current GitHub user
-5. Loop creates pull request with `Closes #<issue_number>` on completion
-6. Pull request merge auto-closes issue
-
-### Context Rotation
-
-- Complete logically related requirements together (same files, same concepts)
-- Exit after meaningful progress to allow fresh context on next iteration
-- Judgment factors: relatedness, complexity, context size, dependencies
-
-### Completion Signal
-
-Output `<promise>COMPLETE</promise>` when all requirement checkboxes are checked to signal task completion.
-
-### Commit as Verification
-
-After implementing requirements, ALWAYS attempt `git commit`. The commit triggers pre-commit hooks which
-run all tests/linting. This IS the verification step:
-
-- If commit fails → fix issues and retry
-- If commit succeeds → requirement is verified, check it off in issue
-- Do not skip this step or run tests separately
-
-### Ralph Learnings
-
-Document failure patterns here after Ralph loops to prevent recurrence. Periodically compact this section
-by merging similar learnings and removing entries that have been incorporated into the workflow or specs above.
-
-#### 2026-01-26: #723 (spec: commit-as-verification not explicit)
-
-**Issue:** Loop implemented requirements but didn't attempt git commit to verify.
-
-**Root cause:** Spec said "commit is the verification gate" but didn't explicitly say to always attempt commit after implementing.
-
-**Fix:** Added explicit "Commit-as-Verification" section requiring commit attempt after every implementation.
+- If something goes wrong during a task, stop immediately and re-plan rather than continuing
+- Use subagents to keep main context window clean and offload research, exploration, and analysis work
+- After user corrections, update `.claude/tasks/lessons.md` with timestamp to prevent repeating mistakes
+- Prove changes work before marking tasks complete - run `mask` checks, compare behavior, demonstrate correctness
+- For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
+- Make every change as simple as possible and impact minimal code
+- Find root causes and avoid temporary fixes - maintain high standards
+- Changes should only touch what's necessary to avoid introducing bugs
