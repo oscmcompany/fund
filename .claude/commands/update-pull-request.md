@@ -10,7 +10,7 @@ Follow these steps:
 
 ### 1. Fetch PR Data
 
-- Accept the pull request ID from $ARGUMENTS; error if no argument is provided with a clear message that a PR number is required.
+- Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a PR number is required.
 - Determine the scratchpad directory path from the system reminder message (shown at session start, format: `/private/tmp/claude-*/scratchpad`). Use this for all temporary file storage instead of `/tmp/` to ensure session isolation and automatic cleanup.
 - Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`) and export variables:
   - `OWNER=<extracted_owner>`
@@ -93,22 +93,22 @@ Follow these steps:
         }
       }
     }
-  ' -f owner="$OWNER" -f repo="$REPO" -F number=$ARGUMENTS > $SCRATCHPAD/pr_data.json
+  ' -f owner="${OWNER}" -f repo="${REPO}" -F number=${ARGUMENTS} > ${SCRATCHPAD}/pr_data.json
   ```
 
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
-- **Important**: Save output to a file (`$SCRATCHPAD/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
+- **Important**: Save output to a file (`${SCRATCHPAD}/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
 - **Critical**: The PR data file will be too large to read directly with the Read tool. Always use `jq` to parse and extract specific fields. Never attempt to read the entire file.
 
 ### 2. Analyze Check Failures
 
-- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/$OWNER/$REPO/actions/runs/{run_id}/logs` (replacing `{run_id}` with the actual run ID).
+- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs` (replacing `{run_id}` with the actual run ID).
 - If logs are inaccessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors and capture the failure details.
 - Add check failures to the list of items that need fixes.
 
 ### 3. Group and Analyze Feedback
 
-- Parse the saved PR data from `$SCRATCHPAD/pr_data.json` using these extraction rules:
+- Parse the saved PR data from `${SCRATCHPAD}/pr_data.json` using these extraction rules:
   - From `data.repository.pullRequest.reviewThreads.nodes[]`:
     - **First, identify outdated threads**: Filter for `isResolved: false` AND `isOutdated: true`
       - Auto-resolve these immediately (see step 3a below) since they're no longer relevant to current code
@@ -140,10 +140,10 @@ Follow these steps:
   ```bash
   # Log outdated threads before resolution for verification
   echo "=== Auto-resolving outdated threads ==="
-  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | "\(.id) | \(.comments.nodes[0].path) | \(.comments.nodes[0].author.login) | \(.comments.nodes[0].body[:80])"' $SCRATCHPAD/pr_data.json
+  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | "\(.id) | \(.comments.nodes[0].path) | \(.comments.nodes[0].author.login) | \(.comments.nodes[0].body[:80])"' ${SCRATCHPAD}/pr_data.json
 
   # Extract outdated thread IDs and resolve
-  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' $SCRATCHPAD/pr_data.json | while read thread_id; do
+  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' ${SCRATCHPAD}/pr_data.json | while read thread_id; do
     gh api graphql -f query="
       mutation {
         resolveReviewThread(input: {threadId: \"$thread_id\"}) {
@@ -233,7 +233,7 @@ Follow these steps:
   - For issue comments (PR-level), use REST API:
 
     ```bash
-    gh api repos/$OWNER/$REPO/issues/$ARGUMENTS/comments -f body="<response_text>"
+    gh api repos/${OWNER}/${REPO}/issues/"${ARGUMENTS}"/comments -f body="<response_text>"
     ```
 
 - For each response posted, capture the returned comment ID for verification.
