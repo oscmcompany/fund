@@ -12,7 +12,7 @@ members = [
     "equitypricemodel",
     "infrastructure",
     "internal",
-    "pocketsizefund",
+    "oscm",
     "portfoliomanager",
     "tools",
 ]
@@ -1722,6 +1722,48 @@ wheels = [
 ]
 
 [[package]]
+name = "oscm"
+version = "20250602.4"
+source = { virtual = "." }
+dependencies = [
+    { name = "fastapi" },
+    { name = "internal" },
+    { name = "numpy" },
+    { name = "requests" },
+    { name = "sagemaker", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'win32'" },
+    { name = "sagemaker", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "structlog" },
+    { name = "tinygrad" },
+    { name = "uvicorn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "behave" },
+    { name = "coverage" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.121.0" },
+    { name = "internal", editable = "libraries/python" },
+    { name = "numpy", specifier = ">=1.26.4" },
+    { name = "requests", specifier = ">=2.32.5" },
+    { name = "sagemaker", specifier = ">=2.256.0" },
+    { name = "structlog", specifier = ">=25.5.0" },
+    { name = "tinygrad", specifier = ">=0.10.3" },
+    { name = "uvicorn", specifier = ">=0.35.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "behave", specifier = ">=1.2.6" },
+    { name = "coverage", specifier = ">=7.8.0" },
+    { name = "pytest", specifier = ">=8.3.5" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1906,48 +1948,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
-]
-
-[[package]]
-name = "pocketsizefund"
-version = "20250602.4"
-source = { virtual = "." }
-dependencies = [
-    { name = "fastapi" },
-    { name = "internal" },
-    { name = "numpy" },
-    { name = "requests" },
-    { name = "sagemaker", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'win32'" },
-    { name = "sagemaker", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
-    { name = "structlog" },
-    { name = "tinygrad" },
-    { name = "uvicorn" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "behave" },
-    { name = "coverage" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastapi", specifier = ">=0.121.0" },
-    { name = "internal", editable = "libraries/python" },
-    { name = "numpy", specifier = ">=1.26.4" },
-    { name = "requests", specifier = ">=2.32.5" },
-    { name = "sagemaker", specifier = ">=2.256.0" },
-    { name = "structlog", specifier = ">=25.5.0" },
-    { name = "tinygrad", specifier = ">=0.10.3" },
-    { name = "uvicorn", specifier = ">=0.35.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "behave", specifier = ">=1.2.6" },
-    { name = "coverage", specifier = ">=7.8.0" },
-    { name = "pytest", specifier = ">=8.3.5" },
 ]
 
 [[package]]

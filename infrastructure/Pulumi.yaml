@@ -1,6 +1,6 @@
-name: pocketsizefund
+name: oscm
 runtime:
   name: python
   options:
     toolchain: uv
-description: Pocket Size Fund application infrastructure
+description: OSCM application infrastructure

@@ -43,7 +43,7 @@ impl State {
                 name
             }
             Err(_) => {
-                let default_bucket = "pocketsizefund-data".to_string();
+                let default_bucket = "oscm-data".to_string();
                 error!(
                     "AWS_S3_DATA_BUCKET_NAME not set, using default: {}",
                     default_bucket
