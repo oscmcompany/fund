@@ -1,6 +1,7 @@
 import json
 import os
 from datetime import date, datetime, timedelta
+from typing import cast
 
 import numpy as np
 import pandera.polars as pa
@@ -212,10 +213,11 @@ class Data:
                 )
 
         data_validated = data_schema.validate(data)
-        data = (
+        data = cast(
+            "pl.DataFrame",
             data_validated.collect()
             if isinstance(data_validated, pl.LazyFrame)
-            else data_validated
+            else data_validated,
         )
 
         self.scaler = Scaler()

@@ -1,4 +1,4 @@
-# Pocket Size Fund Task Manager
+# OSCM Task Manager
 
 ## setup
 

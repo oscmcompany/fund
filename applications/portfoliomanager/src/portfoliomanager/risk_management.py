@@ -10,7 +10,7 @@ from .exceptions import InsufficientPredictionsError
 
 logger = structlog.get_logger()
 
-UNCERTAINTY_THRESHOLD = float(os.getenv("PSF_UNCERTAINTY_THRESHOLD", "0.1"))
+UNCERTAINTY_THRESHOLD = float(os.getenv("OSCM_UNCERTAINTY_THRESHOLD", "0.1"))
 
 
 def add_portfolio_action_column(

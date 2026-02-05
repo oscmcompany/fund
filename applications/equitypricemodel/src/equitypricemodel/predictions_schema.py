@@ -1,3 +1,5 @@
+from typing import cast
+
 import pandera.polars as pa
 import polars as pl
 from pandera.polars import PolarsData
@@ -11,7 +13,8 @@ def check_dates_count_per_ticker(
         pl.col("timestamp").unique().alias("unique_dates")
     )
 
-    unique_dates_per_ticker = grouped.collect()["unique_dates"].to_list()
+    result = cast("pl.DataFrame", grouped.collect())
+    unique_dates_per_ticker = result["unique_dates"].to_list()
 
     if not all(len(dates) == dates_count for dates in unique_dates_per_ticker):
         message = f"Each ticker must have exactly {dates_count} unique dates, found: {unique_dates_per_ticker}"  # noqa: E501
@@ -25,7 +28,8 @@ def check_same_dates_per_ticker(data: PolarsData) -> bool:
         pl.col("timestamp").unique().alias("unique_dates")
     )
 
-    unique_dates_per_ticker = grouped.collect()["unique_dates"].to_list()
+    result = cast("pl.DataFrame", grouped.collect())
+    unique_dates_per_ticker = result["unique_dates"].to_list()
 
     if len(unique_dates_per_ticker) > 1:
         first_ticker_dates = set(unique_dates_per_ticker[0])
@@ -38,7 +42,7 @@ def check_same_dates_per_ticker(data: PolarsData) -> bool:
 
 
 def check_monotonic_quantiles(data: PolarsData) -> bool:
-    lazy_frame = data.lazyframe.collect()
+    lazy_frame = cast("pl.DataFrame", data.lazyframe.collect())
 
     if (
         not (lazy_frame["quantile_10"] <= lazy_frame["quantile_50"]).all()
