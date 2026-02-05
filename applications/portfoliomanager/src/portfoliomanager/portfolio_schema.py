@@ -1,3 +1,5 @@
+from typing import cast
+
 import pandera.polars as pa
 import polars as pl
 from pandera.polars import PolarsData
@@ -15,11 +17,14 @@ def check_position_side_counts(
     data: PolarsData,
     total_positions_count: int = 20,  # 10 long and 10 short
 ) -> bool:
-    counts = data.lazyframe.select(
-        pl.len().alias("total_count"),
-        (pl.col("side") == PositionSide.LONG.value).sum().alias("long_count"),
-        (pl.col("side") == PositionSide.SHORT.value).sum().alias("short_count"),
-    ).collect()
+    counts = cast(
+        "pl.DataFrame",
+        data.lazyframe.select(
+            pl.len().alias("total_count"),
+            (pl.col("side") == PositionSide.LONG.value).sum().alias("long_count"),
+            (pl.col("side") == PositionSide.SHORT.value).sum().alias("short_count"),
+        ).collect(),
+    )
     total_count = counts.get_column("total_count").item()
     long_count = counts.get_column("long_count").item()
     short_count = counts.get_column("short_count").item()
@@ -45,18 +50,21 @@ def check_position_side_sums(
     data: PolarsData,
     maximum_imbalance_percentage: float = 0.05,  # 5%
 ) -> bool:
-    sums = data.lazyframe.select(
-        pl.when(pl.col("side") == PositionSide.LONG.value)
-        .then(pl.col("dollar_amount"))
-        .otherwise(0.0)
-        .sum()
-        .alias("long_sum"),
-        pl.when(pl.col("side") == PositionSide.SHORT.value)
-        .then(pl.col("dollar_amount"))
-        .otherwise(0.0)
-        .sum()
-        .alias("short_sum"),
-    ).collect()
+    sums = cast(
+        "pl.DataFrame",
+        data.lazyframe.select(
+            pl.when(pl.col("side") == PositionSide.LONG.value)
+            .then(pl.col("dollar_amount"))
+            .otherwise(0.0)
+            .sum()
+            .alias("long_sum"),
+            pl.when(pl.col("side") == PositionSide.SHORT.value)
+            .then(pl.col("dollar_amount"))
+            .otherwise(0.0)
+            .sum()
+            .alias("short_sum"),
+        ).collect(),
+    )
 
     long_sum = float(sums.get_column("long_sum").fill_null(0.0).item())
     short_sum = float(sums.get_column("short_sum").fill_null(0.0).item())

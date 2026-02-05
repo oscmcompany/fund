@@ -460,10 +460,11 @@ def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: P
     prior_equity_bars = pl.read_parquet(io.BytesIO(prior_equity_bars_response.content))
 
     prior_equity_bars_validated = equity_bars_schema.validate(prior_equity_bars)
-    prior_equity_bars = (
+    prior_equity_bars = cast(
+        "pl.DataFrame",
         prior_equity_bars_validated.collect()
         if isinstance(prior_equity_bars_validated, pl.LazyFrame)
-        else prior_equity_bars_validated
+        else prior_equity_bars_validated,
     )
 
     prior_equity_bars = add_equity_bars_returns_and_realized_volatility_columns(

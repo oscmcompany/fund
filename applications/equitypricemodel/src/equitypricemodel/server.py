@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import boto3
 import polars as pl
@@ -363,10 +363,11 @@ def parse_responses(
     )
 
     equity_bars_validated = equity_bars_schema.validate(equity_bars_data)
-    equity_bars_data = (
+    equity_bars_data = cast(
+        "pl.DataFrame",
         equity_bars_validated.collect()
         if isinstance(equity_bars_validated, pl.LazyFrame)
-        else equity_bars_validated
+        else equity_bars_validated,
     )
 
     equity_bars_data = filter_equity_bars(equity_bars_data)
@@ -374,10 +375,11 @@ def parse_responses(
     equity_details_data = pl.read_csv(io.BytesIO(equity_details_response.content))
 
     equity_details_validated = equity_details_schema.validate(equity_details_data)
-    equity_details_data = (
+    equity_details_data = cast(
+        "pl.DataFrame",
         equity_details_validated.collect()
         if isinstance(equity_details_validated, pl.LazyFrame)
-        else equity_details_validated
+        else equity_details_validated,
     )
 
     consolidated_data = equity_details_data.join(
