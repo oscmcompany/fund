@@ -783,11 +783,11 @@ def test_add_portfolio_performance_columns_rebalancing_closes_shorts_when_longs_
             if ticker in ["LONG1", "LONG2", "LONG3"]:
                 price = 100.0 - (10.0 * i / 29)  # longs losing -10%
             elif ticker == "SHORT1":
-                price = 100.0 + (20.0 * i / 29)  # short1 gaining +20% (worst for short)
+                price = 100.0 - (5.0 * i / 29)  # short1 falling -5% (best for short)
             elif ticker == "SHORT2":
-                price = 100.0 + (25.0 * i / 29)  # short2 gaining +25% (best performer)
+                price = 100.0 - (2.0 * i / 29)  # short2 falling -2% (second best)
             else:  # SHORT3
-                price = 100.0 + (15.0 * i / 29)  # short3 gaining +15%
+                price = 100.0 - (1.0 * i / 29)  # short3 falling -1% (worst)
 
             raw_equity_bars.append(
                 {"ticker": ticker, "timestamp": timestamp, "close_price": price}
@@ -808,17 +808,19 @@ def test_add_portfolio_performance_columns_rebalancing_closes_shorts_when_longs_
     )
     assert closed_longs.height == 3  # noqa: PLR2004
 
-    # 3 shorts should also be closed for rebalancing (best performers: SHORT2, SHORT1, SHORT3)  # noqa: E501
+    # 3 shorts should also be closed by rebalancing
+    # None of the shorts hit stop-loss (all have negative returns, not >= +15%)
+    # Rebalancing closes 3 shorts to match the 3 closed longs
     closed_shorts = result.filter(
         (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
     )
     assert closed_shorts.height == 3  # noqa: PLR2004
 
-    # Verify that best-performing shorts (most negative cumulative return) were closed
-    # SHORT2 has worst performance for short (+25% = bad), so most negative return
+    # Verify best-performing shorts were closed (most negative cumulative return)
+    # SHORT1 (-5%), SHORT2 (-2%), SHORT3 (-1%) all closed by rebalancing
     closed_short_tickers = closed_shorts["ticker"].to_list()
-    assert "SHORT2" in closed_short_tickers
     assert "SHORT1" in closed_short_tickers
+    assert "SHORT2" in closed_short_tickers
     assert "SHORT3" in closed_short_tickers
 
 
@@ -956,35 +958,41 @@ def test_add_portfolio_performance_columns_rebalancing_respects_pdt_locked_posit
 
     positions = pl.DataFrame(
         {
-            "ticker": ["LONG1", "SHORT1", "SHORT2", "SHORT3"],
-            "timestamp": [base_timestamp] * 4,
-            "side": ["LONG", "SHORT", "SHORT", "SHORT"],
-            "dollar_amount": [1000.0] * 4,
-            "action": ["UNSPECIFIED", "PDT_LOCKED", "UNSPECIFIED", "UNSPECIFIED"],
+            "ticker": ["LONG1", "LONG2", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 5,
+            "side": ["LONG", "LONG", "SHORT", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 5,
+            "action": [
+                "UNSPECIFIED",
+                "UNSPECIFIED",
+                "PDT_LOCKED",
+                "UNSPECIFIED",
+                "UNSPECIFIED",
+            ],
         }
     )
 
     predictions = pl.DataFrame(
         {
-            "ticker": ["LONG1", "SHORT1", "SHORT2", "SHORT3"],
-            "timestamp": [base_timestamp] * 4,
-            "quantile_10": [-0.05] * 4,
-            "quantile_90": [0.15] * 4,
+            "ticker": ["LONG1", "LONG2", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 5,
+            "quantile_10": [-0.05] * 5,
+            "quantile_90": [0.15] * 5,
         }
     )
 
     raw_equity_bars = []
-    for ticker in ["LONG1", "SHORT1", "SHORT2", "SHORT3"]:
+    for ticker in ["LONG1", "LONG2", "SHORT1", "SHORT2", "SHORT3"]:
         for i in range(30):
             timestamp = base_timestamp + (i * 86400)
-            if ticker == "LONG1":
-                price = 100.0 - (10.0 * i / 29)  # long losing -10%
+            if ticker in ["LONG1", "LONG2"]:
+                price = 100.0 - (10.0 * i / 29)  # longs losing -10%
             elif ticker == "SHORT1":
-                price = 100.0 + (30.0 * i / 29)  # short1 +30% (best, but PDT locked)
+                price = 100.0 - (10.0 * i / 29)  # short1 -10% (best, but PDT locked)
             elif ticker == "SHORT2":
-                price = 100.0 + (20.0 * i / 29)  # short2 +20%
+                price = 100.0 - (5.0 * i / 29)  # short2 -5% (second best)
             else:  # SHORT3
-                price = 100.0 + (10.0 * i / 29)  # short3 +10%
+                price = 100.0 - (2.0 * i / 29)  # short3 -2% (worst)
 
             raw_equity_bars.append(
                 {"ticker": ticker, "timestamp": timestamp, "close_price": price}
@@ -999,22 +1007,24 @@ def test_add_portfolio_performance_columns_rebalancing_respects_pdt_locked_posit
         positions, predictions, equity_bars, current_timestamp
     )
 
-    # 1 long should be closed
+    # 2 longs should be closed (both hit stop-loss at -10% < -5%)
     closed_longs = result.filter(
         (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
     )
-    assert closed_longs.height == 1
+    assert closed_longs.height == 2  # noqa: PLR2004
 
-    # 1 short should be closed for rebalancing (should not be SHORT1 since it's PDT locked)  # noqa: E501
+    # 2 shorts should be closed for rebalancing (not SHORT1 since it's PDT locked)
+    # Rebalancing closes SHORT2 and SHORT3 to match the 2 closed longs
     closed_shorts = result.filter(
         (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
     )
-    assert closed_shorts.height == 1
+    assert closed_shorts.height == 2  # noqa: PLR2004
 
     # SHORT1 should remain PDT_LOCKED, not be closed
     short1_action = result.filter(pl.col("ticker") == "SHORT1")["action"][0]
     assert short1_action == "PDT_LOCKED"
 
-    # Either SHORT2 or SHORT3 should be closed (SHORT2 has better performance)
-    closed_short_ticker = closed_shorts["ticker"][0]
-    assert closed_short_ticker == "SHORT2"
+    # SHORT2 and SHORT3 should be closed (SHORT1 skipped due to PDT_LOCKED)
+    closed_short_tickers = closed_shorts["ticker"].to_list()
+    assert "SHORT2" in closed_short_tickers
+    assert "SHORT3" in closed_short_tickers

@@ -137,7 +137,16 @@ def add_portfolio_performance_columns(
             }
         )
 
-    returns = pl.DataFrame(position_returns)
+    if position_returns:
+        returns = pl.DataFrame(position_returns)
+    else:
+        returns = pl.DataFrame(
+            schema={
+                "ticker": pl.Utf8,
+                "timestamp": pl.Float64,
+                "cumulative_simple_return": pl.Float64,
+            }
+        )
 
     prior_portfolio_with_data = prior_portfolio_predictions.join(
         other=returns,
@@ -224,11 +233,15 @@ def add_portfolio_performance_columns(
                 closed_longs=closed_long_count,
                 closed_shorts=closed_short_count,
                 additional_shorts_to_close=shorts_to_rebalance,
+                actual_shorts_closed=best_shorts.height,
                 shorts_being_closed=best_shorts.to_series().to_list(),
             )
 
             portfolio_with_actions = portfolio_with_actions.with_columns(
-                pl.when(pl.col("ticker").is_in(best_shorts["ticker"]))
+                pl.when(
+                    pl.col("ticker").is_in(best_shorts["ticker"])
+                    & (pl.col("side") == PositionSide.SHORT.value)
+                )
                 .then(pl.lit(PositionAction.CLOSE_POSITION.value))
                 .otherwise(pl.col("action"))
                 .alias("action")
@@ -257,11 +270,15 @@ def add_portfolio_performance_columns(
                 closed_longs=closed_long_count,
                 closed_shorts=closed_short_count,
                 additional_longs_to_close=longs_to_rebalance,
+                actual_longs_closed=best_longs.height,
                 longs_being_closed=best_longs.to_series().to_list(),
             )
 
             portfolio_with_actions = portfolio_with_actions.with_columns(
-                pl.when(pl.col("ticker").is_in(best_longs["ticker"]))
+                pl.when(
+                    pl.col("ticker").is_in(best_longs["ticker"])
+                    & (pl.col("side") == PositionSide.LONG.value)
+                )
                 .then(pl.lit(PositionAction.CLOSE_POSITION.value))
                 .otherwise(pl.col("action"))
                 .alias("action")
