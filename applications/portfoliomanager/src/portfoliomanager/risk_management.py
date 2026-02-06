@@ -145,7 +145,7 @@ def add_portfolio_performance_columns(
         how="left",
     )
 
-    return prior_portfolio_with_data.with_columns(
+    portfolio_with_actions = prior_portfolio_with_data.with_columns(
         pl.when(pl.col("action") == PositionAction.PDT_LOCKED.value)
         .then(pl.lit(PositionAction.PDT_LOCKED.value))
         .when(
@@ -187,7 +187,87 @@ def add_portfolio_performance_columns(
         .then(pl.lit(PositionAction.MAINTAIN_POSITION.value))
         .otherwise(pl.lit(PositionAction.UNSPECIFIED.value))
         .alias("action")
-    ).drop(
+    )
+
+    # Rebalancing logic: if one side has more closures than the other,
+    # close equal number of best performers from the opposite side
+    closed_long_count = portfolio_with_actions.filter(
+        (pl.col("side") == PositionSide.LONG.value)
+        & (pl.col("action") == PositionAction.CLOSE_POSITION.value)
+    ).height
+
+    closed_short_count = portfolio_with_actions.filter(
+        (pl.col("side") == PositionSide.SHORT.value)
+        & (pl.col("action") == PositionAction.CLOSE_POSITION.value)
+    ).height
+
+    # If more longs are being closed, close equal number of best-performing shorts
+    if closed_long_count > closed_short_count:
+        shorts_to_rebalance = closed_long_count - closed_short_count
+
+        # Select best-performing shorts (most negative cumulative return = best gain)
+        # Consider positions that are not already being closed and not PDT locked
+        best_shorts = (
+            portfolio_with_actions.filter(
+                (pl.col("side") == PositionSide.SHORT.value)
+                & (pl.col("action") != PositionAction.CLOSE_POSITION.value)
+                & (pl.col("action") != PositionAction.PDT_LOCKED.value)
+            )
+            .sort("cumulative_simple_return", descending=False)
+            .head(shorts_to_rebalance)
+            .select("ticker")
+        )
+
+        if best_shorts.height > 0:
+            logger.info(
+                "Rebalancing portfolio by closing shorts",
+                closed_longs=closed_long_count,
+                closed_shorts=closed_short_count,
+                additional_shorts_to_close=shorts_to_rebalance,
+                shorts_being_closed=best_shorts.to_series().to_list(),
+            )
+
+            portfolio_with_actions = portfolio_with_actions.with_columns(
+                pl.when(pl.col("ticker").is_in(best_shorts["ticker"]))
+                .then(pl.lit(PositionAction.CLOSE_POSITION.value))
+                .otherwise(pl.col("action"))
+                .alias("action")
+            )
+
+    # If more shorts are being closed, close equal number of best-performing longs
+    elif closed_short_count > closed_long_count:
+        longs_to_rebalance = closed_short_count - closed_long_count
+
+        # Select best-performing longs (most positive cumulative return = best gain)
+        # Consider positions that are not already being closed and not PDT locked
+        best_longs = (
+            portfolio_with_actions.filter(
+                (pl.col("side") == PositionSide.LONG.value)
+                & (pl.col("action") != PositionAction.CLOSE_POSITION.value)
+                & (pl.col("action") != PositionAction.PDT_LOCKED.value)
+            )
+            .sort("cumulative_simple_return", descending=True)
+            .head(longs_to_rebalance)
+            .select("ticker")
+        )
+
+        if best_longs.height > 0:
+            logger.info(
+                "Rebalancing portfolio by closing longs",
+                closed_longs=closed_long_count,
+                closed_shorts=closed_short_count,
+                additional_longs_to_close=longs_to_rebalance,
+                longs_being_closed=best_longs.to_series().to_list(),
+            )
+
+            portfolio_with_actions = portfolio_with_actions.with_columns(
+                pl.when(pl.col("ticker").is_in(best_longs["ticker"]))
+                .then(pl.lit(PositionAction.CLOSE_POSITION.value))
+                .otherwise(pl.col("action"))
+                .alias("action")
+            )
+
+    return portfolio_with_actions.drop(
         [
             "original_lower_threshold",
             "original_upper_threshold",

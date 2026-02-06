@@ -749,3 +749,272 @@ def test_create_optimal_portfolio_mixed_closed_and_maintained_positions() -> Non
 
     sorted_result = result.sort(["ticker", "side"])
     assert sorted_result.equals(result)
+
+
+def test_add_portfolio_performance_columns_rebalancing_closes_shorts_when_longs_stopped() -> (  # noqa: E501
+    None
+):
+    """Test that when longs hit stop-loss, best-performing shorts are closed for rebalancing."""  # noqa: E501
+    base_timestamp = datetime(2024, 1, 10, tzinfo=UTC).timestamp()
+
+    positions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 6,
+            "side": ["LONG", "LONG", "LONG", "SHORT", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 6,
+            "action": ["UNSPECIFIED"] * 6,
+        }
+    )
+
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 6,
+            "quantile_10": [-0.05] * 6,
+            "quantile_90": [0.15] * 6,
+        }
+    )
+
+    raw_equity_bars = []
+    for ticker in ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"]:
+        for i in range(30):
+            timestamp = base_timestamp + (i * 86400)
+            if ticker in ["LONG1", "LONG2", "LONG3"]:
+                price = 100.0 - (10.0 * i / 29)  # longs losing -10%
+            elif ticker == "SHORT1":
+                price = 100.0 + (20.0 * i / 29)  # short1 gaining +20% (worst for short)
+            elif ticker == "SHORT2":
+                price = 100.0 + (25.0 * i / 29)  # short2 gaining +25% (best performer)
+            else:  # SHORT3
+                price = 100.0 + (15.0 * i / 29)  # short3 gaining +15%
+
+            raw_equity_bars.append(
+                {"ticker": ticker, "timestamp": timestamp, "close_price": price}
+            )
+
+    equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
+        pl.DataFrame(raw_equity_bars)
+    )
+    current_timestamp = datetime.fromtimestamp(base_timestamp + (29 * 86400), tz=UTC)
+
+    result = add_portfolio_performance_columns(
+        positions, predictions, equity_bars, current_timestamp
+    )
+
+    # 3 longs should be closed (hit stop-loss at -10% < -5%)
+    closed_longs = result.filter(
+        (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_longs.height == 3  # noqa: PLR2004
+
+    # 3 shorts should also be closed for rebalancing (best performers: SHORT2, SHORT1, SHORT3)  # noqa: E501
+    closed_shorts = result.filter(
+        (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_shorts.height == 3  # noqa: PLR2004
+
+    # Verify that best-performing shorts (most negative cumulative return) were closed
+    # SHORT2 has worst performance for short (+25% = bad), so most negative return
+    closed_short_tickers = closed_shorts["ticker"].to_list()
+    assert "SHORT2" in closed_short_tickers
+    assert "SHORT1" in closed_short_tickers
+    assert "SHORT3" in closed_short_tickers
+
+
+def test_add_portfolio_performance_columns_rebalancing_closes_longs_when_shorts_stopped() -> (  # noqa: E501
+    None
+):
+    """Test that when shorts hit stop-loss, best-performing longs are closed for rebalancing."""  # noqa: E501
+    base_timestamp = datetime(2024, 1, 10, tzinfo=UTC).timestamp()
+
+    positions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2"],
+            "timestamp": [base_timestamp] * 5,
+            "side": ["LONG", "LONG", "LONG", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 5,
+            "action": ["UNSPECIFIED"] * 5,
+        }
+    )
+
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2"],
+            "timestamp": [base_timestamp] * 5,
+            "quantile_10": [-0.05] * 5,
+            "quantile_90": [0.15] * 5,
+        }
+    )
+
+    raw_equity_bars = []
+    for ticker in ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2"]:
+        for i in range(30):
+            timestamp = base_timestamp + (i * 86400)
+            if ticker == "LONG1":
+                price = 100.0 + (10.0 * i / 29)  # long1 gaining +10%
+            elif ticker == "LONG2":
+                price = 100.0 + (20.0 * i / 29)  # long2 gaining +20% (best performer)
+            elif ticker == "LONG3":
+                price = 100.0 + (5.0 * i / 29)  # long3 gaining +5%
+            else:  # SHORT1, SHORT2
+                price = 100.0 + (20.0 * i / 29)  # shorts gaining +20% (hit stop-loss)
+
+            raw_equity_bars.append(
+                {"ticker": ticker, "timestamp": timestamp, "close_price": price}
+            )
+
+    equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
+        pl.DataFrame(raw_equity_bars)
+    )
+    current_timestamp = datetime.fromtimestamp(base_timestamp + (29 * 86400), tz=UTC)
+
+    result = add_portfolio_performance_columns(
+        positions, predictions, equity_bars, current_timestamp
+    )
+
+    # 2 shorts should be closed (hit stop-loss at +20% > +15%)
+    closed_shorts = result.filter(
+        (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_shorts.height == 2  # noqa: PLR2004
+
+    # 2 longs should also be closed for rebalancing (best performers)
+    closed_longs = result.filter(
+        (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_longs.height == 2  # noqa: PLR2004
+
+    # Verify that best-performing longs were closed
+    closed_long_tickers = closed_longs["ticker"].to_list()
+    assert "LONG2" in closed_long_tickers  # best performer (+20%)
+    assert "LONG1" in closed_long_tickers  # second best (+10%)
+
+
+def test_add_portfolio_performance_columns_no_rebalancing_when_equal_closures() -> None:
+    """Test that no additional rebalancing occurs when equal positions are closed."""
+    base_timestamp = datetime(2024, 1, 10, tzinfo=UTC).timestamp()
+
+    positions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "SHORT1", "SHORT2"],
+            "timestamp": [base_timestamp] * 4,
+            "side": ["LONG", "LONG", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 4,
+            "action": ["UNSPECIFIED"] * 4,
+        }
+    )
+
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "LONG2", "SHORT1", "SHORT2"],
+            "timestamp": [base_timestamp] * 4,
+            "quantile_10": [-0.05] * 4,
+            "quantile_90": [0.15] * 4,
+        }
+    )
+
+    raw_equity_bars = []
+    for ticker in ["LONG1", "LONG2", "SHORT1", "SHORT2"]:
+        for i in range(30):
+            timestamp = base_timestamp + (i * 86400)
+            if ticker in ["LONG1", "LONG2"]:
+                price = 100.0 - (10.0 * i / 29)  # longs losing -10%
+            else:  # SHORT1, SHORT2
+                price = 100.0 + (20.0 * i / 29)  # shorts gaining +20%
+
+            raw_equity_bars.append(
+                {"ticker": ticker, "timestamp": timestamp, "close_price": price}
+            )
+
+    equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
+        pl.DataFrame(raw_equity_bars)
+    )
+    current_timestamp = datetime.fromtimestamp(base_timestamp + (29 * 86400), tz=UTC)
+
+    result = add_portfolio_performance_columns(
+        positions, predictions, equity_bars, current_timestamp
+    )
+
+    # 2 longs and 2 shorts should be closed (no rebalancing needed)
+    closed_longs = result.filter(
+        (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
+    ).height
+    closed_shorts = result.filter(
+        (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
+    ).height
+
+    assert closed_longs == 2  # noqa: PLR2004
+    assert closed_shorts == 2  # noqa: PLR2004
+
+
+def test_add_portfolio_performance_columns_rebalancing_respects_pdt_locked_positions() -> (  # noqa: E501
+    None
+):
+    """Test that rebalancing does not close PDT-locked positions."""
+    base_timestamp = datetime(2024, 1, 10, tzinfo=UTC).timestamp()
+
+    positions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 4,
+            "side": ["LONG", "SHORT", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 4,
+            "action": ["UNSPECIFIED", "PDT_LOCKED", "UNSPECIFIED", "UNSPECIFIED"],
+        }
+    )
+
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["LONG1", "SHORT1", "SHORT2", "SHORT3"],
+            "timestamp": [base_timestamp] * 4,
+            "quantile_10": [-0.05] * 4,
+            "quantile_90": [0.15] * 4,
+        }
+    )
+
+    raw_equity_bars = []
+    for ticker in ["LONG1", "SHORT1", "SHORT2", "SHORT3"]:
+        for i in range(30):
+            timestamp = base_timestamp + (i * 86400)
+            if ticker == "LONG1":
+                price = 100.0 - (10.0 * i / 29)  # long losing -10%
+            elif ticker == "SHORT1":
+                price = 100.0 + (30.0 * i / 29)  # short1 +30% (best, but PDT locked)
+            elif ticker == "SHORT2":
+                price = 100.0 + (20.0 * i / 29)  # short2 +20%
+            else:  # SHORT3
+                price = 100.0 + (10.0 * i / 29)  # short3 +10%
+
+            raw_equity_bars.append(
+                {"ticker": ticker, "timestamp": timestamp, "close_price": price}
+            )
+
+    equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
+        pl.DataFrame(raw_equity_bars)
+    )
+    current_timestamp = datetime.fromtimestamp(base_timestamp + (29 * 86400), tz=UTC)
+
+    result = add_portfolio_performance_columns(
+        positions, predictions, equity_bars, current_timestamp
+    )
+
+    # 1 long should be closed
+    closed_longs = result.filter(
+        (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_longs.height == 1
+
+    # 1 short should be closed for rebalancing (should not be SHORT1 since it's PDT locked)  # noqa: E501
+    closed_shorts = result.filter(
+        (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
+    )
+    assert closed_shorts.height == 1
+
+    # SHORT1 should remain PDT_LOCKED, not be closed
+    short1_action = result.filter(pl.col("ticker") == "SHORT1")["action"][0]
+    assert short1_action == "PDT_LOCKED"
+
+    # Either SHORT2 or SHORT3 should be closed (SHORT2 has better performance)
+    closed_short_ticker = closed_shorts["ticker"][0]
+    assert closed_short_ticker == "SHORT2"
