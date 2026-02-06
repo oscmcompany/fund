@@ -754,40 +754,64 @@ def test_create_optimal_portfolio_mixed_closed_and_maintained_positions() -> Non
 def test_add_portfolio_performance_columns_rebalancing_closes_shorts_when_longs_stopped() -> (  # noqa: E501
     None
 ):
-    """Test that when longs hit stop-loss, best-performing shorts are closed for rebalancing."""  # noqa: E501
+    """Test that rebalancing closes best shorts when longs hit stop-loss."""
     base_timestamp = datetime(2024, 1, 10, tzinfo=UTC).timestamp()
 
     positions = pl.DataFrame(
         {
-            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"],
-            "timestamp": [base_timestamp] * 6,
-            "side": ["LONG", "LONG", "LONG", "SHORT", "SHORT", "SHORT"],
-            "dollar_amount": [1000.0] * 6,
-            "action": ["UNSPECIFIED"] * 6,
+            "ticker": [
+                "LONG1",
+                "LONG2",
+                "LONG3",
+                "SHORT1",
+                "SHORT2",
+                "SHORT3",
+                "SHORT4",
+            ],
+            "timestamp": [base_timestamp] * 7,
+            "side": ["LONG", "LONG", "LONG", "SHORT", "SHORT", "SHORT", "SHORT"],
+            "dollar_amount": [1000.0] * 7,
+            "action": ["UNSPECIFIED"] * 7,
         }
     )
 
     predictions = pl.DataFrame(
         {
-            "ticker": ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"],
-            "timestamp": [base_timestamp] * 6,
-            "quantile_10": [-0.05] * 6,
-            "quantile_90": [0.15] * 6,
+            "ticker": [
+                "LONG1",
+                "LONG2",
+                "LONG3",
+                "SHORT1",
+                "SHORT2",
+                "SHORT3",
+                "SHORT4",
+            ],
+            "timestamp": [base_timestamp] * 7,
+            "quantile_10": [-0.05] * 7,
+            "quantile_90": [0.15] * 7,
         }
     )
 
     raw_equity_bars = []
-    for ticker in ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3"]:
+    for ticker in ["LONG1", "LONG2", "LONG3", "SHORT1", "SHORT2", "SHORT3", "SHORT4"]:
         for i in range(30):
             timestamp = base_timestamp + (i * 86400)
-            if ticker in ["LONG1", "LONG2", "LONG3"]:
-                price = 100.0 - (10.0 * i / 29)  # longs losing -10%
+            if ticker == "LONG1":
+                price = 100.0 - (10.0 * i / 29)  # long1 losing -10%
+            elif ticker == "LONG2":
+                price = 100.0 - (10.0 * i / 29)  # long2 losing -10%
+            elif ticker == "LONG3":
+                price = 100.0 - (
+                    2.0 * i / 29
+                )  # long3 losing -2% (not enough for stop-loss)
             elif ticker == "SHORT1":
-                price = 100.0 - (5.0 * i / 29)  # short1 falling -5% (best for short)
+                price = 100.0 - (4.5 * i / 29)  # short1 falling -4.5% (best)
             elif ticker == "SHORT2":
-                price = 100.0 - (2.0 * i / 29)  # short2 falling -2% (second best)
-            else:  # SHORT3
+                price = 100.0 - (4.0 * i / 29)  # short2 falling -4.0% (second)
+            elif ticker == "SHORT3":
                 price = 100.0 - (1.0 * i / 29)  # short3 falling -1% (worst)
+            else:  # SHORT4
+                price = 100.0 - (3.0 * i / 29)  # short4 falling -3% (third)
 
             raw_equity_bars.append(
                 {"ticker": ticker, "timestamp": timestamp, "close_price": price}
@@ -802,26 +826,38 @@ def test_add_portfolio_performance_columns_rebalancing_closes_shorts_when_longs_
         positions, predictions, equity_bars, current_timestamp
     )
 
-    # 3 longs should be closed (hit stop-loss at -10% < -5%)
+    expected_closed_long_count = 2
+    expected_closed_short_count = 2
+    expected_open_short_count = 2
+
+    # 2 longs should be closed (LONG1 and LONG2 hit stop-loss at -10% < -5%)
     closed_longs = result.filter(
         (pl.col("side") == "LONG") & (pl.col("action") == "CLOSE_POSITION")
     )
-    assert closed_longs.height == 3  # noqa: PLR2004
+    assert closed_longs.height == expected_closed_long_count
 
-    # 3 shorts should also be closed by rebalancing
+    # 2 shorts should also be closed by rebalancing (to match 2 closed longs)
     # None of the shorts hit stop-loss (all have negative returns, not >= +15%)
-    # Rebalancing closes 3 shorts to match the 3 closed longs
+    # Rebalancing closes top 2 performing shorts: SHORT1 (-5%) and SHORT4 (-3%)
     closed_shorts = result.filter(
         (pl.col("side") == "SHORT") & (pl.col("action") == "CLOSE_POSITION")
     )
-    assert closed_shorts.height == 3  # noqa: PLR2004
+    assert closed_shorts.height == expected_closed_short_count
 
     # Verify best-performing shorts were closed (most negative cumulative return)
-    # SHORT1 (-5%), SHORT2 (-2%), SHORT3 (-1%) all closed by rebalancing
+    # SHORT1 (-4.5%) and SHORT2 (-4.0%) should be closed by rebalancing
     closed_short_tickers = closed_shorts["ticker"].to_list()
     assert "SHORT1" in closed_short_tickers
     assert "SHORT2" in closed_short_tickers
-    assert "SHORT3" in closed_short_tickers
+
+    # Verify other shorts remain open
+    open_shorts = result.filter(
+        (pl.col("side") == "SHORT") & (pl.col("action") != "CLOSE_POSITION")
+    )
+    assert open_shorts.height == expected_open_short_count
+    open_short_tickers = open_shorts["ticker"].to_list()
+    assert "SHORT3" in open_short_tickers
+    assert "SHORT4" in open_short_tickers
 
 
 def test_add_portfolio_performance_columns_rebalancing_closes_longs_when_shorts_stopped() -> (  # noqa: E501
@@ -856,7 +892,7 @@ def test_add_portfolio_performance_columns_rebalancing_closes_longs_when_shorts_
             if ticker == "LONG1":
                 price = 100.0 + (10.0 * i / 29)  # long1 gaining +10%
             elif ticker == "LONG2":
-                price = 100.0 + (20.0 * i / 29)  # long2 gaining +20% (best performer)
+                price = 100.0 + (12.0 * i / 29)  # long2 gaining +12% (best performer)
             elif ticker == "LONG3":
                 price = 100.0 + (5.0 * i / 29)  # long3 gaining +5%
             else:  # SHORT1, SHORT2
@@ -889,7 +925,7 @@ def test_add_portfolio_performance_columns_rebalancing_closes_longs_when_shorts_
 
     # Verify that best-performing longs were closed
     closed_long_tickers = closed_longs["ticker"].to_list()
-    assert "LONG2" in closed_long_tickers  # best performer (+20%)
+    assert "LONG2" in closed_long_tickers  # best performer (+12%)
     assert "LONG1" in closed_long_tickers  # second best (+10%)
 
 
@@ -990,7 +1026,7 @@ def test_add_portfolio_performance_columns_rebalancing_respects_pdt_locked_posit
             elif ticker == "SHORT1":
                 price = 100.0 - (10.0 * i / 29)  # short1 -10% (best, but PDT locked)
             elif ticker == "SHORT2":
-                price = 100.0 - (5.0 * i / 29)  # short2 -5% (second best)
+                price = 100.0 - (3.0 * i / 29)  # short2 -3% (second best)
             else:  # SHORT3
                 price = 100.0 - (2.0 * i / 29)  # short3 -2% (worst)
 

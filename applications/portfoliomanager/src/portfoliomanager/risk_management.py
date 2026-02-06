@@ -214,13 +214,14 @@ def add_portfolio_performance_columns(
     if closed_long_count > closed_short_count:
         shorts_to_rebalance = closed_long_count - closed_short_count
 
-        # Select best-performing shorts (most negative cumulative return = best gain)
-        # Consider positions that are not already being closed and not PDT locked
+        # Select best-performing shorts (most negative cumulative return)
+        # Exclude CLOSE_POSITION, PDT_LOCKED, MAINTAIN_POSITION actions
         best_shorts = (
             portfolio_with_actions.filter(
                 (pl.col("side") == PositionSide.SHORT.value)
                 & (pl.col("action") != PositionAction.CLOSE_POSITION.value)
                 & (pl.col("action") != PositionAction.PDT_LOCKED.value)
+                & (pl.col("action") != PositionAction.MAINTAIN_POSITION.value)
             )
             .sort("cumulative_simple_return", descending=False)
             .head(shorts_to_rebalance)
@@ -251,13 +252,14 @@ def add_portfolio_performance_columns(
     elif closed_short_count > closed_long_count:
         longs_to_rebalance = closed_short_count - closed_long_count
 
-        # Select best-performing longs (most positive cumulative return = best gain)
-        # Consider positions that are not already being closed and not PDT locked
+        # Select best-performing longs (most positive cumulative return)
+        # Exclude CLOSE_POSITION, PDT_LOCKED, MAINTAIN_POSITION actions
         best_longs = (
             portfolio_with_actions.filter(
                 (pl.col("side") == PositionSide.LONG.value)
                 & (pl.col("action") != PositionAction.CLOSE_POSITION.value)
                 & (pl.col("action") != PositionAction.PDT_LOCKED.value)
+                & (pl.col("action") != PositionAction.MAINTAIN_POSITION.value)
             )
             .sort("cumulative_simple_return", descending=True)
             .head(longs_to_rebalance)
