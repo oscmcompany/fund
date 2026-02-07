@@ -3,6 +3,9 @@ name: Rust code checks
 run-name: Rust code checks
 on:
   pull_request:
+  push:
+    branches:
+      - master
 jobs:
   detect_changes:
     runs-on: ubuntu-latest
@@ -34,8 +37,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-ci
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - name: Run Rust code checks
         uses: flox/activate-action@v1
         with:
-          command: mask development rust ci
+          command: mask development rust continuous-integration

@@ -1,24 +1,19 @@
 """Tests for maskfile.md command configuration."""
+
 import re
-from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-MASKFILE = REPO_ROOT / "maskfile.md"
+from .conftest import MASKFILE, REPO_ROOT, read_maskfile
 
 
 def _read_maskfile() -> str:
     """Read the maskfile.md content."""
-    return MASKFILE.read_text()
+    return read_maskfile()
 
 
 def _extract_code_blocks(content: str) -> list[str]:
     """Extract all bash code blocks from maskfile."""
     pattern = r"```bash\n(.*?)```"
     return re.findall(pattern, content, re.DOTALL)
-
-
-# --- Maskfile Structure ---
 
 
 def test_maskfile_structure_maskfile_exists() -> None:
@@ -50,9 +45,6 @@ def test_maskfile_structure_has_push_command() -> None:
     assert "#### push (application_name) (stage_name)" in content
 
 
-# --- Docker Build Command ---
-
-
 def test_docker_build_command_uses_buildx() -> None:
     content = _read_maskfile()
     assert "docker buildx build" in content, "Must use docker buildx for building"
@@ -70,7 +62,9 @@ def test_docker_build_command_has_cache_to() -> None:
 
 def test_docker_build_command_gha_cache_has_scope() -> None:
     content = _read_maskfile()
-    assert "scope=" in content, "GHA cache must use scope to prevent cross-service eviction"
+    assert "scope=" in content, (
+        "GHA cache must use scope to prevent cross-service eviction"
+    )
 
 
 def test_docker_build_command_has_gha_cache_in_ci() -> None:
@@ -100,11 +94,9 @@ def test_docker_build_command_uses_dockerfile_path() -> None:
 
 def test_docker_build_command_buildx_setup_skipped_in_gha() -> None:
     content = _read_maskfile()
-    # When in GHA, should skip manual buildx creation since docker/setup-buildx-action handles it
+    # When in GHA, skip manual buildx creation since docker/setup-buildx-action
+    # handles it
     assert "GITHUB_ACTIONS" in content, "Must detect GitHub Actions environment"
-
-
-# --- Docker Push Command ---
 
 
 def test_docker_push_command_has_ecr_login() -> None:
@@ -114,23 +106,26 @@ def test_docker_push_command_has_ecr_login() -> None:
 
 def test_docker_push_command_has_digest_check() -> None:
     content = _read_maskfile()
-    assert "describe-images" in content or "batch-get-image" in content or "content_hash" in content, \
-        "Push command must check if image already exists before pushing"
+    assert (
+        "describe-images" in content
+        or "batch-get-image" in content
+        or "content_hash" in content
+    ), "Push command must check if image already exists before pushing"
 
 
 def test_docker_push_command_has_skip_push_logic() -> None:
     content = _read_maskfile()
-    assert "skipping push" in content.lower() or "skip" in content.lower(), \
+    assert "skipping push" in content.lower() or "skip" in content.lower(), (
         "Must have logic to skip push when image is unchanged"
+    )
 
 
 def test_docker_push_command_pushes_with_commit_tag() -> None:
     content = _read_maskfile()
-    assert "git" in content.lower() and ("tag" in content.lower() or "rev-parse" in content.lower()), \
+    assert "git" in content.lower(), "Should use git for commit information"
+    assert "tag" in content.lower() or "rev-parse" in content.lower(), (
         "Should tag images with git commit for traceability"
-
-
-# --- Rust Development Commands ---
+    )
 
 
 def test_rust_development_commands_has_rust_section() -> None:
@@ -175,13 +170,17 @@ def test_rust_development_commands_has_all_command() -> None:
 
 def test_rust_development_commands_has_ci_command() -> None:
     content = _read_maskfile()
-    assert "#### ci" in content, "Must have a CI-optimized rust command"
+    assert "#### continuous-integration" in content, (
+        "Must have a CI-optimized rust command"
+    )
 
 
 def test_rust_development_commands_ci_command_skips_cargo_update() -> None:
     content = _read_maskfile()
     # Find the ci command block
-    ci_section_match = re.search(r"#### ci\n.*?```bash\n(.*?)```", content, re.DOTALL)
+    ci_section_match = re.search(
+        r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
+    )
     assert ci_section_match is not None, "CI command must have a bash block"
     ci_code = ci_section_match.group(1)
     assert "cargo update" not in ci_code, "CI command must not run cargo update"
@@ -189,15 +188,21 @@ def test_rust_development_commands_ci_command_skips_cargo_update() -> None:
 
 def test_rust_development_commands_ci_command_skips_cargo_check() -> None:
     content = _read_maskfile()
-    ci_section_match = re.search(r"#### ci\n.*?```bash\n(.*?)```", content, re.DOTALL)
+    ci_section_match = re.search(
+        r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
+    )
     assert ci_section_match is not None
     ci_code = ci_section_match.group(1)
-    assert "cargo check" not in ci_code, "CI command should skip cargo check (redundant with clippy)"
+    assert "cargo check" not in ci_code, (
+        "CI command should skip cargo check (redundant with clippy)"
+    )
 
 
 def test_rust_development_commands_ci_command_has_format_check() -> None:
     content = _read_maskfile()
-    ci_section_match = re.search(r"#### ci\n.*?```bash\n(.*?)```", content, re.DOTALL)
+    ci_section_match = re.search(
+        r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
+    )
     assert ci_section_match is not None
     ci_code = ci_section_match.group(1)
     assert "cargo fmt" in ci_code, "CI must check formatting"
@@ -206,7 +211,9 @@ def test_rust_development_commands_ci_command_has_format_check() -> None:
 
 def test_rust_development_commands_ci_command_has_clippy_with_warnings() -> None:
     content = _read_maskfile()
-    ci_section_match = re.search(r"#### ci\n.*?```bash\n(.*?)```", content, re.DOTALL)
+    ci_section_match = re.search(
+        r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
+    )
     assert ci_section_match is not None
     ci_code = ci_section_match.group(1)
     assert "cargo clippy" in ci_code
@@ -215,7 +222,9 @@ def test_rust_development_commands_ci_command_has_clippy_with_warnings() -> None
 
 def test_rust_development_commands_ci_command_has_tests() -> None:
     content = _read_maskfile()
-    ci_section_match = re.search(r"#### ci\n.*?```bash\n(.*?)```", content, re.DOTALL)
+    ci_section_match = re.search(
+        r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
+    )
     assert ci_section_match is not None
     ci_code = ci_section_match.group(1)
     assert "cargo test" in ci_code, "CI must run tests"
@@ -225,11 +234,9 @@ def test_rust_development_commands_all_code_blocks_have_set_euo_pipefail() -> No
     content = _read_maskfile()
     code_blocks = _extract_code_blocks(content)
     for block in code_blocks:
-        assert "set -euo pipefail" in block, \
-            f"All bash blocks must start with 'set -euo pipefail', found block without it"
-
-
-# --- Dockerfile Configuration ---
+        assert "set -euo pipefail" in block, (
+            "All bash blocks must start with 'set -euo pipefail'"
+        )
 
 
 def test_dockerfile_configuration_datamanager_dockerfile_exists() -> None:
@@ -238,9 +245,12 @@ def test_dockerfile_configuration_datamanager_dockerfile_exists() -> None:
 
 
 def test_dockerfile_configuration_uses_multi_stage_build() -> None:
+    min_dockerfile_stages = 3
     content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
     from_count = content.count("FROM ")
-    assert from_count >= 3, f"Must use multi-stage build, found {from_count} FROM statements"
+    assert from_count >= min_dockerfile_stages, (
+        f"Must use multi-stage build, found {from_count} FROM statements"
+    )
 
 
 def test_dockerfile_configuration_uses_cargo_chef() -> None:

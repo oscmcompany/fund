@@ -37,12 +37,11 @@ impl State {
 
         let s3_client = S3Client::new(&config);
 
-        let bucket_name = std::env::var("AWS_S3_DATA_BUCKET_NAME")
-            .expect("AWS_S3_DATA_BUCKET_NAME must be set");
+        let bucket_name =
+            std::env::var("AWS_S3_DATA_BUCKET_NAME").expect("AWS_S3_DATA_BUCKET_NAME must be set");
         info!("Using S3 bucket: {}", bucket_name);
 
-        let massive_base = std::env::var("MASSIVE_BASE_URL")
-            .expect("MASSIVE_BASE_URL must be set");
+        let massive_base = std::env::var("MASSIVE_BASE_URL").expect("MASSIVE_BASE_URL must be set");
         info!("Using Massive API base URL: {}", massive_base);
 
         let massive_key = match std::env::var("MASSIVE_API_KEY") {

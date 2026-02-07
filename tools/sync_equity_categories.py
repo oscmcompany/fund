@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.polygon.io")
+MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.io")
 
 # Massive ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
 EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}

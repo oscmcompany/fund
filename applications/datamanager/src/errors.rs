@@ -6,12 +6,7 @@ use thiserror::Error as ThisError;
 /// Substrings in DuckDB or S3 error messages that indicate missing data rather
 /// than an unexpected failure. These typically appear on first run before any
 /// parquet files have been written.
-const NOT_FOUND_PATTERNS: &[&str] = &[
-    "No files found",
-    "Could not find",
-    "does not exist",
-    "Invalid Input",
-];
+const NOT_FOUND_PATTERNS: &[&str] = &["No files found", "Could not find", "does not exist"];
 
 #[derive(ThisError, Debug)]
 pub enum Error {

@@ -1,17 +1,12 @@
 """Tests for GitHub Actions workflow configuration."""
-from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+from .conftest import REPO_ROOT
 
 
 def _read_workflow(name: str) -> str:
     """Read a workflow YAML file as text."""
     path = REPO_ROOT / ".github" / "workflows" / name
     return path.read_text()
-
-
-# --- Launch Infrastructure Workflow ---
 
 
 def test_launch_infrastructure_workflow_file_exists() -> None:
@@ -22,12 +17,16 @@ def test_launch_infrastructure_workflow_file_exists() -> None:
 def test_launch_infrastructure_has_concurrency_group() -> None:
     content = _read_workflow("launch_infrastructure.yaml")
     assert "concurrency:" in content, "Must have concurrency control"
-    assert "cancel-in-progress: false" in content, "Must not cancel in-progress deployments"
+    assert "cancel-in-progress: false" in content, (
+        "Must not cancel in-progress deployments"
+    )
 
 
 def test_launch_infrastructure_has_docker_buildx_setup() -> None:
     content = _read_workflow("launch_infrastructure.yaml")
-    assert "docker/setup-buildx-action" in content, "Must use docker/setup-buildx-action for proper cache support"
+    assert "docker/setup-buildx-action" in content, (
+        "Must use docker/setup-buildx-action for proper cache support"
+    )
 
 
 def test_launch_infrastructure_has_service_matrix() -> None:
@@ -79,9 +78,6 @@ def test_launch_infrastructure_has_manual_trigger() -> None:
     assert "workflow_dispatch" in content
 
 
-# --- Rust Code Checks Workflow ---
-
-
 def test_rust_code_checks_workflow_file_exists() -> None:
     path = REPO_ROOT / ".github" / "workflows" / "run_rust_code_checks.yaml"
     assert path.exists(), "run_rust_code_checks.yaml must exist"
@@ -101,7 +97,9 @@ def test_rust_code_checks_detects_rust_file_changes() -> None:
 
 def test_rust_code_checks_has_rust_build_cache() -> None:
     content = _read_workflow("run_rust_code_checks.yaml")
-    assert "Swatinem/rust-cache" in content, "Must use Swatinem/rust-cache for build caching"
+    assert "Swatinem/rust-cache" in content, (
+        "Must use Swatinem/rust-cache for build caching"
+    )
 
 
 def test_rust_code_checks_cache_saves_only_on_master() -> None:
@@ -111,7 +109,9 @@ def test_rust_code_checks_cache_saves_only_on_master() -> None:
 
 def test_rust_code_checks_uses_ci_optimized_command() -> None:
     content = _read_workflow("run_rust_code_checks.yaml")
-    assert "mask development rust ci" in content, "Must use CI-optimized rust command"
+    assert "mask development rust continuous-integration" in content, (
+        "Must use CI-optimized rust command"
+    )
 
 
 def test_rust_code_checks_does_not_use_cargo_update() -> None:
@@ -130,9 +130,6 @@ def test_rust_code_checks_runs_on_pull_request() -> None:
     assert "pull_request" in content
 
 
-# --- Python Code Checks Workflow ---
-
-
 def test_python_code_checks_workflow_file_exists() -> None:
     path = REPO_ROOT / ".github" / "workflows" / "run_python_code_checks.yaml"
     assert path.exists()
@@ -146,22 +143,3 @@ def test_python_code_checks_has_change_detection() -> None:
 def test_python_code_checks_detects_python_file_changes() -> None:
     content = _read_workflow("run_python_code_checks.yaml")
     assert "'**/*.py'" in content
-
-
-# --- All Workflows Exist ---
-
-
-def test_all_workflows_launch_infrastructure_exists() -> None:
-    assert (REPO_ROOT / ".github" / "workflows" / "launch_infrastructure.yaml").exists()
-
-
-def test_all_workflows_rust_code_checks_exists() -> None:
-    assert (REPO_ROOT / ".github" / "workflows" / "run_rust_code_checks.yaml").exists()
-
-
-def test_all_workflows_python_code_checks_exists() -> None:
-    assert (REPO_ROOT / ".github" / "workflows" / "run_python_code_checks.yaml").exists()
-
-
-def test_all_workflows_markdown_code_checks_exists() -> None:
-    assert (REPO_ROOT / ".github" / "workflows" / "run_markdown_code_checks.yaml").exists()

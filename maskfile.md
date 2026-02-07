@@ -88,7 +88,7 @@ echo "Setting up Docker Buildx"
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "Using buildx builder configured by docker/setup-buildx-action"
 else
-    docker buildx create --use --name psf-builder 2>/dev/null || docker buildx use psf-builder || (echo "Using default buildx builder" && docker buildx use default)
+    docker buildx create --use --name oscm-builder 2>/dev/null || docker buildx use oscm-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
 echo "Logging into ECR (to pull cache if available)"
@@ -128,7 +128,7 @@ fi
 
 repository_name="oscmcompany/${application_name}-${stage_name}"
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
-commit_hash=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+commit_hash=$(git rev-parse --short HEAD)
 
 echo "Logging into ECR"
 aws ecr get-login-password --region ${aws_region} | docker login \
@@ -142,7 +142,7 @@ existing_tag=$(aws ecr describe-images \
     --query 'imageDetails[0].imageDigest' \
     --output text 2>/dev/null || echo "NONE")
 
-if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
+if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ] && [[ ! "$existing_tag" =~ ^(An\ error\ occurred) ]]; then
     echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
     echo "Image pushed: ${application_name} ${stage_name} (cached)"
     exit 0
@@ -420,25 +420,28 @@ mask development rust test
 echo "Rust development checks completed successfully"
 ```
 
-#### ci
+#### continuous-integration
 
 > Optimized Rust checks for continuous integration
 
 ```bash
 set -euo pipefail
 
-echo "Running Rust CI checks"
+echo "Running Rust continuous integration checks"
 
 echo "Checking Rust formatting"
 cargo fmt --all --check
+echo "Rust formatting check completed"
 
 echo "Running Rust linting"
 cargo clippy --all-targets -- -D warnings
+echo "Rust linting completed"
 
 echo "Running Rust tests"
 cargo test --workspace
+echo "Rust tests completed"
 
-echo "Rust CI checks completed successfully"
+echo "Rust continuous integration checks completed successfully"
 ```
 
 ### python
