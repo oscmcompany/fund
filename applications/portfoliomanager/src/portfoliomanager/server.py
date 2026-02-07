@@ -1,9 +1,6 @@
-import io
-import json
 import logging
 import os
 from datetime import UTC, datetime
-from typing import cast
 
 import httpx
 import polars as pl
@@ -11,7 +8,6 @@ import requests
 import sentry_sdk
 import structlog
 from fastapi import FastAPI, Response, status
-from internal.equity_bars_schema import equity_bars_schema
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 from .alpaca_client import AlpacaClient
@@ -43,7 +39,7 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
-from .enums import PositionAction, PositionSide, TradeSide  # noqa: E402
+from .enums import PositionSide, TradeSide  # noqa: E402
 from .exceptions import (  # noqa: E402
     AssetNotShortableError,
     InsufficientBuyingPowerError,
@@ -52,9 +48,6 @@ from .exceptions import (  # noqa: E402
 from .portfolio_schema import portfolio_schema  # noqa: E402
 from .risk_management import (  # noqa: E402
     UNCERTAINTY_THRESHOLD,
-    add_equity_bars_returns_and_realized_volatility_columns,
-    add_portfolio_action_column,
-    add_portfolio_performance_columns,
     add_predictions_zscore_ranked_columns,
     create_optimal_portfolio,
 )
@@ -123,16 +116,18 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_portfolio = get_prior_portfolio(current_timestamp=current_timestamp)
-        logger.info("Retrieved prior portfolio", count=len(prior_portfolio))
+        prior_portfolio_tickers = get_prior_portfolio_tickers()
+        logger.info(
+            "Retrieved prior portfolio tickers", count=len(prior_portfolio_tickers)
+        )
     except Exception as e:
-        logger.exception("Failed to retrieve prior portfolio", error=str(e))
+        logger.exception("Failed to retrieve prior portfolio tickers", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         optimal_portfolio = get_optimal_portfolio(
             current_predictions=current_predictions,
-            prior_portfolio=prior_portfolio,
+            prior_portfolio_tickers=prior_portfolio_tickers,
             maximum_capital=float(account.cash_amount),
             current_timestamp=current_timestamp,
         )
@@ -143,7 +138,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             error=str(e),
             uncertainty_threshold=UNCERTAINTY_THRESHOLD,
             predictions_count=len(current_predictions),
-            prior_portfolio_count=len(prior_portfolio),
+            prior_portfolio_tickers_count=len(prior_portfolio_tickers),
         )
         return Response(
             status_code=status.HTTP_204_NO_CONTENT,
@@ -155,7 +150,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
 
     try:
         open_positions, close_positions = get_positions(
-            prior_portfolio=prior_portfolio,
+            prior_portfolio_tickers=prior_portfolio_tickers,
             optimal_portfolio=optimal_portfolio,
         )
         logger.info(
@@ -223,7 +218,6 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         side = open_position["side"]
         dollar_amount = open_position["dollar_amount"]
 
-        # Check if we have enough buying power before attempting the order
         if dollar_amount > remaining_buying_power:
             logger.warning(
                 "Skipping position due to insufficient buying power",
@@ -368,159 +362,60 @@ async def get_current_predictions() -> pl.DataFrame:
         )
 
 
-def get_prior_portfolio(current_timestamp: datetime) -> pl.DataFrame:  # noqa: PLR0911
-    empty_portfolio = pl.DataFrame(
-        {
-            "ticker": [],
-            "timestamp": [],
-            "side": [],
-            "dollar_amount": [],
-            "action": [],
-        }
-    )
-
-    prior_portfolio_response = requests.get(
-        url=f"{DATAMANAGER_BASE_URL}/portfolios",
-        timeout=60,
-    )
-
-    if prior_portfolio_response.status_code == HTTP_NOT_FOUND:
-        logger.info(
-            "No prior portfolio found - this is expected on first run",
-            status_code=prior_portfolio_response.status_code,
-        )
-        return empty_portfolio
-
-    if prior_portfolio_response.status_code >= HTTP_BAD_REQUEST:
-        logger.warning(
-            "Failed to fetch prior portfolio from datamanager",
-            status_code=prior_portfolio_response.status_code,
-        )
-        return empty_portfolio
-
-    # Handle empty or invalid JSON response
-    response_text = prior_portfolio_response.text.strip()
-    if not response_text or response_text == "[]":
-        logger.info("Prior portfolio response is empty")
-        return empty_portfolio
-
+def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
+    """Fetch tickers from prior portfolio to exclude them (PDT avoidance)."""
     try:
+        prior_portfolio_response = requests.get(
+            url=f"{DATAMANAGER_BASE_URL}/portfolios",
+            timeout=60,
+        )
+
+        # If no prior portfolio, return empty list
+        if prior_portfolio_response.status_code == HTTP_NOT_FOUND:
+            logger.info("No prior portfolio found, starting fresh")
+            return []
+
+        if prior_portfolio_response.status_code >= HTTP_BAD_REQUEST:
+            logger.warning(
+                "Failed to fetch prior portfolio from datamanager",
+                status_code=prior_portfolio_response.status_code,
+            )
+            return []
+
+        response_text = prior_portfolio_response.text.strip()
+        if not response_text or response_text == "[]":
+            logger.info("Prior portfolio is empty")
+            return []
+
         prior_portfolio_data = prior_portfolio_response.json()
+
+        if not prior_portfolio_data:
+            return []
+
+        prior_portfolio = pl.DataFrame(prior_portfolio_data)
+
+        if prior_portfolio.is_empty():
+            return []
+
+        tickers = prior_portfolio["ticker"].unique().to_list()
+        logger.info("Retrieved prior portfolio tickers", count=len(tickers))
+        return tickers  # noqa: TRY300
+
     except (ValueError, requests.exceptions.JSONDecodeError) as e:
-        logger.warning(
-            "Failed to parse prior portfolio JSON",
-            error=str(e),
-            response_text=response_text[:200] if response_text else "empty",
-        )
-        return empty_portfolio
-
-    if not prior_portfolio_data:
-        logger.info("Prior portfolio data is empty")
-        return empty_portfolio
-
-    prior_portfolio = pl.DataFrame(prior_portfolio_data)
-
-    if prior_portfolio.is_empty():
-        return empty_portfolio
-
-    tickers = prior_portfolio["ticker"].unique().to_list()
-    timestamps = prior_portfolio["timestamp"].cast(pl.Float64)
-    start_timestamp = datetime.fromtimestamp(cast("float", timestamps.min()), tz=UTC)
-
-    prior_equity_bars_response = requests.get(
-        url=f"{DATAMANAGER_BASE_URL}/equity-bars",
-        params={
-            "tickers": ",".join(tickers),
-            "start_timestamp": start_timestamp.isoformat(),
-            "end_timestamp": current_timestamp.isoformat(),
-        },
-        timeout=60,
-    )
-
-    prior_equity_bars_response.raise_for_status()
-
-    tickers_and_timestamps = [
-        {"ticker": row[0], "timestamp": row[1]}
-        for row in prior_portfolio[["ticker", "timestamp"]].rows()
-    ]
-
-    prior_predictions_response = requests.get(
-        url=f"{DATAMANAGER_BASE_URL}/predictions",
-        params={"tickers_and_timestamps": json.dumps(tickers_and_timestamps)},
-        timeout=60,
-    )
-
-    prior_predictions_response.raise_for_status()
-
-    prior_portfolio = add_portfolio_action_column(
-        prior_portfolio=prior_portfolio,
-        current_timestamp=current_timestamp,
-    )
-
-    prior_equity_bars = pl.read_parquet(io.BytesIO(prior_equity_bars_response.content))
-
-    prior_equity_bars_validated = equity_bars_schema.validate(prior_equity_bars)
-    prior_equity_bars = cast(
-        "pl.DataFrame",
-        prior_equity_bars_validated.collect()
-        if isinstance(prior_equity_bars_validated, pl.LazyFrame)
-        else prior_equity_bars_validated,
-    )
-
-    prior_equity_bars = add_equity_bars_returns_and_realized_volatility_columns(
-        prior_equity_bars=prior_equity_bars
-    )
-
-    predictions_response_text = prior_predictions_response.text.strip()
-    if not predictions_response_text or predictions_response_text == "[]":
-        logger.warning(
-            "Prior predictions empty, returning portfolio without performance"
-        )
-        return add_portfolio_action_column(
-            prior_portfolio=prior_portfolio,
-            current_timestamp=current_timestamp,
-        )
-
-    try:
-        prior_predictions_data = prior_predictions_response.json()
-    except (ValueError, requests.exceptions.JSONDecodeError) as error:
-        logger.exception(
-            "Failed to retrieve prior portfolio",
-            error=str(error),
-        )
-        return add_portfolio_action_column(
-            prior_portfolio=prior_portfolio,
-            current_timestamp=current_timestamp,
-        )
-
-    if not prior_predictions_data:
-        logger.warning("Prior predictions data is empty")
-        return add_portfolio_action_column(
-            prior_portfolio=prior_portfolio,
-            current_timestamp=current_timestamp,
-        )
-
-    prior_predictions = pl.DataFrame(prior_predictions_data).with_columns(
-        pl.col("timestamp").cast(pl.Float64)
-    )
-
-    return add_portfolio_performance_columns(
-        prior_portfolio=prior_portfolio,
-        prior_equity_bars=prior_equity_bars,
-        prior_predictions=prior_predictions,
-        current_timestamp=current_timestamp,
-    )
+        logger.exception("Failed to parse prior portfolio JSON", error=str(e))
+        return []
 
 
 def get_optimal_portfolio(
     current_predictions: pl.DataFrame,
-    prior_portfolio: pl.DataFrame,
+    prior_portfolio_tickers: list[str],
     maximum_capital: float,
     current_timestamp: datetime,
 ) -> pl.DataFrame:
+    """Create optimal portfolio with prediction ranking and ticker exclusion."""
     optimal_portfolio = create_optimal_portfolio(
         current_predictions=current_predictions,
-        prior_portfolio=prior_portfolio,
+        prior_portfolio_tickers=prior_portfolio_tickers,
         maximum_capital=maximum_capital,
         current_timestamp=current_timestamp,
     )
@@ -542,33 +437,11 @@ def get_optimal_portfolio(
 
 
 def get_positions(
-    prior_portfolio: pl.DataFrame,
+    prior_portfolio_tickers: list[str],
     optimal_portfolio: pl.DataFrame,
 ) -> tuple[list[dict], list[dict]]:
-    prior_portfolio = prior_portfolio.clone()
-    optimal_portfolio = optimal_portfolio.clone()
-
-    close_positions = []
-    if not prior_portfolio.is_empty():
-        prior_tickers = set(prior_portfolio["ticker"].to_list())
-        optimal_tickers = set(optimal_portfolio["ticker"].to_list())
-        closing_tickers = prior_tickers - optimal_tickers
-
-        if closing_tickers:
-            close_positions = [
-                {
-                    "ticker": row["ticker"],
-                    "side": (
-                        TradeSide.SELL
-                        if row["side"] == PositionSide.LONG.value
-                        else TradeSide.BUY
-                    ),
-                    "dollar_amount": row["dollar_amount"],
-                }
-                for row in prior_portfolio.filter(
-                    pl.col("ticker").is_in(list(closing_tickers))
-                ).iter_rows(named=True)
-            ]
+    """Get positions to close and open."""
+    close_positions = [{"ticker": ticker} for ticker in prior_portfolio_tickers]
 
     open_positions = [
         {
@@ -580,9 +453,7 @@ def get_positions(
             ),
             "dollar_amount": row["dollar_amount"],
         }
-        for row in optimal_portfolio.filter(
-            pl.col("action") == PositionAction.OPEN_POSITION.value
-        ).iter_rows(named=True)
+        for row in optimal_portfolio.iter_rows(named=True)
     ]
 
     return open_positions, close_positions
