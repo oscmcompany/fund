@@ -30,7 +30,7 @@ members = [
 dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
 
 [tool.pytest.ini_options]
-testpaths = ["applications/*/tests", "libraries/python/tests"]
+testpaths = ["applications/*/tests", "libraries/python/tests", "tools/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
