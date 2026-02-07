@@ -1,17 +1,17 @@
 # Update Pull Request
 
-> Address PR feedback and fix failing checks
+> Address pull request feedback and fix failing checks
 
 ## Important: Context Requirements
 
 **This command requires continuous context throughout execution.** Do not clear context between steps, as this will cause loss of:
-- PR data file paths and metadata
+- Pull request data file paths and metadata
 - Comment and thread IDs needed for responses
 - Mapping between feedback items and their resolution mechanisms
 
 If you need to accept edits during execution:
 - Choose "accept edits and continue" (NOT "clear context")
-- Or wait until Section 10 (commit stage) to accept all edits at once
+- Or wait until the "Commit Changes" step to accept all edits at once
 
 ## Instructions
 
@@ -19,14 +19,14 @@ Analyze and address all feedback and failing checks on a GitHub pull request, th
 
 Follow these steps:
 
-### 1. Fetch PR Data
+### 1. Fetch Pull Request Data
 
-- Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a PR number is required.
+- Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a pull request number is required.
 - Determine the scratchpad directory path from the system reminder message (shown at session start, format: `/private/tmp/claude-*/scratchpad`). Use this for all temporary file storage instead of `/tmp/` to ensure session isolation and automatic cleanup.
 - Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`) and export variables:
   - `OWNER=<extracted_owner>`
   - `REPO=<extracted_repo>`
-- Fetch comprehensive PR data using a single GraphQL query, saving to a file to avoid token limit issues:
+- Fetch comprehensive pull request data using a single GraphQL query, saving to a file to avoid token limit issues:
 
   ```bash
 
@@ -107,25 +107,38 @@ Follow these steps:
   ' -f owner="${OWNER}" -f repo="${REPO}" -F number=${ARGUMENTS} > ${SCRATCHPAD}/pr_data.json
   ```
 
-- Validate that the PR data was fetched successfully:
+- Validate that the pull request data was fetched successfully:
 
   ```bash
-  # Check file exists
-  if [ ! -f "${SCRATCHPAD}/pr_data.json" ]; then
-    echo "Error: Failed to fetch PR data. Check that PR #${ARGUMENTS} exists and gh is authenticated."
+  # Check jq is installed
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq is required but not installed. Install with: brew install jq (macOS) or apt-get install jq (Linux)"
     exit 1
   fi
 
-  # Validate JSON structure
+  # Check file exists
+  if [ ! -f "${SCRATCHPAD}/pr_data.json" ]; then
+    echo "Error: Failed to fetch pull request data to ${SCRATCHPAD}/pr_data.json using 'gh api'. Check that pull request #${ARGUMENTS} exists, run 'gh auth status' to verify authentication, then retry the fetch command."
+    exit 1
+  fi
+
+  # Validate JSON structure and GraphQL response
   if ! jq empty "${SCRATCHPAD}/pr_data.json" 2>/dev/null; then
-    echo "Error: PR data file contains invalid JSON"
+    echo "Error: pull request data file ${SCRATCHPAD}/pr_data.json contains invalid JSON. Try re-running the 'gh api' fetch command; if the problem persists, run 'gh auth status' and verify network access before retrying."
+    exit 1
+  fi
+
+  # Validate GraphQL response structure
+  if ! jq -e '.data.repository.pullRequest.id and (.errors | not)' "${SCRATCHPAD}/pr_data.json" >/dev/null 2>&1; then
+    echo "Error: pull request data missing expected fields or contains GraphQL errors. Check pull request #${ARGUMENTS} exists and you have access."
+    jq -r '.errors[]?.message // "No specific error message available"' "${SCRATCHPAD}/pr_data.json"
     exit 1
   fi
   ```
 
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
 - **Important**: Save output to a file (`${SCRATCHPAD}/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
-- **Critical**: The PR data file will be too large to read directly with the Read tool. Always use `jq` to parse and extract specific fields. Never attempt to read the entire file.
+- **Critical**: The pull request data file will be too large to read directly with the Read tool. Always use `jq` to parse and extract specific fields. Never attempt to read the entire file.
 
 ### 2. Analyze Check Failures
 
@@ -135,10 +148,10 @@ Follow these steps:
 
 ### 3. Group and Analyze Feedback
 
-- Parse the saved PR data from `${SCRATCHPAD}/pr_data.json` using these extraction rules:
+- Parse the saved pull request data from `${SCRATCHPAD}/pr_data.json` using these extraction rules:
   - From `data.repository.pullRequest.reviewThreads.nodes[]`:
     - **First, identify outdated threads**: Filter for `isResolved: false` AND `isOutdated: true`
-      - Auto-resolve these immediately (see step 3a below) since they're no longer relevant to current code
+      - Review these manually (see step 3a below) as they may still contain relevant feedback
     - **Then, extract unresolved threads**: Filter for `isResolved: false` AND `isOutdated: false`
     - For each unresolved thread, extract:
       - Thread ID: `.id` (format: `PRRT_*`) for later resolution
@@ -149,39 +162,29 @@ Follow these steps:
         - Author: `.author.login`
         - File location: `.path` and `.position`
   - From `data.repository.pullRequest.comments.nodes[]`:
-    - Extract issue-level comments (PR conversation):
+    - Extract issue-level comments (pull request conversation):
       - Comment database ID: `.databaseId`
       - Comment body: `.body`
       - Author: `.author.login`
   - From check runs in `commits.nodes[].commit.checkSuites.nodes[].checkRuns.nodes[]`:
     - Filter where `conclusion: "FAILURE"` or `conclusion: "TIMED_OUT"`
 - Store complete metadata for each feedback item to use in later steps.
-- Group related feedback using judgement: by file, by theme, by type of change, or whatever makes most sense for the specific PR; ensure each group maintains the full metadata for all comments it contains.
+- Group related feedback using judgement: by file, by theme, by type of change, or whatever makes most sense for the specific pull request; ensure each group maintains the full metadata for all comments it contains.
 - Analyze dependencies between feedback groups to determine which are independent (can be worked in parallel) and which are interdependent (must be handled sequentially).
 - For each piece of feedback, evaluate whether to address it (make code changes) or reject it (explain why the feedback doesn't apply); provide clear reasoning for each decision.
 
-### 3a. Resolve Outdated Threads
+### 3a. Identify Outdated Threads
 
-- Before processing feedback, auto-resolve all outdated threads that are still unresolved:
+- Before processing feedback, identify outdated threads that are still unresolved:
 
   ```bash
-  # Log outdated threads before resolution for verification
-  echo "=== Auto-resolving outdated threads ==="
+  # Log outdated threads for review
+  echo "=== Outdated threads (require manual review) ==="
   jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | "\(.id) | \(.comments.nodes[0].path) | \(.comments.nodes[0].author.login) | \(.comments.nodes[0].body[:80])"' ${SCRATCHPAD}/pr_data.json
-
-  # Extract outdated thread IDs and resolve
-  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | .id' ${SCRATCHPAD}/pr_data.json | while read thread_id; do
-    gh api graphql -f query="
-      mutation {
-        resolveReviewThread(input: {threadId: \"$thread_id\"}) {
-          thread { id isResolved }
-        }
-      }
-    "
-  done
   ```
 
-- Log which threads were auto-resolved as outdated for the final summary.
+- **Important**: "Outdated" means the code was modified, not that feedback is irrelevant. Review each outdated thread manually during Step 3 to determine if the feedback still applies or should be addressed.
+- Include outdated threads in your feedback grouping and analysis - they may still require responses or code changes.
 
 ### 4. Enter Plan Mode
 
@@ -215,7 +218,7 @@ Follow these steps:
   - Run `mask development python all` if any Python files were modified.
   - Run `mask development rust all` if any Rust files were modified.
   - Skip redundant checks if the next group will touch the same language files (batch them), but always run comprehensive checks at the end.
-  - **Note**: Local verification confirms fixes work in the development environment, but remote CI on the PR will not re-run or reflect these results until changes are pushed in Section 10.
+  - **Note**: Local verification confirms fixes work in the development environment, but remote continuous integration on the pull request will not re-run or reflect these results until changes are pushed in the "Commit Changes" step.
 - If checks fail, resolve issues and re-run until passing before moving to the next group.
 - Do not proceed to the next feedback group until current group's changes pass verification.
 
@@ -248,7 +251,7 @@ Follow these steps:
     '
     ```
 
-    Use the PR's node ID from step 1's query (`data.repository.pullRequest.id`) for `pullRequestId`.
+    Use the pull request's node ID from step 1's query (`data.repository.pullRequest.id`) for `pullRequestId`.
     Use the comment's node ID (format: `PRRC_*`) for `inReplyTo` parameter.
 
     **Response formatting guidelines**:
@@ -257,7 +260,7 @@ Follow these steps:
     - Use simple sentences: "Fixed in step X" or "Updated to use GraphQL approach"
     - For longer responses, reference line numbers or file paths instead of quoting code
 
-  - For issue comments (PR-level), use REST API:
+  - For issue comments (pull request-level), use REST API:
 
     ```bash
     gh api repos/${OWNER}/${REPO}/issues/"${ARGUMENTS}"/comments -f body="<response_text>"
@@ -284,9 +287,9 @@ Follow these steps:
 
     - Map each comment back to its parent thread using the data structure from step 3 parsing.
     - Resolve both addressed and rejected feedback threads (explanation provided in response).
-    - **Note**: Threads are resolved based on local verification. The fixes will not appear on the remote PR branch until Section 10's commit and push. Remote CI will not re-run until changes are pushed.
+    - **Note**: Threads are resolved based on local verification. The fixes will not appear on the remote pull request branch until the "Commit Changes" step. Remote continuous integration will not re-run until changes are pushed.
 
-  - For issue comments (PR-level):
+  - For issue comments (pull request-level):
     - No resolution mechanism (issue comments don't have thread states).
     - Only post response; no resolution step needed.
 
@@ -298,14 +301,14 @@ Follow these steps:
   - Stage all modified files: `git add <files>`
   - Create commit with descriptive message following CLAUDE.md conventions:
     - Include detailed summary of what was fixed and why
-    - Reference PR number
+    - Reference pull request number
     - Add co-author line: extract model name from system context (format: "You are powered by the model named X") and use `Co-Authored-By: Claude X <noreply@anthropic.com>`
   - Example:
 
     ```bash
     git add file1.py file2.md
     git commit -m "$(cat <<'EOF'
-    Address PR #<number> feedback: <brief summary>
+    Address pull request #<number> feedback: <brief summary>
 
     <Detailed explanation of changes made>
 
@@ -314,14 +317,13 @@ Follow these steps:
     )"
     ```
 
-- Ask user: "Ready to push these changes to the remote branch to update the PR? This will trigger remote CI to re-run and make the fixes visible to other reviewers."
+- Ask user: "Ready to push these changes to the remote branch to update the pull request? This will trigger remote continuous integration to re-run and make the fixes visible to other reviewers."
 
 ### 11. Final Summary
 
 - Provide a comprehensive summary showing:
-  - Outdated threads auto-resolved (count and thread IDs).
-  - Total feedback items processed (with count of addressed vs rejected).
+  - Total feedback items processed (with count of addressed vs rejected), including any outdated threads that were reviewed.
   - Which checks were fixed.
   - Confirmation that all comments have been responded to and resolved.
-  - Final verification status (all local checks passing; note that remote CI status will update after pushing changes).
+  - Final verification status (all local checks passing; note that remote continuous integration status will update after pushing changes).
 - For check failures that were fixed, note that no comments were posted - the fixes will be reflected in re-run checks after pushing to the remote branch.
