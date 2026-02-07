@@ -165,8 +165,56 @@ def test_create_optimal_portfolio_with_prior_ticker_exclusion() -> None:
     assert set(long_tickers) == set(expected_long)
 
 
+def test_create_optimal_portfolio_unsorted_input() -> None:
+    """Test that create_optimal_portfolio handles unsorted input correctly."""
+    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
+
+    # Create predictions intentionally out of order
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["TICK10", "TICK05", "TICK20", "TICK15", "TICK25"]
+            + [f"TICK{i:02d}" for i in range(30) if i not in [5, 10, 15, 20, 25]],
+            "quantile_10": [0.0] * 30,
+            "quantile_50": [0.10, 0.05, 0.20, 0.15, 0.25]
+            + [i * 0.01 for i in range(30) if i not in [5, 10, 15, 20, 25]],
+            "quantile_90": [0.05] * 30,  # Low uncertainty
+            "z_score_return": [10.0, 5.0, 20.0, 15.0, 25.0]
+            + [float(i) for i in range(30) if i not in [5, 10, 15, 20, 25]],
+            "inter_quartile_range": [0.05] * 30,
+            "composite_score": [10.0, 5.0, 20.0, 15.0, 25.0]
+            + [float(i) for i in range(30) if i not in [5, 10, 15, 20, 25]],
+            "action": ["UNSPECIFIED"] * 30,
+        }
+    )
+
+    result = create_optimal_portfolio(
+        current_predictions=predictions,
+        prior_portfolio_tickers=[],
+        maximum_capital=10000.0,
+        current_timestamp=current_timestamp,
+    )
+
+    # Should create 20 positions despite unsorted input
+    assert len(result) == 20  # noqa: PLR2004
+    assert result.filter(pl.col("side") == "LONG").height == 10  # noqa: PLR2004
+    assert result.filter(pl.col("side") == "SHORT").height == 10  # noqa: PLR2004
+
+    # Top 10 should be long (highest composite scores)
+    long_tickers = result.filter(pl.col("side") == "LONG")["ticker"].to_list()
+    assert "TICK25" in long_tickers  # Highest score should be long
+    assert "TICK20" in long_tickers
+
+    # Bottom 10 should be short (lowest composite scores)
+    short_tickers = result.filter(pl.col("side") == "SHORT")["ticker"].to_list()
+    assert "TICK00" in short_tickers  # Lowest scores should be short
+
+
 def test_create_optimal_portfolio_high_uncertainty_exclusions() -> None:
-    """Test that high uncertainty predictions are excluded."""
+    """Test that high uncertainty predictions are excluded.
+
+    Note: This test intentionally uses pre-computed ranking columns rather than calling
+    add_predictions_zscore_ranked_columns to verify portfolio logic in isolation.
+    """
     current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
 
     # Create 25 predictions: 20 low uncertainty, 5 high uncertainty
@@ -240,7 +288,8 @@ def test_create_optimal_portfolio_insufficient_after_exclusions() -> None:
     assert "need 20" in str(exc_info.value)
 
 
-def test_create_optimal_portfolio_equal_capital_allocation() -> None:
+@pytest.mark.parametrize("capital", [10000.0, 25000.0, 50000.0])
+def test_create_optimal_portfolio_equal_capital_allocation(capital: float) -> None:
     """Test that capital is allocated equally across positions."""
     current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
 
@@ -256,24 +305,22 @@ def test_create_optimal_portfolio_equal_capital_allocation() -> None:
     # Rank and sort predictions
     ranked_predictions = add_predictions_zscore_ranked_columns(predictions)
 
-    # Test with different capital amounts
-    for capital in [10000.0, 25000.0, 50000.0]:
-        result = create_optimal_portfolio(
-            current_predictions=ranked_predictions,
-            prior_portfolio_tickers=[],
-            maximum_capital=capital,
-            current_timestamp=current_timestamp,
-        )
+    result = create_optimal_portfolio(
+        current_predictions=ranked_predictions,
+        prior_portfolio_tickers=[],
+        maximum_capital=capital,
+        current_timestamp=current_timestamp,
+    )
 
-        expected_per_position = capital / 20
-        for amount in result["dollar_amount"].to_list():
-            assert amount == pytest.approx(expected_per_position)
+    expected_per_position = capital / 20
+    for amount in result["dollar_amount"].to_list():
+        assert amount == pytest.approx(expected_per_position)
 
-        # Long and short should be equal
-        long_sum = result.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
-        short_sum = result.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
-        assert long_sum == pytest.approx(short_sum)
-        assert long_sum == pytest.approx(capital / 2)
+    # Long and short should be equal
+    long_sum = result.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
+    short_sum = result.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
+    assert long_sum == pytest.approx(short_sum)
+    assert long_sum == pytest.approx(capital / 2)
 
 
 def test_create_optimal_portfolio_head_tail_selection() -> None:

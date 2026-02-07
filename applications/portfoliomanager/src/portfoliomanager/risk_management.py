@@ -11,6 +11,7 @@ logger = structlog.get_logger()
 
 UNCERTAINTY_THRESHOLD = float(os.getenv("OSCM_UNCERTAINTY_THRESHOLD", "0.1"))
 REQUIRED_PORTFOLIO_SIZE = 20  # 10 long + 10 short
+SIDE_SIZE = REQUIRED_PORTFOLIO_SIZE // 2
 
 
 def add_predictions_zscore_ranked_columns(
@@ -57,7 +58,7 @@ def create_optimal_portfolio(
     )
 
     # Excluding prior portfolio tickers to avoid pattern day trader restrictions.
-    excluded_tickers = high_uncertainty_tickers + prior_portfolio_tickers
+    excluded_tickers = list(set(high_uncertainty_tickers + prior_portfolio_tickers))
 
     logger.info(
         "Portfolio filtering breakdown",
@@ -70,12 +71,12 @@ def create_optimal_portfolio(
 
     available_predictions = current_predictions.filter(
         ~pl.col("ticker").is_in(excluded_tickers)
-    )
+    ).sort(["composite_score", "inter_quartile_range"], descending=[True, False])
 
     logger.info(
         "Available predictions after filtering",
         available_count=available_predictions.height,
-        required_for_full_portfolio=20,
+        required_for_full_portfolio=REQUIRED_PORTFOLIO_SIZE,
     )
 
     if available_predictions.height < REQUIRED_PORTFOLIO_SIZE:
@@ -87,11 +88,11 @@ def create_optimal_portfolio(
         )
         raise InsufficientPredictionsError(message)
 
-    long_candidates = available_predictions.head(10)
-    short_candidates = available_predictions.tail(10)
+    long_candidates = available_predictions.head(SIDE_SIZE)
+    short_candidates = available_predictions.tail(SIDE_SIZE)
 
     target_side_capital = maximum_capital / 2
-    dollar_amount_per_position = target_side_capital / 10
+    dollar_amount_per_position = target_side_capital / SIDE_SIZE
 
     logger.info(
         "Portfolio allocation",
@@ -99,8 +100,8 @@ def create_optimal_portfolio(
         long_capital=target_side_capital,
         short_capital=target_side_capital,
         dollar_per_position=dollar_amount_per_position,
-        long_count=10,
-        short_count=10,
+        long_count=SIDE_SIZE,
+        short_count=SIDE_SIZE,
     )
 
     long_positions = long_candidates.select(

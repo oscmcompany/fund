@@ -402,10 +402,7 @@ def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
         return tickers  # noqa: TRY300
 
     except (ValueError, requests.exceptions.JSONDecodeError) as e:
-        logger.warning("Failed to parse prior portfolio JSON", error=str(e))
-        return []
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Unexpected error fetching prior portfolio", error=str(e))
+        logger.exception("Failed to parse prior portfolio JSON", error=str(e))
         return []
 
 
