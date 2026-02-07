@@ -2,6 +2,17 @@
 
 > Address PR feedback and fix failing checks
 
+## Important: Context Requirements
+
+**This command requires continuous context throughout execution.** Do not clear context between steps, as this will cause loss of:
+- PR data file paths and metadata
+- Comment and thread IDs needed for responses
+- Mapping between feedback items and their resolution mechanisms
+
+If you need to accept edits during execution:
+- Choose "accept edits and continue" (NOT "clear context")
+- Or wait until Section 10 (commit stage) to accept all edits at once
+
 ## Instructions
 
 Analyze and address all feedback and failing checks on a GitHub pull request, then respond to and resolve all comments.
@@ -94,6 +105,22 @@ Follow these steps:
       }
     }
   ' -f owner="${OWNER}" -f repo="${REPO}" -F number=${ARGUMENTS} > ${SCRATCHPAD}/pr_data.json
+  ```
+
+- Validate that the PR data was fetched successfully:
+
+  ```bash
+  # Check file exists
+  if [ ! -f "${SCRATCHPAD}/pr_data.json" ]; then
+    echo "Error: Failed to fetch PR data. Check that PR #${ARGUMENTS} exists and gh is authenticated."
+    exit 1
+  fi
+
+  # Validate JSON structure
+  if ! jq empty "${SCRATCHPAD}/pr_data.json" 2>/dev/null; then
+    echo "Error: PR data file contains invalid JSON"
+    exit 1
+  fi
   ```
 
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
