@@ -4,7 +4,6 @@ from typing import cast
 import structlog
 from alpaca.common.exceptions import APIError
 from alpaca.data import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading import (
     ClosePositionRequest,
     OrderRequest,
@@ -61,74 +60,18 @@ class AlpacaClient:
             buying_power=float(cast("str", account.buying_power)),
         )
 
-    def _get_current_price(self, ticker: str, side: TradeSide) -> float:
-        """Get current price for a ticker based on trade side.
-
-        Uses ask price for buys, bid price for sells.
-        Falls back to the opposite price if the primary price is unavailable.
-        """
-        request = StockLatestQuoteRequest(symbol_or_symbols=ticker.upper())
-        quotes = self.data_client.get_stock_latest_quote(request)
-        quote = quotes.get(ticker.upper())
-
-        if quote is None:
-            message = f"No quote returned for {ticker}"
-            raise ValueError(message)
-
-        ask_price = (
-            float(quote.ask_price)
-            if quote.ask_price is not None and quote.ask_price > 0
-            else 0.0
-        )
-        bid_price = (
-            float(quote.bid_price)
-            if quote.bid_price is not None and quote.bid_price > 0
-            else 0.0
-        )
-
-        if side == TradeSide.BUY:
-            if ask_price > 0:
-                return ask_price
-            if bid_price > 0:
-                logger.warning(
-                    "Ask price unavailable, using bid price as fallback",
-                    ticker=ticker,
-                    side=side.value,
-                    bid_price=bid_price,
-                )
-                return bid_price
-            message = f"No valid price for {ticker}: ask and bid are 0"
-            raise ValueError(message)
-
-        if bid_price > 0:
-            return bid_price
-        if ask_price > 0:
-            logger.warning(
-                "Bid price unavailable, using ask price as fallback",
-                ticker=ticker,
-                side=side.value,
-                ask_price=ask_price,
-            )
-            return ask_price
-        message = f"No valid price for {ticker}: bid and ask are 0"
-        raise ValueError(message)
-
     def open_position(
         self,
         ticker: str,
         side: TradeSide,
         dollar_amount: float,
     ) -> None:
-        # Calculate quantity from dollar amount and current price
-        # Allow fractional shares where supported by the brokerage
-        current_price = self._get_current_price(ticker, side)
-        qty = dollar_amount / current_price
-
-        if qty <= 0:
+        # Use notional (dollar amount) for order submission
+        # This allows Alpaca to handle fractional shares automatically
+        if dollar_amount <= 0:
             message = (
                 f"Cannot open position for {ticker}: "
-                f"non-positive quantity calculated from dollar_amount {dollar_amount} "
-                f"and price {current_price}"
+                f"non-positive dollar_amount {dollar_amount}"
             )
             raise ValueError(message)
 
@@ -136,7 +79,7 @@ class AlpacaClient:
             self.trading_client.submit_order(
                 order_data=OrderRequest(
                     symbol=ticker.upper(),
-                    qty=qty,
+                    notional=dollar_amount,
                     side=OrderSide(side.value.lower()),
                     type=OrderType.MARKET,
                     time_in_force=TimeInForce.DAY,
