@@ -157,7 +157,23 @@ pub async fn query_equity_bars_parquet_from_s3(
 
     let (start_timestamp, end_timestamp) = match (start_timestamp, end_timestamp) {
         (Some(start), Some(end)) => (start, end),
-        _ => {
+        (Some(start), None) => {
+            let end_date = chrono::Utc::now();
+            info!(
+                "No end date specified, defaulting to now: {} to {}",
+                start, end_date
+            );
+            (start, end_date)
+        }
+        (None, Some(end)) => {
+            let start_date = end - chrono::Duration::days(7);
+            info!(
+                "No start date specified, defaulting to 7 days before end: {} to {}",
+                start_date, end
+            );
+            (start_date, end)
+        }
+        (None, None) => {
             let end_date = chrono::Utc::now();
             let start_date = end_date - chrono::Duration::days(7);
             info!(

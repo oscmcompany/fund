@@ -1,11 +1,11 @@
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
     pub base: String,
-    pub key: String,
+    pub key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -37,41 +37,22 @@ impl State {
 
         let s3_client = S3Client::new(&config);
 
-        let bucket_name = match std::env::var("AWS_S3_DATA_BUCKET_NAME") {
-            Ok(name) => {
-                info!("Using S3 bucket from environment: {}", name);
-                name
-            }
-            Err(_) => {
-                let default_bucket = "oscm-data".to_string();
-                error!(
-                    "AWS_S3_DATA_BUCKET_NAME not set, using default: {}",
-                    default_bucket
-                );
-                default_bucket
-            }
-        };
+        let bucket_name = std::env::var("AWS_S3_DATA_BUCKET_NAME")
+            .expect("AWS_S3_DATA_BUCKET_NAME must be set");
+        info!("Using S3 bucket: {}", bucket_name);
 
-        let massive_base = match std::env::var("MASSIVE_BASE_URL") {
-            Ok(url) => {
-                info!("Using Massive API base URL from environment: {}", url);
-                url
-            }
-            Err(_) => {
-                let default_url = "https://api.massive.io".to_string();
-                error!("MASSIVE_BASE_URL not set, using default: {}", default_url);
-                default_url
-            }
-        };
+        let massive_base = std::env::var("MASSIVE_BASE_URL")
+            .expect("MASSIVE_BASE_URL must be set");
+        info!("Using Massive API base URL: {}", massive_base);
 
         let massive_key = match std::env::var("MASSIVE_API_KEY") {
             Ok(key) => {
                 debug!("MASSIVE_API_KEY loaded (length: {} chars)", key.len());
-                key
+                Some(key)
             }
             Err(_) => {
                 warn!("MASSIVE_API_KEY not set - equity bar sync will not work");
-                String::new()
+                None
             }
         };
 
