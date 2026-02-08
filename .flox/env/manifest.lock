@@ -66,6 +66,10 @@
           "x86_64-darwin"
         ]
       },
+      "llvm": {
+        "pkg-path": "llvm",
+        "pkg-group": "rust-toolchain"
+      },
       "markdownlint-cli": {
         "pkg-path": "markdownlint-cli"
       },
@@ -603,6 +607,139 @@
       "outputs": {
         "debug": "/nix/store/yvamzvy4r4ml91sl0fap3jvp12wgwflx-clippy-1.92.0-debug",
         "out": "/nix/store/zmrbcbd77w6nylgwyagnxh87all5swjf-clippy-1.92.0"
+      },
+      "system": "x86_64-linux",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "llvm",
+      "broken": false,
+      "derivation": "/nix/store/a0z2gcp85jm7568c9hrbl5zdbflgjnsl-llvm-21.1.8.drv",
+      "description": "Collection of modular and reusable compiler and toolchain technologies",
+      "install_id": "llvm",
+      "license": "[ NCSA, Apache-2.0, LLVM-exception ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "name": "llvm-21.1.8",
+      "pname": "llvm",
+      "rev": "00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "rev_count": 940249,
+      "rev_date": "2026-02-04T09:32:58Z",
+      "scrape_date": "2026-02-06T04:36:12.840423Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.1.8",
+      "outputs_to_install": [
+        "out",
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/y96jxh4yxjvq6dhri26x35370w4vzpz9-llvm-21.1.8-dev",
+        "lib": "/nix/store/ixyxn9ipysnrr3q2x5mlfhbkl4ada78j-llvm-21.1.8-lib",
+        "out": "/nix/store/yq033yr0zwx5zcqmfgpdzl751xs9qzzb-llvm-21.1.8",
+        "python": "/nix/store/454pgdykfy2nwhd0cz1lgdi0v7ngk7yl-llvm-21.1.8-python"
+      },
+      "system": "aarch64-darwin",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "llvm",
+      "broken": false,
+      "derivation": "/nix/store/lfqpgrr022iyxrs952i7376i2nw4nnw1-llvm-21.1.8.drv",
+      "description": "Collection of modular and reusable compiler and toolchain technologies",
+      "install_id": "llvm",
+      "license": "[ NCSA, Apache-2.0, LLVM-exception ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "name": "llvm-21.1.8",
+      "pname": "llvm",
+      "rev": "00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "rev_count": 940249,
+      "rev_date": "2026-02-04T09:32:58Z",
+      "scrape_date": "2026-02-06T05:05:51.100366Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.1.8",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/4s30hy5240j3rvn10w4v55c9xvdn2slb-llvm-21.1.8-dev",
+        "lib": "/nix/store/fq36ddj5says0g96sv408zzrzvrdxb42-llvm-21.1.8-lib",
+        "out": "/nix/store/p15k615lkir3sxkj066yww4sfiz1b81n-llvm-21.1.8",
+        "python": "/nix/store/5mvv9pv1kadg1frjs0kmsk8x905x5kmd-llvm-21.1.8-python"
+      },
+      "system": "aarch64-linux",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "llvm",
+      "broken": false,
+      "derivation": "/nix/store/va5vrxggkampw9jh2dhycwijyyqs7si8-llvm-21.1.8.drv",
+      "description": "Collection of modular and reusable compiler and toolchain technologies",
+      "install_id": "llvm",
+      "license": "[ NCSA, Apache-2.0, LLVM-exception ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "name": "llvm-21.1.8",
+      "pname": "llvm",
+      "rev": "00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "rev_count": 940249,
+      "rev_date": "2026-02-04T09:32:58Z",
+      "scrape_date": "2026-02-06T05:33:51.129745Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.1.8",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/z2l891zsd5rzxsjhyzi552mg1lnq1yc0-llvm-21.1.8-dev",
+        "lib": "/nix/store/39h8zyrkknws8966p5kxgbyqcbc28q52-llvm-21.1.8-lib",
+        "out": "/nix/store/8wqrv04hhq3smj5id34402gdnjr44j2v-llvm-21.1.8",
+        "python": "/nix/store/kwia8hcfl8xfmgcqrvw7ii85cbdmb03k-llvm-21.1.8-python"
+      },
+      "system": "x86_64-darwin",
+      "group": "rust-toolchain",
+      "priority": 5
+    },
+    {
+      "attr_path": "llvm",
+      "broken": false,
+      "derivation": "/nix/store/ilgysj1s90haj2ks4fr3v1a1h5kqplci-llvm-21.1.8.drv",
+      "description": "Collection of modular and reusable compiler and toolchain technologies",
+      "install_id": "llvm",
+      "license": "[ NCSA, Apache-2.0, LLVM-exception ]",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "name": "llvm-21.1.8",
+      "pname": "llvm",
+      "rev": "00c21e4c93d963c50d4c0c89bfa84ed6e0694df2",
+      "rev_count": 940249,
+      "rev_date": "2026-02-04T09:32:58Z",
+      "scrape_date": "2026-02-06T06:06:16.945436Z",
+      "stabilities": [
+        "staging",
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "21.1.8",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dev": "/nix/store/f36xxmmzivp37h20k4id9a1vximc508n-llvm-21.1.8-dev",
+        "lib": "/nix/store/apf2d7f948m7qch6vnk6i3rhrky0pd9v-llvm-21.1.8-lib",
+        "out": "/nix/store/5chxlq8nygpr9y6y9y9aqc3fsa28ng8w-llvm-21.1.8",
+        "python": "/nix/store/hyvq2nabmfhan1751dwb0dadrqc6nnlw-llvm-21.1.8-python"
       },
       "system": "x86_64-linux",
       "group": "rust-toolchain",

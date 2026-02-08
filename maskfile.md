@@ -372,22 +372,20 @@ echo "Running Rust tests with coverage"
 
 mkdir -p .coverage_output
 
-if ! command -v cargo-tarpaulin >/dev/null 2>&1; then
-    echo "Tarpaulin not available (expected on macOS ARM). Running tests without coverage"
+if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+    echo "cargo-llvm-cov not available. Running tests without coverage"
     cargo test --workspace --verbose
-elif cargo tarpaulin --workspace --verbose \
-    --engine llvm \
-    --out Xml \
-    --output-dir .coverage_output \
-    --timeout 300 \
-    --line \
-    --ignore-panics \
-    --follow-exec; then
-    mv .coverage_output/cobertura.xml .coverage_output/rust.xml
-    echo "Rust tests with coverage completed successfully"
 else
-    echo "Tarpaulin failed. Check test output above."
-    exit 1
+    export LLVM_COV=$(which llvm-cov)
+    export LLVM_PROFDATA=$(which llvm-profdata)
+    if cargo llvm-cov --workspace --verbose \
+        --cobertura \
+        --output-path .coverage_output/rust.xml; then
+        echo "Rust tests with coverage completed successfully"
+    else
+        echo "cargo llvm-cov failed. Check test output above."
+        exit 1
+    fi
 fi
 ```
 
