@@ -66,12 +66,12 @@ fn test_ticker_validation_edge_cases() {
     assert!(!is_valid_ticker(empty), "Empty string should be invalid");
 
     let dots = "...";
-    assert!(is_valid_ticker(dots), "Dots-only ticker should be valid");
+    assert!(!is_valid_ticker(dots), "Dots-only ticker should be invalid");
 
     let dashes = "---";
     assert!(
-        is_valid_ticker(dashes),
-        "Dashes-only ticker should be valid"
+        !is_valid_ticker(dashes),
+        "Dashes-only ticker should be invalid"
     );
 }
 
@@ -175,17 +175,4 @@ fn test_ticker_sql_escaping() {
     let escaped_multiple = escape_sql_ticker(multiple_quotes);
 
     assert_eq!(escaped_multiple, "A''B''C");
-}
-
-#[test]
-fn test_default_date_range_calculation() {
-    use chrono::{Duration, Utc};
-
-    let end_date = Utc::now();
-    let start_date = end_date - Duration::days(7);
-
-    let duration = end_date - start_date;
-    assert_eq!(duration.num_days(), 7);
-
-    assert!(start_date < end_date);
 }

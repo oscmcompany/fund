@@ -39,6 +39,7 @@ pub async fn write_predictions_dataframe_to_s3(
 
 pub fn is_valid_ticker(ticker: &str) -> bool {
     !ticker.is_empty()
+        && ticker.chars().any(|c| c.is_ascii_alphanumeric())
         && ticker
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
@@ -60,7 +61,7 @@ pub fn date_to_int(timestamp: &DateTime<Utc>) -> i32 {
         .format("%Y%m%d")
         .to_string()
         .parse::<i32>()
-        .unwrap_or(0)
+        .expect("formatted date string should always parse to i32")
 }
 
 pub fn escape_sql_ticker(ticker: &str) -> String {

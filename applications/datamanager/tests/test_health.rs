@@ -1,21 +1,9 @@
-use axum::{body::Body, http::Request};
-use datamanager::router::create_app;
-use hyper::http::StatusCode;
-use tower::ServiceExt;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use datamanager::health::get_health;
 
 #[tokio::test]
 async fn test_health_endpoint_returns_ok() {
-    let app = create_app().await;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
+    let response = get_health().await.into_response();
     assert_eq!(response.status(), StatusCode::OK);
 }

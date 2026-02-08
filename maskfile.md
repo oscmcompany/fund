@@ -372,8 +372,10 @@ echo "Running Rust tests with coverage"
 
 mkdir -p .coverage_output
 
-# In continuous integration (Linux), this generates coverage. Locally on macOS, use 'cargo test' instead.
-if cargo tarpaulin --workspace --verbose \
+if ! command -v cargo-tarpaulin >/dev/null 2>&1; then
+    echo "Tarpaulin not available (expected on macOS ARM). Running tests without coverage"
+    cargo test --workspace --verbose
+elif cargo tarpaulin --workspace --verbose \
     --engine llvm \
     --out Xml \
     --output-dir .coverage_output \
@@ -382,12 +384,11 @@ if cargo tarpaulin --workspace --verbose \
     --ignore-panics \
     --follow-exec; then
     mv .coverage_output/cobertura.xml .coverage_output/rust.xml
+    echo "Rust tests with coverage completed successfully"
 else
-    echo "Tarpaulin failed (expected on macOS ARM). Running tests without coverage"
-    cargo test --workspace --verbose
+    echo "Tarpaulin failed. Check test output above."
+    exit 1
 fi
-
-echo "Rust tests completed successfully"
 ```
 
 #### all
