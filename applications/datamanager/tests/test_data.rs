@@ -458,4 +458,10 @@ fn test_create_equity_details_dataframe_malformed_csv() {
     let result = create_equity_details_dataframe(csv_content.to_string());
 
     assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Polars") || err_msg.contains("parse") || err_msg.contains("column"),
+        "Expected parse error but got: {}",
+        err_msg
+    );
 }

@@ -37,6 +37,36 @@ pub async fn write_predictions_dataframe_to_s3(
     write_dataframe_to_s3(state, dataframe, timestamp, "predictions".to_string()).await
 }
 
+pub fn is_valid_ticker(ticker: &str) -> bool {
+    !ticker.is_empty()
+        && ticker
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+pub fn format_s3_key(timestamp: &DateTime<Utc>, dataframe_type: &str) -> String {
+    let year = timestamp.format("%Y");
+    let month = timestamp.format("%m");
+    let day = timestamp.format("%d");
+
+    format!(
+        "equity/{}/daily/year={}/month={}/day={}/data.parquet",
+        dataframe_type, year, month, day,
+    )
+}
+
+pub fn date_to_int(timestamp: &DateTime<Utc>) -> i32 {
+    timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .unwrap_or(0)
+}
+
+pub fn escape_sql_ticker(ticker: &str) -> String {
+    ticker.replace('\'', "''")
+}
+
 async fn write_dataframe_to_s3(
     state: &State,
     dataframe: &DataFrame,
@@ -45,14 +75,7 @@ async fn write_dataframe_to_s3(
 ) -> Result<String, Error> {
     info!("Uploading DataFrame to S3 as parquet");
 
-    let year = timestamp.format("%Y");
-    let month = timestamp.format("%m");
-    let day = timestamp.format("%d");
-
-    let key = format!(
-        "equity/{}/daily/year={}/month={}/day={}/data.parquet",
-        dataframe_type, year, month, day,
-    );
+    let key = format_s3_key(timestamp, &dataframe_type);
 
     let mut buffer = Vec::new();
     {
@@ -179,16 +202,8 @@ pub async fn query_equity_bars_parquet_from_s3(
     info!("Using S3 glob pattern: {}", s3_glob);
 
     // Build date filter for hive partitions
-    let start_date_int = start_timestamp
-        .format("%Y%m%d")
-        .to_string()
-        .parse::<i32>()
-        .unwrap_or(0);
-    let end_date_int = end_timestamp
-        .format("%Y%m%d")
-        .to_string()
-        .parse::<i32>()
-        .unwrap_or(99999999);
+    let start_date_int = date_to_int(&start_timestamp);
+    let end_date_int = date_to_int(&end_timestamp);
 
     debug!(
         "Date range filter: {} to {} (as integers)",
@@ -200,10 +215,7 @@ pub async fn query_equity_bars_parquet_from_s3(
         Some(ticker_list) if !ticker_list.is_empty() => {
             debug!("Validating {} tickers for query filter", ticker_list.len());
             for ticker in ticker_list {
-                if !ticker
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-                {
+                if !is_valid_ticker(ticker) {
                     warn!("Invalid ticker format rejected: {}", ticker);
                     return Err(Error::Other(format!("Invalid ticker format: {}", ticker)));
                 }
@@ -211,7 +223,7 @@ pub async fn query_equity_bars_parquet_from_s3(
             debug!("Ticker validation passed: {:?}", ticker_list);
             let ticker_values = ticker_list
                 .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .map(|t| format!("'{}'", escape_sql_ticker(t)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("AND ticker IN ({})", ticker_values)

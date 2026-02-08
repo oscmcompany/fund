@@ -49,4 +49,12 @@ mod tests {
         let display = format!("{}", err);
         assert!(display.starts_with("Polars error:"));
     }
+
+    #[test]
+    fn test_credentials_error_conversion() {
+        let cred_err = CredentialsError::not_loaded("test credentials error");
+        let err: Error = cred_err.into();
+        let display = format!("{}", err);
+        assert!(display.starts_with("Credentials error:"));
+    }
 }

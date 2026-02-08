@@ -374,12 +374,13 @@ mkdir -p .coverage_output
 
 # In continuous integration (Linux), this generates coverage. Locally on macOS, use 'cargo test' instead.
 if cargo tarpaulin --workspace --verbose \
+    --engine llvm \
     --out Xml \
     --output-dir .coverage_output \
     --timeout 300 \
     --line \
     --ignore-panics \
-    --follow-exec 2>/dev/null; then
+    --follow-exec; then
     mv .coverage_output/cobertura.xml .coverage_output/rust.xml
 else
     echo "Tarpaulin failed (expected on macOS ARM). Running tests without coverage"

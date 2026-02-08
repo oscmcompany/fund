@@ -1,16 +1,15 @@
 // Integration tests for storage module
 // Note: Full S3/DuckDB tests require AWS credentials and are tested via handler integration tests
 
+use datamanager::storage::{date_to_int, escape_sql_ticker, format_s3_key, is_valid_ticker};
+
 #[test]
 fn test_ticker_validation_valid_tickers() {
     let valid_tickers = vec!["AAPL", "GOOGL", "BRK.A", "BRK.B", "TEST-A", "A", "ABCD1234"];
 
     for ticker in valid_tickers {
-        let is_valid = ticker
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
         assert!(
-            is_valid,
+            is_valid_ticker(ticker),
             "Ticker '{}' should be valid but validation failed",
             ticker
         );
@@ -53,11 +52,8 @@ fn test_ticker_validation_rejects_invalid_characters() {
     ];
 
     for ticker in invalid_tickers {
-        let is_valid = ticker
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
         assert!(
-            !is_valid,
+            !is_valid_ticker(ticker),
             "Ticker '{}' should be invalid but passed validation",
             ticker
         );
@@ -67,22 +63,16 @@ fn test_ticker_validation_rejects_invalid_characters() {
 #[test]
 fn test_ticker_validation_edge_cases() {
     let empty = "";
-    let is_valid = empty
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    assert!(is_valid); // Empty string passes .all() but would fail elsewhere
+    assert!(!is_valid_ticker(empty), "Empty string should be invalid");
 
     let dots = "...";
-    let is_valid = dots
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    assert!(is_valid);
+    assert!(is_valid_ticker(dots), "Dots-only ticker should be valid");
 
     let dashes = "---";
-    let is_valid = dashes
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    assert!(is_valid);
+    assert!(
+        is_valid_ticker(dashes),
+        "Dashes-only ticker should be valid"
+    );
 }
 
 #[test]
@@ -108,14 +98,7 @@ fn test_s3_key_format_generation() {
     ];
 
     for (timestamp, dataframe_type, expected_key) in test_cases {
-        let year = timestamp.format("%Y");
-        let month = timestamp.format("%m");
-        let day = timestamp.format("%d");
-
-        let key = format!(
-            "equity/{}/daily/year={}/month={}/day={}/data.parquet",
-            dataframe_type, year, month, day,
-        );
+        let key = format_s3_key(&timestamp, dataframe_type);
 
         assert_eq!(
             key, expected_key,
@@ -146,11 +129,7 @@ fn test_date_range_integer_conversion() {
     ];
 
     for (timestamp, expected_int) in test_cases {
-        let date_int = timestamp
-            .format("%Y%m%d")
-            .to_string()
-            .parse::<i32>()
-            .unwrap();
+        let date_int = date_to_int(&timestamp);
 
         assert_eq!(
             date_int, expected_int,
@@ -188,12 +167,12 @@ fn test_date_range_comparison_logic() {
 #[test]
 fn test_ticker_sql_escaping() {
     let ticker_with_quote = "TEST'TICKER";
-    let escaped = ticker_with_quote.replace('\'', "''");
+    let escaped = escape_sql_ticker(ticker_with_quote);
 
     assert_eq!(escaped, "TEST''TICKER");
 
     let multiple_quotes = "A'B'C";
-    let escaped_multiple = multiple_quotes.replace('\'', "''");
+    let escaped_multiple = escape_sql_ticker(multiple_quotes);
 
     assert_eq!(escaped_multiple, "A''B''C");
 }
