@@ -14,3 +14,39 @@ pub enum Error {
     #[error("Other error: {0}")]
     Other(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_other_error_display() {
+        let err = Error::Other("Test error message".to_string());
+        let display = format!("{}", err);
+        assert_eq!(display, "Other error: Test error message");
+    }
+
+    #[test]
+    fn test_other_error_debug() {
+        let err = Error::Other("Debug test".to_string());
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("Other"));
+        assert!(debug.contains("Debug test"));
+    }
+
+    #[test]
+    fn test_duckdb_error_conversion() {
+        let duck_err = DuckError::ExecuteReturnedResults;
+        let err: Error = duck_err.into();
+        let display = format!("{}", err);
+        assert!(display.starts_with("DuckDB error:"));
+    }
+
+    #[test]
+    fn test_polars_error_conversion() {
+        let polars_err = PolarsError::NoData("test data".into());
+        let err: Error = polars_err.into();
+        let display = format!("{}", err);
+        assert!(display.starts_with("Polars error:"));
+    }
+}

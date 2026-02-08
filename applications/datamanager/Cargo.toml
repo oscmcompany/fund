@@ -3,6 +3,10 @@ name = "datamanager"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "datamanager"
+path = "src/lib.rs"
+
 [[bin]]
 name = "datamanager"
 path = "src/main.rs"
@@ -43,3 +47,6 @@ tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1.0", features = ["full"] }
 http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
+mockito = "1.6"
+tempfile = "3.15"
+serial_test = "3.2"

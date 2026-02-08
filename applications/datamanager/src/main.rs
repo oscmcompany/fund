@@ -1,15 +1,4 @@
-mod data;
-mod equity_bars;
-mod equity_details;
-mod errors;
-mod health;
-mod portfolios;
-mod predictions;
-mod router;
-mod state;
-mod storage;
-
-use router::create_app;
+use datamanager::router::create_app;
 use std::env;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

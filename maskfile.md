@@ -363,14 +363,28 @@ echo "Rust linting completed successfully"
 
 #### test
 
-> Run Rust tests
+> Run Rust tests with coverage reporting
 
 ```bash
 set -euo pipefail
 
-echo "Running Rust tests"
+echo "Running Rust tests with coverage"
 
-cargo test --workspace --verbose
+mkdir -p coverage
+
+# In continuous integration (Linux), this generates coverage. Locally on macOS, use 'cargo test' instead.
+if cargo tarpaulin --workspace --verbose \
+    --out Xml \
+    --output-dir coverage \
+    --timeout 300 \
+    --line \
+    --ignore-panics \
+    --follow-exec 2>/dev/null; then
+    mv coverage/cobertura.xml coverage/.rust.xml
+else
+    echo "Tarpaulin failed (expected on macOS ARM). Running tests without coverage"
+    cargo test --workspace --verbose
+fi
 
 echo "Rust tests completed successfully"
 ```
@@ -481,7 +495,9 @@ uvx ty check
 ```bash
 set -euo pipefail
 
-echo "Running Python tests"
+echo "Running Python tests with coverage"
+
+mkdir -p coverage
 
 uv run coverage run --parallel-mode -m pytest && uv run coverage combine && uv run coverage report && uv run coverage xml -o coverage/.python.xml
 
