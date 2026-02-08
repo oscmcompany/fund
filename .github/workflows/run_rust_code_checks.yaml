@@ -35,7 +35,6 @@ jobs:
         with:
           command: mask development rust all
       - name: Upload Rust coverage to Coveralls
-        if: hashFiles('.coverage_output/rust.xml') != ''
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
