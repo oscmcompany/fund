@@ -55,7 +55,7 @@ show_missing = true
 skip_covered = true
 
 [tool.coverage.xml]
-output = "coverage/.python.xml"
+output = ".coverage_output/python.xml"
 
 [tool.ruff.lint]
 select = [

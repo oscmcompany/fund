@@ -39,4 +39,6 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          file: coverage/.python.xml
+          file: .coverage_output/python.xml
+          flag-name: python
+          parallel: false

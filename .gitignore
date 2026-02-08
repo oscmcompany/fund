@@ -9,7 +9,7 @@
 __pycache__/
 .envrc
 .env.nu
-coverage/
+.coverage_output/
 .coverage
 *.csv
 *.egg-info/

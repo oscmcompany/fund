@@ -370,17 +370,17 @@ set -euo pipefail
 
 echo "Running Rust tests with coverage"
 
-mkdir -p coverage
+mkdir -p .coverage_output
 
 # In continuous integration (Linux), this generates coverage. Locally on macOS, use 'cargo test' instead.
 if cargo tarpaulin --workspace --verbose \
     --out Xml \
-    --output-dir coverage \
+    --output-dir .coverage_output \
     --timeout 300 \
     --line \
     --ignore-panics \
     --follow-exec 2>/dev/null; then
-    mv coverage/cobertura.xml coverage/.rust.xml
+    mv .coverage_output/cobertura.xml .coverage_output/rust.xml
 else
     echo "Tarpaulin failed (expected on macOS ARM). Running tests without coverage"
     cargo test --workspace --verbose
@@ -497,9 +497,12 @@ set -euo pipefail
 
 echo "Running Python tests with coverage"
 
-mkdir -p coverage
+mkdir -p .coverage_output
 
-uv run coverage run --parallel-mode -m pytest && uv run coverage combine && uv run coverage report && uv run coverage xml -o coverage/.python.xml
+uv run coverage run --parallel-mode -m pytest \
+    && uv run coverage combine \
+    && uv run coverage report \
+    && uv run coverage xml -o .coverage_output/python.xml
 
 echo "Python tests completed successfully"
 ```
