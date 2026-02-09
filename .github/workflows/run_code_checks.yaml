@@ -1,0 +1,106 @@
+---
+name: Code checks
+run-name: Code checks
+on:
+  pull_request:
+jobs:
+  detect_changes:
+    runs-on: ubuntu-latest
+    name: Detect code changes
+    permissions:
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+            python:
+              - '**/*.py'
+              - '**/*.pyi'
+              - '**/pyproject.toml'
+              - '**/uv.lock'
+            markdown:
+              - '**/*.md'
+              - '**/*.markdown'
+  run_rust_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.rust == 'true' }}
+    name: Run Rust code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run Rust code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development rust all
+      - name: Upload test coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}_test_coverage
+          path: .coverage_output/rust.xml
+          if-no-files-found: error
+          overwrite: true
+  run_python_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.python == 'true' }}
+    name: Run Python code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run Python code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development python all
+      - name: Upload test coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}_test_coverage
+          path: .coverage_output/python.xml
+          if-no-files-found: error
+          overwrite: true
+  run_markdown_code_checks:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.markdown == 'true' }}
+    name: Run Markdown code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run Markdown code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development markdown all
+  upload_test_coverage:
+    needs:
+      - run_rust_code_checks
+      - run_python_code_checks
+    name: Upload coverage to Coveralls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*_test_coverage'
+          path: .coverage_output/
+          merge-multiple: true
+          run-id: ${{ github.run_id }}
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          files:
+            - .coverage_output/python.xml
+            - .coverage_output/rust.xml

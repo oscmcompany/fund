@@ -1,6 +1,7 @@
 use datamanager::data::{EquityBar, Portfolio, Prediction};
 
 /// Create a sample EquityBar for testing
+#[allow(dead_code)]
 pub fn sample_equity_bar() -> EquityBar {
     EquityBar {
         ticker: "AAPL".to_string(),
@@ -16,6 +17,7 @@ pub fn sample_equity_bar() -> EquityBar {
 }
 
 /// Create a sample EquityBar with lowercase ticker for testing normalization
+#[allow(dead_code)]
 pub fn sample_equity_bar_lowercase() -> EquityBar {
     EquityBar {
         ticker: "googl".to_string(),
@@ -31,6 +33,7 @@ pub fn sample_equity_bar_lowercase() -> EquityBar {
 }
 
 /// Create a sample Prediction for testing
+#[allow(dead_code)]
 pub fn sample_prediction() -> Prediction {
     Prediction {
         ticker: "AAPL".to_string(),
@@ -42,6 +45,7 @@ pub fn sample_prediction() -> Prediction {
 }
 
 /// Create a sample Prediction with a different timestamp
+#[allow(dead_code)]
 pub fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
     Prediction {
         ticker: "AAPL".to_string(),
@@ -53,6 +57,7 @@ pub fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
 }
 
 /// Create a sample Portfolio position for testing
+#[allow(dead_code)]
 pub fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
@@ -64,6 +69,7 @@ pub fn sample_portfolio() -> Portfolio {
 }
 
 /// Create a sample Portfolio with lowercase fields for testing normalization
+#[allow(dead_code)]
 pub fn sample_portfolio_lowercase() -> Portfolio {
     Portfolio {
         ticker: "aapl".to_string(),
