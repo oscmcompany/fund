@@ -3,8 +3,10 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
+  # TEMPORARY
   push:
     branches:
+      - master
       - rust-unit-tests-and-coverage-updates
 jobs:
   run_rust_code_checks:
@@ -19,6 +21,8 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development rust all
+      - name: Ensure coverage file permissions
+        run: chmod 644 .coverage_output/rust.xml
       - name: Upload test coverage results
         uses: actions/upload-artifact@v4
         with:
@@ -61,10 +65,12 @@ jobs:
     needs:
       - run_rust_code_checks
       - run_python_code_checks
+    if: ${{ always() && (needs.run_rust_code_checks.result == 'success' || needs.run_python_code_checks.result == 'success') }}
     name: Upload coverage to Coveralls
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download test coverage results
+        uses: actions/download-artifact@v4
         with:
           pattern: '*_test_coverage'
           path: .coverage_output/

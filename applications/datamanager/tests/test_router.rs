@@ -1,6 +1,7 @@
 use axum::{
     body::Body,
     http::{Method, Request, StatusCode},
+    routing::get,
     Router,
 };
 use tower::ServiceExt;
@@ -16,14 +17,20 @@ fn test_route_paths_follow_conventions() {
     ];
 
     for route in routes {
-        assert!(route.starts_with('/'), "Route should start with /: {}", route);
+        assert!(
+            route.starts_with('/'),
+            "Route should start with /: {}",
+            route
+        );
         assert!(
             !route.ends_with('/') || route == "/",
             "Route should not end with /: {}",
             route
         );
         assert!(
-            route.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-'),
+            route
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-'),
             "Route should only contain alphanumeric, /, or - characters: {}",
             route
         );
@@ -215,13 +222,12 @@ fn test_route_uniqueness() {
         "/equity-details",
     ];
 
-    let unique_count = routes.iter().collect::<std::collections::HashSet<_>>().len();
+    let unique_count = routes
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
 
-    assert_eq!(
-        unique_count,
-        routes.len(),
-        "All routes should be unique"
-    );
+    assert_eq!(unique_count, routes.len(), "All routes should be unique");
 }
 
 #[test]
@@ -275,10 +281,7 @@ async fn test_router_with_single_route() {
 
     let router = Router::new().route("/test", axum::routing::get(handler));
 
-    let request = Request::builder()
-        .uri("/test")
-        .body(Body::empty())
-        .unwrap();
+    let request = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
     let response = router.oneshot(request).await.unwrap();
 
@@ -401,9 +404,7 @@ async fn test_router_same_path_different_methods() {
         "POST"
     }
 
-    let router = Router::new()
-        .route("/resource", axum::routing::get(get_handler))
-        .route("/resource", axum::routing::post(post_handler));
+    let router = Router::new().route("/resource", get(get_handler).post(post_handler));
 
     let get_request = Request::builder()
         .method(Method::GET)
@@ -623,5 +624,154 @@ async fn test_router_preserves_route_order() {
     assert_eq!(
         router.oneshot(request3).await.unwrap().status(),
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn test_production_app_health_route() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let request = Request::builder()
+        .uri("/health")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_production_app_predictions_routes() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let get_request = Request::builder()
+        .uri("/predictions")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let get_response = app.clone().oneshot(get_request).await.unwrap();
+    assert!(
+        get_response.status() != StatusCode::NOT_FOUND,
+        "GET /predictions route should exist"
+    );
+
+    let post_request = Request::builder()
+        .uri("/predictions")
+        .method(Method::POST)
+        .body(Body::empty())
+        .unwrap();
+
+    let post_response = app.oneshot(post_request).await.unwrap();
+    assert!(
+        post_response.status() != StatusCode::NOT_FOUND,
+        "POST /predictions route should exist"
+    );
+}
+
+#[tokio::test]
+async fn test_production_app_portfolios_routes() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let get_request = Request::builder()
+        .uri("/portfolios")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let get_response = app.clone().oneshot(get_request).await.unwrap();
+    assert!(
+        get_response.status() != StatusCode::NOT_FOUND,
+        "GET /portfolios route should exist"
+    );
+
+    let post_request = Request::builder()
+        .uri("/portfolios")
+        .method(Method::POST)
+        .body(Body::empty())
+        .unwrap();
+
+    let post_response = app.oneshot(post_request).await.unwrap();
+    assert!(
+        post_response.status() != StatusCode::NOT_FOUND,
+        "POST /portfolios route should exist"
+    );
+}
+
+#[tokio::test]
+async fn test_production_app_equity_bars_routes() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let get_request = Request::builder()
+        .uri("/equity-bars")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let get_response = app.clone().oneshot(get_request).await.unwrap();
+    assert!(
+        get_response.status() != StatusCode::NOT_FOUND,
+        "GET /equity-bars route should exist"
+    );
+
+    let post_request = Request::builder()
+        .uri("/equity-bars")
+        .method(Method::POST)
+        .body(Body::empty())
+        .unwrap();
+
+    let post_response = app.oneshot(post_request).await.unwrap();
+    assert!(
+        post_response.status() != StatusCode::NOT_FOUND,
+        "POST /equity-bars route should exist"
+    );
+}
+
+#[tokio::test]
+async fn test_production_app_equity_details_route() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let request = Request::builder()
+        .uri("/equity-details")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert!(
+        response.status() != StatusCode::NOT_FOUND,
+        "GET /equity-details route should exist"
+    );
+}
+
+#[tokio::test]
+async fn test_production_app_nonexistent_route() {
+    use datamanager::router::create_app;
+
+    let app = create_app().await;
+
+    let request = Request::builder()
+        .uri("/nonexistent-route")
+        .method(Method::GET)
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "Nonexistent routes should return 404"
     );
 }

@@ -18,6 +18,9 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_credential_types::provider::error::CredentialsError;
+    use duckdb::Error as DuckError;
+    use polars::prelude::PolarsError;
 
     #[test]
     fn test_other_error_display() {

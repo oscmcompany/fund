@@ -208,11 +208,7 @@ fn test_bar_result_deserialization_missing_required_fields() {
 
     for json in invalid_cases {
         let result: Result<serde_json::Value, _> = serde_json::from_str(json);
-        assert!(
-            result.is_ok(),
-            "JSON parsing should succeed for: {}",
-            json
-        );
+        assert!(result.is_ok(), "JSON parsing should succeed for: {}", json);
     }
 }
 
@@ -301,8 +297,28 @@ fn test_massive_response_deserialization_null_results() {
 #[test]
 fn test_dataframe_column_construction_from_bar_results() {
     let bars = vec![
-        ("AAPL", Some(100.0), Some(105.0), Some(99.0), Some(103.0), Some(1000000.0), Some(102.0), 1234567890_u64, Some(5000_u64)),
-        ("GOOGL", Some(2000.0), Some(2050.0), Some(1990.0), Some(2030.0), Some(500000.0), Some(2020.0), 1234567890_u64, Some(2500_u64)),
+        (
+            "AAPL",
+            Some(100.0),
+            Some(105.0),
+            Some(99.0),
+            Some(103.0),
+            Some(1000000.0),
+            Some(102.0),
+            1234567890_u64,
+            Some(5000_u64),
+        ),
+        (
+            "GOOGL",
+            Some(2000.0),
+            Some(2050.0),
+            Some(1990.0),
+            Some(2030.0),
+            Some(500000.0),
+            Some(2020.0),
+            1234567890_u64,
+            Some(2500_u64),
+        ),
     ];
 
     let tickers: Vec<String> = bars.iter().map(|(t, ..)| t.to_string()).collect();
@@ -312,8 +328,12 @@ fn test_dataframe_column_construction_from_bar_results() {
     let close_prices: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, c, ..)| *c).collect();
     let volumes: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, _, v, ..)| *v).collect();
     let vwaps: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, _, _, vw, ..)| *vw).collect();
-    let timestamps: Vec<i64> = bars.iter().map(|(_, _, _, _, _, _, _, t, _)| *t as i64).collect();
-    let transactions: Vec<Option<u64>> = bars.iter().map(|(_, _, _, _, _, _, _, _, n)| *n).collect();
+    let timestamps: Vec<i64> = bars
+        .iter()
+        .map(|(_, _, _, _, _, _, _, t, _)| *t as i64)
+        .collect();
+    let transactions: Vec<Option<u64>> =
+        bars.iter().map(|(_, _, _, _, _, _, _, _, n)| *n).collect();
 
     assert_eq!(tickers.len(), 2);
     assert_eq!(tickers[0], "AAPL");
@@ -354,9 +374,17 @@ fn test_dataframe_column_construction_from_bar_results() {
 
 #[test]
 fn test_dataframe_column_construction_with_nulls() {
-    let bars = vec![
-        ("TEST", None, None, None, None, None, None, 1234567890_u64, None),
-    ];
+    let bars = vec![(
+        "TEST",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1234567890_u64,
+        None,
+    )];
 
     let tickers: Vec<String> = bars.iter().map(|(t, ..)| t.to_string()).collect();
     let open_prices: Vec<Option<f64>> = bars.iter().map(|(_, o, ..)| *o).collect();
@@ -365,8 +393,12 @@ fn test_dataframe_column_construction_with_nulls() {
     let close_prices: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, c, ..)| *c).collect();
     let volumes: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, _, v, ..)| *v).collect();
     let vwaps: Vec<Option<f64>> = bars.iter().map(|(_, _, _, _, _, _, vw, ..)| *vw).collect();
-    let timestamps: Vec<i64> = bars.iter().map(|(_, _, _, _, _, _, _, t, _)| *t as i64).collect();
-    let transactions: Vec<Option<u64>> = bars.iter().map(|(_, _, _, _, _, _, _, _, n)| *n).collect();
+    let timestamps: Vec<i64> = bars
+        .iter()
+        .map(|(_, _, _, _, _, _, _, t, _)| *t as i64)
+        .collect();
+    let transactions: Vec<Option<u64>> =
+        bars.iter().map(|(_, _, _, _, _, _, _, _, n)| *n).collect();
 
     assert_eq!(tickers.len(), 1);
     assert_eq!(tickers[0], "TEST");

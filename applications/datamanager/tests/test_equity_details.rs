@@ -154,9 +154,7 @@ fn test_dataframe_to_csv_large_dataset() {
     let sectors: Vec<String> = (0..ticker_count)
         .map(|_| "TECHNOLOGY".to_string())
         .collect();
-    let industries: Vec<String> = (0..ticker_count)
-        .map(|_| "SOFTWARE".to_string())
-        .collect();
+    let industries: Vec<String> = (0..ticker_count).map(|_| "SOFTWARE".to_string()).collect();
 
     let ticker_refs: Vec<&str> = tickers.iter().map(|s| s.as_str()).collect();
     let sector_refs: Vec<&str> = sectors.iter().map(|s| s.as_str()).collect();
@@ -485,13 +483,7 @@ fn test_dataframe_clone_preserves_data() {
     assert_eq!(df.height(), cloned_df.height());
     assert_eq!(df.width(), cloned_df.width());
 
-    let original_ticker = df
-        .column("ticker")
-        .unwrap()
-        .str()
-        .unwrap()
-        .get(0)
-        .unwrap();
+    let original_ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
 
     let cloned_ticker = cloned_df
         .column("ticker")

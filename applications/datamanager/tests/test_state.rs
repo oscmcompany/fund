@@ -95,7 +95,9 @@ fn test_default_bucket_name() {
 
     assert_eq!(default_bucket, "oscm-data");
     assert!(!default_bucket.is_empty());
-    assert!(default_bucket.chars().all(|c| c.is_ascii_lowercase() || c == '-'));
+    assert!(default_bucket
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c == '-'));
 }
 
 #[test]
@@ -129,7 +131,8 @@ fn test_environment_variable_names() {
             "Environment variable name should not be empty"
         );
         assert!(
-            var.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+            var.chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
             "Environment variable should be uppercase with underscores and digits: {}",
             var
         );
@@ -231,7 +234,10 @@ fn test_bucket_name_validation() {
 fn test_bucket_name_length() {
     let bucket_name = "oscm-data";
 
-    assert!(bucket_name.len() >= 3, "Bucket name should be at least 3 chars");
+    assert!(
+        bucket_name.len() >= 3,
+        "Bucket name should be at least 3 chars"
+    );
     assert!(
         bucket_name.len() <= 63,
         "Bucket name should be at most 63 chars"
@@ -371,7 +377,10 @@ fn test_configuration_defaults_are_sensible() {
     let default_url = "https://api.massive.io";
     let default_key = "";
 
-    assert!(!default_bucket.is_empty(), "Default bucket should not be empty");
+    assert!(
+        !default_bucket.is_empty(),
+        "Default bucket should not be empty"
+    );
     assert!(!default_url.is_empty(), "Default URL should not be empty");
     assert!(
         default_url.starts_with("https://"),
@@ -388,7 +397,6 @@ fn test_http_client_builder_pattern() {
 
     assert!(client.is_ok());
 }
-
 
 #[test]
 fn test_bucket_name_no_uppercase() {
@@ -505,7 +513,10 @@ fn test_configuration_value_types() {
     let url: String = "https://api.massive.io".to_string();
     let key: String = String::new();
 
-    assert_eq!(std::mem::size_of_val(&bucket), std::mem::size_of::<String>());
+    assert_eq!(
+        std::mem::size_of_val(&bucket),
+        std::mem::size_of::<String>()
+    );
     assert_eq!(std::mem::size_of_val(&url), std::mem::size_of::<String>());
     assert_eq!(std::mem::size_of_val(&key), std::mem::size_of::<String>());
 }

@@ -3,7 +3,7 @@
 > The open source capital management company  
 
 <!-- markdownlint-disable-next-line MD013 -->
-[![Python code checks](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_python_code_checks.yaml) [![Rust code checks](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_rust_code_checks.yaml) [![Test coverage](https://coveralls.io/repos/github/oscmcompany/fund/badge.svg?branch=master)](https://coveralls.io/github/oscmcompany/fund?branch=master)
+[![Code checks](https://github.com/oscmcompany/fund/actions/workflows/run_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_code_checks.yaml) [![Test coverage](https://coveralls.io/repos/github/oscmcompany/fund/badge.svg?branch=master)](https://coveralls.io/github/oscmcompany/fund?branch=master)
 
 ## About
 
