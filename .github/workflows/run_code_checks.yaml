@@ -3,6 +3,9 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
+  push:
+    branches:
+      - rust-unit-tests-and-coverage-updates
 jobs:
   detect_changes:
     runs-on: ubuntu-latest
