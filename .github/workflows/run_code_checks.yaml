@@ -74,6 +74,6 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          files:
-            - .coverage_output/python.xml
-            - .coverage_output/rust.xml
+          files: |
+            .coverage_output/python.xml
+            .coverage_output/rust.xml
