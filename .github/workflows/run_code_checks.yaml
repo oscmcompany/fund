@@ -11,6 +11,8 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      markdown: ${{ steps.filter.outputs.markdown }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
