@@ -7,37 +7,7 @@ on:
     branches:
       - rust-unit-tests-and-coverage-updates
 jobs:
-  detect_changes:
-    runs-on: ubuntu-latest
-    name: Detect code changes
-    permissions:
-      pull-requests: read
-    outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      python: ${{ steps.filter.outputs.python }}
-      markdown: ${{ steps.filter.outputs.markdown }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - '**/Cargo.lock'
-            python:
-              - '**/*.py'
-              - '**/*.pyi'
-              - '**/pyproject.toml'
-              - '**/uv.lock'
-            markdown:
-              - '**/*.md'
-              - '**/*.markdown'
   run_rust_code_checks:
-    needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.rust == 'true' }}
     name: Run Rust code checks
     runs-on: ubuntu-latest
     steps:
@@ -57,8 +27,6 @@ jobs:
           if-no-files-found: error
           overwrite: true
   run_python_code_checks:
-    needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.python == 'true' }}
     name: Run Python code checks
     runs-on: ubuntu-latest
     steps:
@@ -78,8 +46,6 @@ jobs:
           if-no-files-found: error
           overwrite: true
   run_markdown_code_checks:
-    needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.markdown == 'true' }}
     name: Run Markdown code checks
     runs-on: ubuntu-latest
     steps:
