@@ -33,11 +33,7 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
         "volume" => equity_bars_rows.iter().map(|b| b.volume).collect::<Vec<_>>(),
         "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
         "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
-    )
-    .map_err(|e| {
-        warn!("Failed to create equity bar DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    )?;
 
     debug!("Normalizing ticker column to uppercase");
     let equity_bars_dataframe = equity_bars_dataframe
@@ -75,11 +71,7 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
         "quantile_10" => prediction_rows.iter().map(|p| p.quantile_10).collect::<Vec<_>>(),
         "quantile_50" => prediction_rows.iter().map(|p| p.quantile_50).collect::<Vec<_>>(),
         "quantile_90" => prediction_rows.iter().map(|p| p.quantile_90).collect::<Vec<_>>(),
-    )
-    .map_err(|e| {
-        warn!("Failed to create predictions DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    )?;
 
     debug!("Normalizing ticker column to uppercase");
     let unfiltered_prediction_dataframe = prediction_dataframe
@@ -141,11 +133,7 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
         "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
         "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
         "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
-    )
-    .map_err(|e| {
-        warn!("Failed to create portfolio DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    )?;
 
     debug!("Normalizing ticker, side, and action columns to uppercase");
     let portfolio_dataframe = portfolio_dataframe
@@ -201,10 +189,7 @@ pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame,
     }
 
     debug!("All required columns present, selecting subset");
-    dataframe = dataframe.select(required_columns).map_err(|e| {
-        warn!("Failed to select columns: {}", e);
-        Error::Other(format!("Failed to select columns: {}", e))
-    })?;
+    dataframe = dataframe.select(required_columns)?;
 
     debug!("Normalizing ticker, sector, and industry columns to uppercase and filling nulls");
     let equity_details_dataframe = dataframe
@@ -222,11 +207,7 @@ pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame,
                 .fill_null(lit("NOT AVAILABLE"))
                 .alias("industry"),
         ])
-        .collect()
-        .map_err(|e| {
-            warn!("Failed to transform columns: {}", e);
-            Error::Other(format!("Failed to transform columns: {}", e))
-        })?;
+        .collect()?;
 
     info!(
         "Created equity details DataFrame: {} rows x {} columns",

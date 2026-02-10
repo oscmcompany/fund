@@ -1,47 +1,50 @@
-use datamanager::router::create_app;
-use std::env;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use datamanager::startup::{initialize_sentry, initialize_tracing, run_server};
+
+async fn run_with_bind_address(bind_address: &str) -> i32 {
+    let _sentry_guard = initialize_sentry();
+    initialize_tracing();
+
+    handle_server_result(run_server(bind_address).await)
+}
+
+fn handle_server_result(server_result: Result<(), std::io::Error>) -> i32 {
+    match server_result {
+        Ok(_) => 0,
+        Err(error) => {
+            tracing::error!("Server error: {}", error);
+            1
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    let _sentry_guard = sentry::init((
-        env::var("SENTRY_DSN").unwrap_or_default(),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            environment: Some(
-                env::var("ENVIRONMENT")
-                    .unwrap_or_else(|_| "development".to_string())
-                    .into(),
-            ),
-            traces_sample_rate: 1.0,
-            ..Default::default()
-        },
-    ));
+    let exit_code = run_with_bind_address("0.0.0.0:8080").await;
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "datamanager=debug,tower_http=debug,axum=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            sentry::integrations::tracing::layer().event_filter(|metadata| {
-                use sentry::integrations::tracing::EventFilter;
-                match metadata.level() {
-                    &tracing::Level::ERROR | &tracing::Level::WARN => EventFilter::Event,
-                    _ => EventFilter::Breadcrumb,
-                }
-            }),
-        )
-        .init();
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
 
-    tracing::info!("Starting datamanager service");
+#[cfg(test)]
+mod tests {
+    use super::{handle_server_result, run_with_bind_address};
 
-    let app = create_app().await;
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    #[test]
+    fn test_handle_server_result_success() {
+        assert_eq!(handle_server_result(Ok(())), 0);
+    }
 
-    if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("Server error: {}", e);
-        std::process::exit(1);
+    #[test]
+    fn test_handle_server_result_error() {
+        let error = std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "bind failed");
+        assert_eq!(handle_server_result(Err(error)), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_with_bind_address_returns_error_code_for_invalid_bind_address() {
+        let exit_code = run_with_bind_address("invalid-address").await;
+
+        assert_eq!(exit_code, 1);
     }
 }

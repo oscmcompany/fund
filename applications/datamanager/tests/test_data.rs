@@ -3,6 +3,18 @@ use datamanager::data::{
     create_predictions_dataframe, EquityBar, Portfolio, Prediction,
 };
 use polars::prelude::*;
+use std::sync::Once;
+
+static TEST_TRACING_INIT: Once = Once::new();
+
+fn initialize_test_tracing() {
+    TEST_TRACING_INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 #[allow(dead_code)]
 fn sample_equity_bar() -> EquityBar {
@@ -80,6 +92,7 @@ fn sample_portfolio_lowercase() -> Portfolio {
 
 #[test]
 fn test_create_equity_bar_dataframe_valid_data() {
+    initialize_test_tracing();
     let bars = vec![sample_equity_bar()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
@@ -99,6 +112,7 @@ fn test_create_equity_bar_dataframe_valid_data() {
 
 #[test]
 fn test_create_equity_bar_dataframe_uppercase_normalization() {
+    initialize_test_tracing();
     let bars = vec![sample_equity_bar_lowercase()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
@@ -110,6 +124,7 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
 
 #[test]
 fn test_create_equity_bar_dataframe_mixed_case_tickers() {
+    initialize_test_tracing();
     let bars = vec![sample_equity_bar(), sample_equity_bar_lowercase()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
@@ -130,6 +145,7 @@ fn test_create_equity_bar_dataframe_mixed_case_tickers() {
 
 #[test]
 fn test_create_equity_bar_dataframe_empty_vec() {
+    initialize_test_tracing();
     let bars: Vec<EquityBar> = vec![];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
@@ -140,6 +156,7 @@ fn test_create_equity_bar_dataframe_empty_vec() {
 
 #[test]
 fn test_create_equity_bar_dataframe_with_none_prices() {
+    initialize_test_tracing();
     let bars = vec![EquityBar {
         ticker: "TEST".to_string(),
         timestamp: 1234567890,
@@ -162,6 +179,7 @@ fn test_create_equity_bar_dataframe_with_none_prices() {
 
 #[test]
 fn test_create_equity_bar_dataframe_multiple_rows() {
+    initialize_test_tracing();
     let bars = vec![
         sample_equity_bar(),
         sample_equity_bar(),
@@ -176,6 +194,7 @@ fn test_create_equity_bar_dataframe_multiple_rows() {
 
 #[test]
 fn test_create_predictions_dataframe_valid_data() {
+    initialize_test_tracing();
     let predictions = vec![sample_prediction()];
 
     let df = create_predictions_dataframe(predictions).unwrap();
@@ -191,6 +210,7 @@ fn test_create_predictions_dataframe_valid_data() {
 
 #[test]
 fn test_create_predictions_dataframe_uppercase_normalization() {
+    initialize_test_tracing();
     let predictions = vec![Prediction {
         ticker: "aapl".to_string(),
         timestamp: 1234567890,
@@ -208,6 +228,7 @@ fn test_create_predictions_dataframe_uppercase_normalization() {
 
 #[test]
 fn test_create_predictions_dataframe_deduplication() {
+    initialize_test_tracing();
     let predictions = vec![
         sample_prediction_with_timestamp(1000),
         sample_prediction_with_timestamp(2000),
@@ -224,6 +245,7 @@ fn test_create_predictions_dataframe_deduplication() {
 
 #[test]
 fn test_create_predictions_dataframe_keeps_most_recent_per_ticker() {
+    initialize_test_tracing();
     let predictions = vec![
         Prediction {
             ticker: "AAPL".to_string(),
@@ -266,6 +288,7 @@ fn test_create_predictions_dataframe_keeps_most_recent_per_ticker() {
 
 #[test]
 fn test_create_predictions_dataframe_empty_vec() {
+    initialize_test_tracing();
     let predictions: Vec<Prediction> = vec![];
 
     let df = create_predictions_dataframe(predictions).unwrap();
@@ -276,6 +299,7 @@ fn test_create_predictions_dataframe_empty_vec() {
 
 #[test]
 fn test_create_predictions_dataframe_multiple_different_tickers() {
+    initialize_test_tracing();
     let predictions = vec![
         Prediction {
             ticker: "AAPL".to_string(),
@@ -307,6 +331,7 @@ fn test_create_predictions_dataframe_multiple_different_tickers() {
 
 #[test]
 fn test_create_portfolio_dataframe_valid_data() {
+    initialize_test_tracing();
     let portfolios = vec![sample_portfolio()];
 
     let df = create_portfolio_dataframe(portfolios).unwrap();
@@ -322,6 +347,7 @@ fn test_create_portfolio_dataframe_valid_data() {
 
 #[test]
 fn test_create_portfolio_dataframe_uppercase_normalization() {
+    initialize_test_tracing();
     let portfolios = vec![sample_portfolio_lowercase()];
 
     let df = create_portfolio_dataframe(portfolios).unwrap();
@@ -338,6 +364,7 @@ fn test_create_portfolio_dataframe_uppercase_normalization() {
 
 #[test]
 fn test_create_portfolio_dataframe_mixed_case() {
+    initialize_test_tracing();
     let portfolios = vec![
         Portfolio {
             ticker: "aapl".to_string(),
@@ -392,6 +419,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
 
 #[test]
 fn test_create_portfolio_dataframe_empty_vec() {
+    initialize_test_tracing();
     let portfolios: Vec<Portfolio> = vec![];
 
     let df = create_portfolio_dataframe(portfolios).unwrap();
@@ -404,6 +432,7 @@ fn test_create_portfolio_dataframe_empty_vec() {
 
 #[test]
 fn test_create_equity_details_dataframe_valid_csv() {
+    initialize_test_tracing();
     let csv_content = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\nGOOGL,Technology,Internet Services\n";
 
     let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
@@ -417,6 +446,7 @@ fn test_create_equity_details_dataframe_valid_csv() {
 
 #[test]
 fn test_create_equity_details_dataframe_uppercase_normalization() {
+    initialize_test_tracing();
     let csv_content = "ticker,sector,industry\naapl,technology,consumer electronics\n";
 
     let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
@@ -439,6 +469,7 @@ fn test_create_equity_details_dataframe_uppercase_normalization() {
 
 #[test]
 fn test_create_equity_details_dataframe_with_nulls() {
+    initialize_test_tracing();
     let csv_content = "ticker,sector,industry\nAAPL,,\n";
 
     let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
@@ -460,6 +491,7 @@ fn test_create_equity_details_dataframe_with_nulls() {
 
 #[test]
 fn test_create_equity_details_dataframe_extra_columns() {
+    initialize_test_tracing();
     let csv_content =
         "ticker,sector,industry,extra_column\nAAPL,Technology,Consumer Electronics,Extra\n";
 
@@ -472,6 +504,7 @@ fn test_create_equity_details_dataframe_extra_columns() {
 
 #[test]
 fn test_create_equity_details_dataframe_missing_ticker_column() {
+    initialize_test_tracing();
     let csv_content = "sector,industry\nTechnology,Consumer Electronics\n";
 
     let result = create_equity_details_dataframe(csv_content.to_string());
@@ -485,6 +518,7 @@ fn test_create_equity_details_dataframe_missing_ticker_column() {
 
 #[test]
 fn test_create_equity_details_dataframe_missing_sector_column() {
+    initialize_test_tracing();
     let csv_content = "ticker,industry\nAAPL,Consumer Electronics\n";
 
     let result = create_equity_details_dataframe(csv_content.to_string());
@@ -498,6 +532,7 @@ fn test_create_equity_details_dataframe_missing_sector_column() {
 
 #[test]
 fn test_create_equity_details_dataframe_missing_industry_column() {
+    initialize_test_tracing();
     let csv_content = "ticker,sector\nAAPL,Technology\n";
 
     let result = create_equity_details_dataframe(csv_content.to_string());
@@ -511,6 +546,7 @@ fn test_create_equity_details_dataframe_missing_industry_column() {
 
 #[test]
 fn test_create_equity_details_dataframe_empty_csv() {
+    initialize_test_tracing();
     let csv_content = "ticker,sector,industry\n";
 
     let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
@@ -521,6 +557,7 @@ fn test_create_equity_details_dataframe_empty_csv() {
 
 #[test]
 fn test_create_equity_details_dataframe_malformed_csv() {
+    initialize_test_tracing();
     let csv_content =
         "ticker,sector,industry\nAAPL,Technology\nGOOGL,Technology,Internet Services,Extra\n";
 
@@ -537,6 +574,7 @@ fn test_create_equity_details_dataframe_malformed_csv() {
 
 #[test]
 fn test_equity_bar_dataframe_parquet_roundtrip() {
+    initialize_test_tracing();
     use std::io::Cursor;
 
     let original_bars = vec![sample_equity_bar()];
@@ -571,6 +609,7 @@ fn test_equity_bar_dataframe_parquet_roundtrip() {
 
 #[test]
 fn test_predictions_dataframe_parquet_roundtrip() {
+    initialize_test_tracing();
     use std::io::Cursor;
 
     let original_predictions = vec![sample_prediction()];
@@ -599,6 +638,7 @@ fn test_predictions_dataframe_parquet_roundtrip() {
 
 #[test]
 fn test_portfolio_dataframe_parquet_roundtrip() {
+    initialize_test_tracing();
     use std::io::Cursor;
 
     let original_portfolios = vec![sample_portfolio()];
@@ -627,6 +667,7 @@ fn test_portfolio_dataframe_parquet_roundtrip() {
 
 #[test]
 fn test_parquet_empty_dataframe_roundtrip() {
+    initialize_test_tracing();
     use std::io::Cursor;
 
     let empty_bars: Vec<EquityBar> = vec![];

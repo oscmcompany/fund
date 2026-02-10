@@ -56,14 +56,8 @@ pub fn format_s3_key(timestamp: &DateTime<Utc>, dataframe_type: &str) -> String 
     )
 }
 
-pub fn date_to_int(timestamp: &DateTime<Utc>) -> Result<i32, Error> {
-    let formatted = timestamp.format("%Y%m%d").to_string();
-    formatted.parse::<i32>().map_err(|parse_error| {
-        Error::Other(format!(
-            "Failed to parse formatted date '{}' to i32: {}",
-            formatted, parse_error
-        ))
-    })
+pub fn date_to_int(timestamp: &DateTime<Utc>) -> i32 {
+    timestamp.format("%Y%m%d").to_string().parse::<i32>().unwrap()
 }
 
 pub fn escape_sql_ticker(ticker: &str) -> String {
@@ -152,22 +146,32 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
     );
 
     let session_token = credentials.session_token().unwrap_or_default();
-    let s3_config = format!(
-        "
-            SET s3_region='{}';
-            SET s3_url_style='path';
-            SET s3_access_key_id='{}';
-            SET s3_secret_access_key='{}';
-            SET s3_session_token='{}';
-        ",
-        region,
-        credentials.access_key_id(),
-        credentials.secret_access_key(),
-        session_token
-    );
+
+    let mut s3_configuration_statements = vec![
+        format!("SET s3_region='{}';", region),
+        "SET s3_url_style='path';".to_string(),
+        format!("SET s3_access_key_id='{}';", credentials.access_key_id()),
+        format!(
+            "SET s3_secret_access_key='{}';",
+            credentials.secret_access_key()
+        ),
+        format!("SET s3_session_token='{}';", session_token),
+    ];
+
+    if let Ok(duckdb_s3_endpoint) = std::env::var("DUCKDB_S3_ENDPOINT") {
+        debug!("Configuring DuckDB with custom S3 endpoint");
+        s3_configuration_statements.push(format!("SET s3_endpoint='{}';", duckdb_s3_endpoint));
+
+        let duckdb_s3_use_ssl = std::env::var("DUCKDB_S3_USE_SSL")
+            .unwrap_or_else(|_| "true".to_string())
+            .to_lowercase();
+        s3_configuration_statements.push(format!("SET s3_use_ssl={};", duckdb_s3_use_ssl));
+    }
+
+    let s3_configuration_sql = s3_configuration_statements.join("\n");
 
     debug!("Configuring DuckDB S3 settings");
-    connection.execute_batch(&s3_config)?;
+    connection.execute_batch(&s3_configuration_sql)?;
 
     info!("DuckDB connection established with S3 access");
     Ok(connection)
@@ -205,8 +209,8 @@ pub async fn query_equity_bars_parquet_from_s3(
     info!("Using S3 glob pattern: {}", s3_glob);
 
     // Build date filter for hive partitions
-    let start_date_int = date_to_int(&start_timestamp)?;
-    let end_date_int = date_to_int(&end_timestamp)?;
+    let start_date_int = date_to_int(&start_timestamp);
+    let end_date_int = date_to_int(&end_timestamp);
 
     debug!(
         "Date range filter: {} to {} (as integers)",

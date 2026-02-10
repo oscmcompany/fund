@@ -7,4 +7,5 @@ pub mod portfolios;
 pub mod predictions;
 pub mod router;
 pub mod state;
+pub mod startup;
 pub mod storage;
