@@ -56,12 +56,14 @@ pub fn format_s3_key(timestamp: &DateTime<Utc>, dataframe_type: &str) -> String 
     )
 }
 
-pub fn date_to_int(timestamp: &DateTime<Utc>) -> i32 {
-    timestamp
-        .format("%Y%m%d")
-        .to_string()
-        .parse::<i32>()
-        .expect("formatted date string should always parse to i32")
+pub fn date_to_int(timestamp: &DateTime<Utc>) -> Result<i32, Error> {
+    let formatted = timestamp.format("%Y%m%d").to_string();
+    formatted.parse::<i32>().map_err(|parse_error| {
+        Error::Other(format!(
+            "Failed to parse formatted date '{}' to i32: {}",
+            formatted, parse_error
+        ))
+    })
 }
 
 pub fn escape_sql_ticker(ticker: &str) -> String {
@@ -203,8 +205,8 @@ pub async fn query_equity_bars_parquet_from_s3(
     info!("Using S3 glob pattern: {}", s3_glob);
 
     // Build date filter for hive partitions
-    let start_date_int = date_to_int(&start_timestamp);
-    let end_date_int = date_to_int(&end_timestamp);
+    let start_date_int = date_to_int(&start_timestamp)?;
+    let end_date_int = date_to_int(&end_timestamp)?;
 
     debug!(
         "Date range filter: {} to {} (as integers)",

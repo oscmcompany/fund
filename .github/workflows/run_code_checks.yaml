@@ -3,11 +3,6 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
-  # TEMPORARY
-  push:
-    branches:
-      - master
-      - rust-unit-tests-and-coverage-updates
 jobs:
   run_rust_code_checks:
     name: Run Rust code checks
@@ -93,4 +88,5 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          files: .coverage_output/python.xml .coverage_output/rust.xml
+          # Rust is being excluded from coverage in favor of DataFrame correctness checks
+          files: .coverage_output/python.xml

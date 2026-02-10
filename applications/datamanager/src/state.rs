@@ -87,4 +87,18 @@ impl State {
             bucket_name,
         }
     }
+
+    pub fn new(
+        http_client: HTTPClient,
+        massive: MassiveSecrets,
+        s3_client: S3Client,
+        bucket_name: String,
+    ) -> Self {
+        Self {
+            http_client,
+            massive,
+            s3_client,
+            bucket_name,
+        }
+    }
 }

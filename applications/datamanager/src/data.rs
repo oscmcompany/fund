@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct EquityBar {
     pub ticker: String,
     pub timestamp: i64,
@@ -54,7 +54,7 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
     Ok(equity_bars_dataframe)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Prediction {
     pub ticker: String,
     pub timestamp: i64,
@@ -120,7 +120,7 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
     Ok(filtered_prediction_dataframe)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Portfolio {
     pub ticker: String,
     pub timestamp: f64,

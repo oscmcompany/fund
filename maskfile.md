@@ -373,7 +373,10 @@ echo "Running Rust tests with coverage"
 mkdir -p .coverage_output
 
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-    echo "cargo-llvm-cov not available. Running tests without coverage"
+    echo "cargo-llvm-cov not available - running tests without coverage"
+    cargo test --workspace --verbose
+elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
+    echo "LLVM tools (llvm-cov or llvm-profdata) not available - running tests without coverage"
     cargo test --workspace --verbose
 else
     echo "Cleaning previous build artifacts to free disk space"
@@ -385,7 +388,7 @@ else
         --output-path .coverage_output/rust.xml; then
         echo "Rust tests with coverage completed successfully"
     else
-        echo "cargo llvm-cov failed. Check test output above."
+        echo "cargo llvm-cov failed - check test output above"
         exit 1
     fi
 fi

@@ -24,6 +24,7 @@ brew install flox # https://flox.dev/ for more information
 flox activate
 uv venv
 source .venv/bin/activate
+pre-commit install
 mask --help # see all available Mask tasks
 mask setup
 mask development python install

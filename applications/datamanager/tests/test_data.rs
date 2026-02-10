@@ -1,14 +1,86 @@
-mod common;
-
 use datamanager::data::{
     create_equity_bar_dataframe, create_equity_details_dataframe, create_portfolio_dataframe,
     create_predictions_dataframe, EquityBar, Portfolio, Prediction,
 };
 use polars::prelude::*;
 
+#[allow(dead_code)]
+fn sample_equity_bar() -> EquityBar {
+    EquityBar {
+        ticker: "AAPL".to_string(),
+        timestamp: 1234567890,
+        open_price: Some(100.0),
+        high_price: Some(105.0),
+        low_price: Some(99.0),
+        close_price: Some(103.0),
+        volume: Some(1000000.0),
+        volume_weighted_average_price: Some(102.0),
+        transactions: Some(5000),
+    }
+}
+
+#[allow(dead_code)]
+fn sample_equity_bar_lowercase() -> EquityBar {
+    EquityBar {
+        ticker: "googl".to_string(),
+        timestamp: 1234567890,
+        open_price: Some(2000.0),
+        high_price: Some(2050.0),
+        low_price: Some(1990.0),
+        close_price: Some(2030.0),
+        volume: Some(500000.0),
+        volume_weighted_average_price: Some(2020.0),
+        transactions: Some(2500),
+    }
+}
+
+#[allow(dead_code)]
+fn sample_prediction() -> Prediction {
+    Prediction {
+        ticker: "AAPL".to_string(),
+        timestamp: 1234567890,
+        quantile_10: 95.0,
+        quantile_50: 100.0,
+        quantile_90: 105.0,
+    }
+}
+
+#[allow(dead_code)]
+fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
+    Prediction {
+        ticker: "AAPL".to_string(),
+        timestamp,
+        quantile_10: 95.0,
+        quantile_50: 100.0,
+        quantile_90: 105.0,
+    }
+}
+
+#[allow(dead_code)]
+fn sample_portfolio() -> Portfolio {
+    Portfolio {
+        ticker: "AAPL".to_string(),
+        timestamp: 1234567890.0,
+        side: "long".to_string(),
+        dollar_amount: 10000.0,
+        action: "hold".to_string(),
+    }
+}
+
+#[allow(dead_code)]
+fn sample_portfolio_lowercase() -> Portfolio {
+    Portfolio {
+        ticker: "aapl".to_string(),
+        timestamp: 1234567890.0,
+        side: "short".to_string(),
+        dollar_amount: 5000.0,
+        action: "sell".to_string(),
+    }
+}
+
 #[test]
 fn test_create_equity_bar_dataframe_valid_data() {
-    let bars = vec![common::sample_equity_bar()];
+    let bars = vec![sample_equity_bar()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
 
@@ -27,7 +99,7 @@ fn test_create_equity_bar_dataframe_valid_data() {
 
 #[test]
 fn test_create_equity_bar_dataframe_uppercase_normalization() {
-    let bars = vec![common::sample_equity_bar_lowercase()];
+    let bars = vec![sample_equity_bar_lowercase()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
 
@@ -38,10 +110,7 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
 
 #[test]
 fn test_create_equity_bar_dataframe_mixed_case_tickers() {
-    let bars = vec![
-        common::sample_equity_bar(),
-        common::sample_equity_bar_lowercase(),
-    ];
+    let bars = vec![sample_equity_bar(), sample_equity_bar_lowercase()];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
 
@@ -94,9 +163,9 @@ fn test_create_equity_bar_dataframe_with_none_prices() {
 #[test]
 fn test_create_equity_bar_dataframe_multiple_rows() {
     let bars = vec![
-        common::sample_equity_bar(),
-        common::sample_equity_bar(),
-        common::sample_equity_bar(),
+        sample_equity_bar(),
+        sample_equity_bar(),
+        sample_equity_bar(),
     ];
 
     let df = create_equity_bar_dataframe(bars).unwrap();
@@ -107,7 +176,7 @@ fn test_create_equity_bar_dataframe_multiple_rows() {
 
 #[test]
 fn test_create_predictions_dataframe_valid_data() {
-    let predictions = vec![common::sample_prediction()];
+    let predictions = vec![sample_prediction()];
 
     let df = create_predictions_dataframe(predictions).unwrap();
 
@@ -140,9 +209,9 @@ fn test_create_predictions_dataframe_uppercase_normalization() {
 #[test]
 fn test_create_predictions_dataframe_deduplication() {
     let predictions = vec![
-        common::sample_prediction_with_timestamp(1000),
-        common::sample_prediction_with_timestamp(2000),
-        common::sample_prediction_with_timestamp(3000),
+        sample_prediction_with_timestamp(1000),
+        sample_prediction_with_timestamp(2000),
+        sample_prediction_with_timestamp(3000),
     ];
 
     let df = create_predictions_dataframe(predictions).unwrap();
@@ -238,7 +307,7 @@ fn test_create_predictions_dataframe_multiple_different_tickers() {
 
 #[test]
 fn test_create_portfolio_dataframe_valid_data() {
-    let portfolios = vec![common::sample_portfolio()];
+    let portfolios = vec![sample_portfolio()];
 
     let df = create_portfolio_dataframe(portfolios).unwrap();
 
@@ -253,7 +322,7 @@ fn test_create_portfolio_dataframe_valid_data() {
 
 #[test]
 fn test_create_portfolio_dataframe_uppercase_normalization() {
-    let portfolios = vec![common::sample_portfolio_lowercase()];
+    let portfolios = vec![sample_portfolio_lowercase()];
 
     let df = create_portfolio_dataframe(portfolios).unwrap();
 
@@ -464,4 +533,113 @@ fn test_create_equity_details_dataframe_malformed_csv() {
         "Expected parse error but got: {}",
         err_msg
     );
+}
+
+#[test]
+fn test_equity_bar_dataframe_parquet_roundtrip() {
+    use std::io::Cursor;
+
+    let original_bars = vec![sample_equity_bar()];
+    let original_df = create_equity_bar_dataframe(original_bars.clone()).unwrap();
+
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut original_df.clone())
+        .unwrap();
+
+    let cursor = Cursor::new(buffer);
+    let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
+
+    assert_eq!(deserialized_df.width(), 9);
+    assert_eq!(deserialized_df.height(), 1);
+
+    assert!(deserialized_df.column("ticker").is_ok());
+    assert!(deserialized_df.column("timestamp").is_ok());
+    assert!(deserialized_df.column("open_price").is_ok());
+    assert!(deserialized_df.column("high_price").is_ok());
+    assert!(deserialized_df.column("low_price").is_ok());
+    assert!(deserialized_df.column("close_price").is_ok());
+    assert!(deserialized_df.column("volume").is_ok());
+    assert!(deserialized_df
+        .column("volume_weighted_average_price")
+        .is_ok());
+    assert!(deserialized_df.column("transactions").is_ok());
+
+    let ticker_series = deserialized_df.column("ticker").unwrap();
+    assert_eq!(ticker_series.str().unwrap().get(0).unwrap(), "AAPL");
+}
+
+#[test]
+fn test_predictions_dataframe_parquet_roundtrip() {
+    use std::io::Cursor;
+
+    let original_predictions = vec![sample_prediction()];
+    let original_df = create_predictions_dataframe(original_predictions.clone()).unwrap();
+
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut original_df.clone())
+        .unwrap();
+
+    let cursor = Cursor::new(buffer);
+    let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
+
+    assert_eq!(deserialized_df.width(), 5);
+    assert_eq!(deserialized_df.height(), 1);
+
+    assert!(deserialized_df.column("ticker").is_ok());
+    assert!(deserialized_df.column("timestamp").is_ok());
+    assert!(deserialized_df.column("quantile_10").is_ok());
+    assert!(deserialized_df.column("quantile_50").is_ok());
+    assert!(deserialized_df.column("quantile_90").is_ok());
+
+    let ticker_series = deserialized_df.column("ticker").unwrap();
+    assert_eq!(ticker_series.str().unwrap().get(0).unwrap(), "AAPL");
+}
+
+#[test]
+fn test_portfolio_dataframe_parquet_roundtrip() {
+    use std::io::Cursor;
+
+    let original_portfolios = vec![sample_portfolio()];
+    let original_df = create_portfolio_dataframe(original_portfolios.clone()).unwrap();
+
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut original_df.clone())
+        .unwrap();
+
+    let cursor = Cursor::new(buffer);
+    let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
+
+    assert_eq!(deserialized_df.width(), 5);
+    assert_eq!(deserialized_df.height(), 1);
+
+    assert!(deserialized_df.column("ticker").is_ok());
+    assert!(deserialized_df.column("timestamp").is_ok());
+    assert!(deserialized_df.column("side").is_ok());
+    assert!(deserialized_df.column("dollar_amount").is_ok());
+    assert!(deserialized_df.column("action").is_ok());
+
+    let ticker_series = deserialized_df.column("ticker").unwrap();
+    assert_eq!(ticker_series.str().unwrap().get(0).unwrap(), "AAPL");
+}
+
+#[test]
+fn test_parquet_empty_dataframe_roundtrip() {
+    use std::io::Cursor;
+
+    let empty_bars: Vec<EquityBar> = vec![];
+    let original_df = create_equity_bar_dataframe(empty_bars).unwrap();
+
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut original_df.clone())
+        .unwrap();
+
+    let cursor = Cursor::new(buffer);
+    let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
+
+    assert_eq!(deserialized_df.width(), 9);
+    assert_eq!(deserialized_df.height(), 0);
 }
