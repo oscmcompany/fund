@@ -1,4 +1,4 @@
-name: oscm
+name: oscmcompany
 runtime:
   name: python
   options:

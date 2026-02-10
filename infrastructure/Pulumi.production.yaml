@@ -1,2 +1,25 @@
 config:
-  aws:region: us-east-1
+  oscmcompany:githubActionsRoleName: oscm-github-actions-infrastructure-role
+  oscmcompany:githubRepository: oscmcompany/fund
+  oscmcompany:githubBranch: master
+  oscmcompany:githubWorkflowFiles:
+    - launch_infrastructure.yaml
+    - teardown_infrastructure.yaml
+  oscmcompany:monthlyBudgetLimitUsd: "25"
+  oscmcompany:sagemakerExecutionRoleName: oscm-sagemaker-execution-role
+  oscmcompany:datamanagerSecretsName:
+    secure: AAABAGu4ra3hnGjI0A6mIEZfRq7S4Gt1dlJlsXl5IPrNFBq5iI+9mY4LTMVcxrsu9UApxjmJvHjzWdg=
+  oscmcompany:portfoliomanagerSecretsName:
+    secure: AAABAEta3vnia3gogqNqYIkLTcqNhN2mm/L0kcZzMMCZMKMW4DoAKghpSs8mBbOaX/c7z7eIIPyveW3LFi5WOA==
+  oscmcompany:sharedSecretsName:
+    secure: AAABAH+pUud4fI8yo0/OomA1xH64LIRFL1/HFb+vR6nN8BES4QtRd3aRQCyf2cRbzJk6K7S6
+  oscmcompany:budgetAlertEmailAddresses:
+    secure: AAABAMb3h0667aby5qWBl7wR+YJcEJam9aATIoXYBlx3Bxs7rwnx76uFBTBrtuOGGRfrSW0Z/q1DmDiPV0tQwjSnGFyVwmxTUmmxC0HIrGEf9XbZCyKDOc0VSA==
+  oscmcompany:sharedSecretValues:
+    secure: AAABAIz1Ftl2ENTaRpNksbHoBJW7BpopzwKbY+nafvdgiLI7qqauqbg2CTb+rMKNnuq3C/aLmTNridsHgHLWTmPmKp56D5xa1G1TwbhzV6nefdYU7cDgmgdl+oXjkBHB/wG2FFfcVM+afiJsVGbpbCgFugZcHKPLsROQeYrHROV9wV2MNl41g+u4GB9/Q+kP8w==
+  oscmcompany:portfoliomanagerSecretValues:
+    secure: AAABAGnysbrui0oT0MnFkNBQCyaqGz5NTJY6Hiu76FHt/g6wDQURQ36QhFFqTMhvVRS23q0bqJRz6f3nB668vNy+ookaDgeR2mkJD7sBov0TePnzerpLmdRjwzzR0MIlflCLgNKsnMDR0aUGrGDEStA1VQnnDBIf2VgUfArxoQdi6Cs=
+  oscmcompany:datamanagerSecretValues:
+    secure: AAABAK5TqECde3nfl5kJsSt/9TGhvfoK/FCXS5Y2Kd17sdagjrUE/XN4IBuhbD3CPPf2/ylutoQc2bwCA3ovpkU99U0C79xcP/idAmLeDkmK0xtyY8WC
+  aws:region:
+    secure: AAABAOzhzfVyWQZNwzf6cCYoVd2/1GneDFnmS27/bRkUMo1tSPoYm2E=

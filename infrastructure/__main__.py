@@ -1,33 +1,264 @@
 import json
+from importlib import import_module
+from typing import cast
 
-import parameters
 import pulumi
 import pulumi_aws as aws
+
+
+def require_secret_config_object(
+    config: pulumi.Config,
+    key: str,
+) -> pulumi.Output[dict[str, str]]:
+    config_full_key = config.full_key(key)
+    if not pulumi.runtime.is_config_secret(config_full_key):
+        message = f"Pulumi config '{key}' must be configured as a secret object."
+        raise ValueError(message)
+
+    return cast(
+        "pulumi.Output[dict[str, str]]",
+        config.require_secret_object(key),
+    )
+
+
+def serialize_secret_config_object(
+    secret_values: dict[str, str],
+    config_key: str,
+    required_keys: set[str],
+) -> str:
+    missing_secret_keys = sorted(required_keys.difference(secret_values))
+    if missing_secret_keys:
+        message = (
+            f"Pulumi config '{config_key}' is missing required keys: "
+            f"{', '.join(missing_secret_keys)}."
+        )
+        raise ValueError(message)
+
+    return json.dumps(secret_values)
+
+
+stack_name = pulumi.get_stack()
+if stack_name != "production":
+    message = "Only the production Pulumi stack is supported."
+    raise ValueError(message)
+
+stack_config = pulumi.Config()
+aws_config = pulumi.Config("aws")
+
+aws_region_full_key = aws_config.full_key("region")
+if not pulumi.runtime.is_config_secret(aws_region_full_key):
+    message = "Pulumi config 'aws:region' must be configured as a secret."
+    raise ValueError(message)
+region = aws_config.require("region")
+
+github_actions_role_name = stack_config.require("githubActionsRoleName")
+github_repository = stack_config.require("githubRepository")
+github_branch = stack_config.require("githubBranch")
+github_workflow_files = cast(
+    "list[str]",
+    stack_config.require_object("githubWorkflowFiles"),
+)
+if not github_workflow_files:
+    message = (
+        "Pulumi config 'githubWorkflowFiles' must include at least one workflow file."
+    )
+    raise ValueError(message)
+
+budget_alert_email_addresses = cast(
+    "list[str]",
+    stack_config.require_object("budgetAlertEmailAddresses"),
+)
+budget_alert_email_addresses_full_key = stack_config.full_key(
+    "budgetAlertEmailAddresses"
+)
+if not pulumi.runtime.is_config_secret(budget_alert_email_addresses_full_key):
+    message = (
+        "Pulumi config 'budgetAlertEmailAddresses' must be configured as a secret list."
+    )
+    raise ValueError(message)
+if not budget_alert_email_addresses:
+    message = (
+        "Pulumi config 'budgetAlertEmailAddresses' must include at least one email "
+        "address."
+    )
+    raise ValueError(message)
+
+monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
+sagemaker_execution_role_name = stack_config.require("sagemakerExecutionRoleName")
+
+datamanager_secrets_name = stack_config.require("datamanagerSecretsName")
+portfoliomanager_secrets_name = stack_config.require("portfoliomanagerSecretsName")
+shared_secrets_name = stack_config.require("sharedSecretsName")
+
+datamanager_secret_values = require_secret_config_object(
+    stack_config,
+    "datamanagerSecretValues",
+)
+portfoliomanager_secret_values = require_secret_config_object(
+    stack_config,
+    "portfoliomanagerSecretValues",
+)
+shared_secret_values = require_secret_config_object(
+    stack_config,
+    "sharedSecretValues",
+)
+
+parameters = import_module("parameters")
+
+github_oidc_audience_claim = "token.actions.githubusercontent.com:aud"
+github_oidc_repository_claim = "token.actions.githubusercontent.com:repository"
+github_oidc_ref_claim = "token.actions.githubusercontent.com:ref"
+github_oidc_sub_claim = "token.actions.githubusercontent.com:sub"
+github_oidc_workflow_ref_claim = "token.actions.githubusercontent.com:job_workflow_ref"
+
+github_workflow_refs = [
+    (
+        f"{github_repository}/.github/workflows/{github_workflow_file}"
+        f"@refs/heads/{github_branch}"
+    )
+    for github_workflow_file in github_workflow_files
+]
 
 current_identity = aws.get_caller_identity()
 
 account_id = current_identity.account_id
-
-region = aws.get_region().name
-
-secret = aws.secretsmanager.get_secret(
-    name="oscm/production/environment_variables",
-)
 
 availability_zone_a = f"{region}a"
 availability_zone_b = f"{region}b"
 
 tags = {
     "project": "oscm",
-    "stack": pulumi.get_stack(),
+    "stack": stack_name,
     "manager": "pulumi",
 }
+
+github_oidc_provider_arn = (
+    f"arn:aws:iam::{account_id}:oidc-provider/token.actions.githubusercontent.com"
+)
+
+datamanager_secret = aws.secretsmanager.Secret(
+    "datamanager_secret",
+    name=datamanager_secrets_name,
+    tags=tags,
+)
+
+portfoliomanager_secret = aws.secretsmanager.Secret(
+    "portfoliomanager_secret",
+    name=portfoliomanager_secrets_name,
+    tags=tags,
+)
+
+shared_secret = aws.secretsmanager.Secret(
+    "shared_secret",
+    name=shared_secrets_name,
+    tags=tags,
+)
+
+aws.secretsmanager.SecretVersion(
+    "datamanager_secret_version",
+    secret_id=datamanager_secret.id,
+    secret_string=datamanager_secret_values.apply(
+        lambda values: serialize_secret_config_object(
+            values,
+            "datamanagerSecretValues",
+            {"MASSIVE_API_KEY"},
+        )
+    ),
+)
+
+aws.secretsmanager.SecretVersion(
+    "portfoliomanager_secret_version",
+    secret_id=portfoliomanager_secret.id,
+    secret_string=portfoliomanager_secret_values.apply(
+        lambda values: serialize_secret_config_object(
+            values,
+            "portfoliomanagerSecretValues",
+            {"ALPACA_API_KEY_ID", "ALPACA_API_SECRET", "ALPACA_IS_PAPER"},
+        )
+    ),
+)
+
+aws.secretsmanager.SecretVersion(
+    "shared_secret_version",
+    secret_id=shared_secret.id,
+    secret_string=shared_secret_values.apply(
+        lambda values: serialize_secret_config_object(
+            values,
+            "sharedSecretValues",
+            {"SENTRY_DSN"},
+        )
+    ),
+)
+
+infrastructure_alerts_topic = aws.sns.Topic(
+    "infrastructure_alerts_topic",
+    name="oscm-production-infrastructure-alerts",
+    tags=tags,
+)
+
+for notification_email_index, notification_email_address in enumerate(
+    budget_alert_email_addresses,
+    start=1,
+):
+    aws.sns.TopicSubscription(
+        f"infrastructure_alert_email_subscription_{notification_email_index}",
+        topic=infrastructure_alerts_topic.arn,
+        protocol="email",
+        endpoint=notification_email_address,
+    )
+
+aws.budgets.Budget(
+    "production_cost_budget",
+    account_id=account_id,
+    name="oscm-production-monthly-cost",
+    budget_type="COST",
+    time_unit="MONTHLY",
+    limit_amount=f"{monthly_budget_limit_usd:.2f}",
+    limit_unit="USD",
+    notifications=[
+        aws.budgets.BudgetNotificationArgs(
+            comparison_operator="GREATER_THAN",
+            notification_type="ACTUAL",
+            threshold=monthly_budget_limit_usd,
+            threshold_type="ABSOLUTE_VALUE",
+            subscriber_email_addresses=budget_alert_email_addresses,
+        ),
+        aws.budgets.BudgetNotificationArgs(
+            comparison_operator="GREATER_THAN",
+            notification_type="FORECASTED",
+            threshold=monthly_budget_limit_usd,
+            threshold_type="ABSOLUTE_VALUE",
+            subscriber_email_addresses=budget_alert_email_addresses,
+        ),
+    ],
+)
 
 # S3 Data Bucket for storing equity bars, predictions, portfolios
 data_bucket = aws.s3.Bucket(
     "data_bucket",
     bucket_prefix="oscm-data-",
     tags=tags,
+)
+
+aws.s3.BucketServerSideEncryptionConfigurationV2(
+    "data_bucket_encryption",
+    bucket=data_bucket.id,
+    rules=[
+        aws.s3.BucketServerSideEncryptionConfigurationV2RuleArgs(
+            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationV2RuleApplyServerSideEncryptionByDefaultArgs(
+                sse_algorithm="AES256",
+            ),
+        )
+    ],
+)
+
+aws.s3.BucketPublicAccessBlock(
+    "data_bucket_public_access_block",
+    bucket=data_bucket.id,
+    block_public_acls=True,
+    block_public_policy=True,
+    ignore_public_acls=True,
+    restrict_public_buckets=True,
 )
 
 aws.s3.BucketVersioning(
@@ -43,6 +274,27 @@ model_artifacts_bucket = aws.s3.Bucket(
     "model_artifacts_bucket",
     bucket_prefix="oscm-model-artifacts-",
     tags=tags,
+)
+
+aws.s3.BucketServerSideEncryptionConfigurationV2(
+    "model_artifacts_bucket_encryption",
+    bucket=model_artifacts_bucket.id,
+    rules=[
+        aws.s3.BucketServerSideEncryptionConfigurationV2RuleArgs(
+            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationV2RuleApplyServerSideEncryptionByDefaultArgs(
+                sse_algorithm="AES256",
+            ),
+        )
+    ],
+)
+
+aws.s3.BucketPublicAccessBlock(
+    "model_artifacts_bucket_public_access_block",
+    bucket=model_artifacts_bucket.id,
+    block_public_acls=True,
+    block_public_policy=True,
+    ignore_public_acls=True,
+    restrict_public_buckets=True,
 )
 
 aws.s3.BucketVersioning(
@@ -198,6 +450,27 @@ nat = aws.ec2.NatGateway(
     "nat_gateway",
     subnet_id=public_subnet_1.id,
     allocation_id=eip.id,
+    tags=tags,
+)
+
+aws.cloudwatch.MetricAlarm(
+    "nat_gateway_bytes_out_to_destination_alarm",
+    name="oscm-production-nat-gateway-bytes-out-to-destination",
+    alarm_description=(
+        "Triggers when NAT gateway outbound traffic exceeds 500 MB per hour for "
+        "2 consecutive hours."
+    ),
+    namespace="AWS/NATGateway",
+    metric_name="BytesOutToDestination",
+    statistic="Sum",
+    period=3600,
+    evaluation_periods=2,
+    threshold=500_000_000,
+    comparison_operator="GreaterThanThreshold",
+    treat_missing_data="notBreaching",
+    dimensions={"NatGatewayId": nat.id},
+    alarm_actions=[infrastructure_alerts_topic.arn],
+    ok_actions=[infrastructure_alerts_topic.arn],
     tags=tags,
 )
 
@@ -565,6 +838,365 @@ aws.lb.ListenerRule(
     tags=tags,
 )
 
+github_actions_oidc_provider = aws.iam.OpenIdConnectProvider(
+    "github_actions_oidc_provider",
+    url="https://token.actions.githubusercontent.com",
+    client_id_lists=["sts.amazonaws.com"],
+    tags=tags,
+)
+
+github_actions_infrastructure_role = aws.iam.Role(
+    "github_actions_infrastructure_role",
+    name=github_actions_role_name,
+    assume_role_policy=github_actions_oidc_provider.arn.apply(
+        lambda github_actions_oidc_provider_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Federated": github_actions_oidc_provider_arn,
+                        },
+                        "Action": "sts:AssumeRoleWithWebIdentity",
+                        "Condition": {
+                            "StringEquals": {
+                                github_oidc_audience_claim: "sts.amazonaws.com",
+                                github_oidc_repository_claim: github_repository,
+                                github_oidc_ref_claim: f"refs/heads/{github_branch}",
+                                github_oidc_workflow_ref_claim: github_workflow_refs,
+                            },
+                            "StringLike": {
+                                github_oidc_sub_claim: f"repo:{github_repository}:*",
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+    ),
+    tags=tags,
+)
+
+github_actions_infrastructure_policy = aws.iam.Policy(
+    "github_actions_infrastructure_policy",
+    name="oscm-github-actions-infrastructure-policy",
+    description=(
+        "Least-privilege policy for GitHub Actions infrastructure deployments."
+    ),
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                # These list/describe APIs are account-scoped and require wildcard
+                # resources.
+                {
+                    "Sid": "ReadGlobalMetadata",
+                    "Effect": "Allow",
+                    "Action": [
+                        "sts:GetCallerIdentity",
+                        "tag:GetResources",
+                        "tag:GetTagKeys",
+                        "tag:GetTagValues",
+                        "iam:Get*",
+                        "iam:List*",
+                        "ec2:Describe*",
+                        "ecs:Describe*",
+                        "ecs:List*",
+                        "elasticloadbalancing:Describe*",
+                        "ecr:Describe*",
+                        "ecr:ListTagsForResource",
+                        "s3:GetBucketLocation",
+                        "s3:ListAllMyBuckets",
+                        "ssm:DescribeParameters",
+                        "secretsmanager:ListSecrets",
+                        "logs:Describe*",
+                        "cloudwatch:Describe*",
+                        "cloudwatch:Get*",
+                        "sns:Get*",
+                        "sns:List*",
+                        "budgets:Describe*",
+                        "budgets:ViewBudget",
+                        "servicediscovery:Get*",
+                        "servicediscovery:List*",
+                    ],
+                    "Resource": "*",
+                },
+                # These control-plane APIs rely on generated identifiers and do not
+                # support practical resource-level scoping for stack create/update/
+                # delete operations.
+                {
+                    "Sid": "ManageEc2EcsElbBudgetsAndServiceDiscovery",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:*",
+                        "ecs:*",
+                        "elasticloadbalancing:*",
+                        "budgets:*",
+                        "servicediscovery:*",
+                    ],
+                    "Resource": "*",
+                },
+                # CreateRepository/GetAuthorizationToken require wildcard resources.
+                {
+                    "Sid": "CreateAndAuthenticateEcrRepositories",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:CreateRepository",
+                        "ecr:GetAuthorizationToken",
+                    ],
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "ManageOscmEcrRepositories",
+                    "Effect": "Allow",
+                    "Action": "ecr:*",
+                    "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/oscm/*",
+                },
+                # CreateBucket requires wildcard resources.
+                {
+                    "Sid": "CreateBuckets",
+                    "Effect": "Allow",
+                    "Action": "s3:CreateBucket",
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "ManageOscmBuckets",
+                    "Effect": "Allow",
+                    "Action": "s3:*",
+                    "Resource": [
+                        "arn:aws:s3:::oscm-data-*",
+                        "arn:aws:s3:::oscm-data-*/*",
+                        "arn:aws:s3:::oscm-model-artifacts-*",
+                        "arn:aws:s3:::oscm-model-artifacts-*/*",
+                    ],
+                },
+                # CreateSecret requires wildcard resources before an ARN exists.
+                {
+                    "Sid": "CreateSecrets",
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:CreateSecret",
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "ManageConfiguredSecrets",
+                    "Effect": "Allow",
+                    "Action": "secretsmanager:*",
+                    "Resource": [
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{datamanager_secrets_name}*",
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{portfoliomanager_secrets_name}*",
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{shared_secrets_name}*",
+                    ],
+                },
+                {
+                    "Sid": "ManageOscmParameters",
+                    "Effect": "Allow",
+                    "Action": "ssm:*",
+                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/oscm/*",
+                },
+                {
+                    "Sid": "ManageOscmLogGroups",
+                    "Effect": "Allow",
+                    "Action": "logs:*",
+                    "Resource": [
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/oscm/*",
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/oscm/*:*",
+                    ],
+                },
+                # Alarm mutation APIs require wildcard resources.
+                {
+                    "Sid": "ManageOscmAlarms",
+                    "Effect": "Allow",
+                    "Action": [
+                        "cloudwatch:DeleteAlarms",
+                        "cloudwatch:ListTagsForResource",
+                        "cloudwatch:PutMetricAlarm",
+                        "cloudwatch:TagResource",
+                        "cloudwatch:UntagResource",
+                    ],
+                    "Resource": "*",
+                },
+                # CreateTopic requires wildcard resources.
+                {
+                    "Sid": "CreateInfrastructureAlertsTopic",
+                    "Effect": "Allow",
+                    "Action": "sns:CreateTopic",
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "ManageInfrastructureAlertsTopic",
+                    "Effect": "Allow",
+                    "Action": "sns:*",
+                    "Resource": [
+                        f"arn:aws:sns:{region}:{account_id}:oscm-production-infrastructure-alerts",
+                        f"arn:aws:sns:{region}:{account_id}:oscm-production-infrastructure-alerts:*",
+                    ],
+                },
+                {
+                    "Sid": "CreateGithubActionsOidcProvider",
+                    "Effect": "Allow",
+                    "Action": "iam:CreateOpenIDConnectProvider",
+                    "Resource": github_oidc_provider_arn,
+                },
+                # CreateRole uses wildcard resources by API design.
+                {
+                    "Sid": "CreateOscmRoles",
+                    "Effect": "Allow",
+                    "Action": "iam:CreateRole",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:RoleName": [
+                                "oscm-ecs-execution-role",
+                                "oscm-ecs-task-role",
+                                github_actions_role_name,
+                                sagemaker_execution_role_name,
+                            ]
+                        }
+                    },
+                },
+                # CreatePolicy uses wildcard resources by API design.
+                {
+                    "Sid": "CreateOscmPolicies",
+                    "Effect": "Allow",
+                    "Action": "iam:CreatePolicy",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringLike": {
+                            "iam:PolicyName": "oscm-*",
+                        }
+                    },
+                },
+                # CreateServiceLinkedRole uses wildcard resources by API design.
+                {
+                    "Sid": "CreateServiceLinkedRolesForOscmStack",
+                    "Effect": "Allow",
+                    "Action": "iam:CreateServiceLinkedRole",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:AWSServiceName": [
+                                "ecs.amazonaws.com",
+                                "elasticloadbalancing.amazonaws.com",
+                            ]
+                        }
+                    },
+                },
+                {
+                    "Sid": "ManageOscmRoles",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:AttachRolePolicy",
+                        "iam:DeleteRole",
+                        "iam:DetachRolePolicy",
+                        "iam:PassRole",
+                        "iam:TagRole",
+                        "iam:UntagRole",
+                        "iam:UpdateAssumeRolePolicy",
+                    ],
+                    "Resource": [
+                        f"arn:aws:iam::{account_id}:role/oscm-ecs-execution-role",
+                        f"arn:aws:iam::{account_id}:role/oscm-ecs-task-role",
+                        f"arn:aws:iam::{account_id}:role/{github_actions_role_name}",
+                        f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
+                    ],
+                    "Condition": {
+                        "ArnLikeIfExists": {
+                            "iam:PolicyARN": [
+                                "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+                                f"arn:aws:iam::{account_id}:policy/oscm-*",
+                            ]
+                        },
+                        "StringLikeIfExists": {
+                            "iam:PassedToService": [
+                                "ecs-tasks.amazonaws.com",
+                                "ecs.amazonaws.com",
+                                "sagemaker.amazonaws.com",
+                            ]
+                        },
+                    },
+                },
+                {
+                    "Sid": "ManageOscmInlineRolePolicies",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:DeleteRolePolicy",
+                        "iam:PutRolePolicy",
+                    ],
+                    "Resource": [
+                        f"arn:aws:iam::{account_id}:role/oscm-ecs-execution-role",
+                        f"arn:aws:iam::{account_id}:role/oscm-ecs-task-role",
+                        f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
+                    ],
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:PolicyName": [
+                                "oscm-ecs-execution-role-secrets-policy",
+                                "oscm-ecs-task-role-s3-policy",
+                                "oscm-ecs-task-role-ssm-policy",
+                                "oscm-sagemaker-s3-policy",
+                                "oscm-sagemaker-ecr-policy",
+                                "oscm-sagemaker-cloudwatch-policy",
+                            ]
+                        }
+                    },
+                },
+                {
+                    "Sid": "ManageOscmPolicies",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:CreatePolicyVersion",
+                        "iam:DeletePolicy",
+                        "iam:DeletePolicyVersion",
+                        "iam:SetDefaultPolicyVersion",
+                        "iam:TagPolicy",
+                        "iam:UntagPolicy",
+                    ],
+                    "Resource": f"arn:aws:iam::{account_id}:policy/oscm-*",
+                },
+                {
+                    "Sid": "ManageGithubActionsOidcProvider",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:AddClientIDToOpenIDConnectProvider",
+                        "iam:DeleteOpenIDConnectProvider",
+                        "iam:RemoveClientIDFromOpenIDConnectProvider",
+                        "iam:TagOpenIDConnectProvider",
+                        "iam:UntagOpenIDConnectProvider",
+                        "iam:UpdateOpenIDConnectProviderThumbprint",
+                    ],
+                    "Resource": github_oidc_provider_arn,
+                },
+                # Service-linked role teardown APIs are wildcard-resource only.
+                {
+                    "Sid": "DeleteServiceLinkedRoles",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:DeleteServiceLinkedRole",
+                        "iam:GetServiceLinkedRoleDeletionStatus",
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringLikeIfExists": {
+                            "iam:AWSServiceName": [
+                                "ecs.amazonaws.com",
+                                "elasticloadbalancing.amazonaws.com",
+                            ]
+                        }
+                    },
+                },
+            ],
+        }
+    ),
+    tags=tags,
+)
+
+aws.iam.RolePolicyAttachment(
+    "github_actions_infrastructure_role_custom_policy",
+    role=github_actions_infrastructure_role.name,
+    policy_arn=github_actions_infrastructure_policy.arn,
+)
+
 # IAM Role for ECS to perform infrastructure tasks
 execution_role = aws.iam.Role(
     "execution_role",
@@ -595,7 +1227,11 @@ aws.iam.RolePolicy(
     "execution_role_secrets_policy",
     name="oscm-ecs-execution-role-secrets-policy",
     role=execution_role.id,
-    policy=pulumi.Output.all(secret.arn).apply(
+    policy=pulumi.Output.all(
+        datamanager_secret.arn,
+        portfoliomanager_secret.arn,
+        shared_secret.arn,
+    ).apply(
         lambda args: json.dumps(
             {
                 "Version": "2012-10-17",
@@ -603,7 +1239,7 @@ aws.iam.RolePolicy(
                     {
                         "Effect": "Allow",
                         "Action": ["secretsmanager:GetSecretValue"],
-                        "Resource": args[0],
+                        "Resource": [args[0], args[1], args[2]],
                     }
                 ],
             }
@@ -677,7 +1313,7 @@ aws.iam.RolePolicy(
 # SageMaker Execution Role for training jobs
 sagemaker_execution_role = aws.iam.Role(
     "sagemaker_execution_role",
-    name="oscm-sagemaker-execution-role",
+    name=sagemaker_execution_role_name,
     assume_role_policy=json.dumps(
         {
             "Version": "2012-10-17",
@@ -808,7 +1444,8 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
     container_definitions=pulumi.Output.all(
         datamanager_log_group.name,
         datamanager_image_uri,
-        secret.arn,
+        datamanager_secret.arn,
+        shared_secret.arn,
         data_bucket.bucket,
     ).apply(
         lambda args: json.dumps(
@@ -824,7 +1461,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "AWS_S3_DATA_BUCKET_NAME",
-                            "value": args[3],
+                            "value": args[4],
                         },
                         {
                             "name": "ENVIRONMENT",
@@ -838,7 +1475,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "SENTRY_DSN",
-                            "valueFrom": f"{args[2]}:SENTRY_DSN::",
+                            "valueFrom": f"{args[3]}:SENTRY_DSN::",
                         },
                     ],
                     "logConfiguration": {
@@ -870,7 +1507,8 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
         portfoliomanager_log_group.name,
         service_discovery_namespace.name,
         portfoliomanager_image_uri,
-        secret.arn,
+        portfoliomanager_secret.arn,
+        shared_secret.arn,
         parameters.uncertainty_threshold.value,
     ).apply(
         lambda args: json.dumps(
@@ -894,7 +1532,7 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "OSCM_UNCERTAINTY_THRESHOLD",
-                            "value": args[4],
+                            "value": args[5],
                         },
                     ],
                     "secrets": [
@@ -912,7 +1550,7 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "SENTRY_DSN",
-                            "valueFrom": f"{args[3]}:SENTRY_DSN::",
+                            "valueFrom": f"{args[4]}:SENTRY_DSN::",
                         },
                     ],
                     "logConfiguration": {
@@ -945,7 +1583,7 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
         service_discovery_namespace.name,
         equitypricemodel_image_uri,
         model_artifacts_bucket.bucket,
-        secret.arn,
+        shared_secret.arn,
     ).apply(
         lambda args: json.dumps(
             [
@@ -1147,5 +1785,13 @@ pulumi.export(
     "aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri
 )
 pulumi.export("aws_iam_sagemaker_role_arn", sagemaker_execution_role.arn)
+pulumi.export(
+    "aws_iam_github_actions_infrastructure_role_arn",
+    github_actions_infrastructure_role.arn,
+)
+pulumi.export(
+    "aws_iam_github_actions_oidc_provider_arn",
+    github_actions_oidc_provider.arn,
+)
 pulumi.export("oscm_base_url", oscm_base_url)
 pulumi.export("readme", pulumi.Output.format(readme_content, oscm_base_url))
