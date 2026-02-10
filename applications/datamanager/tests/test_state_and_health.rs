@@ -7,51 +7,10 @@ use datamanager::{
 use reqwest::StatusCode;
 use serial_test::serial;
 
-use common::{create_test_s3_client, setup_test_bucket, test_bucket_name, SpawnedAppServer};
-
-struct EnvironmentVariableGuard {
-    name: String,
-    original_value: Option<String>,
-}
-
-impl EnvironmentVariableGuard {
-    fn set(name: &str, value: &str) -> Self {
-        let original_value = std::env::var(name).ok();
-        unsafe {
-            std::env::set_var(name, value);
-        }
-
-        Self {
-            name: name.to_string(),
-            original_value,
-        }
-    }
-
-    fn remove(name: &str) -> Self {
-        let original_value = std::env::var(name).ok();
-        unsafe {
-            std::env::remove_var(name);
-        }
-
-        Self {
-            name: name.to_string(),
-            original_value,
-        }
-    }
-}
-
-impl Drop for EnvironmentVariableGuard {
-    fn drop(&mut self) {
-        match self.original_value.as_ref() {
-            Some(value) => unsafe {
-                std::env::set_var(&self.name, value);
-            },
-            None => unsafe {
-                std::env::remove_var(&self.name);
-            },
-        }
-    }
-}
+use common::{
+    create_test_s3_client, setup_test_bucket, test_bucket_name, EnvironmentVariableGuard,
+    SpawnedAppServer,
+};
 
 async fn create_state_for_endpoint(endpoint: &str, bucket_name: &str) -> State {
     let s3_client = create_test_s3_client(endpoint).await;

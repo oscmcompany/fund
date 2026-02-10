@@ -15,12 +15,29 @@ pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
         Ok(dataframe) => {
             let mut buffer = Vec::new();
             let mut writer = CsvWriter::new(&mut buffer);
-            writer
-                .finish(&mut dataframe.clone())
-                .expect("CSV writer should succeed for equity details schema");
+            match writer.finish(&mut dataframe.clone()) {
+                Ok(_) => {}
+                Err(err) => {
+                    info!("Failed to write CSV: {}", err);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to write CSV: {}", err),
+                    )
+                        .into_response();
+                }
+            }
 
-            let csv_content =
-                String::from_utf8(buffer).expect("CSV writer output should be valid UTF-8");
+            let csv_content = match String::from_utf8(buffer) {
+                Ok(content) => content,
+                Err(err) => {
+                    info!("Failed to convert CSV to UTF-8: {}", err);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to convert CSV to UTF-8: {}", err),
+                    )
+                        .into_response();
+                }
+            };
             let mut response = csv_content.into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,

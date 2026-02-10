@@ -379,8 +379,6 @@ elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/n
     echo "LLVM tools (llvm-cov or llvm-profdata) not available - running tests without coverage"
     cargo test --workspace --verbose
 else
-    echo "Cleaning previous build artifacts to free disk space"
-    cargo clean
     export LLVM_COV=$(which llvm-cov)
     export LLVM_PROFDATA=$(which llvm-profdata)
     if cargo llvm-cov --workspace --verbose \

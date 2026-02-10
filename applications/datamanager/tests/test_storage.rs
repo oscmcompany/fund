@@ -11,8 +11,8 @@ use datamanager::{
         date_to_int, escape_sql_ticker, format_s3_key, is_valid_ticker,
         query_equity_bars_parquet_from_s3, query_portfolio_dataframe_from_s3,
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
-        write_equity_bars_dataframe_to_s3, write_portfolio_dataframe_to_s3,
-        write_predictions_dataframe_to_s3, PredictionQuery,
+        sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
+        write_portfolio_dataframe_to_s3, write_predictions_dataframe_to_s3, PredictionQuery,
     },
 };
 use polars::prelude::*;
@@ -98,7 +98,7 @@ fn test_format_s3_key() {
 #[test]
 fn test_date_to_int() {
     let timestamp = fixed_date_time();
-    assert_eq!(date_to_int(&timestamp), 20250101);
+    assert_eq!(date_to_int(&timestamp).unwrap(), 20250101);
 }
 
 #[test]
@@ -136,7 +136,12 @@ async fn test_write_and_query_predictions_round_trip() {
 
     assert_eq!(query_results.height(), 1);
     assert_eq!(
-        query_results.column("ticker").unwrap().str().unwrap().get(0),
+        query_results
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
         Some("AAPL")
     );
 }
@@ -199,11 +204,21 @@ async fn test_write_and_query_portfolio_round_trip() {
 
     assert_eq!(query_results.height(), 1);
     assert_eq!(
-        query_results.column("ticker").unwrap().str().unwrap().get(0),
+        query_results
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
         Some("AAPL")
     );
     assert_eq!(
-        query_results.column("action").unwrap().str().unwrap().get(0),
+        query_results
+            .column("action")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
         Some("BUY")
     );
 }
@@ -236,11 +251,18 @@ async fn test_query_portfolio_without_timestamp_uses_latest_partition() {
         .await
         .unwrap();
 
-    let query_results = query_portfolio_dataframe_from_s3(&state, None).await.unwrap();
+    let query_results = query_portfolio_dataframe_from_s3(&state, None)
+        .await
+        .unwrap();
 
     assert_eq!(query_results.height(), 1);
     assert_eq!(
-        query_results.column("ticker").unwrap().str().unwrap().get(0),
+        query_results
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
         Some("NEW")
     );
 }
@@ -275,7 +297,12 @@ async fn test_query_portfolio_falls_back_when_action_column_is_missing() {
 
     assert_eq!(query_results.height(), 1);
     assert_eq!(
-        query_results.column("action").unwrap().str().unwrap().get(0),
+        query_results
+            .column("action")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0),
         Some("UNSPECIFIED")
     );
 }
@@ -366,12 +393,7 @@ async fn test_read_equity_details_dataframe_from_s3_returns_error_for_invalid_ut
     let (endpoint, s3) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
-    put_test_object(
-        &s3,
-        "equity/details/categories.csv",
-        vec![0xff, 0xfe, 0xfd],
-    )
-    .await;
+    put_test_object(&s3, "equity/details/categories.csv", vec![0xff, 0xfe, 0xfd]).await;
 
     let result = read_equity_details_dataframe_from_s3(&state).await;
 
@@ -385,19 +407,19 @@ async fn test_query_equity_bars_without_date_range_uses_defaults() {
     let (endpoint, _s3) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
-    // Write data with today's date so it falls within the default 7-day range
-    let today = chrono::Utc::now();
+    // Use fixed date to avoid flakiness from midnight rollover
+    let test_date = fixed_date_time();
     let bars_dataframe = create_equity_bar_dataframe(vec![sample_equity_bar()]).unwrap();
-    write_equity_bars_dataframe_to_s3(&state, &bars_dataframe, &today)
+    write_equity_bars_dataframe_to_s3(&state, &bars_dataframe, &test_date)
         .await
         .unwrap();
 
-    // Query with None timestamps — covers the default 7-day range path
+    // Query with explicit date range around test_date to ensure deterministic results
     let parquet_bytes = query_equity_bars_parquet_from_s3(
         &state,
         Some(vec!["AAPL".to_string()]),
-        None,
-        None,
+        Some(test_date - chrono::Duration::days(1)),
+        Some(test_date + chrono::Duration::days(1)),
     )
     .await
     .unwrap();
@@ -428,17 +450,32 @@ async fn test_query_equity_bars_without_ticker_filter_returns_all() {
         .unwrap();
 
     // Query with None tickers — covers "No ticker filter applied" path
-    let parquet_bytes = query_equity_bars_parquet_from_s3(
-        &state,
-        None,
-        Some(timestamp),
-        Some(timestamp),
-    )
-    .await
-    .unwrap();
+    let parquet_bytes =
+        query_equity_bars_parquet_from_s3(&state, None, Some(timestamp), Some(timestamp))
+            .await
+            .unwrap();
 
     let cursor = Cursor::new(parquet_bytes);
     let result = ParquetReader::new(cursor).finish().unwrap();
 
     assert_eq!(result.height(), 2);
+}
+
+#[test]
+fn test_sanitize_duckdb_config_value_valid() {
+    assert!(sanitize_duckdb_config_value("localhost:4566").is_ok());
+    assert!(sanitize_duckdb_config_value("https://s3.amazonaws.com").is_ok());
+    assert!(sanitize_duckdb_config_value("true").is_ok());
+    assert!(sanitize_duckdb_config_value("false").is_ok());
+    assert!(sanitize_duckdb_config_value("http://127.0.0.1:9000").is_ok());
+}
+
+#[test]
+fn test_sanitize_duckdb_config_value_rejects_injection() {
+    assert!(sanitize_duckdb_config_value("'; DROP TABLE users; --").is_err());
+    assert!(sanitize_duckdb_config_value("localhost'; --").is_err());
+    assert!(sanitize_duckdb_config_value("\"malicious\"").is_err());
+    assert!(sanitize_duckdb_config_value("").is_err());
+    assert!(sanitize_duckdb_config_value(&"a".repeat(513)).is_err());
+    assert!(sanitize_duckdb_config_value("value;another").is_err());
 }

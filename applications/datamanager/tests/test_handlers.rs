@@ -10,31 +10,36 @@ use reqwest::StatusCode;
 use serial_test::serial;
 
 use common::{
-    create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name, SpawnedAppServer,
+    create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name,
+    DuckDbEnvironmentGuard, EnvironmentVariableGuard, SpawnedAppServer,
 };
 
-async fn spawn_app(endpoint: &str, massive_base: String) -> SpawnedAppServer {
+async fn spawn_app(
+    endpoint: &str,
+    massive_base: String,
+) -> (SpawnedAppServer, EnvironmentVariableGuard) {
+    let env_guard = EnvironmentVariableGuard::set("MASSIVE_API_KEY", "test-api-key");
+
     let s3_client = create_test_s3_client(endpoint).await;
     let state = State::new(
         reqwest::Client::new(),
         MassiveSecrets {
             base: massive_base,
-            key: std::env::var("MASSIVE_API_KEY").unwrap_or_else(|_| "test-api-key".to_string()),
+            key: std::env::var("MASSIVE_API_KEY").unwrap(),
         },
         s3_client,
         test_bucket_name(),
     );
     let app = create_app_with_state(state);
-    SpawnedAppServer::start(app).await
+    (SpawnedAppServer::start(app).await, env_guard)
 }
 
-async fn spawn_app_with_unreachable_s3(massive_base: String) -> SpawnedAppServer {
+async fn spawn_app_with_unreachable_s3(
+    massive_base: String,
+) -> (SpawnedAppServer, DuckDbEnvironmentGuard) {
     // Point DuckDB env vars to the same unreachable endpoint so that
     // DuckDB's httpfs also fails (DuckDB reads credentials and endpoint from env).
-    unsafe {
-        std::env::set_var("DUCKDB_S3_ENDPOINT", "127.0.0.1:9");
-        std::env::set_var("DUCKDB_S3_USE_SSL", "false");
-    }
+    let env_guard = DuckDbEnvironmentGuard::new("127.0.0.1:9");
 
     let unreachable_s3_client = create_test_s3_client("http://127.0.0.1:9").await;
     let state = State::new(
@@ -47,18 +52,14 @@ async fn spawn_app_with_unreachable_s3(massive_base: String) -> SpawnedAppServer
         "test-bucket".to_string(),
     );
     let app = create_app_with_state(state);
-    SpawnedAppServer::start(app).await
+    (SpawnedAppServer::start(app).await, env_guard)
 }
-
-// ---------------------------------------------------------------------------
-// Predictions
-// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_predictions_save_and_query_round_trip() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
 
     let save_payload = r#"{
@@ -83,7 +84,10 @@ async fn test_predictions_save_and_query_round_trip() {
 
     let encoded_query = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600.0}]");
     let response = client
-        .get(app.url(&format!("/predictions?tickers_and_timestamps={}", encoded_query)))
+        .get(app.url(&format!(
+            "/predictions?tickers_and_timestamps={}",
+            encoded_query
+        )))
         .send()
         .await
         .unwrap();
@@ -97,7 +101,7 @@ async fn test_predictions_save_and_query_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fails() {
-    let app = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 
     let save_payload = r#"{
         "data": [{
@@ -124,7 +128,7 @@ async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fail
 #[serial]
 async fn test_predictions_query_returns_bad_request_for_invalid_url_encoding() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url("/predictions?tickers_and_timestamps=%"))
@@ -138,7 +142,7 @@ async fn test_predictions_query_returns_bad_request_for_invalid_url_encoding() {
 #[serial]
 async fn test_predictions_query_returns_bad_request_for_invalid_json() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let encoded = urlencoding::encode("not-json");
     let response = reqwest::Client::new()
@@ -153,7 +157,7 @@ async fn test_predictions_query_returns_bad_request_for_invalid_json() {
 #[serial]
 async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
 
     let save_payload = r#"{
@@ -189,7 +193,7 @@ async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_predictions_query_returns_internal_server_error_when_storage_query_fails() {
-    let app = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 
     let encoded = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600.0}]");
     let response = reqwest::Client::new()
@@ -200,15 +204,11 @@ async fn test_predictions_query_returns_internal_server_error_when_storage_query
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
-// ---------------------------------------------------------------------------
-// Portfolios
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_portfolios_save_and_get_round_trip() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
 
     let save_payload = r#"{
@@ -242,18 +242,14 @@ async fn test_portfolios_save_and_get_round_trip() {
     assert!(body.contains("AAPL"));
     assert!(body.contains("BUY"));
 
-    let response = client
-        .get(app.url("/portfolios"))
-        .send()
-        .await
-        .unwrap();
+    let response = client.get(app.url("/portfolios")).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails() {
-    let app = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 
     let save_payload = r#"{
         "data": [{
@@ -280,7 +276,7 @@ async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails
 #[serial]
 async fn test_portfolios_get_returns_not_found_for_first_run_without_files() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url("/portfolios"))
@@ -294,7 +290,7 @@ async fn test_portfolios_get_returns_not_found_for_first_run_without_files() {
 #[serial]
 async fn test_portfolios_get_returns_not_found_when_portfolio_file_is_empty() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
 
     let empty_save_payload = r#"{
@@ -319,10 +315,6 @@ async fn test_portfolios_get_returns_not_found_when_portfolio_file_is_empty() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-// ---------------------------------------------------------------------------
-// Equity details
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_equity_details_get_returns_csv_content() {
@@ -335,7 +327,7 @@ async fn test_equity_details_get_returns_csv_content() {
     )
     .await;
 
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url("/equity-details"))
@@ -360,7 +352,7 @@ async fn test_equity_details_get_returns_csv_content() {
 #[serial]
 async fn test_equity_details_get_returns_internal_server_error_when_csv_is_missing() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url("/equity-details"))
@@ -369,10 +361,6 @@ async fn test_equity_details_get_returns_internal_server_error_when_csv_is_missi
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
-
-// ---------------------------------------------------------------------------
-// Equity bars — error cases (mockito for controlled Massive API responses)
-// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
@@ -410,7 +398,7 @@ async fn test_equity_bars_sync_and_query_round_trip() {
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
     let client = reqwest::Client::new();
 
     let response = client
@@ -467,7 +455,7 @@ async fn test_equity_bars_sync_returns_no_content_when_api_has_no_results() {
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -496,7 +484,7 @@ async fn test_equity_bars_sync_returns_internal_server_error_for_invalid_json() 
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -530,7 +518,7 @@ async fn test_equity_bars_sync_returns_bad_gateway_for_unparseable_results() {
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -546,7 +534,7 @@ async fn test_equity_bars_sync_returns_bad_gateway_for_unparseable_results() {
 #[serial]
 async fn test_equity_bars_sync_returns_internal_server_error_when_api_request_fails() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -562,7 +550,7 @@ async fn test_equity_bars_sync_returns_internal_server_error_when_api_request_fa
 #[serial]
 async fn test_equity_bars_query_returns_internal_server_error_for_invalid_ticker() {
     let (endpoint, _s3) = setup_test_bucket().await;
-    let app = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url(
@@ -573,10 +561,6 @@ async fn test_equity_bars_query_returns_internal_server_error_for_invalid_ticker
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
-
-// ---------------------------------------------------------------------------
-// Coverage: equity bars — additional paths
-// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
@@ -595,7 +579,7 @@ async fn test_equity_bars_query_without_ticker_filter_returns_data() {
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
     let client = reqwest::Client::new();
 
     let response = client
@@ -641,7 +625,7 @@ async fn test_equity_bars_query_with_empty_tickers_param_returns_data() {
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
     let client = reqwest::Client::new();
 
     let response = client
@@ -681,7 +665,7 @@ async fn test_equity_bars_sync_returns_internal_server_error_for_api_error_statu
         .create_async()
         .await;
 
-    let app = spawn_app(&endpoint, massive_server.url()).await;
+    let (app, _env_guard) = spawn_app(&endpoint, massive_server.url()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -709,7 +693,7 @@ async fn test_equity_bars_sync_returns_bad_gateway_when_s3_upload_fails() {
         .await;
 
     // Working Massive API but broken S3 → parse succeeds, upload fails
-    let app = spawn_app_with_unreachable_s3(massive_server.url()).await;
+    let (app, _env_guard) = spawn_app_with_unreachable_s3(massive_server.url()).await;
 
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
@@ -721,15 +705,11 @@ async fn test_equity_bars_sync_returns_bad_gateway_when_s3_upload_fails() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
-// ---------------------------------------------------------------------------
-// Coverage: portfolios — generic storage failure
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_portfolios_get_returns_internal_server_error_when_storage_query_fails() {
     // DuckDB connects to unreachable S3 → connection error (not "not found")
-    let app = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 
     let response = reqwest::Client::new()
         .get(app.url("/portfolios"))

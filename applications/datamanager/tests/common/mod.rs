@@ -1,18 +1,10 @@
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use axum::Router;
-use std::{
-    net::SocketAddr,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::OnceLock, time::Duration};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::localstack::LocalStack;
-use tokio::{
-    net::TcpListener,
-    sync::oneshot,
-    task::JoinHandle,
-};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 const TEST_BUCKET: &str = "test-bucket";
 const TEST_ACCESS_KEY: &str = "test";
@@ -21,6 +13,68 @@ const TEST_REGION: &str = "us-east-1";
 
 static LOCALSTACK_ENDPOINT: OnceLock<String> = OnceLock::new();
 static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+pub struct EnvironmentVariableGuard {
+    name: String,
+    original_value: Option<String>,
+}
+
+impl EnvironmentVariableGuard {
+    pub fn set(name: &str, value: &str) -> Self {
+        let original_value = std::env::var(name).ok();
+        unsafe {
+            std::env::set_var(name, value);
+        }
+
+        Self {
+            name: name.to_string(),
+            original_value,
+        }
+    }
+
+    pub fn remove(name: &str) -> Self {
+        let original_value = std::env::var(name).ok();
+        unsafe {
+            std::env::remove_var(name);
+        }
+
+        Self {
+            name: name.to_string(),
+            original_value,
+        }
+    }
+}
+
+impl Drop for EnvironmentVariableGuard {
+    fn drop(&mut self) {
+        match self.original_value.as_ref() {
+            Some(value) => unsafe {
+                std::env::set_var(&self.name, value);
+            },
+            None => unsafe {
+                std::env::remove_var(&self.name);
+            },
+        }
+    }
+}
+
+pub struct DuckDbEnvironmentGuard {
+    _guards: Vec<EnvironmentVariableGuard>,
+}
+
+impl DuckDbEnvironmentGuard {
+    pub fn new(endpoint_host_port: &str) -> Self {
+        let guards = vec![
+            EnvironmentVariableGuard::set("AWS_REGION", TEST_REGION),
+            EnvironmentVariableGuard::set("AWS_ACCESS_KEY_ID", TEST_ACCESS_KEY),
+            EnvironmentVariableGuard::set("AWS_SECRET_ACCESS_KEY", TEST_SECRET_KEY),
+            EnvironmentVariableGuard::set("AWS_EC2_METADATA_DISABLED", "true"),
+            EnvironmentVariableGuard::set("DUCKDB_S3_ENDPOINT", endpoint_host_port),
+            EnvironmentVariableGuard::set("DUCKDB_S3_USE_SSL", "false"),
+        ];
+        Self { _guards: guards }
+    }
+}
 
 pub fn initialize_test_tracing() {
     TRACING_INIT.call_once(|| {
@@ -45,7 +99,17 @@ pub async fn get_localstack_endpoint() -> String {
     let port = container.get_host_port_ipv4(4566).await.unwrap();
     let endpoint = format!("http://{}:{}", host, port);
 
-    // Leak container so it stays alive for the full test run
+    // INTENTIONAL LEAK: Container is leaked to keep it alive for entire test run.
+    //
+    // Rationale:
+    // - Tests use #[serial] for sequential execution within this process
+    // - All tests share the same LocalStack container for performance
+    // - Container cleanup happens automatically when process exits
+    // - Alternative (proper Drop cleanup) requires complex lifetime management
+    //   across static OnceLock, creating more complexity than benefit
+    //
+    // Trade-off: Small memory leak during test execution vs architectural complexity
+    // Impact: Container memory is reclaimed when test process terminates
     Box::leak(Box::new(container));
 
     let _ = LOCALSTACK_ENDPOINT.set(endpoint.clone());
@@ -78,11 +142,7 @@ pub async fn setup_test_bucket() -> (String, S3Client) {
     let s3_client = create_test_s3_client(&endpoint).await;
 
     // Create bucket (ignore AlreadyExists / BucketAlreadyOwnedByYou)
-    let _ = s3_client
-        .create_bucket()
-        .bucket(TEST_BUCKET)
-        .send()
-        .await;
+    let _ = s3_client.create_bucket().bucket(TEST_BUCKET).send().await;
 
     clean_bucket(&s3_client).await;
 

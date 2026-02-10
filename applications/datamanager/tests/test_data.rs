@@ -1,20 +1,11 @@
+mod common;
+
+use common::initialize_test_tracing;
 use datamanager::data::{
     create_equity_bar_dataframe, create_equity_details_dataframe, create_portfolio_dataframe,
     create_predictions_dataframe, EquityBar, Portfolio, Prediction,
 };
 use polars::prelude::*;
-use std::sync::Once;
-
-static TEST_TRACING_INIT: Once = Once::new();
-
-fn initialize_test_tracing() {
-    TEST_TRACING_INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_test_writer()
-            .try_init();
-    });
-}
 
 #[allow(dead_code)]
 fn sample_equity_bar() -> EquityBar {

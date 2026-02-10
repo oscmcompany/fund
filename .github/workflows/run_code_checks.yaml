@@ -88,5 +88,4 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Rust is being excluded from coverage in favor of DataFrame correctness checks
-          files: .coverage_output/python.xml
+          files: .coverage_output/python.xml .coverage_output/rust.xml
