@@ -36,8 +36,6 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development rust all
-      - name: Ensure coverage file permissions
-        run: chmod 644 .coverage_output/rust.xml
       - name: Upload test coverage results
         uses: actions/upload-artifact@v4
         with:
@@ -95,6 +93,4 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          files: |
-            .coverage_output/python.xml
-            .coverage_output/rust.xml
+          files: .coverage_output/python.xml .coverage_output/rust.xml
