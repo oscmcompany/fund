@@ -1,7 +1,7 @@
 import json
-from importlib import import_module
 from typing import cast
 
+import parameters
 import pulumi
 import pulumi_aws as aws
 
@@ -34,7 +34,7 @@ def serialize_secret_config_object(
         )
         raise ValueError(message)
 
-    return json.dumps(secret_values)
+    return json.dumps(secret_values, sort_keys=True)
 
 
 stack_name = pulumi.get_stack()
@@ -42,7 +42,7 @@ if stack_name != "production":
     message = "Only the production Pulumi stack is supported."
     raise ValueError(message)
 
-stack_config = pulumi.Config()
+stack_config = pulumi.Config("oscmcompany")
 aws_config = pulumi.Config("aws")
 
 aws_region_full_key = aws_config.full_key("region")
@@ -102,8 +102,6 @@ shared_secret_values = require_secret_config_object(
     stack_config,
     "sharedSecretValues",
 )
-
-parameters = import_module("parameters")
 
 github_oidc_audience_claim = "token.actions.githubusercontent.com:aud"
 github_oidc_repository_claim = "token.actions.githubusercontent.com:repository"
@@ -872,7 +870,8 @@ github_actions_infrastructure_role = aws.iam.Role(
                         },
                     }
                 ],
-            }
+            },
+            sort_keys=True,
         )
     ),
     tags=tags,
@@ -1186,7 +1185,8 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     },
                 },
             ],
-        }
+        },
+        sort_keys=True,
     ),
     tags=tags,
 )
@@ -1211,7 +1211,8 @@ execution_role = aws.iam.Role(
                     "Principal": {"Service": "ecs-tasks.amazonaws.com"},
                 }
             ],
-        }
+        },
+        sort_keys=True,
     ),
     tags=tags,
 )
@@ -1242,7 +1243,8 @@ aws.iam.RolePolicy(
                         "Resource": [args[0], args[1], args[2]],
                     }
                 ],
-            }
+            },
+            sort_keys=True,
         )
     ),
 )
@@ -1262,7 +1264,8 @@ task_role = aws.iam.Role(
                     "Principal": {"Service": "ecs-tasks.amazonaws.com"},
                 }
             ],
-        }
+        },
+        sort_keys=True,
     ),
     tags=tags,
 )
@@ -1287,7 +1290,8 @@ aws.iam.RolePolicy(
                         ],
                     }
                 ],
-            }
+            },
+            sort_keys=True,
         )
     ),
 )
@@ -1306,7 +1310,8 @@ aws.iam.RolePolicy(
                     "Resource": (f"arn:aws:ssm:{region}:{account_id}:parameter/oscm/*"),
                 }
             ],
-        }
+        },
+        sort_keys=True,
     ),
 )
 
@@ -1324,7 +1329,8 @@ sagemaker_execution_role = aws.iam.Role(
                     "Principal": {"Service": "sagemaker.amazonaws.com"},
                 }
             ],
-        }
+        },
+        sort_keys=True,
     ),
     tags=tags,
 )
@@ -1354,7 +1360,8 @@ aws.iam.RolePolicy(
                         ],
                     }
                 ],
-            }
+            },
+            sort_keys=True,
         )
     ),
 )
@@ -1383,7 +1390,8 @@ aws.iam.RolePolicy(
                         "Resource": "*",
                     },
                 ],
-            }
+            },
+            sort_keys=True,
         )
     ),
 )
@@ -1407,7 +1415,8 @@ aws.iam.RolePolicy(
                     "Resource": "arn:aws:logs:*:*:log-group:/aws/sagemaker/*",
                 }
             ],
-        }
+        },
+        sort_keys=True,
     ),
 )
 
@@ -1488,7 +1497,8 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                     },
                     "essential": True,
                 }
-            ]
+            ],
+            sort_keys=True,
         )
     ),
     tags=tags,
@@ -1563,7 +1573,8 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                     },
                     "essential": True,
                 }
-            ]
+            ],
+            sort_keys=True,
         )
     ),
     tags=tags,
@@ -1625,7 +1636,8 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                     },
                     "essential": True,
                 }
-            ]
+            ],
+            sort_keys=True,
         )
     ),
     tags=tags,

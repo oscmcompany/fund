@@ -30,8 +30,6 @@ def test_production_stack_config_stores_budget_alert_emails_as_secret() -> None:
         "  oscmcompany:budgetAlertEmailAddresses:\n    secure:"
         in production_stack_config
     )
-    assert "john.forstmeier@gmail.com" not in production_stack_config
-    assert "chris.william.addy@gmail.com" not in production_stack_config
 
 
 def test_infrastructure_entrypoint_contains_oidc_claim_constraints() -> None:

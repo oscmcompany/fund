@@ -23,8 +23,5 @@ data/
 .claude/tasks/
 .scratchpad/
 
-coverage/
-
-.pi
 node_modules
 bun.lock
