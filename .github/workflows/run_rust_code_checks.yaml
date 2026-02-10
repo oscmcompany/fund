@@ -11,10 +11,15 @@ jobs:
     runs-on: ubuntu-latest
     name: Detect Rust code changes
     permissions:
+      contents: read
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dorny/paths-filter@v3
         id: filter
         with:

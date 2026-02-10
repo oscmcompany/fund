@@ -136,13 +136,16 @@ aws ecr get-login-password --region ${aws_region} | docker login \
     --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
 
 echo "Checking if image for commit ${commit_hash} already exists in ECR"
-existing_tag=$(aws ecr describe-images \
+existing_tag="NONE"
+if image_digest=$(aws ecr describe-images \
     --repository-name "${repository_name}" \
     --image-ids "imageTag=git-${commit_hash}" \
     --query 'imageDetails[0].imageDigest' \
-    --output text 2>/dev/null || echo "NONE")
+    --output text 2>/dev/null); then
+    existing_tag="${image_digest}"
+fi
 
-if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ] && [[ ! "$existing_tag" =~ ^(An\ error\ occurred) ]]; then
+if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
     echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
     echo "Image pushed: ${application_name} ${stage_name} (cached)"
     exit 0

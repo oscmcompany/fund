@@ -2,12 +2,18 @@
 
 import re
 
+import pytest
+
 from .conftest import MASKFILE, REPO_ROOT, read_maskfile
 
+DATAMANAGER_DOCKERFILE = REPO_ROOT / "applications" / "datamanager" / "Dockerfile"
 
-def _read_maskfile() -> str:
-    """Read the maskfile.md content."""
-    return read_maskfile()
+
+@pytest.fixture(scope="module")
+def datamanager_dockerfile_content() -> str:
+    """Read the datamanager Dockerfile once for all Dockerfile assertions."""
+    assert DATAMANAGER_DOCKERFILE.exists(), "Datamanager Dockerfile must exist"
+    return DATAMANAGER_DOCKERFILE.read_text()
 
 
 def _extract_code_blocks(content: str) -> list[str]:
@@ -21,91 +27,91 @@ def test_maskfile_structure_maskfile_exists() -> None:
 
 
 def test_maskfile_structure_has_infrastructure_section() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "## infrastructure" in content
 
 
 def test_maskfile_structure_has_development_section() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "## development" in content
 
 
 def test_maskfile_structure_has_images_subsection() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "### images" in content
 
 
 def test_maskfile_structure_has_build_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### build (application_name) (stage_name)" in content
 
 
 def test_maskfile_structure_has_push_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### push (application_name) (stage_name)" in content
 
 
 def test_docker_build_command_uses_buildx() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "docker buildx build" in content, "Must use docker buildx for building"
 
 
 def test_docker_build_command_has_cache_from() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "--cache-from" in content, "Must configure cache-from"
 
 
 def test_docker_build_command_has_cache_to() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "--cache-to" in content, "Must configure cache-to"
 
 
 def test_docker_build_command_gha_cache_has_scope() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "scope=" in content, (
         "GHA cache must use scope to prevent cross-service eviction"
     )
 
 
 def test_docker_build_command_has_gha_cache_in_ci() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "type=gha" in content, "Must use GHA cache backend in CI"
 
 
 def test_docker_build_command_has_registry_cache() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "type=registry" in content, "Must use registry cache as fallback"
 
 
 def test_docker_build_command_cache_mode_max() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "mode=max" in content, "Must use mode=max for maximum layer caching"
 
 
 def test_docker_build_command_targets_linux_amd64() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "--platform linux/amd64" in content
 
 
 def test_docker_build_command_uses_dockerfile_path() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "--file applications/${application_name}/Dockerfile" in content
 
 
 def test_docker_build_command_buildx_setup_skipped_in_gha() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     # When in GHA, skip manual buildx creation since docker/setup-buildx-action
     # handles it
     assert "GITHUB_ACTIONS" in content, "Must detect GitHub Actions environment"
 
 
 def test_docker_push_command_has_ecr_login() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "aws ecr get-login-password" in content, "Must log into ECR"
 
 
 def test_docker_push_command_has_digest_check() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert (
         "describe-images" in content
         or "batch-get-image" in content
@@ -114,14 +120,14 @@ def test_docker_push_command_has_digest_check() -> None:
 
 
 def test_docker_push_command_has_skip_push_logic() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "skipping push" in content.lower() or "skip" in content.lower(), (
         "Must have logic to skip push when image is unchanged"
     )
 
 
 def test_docker_push_command_pushes_with_commit_tag() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "git" in content.lower(), "Should use git for commit information"
     assert "tag" in content.lower() or "rev-parse" in content.lower(), (
         "Should tag images with git commit for traceability"
@@ -129,54 +135,54 @@ def test_docker_push_command_pushes_with_commit_tag() -> None:
 
 
 def test_rust_development_commands_has_rust_section() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "### rust" in content
 
 
 def test_rust_development_commands_has_update_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### update" in content
     assert "cargo update" in content
 
 
 def test_rust_development_commands_has_check_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### check" in content
     assert "cargo check" in content
 
 
 def test_rust_development_commands_has_format_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### format" in content
     assert "cargo fmt" in content
 
 
 def test_rust_development_commands_has_lint_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### lint" in content
     assert "cargo clippy" in content
 
 
 def test_rust_development_commands_has_test_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### test" in content
     assert "cargo test" in content
 
 
 def test_rust_development_commands_has_all_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### all" in content
 
 
 def test_rust_development_commands_has_ci_command() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     assert "#### continuous-integration" in content, (
         "Must have a CI-optimized rust command"
     )
 
 
 def test_rust_development_commands_ci_command_skips_cargo_update() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     # Find the ci command block
     ci_section_match = re.search(
         r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
@@ -187,7 +193,7 @@ def test_rust_development_commands_ci_command_skips_cargo_update() -> None:
 
 
 def test_rust_development_commands_ci_command_skips_cargo_check() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     ci_section_match = re.search(
         r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
     )
@@ -199,7 +205,7 @@ def test_rust_development_commands_ci_command_skips_cargo_check() -> None:
 
 
 def test_rust_development_commands_ci_command_has_format_check() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     ci_section_match = re.search(
         r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
     )
@@ -210,7 +216,7 @@ def test_rust_development_commands_ci_command_has_format_check() -> None:
 
 
 def test_rust_development_commands_ci_command_has_clippy_with_warnings() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     ci_section_match = re.search(
         r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
     )
@@ -221,7 +227,7 @@ def test_rust_development_commands_ci_command_has_clippy_with_warnings() -> None
 
 
 def test_rust_development_commands_ci_command_has_tests() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     ci_section_match = re.search(
         r"#### continuous-integration\n.*?```bash\n(.*?)```", content, re.DOTALL
     )
@@ -231,7 +237,7 @@ def test_rust_development_commands_ci_command_has_tests() -> None:
 
 
 def test_rust_development_commands_all_code_blocks_have_set_euo_pipefail() -> None:
-    content = _read_maskfile()
+    content = read_maskfile()
     code_blocks = _extract_code_blocks(content)
     for block in code_blocks:
         assert "set -euo pipefail" in block, (
@@ -240,44 +246,60 @@ def test_rust_development_commands_all_code_blocks_have_set_euo_pipefail() -> No
 
 
 def test_dockerfile_configuration_datamanager_dockerfile_exists() -> None:
-    path = REPO_ROOT / "applications" / "datamanager" / "Dockerfile"
-    assert path.exists()
+    assert DATAMANAGER_DOCKERFILE.exists()
 
 
-def test_dockerfile_configuration_uses_multi_stage_build() -> None:
+def test_dockerfile_configuration_uses_multi_stage_build(
+    datamanager_dockerfile_content: str,
+) -> None:
     min_dockerfile_stages = 3
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    from_count = content.count("FROM ")
+    from_count = datamanager_dockerfile_content.count("FROM ")
     assert from_count >= min_dockerfile_stages, (
         f"Must use multi-stage build, found {from_count} FROM statements"
     )
 
 
-def test_dockerfile_configuration_uses_cargo_chef() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "cargo-chef" in content, "Must use cargo-chef for dependency caching"
+def test_dockerfile_configuration_uses_cargo_chef(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "cargo-chef" in datamanager_dockerfile_content, (
+        "Must use cargo-chef for dependency caching"
+    )
 
 
-def test_dockerfile_configuration_has_buildkit_cache_mounts() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "--mount=type=cache" in content, "Must use BuildKit cache mounts"
+def test_dockerfile_configuration_has_buildkit_cache_mounts(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "--mount=type=cache" in datamanager_dockerfile_content, (
+        "Must use BuildKit cache mounts"
+    )
 
 
-def test_dockerfile_configuration_caches_cargo_registry() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "/usr/local/cargo/registry" in content, "Must cache cargo registry"
+def test_dockerfile_configuration_caches_cargo_registry(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "/usr/local/cargo/registry" in datamanager_dockerfile_content, (
+        "Must cache cargo registry"
+    )
 
 
-def test_dockerfile_configuration_caches_build_target() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "/app/target" in content, "Must cache build target directory"
+def test_dockerfile_configuration_caches_build_target(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "/app/target" in datamanager_dockerfile_content, (
+        "Must cache build target directory"
+    )
 
 
-def test_dockerfile_configuration_final_stage_is_slim() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "slim" in content, "Final stage should use slim base image"
+def test_dockerfile_configuration_final_stage_is_slim(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "slim" in datamanager_dockerfile_content, (
+        "Final stage should use slim base image"
+    )
 
 
-def test_dockerfile_configuration_builds_in_release_mode() -> None:
-    content = (REPO_ROOT / "applications" / "datamanager" / "Dockerfile").read_text()
-    assert "--release" in content, "Must build in release mode"
+def test_dockerfile_configuration_builds_in_release_mode(
+    datamanager_dockerfile_content: str,
+) -> None:
+    assert "--release" in datamanager_dockerfile_content, "Must build in release mode"
