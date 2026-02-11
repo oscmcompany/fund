@@ -22,6 +22,7 @@ Follow these steps:
 ### 1. Fetch Pull Request Data
 
 - Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a pull request number is required.
+- **IMPORTANT: Environment variable persistence** - When using the Bash tool, environment variables do not persist between separate tool invocations. The SCRATCHPAD, OWNER, and REPO setup commands below should be combined into a single bash execution along with the PR data fetch, or re-declared at the start of each subsequent bash command that needs them.
 - **CRITICAL: Set up SCRATCHPAD environment variable FIRST** before any file operations:
 
   ```bash
@@ -53,7 +54,7 @@ Follow these steps:
   ```bash
   _remote_url=$(git remote get-url origin)
   export OWNER=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\1|')
-  export REPO=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|')
+  export REPO=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|' | sed 's/\.git$//')
 
   if [ -z "${OWNER}" ] || [ -z "${REPO}" ]; then
     echo "Error: Failed to determine repository owner and name from git remote \"origin\""
@@ -67,8 +68,10 @@ Follow these steps:
 
   ```bash
   # Critical: Validate SCRATCHPAD is set and accessible before proceeding
+  # Note: If running these commands in separate bash invocations, SCRATCHPAD must be
+  # re-declared or the setup block must be combined with this validation block.
   if [ -z "${SCRATCHPAD}" ]; then
-    echo "Error: SCRATCHPAD variable is not set. This should have been set in the previous step."
+    echo "Error: SCRATCHPAD variable is not set. Ensure SCRATCHPAD setup and this validation are in the same bash execution context."
     exit 1
   fi
 
