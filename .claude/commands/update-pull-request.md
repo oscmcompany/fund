@@ -58,10 +58,26 @@ Follow these steps:
   echo "Repository: ${OWNER}/${REPO}"
   ```
 
+- **Verify SCRATCHPAD is set before file operations**:
+
+  ```bash
+  # Critical: Validate SCRATCHPAD is set and accessible before proceeding
+  if [ -z "${SCRATCHPAD}" ]; then
+    echo "Error: SCRATCHPAD variable is not set. This should have been set in the previous step."
+    exit 1
+  fi
+
+  if [ ! -d "${SCRATCHPAD}" ] || [ ! -w "${SCRATCHPAD}" ]; then
+    echo "Error: SCRATCHPAD directory ${SCRATCHPAD} does not exist or is not writable"
+    exit 1
+  fi
+
+  echo "SCRATCHPAD validated: ${SCRATCHPAD}"
+  ```
+
 - Fetch comprehensive pull request data using a single GraphQL query, saving to a file to avoid token limit issues:
 
   ```bash
-
   gh api graphql -f query='
     query($owner: String!, $repo: String!, $number: Int!) {
       repository(owner: $owner, name: $repo) {
