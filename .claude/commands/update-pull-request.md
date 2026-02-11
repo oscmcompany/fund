@@ -25,16 +25,21 @@ Follow these steps:
 - **CRITICAL: Set up SCRATCHPAD environment variable FIRST** before any file operations:
 
   ```bash
-  # Determine scratchpad from system or use default
-  SCRATCHPAD="${SCRATCHPAD:-/tmp/claude-scratchpad}"
-  mkdir -p "${SCRATCHPAD}"
-  export SCRATCHPAD
-
-  # Verify scratchpad is writable
-  if [ ! -w "${SCRATCHPAD}" ]; then
-    echo "Error: Scratchpad directory ${SCRATCHPAD} is not writable"
-    exit 1
+  # Set up scratchpad directory with session isolation
+  : "${TMPDIR:=/tmp}"
+  if [ -z "${SCRATCHPAD:-}" ]; then
+    # Create a unique, private scratchpad directory
+    umask 077
+    SCRATCHPAD="$(mktemp -d "${TMPDIR%/}/claude-scratchpad.XXXXXX")" || {
+      echo "Error: Failed to create scratchpad directory under ${TMPDIR}"
+      exit 1
+    }
+  else
+    # Use caller-provided SCRATCHPAD, hardening it
+    mkdir -p "${SCRATCHPAD}"
+    chmod 700 "${SCRATCHPAD}" 2>/dev/null || true
   fi
+  export SCRATCHPAD
 
   echo "Using scratchpad: ${SCRATCHPAD}"
   ```
@@ -42,8 +47,13 @@ Follow these steps:
 - Determine repository owner and name from git remote and export as environment variables:
 
   ```bash
-  export OWNER=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)\.git|\1|')
-  export REPO=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)\.git|\2|')
+  export OWNER=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\1|')
+  export REPO=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|')
+
+  if [ -z "${OWNER}" ] || [ -z "${REPO}" ]; then
+    echo "Error: Failed to determine repository owner and name from git remote \"origin\""
+    exit 1
+  fi
 
   echo "Repository: ${OWNER}/${REPO}"
   ```
@@ -210,21 +220,21 @@ Follow these steps:
   }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/pr_comments.json"
 
   # Extract check failures
-  jq '[.data.repository.pullRequest.commits.nodes[].commit.checkSuites.nodes[] |
-    .checkRuns.nodes[] |
+  jq '[.data.repository.pullRequest.commits.nodes[].commit.checkSuites.nodes[] as $suite |
+    $suite.checkRuns.nodes[] |
     select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT") | {
     name: .name,
     conclusion: .conclusion,
     detailsUrl: .detailsUrl,
-    workflowRunId: (.checkSuite.workflowRun.databaseId // null)
+    workflowRunId: ($suite.workflowRun.databaseId // null)
   }] | unique_by(.name)' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/check_failures.json"
 
   echo "Data extraction complete:"
   echo "  - metadata.json (PR info)"
-  echo "  - review_threads.json ($(jq 'length' ${SCRATCHPAD}/review_threads.json) unresolved threads)"
-  echo "  - outdated_threads.json ($(jq 'length' ${SCRATCHPAD}/outdated_threads.json) outdated threads)"
-  echo "  - pr_comments.json ($(jq 'length' ${SCRATCHPAD}/pr_comments.json) PR comments)"
-  echo "  - check_failures.json ($(jq 'length' ${SCRATCHPAD}/check_failures.json) failed checks)"
+  echo "  - review_threads.json ($(jq 'length' "${SCRATCHPAD}/review_threads.json") unresolved threads)"
+  echo "  - outdated_threads.json ($(jq 'length' "${SCRATCHPAD}/outdated_threads.json") outdated threads)"
+  echo "  - pr_comments.json ($(jq 'length' "${SCRATCHPAD}/pr_comments.json") PR comments)"
+  echo "  - check_failures.json ($(jq 'length' "${SCRATCHPAD}/check_failures.json") failed checks)"
   ```
 
 - These smaller structured files can be read with Read tool if needed, and eliminate redundant jq parsing throughout the command.
@@ -248,7 +258,7 @@ Follow these steps:
 
   ```bash
   echo "=== Unresolved Review Threads ==="
-  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
+  jq -r '.[] | "\(.threadId) | \(if .comments[0].path then .comments[0].path else "N/A" end) | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
 
   echo ""
   echo "=== PR-level Comments ==="
@@ -277,7 +287,7 @@ Follow these steps:
 
   ```bash
   echo "=== Outdated threads (require manual review) ==="
-  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
+  jq -r '.[] | "\(.threadId) | \(if .comments[0].path then .comments[0].path else "N/A" end) | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
   ```
 
 - **Important**: "Outdated" means the code was modified, not that feedback is irrelevant. Review each outdated thread manually during Step 3 to determine if the feedback still applies or should be addressed.
@@ -355,6 +365,7 @@ Follow these steps:
     Use the comment node ID (format: `PRRC_*`) from `review_threads.json` for `inReplyTo` parameter.
 
     Example to get comment node ID:
+
     ```bash
     # Get first comment's node ID from a specific thread
     COMMENT_ID=$(jq -r '.[] | select(.threadId == "PRRT_xxx") | .comments[0].id' "${SCRATCHPAD}/review_threads.json")
