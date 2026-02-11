@@ -1,13 +1,12 @@
-# GitHub Pulumi environment runbook
+# GitHub Pulumi Environment Runbook
 
 Required GitHub Environment: `pulumi`
 
-Required environment secrets:
+Required environment secrets for operations with Pulumi:
 
 - `AWS_IAM_INFRASTRUCTURE_ROLE_ARN`
-- `AWS_REGION` *(still required in GitHub for now)*
+- `AWS_REGION`
 - `PULUMI_ACCESS_TOKEN`
-- `AWS_S3_ARTIFACTS_BUCKET_NAME`
 
 ## Update `AWS_IAM_INFRASTRUCTURE_ROLE_ARN` from Pulumi output
 
@@ -15,7 +14,7 @@ Run from repository root:
 
 ```bash
 cd infrastructure
-pulumi stack select <pulumi-org>/oscmcompany/production
+pulumi stack select oscmcompany/fund/production
 role_arn="$(pulumi stack output aws_iam_github_actions_infrastructure_role_arn --stack production)"
 cd ..
 gh secret set AWS_IAM_INFRASTRUCTURE_ROLE_ARN --env pulumi --body "$role_arn"
@@ -27,7 +26,7 @@ Run from repository root:
 
 ```bash
 cd infrastructure
-pulumi stack select <pulumi-org>/oscmcompany/production
+pulumi stack select oscmcompany/fund/production
 region="$(pulumi config get aws:region --stack production)"
 cd ..
 gh secret set AWS_REGION --env pulumi --body "$region"
@@ -41,18 +40,6 @@ Run from repository root:
 
 ```bash
 gh secret set PULUMI_ACCESS_TOKEN --env pulumi --body "<your-token>"
-```
-
-## Update `AWS_S3_ARTIFACTS_BUCKET_NAME` from Pulumi output
-
-Run from repository root:
-
-```bash
-cd infrastructure
-pulumi stack select <pulumi-org>/oscmcompany/production
-bucket_name="$(pulumi stack output aws_s3_pulumi_artifacts_bucket_name --stack production)"
-cd ..
-gh secret set AWS_S3_ARTIFACTS_BUCKET_NAME --env pulumi --body "$bucket_name"
 ```
 
 ## Verify all secrets

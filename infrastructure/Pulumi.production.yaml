@@ -1,25 +1,25 @@
 config:
-  oscmcompany:githubActionsRoleName: oscm-github-actions-infrastructure-role
-  oscmcompany:githubRepository: oscmcompany/fund
-  oscmcompany:githubBranch: master
-  oscmcompany:githubWorkflowFiles:
+  aws:region:
+    secure: AAABAHZdRn/VT0csV4a+3PcpSKdeMfYLIAPSZxB5TBpYzC/qCrJDtfU=
+  fund:budgetAlertEmailAddresses:
+    secure: AAABAEVOj8Wk2uRR16QLK4GVV/0Q7NqIgcpgPSEGeWeIDeq2l9JANRiPzcqKk0HfPYnJ1+x+DR0GeVYwvSENSURnq/Or5Bc0pMqMYHyMFbXqXp45VE6J2XuyaUSF8WQK3IyNcJr7HAoK/9VtRrttbQ==
+  fund:sharedSecretsName:
+    secure: AAABAJP6Q5kDqu75F0YSIGC1Kd4Em6BQsRjupyMIGdF13bj6HQMByXqcklK5R5co/rG92MiK
+  fund:sharedSecretValues:
+    secure: AAABANfo8z5V73nucW1gQqlDxf5UMJDbq7qK8ebRvm02qnD2PMqwdjB90pYsWUylf2b9l2VancHv1D3FaSSIKC/aXP+NXJVWzDUKzHhUUq8jYX1e9Bg3c6/K1FOYM+zC/2/SElj3UTGQ/w8rFAWnLWOfsARlonIKb5xWU8/spNwZlis0iiNC4fwOxp2nSszvFQ==
+  fund:datamanagerSecretsName:
+    secure: AAABAFZGgR8hSJ3MpCG458g5pDd4YBtqryzG0fjWgzw5Wj7/EqNYpc1QYgDDw2w2LpYVMRAHXLBSGTU=
+  fund:datamanagerSecretValues:
+    secure: AAABAGePtT+1PQC2F5eUwwHdGyR9ogUvwvEs+IqUFxczHP2/zF50sWrszai36v7V8yRhQCgjI5OT/wQa9d/yr5djB6+1xTXHV48zouHZNgROPpOl4p1f
+  fund:portfoliomanagerSecretName:
+    secure: AAABAJatHFOp4tQTL8lf14JfSYVM1GlUyFASwA+eLhdZ9Fe/xwzYDe8LrkFwjW8H6Uc8heRdNdKOur7OplyrJA==
+  fund:portfoliomanagerSecretValues:
+    secure: AAABAK5T3T/Ka1MaJgfNaJkWDfhzjqavKrRc+TkWwNWgLrrgFY2nFncT7nTVFBUnWp+2hTYB+QV0obHY1YBmPu7p+D2orJXpt3rI7PcmZ6G/KQ+ob55fDxTLdr/cebQhaIuj/P8zPJu6YBJkqJw87FdsDXl+L9Yhx9x4MAC0Ub03+w2yi6aOgtxj3IrFasJyTaMsseWUMNQIU4bGXSLatsWh9UcceOYN0w==
+  fund:githubActionsRoleName: oscm-github-actions-infrastructure-role
+  fund:sagemakerExecutionRoleName: oscm-sagemaker-execution-role
+  fund:githubRepository: oscmcompany/fund
+  fund:githubBranch: master
+  fund:monthlyBudgetLimitUsd: "25"
+  fund:githubWorkflowFiles:
     - launch_infrastructure.yaml
     - teardown_infrastructure.yaml
-  oscmcompany:monthlyBudgetLimitUsd: "25"
-  oscmcompany:sagemakerExecutionRoleName: oscm-sagemaker-execution-role
-  oscmcompany:datamanagerSecretsName:
-    secure: AAABAGu4ra3hnGjI0A6mIEZfRq7S4Gt1dlJlsXl5IPrNFBq5iI+9mY4LTMVcxrsu9UApxjmJvHjzWdg=
-  oscmcompany:portfoliomanagerSecretsName:
-    secure: AAABAEta3vnia3gogqNqYIkLTcqNhN2mm/L0kcZzMMCZMKMW4DoAKghpSs8mBbOaX/c7z7eIIPyveW3LFi5WOA==
-  oscmcompany:sharedSecretsName:
-    secure: AAABAH+pUud4fI8yo0/OomA1xH64LIRFL1/HFb+vR6nN8BES4QtRd3aRQCyf2cRbzJk6K7S6
-  oscmcompany:budgetAlertEmailAddresses:
-    secure: AAABAMb3h0667aby5qWBl7wR+YJcEJam9aATIoXYBlx3Bxs7rwnx76uFBTBrtuOGGRfrSW0Z/q1DmDiPV0tQwjSnGFyVwmxTUmmxC0HIrGEf9XbZCyKDOc0VSA==
-  oscmcompany:sharedSecretValues:
-    secure: AAABAIz1Ftl2ENTaRpNksbHoBJW7BpopzwKbY+nafvdgiLI7qqauqbg2CTb+rMKNnuq3C/aLmTNridsHgHLWTmPmKp56D5xa1G1TwbhzV6nefdYU7cDgmgdl+oXjkBHB/wG2FFfcVM+afiJsVGbpbCgFugZcHKPLsROQeYrHROV9wV2MNl41g+u4GB9/Q+kP8w==
-  oscmcompany:portfoliomanagerSecretValues:
-    secure: AAABAGnysbrui0oT0MnFkNBQCyaqGz5NTJY6Hiu76FHt/g6wDQURQ36QhFFqTMhvVRS23q0bqJRz6f3nB668vNy+ookaDgeR2mkJD7sBov0TePnzerpLmdRjwzzR0MIlflCLgNKsnMDR0aUGrGDEStA1VQnnDBIf2VgUfArxoQdi6Cs=
-  oscmcompany:datamanagerSecretValues:
-    secure: AAABAK5TqECde3nfl5kJsSt/9TGhvfoK/FCXS5Y2Kd17sdagjrUE/XN4IBuhbD3CPPf2/ylutoQc2bwCA3ovpkU99U0C79xcP/idAmLeDkmK0xtyY8WC
-  aws:region:
-    secure: AAABAOzhzfVyWQZNwzf6cCYoVd2/1GneDFnmS27/bRkUMo1tSPoYm2E=

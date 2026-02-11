@@ -42,7 +42,7 @@ if stack_name != "production":
     message = "Only the production Pulumi stack is supported."
     raise ValueError(message)
 
-stack_config = pulumi.Config("oscmcompany")
+stack_config = pulumi.Config("fund")
 aws_config = pulumi.Config("aws")
 
 aws_region_full_key = aws_config.full_key("region")
@@ -86,9 +86,9 @@ if not budget_alert_email_addresses:
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
 sagemaker_execution_role_name = stack_config.require("sagemakerExecutionRoleName")
 
-datamanager_secrets_name = stack_config.require("datamanagerSecretsName")
-portfoliomanager_secrets_name = stack_config.require("portfoliomanagerSecretsName")
-shared_secrets_name = stack_config.require("sharedSecretsName")
+datamanager_secrets_name = stack_config.require("datamanagerSecretName")
+portfoliomanager_secrets_name = stack_config.require("portfoliomanagerSecretName")
+shared_secrets_name = stack_config.require("sharedSecretName")
 
 datamanager_secret_values = require_secret_config_object(
     stack_config,
@@ -190,7 +190,7 @@ aws.secretsmanager.SecretVersion(
 
 infrastructure_alerts_topic = aws.sns.Topic(
     "infrastructure_alerts_topic",
-    name="oscm-production-infrastructure-alerts",
+    name="oscm-infrastructure-alerts",
     tags=tags,
 )
 
@@ -208,7 +208,7 @@ for notification_email_index, notification_email_address in enumerate(
 aws.budgets.Budget(
     "production_cost_budget",
     account_id=account_id,
-    name="oscm-production-monthly-cost",
+    name="oscm-monthly-cost",
     budget_type="COST",
     time_unit="MONTHLY",
     limit_amount=f"{monthly_budget_limit_usd:.2f}",
@@ -235,6 +235,7 @@ aws.budgets.Budget(
 data_bucket = aws.s3.Bucket(
     "data_bucket",
     bucket_prefix="oscm-data-",
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -271,6 +272,7 @@ aws.s3.BucketVersioning(
 model_artifacts_bucket = aws.s3.Bucket(
     "model_artifacts_bucket",
     bucket_prefix="oscm-model-artifacts-",
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -453,7 +455,7 @@ nat = aws.ec2.NatGateway(
 
 aws.cloudwatch.MetricAlarm(
     "nat_gateway_bytes_out_to_destination_alarm",
-    name="oscm-production-nat-gateway-bytes-out-to-destination",
+    name="oscm-nat-gateway-bytes-out-to-destination",
     alarm_description=(
         "Triggers when NAT gateway outbound traffic exceeds 500 MB per hour for "
         "2 consecutive hours."
@@ -874,6 +876,7 @@ github_actions_infrastructure_role = aws.iam.Role(
             sort_keys=True,
         )
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -925,7 +928,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                 # support practical resource-level scoping for stack create/update/
                 # delete operations.
                 {
-                    "Sid": "ManageEc2EcsElbBudgetsAndServiceDiscovery",
+                    "Sid": "ManageEC2ECSELBBudgetsAndServiceDiscovery",
                     "Effect": "Allow",
                     "Action": [
                         "ec2:*",
@@ -938,7 +941,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                 },
                 # CreateRepository/GetAuthorizationToken require wildcard resources.
                 {
-                    "Sid": "CreateAndAuthenticateEcrRepositories",
+                    "Sid": "CreateAndAuthenticateECRRepositories",
                     "Effect": "Allow",
                     "Action": [
                         "ecr:CreateRepository",
@@ -947,7 +950,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     "Resource": "*",
                 },
                 {
-                    "Sid": "ManageOscmEcrRepositories",
+                    "Sid": "ManageECRRepositories",
                     "Effect": "Allow",
                     "Action": "ecr:*",
                     "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/oscm/*",
@@ -960,7 +963,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     "Resource": "*",
                 },
                 {
-                    "Sid": "ManageOscmBuckets",
+                    "Sid": "ManageBuckets",
                     "Effect": "Allow",
                     "Action": "s3:*",
                     "Resource": [
@@ -988,13 +991,13 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     ],
                 },
                 {
-                    "Sid": "ManageOscmParameters",
+                    "Sid": "ManageParameters",
                     "Effect": "Allow",
                     "Action": "ssm:*",
                     "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/oscm/*",
                 },
                 {
-                    "Sid": "ManageOscmLogGroups",
+                    "Sid": "ManageLogGroups",
                     "Effect": "Allow",
                     "Action": "logs:*",
                     "Resource": [
@@ -1004,7 +1007,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                 },
                 # Alarm mutation APIs require wildcard resources.
                 {
-                    "Sid": "ManageOscmAlarms",
+                    "Sid": "ManageAlarms",
                     "Effect": "Allow",
                     "Action": [
                         "cloudwatch:DeleteAlarms",
@@ -1027,19 +1030,19 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     "Effect": "Allow",
                     "Action": "sns:*",
                     "Resource": [
-                        f"arn:aws:sns:{region}:{account_id}:oscm-production-infrastructure-alerts",
-                        f"arn:aws:sns:{region}:{account_id}:oscm-production-infrastructure-alerts:*",
+                        f"arn:aws:sns:{region}:{account_id}:oscm-infrastructure-alerts",
+                        f"arn:aws:sns:{region}:{account_id}:oscm-infrastructure-alerts:*",
                     ],
                 },
                 {
-                    "Sid": "CreateGithubActionsOidcProvider",
+                    "Sid": "CreateGithubActionsOIDCProvider",
                     "Effect": "Allow",
                     "Action": "iam:CreateOpenIDConnectProvider",
                     "Resource": github_oidc_provider_arn,
                 },
                 # CreateRole uses wildcard resources by API design.
                 {
-                    "Sid": "CreateOscmRoles",
+                    "Sid": "CreateRoles",
                     "Effect": "Allow",
                     "Action": "iam:CreateRole",
                     "Resource": "*",
@@ -1056,7 +1059,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                 },
                 # CreatePolicy uses wildcard resources by API design.
                 {
-                    "Sid": "CreateOscmPolicies",
+                    "Sid": "CreatePolicies",
                     "Effect": "Allow",
                     "Action": "iam:CreatePolicy",
                     "Resource": "*",
@@ -1068,7 +1071,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                 },
                 # CreateServiceLinkedRole uses wildcard resources by API design.
                 {
-                    "Sid": "CreateServiceLinkedRolesForOscmStack",
+                    "Sid": "CreateServiceLinkedRolesForStack",
                     "Effect": "Allow",
                     "Action": "iam:CreateServiceLinkedRole",
                     "Resource": "*",
@@ -1082,7 +1085,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     },
                 },
                 {
-                    "Sid": "ManageOscmRoles",
+                    "Sid": "ManageRoles",
                     "Effect": "Allow",
                     "Action": [
                         "iam:AttachRolePolicy",
@@ -1116,7 +1119,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     },
                 },
                 {
-                    "Sid": "ManageOscmInlineRolePolicies",
+                    "Sid": "ManageInlineRolePolicies",
                     "Effect": "Allow",
                     "Action": [
                         "iam:DeleteRolePolicy",
@@ -1141,7 +1144,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     },
                 },
                 {
-                    "Sid": "ManageOscmPolicies",
+                    "Sid": "ManagePolicies",
                     "Effect": "Allow",
                     "Action": [
                         "iam:CreatePolicyVersion",
@@ -1154,7 +1157,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     "Resource": f"arn:aws:iam::{account_id}:policy/oscm-*",
                 },
                 {
-                    "Sid": "ManageGithubActionsOidcProvider",
+                    "Sid": "ManageGithubActionsOIDCProvider",
                     "Effect": "Allow",
                     "Action": [
                         "iam:AddClientIDToOpenIDConnectProvider",
@@ -1188,6 +1191,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
         },
         sort_keys=True,
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1195,6 +1199,7 @@ aws.iam.RolePolicyAttachment(
     "github_actions_infrastructure_role_custom_policy",
     role=github_actions_infrastructure_role.name,
     policy_arn=github_actions_infrastructure_policy.arn,
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 # IAM Role for ECS to perform infrastructure tasks
@@ -1332,6 +1337,7 @@ sagemaker_execution_role = aws.iam.Role(
         },
         sort_keys=True,
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1364,6 +1370,7 @@ aws.iam.RolePolicy(
             sort_keys=True,
         )
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.iam.RolePolicy(
@@ -1394,6 +1401,7 @@ aws.iam.RolePolicy(
             sort_keys=True,
         )
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.iam.RolePolicy(
@@ -1418,6 +1426,7 @@ aws.iam.RolePolicy(
         },
         sort_keys=True,
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 datamanager_log_group = aws.cloudwatch.LogGroup(

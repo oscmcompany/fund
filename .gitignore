@@ -9,8 +9,8 @@
 __pycache__/
 .envrc
 .env.nu
-coverage/
-.coverage
+.coverage_output/
+.coverage*
 *.csv
 *.egg-info/
 wandb/
@@ -22,6 +22,3 @@ data/
 **/*.json
 .claude/tasks/
 .scratchpad/
-
-node_modules
-bun.lock

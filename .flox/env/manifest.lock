@@ -119,6 +119,9 @@
     "hook": {
       "on-activate": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n"
     },
+    "profile": {
+      "common": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n"
+    },
     "options": {
       "systems": [
         "aarch64-darwin",

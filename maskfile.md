@@ -68,7 +68,7 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscmcompany/${application_name}-${stage_name}"
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscm/${application_name}-${stage_name}"
 cache_reference="${image_reference}:buildcache"
 
 # Use GHA backend for Cargo caching when running in GitHub Actions 
@@ -120,7 +120,7 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscmcompany/${application_name}-${stage_name}"
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscm/${application_name}-${stage_name}"
 
 echo "Logging into ECR"
 aws ecr get-login-password --region ${aws_region} | docker login \
@@ -148,14 +148,14 @@ cd infrastructure/
 
 echo "Launching infrastructure"
 
-organization_name=$(pulumi whoami)
+organization_name=$(pulumi org get-default)
 
 if [ -z "${organization_name}" ]; then
     echo "Unable to determine Pulumi organization name - ensure you are logged in"
     exit 1
 fi
 
-pulumi stack select ${organization_name}/oscmcompany/production --create
+pulumi stack select ${organization_name}/fund/production --create
 
 pulumi up --diff --yes
 
@@ -166,7 +166,7 @@ cluster=$(pulumi stack output aws_ecs_cluster_name --stack production 2>/dev/nul
 if [ -z "$cluster" ]; then
     echo "Cluster not found - skipping service deployments (initial setup)"
 else
-    for service in oscmcompany-datamanager oscmcompany-portfoliomanager oscmcompany-equitypricemodel; do
+    for service in oscm-datamanager oscm-portfoliomanager oscm-equitypricemodel; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -210,7 +210,7 @@ else
     done
 
     echo "Stack update complete - ECS is performing rolling deployments"
-    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services oscmcompany-portfoliomanager"
+    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services oscm-portfoliomanager"
 fi
 
 echo "Infrastructure launched successfully"
@@ -570,7 +570,7 @@ if [ "${data_type}" = "categories" ]; then
     echo "Syncing equity categories"
 
     export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
-        --secret-id oscmcompany/production/environment_variables \
+        --secret-id oscm/production/datamanager \
         --query 'SecretString' \
         --output text | jq -r '.MASSIVE_API_KEY')
 
