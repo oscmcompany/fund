@@ -29,15 +29,19 @@ Follow these steps:
   : "${TMPDIR:=/tmp}"
   if [ -z "${SCRATCHPAD:-}" ]; then
     # Create a unique, private scratchpad directory
+    _old_umask=$(umask)
     umask 077
     SCRATCHPAD="$(mktemp -d "${TMPDIR%/}/claude-scratchpad.XXXXXX")" || {
       echo "Error: Failed to create scratchpad directory under ${TMPDIR}"
       exit 1
     }
+    umask "${_old_umask}"
   else
     # Use caller-provided SCRATCHPAD, hardening it
+    _old_umask=$(umask)
     mkdir -p "${SCRATCHPAD}"
     chmod 700 "${SCRATCHPAD}" 2>/dev/null || true
+    umask "${_old_umask}"
   fi
   export SCRATCHPAD
 
@@ -47,8 +51,9 @@ Follow these steps:
 - Determine repository owner and name from git remote and export as environment variables:
 
   ```bash
-  export OWNER=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\1|')
-  export REPO=$(git remote get-url origin | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|')
+  _remote_url=$(git remote get-url origin)
+  export OWNER=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\1|')
+  export REPO=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|')
 
   if [ -z "${OWNER}" ] || [ -z "${REPO}" ]; then
     echo "Error: Failed to determine repository owner and name from git remote \"origin\""
@@ -274,7 +279,7 @@ Follow these steps:
 
   ```bash
   echo "=== Unresolved Review Threads ==="
-  jq -r '.[] | "\(.threadId) | \(if .comments[0].path then .comments[0].path else "N/A" end) | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
+  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
 
   echo ""
   echo "=== PR-level Comments ==="
@@ -303,7 +308,7 @@ Follow these steps:
 
   ```bash
   echo "=== Outdated threads (require manual review) ==="
-  jq -r '.[] | "\(.threadId) | \(if .comments[0].path then .comments[0].path else "N/A" end) | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
+  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
   ```
 
 - **Important**: "Outdated" means the code was modified, not that feedback is irrelevant. Review each outdated thread manually during Step 3 to determine if the feedback still applies or should be addressed.
@@ -367,7 +372,7 @@ Follow these steps:
     gh api graphql -f query='
       mutation {
         addPullRequestReviewComment(input: {
-          pullRequestId: "'"${PR_ID}"'",
+          pullRequestId: "'$PR_ID'",
           body: "<response_text>",
           inReplyTo: "<comment_node_id>"
         }) {
