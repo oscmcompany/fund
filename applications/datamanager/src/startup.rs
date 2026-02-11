@@ -20,8 +20,8 @@ pub fn initialize_sentry() -> sentry::ClientInitGuard {
     ))
 }
 
-pub fn initialize_tracing() {
-    let _ = tracing_subscriber::registry()
+pub fn initialize_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "datamanager=debug,tower_http=debug,axum=debug".into()),
@@ -36,7 +36,8 @@ pub fn initialize_tracing() {
                 }
             }),
         )
-        .try_init();
+        .try_init()?;
+    Ok(())
 }
 
 pub async fn serve_app(listener: TcpListener, app: Router) -> std::io::Result<()> {
@@ -74,6 +75,10 @@ mod tests {
     impl EnvironmentVariableGuard {
         fn set(name: &str, value: &str) -> Self {
             let original_value = std::env::var(name).ok();
+            // SAFETY: Environment variable mutation is safe here because:
+            // 1. Tests using this guard are marked with #[serial] to prevent concurrent execution
+            // 2. Env vars are set synchronously before spawning async tasks
+            // 3. The Drop implementation ensures cleanup when guard goes out of scope
             unsafe {
                 std::env::set_var(name, value);
             }
@@ -88,12 +93,18 @@ mod tests {
     impl Drop for EnvironmentVariableGuard {
         fn drop(&mut self) {
             match self.original_value.as_ref() {
-                Some(value) => unsafe {
-                    std::env::set_var(&self.name, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(&self.name);
-                },
+                Some(value) => {
+                    // SAFETY: See set() method - protected by #[serial] annotation
+                    unsafe {
+                        std::env::set_var(&self.name, value);
+                    }
+                }
+                None => {
+                    // SAFETY: See set() method - protected by #[serial] annotation
+                    unsafe {
+                        std::env::remove_var(&self.name);
+                    }
+                }
             }
         }
     }
@@ -131,8 +142,8 @@ mod tests {
     fn test_initialize_observability_functions() {
         let _environment_guard = EnvironmentVariableGuard::set("ENVIRONMENT", "test");
         let _sentry_guard = initialize_sentry();
-        initialize_tracing();
-        initialize_tracing();
+        let _ = initialize_tracing();
+        let _ = initialize_tracing();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

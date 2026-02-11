@@ -135,7 +135,7 @@ pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
 
 /// Start LocalStack, create the test bucket, clean it, configure DuckDB env vars,
 /// and return the endpoint URL and a ready-to-use S3 client.
-pub async fn setup_test_bucket() -> (String, S3Client) {
+pub async fn setup_test_bucket() -> (String, S3Client, DuckDbEnvironmentGuard) {
     initialize_test_tracing();
 
     let endpoint = get_localstack_endpoint().await;
@@ -150,9 +150,9 @@ pub async fn setup_test_bucket() -> (String, S3Client) {
         .strip_prefix("http://")
         .unwrap_or(&endpoint)
         .to_string();
-    set_duckdb_aws_environment(&host_port);
+    let env_guard = DuckDbEnvironmentGuard::new(&host_port);
 
-    (endpoint, s3_client)
+    (endpoint, s3_client, env_guard)
 }
 
 pub async fn clean_bucket(s3_client: &S3Client) {
@@ -186,17 +186,6 @@ pub async fn clean_bucket(s3_client: &S3Client) {
         } else {
             break;
         }
-    }
-}
-
-pub fn set_duckdb_aws_environment(endpoint_host_port: &str) {
-    unsafe {
-        std::env::set_var("AWS_REGION", TEST_REGION);
-        std::env::set_var("AWS_ACCESS_KEY_ID", TEST_ACCESS_KEY);
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", TEST_SECRET_KEY);
-        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
-        std::env::set_var("DUCKDB_S3_ENDPOINT", endpoint_host_port);
-        std::env::set_var("DUCKDB_S3_USE_SSL", "false");
     }
 }
 

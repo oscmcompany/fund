@@ -2,7 +2,7 @@ use datamanager::startup::{initialize_sentry, initialize_tracing, run_server};
 
 async fn run_with_bind_address(bind_address: &str) -> i32 {
     let _sentry_guard = initialize_sentry();
-    initialize_tracing();
+    initialize_tracing().expect("Failed to initialize tracing");
 
     handle_server_result(run_server(bind_address).await)
 }

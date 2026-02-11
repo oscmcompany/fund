@@ -34,7 +34,7 @@ async fn spawn_server_for_state(state: State) -> SpawnedAppServer {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_health_route_returns_ok() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state_for_endpoint(&endpoint, &test_bucket_name()).await;
     let app_server = spawn_server_for_state(state).await;
 
@@ -50,7 +50,7 @@ async fn test_health_route_returns_ok() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_router_returns_not_found_for_unknown_route() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state_for_endpoint(&endpoint, &test_bucket_name()).await;
     let app_server = spawn_server_for_state(state).await;
 
@@ -66,7 +66,7 @@ async fn test_router_returns_not_found_for_unknown_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_state_new_sets_all_fields() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state_for_endpoint(&endpoint, "custom-bucket").await;
 
     assert_eq!(state.massive.base, "http://127.0.0.1:1");

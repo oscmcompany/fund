@@ -110,7 +110,7 @@ fn test_escape_sql_ticker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_write_and_query_predictions_round_trip() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -149,7 +149,7 @@ async fn test_write_and_query_predictions_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_predictions_returns_empty_dataframe_when_no_rows_match() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -174,7 +174,7 @@ async fn test_query_predictions_returns_empty_dataframe_when_no_rows_match() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_predictions_errors_when_query_positions_are_empty() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     let result = query_predictions_dataframe_from_s3(&state, vec![]).await;
@@ -189,7 +189,7 @@ async fn test_query_predictions_errors_when_query_positions_are_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_write_and_query_portfolio_round_trip() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -226,7 +226,7 @@ async fn test_write_and_query_portfolio_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_portfolio_without_timestamp_uses_latest_partition() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     let old_timestamp = Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap();
@@ -270,7 +270,7 @@ async fn test_query_portfolio_without_timestamp_uses_latest_partition() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_portfolio_falls_back_when_action_column_is_missing() {
-    let (endpoint, s3) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -310,7 +310,7 @@ async fn test_query_portfolio_falls_back_when_action_column_is_missing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_write_and_query_equity_bars_round_trip() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -346,7 +346,7 @@ async fn test_write_and_query_equity_bars_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_equity_bars_rejects_invalid_ticker_format() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
@@ -368,7 +368,7 @@ async fn test_query_equity_bars_rejects_invalid_ticker_format() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_read_equity_details_dataframe_from_s3_success() {
-    let (endpoint, s3) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     put_test_object(
@@ -390,7 +390,7 @@ async fn test_read_equity_details_dataframe_from_s3_success() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_read_equity_details_dataframe_from_s3_returns_error_for_invalid_utf8() {
-    let (endpoint, s3) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     put_test_object(&s3, "equity/details/categories.csv", vec![0xff, 0xfe, 0xfd]).await;
@@ -404,7 +404,7 @@ async fn test_read_equity_details_dataframe_from_s3_returns_error_for_invalid_ut
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_equity_bars_without_date_range_uses_defaults() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     // Use fixed date to avoid flakiness from midnight rollover
@@ -432,7 +432,7 @@ async fn test_query_equity_bars_without_date_range_uses_defaults() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_equity_bars_without_ticker_filter_returns_all() {
-    let (endpoint, _s3) = setup_test_bucket().await;
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
