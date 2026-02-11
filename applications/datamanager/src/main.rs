@@ -29,6 +29,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{handle_server_result, run_with_bind_address};
+    use serial_test::serial;
 
     #[test]
     fn test_handle_server_result_success() {
@@ -42,7 +43,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_run_with_bind_address_returns_error_code_for_invalid_bind_address() {
+        // SAFETY: Environment variable mutation is safe here because:
+        // 1. Test is marked with #[serial] to prevent concurrent execution
+        // 2. Env vars are set synchronously before spawning async tasks
+        unsafe {
+            std::env::set_var("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
+            std::env::set_var("MASSIVE_BASE_URL", "http://test");
+            std::env::set_var("MASSIVE_API_KEY", "test-key");
+        }
+
         let exit_code = run_with_bind_address("invalid-address").await;
 
         assert_eq!(exit_code, 1);

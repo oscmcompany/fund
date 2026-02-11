@@ -23,18 +23,18 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-POLYGON_BASE_URL = "https://api.polygon.io"
+MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.io")
 
 # Polygon ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
 EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}
 
 
 def fetch_all_tickers(api_key: str) -> list[dict]:
-    """Fetch all US stock tickers from Polygon API with pagination."""
-    logger.info("Fetching tickers from Polygon API")
+    """Fetch all US stock tickers from Massive API with pagination."""
+    logger.info("Fetching tickers from Massive API")
 
     all_tickers = []
-    url = f"{POLYGON_BASE_URL}/v3/reference/tickers"
+    url = f"{MASSIVE_BASE_URL}/v3/reference/tickers"
     params = {
         "market": "stocks",
         "active": "true",
@@ -80,7 +80,7 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
         if ticker_data.get("type") not in EQUITY_TYPES:
             continue
 
-        # Try to get sector/industry from various fields Polygon provides
+        # Try to get sector/industry from various fields Massive provides
         sector = ticker_data.get("sector", "")
         industry = ticker_data.get("industry", "")
 

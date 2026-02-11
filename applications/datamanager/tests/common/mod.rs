@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use axum::Router;

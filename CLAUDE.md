@@ -31,7 +31,7 @@ This is a collection of guidelines and references.
 - Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and
   [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
-- Write `pytest` functions for Python tests
+- Write `pytest` functions for Python tests using plain functions, not class-based test organization
 - Ensure Rust and Python automated test suites achieve at least 90% line or statement coverage per service or library
 - Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations

@@ -27,6 +27,8 @@ jobs:
         with:
           workspaces: .
           cache-on-failure: false
+          shared-key: rust-continuous-integration
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - name: Run Rust code checks
         uses: flox/activate-action@v1
         with:
