@@ -10,7 +10,7 @@ __pycache__/
 .envrc
 .env.nu
 .coverage_output/
-.coverage
+.coverage*
 *.csv
 *.egg-info/
 wandb/
@@ -22,3 +22,4 @@ data/
 **/*.json
 .claude/tasks/
 .scratchpad/
+

@@ -27,6 +27,8 @@ jobs:
         with:
           workspaces: .
           cache-on-failure: false
+          shared-key: rust-continuous-integration
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
       - name: Run Rust code checks
         uses: flox/activate-action@v1
         with:
@@ -88,5 +90,4 @@ jobs:
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Rust is being excluded from coverage in favor of DataFrame correctness checks
-          files: .coverage_output/python.xml
+          files: .coverage_output/python.xml .coverage_output/rust.xml

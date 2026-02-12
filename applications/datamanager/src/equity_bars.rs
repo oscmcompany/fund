@@ -122,6 +122,9 @@ pub async fn sync(
     Json(payload): Json<DailySync>,
 ) -> impl IntoResponse {
     info!("Sync date: {}", payload.date);
+
+    let massive_api_key = state.massive.key.clone();
+
     let date = payload.date.format("%Y-%m-%d").to_string();
     let url = format!(
         "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
@@ -134,7 +137,7 @@ pub async fn sync(
         .http_client
         .get(&url)
         .header("accept", "application/json")
-        .query(&[("adjusted", "true"), ("apiKey", state.massive.key.as_str())])
+        .query(&[("adjusted", "true"), ("apiKey", massive_api_key.as_str())])
         .send()
         .await
     {

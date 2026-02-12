@@ -49,16 +49,12 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_IAM_INFRASTRUCTURE_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
+      - name: Set up Docker Buildx
+        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+        uses: docker/setup-buildx-action@v3
       - name: Install Flox
         if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
         uses: flox/install-flox-action@v2
-      - name: Conditionally download artifacts
-        if: (steps.changes.outputs.service == 'true' || github.event_name == 'schedule') && matrix.service == 'equitypricemodel'
-        uses: flox/activate-action@v1
-        env:
-          AWS_S3_ARTIFACTS_BUCKET_NAME: ${{ secrets.AWS_S3_ARTIFACTS_BUCKET_NAME }}
-        with:
-          command: mask models artifacts download equitypricemodel
       - name: Build ${{ matrix.service }} image
         if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
         uses: flox/activate-action@v1
