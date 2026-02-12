@@ -22,14 +22,70 @@ Follow these steps:
 ### 1. Fetch Pull Request Data
 
 - Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a pull request number is required.
-- Determine the scratchpad directory path from the system reminder message (shown at session start, format: `/private/tmp/claude-*/scratchpad`). Use this for all temporary file storage instead of `/tmp/` to ensure session isolation and automatic cleanup.
-- Determine repository owner and name from git remote: extract from `git remote get-url origin` (format: `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`) and export variables:
-  - `OWNER=<extracted_owner>`
-  - `REPO=<extracted_repo>`
+- **IMPORTANT: Environment variable persistence** - When using the Bash tool, environment variables do not persist between separate tool invocations. The SCRATCHPAD, OWNER, and REPO setup commands below should be combined into a single bash execution along with the PR data fetch, or re-declared at the start of each subsequent bash command that needs them.
+- **CRITICAL: Set up SCRATCHPAD environment variable FIRST** before any file operations:
+
+  ```bash
+  # Set up scratchpad directory with session isolation
+  : "${TMPDIR:=/tmp}"
+  if [ -z "${SCRATCHPAD:-}" ]; then
+    # Create a unique, private scratchpad directory
+    _old_umask=$(umask)
+    umask 077
+    SCRATCHPAD="$(mktemp -d "${TMPDIR%/}/claude-scratchpad.XXXXXX")" || {
+      echo "Error: Failed to create scratchpad directory under ${TMPDIR}"
+      exit 1
+    }
+    umask "${_old_umask}"
+  else
+    # Use caller-provided SCRATCHPAD, hardening it
+    _old_umask=$(umask)
+    mkdir -p "${SCRATCHPAD}"
+    chmod 700 "${SCRATCHPAD}" 2>/dev/null || true
+    umask "${_old_umask}"
+  fi
+  export SCRATCHPAD
+
+  echo "Using scratchpad: ${SCRATCHPAD}"
+  ```
+
+- Determine repository owner and name from git remote and export as environment variables:
+
+  ```bash
+  _remote_url=$(git remote get-url origin)
+  export OWNER=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\1|')
+  export REPO=$(echo "${_remote_url}" | sed -E 's|.*[:/]([^/]+)/([^/]+)(\.git)?$|\2|' | sed 's/\.git$//')
+
+  if [ -z "${OWNER}" ] || [ -z "${REPO}" ]; then
+    echo "Error: Failed to determine repository owner and name from git remote \"origin\""
+    exit 1
+  fi
+
+  echo "Repository: ${OWNER}/${REPO}"
+  ```
+
+- **Verify SCRATCHPAD is set before file operations**:
+
+  ```bash
+  # Critical: Validate SCRATCHPAD is set and accessible before proceeding
+  # Note: If running these commands in separate bash invocations, SCRATCHPAD must be
+  # re-declared or the setup block must be combined with this validation block.
+  if [ -z "${SCRATCHPAD}" ]; then
+    echo "Error: SCRATCHPAD variable is not set. Ensure SCRATCHPAD setup and this validation are in the same bash execution context."
+    exit 1
+  fi
+
+  if [ ! -d "${SCRATCHPAD}" ] || [ ! -w "${SCRATCHPAD}" ]; then
+    echo "Error: SCRATCHPAD directory ${SCRATCHPAD} does not exist or is not writable"
+    exit 1
+  fi
+
+  echo "SCRATCHPAD validated: ${SCRATCHPAD}"
+  ```
+
 - Fetch comprehensive pull request data using a single GraphQL query, saving to a file to avoid token limit issues:
 
   ```bash
-
   gh api graphql -f query='
     query($owner: String!, $repo: String!, $number: Int!) {
       repository(owner: $owner, name: $repo) {
@@ -138,37 +194,113 @@ Follow these steps:
 
 - This single query replaces multiple REST API calls and includes thread IDs needed for later resolution.
 - **Important**: Save output to a file (`${SCRATCHPAD}/pr_data.json`) to avoid token limit errors when reading large responses. Parse this file using `jq` for subsequent processing.
-- **Critical**: The pull request data file will be too large to read directly with the Read tool. Always use `jq` to parse and extract specific fields. Never attempt to read the entire file.
+- **Critical**: The pull request data file will be too large to read directly with the Read tool. Extract structured data once into smaller files (see below).
+
+- **Extract structured data into focused files** (replaces all scattered jq calls throughout command):
+
+  ```bash
+  echo "Extracting structured data from PR response..."
+
+  # Extract PR metadata
+  jq '.data.repository.pullRequest | {
+    id: .id,
+    title: .title,
+    headRefName: .headRefName,
+    baseRefName: .baseRefName
+  }' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/metadata.json"
+
+  # Extract unresolved review threads
+  jq '[.data.repository.pullRequest.reviewThreads.nodes[] |
+    select(.isResolved == false and .isOutdated == false) | {
+    threadId: .id,
+    comments: [.comments.nodes[] | {
+      id: .id,
+      databaseId: .databaseId,
+      body: .body,
+      author: .author.login,
+      path: .path,
+      position: .position
+    }]
+  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/review_threads.json"
+
+  # Extract outdated threads
+  jq '[.data.repository.pullRequest.reviewThreads.nodes[] |
+    select(.isResolved == false and .isOutdated == true) | {
+    threadId: .id,
+    comments: [.comments.nodes[] | {
+      id: .id,
+      body: .body,
+      author: .author.login,
+      path: .path
+    }]
+  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/outdated_threads.json"
+
+  # Extract PR-level comments
+  jq '[.data.repository.pullRequest.comments.nodes[] | {
+    id: .id,
+    databaseId: .databaseId,
+    body: .body,
+    author: .author.login
+  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/pr_comments.json"
+
+  # Extract check failures
+  jq '[.data.repository.pullRequest.commits.nodes[].commit.checkSuites.nodes[] as $suite |
+    $suite.checkRuns.nodes[] |
+    select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT") | {
+    name: .name,
+    conclusion: .conclusion,
+    detailsUrl: .detailsUrl,
+    workflowRunId: ($suite.workflowRun.databaseId // null)
+  }] | unique_by(.name)' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/check_failures.json"
+
+  echo "Data extraction complete:"
+  echo "  - metadata.json (PR info)"
+  echo "  - review_threads.json ($(jq 'length' "${SCRATCHPAD}/review_threads.json") unresolved threads)"
+  echo "  - outdated_threads.json ($(jq 'length' "${SCRATCHPAD}/outdated_threads.json") outdated threads)"
+  echo "  - pr_comments.json ($(jq 'length' "${SCRATCHPAD}/pr_comments.json") PR comments)"
+  echo "  - check_failures.json ($(jq 'length' "${SCRATCHPAD}/check_failures.json") failed checks)"
+  ```
+
+- These smaller structured files can be read with Read tool if needed, and eliminate redundant jq parsing throughout the command.
 
 ### 2. Analyze Check Failures
 
-- Identify failing checks (Python or Rust checks specifically). Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID from the check-run's check_suite, then use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs` (replacing `{run_id}` with the actual run ID).
+- Review failing checks from the extracted data:
+
+  ```bash
+  echo "=== Check Failures ==="
+  jq -r '.[] | "[\(.conclusion)] \(.name) - \(.detailsUrl)"' "${SCRATCHPAD}/check_failures.json"
+  ```
+
+- Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID, then use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs`.
 - If logs are inaccessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors and capture the failure details.
 - Add check failures to the list of items that need fixes.
 
 ### 3. Group and Analyze Feedback
 
-- Parse the saved pull request data from `${SCRATCHPAD}/pr_data.json` using these extraction rules:
-  - From `data.repository.pullRequest.reviewThreads.nodes[]`:
-    - **First, identify outdated threads**: Filter for `isResolved: false` AND `isOutdated: true`
-      - Review these manually (see step 3a below) as they may still contain relevant feedback
-    - **Then, extract unresolved threads**: Filter for `isResolved: false` AND `isOutdated: false`
-    - For each unresolved thread, extract:
-      - Thread ID: `.id` (format: `PRRT_*`) for later resolution
-      - For each comment in `.comments.nodes[]`:
-        - Comment database ID: `.databaseId` (integer)
-        - Comment node ID: `.id` (format: `PRRC_*`) for GraphQL replies
-        - Comment body: `.body`
-        - Author: `.author.login`
-        - File location: `.path` and `.position`
-  - From `data.repository.pullRequest.comments.nodes[]`:
-    - Extract issue-level comments (pull request conversation):
-      - Comment database ID: `.databaseId`
-      - Comment body: `.body`
-      - Author: `.author.login`
-  - From check runs in `commits.nodes[].commit.checkSuites.nodes[].checkRuns.nodes[]`:
-    - Filter where `conclusion: "FAILURE"` or `conclusion: "TIMED_OUT"`
-- Store complete metadata for each feedback item to use in later steps.
+- Review the extracted feedback data from structured files:
+
+  ```bash
+  echo "=== Unresolved Review Threads ==="
+  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
+
+  echo ""
+  echo "=== PR-level Comments ==="
+  jq -r '.[] | "\(.databaseId) | \(.author) | \(.body[:80])"' "${SCRATCHPAD}/pr_comments.json"
+  ```
+
+- For detailed review of specific threads, use:
+
+  ```bash
+  # Get full details of a specific thread
+  jq '.[] | select(.threadId == "PRRT_xxx")' "${SCRATCHPAD}/review_threads.json"
+  ```
+
+- The structured files contain all necessary metadata:
+  - `review_threads.json`: Thread ID, comment IDs (both node and database), body, author, file path/position
+  - `pr_comments.json`: Comment IDs, body, author
+  - `check_failures.json`: Check name, conclusion, details URL
+
 - Group related feedback using judgement: by file, by theme, by type of change, or whatever makes most sense for the specific pull request; ensure each group maintains the full metadata for all comments it contains.
 - Analyze dependencies between feedback groups to determine which are independent (can be worked in parallel) and which are interdependent (must be handled sequentially).
 - For each piece of feedback, evaluate whether to address it (make code changes) or reject it (explain why the feedback doesn't apply); provide clear reasoning for each decision.
@@ -178,9 +310,8 @@ Follow these steps:
 - Before processing feedback, identify outdated threads that are still unresolved:
 
   ```bash
-  # Log outdated threads for review
   echo "=== Outdated threads (require manual review) ==="
-  jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == true) | "\(.id) | \(.comments.nodes[0].path) | \(.comments.nodes[0].author.login) | \(.comments.nodes[0].body[:80])"' ${SCRATCHPAD}/pr_data.json
+  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
   ```
 
 - **Important**: "Outdated" means the code was modified, not that feedback is irrelevant. Review each outdated thread manually during Step 3 to determine if the feedback still applies or should be addressed.
@@ -234,6 +365,9 @@ Follow these steps:
   - For review comments (code-level), use GraphQL `addPullRequestReviewComment` mutation:
 
     ```bash
+    # Extract PR node ID from metadata
+    PR_ID=$(jq -r '.id' "${SCRATCHPAD}/metadata.json")
+
     # IMPORTANT: Keep response text simple - avoid newlines, code blocks, and special characters
     # GraphQL string literals cannot contain raw newlines; use spaces or simple sentences
     # If complex formatting is needed, save response to a variable first and ensure proper escaping
@@ -241,7 +375,7 @@ Follow these steps:
     gh api graphql -f query='
       mutation {
         addPullRequestReviewComment(input: {
-          pullRequestId: "<pr_node_id>",
+          pullRequestId: "'$PR_ID'",
           body: "<response_text>",
           inReplyTo: "<comment_node_id>"
         }) {
@@ -251,8 +385,15 @@ Follow these steps:
     '
     ```
 
-    Use the pull request's node ID from step 1's query (`data.repository.pullRequest.id`) for `pullRequestId`.
-    Use the comment's node ID (format: `PRRC_*`) for `inReplyTo` parameter.
+    Use the PR node ID from `metadata.json` for `pullRequestId`.
+    Use the comment node ID (format: `PRRC_*`) from `review_threads.json` for `inReplyTo` parameter.
+
+    Example to get comment node ID:
+
+    ```bash
+    # Get first comment's node ID from a specific thread
+    COMMENT_ID=$(jq -r '.[] | select(.threadId == "PRRT_xxx") | .comments[0].id' "${SCRATCHPAD}/review_threads.json")
+    ```
 
     **Response formatting guidelines**:
     - Keep responses concise and single-line when possible
