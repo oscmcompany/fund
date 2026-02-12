@@ -1,6 +1,6 @@
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -37,52 +37,38 @@ impl State {
 
         let s3_client = S3Client::new(&config);
 
-        let bucket_name = match std::env::var("AWS_S3_DATA_BUCKET_NAME") {
-            Ok(name) => {
-                info!("Using S3 bucket from environment: {}", name);
-                name
-            }
-            Err(_) => {
-                let default_bucket = "oscm-data".to_string();
-                error!(
-                    "AWS_S3_DATA_BUCKET_NAME not set, using default: {}",
-                    default_bucket
-                );
-                default_bucket
-            }
-        };
+        let bucket_name =
+            std::env::var("AWS_S3_DATA_BUCKET_NAME").unwrap_or_else(|_| "oscm-data".to_string());
+        info!("Using S3 bucket: {}", bucket_name);
 
-        let massive_base = match std::env::var("MASSIVE_BASE_URL") {
-            Ok(url) => {
-                info!("Using Massive API base URL from environment: {}", url);
-                url
-            }
-            Err(_) => {
-                let default_url = "https://api.massive.io".to_string();
-                error!("MASSIVE_BASE_URL not set, using default: {}", default_url);
-                default_url
-            }
-        };
+        let massive_base_url = std::env::var("MASSIVE_BASE_URL")
+            .unwrap_or_else(|_| "https://api.massive.io".to_string());
+        info!("Using Massive API base URL: {}", massive_base_url);
 
-        let massive_key = match std::env::var("MASSIVE_API_KEY") {
-            Ok(key) => {
-                debug!("MASSIVE_API_KEY loaded (length: {} chars)", key.len());
-                key
-            }
-            Err(_) => {
-                warn!("MASSIVE_API_KEY not set - equity bar sync will not work");
-                String::new()
-            }
-        };
+        let massive_api_key = std::env::var("MASSIVE_API_KEY").unwrap_or_else(|_| String::new());
 
         info!("Application state initialized successfully");
 
         Self {
             http_client,
             massive: MassiveSecrets {
-                base: massive_base,
-                key: massive_key,
+                base: massive_base_url,
+                key: massive_api_key,
             },
+            s3_client,
+            bucket_name,
+        }
+    }
+
+    pub fn new(
+        http_client: HTTPClient,
+        massive: MassiveSecrets,
+        s3_client: S3Client,
+        bucket_name: String,
+    ) -> Self {
+        Self {
+            http_client,
+            massive,
             s3_client,
             bucket_name,
         }

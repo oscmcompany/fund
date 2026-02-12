@@ -71,11 +71,12 @@ fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscmcompany/${application_name}-${stage_name}"
 cache_reference="${image_reference}:buildcache"
 
-# Use GHA backend for Cargo caching when running in GitHub Actions 
+# Use GHA backend for caching when running in GitHub Actions 
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "Running in GitHub Actions - using hybrid cache (gha + registry)"
-    cache_from_arguments="--cache-from type=gha --cache-from type=registry,ref=${cache_reference}"
-    cache_to_arguments="--cache-to type=gha,mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
+    scope="${application_name}-${stage_name}"
+    echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
+    cache_from_arguments="--cache-from type=gha,scope=${scope} --cache-from type=registry,ref=${cache_reference}"
+    cache_to_arguments="--cache-to type=gha,scope=${scope},mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
 else
     echo "Running locally - using registry cache only"
     cache_from_arguments="--cache-from type=registry,ref=${cache_reference}"
@@ -83,7 +84,11 @@ else
 fi
 
 echo "Setting up Docker Buildx"
-docker buildx create --use --name psf-builder 2>/dev/null || docker buildx use psf-builder || (echo "Using default buildx builder" && docker buildx use default)
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "Using buildx builder configured by docker/setup-buildx-action"
+else
+    docker buildx create --use --name oscm-builder 2>/dev/null || docker buildx use oscm-builder || (echo "Using default buildx builder" && docker buildx use default)
+fi
 
 echo "Logging into ECR (to pull cache if available)"
 aws ecr get-login-password --region ${aws_region} | docker login \
@@ -120,17 +125,37 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscmcompany/${application_name}-${stage_name}"
+repository_name="oscm/${application_name}-${stage_name}"
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
+commit_hash=$(git rev-parse --short HEAD)
 
 echo "Logging into ECR"
 aws ecr get-login-password --region ${aws_region} | docker login \
     --username AWS \
     --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
 
-echo "Pushing image"
-docker push ${image_reference}:latest
+echo "Checking if image for commit ${commit_hash} already exists in ECR"
+existing_tag="NONE"
+if image_digest=$(aws ecr describe-images \
+    --repository-name "${repository_name}" \
+    --image-ids "imageTag=git-${commit_hash}" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text 2>/dev/null); then
+    existing_tag="${image_digest}"
+fi
 
-echo "Image pushed: ${application_name} ${stage_name}"
+if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
+    echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
+    echo "Image pushed: ${application_name} ${stage_name} (cached)"
+    exit 0
+fi
+
+echo "Pushing image"
+docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
+docker push "${image_reference}:latest"
+docker push "${image_reference}:git-${commit_hash}"
+
+echo "Image pushed: ${application_name} ${stage_name} (commit: ${commit_hash})"
 ```
 
 ### stack
@@ -363,16 +388,60 @@ echo "Rust linting completed successfully"
 
 #### test
 
-> Run Rust tests
+> Run Rust tests with coverage reporting
 
 ```bash
 set -euo pipefail
 
-echo "Running Rust tests"
+echo "Running Rust tests with coverage"
 
-cargo test --workspace --verbose
+echo "Checking Docker availability for integration tests"
+if [[ "${RUN_INTEGRATION_TESTS:-0}" == "1" ]]; then
+    echo "RUN_INTEGRATION_TESTS=1 - enforcing Docker availability"
+    if command -v docker >/dev/null 2>&1; then
+        if ! docker info >/dev/null 2>&1; then
+            echo "Error: Docker is installed but daemon is not running"
+            echo "Integration tests requiring Docker will fail"
+            echo "Start Docker with: open -a Docker (macOS) or sudo systemctl start docker (Linux)"
+            exit 1
+        fi
+        echo "Docker daemon is running"
+    else
+        echo "Error: Docker is not installed"
+        echo "Integration tests requiring Docker will fail"
+        echo "Install Docker from: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+else
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo "Docker is available - integration tests can run"
+    else
+        echo "Warning: Docker is not available or daemon is not running"
+        echo "Integration tests requiring Docker may be skipped or fail"
+        echo "To enforce Docker for integration tests, set RUN_INTEGRATION_TESTS=1"
+    fi
+fi
 
-echo "Rust tests completed successfully"
+mkdir -p .coverage_output
+
+if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+    echo "cargo-llvm-cov not available - running tests without coverage"
+    cargo test --workspace --verbose
+elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
+    echo "LLVM tools (llvm-cov or llvm-profdata) not available - running tests without coverage"
+    cargo test --workspace --verbose
+else
+    export LLVM_COV=$(which llvm-cov)
+    export LLVM_PROFDATA=$(which llvm-profdata)
+    if cargo llvm-cov --workspace --verbose \
+        --cobertura \
+        --output-path .coverage_output/rust.xml; then
+        echo "Rust tests with coverage completed successfully"
+    else
+        echo "cargo llvm-cov failed - check test output above"
+        exit 1
+    fi
+fi
 ```
 
 #### all
@@ -384,7 +453,7 @@ set -euo pipefail
 
 echo "Running Rust development checks"
 
-mask development rust update
+# mask development rust update # Temporarily removing for continuous integration speed
 
 mask development rust check
 
@@ -481,9 +550,14 @@ uvx ty check
 ```bash
 set -euo pipefail
 
-echo "Running Python tests"
+echo "Running Python tests with coverage"
 
-uv run coverage run --parallel-mode -m pytest && uv run coverage combine && uv run coverage report && uv run coverage xml -o coverage/.python.xml
+mkdir -p .coverage_output
+
+uv run coverage run --parallel-mode -m pytest \
+    && uv run coverage combine \
+    && uv run coverage report \
+    && uv run coverage xml -o .coverage_output/python.xml
 
 echo "Python tests completed successfully"
 ```

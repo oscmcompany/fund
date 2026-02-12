@@ -37,6 +37,62 @@ pub async fn write_predictions_dataframe_to_s3(
     write_dataframe_to_s3(state, dataframe, timestamp, "predictions".to_string()).await
 }
 
+pub fn is_valid_ticker(ticker: &str) -> bool {
+    !ticker.is_empty()
+        && ticker.chars().any(|c| c.is_ascii_alphanumeric())
+        && ticker
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+pub fn format_s3_key(timestamp: &DateTime<Utc>, dataframe_type: &str) -> String {
+    let year = timestamp.format("%Y");
+    let month = timestamp.format("%m");
+    let day = timestamp.format("%d");
+
+    format!(
+        "equity/{}/daily/year={}/month={}/day={}/data.parquet",
+        dataframe_type, year, month, day,
+    )
+}
+
+pub fn date_to_int(timestamp: &DateTime<Utc>) -> Result<i32, Error> {
+    timestamp
+        .format("%Y%m%d")
+        .to_string()
+        .parse::<i32>()
+        .map_err(|e| Error::Other(format!("Failed to convert date to integer: {}", e)))
+}
+
+pub fn escape_sql_ticker(ticker: &str) -> String {
+    ticker.replace('\'', "''")
+}
+
+pub fn sanitize_duckdb_config_value(value: &str) -> Result<String, Error> {
+    if value.is_empty() {
+        return Err(Error::Other("Configuration value cannot be empty".into()));
+    }
+
+    // Reject SQL metacharacters
+    if value.contains('\'') || value.contains('"') || value.contains(';') || value.contains("--") {
+        let message = format!(
+            "Invalid configuration value contains SQL metacharacters: {}",
+            value
+        );
+        error!("{}", message);
+        return Err(Error::Other(message));
+    }
+
+    // Reasonable length limit
+    if value.len() > 512 {
+        let message = format!("Configuration value too long: {} characters", value.len());
+        error!("{}", message);
+        return Err(Error::Other(message));
+    }
+
+    Ok(value.to_string())
+}
+
 async fn write_dataframe_to_s3(
     state: &State,
     dataframe: &DataFrame,
@@ -45,14 +101,7 @@ async fn write_dataframe_to_s3(
 ) -> Result<String, Error> {
     info!("Uploading DataFrame to S3 as parquet");
 
-    let year = timestamp.format("%Y");
-    let month = timestamp.format("%m");
-    let day = timestamp.format("%d");
-
-    let key = format!(
-        "equity/{}/daily/year={}/month={}/day={}/data.parquet",
-        dataframe_type, year, month, day,
-    );
+    let key = format_s3_key(timestamp, &dataframe_type);
 
     let mut buffer = Vec::new();
     {
@@ -126,22 +175,50 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
     );
 
     let session_token = credentials.session_token().unwrap_or_default();
-    let s3_config = format!(
-        "
-            SET s3_region='{}';
-            SET s3_url_style='path';
-            SET s3_access_key_id='{}';
-            SET s3_secret_access_key='{}';
-            SET s3_session_token='{}';
-        ",
-        region,
-        credentials.access_key_id(),
-        credentials.secret_access_key(),
-        session_token
-    );
+
+    let sanitized_region = sanitize_duckdb_config_value(&region)?;
+    let sanitized_access_key = sanitize_duckdb_config_value(credentials.access_key_id())?;
+    let sanitized_secret_key = sanitize_duckdb_config_value(credentials.secret_access_key())?;
+    // Session token can be empty for static credentials (no temporary session)
+    let sanitized_session_token = if !session_token.is_empty() {
+        sanitize_duckdb_config_value(session_token)?
+    } else {
+        String::new()
+    };
+
+    let mut s3_configuration_statements = vec![
+        format!("SET s3_region='{}';", sanitized_region),
+        "SET s3_url_style='path';".to_string(),
+        format!("SET s3_access_key_id='{}';", sanitized_access_key),
+        format!("SET s3_secret_access_key='{}';", sanitized_secret_key),
+        format!("SET s3_session_token='{}';", sanitized_session_token),
+    ];
+
+    if let Ok(duckdb_s3_endpoint) = std::env::var("DUCKDB_S3_ENDPOINT") {
+        debug!("Configuring DuckDB with custom S3 endpoint");
+        let sanitized_endpoint = sanitize_duckdb_config_value(&duckdb_s3_endpoint)?;
+        s3_configuration_statements.push(format!("SET s3_endpoint='{}';", sanitized_endpoint));
+
+        let duckdb_s3_use_ssl = std::env::var("DUCKDB_S3_USE_SSL")
+            .unwrap_or_else(|_| "true".to_string())
+            .to_lowercase();
+
+        if duckdb_s3_use_ssl != "true" && duckdb_s3_use_ssl != "false" {
+            let message = format!(
+                "Invalid DUCKDB_S3_USE_SSL: must be 'true' or 'false', got '{}'",
+                duckdb_s3_use_ssl
+            );
+            error!("{}", message);
+            return Err(Error::Other(message));
+        }
+
+        s3_configuration_statements.push(format!("SET s3_use_ssl={};", duckdb_s3_use_ssl));
+    }
+
+    let s3_configuration_sql = s3_configuration_statements.join("\n");
 
     debug!("Configuring DuckDB S3 settings");
-    connection.execute_batch(&s3_config)?;
+    connection.execute_batch(&s3_configuration_sql)?;
 
     info!("DuckDB connection established with S3 access");
     Ok(connection)
@@ -157,7 +234,23 @@ pub async fn query_equity_bars_parquet_from_s3(
 
     let (start_timestamp, end_timestamp) = match (start_timestamp, end_timestamp) {
         (Some(start), Some(end)) => (start, end),
-        _ => {
+        (Some(start), None) => {
+            let end_date = chrono::Utc::now();
+            info!(
+                "No end date specified, defaulting to now: {} to {}",
+                start, end_date
+            );
+            (start, end_date)
+        }
+        (None, Some(end)) => {
+            let start_date = end - chrono::Duration::days(7);
+            info!(
+                "No start date specified, defaulting to 7 days before end: {} to {}",
+                start_date, end
+            );
+            (start_date, end)
+        }
+        (None, None) => {
             let end_date = chrono::Utc::now();
             let start_date = end_date - chrono::Duration::days(7);
             info!(
@@ -179,16 +272,8 @@ pub async fn query_equity_bars_parquet_from_s3(
     info!("Using S3 glob pattern: {}", s3_glob);
 
     // Build date filter for hive partitions
-    let start_date_int = start_timestamp
-        .format("%Y%m%d")
-        .to_string()
-        .parse::<i32>()
-        .unwrap_or(0);
-    let end_date_int = end_timestamp
-        .format("%Y%m%d")
-        .to_string()
-        .parse::<i32>()
-        .unwrap_or(99999999);
+    let start_date_int = date_to_int(&start_timestamp)?;
+    let end_date_int = date_to_int(&end_timestamp)?;
 
     debug!(
         "Date range filter: {} to {} (as integers)",
@@ -200,10 +285,7 @@ pub async fn query_equity_bars_parquet_from_s3(
         Some(ticker_list) if !ticker_list.is_empty() => {
             debug!("Validating {} tickers for query filter", ticker_list.len());
             for ticker in ticker_list {
-                if !ticker
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-                {
+                if !is_valid_ticker(ticker) {
                     warn!("Invalid ticker format rejected: {}", ticker);
                     return Err(Error::Other(format!("Invalid ticker format: {}", ticker)));
                 }
@@ -211,7 +293,7 @@ pub async fn query_equity_bars_parquet_from_s3(
             debug!("Ticker validation passed: {:?}", ticker_list);
             let ticker_values = ticker_list
                 .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .map(|t| format!("'{}'", escape_sql_ticker(t)))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("AND ticker IN ({})", ticker_values)

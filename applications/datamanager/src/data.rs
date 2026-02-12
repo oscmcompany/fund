@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct EquityBar {
     pub ticker: String,
     pub timestamp: i64,
@@ -34,16 +34,14 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
         "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
         "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
     )
-    .map_err(|e| {
-        warn!("Failed to create equity bar DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 
     debug!("Normalizing ticker column to uppercase");
     let equity_bars_dataframe = equity_bars_dataframe
         .lazy()
         .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
     info!(
         "Created equity bar DataFrame: {} rows x {} columns",
@@ -54,7 +52,7 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
     Ok(equity_bars_dataframe)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Prediction {
     pub ticker: String,
     pub timestamp: i64,
@@ -76,16 +74,14 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
         "quantile_50" => prediction_rows.iter().map(|p| p.quantile_50).collect::<Vec<_>>(),
         "quantile_90" => prediction_rows.iter().map(|p| p.quantile_90).collect::<Vec<_>>(),
     )
-    .map_err(|e| {
-        warn!("Failed to create predictions DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    .map_err(|e| Error::Other(format!("Failed to create predictions DataFrame: {}", e)))?;
 
     debug!("Normalizing ticker column to uppercase");
     let unfiltered_prediction_dataframe = prediction_dataframe
         .lazy()
         .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
     debug!(
         "Unfiltered predictions DataFrame has {} rows",
@@ -108,7 +104,8 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
             col("quantile_50"),
             col("quantile_90"),
         ])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to filter predictions DataFrame: {}", e)))?;
 
     info!(
         "Created predictions DataFrame: {} rows x {} columns (filtered from {} input rows)",
@@ -120,7 +117,7 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
     Ok(filtered_prediction_dataframe)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Portfolio {
     pub ticker: String,
     pub timestamp: f64,
@@ -141,11 +138,7 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
         "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
         "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
         "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
-    )
-    .map_err(|e| {
-        warn!("Failed to create portfolio DataFrame: {}", e);
-        Error::Other(format!("Failed to create DataFrame: {}", e))
-    })?;
+    )?;
 
     debug!("Normalizing ticker, side, and action columns to uppercase");
     let portfolio_dataframe = portfolio_dataframe
@@ -201,10 +194,7 @@ pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame,
     }
 
     debug!("All required columns present, selecting subset");
-    dataframe = dataframe.select(required_columns).map_err(|e| {
-        warn!("Failed to select columns: {}", e);
-        Error::Other(format!("Failed to select columns: {}", e))
-    })?;
+    dataframe = dataframe.select(required_columns)?;
 
     debug!("Normalizing ticker, sector, and industry columns to uppercase and filling nulls");
     let equity_details_dataframe = dataframe
@@ -222,11 +212,7 @@ pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame,
                 .fill_null(lit("NOT AVAILABLE"))
                 .alias("industry"),
         ])
-        .collect()
-        .map_err(|e| {
-            warn!("Failed to transform columns: {}", e);
-            Error::Other(format!("Failed to transform columns: {}", e))
-        })?;
+        .collect()?;
 
     info!(
         "Created equity details DataFrame: {} rows x {} columns",

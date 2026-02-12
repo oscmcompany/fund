@@ -1,0 +1,93 @@
+---
+name: Code checks
+run-name: Code checks
+on:
+  pull_request:
+jobs:
+  run_rust_code_checks:
+    name: Run Rust code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          echo "Disk space after cleanup:"
+          df -h
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-on-failure: false
+          shared-key: rust-continuous-integration
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+      - name: Run Rust code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development rust all
+      - name: Upload test coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}_test_coverage
+          path: .coverage_output/rust.xml
+          if-no-files-found: error
+          overwrite: true
+  run_python_code_checks:
+    name: Run Python code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run Python code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development python all
+      - name: Upload test coverage results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.job }}_test_coverage
+          path: .coverage_output/python.xml
+          if-no-files-found: error
+          overwrite: true
+  run_markdown_code_checks:
+    name: Run Markdown code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run Markdown code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development markdown all
+  upload_test_coverage:
+    needs:
+      - run_rust_code_checks
+      - run_python_code_checks
+    if: ${{ always() && (needs.run_rust_code_checks.result == 'success' || needs.run_python_code_checks.result == 'success') }}
+    name: Upload coverage to Coveralls
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download test coverage results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*_test_coverage'
+          path: .coverage_output/
+          merge-multiple: true
+          run-id: ${{ github.run_id }}
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          files: .coverage_output/python.xml .coverage_output/rust.xml

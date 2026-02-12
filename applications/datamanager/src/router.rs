@@ -13,7 +13,10 @@ use tower_http::trace::TraceLayer;
 
 pub async fn create_app() -> Router {
     let state = State::from_env().await;
+    create_app_with_state(state)
+}
 
+pub fn create_app_with_state(state: State) -> Router {
     Router::new()
         .route("/health", get(health::get_health))
         .route("/predictions", post(predictions::save))
