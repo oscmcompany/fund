@@ -176,15 +176,22 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
 
     let session_token = credentials.session_token().unwrap_or_default();
 
+    let sanitized_region = sanitize_duckdb_config_value(&region)?;
+    let sanitized_access_key = sanitize_duckdb_config_value(credentials.access_key_id())?;
+    let sanitized_secret_key = sanitize_duckdb_config_value(credentials.secret_access_key())?;
+    // Session token can be empty for static credentials (no temporary session)
+    let sanitized_session_token = if !session_token.is_empty() {
+        sanitize_duckdb_config_value(session_token)?
+    } else {
+        String::new()
+    };
+
     let mut s3_configuration_statements = vec![
-        format!("SET s3_region='{}';", region),
+        format!("SET s3_region='{}';", sanitized_region),
         "SET s3_url_style='path';".to_string(),
-        format!("SET s3_access_key_id='{}';", credentials.access_key_id()),
-        format!(
-            "SET s3_secret_access_key='{}';",
-            credentials.secret_access_key()
-        ),
-        format!("SET s3_session_token='{}';", session_token),
+        format!("SET s3_access_key_id='{}';", sanitized_access_key),
+        format!("SET s3_secret_access_key='{}';", sanitized_secret_key),
+        format!("SET s3_session_token='{}';", sanitized_session_token),
     ];
 
     if let Ok(duckdb_s3_endpoint) = std::env::var("DUCKDB_S3_ENDPOINT") {

@@ -125,8 +125,6 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscmcompany/${application_name}-${stage_name}"
-
 repository_name="oscm/${application_name}-${stage_name}"
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 commit_hash=$(git rev-parse --short HEAD)
@@ -398,19 +396,30 @@ set -euo pipefail
 echo "Running Rust tests with coverage"
 
 echo "Checking Docker availability for integration tests"
-if command -v docker >/dev/null 2>&1; then
-    if ! docker info >/dev/null 2>&1; then
-        echo "Error: Docker is installed but daemon is not running"
+if [[ "${RUN_INTEGRATION_TESTS:-0}" == "1" ]]; then
+    echo "RUN_INTEGRATION_TESTS=1 - enforcing Docker availability"
+    if command -v docker >/dev/null 2>&1; then
+        if ! docker info >/dev/null 2>&1; then
+            echo "Error: Docker is installed but daemon is not running"
+            echo "Integration tests requiring Docker will fail"
+            echo "Start Docker with: open -a Docker (macOS) or sudo systemctl start docker (Linux)"
+            exit 1
+        fi
+        echo "Docker daemon is running"
+    else
+        echo "Error: Docker is not installed"
         echo "Integration tests requiring Docker will fail"
-        echo "Start Docker with: open -a Docker (macOS) or sudo systemctl start docker (Linux)"
+        echo "Install Docker from: https://docs.docker.com/get-docker/"
         exit 1
     fi
-    echo "Docker daemon is running"
 else
-    echo "Error: Docker is not installed"
-    echo "Integration tests requiring Docker will fail"
-    echo "Install Docker from: https://docs.docker.com/get-docker/"
-    exit 1
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        echo "Docker is available - integration tests can run"
+    else
+        echo "Warning: Docker is not available or daemon is not running"
+        echo "Integration tests requiring Docker may be skipped or fail"
+        echo "To enforce Docker for integration tests, set RUN_INTEGRATION_TESTS=1"
+    fi
 fi
 
 mkdir -p .coverage_output
@@ -444,7 +453,7 @@ set -euo pipefail
 
 echo "Running Rust development checks"
 
-mask development rust update
+# mask development rust update # Temporarily removing for continuous integration speed
 
 mask development rust check
 

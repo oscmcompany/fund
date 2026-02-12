@@ -25,7 +25,7 @@ logger = structlog.get_logger()
 
 MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.io")
 
-# Polygon ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
+# Massive ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
 EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}
 
 
@@ -144,7 +144,7 @@ def sync_equity_categories(
     tickers = fetch_all_tickers(api_key)
     categories = extract_categories(tickers)
 
-    s3_client = boto3.client("s3")
+    s3_client = cast("S3Client", boto3.client("s3"))
     return upload_categories_to_s3(s3_client, bucket_name, categories)
 
 

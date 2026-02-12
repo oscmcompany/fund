@@ -57,5 +57,11 @@ mod tests {
         let exit_code = run_with_bind_address("invalid-address").await;
 
         assert_eq!(exit_code, 1);
+
+        unsafe {
+            std::env::remove_var("AWS_S3_DATA_BUCKET_NAME");
+            std::env::remove_var("MASSIVE_BASE_URL");
+            std::env::remove_var("MASSIVE_API_KEY");
+        }
     }
 }

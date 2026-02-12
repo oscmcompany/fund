@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.26.4",
   "tinygrad>=0.10.3",
   "requests>=2.32.5",
+  "mypy-boto3-s3>=1.42.37",
 ]
 
 [tool.uv.sources]

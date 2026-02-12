@@ -33,13 +33,15 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
         "volume" => equity_bars_rows.iter().map(|b| b.volume).collect::<Vec<_>>(),
         "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
         "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
-    )?;
+    )
+    .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 
     debug!("Normalizing ticker column to uppercase");
     let equity_bars_dataframe = equity_bars_dataframe
         .lazy()
         .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
     info!(
         "Created equity bar DataFrame: {} rows x {} columns",
@@ -71,13 +73,15 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
         "quantile_10" => prediction_rows.iter().map(|p| p.quantile_10).collect::<Vec<_>>(),
         "quantile_50" => prediction_rows.iter().map(|p| p.quantile_50).collect::<Vec<_>>(),
         "quantile_90" => prediction_rows.iter().map(|p| p.quantile_90).collect::<Vec<_>>(),
-    )?;
+    )
+    .map_err(|e| Error::Other(format!("Failed to create predictions DataFrame: {}", e)))?;
 
     debug!("Normalizing ticker column to uppercase");
     let unfiltered_prediction_dataframe = prediction_dataframe
         .lazy()
         .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
     debug!(
         "Unfiltered predictions DataFrame has {} rows",
@@ -100,7 +104,8 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
             col("quantile_50"),
             col("quantile_90"),
         ])
-        .collect()?;
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to filter predictions DataFrame: {}", e)))?;
 
     info!(
         "Created predictions DataFrame: {} rows x {} columns (filtered from {} input rows)",
