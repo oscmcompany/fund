@@ -25,11 +25,8 @@ def test_production_stack_config_stores_region_as_secret() -> None:
 def test_production_stack_config_stores_budget_alert_emails_as_secret() -> None:
     production_stack_config = load_production_stack_config()
 
-    assert "oscmcompany:budgetAlertEmailAddresses:" in production_stack_config
-    assert (
-        "  oscmcompany:budgetAlertEmailAddresses:\n    secure:"
-        in production_stack_config
-    )
+    assert "fund:budgetAlertEmailAddresses:" in production_stack_config
+    assert "  fund:budgetAlertEmailAddresses:\n    secure:" in production_stack_config
 
 
 def test_infrastructure_entrypoint_contains_oidc_claim_constraints() -> None:
@@ -96,6 +93,6 @@ def test_infrastructure_entrypoint_contains_s3_public_access_block_resources() -
 def test_infrastructure_entrypoint_scopes_oidc_provider_creation_statement() -> None:
     infrastructure_entrypoint = load_infrastructure_entrypoint()
 
-    assert '"CreateGithubActionsOidcProvider"' in infrastructure_entrypoint
+    assert '"CreateGithubActionsOIDCProvider"' in infrastructure_entrypoint
     assert '"Resource": github_oidc_provider_arn' in infrastructure_entrypoint
     assert '"CreateIamResourcesForOscmStack"' not in infrastructure_entrypoint
