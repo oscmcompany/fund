@@ -92,15 +92,15 @@ shared_secrets_name = stack_config.require("sharedSecretName")
 
 datamanager_secret_values = require_secret_config_object(
     stack_config,
-    "datamanagerSecretValues",
+    "datamanagerSecretValue",
 )
 portfoliomanager_secret_values = require_secret_config_object(
     stack_config,
-    "portfoliomanagerSecretValues",
+    "portfoliomanagerSecretValue",
 )
 shared_secret_values = require_secret_config_object(
     stack_config,
-    "sharedSecretValues",
+    "sharedSecretValue",
 )
 
 github_oidc_audience_claim = "token.actions.githubusercontent.com:aud"
