@@ -3,8 +3,8 @@ config:
     secure: AAABAHZdRn/VT0csV4a+3PcpSKdeMfYLIAPSZxB5TBpYzC/qCrJDtfU=
   fund:budgetAlertEmailAddresses:
     secure: AAABAEVOj8Wk2uRR16QLK4GVV/0Q7NqIgcpgPSEGeWeIDeq2l9JANRiPzcqKk0HfPYnJ1+x+DR0GeVYwvSENSURnq/Or5Bc0pMqMYHyMFbXqXp45VE6J2XuyaUSF8WQK3IyNcJr7HAoK/9VtRrttbQ==
-  fund:githubActionsRoleName: oscm-github-actions-infrastructure-role
-  fund:sagemakerExecutionRoleName: oscm-sagemaker-execution-role
+  fund:githubActionsRoleName: fund-github-actions-infrastructure-role
+  fund:sagemakerExecutionRoleName: fund-sagemaker-execution-role
   fund:githubRepository: oscmcompany/fund
   fund:githubBranch: master
   fund:monthlyBudgetLimitUsd: "25"

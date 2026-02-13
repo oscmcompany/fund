@@ -314,14 +314,17 @@ def create_predictions(request: Request) -> Response:
         )
     )
 
-    processed_predictions = predictions_schema.validate(processed_predictions)
+    validated_predictions = cast(
+        "pl.DataFrame",
+        predictions_schema.validate(processed_predictions),
+    )
 
     try:
         save_predictions_response = requests.post(
             url=f"{DATAMANAGER_BASE_URL}/predictions",
             json={
                 "timestamp": current_timestamp.isoformat(),
-                "data": processed_predictions.to_dicts(),
+                "data": validated_predictions.to_dicts(),
             },
             timeout=60,
         )
@@ -339,7 +342,7 @@ def create_predictions(request: Request) -> Response:
     logger.info("Successfully generated and saved predictions")
 
     return Response(
-        content=json.dumps({"data": processed_predictions.to_dicts()}).encode("utf-8"),
+        content=json.dumps({"data": validated_predictions.to_dicts()}).encode("utf-8"),
         status_code=status.HTTP_200_OK,
     )
 
