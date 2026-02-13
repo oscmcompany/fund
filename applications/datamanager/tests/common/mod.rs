@@ -98,6 +98,9 @@ pub async fn get_localstack_endpoint() -> String {
         .await
         .expect("Failed to start LocalStack container — is Docker running?");
 
+    // Give LocalStack additional time to fully initialize services
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(4566).await.unwrap();
     let endpoint = format!("http://{}:{}", host, port);

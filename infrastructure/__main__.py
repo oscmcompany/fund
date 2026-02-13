@@ -45,11 +45,7 @@ if stack_name != "production":
 stack_config = pulumi.Config("fund")
 aws_config = pulumi.Config("aws")
 
-aws_region_full_key = aws_config.full_key("region")
-if not pulumi.runtime.is_config_secret(aws_region_full_key):
-    message = "Pulumi config 'aws:region' must be configured as a secret."
-    raise ValueError(message)
-region = aws_config.require_secret("region")
+region = aws_config.require("region")
 
 github_actions_role_name = stack_config.require("githubActionsRoleName")
 github_repository = stack_config.require("githubRepository")
@@ -86,9 +82,9 @@ if not budget_alert_email_addresses:
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
 sagemaker_execution_role_name = stack_config.require("sagemakerExecutionRoleName")
 
-datamanager_secret_name = stack_config.require("datamanagerSecretName")
-portfoliomanager_secret_name = stack_config.require("portfoliomanagerSecretName")
-shared_secret_name = stack_config.require("sharedSecretName")
+datamanager_secret_name = stack_config.require_secret("datamanagerSecretName")
+portfoliomanager_secret_name = stack_config.require_secret("portfoliomanagerSecretName")
+shared_secret_name = stack_config.require_secret("sharedSecretName")
 
 datamanager_secret_values = require_secret_config_object(
     stack_config,
@@ -130,8 +126,10 @@ tags = {
     "manager": "pulumi",
 }
 
-github_oidc_provider_arn = (
-    f"arn:aws:iam::{account_id}:oidc-provider/token.actions.githubusercontent.com"
+github_oidc_provider_arn = pulumi.Output.concat(
+    "arn:aws:iam::",
+    account_id,
+    ":oidc-provider/token.actions.githubusercontent.com",
 )
 
 datamanager_secret = aws.secretsmanager.Secret(
@@ -886,310 +884,320 @@ github_actions_infrastructure_policy = aws.iam.Policy(
     description=(
         "Least-privilege policy for GitHub Actions infrastructure deployments."
     ),
-    policy=json.dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                # These list/describe APIs are account-scoped and require wildcard
-                # resources.
-                {
-                    "Sid": "ReadGlobalMetadata",
-                    "Effect": "Allow",
-                    "Action": [
-                        "sts:GetCallerIdentity",
-                        "tag:GetResources",
-                        "tag:GetTagKeys",
-                        "tag:GetTagValues",
-                        "iam:Get*",
-                        "iam:List*",
-                        "ec2:Describe*",
-                        "ecs:Describe*",
-                        "ecs:List*",
-                        "elasticloadbalancing:Describe*",
-                        "ecr:Describe*",
-                        "ecr:ListTagsForResource",
-                        "s3:GetBucketLocation",
-                        "s3:ListAllMyBuckets",
-                        "ssm:DescribeParameters",
-                        "secretsmanager:ListSecrets",
-                        "logs:Describe*",
-                        "cloudwatch:Describe*",
-                        "cloudwatch:Get*",
-                        "sns:Get*",
-                        "sns:List*",
-                        "budgets:Describe*",
-                        "budgets:ViewBudget",
-                        "servicediscovery:Get*",
-                        "servicediscovery:List*",
-                    ],
-                    "Resource": "*",
-                },
-                # These control-plane APIs rely on generated identifiers and do not
-                # support practical resource-level scoping for stack create/update/
-                # delete operations.
-                {
-                    "Sid": "ManageEC2ECSELBBudgetsAndServiceDiscovery",
-                    "Effect": "Allow",
-                    "Action": [
-                        "ec2:*",
-                        "ecs:*",
-                        "elasticloadbalancing:*",
-                        "budgets:*",
-                        "servicediscovery:*",
-                    ],
-                    "Resource": "*",
-                },
-                # CreateRepository/GetAuthorizationToken require wildcard resources.
-                {
-                    "Sid": "CreateAndAuthenticateECRRepositories",
-                    "Effect": "Allow",
-                    "Action": [
-                        "ecr:CreateRepository",
-                        "ecr:GetAuthorizationToken",
-                    ],
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ManageECRRepositories",
-                    "Effect": "Allow",
-                    "Action": "ecr:*",
-                    "Resource": f"arn:aws:ecr:{region}:{account_id}:repository/fund/*",
-                },
-                # CreateBucket requires wildcard resources.
-                {
-                    "Sid": "CreateBuckets",
-                    "Effect": "Allow",
-                    "Action": "s3:CreateBucket",
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ManageBuckets",
-                    "Effect": "Allow",
-                    "Action": "s3:*",
-                    "Resource": [
-                        "arn:aws:s3:::fund-data-*",
-                        "arn:aws:s3:::fund-data-*/*",
-                        "arn:aws:s3:::fund-model-artifacts-*",
-                        "arn:aws:s3:::fund-model-artifacts-*/*",
-                    ],
-                },
-                # CreateSecret requires wildcard resources before an ARN exists.
-                {
-                    "Sid": "CreateSecrets",
-                    "Effect": "Allow",
-                    "Action": "secretsmanager:CreateSecret",
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ManageConfiguredSecrets",
-                    "Effect": "Allow",
-                    "Action": "secretsmanager:*",
-                    "Resource": [
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{datamanager_secret_name}*",
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{portfoliomanager_secret_name}*",
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{shared_secret_name}*",
-                    ],
-                },
-                {
-                    "Sid": "ManageParameters",
-                    "Effect": "Allow",
-                    "Action": "ssm:*",
-                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/fund/*",
-                },
-                {
-                    "Sid": "ManageLogGroups",
-                    "Effect": "Allow",
-                    "Action": "logs:*",
-                    "Resource": [
-                        f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*",
-                        f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*:*",
-                    ],
-                },
-                # Alarm mutation APIs require wildcard resources.
-                {
-                    "Sid": "ManageAlarms",
-                    "Effect": "Allow",
-                    "Action": [
-                        "cloudwatch:DeleteAlarms",
-                        "cloudwatch:ListTagsForResource",
-                        "cloudwatch:PutMetricAlarm",
-                        "cloudwatch:TagResource",
-                        "cloudwatch:UntagResource",
-                    ],
-                    "Resource": "*",
-                },
-                # CreateTopic requires wildcard resources.
-                {
-                    "Sid": "CreateInfrastructureAlertsTopic",
-                    "Effect": "Allow",
-                    "Action": "sns:CreateTopic",
-                    "Resource": "*",
-                },
-                {
-                    "Sid": "ManageInfrastructureAlertsTopic",
-                    "Effect": "Allow",
-                    "Action": "sns:*",
-                    "Resource": [
-                        f"arn:aws:sns:{region}:{account_id}:fund-infrastructure-alerts",
-                        f"arn:aws:sns:{region}:{account_id}:fund-infrastructure-alerts:*",
-                    ],
-                },
-                {
-                    "Sid": "CreateGithubActionsOIDCProvider",
-                    "Effect": "Allow",
-                    "Action": "iam:CreateOpenIDConnectProvider",
-                    "Resource": github_oidc_provider_arn,
-                },
-                # CreateRole uses wildcard resources by API design.
-                {
-                    "Sid": "CreateRoles",
-                    "Effect": "Allow",
-                    "Action": "iam:CreateRole",
-                    "Resource": "*",
-                    "Condition": {
-                        "StringEquals": {
-                            "iam:RoleName": [
-                                "fund-ecs-execution-role",
-                                "fund-ecs-task-role",
-                                github_actions_role_name,
-                                sagemaker_execution_role_name,
-                            ]
-                        }
+    policy=pulumi.Output.all(
+        datamanager_secret_name,
+        portfoliomanager_secret_name,
+        shared_secret_name,
+    ).apply(
+        lambda args: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    # These list/describe APIs are account-scoped and require wildcard
+                    # resources.
+                    {
+                        "Sid": "ReadGlobalMetadata",
+                        "Effect": "Allow",
+                        "Action": [
+                            "sts:GetCallerIdentity",
+                            "tag:GetResources",
+                            "tag:GetTagKeys",
+                            "tag:GetTagValues",
+                            "iam:Get*",
+                            "iam:List*",
+                            "ec2:Describe*",
+                            "ecs:Describe*",
+                            "ecs:List*",
+                            "elasticloadbalancing:Describe*",
+                            "ecr:Describe*",
+                            "ecr:ListTagsForResource",
+                            "s3:GetBucketLocation",
+                            "s3:ListAllMyBuckets",
+                            "ssm:DescribeParameters",
+                            "secretsmanager:ListSecrets",
+                            "logs:Describe*",
+                            "cloudwatch:Describe*",
+                            "cloudwatch:Get*",
+                            "sns:Get*",
+                            "sns:List*",
+                            "budgets:Describe*",
+                            "budgets:ViewBudget",
+                            "servicediscovery:Get*",
+                            "servicediscovery:List*",
+                        ],
+                        "Resource": "*",
                     },
-                },
-                # CreatePolicy uses wildcard resources by API design.
-                {
-                    "Sid": "CreatePolicies",
-                    "Effect": "Allow",
-                    "Action": "iam:CreatePolicy",
-                    "Resource": "*",
-                    "Condition": {
-                        "StringLike": {
-                            "iam:PolicyName": "fund-*",
-                        }
+                    # These control-plane APIs rely on generated identifiers and do not
+                    # support practical resource-level scoping for stack create/update/
+                    # delete operations.
+                    {
+                        "Sid": "ManageEC2ECSELBBudgetsAndServiceDiscovery",
+                        "Effect": "Allow",
+                        "Action": [
+                            "ec2:*",
+                            "ecs:*",
+                            "elasticloadbalancing:*",
+                            "budgets:*",
+                            "servicediscovery:*",
+                        ],
+                        "Resource": "*",
                     },
-                },
-                # CreateServiceLinkedRole uses wildcard resources by API design.
-                {
-                    "Sid": "CreateServiceLinkedRolesForStack",
-                    "Effect": "Allow",
-                    "Action": "iam:CreateServiceLinkedRole",
-                    "Resource": "*",
-                    "Condition": {
-                        "StringEquals": {
-                            "iam:AWSServiceName": [
-                                "ecs.amazonaws.com",
-                                "elasticloadbalancing.amazonaws.com",
-                            ]
-                        }
+                    # CreateRepository/GetAuthorizationToken require wildcard resources.
+                    {
+                        "Sid": "CreateAndAuthenticateECRRepositories",
+                        "Effect": "Allow",
+                        "Action": [
+                            "ecr:CreateRepository",
+                            "ecr:GetAuthorizationToken",
+                        ],
+                        "Resource": "*",
                     },
-                },
-                {
-                    "Sid": "ManageRoles",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:AttachRolePolicy",
-                        "iam:DeleteRole",
-                        "iam:DetachRolePolicy",
-                        "iam:PassRole",
-                        "iam:TagRole",
-                        "iam:UntagRole",
-                        "iam:UpdateAssumeRolePolicy",
-                    ],
-                    "Resource": [
-                        f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
-                        f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
-                        f"arn:aws:iam::{account_id}:role/{github_actions_role_name}",
-                        f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
-                    ],
-                    "Condition": {
-                        "ArnLikeIfExists": {
-                            "iam:PolicyARN": [
-                                "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-                                f"arn:aws:iam::{account_id}:policy/fund-*",
-                            ]
-                        },
-                        "StringLikeIfExists": {
-                            "iam:PassedToService": [
-                                "ecs-tasks.amazonaws.com",
-                                "ecs.amazonaws.com",
-                                "sagemaker.amazonaws.com",
-                            ]
+                    {
+                        "Sid": "ManageECRRepositories",
+                        "Effect": "Allow",
+                        "Action": "ecr:*",
+                        "Resource": (
+                            f"arn:aws:ecr:{region}:{account_id}:repository/fund/*"
+                        ),
+                    },
+                    # CreateBucket requires wildcard resources.
+                    {
+                        "Sid": "CreateBuckets",
+                        "Effect": "Allow",
+                        "Action": "s3:CreateBucket",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "ManageBuckets",
+                        "Effect": "Allow",
+                        "Action": "s3:*",
+                        "Resource": [
+                            "arn:aws:s3:::fund-data-*",
+                            "arn:aws:s3:::fund-data-*/*",
+                            "arn:aws:s3:::fund-model-artifacts-*",
+                            "arn:aws:s3:::fund-model-artifacts-*/*",
+                        ],
+                    },
+                    # CreateSecret requires wildcard resources before an ARN exists.
+                    {
+                        "Sid": "CreateSecrets",
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:CreateSecret",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "ManageConfiguredSecrets",
+                        "Effect": "Allow",
+                        "Action": "secretsmanager:*",
+                        "Resource": [
+                            f"arn:aws:secretsmanager:{region}:{account_id}:secret:{args[0]}*",
+                            f"arn:aws:secretsmanager:{region}:{account_id}:secret:{args[1]}*",
+                            f"arn:aws:secretsmanager:{region}:{account_id}:secret:{args[2]}*",
+                        ],
+                    },
+                    {
+                        "Sid": "ManageParameters",
+                        "Effect": "Allow",
+                        "Action": "ssm:*",
+                        "Resource": (
+                            f"arn:aws:ssm:{region}:{account_id}:parameter/fund/*"
+                        ),
+                    },
+                    {
+                        "Sid": "ManageLogGroups",
+                        "Effect": "Allow",
+                        "Action": "logs:*",
+                        "Resource": [
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*",
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*:*",
+                        ],
+                    },
+                    # Alarm mutation APIs require wildcard resources.
+                    {
+                        "Sid": "ManageAlarms",
+                        "Effect": "Allow",
+                        "Action": [
+                            "cloudwatch:DeleteAlarms",
+                            "cloudwatch:ListTagsForResource",
+                            "cloudwatch:PutMetricAlarm",
+                            "cloudwatch:TagResource",
+                            "cloudwatch:UntagResource",
+                        ],
+                        "Resource": "*",
+                    },
+                    # CreateTopic requires wildcard resources.
+                    {
+                        "Sid": "CreateInfrastructureAlertsTopic",
+                        "Effect": "Allow",
+                        "Action": "sns:CreateTopic",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "ManageInfrastructureAlertsTopic",
+                        "Effect": "Allow",
+                        "Action": "sns:*",
+                        "Resource": [
+                            f"arn:aws:sns:{region}:{account_id}:fund-infrastructure-alerts",
+                            f"arn:aws:sns:{region}:{account_id}:fund-infrastructure-alerts:*",
+                        ],
+                    },
+                    {
+                        "Sid": "CreateGithubActionsOIDCProvider",
+                        "Effect": "Allow",
+                        "Action": "iam:CreateOpenIDConnectProvider",
+                        "Resource": github_oidc_provider_arn,
+                    },
+                    # CreateRole uses wildcard resources by API design.
+                    {
+                        "Sid": "CreateRoles",
+                        "Effect": "Allow",
+                        "Action": "iam:CreateRole",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "iam:RoleName": [
+                                    "fund-ecs-execution-role",
+                                    "fund-ecs-task-role",
+                                    github_actions_role_name,
+                                    sagemaker_execution_role_name,
+                                ]
+                            }
                         },
                     },
-                },
-                {
-                    "Sid": "ManageInlineRolePolicies",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:DeleteRolePolicy",
-                        "iam:PutRolePolicy",
-                    ],
-                    "Resource": [
-                        f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
-                        f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
-                        f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
-                    ],
-                    "Condition": {
-                        "StringEquals": {
-                            "iam:PolicyName": [
-                                "fund-ecs-execution-role-secrets-policy",
-                                "fund-ecs-task-role-s3-policy",
-                                "fund-ecs-task-role-ssm-policy",
-                                "fund-sagemaker-s3-policy",
-                                "fund-sagemaker-ecr-policy",
-                                "fund-sagemaker-cloudwatch-policy",
-                            ]
-                        }
+                    # CreatePolicy uses wildcard resources by API design.
+                    {
+                        "Sid": "CreatePolicies",
+                        "Effect": "Allow",
+                        "Action": "iam:CreatePolicy",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringLike": {
+                                "iam:PolicyName": "fund-*",
+                            }
+                        },
                     },
-                },
-                {
-                    "Sid": "ManagePolicies",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:CreatePolicyVersion",
-                        "iam:DeletePolicy",
-                        "iam:DeletePolicyVersion",
-                        "iam:SetDefaultPolicyVersion",
-                        "iam:TagPolicy",
-                        "iam:UntagPolicy",
-                    ],
-                    "Resource": f"arn:aws:iam::{account_id}:policy/fund-*",
-                },
-                {
-                    "Sid": "ManageGithubActionsOIDCProvider",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:AddClientIDToOpenIDConnectProvider",
-                        "iam:DeleteOpenIDConnectProvider",
-                        "iam:RemoveClientIDFromOpenIDConnectProvider",
-                        "iam:TagOpenIDConnectProvider",
-                        "iam:UntagOpenIDConnectProvider",
-                        "iam:UpdateOpenIDConnectProviderThumbprint",
-                    ],
-                    "Resource": github_oidc_provider_arn,
-                },
-                # Service-linked role teardown APIs are wildcard-resource only.
-                {
-                    "Sid": "DeleteServiceLinkedRoles",
-                    "Effect": "Allow",
-                    "Action": [
-                        "iam:DeleteServiceLinkedRole",
-                        "iam:GetServiceLinkedRoleDeletionStatus",
-                    ],
-                    "Resource": "*",
-                    "Condition": {
-                        "StringLikeIfExists": {
-                            "iam:AWSServiceName": [
-                                "ecs.amazonaws.com",
-                                "elasticloadbalancing.amazonaws.com",
-                            ]
-                        }
+                    # CreateServiceLinkedRole uses wildcard resources by API design.
+                    {
+                        "Sid": "CreateServiceLinkedRolesForStack",
+                        "Effect": "Allow",
+                        "Action": "iam:CreateServiceLinkedRole",
+                        "Resource": "*",
+                        "Condition": {
+                            "StringEquals": {
+                                "iam:AWSServiceName": [
+                                    "ecs.amazonaws.com",
+                                    "elasticloadbalancing.amazonaws.com",
+                                ]
+                            }
+                        },
                     },
-                },
-            ],
-        },
-        sort_keys=True,
+                    {
+                        "Sid": "ManageRoles",
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:AttachRolePolicy",
+                            "iam:DeleteRole",
+                            "iam:DetachRolePolicy",
+                            "iam:PassRole",
+                            "iam:TagRole",
+                            "iam:UntagRole",
+                            "iam:UpdateAssumeRolePolicy",
+                        ],
+                        "Resource": [
+                            f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
+                            f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
+                            f"arn:aws:iam::{account_id}:role/{github_actions_role_name}",
+                            f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
+                        ],
+                        "Condition": {
+                            "ArnLikeIfExists": {
+                                "iam:PolicyARN": [
+                                    "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+                                    f"arn:aws:iam::{account_id}:policy/fund-*",
+                                ]
+                            },
+                            "StringLikeIfExists": {
+                                "iam:PassedToService": [
+                                    "ecs-tasks.amazonaws.com",
+                                    "ecs.amazonaws.com",
+                                    "sagemaker.amazonaws.com",
+                                ]
+                            },
+                        },
+                    },
+                    {
+                        "Sid": "ManageInlineRolePolicies",
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:DeleteRolePolicy",
+                            "iam:PutRolePolicy",
+                        ],
+                        "Resource": [
+                            f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
+                            f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
+                            f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
+                        ],
+                        "Condition": {
+                            "StringEquals": {
+                                "iam:PolicyName": [
+                                    "fund-ecs-execution-role-secrets-policy",
+                                    "fund-ecs-task-role-s3-policy",
+                                    "fund-ecs-task-role-ssm-policy",
+                                    "fund-sagemaker-s3-policy",
+                                    "fund-sagemaker-ecr-policy",
+                                    "fund-sagemaker-cloudwatch-policy",
+                                ]
+                            }
+                        },
+                    },
+                    {
+                        "Sid": "ManagePolicies",
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:CreatePolicyVersion",
+                            "iam:DeletePolicy",
+                            "iam:DeletePolicyVersion",
+                            "iam:SetDefaultPolicyVersion",
+                            "iam:TagPolicy",
+                            "iam:UntagPolicy",
+                        ],
+                        "Resource": f"arn:aws:iam::{account_id}:policy/fund-*",
+                    },
+                    {
+                        "Sid": "ManageGithubActionsOIDCProvider",
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:AddClientIDToOpenIDConnectProvider",
+                            "iam:DeleteOpenIDConnectProvider",
+                            "iam:RemoveClientIDFromOpenIDConnectProvider",
+                            "iam:TagOpenIDConnectProvider",
+                            "iam:UntagOpenIDConnectProvider",
+                            "iam:UpdateOpenIDConnectProviderThumbprint",
+                        ],
+                        "Resource": github_oidc_provider_arn,
+                    },
+                    # Service-linked role teardown APIs are wildcard-resource only.
+                    {
+                        "Sid": "DeleteServiceLinkedRoles",
+                        "Effect": "Allow",
+                        "Action": [
+                            "iam:DeleteServiceLinkedRole",
+                            "iam:GetServiceLinkedRoleDeletionStatus",
+                        ],
+                        "Resource": "*",
+                        "Condition": {
+                            "StringLikeIfExists": {
+                                "iam:AWSServiceName": [
+                                    "ecs.amazonaws.com",
+                                    "elasticloadbalancing.amazonaws.com",
+                                ]
+                            }
+                        },
+                    },
+                ],
+            },
+            sort_keys=True,
+        )
     ),
     opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
@@ -1245,7 +1253,7 @@ aws.iam.RolePolicy(
                     {
                         "Effect": "Allow",
                         "Action": ["secretsmanager:GetSecretValue"],
-                        "Resource": [args[0], args[1], args[2]],
+                        "Resource": [account_id, args[0], args[1]],
                     }
                 ],
             },
@@ -1288,10 +1296,10 @@ aws.iam.RolePolicy(
                         "Effect": "Allow",
                         "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
                         "Resource": [
+                            account_id,
+                            f"{account_id}/*",
                             args[0],
                             f"{args[0]}/*",
-                            args[1],
-                            f"{args[1]}/*",
                         ],
                     }
                 ],
@@ -1312,7 +1320,7 @@ aws.iam.RolePolicy(
                 {
                     "Effect": "Allow",
                     "Action": ["ssm:GetParameter", "ssm:GetParameters"],
-                    "Resource": (f"arn:aws:ssm:{region}:{account_id}:parameter/fund/*"),
+                    "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/fund/*",
                 }
             ],
         },
@@ -1359,10 +1367,10 @@ aws.iam.RolePolicy(
                             "s3:ListBucket",
                         ],
                         "Resource": [
+                            account_id,
+                            f"{account_id}/*",
                             args[0],
                             f"{args[0]}/*",
-                            args[1],
-                            f"{args[1]}/*",
                         ],
                     }
                 ],
@@ -1470,7 +1478,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "datamanager",
-                    "image": args[1],
+                    "image": args[0],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
@@ -1489,17 +1497,17 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                     "secrets": [
                         {
                             "name": "MASSIVE_API_KEY",
-                            "valueFrom": f"{args[2]}:MASSIVE_API_KEY::",
+                            "valueFrom": f"{args[1]}:MASSIVE_API_KEY::",
                         },
                         {
                             "name": "SENTRY_DSN",
-                            "valueFrom": f"{args[3]}:SENTRY_DSN::",
+                            "valueFrom": f"{args[2]}:SENTRY_DSN::",
                         },
                     ],
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": args[0],
+                            "awslogs-group": account_id,
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "datamanager",
                         },
@@ -1534,16 +1542,16 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "portfoliomanager",
-                    "image": args[2],
+                    "image": args[1],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[1]}:8080",
+                            "value": f"http://datamanager.{args[0]}:8080",
                         },
                         {
                             "name": "FUND_EQUITYPRICEMODEL_BASE_URL",
-                            "value": f"http://equitypricemodel.{args[1]}:8080",
+                            "value": f"http://equitypricemodel.{args[0]}:8080",
                         },
                         {
                             "name": "ENVIRONMENT",
@@ -1557,15 +1565,15 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                     "secrets": [
                         {
                             "name": "ALPACA_API_KEY_ID",
-                            "valueFrom": f"{args[3]}:ALPACA_API_KEY_ID::",
+                            "valueFrom": f"{args[2]}:ALPACA_API_KEY_ID::",
                         },
                         {
                             "name": "ALPACA_API_SECRET",
-                            "valueFrom": f"{args[3]}:ALPACA_API_SECRET::",
+                            "valueFrom": f"{args[2]}:ALPACA_API_SECRET::",
                         },
                         {
                             "name": "ALPACA_IS_PAPER",
-                            "valueFrom": f"{args[3]}:ALPACA_IS_PAPER::",
+                            "valueFrom": f"{args[2]}:ALPACA_IS_PAPER::",
                         },
                         {
                             "name": "SENTRY_DSN",
@@ -1575,7 +1583,7 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": args[0],
+                            "awslogs-group": account_id,
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "portfoliomanager",
                         },
@@ -1609,16 +1617,16 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "equitypricemodel",
-                    "image": args[2],
+                    "image": args[1],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[1]}:8080",
+                            "value": f"http://datamanager.{args[0]}:8080",
                         },
                         {
                             "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET",
-                            "value": args[3],
+                            "value": args[2],
                         },
                         {
                             "name": "ENVIRONMENT",
@@ -1638,7 +1646,7 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": args[0],
+                            "awslogs-group": account_id,
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "equitypricemodel",
                         },

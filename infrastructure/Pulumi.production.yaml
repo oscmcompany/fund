@@ -1,6 +1,5 @@
 config:
-  aws:region:
-    secure: AAABAHZdRn/VT0csV4a+3PcpSKdeMfYLIAPSZxB5TBpYzC/qCrJDtfU=
+  aws:region: us-east-1
   fund:budgetAlertEmailAddresses:
     secure: AAABAEVOj8Wk2uRR16QLK4GVV/0Q7NqIgcpgPSEGeWeIDeq2l9JANRiPzcqKk0HfPYnJ1+x+DR0GeVYwvSENSURnq/Or5Bc0pMqMYHyMFbXqXp45VE6J2XuyaUSF8WQK3IyNcJr7HAoK/9VtRrttbQ==
   fund:githubActionsRoleName: fund-github-actions-infrastructure-role
