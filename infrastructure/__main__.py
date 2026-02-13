@@ -86,9 +86,9 @@ if not budget_alert_email_addresses:
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
 sagemaker_execution_role_name = stack_config.require("sagemakerExecutionRoleName")
 
-datamanager_secrets_name = stack_config.require("datamanagerSecretName")
-portfoliomanager_secrets_name = stack_config.require("portfoliomanagerSecretName")
-shared_secrets_name = stack_config.require("sharedSecretName")
+datamanager_secret_name = stack_config.require("datamanagerSecretName")
+portfoliomanager_secret_name = stack_config.require("portfoliomanagerSecretName")
+shared_secret_name = stack_config.require("sharedSecretName")
 
 datamanager_secret_values = require_secret_config_object(
     stack_config,
@@ -136,19 +136,19 @@ github_oidc_provider_arn = (
 
 datamanager_secret = aws.secretsmanager.Secret(
     "datamanager_secret",
-    name=datamanager_secrets_name,
+    name=datamanager_secret_name,
     tags=tags,
 )
 
 portfoliomanager_secret = aws.secretsmanager.Secret(
     "portfoliomanager_secret",
-    name=portfoliomanager_secrets_name,
+    name=portfoliomanager_secret_name,
     tags=tags,
 )
 
 shared_secret = aws.secretsmanager.Secret(
     "shared_secret",
-    name=shared_secrets_name,
+    name=shared_secret_name,
     tags=tags,
 )
 
@@ -985,9 +985,9 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                     "Effect": "Allow",
                     "Action": "secretsmanager:*",
                     "Resource": [
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{datamanager_secrets_name}*",
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{portfoliomanager_secrets_name}*",
-                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{shared_secrets_name}*",
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{datamanager_secret_name}*",
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{portfoliomanager_secret_name}*",
+                        f"arn:aws:secretsmanager:{region}:{account_id}:secret:{shared_secret_name}*",
                     ],
                 },
                 {

@@ -58,7 +58,7 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-DATAMANAGER_BASE_URL = os.getenv("OSCM_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 
 
 def find_latest_artifact_key(
@@ -314,10 +314,17 @@ def create_predictions(request: Request) -> Response:
         )
     )
 
-    validated_predictions = cast(
-        "pl.DataFrame",
-        predictions_schema.validate(processed_predictions),
-    )
+    try:
+        validated_result = predictions_schema.validate(processed_predictions)
+        validated_predictions = cast(
+            "pl.DataFrame",
+            validated_result.collect()
+            if isinstance(validated_result, pl.LazyFrame)
+            else validated_result,
+        )
+    except Exception:
+        logger.exception("Predictions failed schema validation")
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         save_predictions_response = requests.post(
