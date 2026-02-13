@@ -351,11 +351,11 @@ echo "Rust dependencies updated successfully"
 ```bash
 set -euo pipefail
 
-echo "Check Rust compilation"
+echo "Check Rust packages"
 
-cargo check 
+cargo check --workspace
 
-echo "Rust compiled successfully"
+echo "Rust packages checked successfully"
 ```
 
 #### format
@@ -381,7 +381,7 @@ set -euo pipefail
 
 echo "Running Rust lint checks"
 
-cargo clippy
+cargo clippy || exit 1
 
 echo "Rust linting completed successfully"
 ```
@@ -426,10 +426,10 @@ mkdir -p .coverage_output
 
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     echo "cargo-llvm-cov not available - running tests without coverage"
-    cargo test --workspace --verbose
+    cargo test --workspace --verbose || exit 1
 elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
     echo "LLVM tools (llvm-cov or llvm-profdata) not available - running tests without coverage"
-    cargo test --workspace --verbose
+    cargo test --workspace --verbose || exit 1
 else
     export LLVM_COV=$(which llvm-cov)
     export LLVM_PROFDATA=$(which llvm-profdata)
@@ -455,9 +455,9 @@ echo "Running Rust development checks"
 
 # mask development rust update # Temporarily removing for continuous integration speed
 
-mask development rust check
-
 mask development rust format
+
+mask development rust check
 
 mask development rust lint
 
@@ -493,7 +493,7 @@ set -euo pipefail
 
 echo "Formatting Python code"
 
-ruff format
+ruff format || exit 1
 
 echo "Python code formatted successfully"
 ```
@@ -510,7 +510,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    . tools/vulture_whitelist.py
+    . tools/vulture_whitelist.py || exit 1
 
 echo "Dead code check completed"
 ```
@@ -526,7 +526,7 @@ echo "Running Python lint checks"
 
 ruff check \
     --output-format=github \
-    .
+    . || exit 1
 
 echo "Python linting completed successfully"
 ```
@@ -540,7 +540,9 @@ set -euo pipefail
 
 echo "Running Python type checks"
 
-uvx ty check
+uvx ty check || exit 1
+
+echo "Python type checks completed successfully"
 ```
 
 #### test
@@ -557,7 +559,8 @@ mkdir -p .coverage_output
 uv run coverage run --parallel-mode -m pytest \
     && uv run coverage combine \
     && uv run coverage report \
-    && uv run coverage xml -o .coverage_output/python.xml
+    && uv run coverage xml -o .coverage_output/python.xml \
+    || exit 1
 
 echo "Python tests completed successfully"
 ```
