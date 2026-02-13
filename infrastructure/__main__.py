@@ -49,7 +49,7 @@ aws_region_full_key = aws_config.full_key("region")
 if not pulumi.runtime.is_config_secret(aws_region_full_key):
     message = "Pulumi config 'aws:region' must be configured as a secret."
     raise ValueError(message)
-region = aws_config.require("region")
+region = aws_config.require_secret("region")
 
 github_actions_role_name = stack_config.require("githubActionsRoleName")
 github_repository = stack_config.require("githubRepository")
@@ -64,10 +64,6 @@ if not github_workflow_files:
     )
     raise ValueError(message)
 
-budget_alert_email_addresses = cast(
-    "list[str]",
-    stack_config.require_object("budgetAlertEmailAddresses"),
-)
 budget_alert_email_addresses_full_key = stack_config.full_key(
     "budgetAlertEmailAddresses"
 )
@@ -76,6 +72,10 @@ if not pulumi.runtime.is_config_secret(budget_alert_email_addresses_full_key):
         "Pulumi config 'budgetAlertEmailAddresses' must be configured as a secret list."
     )
     raise ValueError(message)
+budget_alert_email_addresses = cast(
+    "list[str]",
+    stack_config.require_secret_object("budgetAlertEmailAddresses"),
+)
 if not budget_alert_email_addresses:
     message = (
         "Pulumi config 'budgetAlertEmailAddresses' must include at least one email "

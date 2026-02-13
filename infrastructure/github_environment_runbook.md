@@ -27,7 +27,7 @@ Run from repository root:
 ```bash
 cd infrastructure
 pulumi stack select "$(pulumi org get-default)/fund/production"
-region="$(pulumi config get aws:region --stack production)"
+region="$(pulumi config get aws:region --stack production --show-secrets)"
 cd ..
 gh secret set AWS_REGION --env pulumi --body "$region"
 ```
