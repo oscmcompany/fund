@@ -3,10 +3,14 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
+  push:
+    branches:
+      - master
 jobs:
   run_rust_code_checks:
     name: Run Rust code checks
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,6 +24,14 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
           echo "Disk space after cleanup:"
           df -h
+      - name: Install DuckDB system library
+        run: |
+          wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.3/libduckdb-linux-amd64.zip
+          unzip libduckdb-linux-amd64.zip -d /tmp/duckdb
+          sudo mv /tmp/duckdb/libduckdb.so /usr/local/lib/
+          sudo mv /tmp/duckdb/*.h /usr/local/include/
+          sudo ldconfig
+          rm -rf /tmp/duckdb libduckdb-linux-amd64.zip
       - name: Install Flox
         uses: flox/install-flox-action@v2
       - name: Cache Rust dependencies
