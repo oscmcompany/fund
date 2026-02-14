@@ -342,21 +342,21 @@ set -euo pipefail
 
 echo "Updating Rust dependencies"
 
-cargo update || exit 1
+cargo update
 
 echo "Rust dependencies updated successfully"
 ```
 
 #### check
 
-> Check Rust compilation
+> Check Rust packages
 
 ```bash
 set -euo pipefail
 
 echo "Check Rust packages"
 
-cargo check --workspace || exit 1
+cargo check --workspace
 
 echo "Rust packages checked successfully"
 ```
@@ -370,7 +370,7 @@ set -euo pipefail
 
 echo "Formatting Rust code"
 
-cargo fmt --all || exit 1
+cargo fmt --all
 
 echo "Rust code formatted successfully"
 ```
@@ -384,7 +384,7 @@ set -euo pipefail
 
 echo "Running Rust lint checks"
 
-cargo clippy || exit 1
+cargo clippy
 
 echo "Rust linting completed successfully"
 ```
@@ -429,10 +429,10 @@ mkdir -p .coverage_output
 
 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     echo "cargo-llvm-cov not available - running tests without coverage"
-    cargo test --workspace --verbose || exit 1
+    cargo test --workspace --verbose
 elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
     echo "LLVM tools (llvm-cov or llvm-profdata) not available - running tests without coverage"
-    cargo test --workspace --verbose || exit 1
+    cargo test --workspace --verbose
 else
     export LLVM_COV=$(which llvm-cov)
     export LLVM_PROFDATA=$(which llvm-profdata)
@@ -482,7 +482,7 @@ set -euo pipefail
 
 echo "Installing Python dependencies"
 
-uv sync --all-packages --all-groups || exit 1
+uv sync --all-packages --all-groups
 
 echo "Python dependencies installed successfully"
 ```
@@ -496,7 +496,7 @@ set -euo pipefail
 
 echo "Formatting Python code"
 
-ruff format || exit 1
+ruff format
 
 echo "Python code formatted successfully"
 ```
@@ -513,7 +513,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    . tools/vulture_whitelist.py || exit 1
+    . tools/vulture_whitelist.py
 
 echo "Dead code check completed"
 ```
@@ -529,7 +529,7 @@ echo "Running Python lint checks"
 
 ruff check \
     --output-format=github \
-    . || exit 1
+    .
 
 echo "Python linting completed successfully"
 ```
@@ -543,7 +543,7 @@ set -euo pipefail
 
 echo "Running Python type checks"
 
-uvx ty check || exit 1
+uvx ty check
 
 echo "Python type checks completed successfully"
 ```
@@ -563,7 +563,7 @@ uv run coverage run --parallel-mode -m pytest \
     && uv run coverage combine \
     && uv run coverage report \
     && uv run coverage xml -o .coverage_output/python.xml \
-    || exit 1
+    || exit
 
 echo "Python tests completed successfully"
 ```
