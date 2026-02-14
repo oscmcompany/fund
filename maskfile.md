@@ -342,7 +342,7 @@ set -euo pipefail
 
 echo "Updating Rust dependencies"
 
-cargo update
+cargo update || exit 1
 
 echo "Rust dependencies updated successfully"
 ```
@@ -356,7 +356,7 @@ set -euo pipefail
 
 echo "Check Rust packages"
 
-cargo check --workspace
+cargo check --workspace || exit 1
 
 echo "Rust packages checked successfully"
 ```
@@ -370,7 +370,7 @@ set -euo pipefail
 
 echo "Formatting Rust code"
 
-cargo fmt --all
+cargo fmt --all || exit 1
 
 echo "Rust code formatted successfully"
 ```
@@ -482,7 +482,7 @@ set -euo pipefail
 
 echo "Installing Python dependencies"
 
-uv sync --all-packages --all-groups
+uv sync --all-packages --all-groups || exit 1
 
 echo "Python dependencies installed successfully"
 ```
