@@ -1,4 +1,4 @@
-name: oscm
+name: fund
 runtime:
   name: python
   options:

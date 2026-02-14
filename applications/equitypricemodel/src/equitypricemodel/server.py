@@ -58,7 +58,7 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-DATAMANAGER_BASE_URL = os.getenv("OSCM_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 
 
 def find_latest_artifact_key(
@@ -314,14 +314,24 @@ def create_predictions(request: Request) -> Response:
         )
     )
 
-    processed_predictions = predictions_schema.validate(processed_predictions)
+    try:
+        validated_result = predictions_schema.validate(processed_predictions)
+        validated_predictions = cast(
+            "pl.DataFrame",
+            validated_result.collect()
+            if isinstance(validated_result, pl.LazyFrame)
+            else validated_result,
+        )
+    except Exception:
+        logger.exception("Predictions failed schema validation")
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         save_predictions_response = requests.post(
             url=f"{DATAMANAGER_BASE_URL}/predictions",
             json={
                 "timestamp": current_timestamp.isoformat(),
-                "data": processed_predictions.to_dicts(),
+                "data": validated_predictions.to_dicts(),
             },
             timeout=60,
         )
@@ -339,7 +349,7 @@ def create_predictions(request: Request) -> Response:
     logger.info("Successfully generated and saved predictions")
 
     return Response(
-        content=json.dumps({"data": processed_predictions.to_dicts()}).encode("utf-8"),
+        content=json.dumps({"data": validated_predictions.to_dicts()}).encode("utf-8"),
         status_code=status.HTTP_200_OK,
     )
 
