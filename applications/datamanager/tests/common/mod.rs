@@ -4,7 +4,7 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use axum::Router;
 use std::{net::SocketAddr, sync::OnceLock, time::Duration};
-use testcontainers::runners::AsyncRunner;
+use testcontainers::{runners::AsyncRunner, ContainerAsync};
 use testcontainers_modules::localstack::LocalStack;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
@@ -14,6 +14,7 @@ const TEST_SECRET_KEY: &str = "test";
 const TEST_REGION: &str = "us-east-1";
 
 static LOCALSTACK_ENDPOINT: OnceLock<String> = OnceLock::new();
+static LOCALSTACK_CONTAINER: OnceLock<&'static ContainerAsync<LocalStack>> = OnceLock::new();
 static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
 pub struct EnvironmentVariableGuard {
@@ -97,6 +98,9 @@ pub async fn get_localstack_endpoint() -> String {
         .await
         .expect("Failed to start LocalStack container — is Docker running?");
 
+    // Give LocalStack additional time to fully initialize services
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(4566).await.unwrap();
     let endpoint = format!("http://{}:{}", host, port);
@@ -107,14 +111,14 @@ pub async fn get_localstack_endpoint() -> String {
     // - Tests use #[serial] for sequential execution within this process
     // - All tests share the same LocalStack container for performance
     // - Container cleanup happens automatically when process exits
-    // - Alternative (proper Drop cleanup) requires complex lifetime management
-    //   across static OnceLock, creating more complexity than benefit
+    // - Storing container reference prevents testcontainers from losing port mapping
     //
     // Trade-off: Small memory leak during test execution vs architectural complexity
     // Impact: Container memory is reclaimed when test process terminates
-    Box::leak(Box::new(container));
-
+    let leaked_container: &'static ContainerAsync<LocalStack> = Box::leak(Box::new(container));
+    let _ = LOCALSTACK_CONTAINER.set(leaked_container);
     let _ = LOCALSTACK_ENDPOINT.set(endpoint.clone());
+
     endpoint
 }
 

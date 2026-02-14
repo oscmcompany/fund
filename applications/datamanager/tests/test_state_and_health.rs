@@ -85,7 +85,7 @@ async fn test_state_from_env_uses_defaults_when_variables_are_missing() {
 
     let state = State::from_env().await;
 
-    assert_eq!(state.bucket_name, "oscm-data");
+    assert_eq!(state.bucket_name, "fund-data");
     assert_eq!(state.massive.base, "https://api.massive.io");
     assert!(state.massive.key.is_empty());
 }

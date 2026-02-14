@@ -56,15 +56,6 @@ if [[ -f .env ]]; then
 fi
 '''
 
-[profile]
-common = '''
-if [[ -f .env ]]; then
-  set -a
-  source .env
-  set +a
-fi
-'''
-
 [build]
 
 [options]

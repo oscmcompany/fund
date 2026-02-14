@@ -38,7 +38,7 @@ impl State {
         let s3_client = S3Client::new(&config);
 
         let bucket_name =
-            std::env::var("AWS_S3_DATA_BUCKET_NAME").unwrap_or_else(|_| "oscm-data".to_string());
+            std::env::var("AWS_S3_DATA_BUCKET_NAME").unwrap_or_else(|_| "fund-data".to_string());
         info!("Using S3 bucket: {}", bucket_name);
 
         let massive_base_url = std::env::var("MASSIVE_BASE_URL")

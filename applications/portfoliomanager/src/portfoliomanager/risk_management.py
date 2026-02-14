@@ -9,7 +9,7 @@ from .exceptions import InsufficientPredictionsError
 
 logger = structlog.get_logger()
 
-UNCERTAINTY_THRESHOLD = float(os.getenv("OSCM_UNCERTAINTY_THRESHOLD", "0.1"))
+UNCERTAINTY_THRESHOLD = float(os.getenv("FUND_UNCERTAINTY_THRESHOLD", "0.1"))
 REQUIRED_PORTFOLIO_SIZE = 20  # 10 long + 10 short
 SIDE_SIZE = REQUIRED_PORTFOLIO_SIZE // 2
 

@@ -14,7 +14,7 @@ Run from repository root:
 
 ```bash
 cd infrastructure
-pulumi stack select oscmcompany/fund/production
+pulumi stack select "$(pulumi org get-default)/fund/production"
 role_arn="$(pulumi stack output aws_iam_github_actions_infrastructure_role_arn --stack production)"
 cd ..
 gh secret set AWS_IAM_INFRASTRUCTURE_ROLE_ARN --env pulumi --body "$role_arn"
@@ -26,8 +26,8 @@ Run from repository root:
 
 ```bash
 cd infrastructure
-pulumi stack select oscmcompany/fund/production
-region="$(pulumi config get aws:region --stack production)"
+pulumi stack select "$(pulumi org get-default)/fund/production"
+region="$(pulumi config get aws:region --stack production --show-secrets)"
 cd ..
 gh secret set AWS_REGION --env pulumi --body "$region"
 ```

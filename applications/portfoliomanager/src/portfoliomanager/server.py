@@ -56,11 +56,11 @@ logger = structlog.get_logger()
 
 application: FastAPI = FastAPI()
 
-DATAMANAGER_BASE_URL = os.getenv("OSCM_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 HTTP_NOT_FOUND = 404
 HTTP_BAD_REQUEST = 400
 EQUITYPRICEMODEL_BASE_URL = os.getenv(
-    "OSCM_EQUITYPRICEMODEL_BASE_URL",
+    "FUND_EQUITYPRICEMODEL_BASE_URL",
     "http://equitypricemodel:8080",
 )
 

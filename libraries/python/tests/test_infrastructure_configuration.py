@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -15,18 +16,21 @@ def load_production_stack_config() -> str:
     return PRODUCTION_STACK_CONFIG_PATH.read_text(encoding="utf-8")
 
 
-def test_production_stack_config_stores_region_as_secret() -> None:
+def test_production_stack_config_stores_region_as_plaintext() -> None:
     production_stack_config = load_production_stack_config()
 
     assert "aws:region:" in production_stack_config
-    assert "  aws:region:\n    secure:" in production_stack_config
+    assert re.search(r"aws:region:\s+[a-z]+-[a-z]+-\d+", production_stack_config)
+    assert not re.search(r"aws:region:\s+secure:", production_stack_config)
 
 
 def test_production_stack_config_stores_budget_alert_emails_as_secret() -> None:
     production_stack_config = load_production_stack_config()
 
     assert "fund:budgetAlertEmailAddresses:" in production_stack_config
-    assert "  fund:budgetAlertEmailAddresses:\n    secure:" in production_stack_config
+    assert re.search(
+        r"fund:budgetAlertEmailAddresses:\s+secure:", production_stack_config
+    )
 
 
 def test_infrastructure_entrypoint_contains_oidc_claim_constraints() -> None:

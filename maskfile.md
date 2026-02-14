@@ -68,7 +68,7 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/oscm/${application_name}-${stage_name}"
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/${application_name}-${stage_name}"
 cache_reference="${image_reference}:buildcache"
 
 # Use GHA backend for caching when running in GitHub Actions 
@@ -87,7 +87,7 @@ echo "Setting up Docker Buildx"
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "Using buildx builder configured by docker/setup-buildx-action"
 else
-    docker buildx create --use --name oscm-builder 2>/dev/null || docker buildx use oscm-builder || (echo "Using default buildx builder" && docker buildx use default)
+    docker buildx create --use --name fund-builder 2>/dev/null || docker buildx use fund-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
 echo "Logging into ECR (to pull cache if available)"
@@ -125,7 +125,7 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-repository_name="oscm/${application_name}-${stage_name}"
+repository_name="fund/${application_name}-${stage_name}"
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 commit_hash=$(git rev-parse --short HEAD)
 
@@ -191,7 +191,10 @@ cluster=$(pulumi stack output aws_ecs_cluster_name --stack production 2>/dev/nul
 if [ -z "$cluster" ]; then
     echo "Cluster not found - skipping service deployments (initial setup)"
 else
-    for service in oscm-datamanager oscm-portfoliomanager oscm-equitypricemodel; do
+    # Note: Service names use 'fund' prefix matching the Pulumi project name.
+    # These must exactly match the ECS service names created by the infrastructure code.
+    # The AWS account provides environment context (one account = one environment).
+    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -235,7 +238,7 @@ else
     done
 
     echo "Stack update complete - ECS is performing rolling deployments"
-    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services oscm-portfoliomanager"
+    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services fund-portfoliomanager"
 fi
 
 echo "Infrastructure launched successfully"
@@ -272,10 +275,10 @@ echo "Invoking ${application_name} service"
 
 cd infrastructure/
 
-base_url=$(pulumi stack output psf_base_url --stack production 2>/dev/null || echo "")
+base_url=$(pulumi stack output fund_base_url --stack production 2>/dev/null || echo "")
 
 if [ -z "$base_url" ]; then
-    echo "psf_base_url not found - infrastructure might not be deployed"
+    echo "fund_base_url not found - infrastructure might not be deployed"
     exit 1
 fi
 
@@ -647,7 +650,7 @@ if [ "${data_type}" = "categories" ]; then
     echo "Syncing equity categories"
 
     export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
-        --secret-id oscm/production/datamanager \
+        --secret-id fund/production/datamanager \
         --query 'SecretString' \
         --output text | jq -r '.MASSIVE_API_KEY')
 
