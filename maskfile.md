@@ -349,16 +349,16 @@ echo "Rust dependencies updated successfully"
 
 #### check
 
-> Check Rust compilation
+> Check Rust packages
 
 ```bash
 set -euo pipefail
 
-echo "Check Rust compilation"
+echo "Check Rust packages"
 
-cargo check 
+cargo check --workspace
 
-echo "Rust compiled successfully"
+echo "Rust packages checked successfully"
 ```
 
 #### format
@@ -458,9 +458,9 @@ echo "Running Rust development checks"
 
 # mask development rust update # Temporarily removing for continuous integration speed
 
-mask development rust check
-
 mask development rust format
+
+mask development rust check
 
 mask development rust lint
 
@@ -544,6 +544,8 @@ set -euo pipefail
 echo "Running Python type checks"
 
 uvx ty check
+
+echo "Python type checks completed successfully"
 ```
 
 #### test
@@ -560,7 +562,8 @@ mkdir -p .coverage_output
 uv run coverage run --parallel-mode -m pytest \
     && uv run coverage combine \
     && uv run coverage report \
-    && uv run coverage xml -o .coverage_output/python.xml
+    && uv run coverage xml -o .coverage_output/python.xml \
+    || exit
 
 echo "Python tests completed successfully"
 ```
