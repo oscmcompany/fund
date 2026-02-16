@@ -44,6 +44,7 @@ from .exceptions import (  # noqa: E402
     AssetNotShortableError,
     InsufficientBuyingPowerError,
     InsufficientPredictionsError,
+    PortfolioDataError,
 )
 from .portfolio_schema import portfolio_schema  # noqa: E402
 from .risk_management import (  # noqa: E402
@@ -299,12 +300,12 @@ def _open_all_positions(
 
 async def _prepare_portfolio_data(
     current_timestamp: datetime,
-) -> tuple[AlpacaAccount, pl.DataFrame, list[str], pl.DataFrame] | Response:
+) -> tuple[AlpacaAccount, pl.DataFrame, list[str], pl.DataFrame]:
     """
     Prepare all data needed for portfolio rebalancing.
 
-    Returns either a tuple of (account, predictions, tickers, portfolio)
-    or an error Response.
+    Returns a tuple of (account, predictions, tickers, portfolio).
+    Raises PortfolioDataError if preparation fails.
     """
     try:
         account = alpaca_client.get_account()
@@ -315,14 +316,16 @@ async def _prepare_portfolio_data(
         )
     except Exception as e:
         logger.exception("Failed to retrieve account", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        message = "Failed to retrieve account"
+        raise PortfolioDataError(message) from e
 
     try:
         current_predictions = await get_current_predictions()
         logger.info("Retrieved predictions", count=len(current_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        message = "Failed to retrieve predictions"
+        raise PortfolioDataError(message) from e
 
     try:
         prior_portfolio_tickers = get_prior_portfolio_tickers()
@@ -331,7 +334,8 @@ async def _prepare_portfolio_data(
         )
     except Exception as e:
         logger.exception("Failed to retrieve prior portfolio tickers", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        message = "Failed to retrieve prior portfolio tickers"
+        raise PortfolioDataError(message) from e
 
     try:
         optimal_portfolio = get_optimal_portfolio(
@@ -349,13 +353,11 @@ async def _prepare_portfolio_data(
             predictions_count=len(current_predictions),
             prior_portfolio_tickers_count=len(prior_portfolio_tickers),
         )
-        return Response(
-            status_code=status.HTTP_204_NO_CONTENT,
-            headers={"X-Portfolio-Status": "insufficient-predictions"},
-        )
+        raise
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        message = "Failed to create optimal portfolio"
+        raise PortfolioDataError(message) from e
 
     return account, current_predictions, prior_portfolio_tickers, optimal_portfolio
 
@@ -365,11 +367,20 @@ async def create_portfolio() -> Response:
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
-    portfolio_data = await _prepare_portfolio_data(current_timestamp)
-    if isinstance(portfolio_data, Response):
-        return portfolio_data
-
-    account, _, prior_portfolio_tickers, optimal_portfolio = portfolio_data
+    try:
+        (
+            account,
+            _,
+            prior_portfolio_tickers,
+            optimal_portfolio,
+        ) = await _prepare_portfolio_data(current_timestamp)
+    except InsufficientPredictionsError:
+        return Response(
+            status_code=status.HTTP_204_NO_CONTENT,
+            headers={"X-Portfolio-Status": "insufficient-predictions"},
+        )
+    except PortfolioDataError:
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         open_positions, close_positions = get_positions(
@@ -389,6 +400,15 @@ async def create_portfolio() -> Response:
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     close_results = _close_all_positions(close_positions)
+
+    try:
+        account = alpaca_client.get_account()
+    except Exception as e:
+        logger.exception(
+            "Failed to refresh account after closing positions", error=str(e)
+        )
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     open_results, _, _ = _open_all_positions(open_positions, account.buying_power)
 
     all_results = close_results + open_results

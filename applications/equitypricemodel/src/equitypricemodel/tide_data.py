@@ -1,7 +1,7 @@
 import json
 import os
 from datetime import date, datetime, timedelta
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import pandera.polars as pa
@@ -10,6 +10,8 @@ import structlog
 from tinygrad.tensor import Tensor
 
 logger = structlog.get_logger()
+
+DataType = Literal["train", "validate", "predict"]
 
 
 class Scaler:
@@ -326,7 +328,7 @@ class Data:
         }
 
     def _select_batch_data(
-        self, data_type: str, validation_split: float, sequence_length: int
+        self, data_type: DataType, validation_split: float, sequence_length: int
     ) -> pl.DataFrame:
         """Select the appropriate batch data based on data type."""
         if data_type == "train":
@@ -356,12 +358,16 @@ class Data:
         ticker_df: pl.DataFrame,
         input_length: int,
         output_length: int,
-        data_type: str,
+        data_type: DataType,
     ) -> list[dict]:
         """Collect samples from a single ticker's data."""
         has_targets = data_type in {"train", "validate"}
-        cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
-        cont_array = ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+        categorical_array = (
+            ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
+        )
+        continuous_array = (
+            ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+        )
         static_array = (
             ticker_df[self.static_categorical_columns]
             .head(1)
@@ -387,9 +393,9 @@ class Data:
         samples = []
         for i in window_indices:
             sample = {
-                "encoder_categorical": cat_array[i : i + input_length].copy(),
-                "encoder_continuous": cont_array[i : i + input_length].copy(),
-                "decoder_categorical": cat_array[
+                "encoder_categorical": categorical_array[i : i + input_length].copy(),
+                "encoder_continuous": continuous_array[i : i + input_length].copy(),
+                "decoder_categorical": categorical_array[
                     i + input_length : i + input_length + output_length
                 ].copy(),
                 "static_categorical": static_array.copy(),
@@ -409,7 +415,7 @@ class Data:
         batch_data: pl.DataFrame,
         input_length: int,
         output_length: int,
-        data_type: str,
+        data_type: DataType,
     ) -> list[dict]:
         """Collect samples from all tickers."""
         samples = []
@@ -434,7 +440,7 @@ class Data:
         return samples
 
     def _create_batches(
-        self, samples: list[dict], batch_size: int, data_type: str
+        self, samples: list[dict], batch_size: int, data_type: DataType
     ) -> list[dict[str, Tensor]]:
         """Create batches from collected samples."""
         logger.info("batching_samples", batch_size=batch_size)
@@ -470,7 +476,7 @@ class Data:
 
     def get_batches(
         self,
-        data_type: str = "train",
+        data_type: DataType = "train",
         validation_split: float = 0.8,
         input_length: int = 35,
         output_length: int = 7,

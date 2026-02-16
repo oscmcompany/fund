@@ -99,7 +99,7 @@ jobs:
     needs:
       - run_rust_code_checks
       - run_python_code_checks
-    if: always() && (needs.run_rust_code_checks.result == 'success' || needs.run_python_code_checks.result == 'success')
+    if: always() && (needs.run_rust_code_checks.result == 'success' && needs.run_python_code_checks.result == 'success')
     name: Upload coverage to Coveralls
     runs-on: ubuntu-latest
     steps:

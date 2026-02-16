@@ -8,3 +8,7 @@ class InsufficientBuyingPowerError(Exception):
 
 class AssetNotShortableError(Exception):
     """Raised when attempting to short an asset that cannot be shorted."""
+
+
+class PortfolioDataError(Exception):
+    """Raised when portfolio data preparation fails."""

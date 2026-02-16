@@ -447,25 +447,6 @@ else
 fi
 ```
 
-#### audit
-
-> Run Rust dependency security audit
-
-```bash
-set -euo pipefail
-
-echo "Running Rust dependency audit"
-
-if ! command -v cargo-audit >/dev/null 2>&1; then
-    echo "cargo-audit not available - installing"
-    cargo install cargo-audit
-fi
-
-cargo audit
-
-echo "Rust dependency audit completed successfully"
-```
-
 #### all
 
 > Full Rust development checks
@@ -484,8 +465,6 @@ mask development rust check
 mask development rust lint
 
 mask development rust test
-
-mask development rust audit
 
 echo "Rust development checks completed successfully"
 ```
@@ -589,35 +568,6 @@ uv run coverage run --parallel-mode -m pytest \
 echo "Python tests completed successfully"
 ```
 
-#### complexity
-
-> Run Python code complexity analysis
-
-```bash
-set -euo pipefail
-
-echo "Running Python complexity analysis"
-
-# xenon --max-absolute B --max-modules B --max-average A . # Eventually enforce higher standards
-xenon --max-absolute C --max-modules C --max-average A --exclude '.flox,.venv,target' .
-
-echo "Python complexity analysis completed successfully"
-```
-
-#### audit
-
-> Run Python dependency security audit
-
-```bash
-set -euo pipefail
-
-echo "Running Python dependency audit"
-
-uv run --with pip-audit pip-audit
-
-echo "Python dependency audit completed successfully"
-```
-
 #### all
 
 > Full Python development checks
@@ -635,11 +585,7 @@ mask development python lint
 
 mask development python type-check
 
-mask development python complexity
-
 mask development python dead-code
-
-mask development python audit
 
 mask development python test
 

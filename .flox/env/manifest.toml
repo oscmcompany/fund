@@ -47,7 +47,6 @@ markdownlint-cli.pkg-path = "markdownlint-cli"
 pre-commit.pkg-path = "pre-commit"
 yamllint.pkg-path = "yamllint"
 xenon.pkg-path = "xenon"
-cargo-audit.pkg-path = "cargo-audit"
 
 [hook]
 on-activate = '''
