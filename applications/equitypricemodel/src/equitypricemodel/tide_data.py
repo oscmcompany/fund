@@ -325,40 +325,25 @@ class Data:
             "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
 
-    def get_batches(  # noqa: C901
-        self,
-        data_type: str = "train",  # "train", "validate", or "predict"
-        validation_split: float = 0.8,
-        input_length: int = 35,
-        output_length: int = 7,
-        batch_size: int = 32,
-    ) -> list[dict[str, Tensor]]:
-        if data_type not in {"train", "validate", "predict"}:
-            message = f"Invalid data type: {data_type}. Must be 'train', 'validate', or 'predict'."  # noqa: E501
-            raise ValueError(message)
-
+    def _select_batch_data(
+        self, data_type: str, validation_split: float, sequence_length: int
+    ) -> pl.DataFrame:
+        """Select the appropriate batch data based on data type."""
         if data_type == "train":
-            self.batch_data, _ = self._get_training_and_validation_data(
-                validation_split
-            )
-
+            batch_data, _ = self._get_training_and_validation_data(validation_split)
         elif data_type == "validate":
-            _, self.batch_data = self._get_training_and_validation_data(
-                validation_split
-            )
+            _, batch_data = self._get_training_and_validation_data(validation_split)
+        else:  # predict
+            batch_data = self._get_prediction_data(sequence_length)
+        return batch_data
 
-        elif data_type == "predict":
-            self.batch_data = self._get_prediction_data(input_length + output_length)
-
-        minimum_date: date = self.batch_data.select(
-            self.batch_data["date"].min()
-        ).item()
-        maximum_date: date = self.batch_data.select(
-            self.batch_data["date"].max()
-        ).item()
-
+    def _validate_date_range(
+        self, batch_data: pl.DataFrame, required_days: int
+    ) -> None:
+        """Validate that the data has enough days for the required sequence length."""
+        minimum_date: date = batch_data.select(batch_data["date"].min()).item()
+        maximum_date: date = batch_data.select(batch_data["date"].max()).item()
         total_days = (maximum_date - minimum_date).days + 1
-        required_days = input_length + output_length
 
         if total_days < required_days:
             message = (
@@ -366,15 +351,71 @@ class Data:
             )
             raise ValueError(message)
 
-        # collect all samples first
-        samples = []
+    def _collect_samples_from_ticker(
+        self,
+        ticker_df: pl.DataFrame,
+        input_length: int,
+        output_length: int,
+        data_type: str,
+    ) -> list[dict]:
+        """Collect samples from a single ticker's data."""
         has_targets = data_type in {"train", "validate"}
-
-        # Partition by ticker once upfront (much faster than filtering per ticker)
-        logger.info("partitioning_data_by_ticker")
-        ticker_groups = self.batch_data.sort("time_idx").partition_by(
-            "ticker", as_dict=True
+        cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
+        cont_array = ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+        static_array = (
+            ticker_df[self.static_categorical_columns]
+            .head(1)
+            .to_numpy()
+            .astype(np.int32)
         )
+        target_array = (
+            ticker_df[["daily_return"]].to_numpy().astype(np.float32)
+            if has_targets
+            else None
+        )
+
+        num_rows = len(ticker_df)
+        num_windows = num_rows - input_length - output_length + 1
+
+        if num_windows <= 0:
+            return []
+
+        window_indices = (
+            [num_windows - 1] if data_type == "predict" else range(num_windows)
+        )
+
+        samples = []
+        for i in window_indices:
+            sample = {
+                "encoder_categorical": cat_array[i : i + input_length].copy(),
+                "encoder_continuous": cont_array[i : i + input_length].copy(),
+                "decoder_categorical": cat_array[
+                    i + input_length : i + input_length + output_length
+                ].copy(),
+                "static_categorical": static_array.copy(),
+            }
+
+            if has_targets and target_array is not None:
+                sample["targets"] = target_array[
+                    i + input_length : i + input_length + output_length
+                ].copy()
+
+            samples.append(sample)
+
+        return samples
+
+    def _collect_all_samples(
+        self,
+        batch_data: pl.DataFrame,
+        input_length: int,
+        output_length: int,
+        data_type: str,
+    ) -> list[dict]:
+        """Collect samples from all tickers."""
+        samples = []
+
+        logger.info("partitioning_data_by_ticker")
+        ticker_groups = batch_data.sort("time_idx").partition_by("ticker", as_dict=True)
         total_tickers = len(ticker_groups)
         logger.info("batch_creation_started", total_tickers=total_tickers)
 
@@ -384,59 +425,21 @@ class Data:
                     "batch_progress", ticker_idx=idx, total_tickers=total_tickers
                 )
 
-            # Convert to numpy once per ticker (avoid repeated DataFrame operations)
-            # Use float32 for GPU compatibility (Metal doesn't support float64)
-            cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
-            cont_array = (
-                ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+            ticker_samples = self._collect_samples_from_ticker(
+                ticker_df, input_length, output_length, data_type
             )
-            static_array = (
-                ticker_df[self.static_categorical_columns]
-                .head(1)
-                .to_numpy()
-                .astype(np.int32)
-            )
-            target_array = (
-                ticker_df[["daily_return"]].to_numpy().astype(np.float32)
-                if has_targets
-                else None
-            )
-
-            num_rows = len(ticker_df)
-            num_windows = num_rows - input_length - output_length + 1
-
-            if num_windows <= 0:
-                continue
-
-            # For prediction, only use the last window (most recent data)
-            # For training/validation, use all windows
-            window_indices = (
-                [num_windows - 1] if data_type == "predict" else range(num_windows)
-            )
-
-            # Use numpy slicing (much faster than DataFrame slicing)
-            for i in window_indices:
-                sample = {
-                    "encoder_categorical": cat_array[i : i + input_length].copy(),
-                    "encoder_continuous": cont_array[i : i + input_length].copy(),
-                    "decoder_categorical": cat_array[
-                        i + input_length : i + input_length + output_length
-                    ].copy(),
-                    "static_categorical": static_array.copy(),
-                }
-
-                if has_targets and target_array is not None:
-                    sample["targets"] = target_array[
-                        i + input_length : i + input_length + output_length
-                    ].copy()
-
-                samples.append(sample)
+            samples.extend(ticker_samples)
 
         logger.info("sample_collection_complete", total_samples=len(samples))
+        return samples
 
-        # now batch the samples
+    def _create_batches(
+        self, samples: list[dict], batch_size: int, data_type: str
+    ) -> list[dict[str, Tensor]]:
+        """Create batches from collected samples."""
         logger.info("batching_samples", batch_size=batch_size)
         batches = []
+
         for i in range(0, len(samples), batch_size):
             batch_samples = samples[i : i + batch_size]
 
@@ -464,6 +467,33 @@ class Data:
 
         logger.info("batch_creation_complete", total_batches=len(batches))
         return batches
+
+    def get_batches(
+        self,
+        data_type: str = "train",
+        validation_split: float = 0.8,
+        input_length: int = 35,
+        output_length: int = 7,
+        batch_size: int = 32,
+    ) -> list[dict[str, Tensor]]:
+        if data_type not in {"train", "validate", "predict"}:
+            message = (
+                f"Invalid data type: {data_type}. "
+                "Must be 'train', 'validate', or 'predict'."
+            )
+            raise ValueError(message)
+
+        self.batch_data = self._select_batch_data(
+            data_type, validation_split, input_length + output_length
+        )
+
+        self._validate_date_range(self.batch_data, input_length + output_length)
+
+        samples = self._collect_all_samples(
+            self.batch_data, input_length, output_length, data_type
+        )
+
+        return self._create_batches(samples, batch_size, data_type)
 
     def save(self, directory_path: str) -> None:
         os.makedirs(directory_path, exist_ok=True)  # noqa: PTH103

@@ -10,7 +10,7 @@ import structlog
 from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
-from .alpaca_client import AlpacaClient
+from .alpaca_client import AlpacaAccount, AlpacaClient
 
 sentry_sdk.init(
     dsn=os.environ.get("SENTRY_DSN"),
@@ -92,11 +92,220 @@ def health_check() -> Response:
     return Response(status_code=status.HTTP_200_OK)
 
 
-@application.post("/portfolio")
-async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
-    current_timestamp = datetime.now(tz=UTC)
-    logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
+def _close_single_position(close_position: dict) -> dict:
+    """Close a single position and return the result."""
+    try:
+        was_closed = alpaca_client.close_position(
+            ticker=close_position["ticker"],
+        )
+        if was_closed:
+            logger.info("Closed position", ticker=close_position["ticker"])
+            return {
+                "ticker": close_position["ticker"],
+                "action": "close",
+                "status": "success",
+            }
+        logger.info(
+            "Position already closed or did not exist",
+            ticker=close_position["ticker"],
+        )
+        return {
+            "ticker": close_position["ticker"],
+            "action": "close",
+            "status": "skipped",
+            "reason": "position_not_found",
+        }
+    except Exception as e:
+        logger.exception(
+            "Failed to close position",
+            ticker=close_position["ticker"],
+            error=str(e),
+        )
+        return {
+            "ticker": close_position["ticker"],
+            "action": "close",
+            "status": "failed",
+            "error": str(e),
+        }
 
+
+def _close_all_positions(close_positions: list[dict]) -> list[dict]:
+    """Close all positions and return results."""
+    return [_close_single_position(position) for position in close_positions]
+
+
+def _open_single_position(
+    open_position: dict, remaining_buying_power: float
+) -> tuple[dict, float, str | None]:
+    """
+    Open a single position and return the result, updated buying power, and skip reason.
+
+    Returns:
+        tuple: (result_dict, new_buying_power, skip_reason)
+        skip_reason is "insufficient_buying_power", "not_shortable", or None
+    """
+    ticker = open_position["ticker"]
+    side = open_position["side"]
+    dollar_amount = open_position["dollar_amount"]
+
+    if dollar_amount > remaining_buying_power:
+        logger.warning(
+            "Skipping position due to insufficient buying power",
+            ticker=ticker,
+            side=side,
+            dollar_amount=dollar_amount,
+            remaining_buying_power=remaining_buying_power,
+        )
+        return (
+            {
+                "ticker": ticker,
+                "action": "open",
+                "side": side,
+                "dollar_amount": dollar_amount,
+                "status": "skipped",
+                "reason": "insufficient_buying_power",
+            },
+            remaining_buying_power,
+            "insufficient_buying_power",
+        )
+
+    try:
+        alpaca_client.open_position(
+            ticker=ticker,
+            side=side,
+            dollar_amount=dollar_amount,
+        )
+        logger.info(
+            "Opened position",
+            ticker=ticker,
+            side=side,
+            dollar_amount=dollar_amount,
+        )
+        try:
+            account = alpaca_client.get_account()
+            remaining_buying_power = account.buying_power
+        except Exception:
+            logger.exception(
+                "Failed to refresh buying power from account, using estimate",
+                ticker=ticker,
+                deducting=dollar_amount,
+            )
+            remaining_buying_power -= dollar_amount
+
+        return (  # noqa: TRY300
+            {
+                "ticker": ticker,
+                "action": "open",
+                "side": side,
+                "dollar_amount": dollar_amount,
+                "status": "success",
+            },
+            remaining_buying_power,
+            None,
+        )
+    except InsufficientBuyingPowerError as e:
+        logger.warning(
+            "Insufficient buying power for position",
+            ticker=ticker,
+            side=side,
+            dollar_amount=dollar_amount,
+            error=str(e),
+        )
+        return (
+            {
+                "ticker": ticker,
+                "action": "open",
+                "side": side,
+                "dollar_amount": dollar_amount,
+                "status": "skipped",
+                "reason": "insufficient_buying_power",
+            },
+            remaining_buying_power,
+            "insufficient_buying_power",
+        )
+    except AssetNotShortableError as e:
+        logger.warning(
+            "Asset cannot be sold short",
+            ticker=ticker,
+            side=side,
+            error=str(e),
+        )
+        return (
+            {
+                "ticker": ticker,
+                "action": "open",
+                "side": side,
+                "dollar_amount": dollar_amount,
+                "status": "skipped",
+                "reason": "not_shortable",
+            },
+            remaining_buying_power,
+            "not_shortable",
+        )
+    except Exception as e:
+        logger.exception(
+            "Failed to open position",
+            ticker=ticker,
+            error=str(e),
+        )
+        return (
+            {
+                "ticker": ticker,
+                "action": "open",
+                "side": side,
+                "dollar_amount": dollar_amount,
+                "status": "failed",
+                "error": str(e),
+            },
+            remaining_buying_power,
+            None,
+        )
+
+
+def _open_all_positions(
+    open_positions: list[dict], initial_buying_power: float
+) -> tuple[list[dict], int, int]:
+    """
+    Open all positions and return results with skip counts.
+
+    Returns:
+        tuple: (results, skipped_insufficient_buying_power, skipped_not_shortable)
+    """
+    open_results = []
+    remaining_buying_power = initial_buying_power
+    skipped_insufficient_buying_power = 0
+    skipped_not_shortable = 0
+
+    for open_position in open_positions:
+        result, remaining_buying_power, skip_reason = _open_single_position(
+            open_position, remaining_buying_power
+        )
+        open_results.append(result)
+
+        if skip_reason == "insufficient_buying_power":
+            skipped_insufficient_buying_power += 1
+        elif skip_reason == "not_shortable":
+            skipped_not_shortable += 1
+
+    if skipped_insufficient_buying_power > 0 or skipped_not_shortable > 0:
+        logger.info(
+            "Some positions were skipped",
+            skipped_insufficient_buying_power=skipped_insufficient_buying_power,
+            skipped_not_shortable=skipped_not_shortable,
+        )
+
+    return open_results, skipped_insufficient_buying_power, skipped_not_shortable
+
+
+async def _prepare_portfolio_data(
+    current_timestamp: datetime,
+) -> tuple[AlpacaAccount, pl.DataFrame, list[str], pl.DataFrame] | Response:
+    """
+    Prepare all data needed for portfolio rebalancing.
+
+    Returns either a tuple of (account, predictions, tickers, portfolio)
+    or an error Response.
+    """
     try:
         account = alpaca_client.get_account()
         logger.info(
@@ -148,6 +357,20 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         logger.exception("Failed to create optimal portfolio", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    return account, current_predictions, prior_portfolio_tickers, optimal_portfolio
+
+
+@application.post("/portfolio")
+async def create_portfolio() -> Response:
+    current_timestamp = datetime.now(tz=UTC)
+    logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
+
+    portfolio_data = await _prepare_portfolio_data(current_timestamp)
+    if isinstance(portfolio_data, Response):
+        return portfolio_data
+
+    account, _, prior_portfolio_tickers, optimal_portfolio = portfolio_data
+
     try:
         open_positions, close_positions = get_positions(
             prior_portfolio_tickers=prior_portfolio_tickers,
@@ -165,172 +388,8 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         )
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    close_results = []
-    for close_position in close_positions:
-        try:
-            was_closed = alpaca_client.close_position(
-                ticker=close_position["ticker"],
-            )
-            if was_closed:
-                logger.info("Closed position", ticker=close_position["ticker"])
-                close_results.append(
-                    {
-                        "ticker": close_position["ticker"],
-                        "action": "close",
-                        "status": "success",
-                    }
-                )
-            else:
-                logger.info(
-                    "Position already closed or did not exist",
-                    ticker=close_position["ticker"],
-                )
-                close_results.append(
-                    {
-                        "ticker": close_position["ticker"],
-                        "action": "close",
-                        "status": "skipped",
-                        "reason": "position_not_found",
-                    }
-                )
-        except Exception as e:
-            logger.exception(
-                "Failed to close position",
-                ticker=close_position["ticker"],
-                error=str(e),
-            )
-            close_results.append(
-                {
-                    "ticker": close_position["ticker"],
-                    "action": "close",
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-
-    open_results = []
-    remaining_buying_power = account.buying_power
-    skipped_insufficient_buying_power = 0
-    skipped_not_shortable = 0
-
-    for open_position in open_positions:
-        ticker = open_position["ticker"]
-        side = open_position["side"]
-        dollar_amount = open_position["dollar_amount"]
-
-        if dollar_amount > remaining_buying_power:
-            logger.warning(
-                "Skipping position due to insufficient buying power",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-                remaining_buying_power=remaining_buying_power,
-            )
-            skipped_insufficient_buying_power += 1
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "insufficient_buying_power",
-                }
-            )
-            continue
-
-        try:
-            alpaca_client.open_position(
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-            )
-            logger.info(
-                "Opened position",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-            )
-            # Refresh remaining buying power from the account after a successful order
-            try:
-                account = alpaca_client.get_account()
-                remaining_buying_power = account.buying_power
-            except Exception:
-                logger.exception(
-                    "Failed to refresh buying power from account, using estimate",
-                    ticker=ticker,
-                    deducting=dollar_amount,
-                )
-                remaining_buying_power -= dollar_amount
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "success",
-                }
-            )
-        except InsufficientBuyingPowerError as e:
-            logger.warning(
-                "Insufficient buying power for position",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-                error=str(e),
-            )
-            skipped_insufficient_buying_power += 1
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "insufficient_buying_power",
-                }
-            )
-        except AssetNotShortableError as e:
-            logger.warning(
-                "Asset cannot be sold short",
-                ticker=ticker,
-                side=side,
-                error=str(e),
-            )
-            skipped_not_shortable += 1
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "not_shortable",
-                }
-            )
-        except Exception as e:
-            logger.exception(
-                "Failed to open position",
-                ticker=ticker,
-                error=str(e),
-            )
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-
-    if skipped_insufficient_buying_power > 0 or skipped_not_shortable > 0:
-        logger.info(
-            "Some positions were skipped",
-            skipped_insufficient_buying_power=skipped_insufficient_buying_power,
-            skipped_not_shortable=skipped_not_shortable,
-        )
+    close_results = _close_all_positions(close_positions)
+    open_results, _, _ = _open_all_positions(open_positions, account.buying_power)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]

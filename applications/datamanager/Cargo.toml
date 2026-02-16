@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8.4"
 chrono = { version = "0.4.41", features = ["serde"] }
-polars = { version = "0.51.0", features = [
+polars = { version = "0.53.0", features = [
   "json",
   "lazy",
   "parquet",
@@ -48,5 +48,5 @@ http-body-util = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 mockito = "1.7"
 serial_test = "3.3"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["localstack"] }
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["localstack"] }
