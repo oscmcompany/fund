@@ -362,37 +362,32 @@ Follow these steps:
 
 - For each piece of feedback (both addressed and rejected), draft a response comment explaining what was done or why it was rejected, using the commenter name for personalization.
 - Post all response comments to their respective threads:
-  - For review comments (code-level), use GraphQL `addPullRequestReviewComment` mutation:
+  - For review comments (code-level), use GraphQL `addPullRequestReviewThreadReply` mutation to post comments directly to threads (NOT as pending review):
 
     ```bash
-    # Extract PR node ID from metadata
-    PR_ID=$(jq -r '.id' "${SCRATCHPAD}/metadata.json")
-
     # IMPORTANT: Keep response text simple - avoid newlines, code blocks, and special characters
     # GraphQL string literals cannot contain raw newlines; use spaces or simple sentences
     # If complex formatting is needed, save response to a variable first and ensure proper escaping
 
     gh api graphql -f query='
-      mutation($pullRequestId: ID!, $body: String!, $inReplyTo: ID!) {
-        addPullRequestReviewComment(input: {
-          pullRequestId: $pullRequestId,
-          body: $body,
-          inReplyTo: $inReplyTo
+      mutation($pullRequestReviewThreadId: ID!, $body: String!) {
+        addPullRequestReviewThreadReply(input: {
+          pullRequestReviewThreadId: $pullRequestReviewThreadId,
+          body: $body
         }) {
           comment { id }
         }
       }
-    ' -f pullRequestId="${PR_ID}" -f body="<response_text>" -f inReplyTo="<comment_node_id>"
+    ' -f pullRequestReviewThreadId="<thread_id>" -f body="<response_text>"
     ```
 
-    Use the PR node ID from `metadata.json` for `pullRequestId`.
-    Use the comment node ID (format: `PRRC_*`) from `review_threads.json` for `inReplyTo` parameter.
+    Use the thread ID (format: `PRRT_*`) from `review_threads.json` for `pullRequestReviewThreadId` parameter.
 
-    Example to get comment node ID:
+    Example to get thread ID:
 
     ```bash
-    # Get first comment's node ID from a specific thread
-    COMMENT_ID=$(jq -r '.[] | select(.threadId == "PRRT_xxx") | .comments[0].id' "${SCRATCHPAD}/review_threads.json")
+    # Get thread ID from review_threads.json
+    THREAD_ID=$(jq -r '.[] | select(.comments[0].body | contains("some text")) | .threadId' "${SCRATCHPAD}/review_threads.json")
     ```
 
     **Response formatting guidelines**:
