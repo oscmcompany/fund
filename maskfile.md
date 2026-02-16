@@ -568,6 +568,20 @@ uv run coverage run --parallel-mode -m pytest \
 echo "Python tests completed successfully"
 ```
 
+#### complexity
+
+> Run Python code complexity analysis
+
+```bash
+set -euo pipefail
+
+echo "Running Python complexity analysis"
+
+xenon --max-absolute D --max-modules D --max-average A .
+
+echo "Python complexity analysis completed successfully"
+```
+
 #### all
 
 > Full Python development checks
@@ -622,6 +636,38 @@ echo "Running Markdown development checks"
 mask development markdown lint
 
 echo "Markdown development checks completed successfully"
+```
+
+### yaml
+
+> YAML development workflow commands
+
+#### lint
+
+> Run YAML lint checks
+
+```bash
+set -euo pipefail
+
+echo "Running YAML lint checks"
+
+yamllint .
+
+echo "YAML linting completed successfully"
+```
+
+#### all
+
+> Full YAML development checks
+
+```bash
+set -euo pipefail
+
+echo "Running YAML development checks"
+
+mask development yaml lint
+
+echo "YAML development checks completed successfully"
 ```
 
 ## data

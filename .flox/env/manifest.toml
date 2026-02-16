@@ -46,6 +46,7 @@ direnv.pkg-path = "direnv"
 jq.pkg-path = "jq"
 markdownlint-cli.pkg-path = "markdownlint-cli"
 pre-commit.pkg-path = "pre-commit"
+xenon.pkg-path = "xenon"
 
 [hook]
 on-activate = '''
