@@ -60,6 +60,6 @@ This is a collection of guidelines and references.
 - If uncertainty arises, ask for help or input rather than guessing
 - Do not introduce abstractions for single-use code
 - Always match existing styles and patterns in the codebase for consistency
-- When fixing a bug, write tess that reproduce the bug before fixing it, then verify the tests pass after the fix
+- When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after the fix
 - Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone
 - When possible, use GitHub's GraphQL API for more efficient data retrieval in scripts and tools
