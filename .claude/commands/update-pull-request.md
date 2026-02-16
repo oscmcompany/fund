@@ -373,16 +373,16 @@ Follow these steps:
     # If complex formatting is needed, save response to a variable first and ensure proper escaping
 
     gh api graphql -f query='
-      mutation {
+      mutation($pullRequestId: ID!, $body: String!, $inReplyTo: ID!) {
         addPullRequestReviewComment(input: {
-          pullRequestId: "'$PR_ID'",
-          body: "<response_text>",
-          inReplyTo: "<comment_node_id>"
+          pullRequestId: $pullRequestId,
+          body: $body,
+          inReplyTo: $inReplyTo
         }) {
           comment { id }
         }
       }
-    '
+    ' -f pullRequestId="${PR_ID}" -f body="<response_text>" -f inReplyTo="<comment_node_id>"
     ```
 
     Use the PR node ID from `metadata.json` for `pullRequestId`.
@@ -415,15 +415,15 @@ Follow these steps:
 
       ```bash
       gh api graphql -f query='
-        mutation {
-          resolveReviewThread(input: {threadId: "<thread_id>"}) {
+        mutation($threadId: ID!) {
+          resolveReviewThread(input: {threadId: $threadId}) {
             thread {
               id
               isResolved
             }
           }
         }
-      '
+      ' -f threadId="<thread_id>"
       ```
 
     - Map each comment back to its parent thread using the data structure from step 3 parsing.

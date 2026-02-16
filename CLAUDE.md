@@ -41,7 +41,7 @@ This is a collection of guidelines and references.
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
 - When debugging or fixing bugs, check Sentry errors, ECS logs, and Alpaca account status to understand what happened
 - After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
-- When creating GitHub issues or pull requests, use the templates provided in the `.github/` directory
+- When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow commented instructions
 - Only use labels already available on the GitHub repository for issues and pull requests
 - When naming branches, use an all-lowercase, hyphenated, and concise summary of the work being done
 - `tools/` folder contains development utilities and scripts
@@ -57,3 +57,9 @@ This is a collection of guidelines and references.
 - Make every change as simple as possible and impact minimal code
 - Find root causes and avoid temporary fixes - maintain high standards
 - Changes should only touch what's necessary to avoid introducing bugs
+- If uncertainty arises, ask for help or input rather than guessing
+- Do not introduce abstractions for single-use code
+- Always match existing styles and patterns in the codebase for consistency
+- When fixing a bug, write tess that reproduce the bug before fixing it, then verify the tests pass after the fix
+- Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone
+- When possible, use GitHub's GraphQL API for more efficient data retrieval in scripts and tools
