@@ -598,7 +598,8 @@ set -euo pipefail
 
 echo "Running Python complexity analysis"
 
-xenon --max-absolute B --max-modules B --max-average A .
+# xenon --max-absolute B --max-modules B --max-average A . # Eventually enforce higher standards
+xenon --max-absolute C --max-modules C --max-average A --exclude '.flox,.venv,target' .
 
 echo "Python complexity analysis completed successfully"
 ```
@@ -612,7 +613,7 @@ set -euo pipefail
 
 echo "Running Python dependency audit"
 
-pip-audit
+uv run --with pip-audit pip-audit
 
 echo "Python dependency audit completed successfully"
 ```

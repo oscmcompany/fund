@@ -82,9 +82,6 @@
       "openssl": {
         "pkg-path": "openssl"
       },
-      "pip-audit": {
-        "pkg-path": "pip-audit"
-      },
       "pkgconf": {
         "pkg-path": "pkgconf"
       },
@@ -3010,126 +3007,6 @@
         "doc": "/nix/store/cgp9ig35iwicfb9spcrgyg2m5dmlcgrv-openssl-3.6.0-doc",
         "man": "/nix/store/a9jdl6xq9fc98ykpvqmc9kf0b0j9y8wh-openssl-3.6.0-man",
         "out": "/nix/store/61i74yjkj9p1qphfl7018ja4sdwkipx0-openssl-3.6.0"
-      },
-      "system": "x86_64-linux",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pip-audit",
-      "broken": false,
-      "derivation": "/nix/store/8jgd3018cx3c998z1g6j65sm9ayyi6l7-pip-audit-2.10.0.drv",
-      "description": "Tool for scanning Python environments for known vulnerabilities",
-      "install_id": "pip-audit",
-      "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "pip-audit-2.10.0",
-      "pname": "pip-audit",
-      "rev": "f61125a668a320878494449750330ca58b78c557",
-      "rev_count": 907002,
-      "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T02:55:23.297151Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "2.10.0",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "dist": "/nix/store/r2i4s4pv4mcxn29v78adk65r3a6mb0a2-pip-audit-2.10.0-dist",
-        "out": "/nix/store/sdfl8ysx817w9024q2m28g872p3j98sw-pip-audit-2.10.0"
-      },
-      "system": "aarch64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pip-audit",
-      "broken": false,
-      "derivation": "/nix/store/6qm6lh2bhn71l2wi6xmkw6cscjrxls7q-pip-audit-2.10.0.drv",
-      "description": "Tool for scanning Python environments for known vulnerabilities",
-      "install_id": "pip-audit",
-      "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "pip-audit-2.10.0",
-      "pname": "pip-audit",
-      "rev": "f61125a668a320878494449750330ca58b78c557",
-      "rev_count": 907002,
-      "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:05:20.179081Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "2.10.0",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "dist": "/nix/store/zincxj73gww6d1961xa4ff56znnij50r-pip-audit-2.10.0-dist",
-        "out": "/nix/store/d66067afw4wvzlgr1qxdxmgbvjlynx9n-pip-audit-2.10.0"
-      },
-      "system": "aarch64-linux",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pip-audit",
-      "broken": false,
-      "derivation": "/nix/store/2dk9fig6lxi1shgkpxhmmfvdxf5ia1ch-pip-audit-2.10.0.drv",
-      "description": "Tool for scanning Python environments for known vulnerabilities",
-      "install_id": "pip-audit",
-      "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "pip-audit-2.10.0",
-      "pname": "pip-audit",
-      "rev": "f61125a668a320878494449750330ca58b78c557",
-      "rev_count": 907002,
-      "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:15:20.726332Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "2.10.0",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "dist": "/nix/store/ndan5n76v56gns7jgjhl6jvk8j560cwp-pip-audit-2.10.0-dist",
-        "out": "/nix/store/m15fn5dngsy1n6afxqihr4ksz18cb7fa-pip-audit-2.10.0"
-      },
-      "system": "x86_64-darwin",
-      "group": "toplevel",
-      "priority": 5
-    },
-    {
-      "attr_path": "pip-audit",
-      "broken": false,
-      "derivation": "/nix/store/qi5q81l9i8p2qx8lidxcaa2pwbw76ma1-pip-audit-2.10.0.drv",
-      "description": "Tool for scanning Python environments for known vulnerabilities",
-      "install_id": "pip-audit",
-      "license": "Apache-2.0",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
-      "name": "pip-audit-2.10.0",
-      "pname": "pip-audit",
-      "rev": "f61125a668a320878494449750330ca58b78c557",
-      "rev_count": 907002,
-      "rev_date": "2025-12-05T15:54:32Z",
-      "scrape_date": "2025-12-07T03:24:57.070582Z",
-      "stabilities": [
-        "unstable"
-      ],
-      "unfree": false,
-      "version": "2.10.0",
-      "outputs_to_install": [
-        "out"
-      ],
-      "outputs": {
-        "dist": "/nix/store/6mrgshl7ngzmckx3qz660jp0zrp1az5x-pip-audit-2.10.0-dist",
-        "out": "/nix/store/28yvnm6h0dnfdqh5qdpqpkcap4wp0l7r-pip-audit-2.10.0"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
