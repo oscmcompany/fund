@@ -577,7 +577,7 @@ set -euo pipefail
 
 echo "Running Python complexity analysis"
 
-xenon --max-absolute D --max-modules D --max-average A .
+xenon --max-absolute D --max-modules D --max-average A --ignore '.flox,.venv,target' .
 
 echo "Python complexity analysis completed successfully"
 ```
@@ -600,6 +600,8 @@ mask development python lint
 mask development python type-check
 
 mask development python dead-code
+
+mask development python complexity
 
 mask development python test
 

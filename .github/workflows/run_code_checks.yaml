@@ -3,7 +3,7 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
-  # Alows for Rust cache to be established on master branch
+  # Allows for Rust cache to be established on master branch
   push:
     branches:
       - master
