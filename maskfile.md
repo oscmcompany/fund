@@ -568,6 +568,20 @@ uv run coverage run --parallel-mode -m pytest \
 echo "Python tests completed successfully"
 ```
 
+#### complexity
+
+> Run Python code complexity analysis
+
+```bash
+set -euo pipefail
+
+echo "Running Python complexity analysis"
+
+xenon --max-absolute C --max-modules C --max-average A .
+
+echo "Python complexity analysis completed successfully"
+```
+
 #### all
 
 > Full Python development checks
