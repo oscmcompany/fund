@@ -120,15 +120,15 @@
       "vulture": {
         "pkg-path": "python312Packages.vulture"
       },
+      "xenon": {
+        "pkg-path": "xenon"
+      },
       "yamllint": {
         "pkg-path": "yamllint"
       }
     },
     "hook": {
       "on-activate": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n"
-    },
-    "profile": {
-      "common": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n"
     },
     "options": {
       "systems": [
@@ -3841,6 +3841,126 @@
       "outputs": {
         "dist": "/nix/store/wf2fjr0w25d4lkxl0d21v23kllbl81gk-python3.12-vulture-2.14-dist",
         "out": "/nix/store/nam3pwdp9wvaqyjzj5gfdii3dcq7708w-python3.12-vulture-2.14"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "xenon",
+      "broken": false,
+      "derivation": "/nix/store/yimma6wljfig168ilbki8iwfannznniz-xenon-0.9.3.drv",
+      "description": "Monitoring tool based on radon",
+      "install_id": "xenon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "xenon-0.9.3",
+      "pname": "xenon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T02:57:24.134342Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.9.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/h707xs7v5p453a3ld80ykawgbmskqsmr-xenon-0.9.3-dist",
+        "out": "/nix/store/12fqv1v3pl5bj068xk6iarari7af9qfm-xenon-0.9.3"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "xenon",
+      "broken": false,
+      "derivation": "/nix/store/qn3i7jk8cmrq1syirx11lipk3i2hzcw0-xenon-0.9.3.drv",
+      "description": "Monitoring tool based on radon",
+      "install_id": "xenon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "xenon-0.9.3",
+      "pname": "xenon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:07:48.320764Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.9.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/6gdi03dhwl9r1r1kk1isds1sdvxjlqk0-xenon-0.9.3-dist",
+        "out": "/nix/store/2cqazgb5nvvlw2m2i704ni55a0a070mx-xenon-0.9.3"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "xenon",
+      "broken": false,
+      "derivation": "/nix/store/l6h708isjw1k8nxwf29lyl4zssg7xpnk-xenon-0.9.3.drv",
+      "description": "Monitoring tool based on radon",
+      "install_id": "xenon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "xenon-0.9.3",
+      "pname": "xenon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:17:11.917914Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.9.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/rvgppp1fj1jpxkgyql9dni0b64gy07jn-xenon-0.9.3-dist",
+        "out": "/nix/store/13x9sz293mi4hkp2p3nn9hsm4qdbyx15-xenon-0.9.3"
+      },
+      "system": "x86_64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "xenon",
+      "broken": false,
+      "derivation": "/nix/store/631zg34bnfrnqr3jfdgvh5glnm278ddf-xenon-0.9.3.drv",
+      "description": "Monitoring tool based on radon",
+      "install_id": "xenon",
+      "license": "MIT",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=f61125a668a320878494449750330ca58b78c557",
+      "name": "xenon-0.9.3",
+      "pname": "xenon",
+      "rev": "f61125a668a320878494449750330ca58b78c557",
+      "rev_count": 907002,
+      "rev_date": "2025-12-05T15:54:32Z",
+      "scrape_date": "2025-12-07T03:27:23.885060Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "0.9.3",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "dist": "/nix/store/sgjrpkpv7nri4pbwh07ixr5829rhkg43-xenon-0.9.3-dist",
+        "out": "/nix/store/4l814ds66cdq01prr8q5krjzz29fchri-xenon-0.9.3"
       },
       "system": "x86_64-linux",
       "group": "toplevel",

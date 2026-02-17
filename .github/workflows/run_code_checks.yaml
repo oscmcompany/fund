@@ -3,6 +3,7 @@ name: Code checks
 run-name: Code checks
 on:
   pull_request:
+  # Allows for Rust cache to be established on master branch
   push:
     branches:
       - master
@@ -83,11 +84,28 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development markdown all
+  run_yaml_code_checks:
+    name: Run YAML code checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install Flox
+        uses: flox/install-flox-action@v2
+      - name: Run YAML code checks
+        uses: flox/activate-action@v1
+        with:
+          command: mask development yaml all
   upload_test_coverage:
     needs:
       - run_rust_code_checks
       - run_python_code_checks
-    if: ${{ always() && (needs.run_rust_code_checks.result == 'success' || needs.run_python_code_checks.result == 'success') }}
+    if: |
+      always() &&
+      (
+        needs.run_rust_code_checks.result == 'success' &&
+        needs.run_python_code_checks.result == 'success'
+      )
     name: Upload coverage to Coveralls
     runs-on: ubuntu-latest
     steps:

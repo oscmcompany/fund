@@ -1,21 +1,25 @@
+---
 version: "3.9"
 services:
   datamanager:
     image: ${AWS_ECR_DATA_MANAGER_SERVER_IMAGE_ARN}
     ports:
-      - "8080:8080"
+      - 8080:8080
     networks:
       - app-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8080/health
       interval: 30s
       timeout: 5s
       retries: 3
-
   portfoliomanager:
     image: ${AWS_ECR_PORTFOLIO_MANAGER_SERVER_IMAGE_ARN}
     ports:
-      - "8081:8080"
+      - 8081:8080
     environment:
       - DATAMANAGER_BASE_URL=http://datamanager:8080
       - EQUITYPRICEMODEL_BASE_URL=http://equitypricemodel:8080
@@ -25,15 +29,18 @@ services:
       - datamanager
       - equitypricemodel
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8080/health
       interval: 30s
       timeout: 5s
       retries: 3
-
   equitypricemodel:
     image: ${AWS_ECR_EQUITY_PRICE_MODEL_SERVER_IMAGE_ARN}
     ports:
-      - "8082:8080"
+      - 8082:8080
     environment:
       - DATAMANAGER_BASE_URL=http://datamanager:8080
       - DISABLE_DISK_CACHE=1
@@ -42,11 +49,14 @@ services:
     depends_on:
       - datamanager
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost:8080/health
       interval: 30s
       timeout: 5s
       retries: 3
-
 networks:
   app-network:
     driver: bridge
