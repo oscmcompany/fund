@@ -1,0 +1,14 @@
+---
+extends: default
+ignore: |
+  .venv/
+  target/
+  .flox/
+rules:
+  line-length:
+    max: 120
+  truthy:
+    allowed-values:
+      - "true"
+      - "false"
+      - 'on'

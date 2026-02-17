@@ -1,3 +1,5 @@
+# yamllint disable rule:line-length
+---
 config:
   aws:region: us-east-1
   fund:budgetAlertEmailAddresses:

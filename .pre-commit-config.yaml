@@ -29,3 +29,12 @@ repos:
           - markdown
         language: system
         fail_fast: true
+      - id: yaml
+        name: Check all YAML code
+        entry: mask development yaml all
+        pass_filenames: false
+        types:
+          - file
+          - yaml
+        language: system
+        fail_fast: true
