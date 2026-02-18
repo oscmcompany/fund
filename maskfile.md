@@ -166,8 +166,21 @@ echo "Image pushed: ${application_name} ${stage_name} (commit: ${commit_hash})"
 
 > Launch or update infrastructure stack
 
+<!-- markdownlint-disable MD036 MD032 MD007 -->
+**OPTIONS**
+* bootstrap
+    * flags: --bootstrap
+    * type: boolean
+    * desc: Run optional bootstrap commands with stack update (e.g. for initial setup from local machine)
+<!-- markdownlint-enable MD036 MD032 MD007 -->
+
 ```bash
 set -euo pipefail
+
+BOOTSTRAP="${bootstrap:-"false"}"
+if [ -n "${bootstrap+x}" ] && [ -z "$bootstrap" ]; then
+    BOOTSTRAP="true"
+fi
 
 cd infrastructure/
 
@@ -182,7 +195,59 @@ fi
 
 pulumi stack select ${organization_name}/fund/production --create
 
+if [[ "$BOOTSTRAP" == "true" ]]; then
+  echo "Importing existing resources into Pulumi state (if they exist)"
+
+  # Import GitHub Actions IAM role if it exists
+  pulumi import --yes aws:iam/role:Role github_actions_infrastructure_role fund-github-actions-infrastructure-role 2>/dev/null || true
+
+  # Import GitHub Actions IAM policy if it exists (requires ARN lookup)
+  GITHUB_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-github-actions-infrastructure-policy`].Arn' --output text 2>/dev/null || echo "")
+  if [ -n "$GITHUB_POLICY_ARN" ]; then
+    pulumi import --yes aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
+  fi
+
+  # Import SageMaker execution role if it exists
+  pulumi import --yes aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
+
+  # Import SageMaker execution policy if it exists (requires ARN lookup)
+  SAGEMAKER_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-sagemaker-execution-policy`].Arn' --output text 2>/dev/null || echo "")
+  if [ -n "$SAGEMAKER_POLICY_ARN" ]; then
+    pulumi import --yes aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
+  fi
+
+  echo "Importing resources complete"
+fi
+
 pulumi up --diff --yes
+
+if [[ "$BOOTSTRAP" == "true" ]]; then
+  echo "Configuring GitHub Actions environment"
+
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "Warning: GitHub CLI not authenticated - skipping GitHub environment setup"
+    echo "Run 'gh auth login' and re-run with --bootstrap to configure GitHub Actions"
+  else
+    echo "Setting GitHub environment secrets for pulumi environment"
+
+    role_arn=$(pulumi stack output aws_iam_github_actions_infrastructure_role_arn --stack production)
+    region=$(pulumi config get aws:region --stack production)
+    artifacts_bucket=$(pulumi stack output aws_s3_model_artifacts_bucket --stack production)
+
+    gh secret set AWS_IAM_INFRASTRUCTURE_ROLE_ARN --env pulumi --body "$role_arn"
+    gh secret set AWS_REGION --env pulumi --body "$region"
+    gh secret set AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME --env pulumi --body "$artifacts_bucket"
+
+    echo "GitHub environment secrets updated successfully"
+    echo "  - AWS_IAM_INFRASTRUCTURE_ROLE_ARN"
+    echo "  - AWS_REGION"
+    echo "  - AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+    echo ""
+    echo "Note: PULUMI_ACCESS_TOKEN must be set manually"
+    echo "Generate token at: https://app.pulumi.com/account/tokens"
+    echo "Then run: gh secret set PULUMI_ACCESS_TOKEN --env pulumi --body \"<your-token>\""
+  fi
+fi
 
 echo "Forcing ECS service deployments to pull latest images"
 

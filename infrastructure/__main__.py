@@ -70,7 +70,7 @@ if not pulumi.runtime.is_config_secret(budget_alert_email_addresses_full_key):
     raise ValueError(message)
 budget_alert_email_addresses = cast(
     "list[str]",
-    stack_config.require_secret_object("budgetAlertEmailAddresses"),
+    stack_config.require_object("budgetAlertEmailAddresses"),
 )
 if not budget_alert_email_addresses:
     message = (
@@ -135,18 +135,21 @@ github_oidc_provider_arn = pulumi.Output.concat(
 datamanager_secret = aws.secretsmanager.Secret(
     "datamanager_secret",
     name=datamanager_secret_name,
+    recovery_window_in_days=0,
     tags=tags,
 )
 
 portfoliomanager_secret = aws.secretsmanager.Secret(
     "portfoliomanager_secret",
     name=portfoliomanager_secret_name,
+    recovery_window_in_days=0,
     tags=tags,
 )
 
 shared_secret = aws.secretsmanager.Secret(
     "shared_secret",
     name=shared_secret_name,
+    recovery_window_in_days=0,
     tags=tags,
 )
 
@@ -237,12 +240,12 @@ data_bucket = aws.s3.Bucket(
     tags=tags,
 )
 
-aws.s3.BucketServerSideEncryptionConfigurationV2(
+aws.s3.BucketServerSideEncryptionConfiguration(
     "data_bucket_encryption",
     bucket=data_bucket.id,
     rules=[
-        aws.s3.BucketServerSideEncryptionConfigurationV2RuleArgs(
-            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationV2RuleApplyServerSideEncryptionByDefaultArgs(
+        aws.s3.BucketServerSideEncryptionConfigurationRuleArgs(
+            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationRuleApplyServerSideEncryptionByDefaultArgs(
                 sse_algorithm="AES256",
             ),
         )
@@ -274,12 +277,12 @@ model_artifacts_bucket = aws.s3.Bucket(
     tags=tags,
 )
 
-aws.s3.BucketServerSideEncryptionConfigurationV2(
+aws.s3.BucketServerSideEncryptionConfiguration(
     "model_artifacts_bucket_encryption",
     bucket=model_artifacts_bucket.id,
     rules=[
-        aws.s3.BucketServerSideEncryptionConfigurationV2RuleArgs(
-            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationV2RuleApplyServerSideEncryptionByDefaultArgs(
+        aws.s3.BucketServerSideEncryptionConfigurationRuleArgs(
+            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationRuleApplyServerSideEncryptionByDefaultArgs(
                 sse_algorithm="AES256",
             ),
         )
@@ -843,41 +846,6 @@ github_actions_oidc_provider = aws.iam.OpenIdConnectProvider(
     tags=tags,
 )
 
-github_actions_infrastructure_role = aws.iam.Role(
-    "github_actions_infrastructure_role",
-    name=github_actions_role_name,
-    assume_role_policy=github_actions_oidc_provider.arn.apply(
-        lambda github_actions_oidc_provider_arn: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Principal": {
-                            "Federated": github_actions_oidc_provider_arn,
-                        },
-                        "Action": "sts:AssumeRoleWithWebIdentity",
-                        "Condition": {
-                            "StringEquals": {
-                                github_oidc_audience_claim: "sts.amazonaws.com",
-                                github_oidc_repository_claim: github_repository,
-                                github_oidc_ref_claim: f"refs/heads/{github_branch}",
-                                github_oidc_workflow_ref_claim: github_workflow_refs,
-                            },
-                            "StringLike": {
-                                github_oidc_sub_claim: f"repo:{github_repository}:*",
-                            },
-                        },
-                    }
-                ],
-            },
-            sort_keys=True,
-        )
-    ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
-    tags=tags,
-)
-
 github_actions_infrastructure_policy = aws.iam.Policy(
     "github_actions_infrastructure_policy",
     name="fund-github-actions-infrastructure-policy",
@@ -888,6 +856,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
         datamanager_secret_name,
         portfoliomanager_secret_name,
         shared_secret_name,
+        github_oidc_provider_arn,
     ).apply(
         lambda args: json.dumps(
             {
@@ -1045,7 +1014,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         "Sid": "CreateGithubActionsOIDCProvider",
                         "Effect": "Allow",
                         "Action": "iam:CreateOpenIDConnectProvider",
-                        "Resource": github_oidc_provider_arn,
+                        "Resource": args[3],
                     },
                     # CreateRole uses wildcard resources by API design.
                     {
@@ -1135,7 +1104,6 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         "Resource": [
                             f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
                             f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
-                            f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
                         ],
                         "Condition": {
                             "StringEquals": {
@@ -1143,9 +1111,6 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                                     "fund-ecs-execution-role-secrets-policy",
                                     "fund-ecs-task-role-s3-policy",
                                     "fund-ecs-task-role-ssm-policy",
-                                    "fund-sagemaker-s3-policy",
-                                    "fund-sagemaker-ecr-policy",
-                                    "fund-sagemaker-cloudwatch-policy",
                                 ]
                             }
                         },
@@ -1174,7 +1139,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                             "iam:UntagOpenIDConnectProvider",
                             "iam:UpdateOpenIDConnectProviderThumbprint",
                         ],
-                        "Resource": github_oidc_provider_arn,
+                        "Resource": args[3],
                     },
                     # Service-linked role teardown APIs are wildcard-resource only.
                     {
@@ -1199,15 +1164,44 @@ github_actions_infrastructure_policy = aws.iam.Policy(
             sort_keys=True,
         )
     ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
     tags=tags,
 )
 
-aws.iam.RolePolicyAttachment(
-    "github_actions_infrastructure_role_custom_policy",
-    role=github_actions_infrastructure_role.name,
-    policy_arn=github_actions_infrastructure_policy.arn,
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+github_actions_infrastructure_role = aws.iam.Role(
+    "github_actions_infrastructure_role",
+    name=github_actions_role_name,
+    assume_role_policy=github_actions_oidc_provider.arn.apply(
+        lambda github_actions_oidc_provider_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {
+                            "Federated": github_actions_oidc_provider_arn,
+                        },
+                        "Action": "sts:AssumeRoleWithWebIdentity",
+                        "Condition": {
+                            "StringEquals": {
+                                github_oidc_audience_claim: "sts.amazonaws.com",
+                                github_oidc_repository_claim: github_repository,
+                                github_oidc_ref_claim: f"refs/heads/{github_branch}",
+                                github_oidc_workflow_ref_claim: github_workflow_refs,
+                            },
+                            "StringLike": {
+                                github_oidc_sub_claim: f"repo:{github_repository}:*",
+                            },
+                        },
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
+    ),
+    managed_policy_arns=[github_actions_infrastructure_policy.arn],
+    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    tags=tags,
 )
 
 # IAM Role for ECS to perform infrastructure tasks
@@ -1253,7 +1247,7 @@ aws.iam.RolePolicy(
                     {
                         "Effect": "Allow",
                         "Action": ["secretsmanager:GetSecretValue"],
-                        "Resource": [account_id, args[0], args[1]],
+                        "Resource": [args[0], args[1], args[2]],
                     }
                 ],
             },
@@ -1296,10 +1290,10 @@ aws.iam.RolePolicy(
                         "Effect": "Allow",
                         "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
                         "Resource": [
-                            account_id,
-                            f"{account_id}/*",
                             args[0],
                             f"{args[0]}/*",
+                            args[1],
+                            f"{args[1]}/*",
                         ],
                     }
                 ],
@@ -1328,6 +1322,72 @@ aws.iam.RolePolicy(
     ),
 )
 
+# SageMaker Execution Policy
+sagemaker_execution_policy = aws.iam.Policy(
+    "sagemaker_execution_policy",
+    name="fund-sagemaker-execution-policy",
+    description="Least-privilege policy for SageMaker execution role.",
+    policy=pulumi.Output.all(
+        data_bucket.arn,
+        model_artifacts_bucket.arn,
+        equitypricemodel_trainer_repository.arn,
+    ).apply(
+        lambda args: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "S3Access",
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetObject",
+                            "s3:PutObject",
+                            "s3:DeleteObject",
+                            "s3:ListBucket",
+                        ],
+                        "Resource": [
+                            args[0],
+                            f"{args[0]}/*",
+                            args[1],
+                            f"{args[1]}/*",
+                        ],
+                    },
+                    {
+                        "Sid": "ECRRepositoryAccess",
+                        "Effect": "Allow",
+                        "Action": [
+                            "ecr:GetDownloadUrlForLayer",
+                            "ecr:BatchGetImage",
+                            "ecr:BatchCheckLayerAvailability",
+                        ],
+                        "Resource": args[2],
+                    },
+                    {
+                        "Sid": "ECRAuthorizationToken",
+                        "Effect": "Allow",
+                        "Action": "ecr:GetAuthorizationToken",
+                        "Resource": "*",
+                    },
+                    {
+                        "Sid": "CloudWatchLogs",
+                        "Effect": "Allow",
+                        "Action": [
+                            "logs:CreateLogGroup",
+                            "logs:CreateLogStream",
+                            "logs:PutLogEvents",
+                            "logs:DescribeLogStreams",
+                        ],
+                        "Resource": "arn:aws:logs:*:*:log-group:/aws/sagemaker/*",
+                    },
+                ],
+            },
+            sort_keys=True,
+        )
+    ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    tags=tags,
+)
+
 # SageMaker Execution Role for training jobs
 sagemaker_execution_role = aws.iam.Role(
     "sagemaker_execution_role",
@@ -1345,96 +1405,9 @@ sagemaker_execution_role = aws.iam.Role(
         },
         sort_keys=True,
     ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    managed_policy_arns=[sagemaker_execution_policy.arn],
+    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
     tags=tags,
-)
-
-aws.iam.RolePolicy(
-    "sagemaker_s3_policy",
-    name="fund-sagemaker-s3-policy",
-    role=sagemaker_execution_role.id,
-    policy=pulumi.Output.all(data_bucket.arn, model_artifacts_bucket.arn).apply(
-        lambda args: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "s3:GetObject",
-                            "s3:PutObject",
-                            "s3:DeleteObject",
-                            "s3:ListBucket",
-                        ],
-                        "Resource": [
-                            account_id,
-                            f"{account_id}/*",
-                            args[0],
-                            f"{args[0]}/*",
-                        ],
-                    }
-                ],
-            },
-            sort_keys=True,
-        )
-    ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
-)
-
-aws.iam.RolePolicy(
-    "sagemaker_ecr_policy",
-    name="fund-sagemaker-ecr-policy",
-    role=sagemaker_execution_role.id,
-    policy=pulumi.Output.all(equitypricemodel_trainer_repository.arn).apply(
-        lambda args: json.dumps(
-            {
-                "Version": "2012-10-17",
-                "Statement": [
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "ecr:GetDownloadUrlForLayer",
-                            "ecr:BatchGetImage",
-                            "ecr:BatchCheckLayerAvailability",
-                        ],
-                        "Resource": args[0],
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": "ecr:GetAuthorizationToken",
-                        "Resource": "*",
-                    },
-                ],
-            },
-            sort_keys=True,
-        )
-    ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
-)
-
-aws.iam.RolePolicy(
-    "sagemaker_cloudwatch_policy",
-    name="fund-sagemaker-cloudwatch-policy",
-    role=sagemaker_execution_role.id,
-    policy=json.dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": [
-                        "logs:CreateLogGroup",
-                        "logs:CreateLogStream",
-                        "logs:PutLogEvents",
-                        "logs:DescribeLogStreams",
-                    ],
-                    "Resource": "arn:aws:logs:*:*:log-group:/aws/sagemaker/*",
-                }
-            ],
-        },
-        sort_keys=True,
-    ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 datamanager_log_group = aws.cloudwatch.LogGroup(
@@ -1478,7 +1451,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "datamanager",
-                    "image": args[0],
+                    "image": args[1],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
@@ -1497,17 +1470,17 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                     "secrets": [
                         {
                             "name": "MASSIVE_API_KEY",
-                            "valueFrom": f"{args[1]}:MASSIVE_API_KEY::",
+                            "valueFrom": f"{args[2]}:MASSIVE_API_KEY::",
                         },
                         {
                             "name": "SENTRY_DSN",
-                            "valueFrom": f"{args[2]}:SENTRY_DSN::",
+                            "valueFrom": f"{args[3]}:SENTRY_DSN::",
                         },
                     ],
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": account_id,
+                            "awslogs-group": args[0],
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "datamanager",
                         },
@@ -1542,16 +1515,16 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "portfoliomanager",
-                    "image": args[1],
+                    "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[0]}:8080",
+                            "value": f"http://datamanager.{args[1]}:8080",
                         },
                         {
                             "name": "FUND_EQUITYPRICEMODEL_BASE_URL",
-                            "value": f"http://equitypricemodel.{args[0]}:8080",
+                            "value": f"http://equitypricemodel.{args[1]}:8080",
                         },
                         {
                             "name": "ENVIRONMENT",
@@ -1565,15 +1538,15 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                     "secrets": [
                         {
                             "name": "ALPACA_API_KEY_ID",
-                            "valueFrom": f"{args[2]}:ALPACA_API_KEY_ID::",
+                            "valueFrom": f"{args[3]}:ALPACA_API_KEY_ID::",
                         },
                         {
                             "name": "ALPACA_API_SECRET",
-                            "valueFrom": f"{args[2]}:ALPACA_API_SECRET::",
+                            "valueFrom": f"{args[3]}:ALPACA_API_SECRET::",
                         },
                         {
                             "name": "ALPACA_IS_PAPER",
-                            "valueFrom": f"{args[2]}:ALPACA_IS_PAPER::",
+                            "valueFrom": f"{args[3]}:ALPACA_IS_PAPER::",
                         },
                         {
                             "name": "SENTRY_DSN",
@@ -1583,7 +1556,7 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": account_id,
+                            "awslogs-group": args[0],
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "portfoliomanager",
                         },
@@ -1617,16 +1590,16 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
             [
                 {
                     "name": "equitypricemodel",
-                    "image": args[1],
+                    "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[0]}:8080",
+                            "value": f"http://datamanager.{args[1]}:8080",
                         },
                         {
                             "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET",
-                            "value": args[2],
+                            "value": args[3],
                         },
                         {
                             "name": "ENVIRONMENT",
@@ -1646,7 +1619,7 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": account_id,
+                            "awslogs-group": args[0],
                             "awslogs-region": region,
                             "awslogs-stream-prefix": "equitypricemodel",
                         },

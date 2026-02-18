@@ -82,7 +82,7 @@ def test_infrastructure_entrypoint_attaches_custom_github_actions_policy() -> No
 
     assert '"github_actions_infrastructure_policy"' in infrastructure_entrypoint
     assert (
-        '"github_actions_infrastructure_role_custom_policy"'
+        "managed_policy_arns=[github_actions_infrastructure_policy.arn]"
         in infrastructure_entrypoint
     )
 
@@ -98,5 +98,5 @@ def test_infrastructure_entrypoint_scopes_oidc_provider_creation_statement() -> 
     infrastructure_entrypoint = load_infrastructure_entrypoint()
 
     assert '"CreateGithubActionsOIDCProvider"' in infrastructure_entrypoint
-    assert '"Resource": github_oidc_provider_arn' in infrastructure_entrypoint
+    assert '"Resource": args[3]' in infrastructure_entrypoint
     assert '"CreateIamResourcesForOscmStack"' not in infrastructure_entrypoint
