@@ -3,6 +3,8 @@ name: Launch infrastructure
 run-name: Launch infrastructure
 on:
   schedule:
+    # Runs at 12:00 UTC weekdays (7:00 AM EST / 8:00 AM EDT)
+    # Launches infrastructure 2.5 hours before market open (EST) or 1.5 hours before (EDT)
     - cron: 0 12 * * 1-5
   push:
     branches:
@@ -12,7 +14,7 @@ concurrency:
   group: infrastructure-deployment
   cancel-in-progress: false
 jobs:
-  build_and_push:
+  build_and_push_images:
     name: Build and push ${{ matrix.service }}
     runs-on: ubuntu-latest
     environment: pulumi
@@ -65,9 +67,9 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask infrastructure images push ${{ matrix.service }} server
-  deploy:
+  launch_infrastructure:
     name: Deploy with Pulumi
-    needs: build_and_push
+    needs: build_and_push_images
     runs-on: ubuntu-latest
     environment: pulumi
     permissions:
@@ -89,9 +91,9 @@ jobs:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
           command: mask infrastructure stack up
-  trigger_sync:
+  trigger_data_sync:
     name: Trigger sync data workflow
-    needs: deploy
+    needs: launch_infrastructure
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:

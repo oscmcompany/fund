@@ -3,6 +3,8 @@ name: Teardown infrastructure
 run-name: Teardown infrastructure
 on:
   schedule:
+    # Runs at 23:00 UTC weekdays (6:00 PM EST / 7:00 PM EDT)
+    # Tears down infrastructure 2 hours after market close (EST) or 3 hours after (EDT)
     - cron: 0 23 * * 1-5
   workflow_dispatch:
 jobs:

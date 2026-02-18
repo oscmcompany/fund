@@ -125,12 +125,12 @@ def download_model_artifacts(  # noqa: C901, PLR0915
 
 if __name__ == "__main__":
     application_name = os.getenv("APPLICATION_NAME", "")
-    artifacts_bucket = os.getenv("AWS_S3_ARTIFACTS_BUCKET_NAME", "")
+    artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
     github_actions_check = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 
     environment_variables = {
         "APPLICATION_NAME": application_name,
-        "AWS_S3_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
+        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
     }
     for environment_variable in [
         application_name,
