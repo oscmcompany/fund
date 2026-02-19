@@ -195,29 +195,23 @@ fi
 
 pulumi stack select ${organization_name}/fund/production --create
 
-if [[ "$BOOTSTRAP" == "true" ]]; then
-  echo "Importing existing resources into Pulumi state (if they exist)"
+echo "Importing existing resources into Pulumi state (if they exist)"
 
-  # Import GitHub Actions IAM role if it exists
-  pulumi import --yes aws:iam/role:Role github_actions_infrastructure_role fund-github-actions-infrastructure-role 2>/dev/null || true
+pulumi import --yes aws:iam/role:Role github_actions_infrastructure_role fund-github-actions-infrastructure-role 2>/dev/null || true
 
-  # Import GitHub Actions IAM policy if it exists (requires ARN lookup)
-  GITHUB_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-github-actions-infrastructure-policy`].Arn' --output text 2>/dev/null || echo "")
-  if [ -n "$GITHUB_POLICY_ARN" ]; then
-    pulumi import --yes aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
-  fi
-
-  # Import SageMaker execution role if it exists
-  pulumi import --yes aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
-
-  # Import SageMaker execution policy if it exists (requires ARN lookup)
-  SAGEMAKER_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-sagemaker-execution-policy`].Arn' --output text 2>/dev/null || echo "")
-  if [ -n "$SAGEMAKER_POLICY_ARN" ]; then
-    pulumi import --yes aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
-  fi
-
-  echo "Importing resources complete"
+GITHUB_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-github-actions-infrastructure-policy`].Arn' --output text 2>/dev/null || echo "")
+if [ -n "$GITHUB_POLICY_ARN" ]; then
+  pulumi import --yes aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
 fi
+
+pulumi import --yes aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
+
+SAGEMAKER_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-sagemaker-execution-policy`].Arn' --output text 2>/dev/null || echo "")
+if [ -n "$SAGEMAKER_POLICY_ARN" ]; then
+  pulumi import --yes aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
+fi
+
+echo "Importing resources complete"
 
 pulumi up --diff --yes
 
@@ -232,16 +226,19 @@ if [[ "$BOOTSTRAP" == "true" ]]; then
 
     role_arn=$(pulumi stack output aws_iam_github_actions_infrastructure_role_arn --stack production)
     region=$(pulumi config get aws:region --stack production)
-    artifacts_bucket=$(pulumi stack output aws_s3_model_artifacts_bucket --stack production)
+    artifacts_bucket=$(pulumi stack output aws_s3_model_artifacts_bucket_name --stack production)
+    data_bucket=$(pulumi stack output aws_s3_data_bucket_name --stack production)
 
     gh secret set AWS_IAM_INFRASTRUCTURE_ROLE_ARN --env pulumi --body "$role_arn"
     gh secret set AWS_REGION --env pulumi --body "$region"
     gh secret set AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME --env pulumi --body "$artifacts_bucket"
+    gh secret set AWS_S3_DATA_BUCKET_NAME --env pulumi --body "$data_bucket"
 
     echo "GitHub environment secrets updated successfully"
     echo "  - AWS_IAM_INFRASTRUCTURE_ROLE_ARN"
     echo "  - AWS_REGION"
     echo "  - AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+    echo "  - AWS_S3_DATA_BUCKET_NAME"
     echo ""
     echo "Note: PULUMI_ACCESS_TOKEN must be set manually"
     echo "Generate token at: https://app.pulumi.com/account/tokens"
@@ -347,15 +344,17 @@ if [ -z "$base_url" ]; then
     exit 1
 fi
 
+cd "${MASKFILE_DIR}"
+
 case "$application_name" in
     portfoliomanager)
         full_url="${base_url}/portfolio"
         echo "Creating portfolio: $full_url"
 
-        http_code=$(curl -X POST "$full_url" \
-            -H "Content-Type: application/json" \
-            -w "%{http_code}" \
-            -s -o /dev/stderr)
+        http_code=$(curl --request POST "$full_url" \
+            --header "Content-Type: application/json" \
+            --write-out "%{http_code}" \
+            --output /dev/stderr)
 
         echo "HTTP Status: $http_code"
 
@@ -367,19 +366,14 @@ case "$application_name" in
 
     datamanager)
         if [ -n "${date_range:-}" ]; then
-            cd "${MASKFILE_DIR}"
             uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range"
         else
-            current_date=$(date -u +"%Y-%m-%dT00:00:00Z")
-            full_url="${base_url}/equity-bars"
-            echo "Syncing equity bars: $full_url"
-
-            curl -X POST "$full_url" \
-                -H "Content-Type: application/json" \
-                -d "{\"date\": \"$current_date\"}" \
-                -w "\nHTTP Status: %{http_code}\n" \
-                -s
+            current_date=$(date -u +"%Y-%m-%d")
+            date_range_json="{\"start_date\": \"$current_date\", \"end_date\": \"$current_date\"}"
+            uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range_json"
         fi
+
+        uv run python tools/sync_equity_categories.py
         ;;
 
     *)
@@ -755,7 +749,7 @@ set -euo pipefail
 echo "Syncing equity data: ${data_type}"
 
 cd infrastructure
-export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
+export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 
 cd ../
 
@@ -791,8 +785,8 @@ set -euo pipefail
 export APPLICATION_NAME="${application_name}"
 
 cd infrastructure
-export AWS_S3_DATA_BUCKET="$(pulumi stack output aws_s3_data_bucket)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET="$(pulumi stack output aws_s3_model_artifacts_bucket)"
+export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 
 cd ../
@@ -861,9 +855,9 @@ export SAGEMAKER_INSTANCE_TYPE="${instance_type}"
 cd infrastructure
 export AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN="$(pulumi stack output aws_ecr_equitypricemodel_trainer_image)"
 export AWS_IAM_SAGEMAKER_ROLE_ARN="$(pulumi stack output aws_iam_sagemaker_role_arn)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET="$(pulumi stack output aws_s3_model_artifacts_bucket)"
-export AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET}/artifacts"
-export AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET}/training"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
+export AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME}/artifacts"
+export AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME}/training"
 
 cd ../
 

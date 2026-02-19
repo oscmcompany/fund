@@ -1164,7 +1164,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
             sort_keys=True,
         )
     ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1200,7 +1200,7 @@ github_actions_infrastructure_role = aws.iam.Role(
         )
     ),
     managed_policy_arns=[github_actions_infrastructure_policy.arn],
-    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1384,7 +1384,7 @@ sagemaker_execution_policy = aws.iam.Policy(
             sort_keys=True,
         )
     ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1406,7 +1406,7 @@ sagemaker_execution_role = aws.iam.Role(
         sort_keys=True,
     ),
     managed_policy_arns=[sagemaker_execution_policy.arn],
-    opts=pulumi.ResourceOptions(retain_on_delete=True, protect=True),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -1598,7 +1598,7 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                             "value": f"http://datamanager.{args[1]}:8080",
                         },
                         {
-                            "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET",
+                            "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME",
                             "value": args[3],
                         },
                         {
@@ -1777,8 +1777,8 @@ pulumi.export(
 pulumi.export(
     "aws_ecr_equitypricemodel_repository", equitypricemodel_repository.repository_url
 )
-pulumi.export("aws_s3_data_bucket", data_bucket.bucket)
-pulumi.export("aws_s3_model_artifacts_bucket", model_artifacts_bucket.bucket)
+pulumi.export("aws_s3_data_bucket_name", data_bucket.bucket)
+pulumi.export("aws_s3_model_artifacts_bucket_name", model_artifacts_bucket.bucket)
 pulumi.export(
     "aws_ecr_equitypricemodel_trainer_repository",
     equitypricemodel_trainer_repository.repository_url,
