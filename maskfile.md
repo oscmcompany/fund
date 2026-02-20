@@ -747,6 +747,16 @@ set -euo pipefail
 echo "Syncing equity data: ${data_type}"
 
 cd infrastructure
+
+organization_name=$(pulumi org get-default)
+
+if [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 
 cd ../
@@ -783,6 +793,16 @@ set -euo pipefail
 export APPLICATION_NAME="${application_name}"
 
 cd infrastructure
+
+organization_name=$(pulumi org get-default)
+
+if [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
@@ -851,6 +871,16 @@ esac
 export SAGEMAKER_INSTANCE_TYPE="${instance_type}"
 
 cd infrastructure
+
+organization_name=$(pulumi org get-default)
+
+if [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
 export AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN="$(pulumi stack output aws_ecr_equitypricemodel_trainer_image)"
 export AWS_IAM_SAGEMAKER_ROLE_ARN="$(pulumi stack output aws_iam_sagemaker_role_arn)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
