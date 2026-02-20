@@ -372,8 +372,6 @@ case "$application_name" in
             date_range_json="{\"start_date\": \"$current_date\", \"end_date\": \"$current_date\"}"
             uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range_json"
         fi
-
-        uv run python tools/sync_equity_categories.py
         ;;
 
     *)
