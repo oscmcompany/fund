@@ -186,9 +186,7 @@ cd infrastructure/
 
 echo "Launching infrastructure"
 
-organization_name=$(pulumi org get-default)
-
-if [ -z "${organization_name}" ]; then
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
     echo "Unable to determine Pulumi organization name - ensure you are logged in"
     exit 1
 fi
@@ -748,9 +746,7 @@ echo "Syncing equity data: ${data_type}"
 
 cd infrastructure
 
-organization_name=$(pulumi org get-default)
-
-if [ -z "${organization_name}" ]; then
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
     echo "Unable to determine Pulumi organization name - ensure you are logged in"
     exit 1
 fi
@@ -794,9 +790,7 @@ export APPLICATION_NAME="${application_name}"
 
 cd infrastructure
 
-organization_name=$(pulumi org get-default)
-
-if [ -z "${organization_name}" ]; then
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
     echo "Unable to determine Pulumi organization name - ensure you are logged in"
     exit 1
 fi
@@ -872,9 +866,7 @@ export SAGEMAKER_INSTANCE_TYPE="${instance_type}"
 
 cd infrastructure
 
-organization_name=$(pulumi org get-default)
-
-if [ -z "${organization_name}" ]; then
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
     echo "Unable to determine Pulumi organization name - ensure you are logged in"
     exit 1
 fi
