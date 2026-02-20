@@ -249,16 +249,16 @@ def prepare_training_data(
 
 
 if __name__ == "__main__":
-    data_bucket: str | None = os.getenv("AWS_S3_DATA_BUCKET")
-    model_artifacts_bucket: str | None = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET")
+    data_bucket: str | None = os.getenv("AWS_S3_DATA_BUCKET_NAME")
+    model_artifacts_bucket: str | None = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
     lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
 
     if data_bucket is None:
-        logger.error("AWS_S3_DATA_BUCKET environment variable not set")
+        logger.error("AWS_S3_DATA_BUCKET_NAME environment variable not set")
         sys.exit(1)
 
     if model_artifacts_bucket is None:
-        logger.error("AWS_S3_MODEL_ARTIFACTS_BUCKET environment variable not set")
+        logger.error("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME environment variable not set")
         sys.exit(1)
 
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)

@@ -25,7 +25,6 @@ logger = structlog.get_logger()
 
 MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.io")
 
-# Massive ticker types: CS (Common Stock), ADRC/ADRP/ADRS (ADR variants)
 EQUITY_TYPES = {"CS", "ADRC", "ADRP", "ADRS"}
 
 
@@ -73,18 +72,14 @@ def extract_categories(tickers: list[dict]) -> pl.DataFrame:
     rows = []
     for ticker_data in tickers:
         ticker = ticker_data.get("ticker", "")
-        # Skip entries with empty or missing ticker values
         if not ticker:
             continue
-        # Filter for Common Stock and all ADR types
         if ticker_data.get("type") not in EQUITY_TYPES:
             continue
 
-        # Try to get sector/industry from various fields Massive provides
         sector = ticker_data.get("sector", "")
         industry = ticker_data.get("industry", "")
 
-        # Some tickers may not have sector/industry
         if not sector:
             sector = "NOT AVAILABLE"
         if not industry:
@@ -150,14 +145,14 @@ def sync_equity_categories(
 
 if __name__ == "__main__":
     api_key: str | None = os.getenv("MASSIVE_API_KEY")
-    bucket_name: str | None = os.getenv("AWS_S3_DATA_BUCKET")
+    bucket_name: str | None = os.getenv("AWS_S3_DATA_BUCKET_NAME")
 
     if api_key is None:
         logger.error("MASSIVE_API_KEY environment variable not set")
         sys.exit(1)
 
     if bucket_name is None:
-        logger.error("AWS_S3_DATA_BUCKET environment variable not set")
+        logger.error("AWS_S3_DATA_BUCKET_NAME environment variable not set")
         sys.exit(1)
 
     try:

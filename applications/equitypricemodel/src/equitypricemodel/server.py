@@ -161,7 +161,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
     import shutil  # noqa: PLC0415
 
-    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET")
+    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
     artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
     model_directory = "."
 
