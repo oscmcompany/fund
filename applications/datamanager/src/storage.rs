@@ -244,13 +244,12 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
         let sanitized_endpoint = sanitize_duckdb_config_value(&duckdb_s3_endpoint)?;
         s3_configuration_statements.push(format!("SET s3_endpoint='{}';", sanitized_endpoint));
 
+        // Defaults to false because custom endpoints are typically local (e.g. LocalStack) and don't use SSL
         let duckdb_s3_use_ssl = std::env::var("DUCKDB_S3_USE_SSL")
-            .map_err(|error| {
-                Error::Other(format!(
-                    "DUCKDB_S3_USE_SSL environment variable must be set: {}",
-                    error
-                ))
-            })?
+            .unwrap_or_else(|_| {
+                debug!("DUCKDB_S3_USE_SSL not set, defaulting to false");
+                "false".to_string()
+            })
             .to_lowercase();
 
         if duckdb_s3_use_ssl != "true" && duckdb_s3_use_ssl != "false" {

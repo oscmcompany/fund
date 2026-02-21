@@ -854,7 +854,7 @@ async fn test_equity_details_sync_returns_no_content_when_api_has_no_results() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

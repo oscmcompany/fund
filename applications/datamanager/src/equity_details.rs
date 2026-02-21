@@ -115,12 +115,12 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
         }
 
         let response = match request.send().await {
-            Ok(resp) => {
+            Ok(response) => {
                 info!(
                     "Received response from Massive API, status: {}",
-                    resp.status()
+                    response.status()
                 );
-                resp
+                response
             }
             Err(err) => {
                 warn!("Failed to send request to Massive API: {}", err);
@@ -176,6 +176,7 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
             Some(next_url) if !next_url.is_empty() => {
                 current_url = next_url;
                 is_first_page = false;
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
             }
             _ => break,
         }
@@ -219,7 +220,7 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
     info!("Filtered to {} equity tickers", tickers.len());
 
     if tickers.is_empty() {
-        return (StatusCode::NO_CONTENT, "No equity ticker data available").into_response();
+        return (StatusCode::OK, "No equity ticker data available").into_response();
     }
 
     let details_data = df! {

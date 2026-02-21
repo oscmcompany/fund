@@ -6,12 +6,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn initialize_sentry() -> sentry::ClientInitGuard {
     sentry::init((
-        env::var("SENTRY_DSN").expect("SENTRY_DSN environment variable must be set"),
+        env::var("SENTRY_DSN").unwrap_or_default(), // Empty DSN disables Sentry; avoids blocking local startup
         sentry::ClientOptions {
             release: sentry::release_name!(),
             environment: Some(
                 env::var("ENVIRONMENT")
-                    .expect("ENVIRONMENT environment variable must be set")
+                    .unwrap_or_else(|_| "development".to_string()) // Defaults to development so local runs don't require this
                     .into(),
             ),
             traces_sample_rate: 1.0,

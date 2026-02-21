@@ -1,7 +1,3 @@
-"""Sync equity details by invoking the datamanager POST /equity-details endpoint."""
-
-from __future__ import annotations
-
 import sys
 
 import requests
@@ -10,30 +6,35 @@ import structlog
 logger = structlog.get_logger()
 
 
-def sync_equity_details(base_url: str) -> None:
-    """POST to the equity-details endpoint to trigger a sync."""
+def sync_equity_details(base_url: str) -> tuple[int, str]:
     url = f"{base_url}/equity-details"
-    logger.info("Syncing equity details", url=url)
+    response = requests.post(url, timeout=300)
+    return response.status_code, response.text
+
+
+def sync_equity_details_data(base_url: str) -> None:
+    logger.info("Syncing equity details", url=f"{base_url}/equity-details")
 
     try:
-        response = requests.post(url, timeout=300)
-        logger.info(
-            "Sync completed",
-            status_code=response.status_code,
-            response=response.text,
-        )
-
-        if response.status_code >= 400:  # noqa: PLR2004
-            logger.error(
-                "Sync failed",
-                status_code=response.status_code,
-                response=response.text,
-            )
-            sys.exit(1)
-
+        status_code, response_text = sync_equity_details(base_url)
     except requests.RequestException as error:
         logger.exception("HTTP request failed", error=f"{error}")
-        sys.exit(1)
+        raise
+
+    logger.info(
+        "Sync completed",
+        status_code=status_code,
+        response=response_text,
+    )
+
+    if status_code >= 400:  # noqa: PLR2004
+        logger.error(
+            "Sync failed",
+            status_code=status_code,
+            response=response_text,
+        )
+        message = "Sync failed"
+        raise RuntimeError(message)
 
 
 if __name__ == "__main__":
@@ -46,8 +47,20 @@ if __name__ == "__main__":
 
     base_url = sys.argv[1]
 
-    if not base_url:
-        logger.error("Missing required positional argument: base_url")
-        sys.exit(1)
+    arguments = {
+        "base_url": base_url,
+    }
 
-    sync_equity_details(base_url=base_url)
+    for argument in [base_url]:
+        if not argument:
+            logger.error(
+                "Missing required positional argument(s)",
+                **arguments,
+            )
+            sys.exit(1)
+
+    try:
+        sync_equity_details_data(base_url=base_url)
+    except Exception as e:
+        logger.exception("Failed to sync equity details data", error=f"{e}")
+        sys.exit(1)
