@@ -6,12 +6,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn initialize_sentry() -> sentry::ClientInitGuard {
     sentry::init((
-        env::var("SENTRY_DSN").unwrap_or_default(),
+        env::var("SENTRY_DSN").expect("SENTRY_DSN environment variable must be set"),
         sentry::ClientOptions {
             release: sentry::release_name!(),
             environment: Some(
                 env::var("ENVIRONMENT")
-                    .unwrap_or_else(|_| "development".to_string())
+                    .expect("ENVIRONMENT environment variable must be set")
                     .into(),
             ),
             traces_sample_rate: 1.0,
@@ -22,10 +22,7 @@ pub fn initialize_sentry() -> sentry::ClientInitGuard {
 
 pub fn initialize_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "datamanager=debug,tower_http=debug,axum=debug".into()),
-        )
+        .with(tracing_subscriber::EnvFilter::try_from_default_env()?)
         .with(tracing_subscriber::fmt::layer())
         .with(
             sentry::integrations::tracing::layer().event_filter(|metadata| {
@@ -141,6 +138,9 @@ mod tests {
     #[serial]
     fn test_initialize_observability_functions() {
         let _environment_guard = EnvironmentVariableGuard::set("ENVIRONMENT", "test");
+        let _sentry_dsn_guard = EnvironmentVariableGuard::set("SENTRY_DSN", "");
+        let _rust_log_guard =
+            EnvironmentVariableGuard::set("RUST_LOG", "datamanager=debug,tower_http=debug");
         let _sentry_guard = initialize_sentry();
         let _ = initialize_tracing();
         let _ = initialize_tracing();

@@ -37,6 +37,51 @@ pub async fn write_predictions_dataframe_to_s3(
     write_dataframe_to_s3(state, dataframe, timestamp, "predictions".to_string()).await
 }
 
+pub async fn write_equity_details_dataframe_to_s3(
+    state: &State,
+    dataframe: &DataFrame,
+) -> Result<String, Error> {
+    info!("Uploading equity details DataFrame to S3 as CSV");
+
+    let key = "equity/details/categories.csv".to_string();
+
+    let mut buffer = Vec::new();
+    let mut writer = CsvWriter::new(&mut buffer);
+    match writer.finish(&mut dataframe.clone()) {
+        Ok(_) => {
+            info!(
+                "DataFrame successfully converted to CSV, size: {} bytes",
+                buffer.len()
+            );
+        }
+        Err(err) => {
+            return Err(Error::Other(format!("Failed to write CSV: {}", err)));
+        }
+    }
+
+    let body = ByteStream::from(buffer);
+
+    match state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .body(body)
+        .content_type("text/csv")
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Successfully uploaded CSV to s3://{}/{}",
+                state.bucket_name, key
+            );
+            Ok(key)
+        }
+        Err(err) => Err(Error::Other(format!("Failed to upload to S3: {}", err))),
+    }
+}
+
 pub fn is_valid_ticker(ticker: &str) -> bool {
     !ticker.is_empty()
         && ticker.chars().any(|c| c.is_ascii_alphanumeric())
@@ -200,7 +245,12 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
         s3_configuration_statements.push(format!("SET s3_endpoint='{}';", sanitized_endpoint));
 
         let duckdb_s3_use_ssl = std::env::var("DUCKDB_S3_USE_SSL")
-            .unwrap_or_else(|_| "true".to_string())
+            .map_err(|error| {
+                Error::Other(format!(
+                    "DUCKDB_S3_USE_SSL environment variable must be set: {}",
+                    error
+                ))
+            })?
             .to_lowercase();
 
         if duckdb_s3_use_ssl != "true" && duckdb_s3_use_ssl != "false" {
