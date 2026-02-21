@@ -39,7 +39,7 @@ def sync_equity_details(base_url: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) != 2:  # noqa: PLR2004
         logger.error(
-            "Usage: python sync_equity_details.py <base_url>",
+            "Usage: python sync_equity_details_data.py <base_url>",
             args_received=len(sys.argv) - 1,
         )
         sys.exit(1)

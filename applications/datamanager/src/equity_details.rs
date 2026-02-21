@@ -84,8 +84,18 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
     let mut all_tickers: Vec<TickerResult> = Vec::new();
     let mut current_url = base_url;
     let mut is_first_page = true;
+    let mut page_count: usize = 0;
+    const MAX_PAGES: usize = 1000;
 
     loop {
+        if page_count >= MAX_PAGES {
+            warn!(
+                "Reached maximum page limit of {}, stopping pagination",
+                MAX_PAGES
+            );
+            break;
+        }
+        page_count += 1;
         debug!("Fetching ticker page, url: {}", current_url);
 
         let mut request = state
@@ -182,7 +192,7 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
 
     for result in all_tickers {
         let ticker = match result.ticker {
-            Some(t) if !t.is_empty() => t,
+            Some(value) if !value.is_empty() => value,
             _ => continue,
         };
 
@@ -192,12 +202,12 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
         }
 
         let sector = match result.sector {
-            Some(s) if !s.is_empty() => s.to_uppercase(),
+            Some(value) if !value.is_empty() => value.to_uppercase(),
             _ => "NOT AVAILABLE".to_string(),
         };
 
         let industry = match result.industry {
-            Some(i) if !i.is_empty() => i.to_uppercase(),
+            Some(value) if !value.is_empty() => value.to_uppercase(),
             _ => "NOT AVAILABLE".to_string(),
         };
 
