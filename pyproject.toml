@@ -34,7 +34,7 @@ dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
 testpaths = [
   "applications/*/tests",
   "libraries/python/tests",
-  "tools/tests",            # Temporarily excluding due to low coverage
+  # "tools/tests", # Temporarily excluding due to low coverage
 ]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
