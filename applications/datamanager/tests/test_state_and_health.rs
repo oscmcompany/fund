@@ -76,18 +76,15 @@ async fn test_state_new_sets_all_fields() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_state_from_env_uses_defaults_when_variables_are_missing() {
+#[should_panic(expected = "AWS_S3_DATA_BUCKET_NAME environment variable must be set")]
+async fn test_state_from_env_panics_when_required_variables_are_missing() {
     let _aws_bucket_guard = EnvironmentVariableGuard::remove("AWS_S3_DATA_BUCKET_NAME");
     let _massive_base_guard = EnvironmentVariableGuard::remove("MASSIVE_BASE_URL");
     let _massive_key_guard = EnvironmentVariableGuard::remove("MASSIVE_API_KEY");
     let _region_guard = EnvironmentVariableGuard::set("AWS_REGION", "us-east-1");
     let _metadata_guard = EnvironmentVariableGuard::set("AWS_EC2_METADATA_DISABLED", "true");
 
-    let state = State::from_env().await;
-
-    assert_eq!(state.bucket_name, "fund-data");
-    assert_eq!(state.massive.base, "https://api.massive.io");
-    assert!(state.massive.key.is_empty());
+    State::from_env().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

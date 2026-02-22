@@ -20,4 +20,4 @@ jobs:
         env:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
-          command: mask infrastructure services invoke datamanager
+          command: mask infrastructure services invoke datamanager --data-type equity-bars

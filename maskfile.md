@@ -324,9 +324,22 @@ echo "Infrastructure torn down successfully"
 
 > Manage infrastructure services
 
-#### invoke (application_name) [date_range]
+#### invoke (application_name)
 
 > Invoke service REST endpoint
+
+<!-- markdownlint-disable MD036 MD032 MD007 -->
+**OPTIONS**
+* date_range
+    * flags: --date-range
+    * type: string
+    * desc: Date range JSON for equity bars sync, e.g. '{"start_date": "2025-01-01", "end_date": "2025-01-01"}'
+* data_type
+    * flags: --data-type
+    * type: string
+    * choices: equity-bars, equity-details
+    * desc: Data type to sync for datamanager
+<!-- markdownlint-enable MD036 MD032 MD007 -->
 
 ```bash
 set -euo pipefail
@@ -363,12 +376,22 @@ case "$application_name" in
         ;;
 
     datamanager)
-        if [ -n "${date_range:-}" ]; then
-            uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range"
-        else
-            current_date=$(date -u +"%Y-%m-%d")
-            date_range_json="{\"start_date\": \"$current_date\", \"end_date\": \"$current_date\"}"
-            uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range_json"
+        if [ -z "${data_type:-}" ]; then
+            echo "Missing required flag: --data-type"
+            echo "Valid choices: equity-bars, equity-details"
+            exit 1
+        fi
+
+        if [ "$data_type" = "equity-bars" ]; then
+            if [ -n "${date_range:-}" ]; then
+                uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range"
+            else
+                current_date=$(date -u +"%Y-%m-%d")
+                date_range_json="{\"start_date\": \"$current_date\", \"end_date\": \"$current_date\"}"
+                uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range_json"
+            fi
+        elif [ "$data_type" = "equity-details" ]; then
+            uv run python tools/sync_equity_details_data.py "$base_url"
         fi
         ;;
 
@@ -725,54 +748,6 @@ echo "Running YAML development checks"
 mask development yaml lint
 
 echo "YAML development checks completed successfully"
-```
-
-## data
-
-> Data management commands
-
-### sync
-
-> Update data in cloud storage
-
-#### equity (data_type)
-
-> Sync equity data to S3
-
-```bash
-set -euo pipefail
-
-echo "Syncing equity data: ${data_type}"
-
-cd infrastructure
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
-
-cd ../
-
-if [ "${data_type}" = "categories" ]; then
-    echo "Syncing equity categories"
-
-    export MASSIVE_API_KEY=$(aws secretsmanager get-secret-value \
-        --secret-id fund/production/datamanager \
-        --query 'SecretString' \
-        --output text | jq -r '.MASSIVE_API_KEY')
-
-    uv run python tools/sync_equity_categories.py
-else
-    echo "Unknown data type: ${data_type}"
-    echo "Valid options: categories"
-    exit 1
-fi
-
-echo "Equity data sync complete"
 ```
 
 ## models

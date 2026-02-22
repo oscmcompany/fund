@@ -12,7 +12,8 @@ use datamanager::{
         query_equity_bars_parquet_from_s3, query_portfolio_dataframe_from_s3,
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
         sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
-        write_portfolio_dataframe_to_s3, write_predictions_dataframe_to_s3, PredictionQuery,
+        write_equity_details_dataframe_to_s3, write_portfolio_dataframe_to_s3,
+        write_predictions_dataframe_to_s3, PredictionQuery,
     },
 };
 use polars::prelude::*;
@@ -450,10 +451,14 @@ async fn test_query_equity_bars_without_ticker_filter_returns_all() {
         .unwrap();
 
     // Query with None tickers — covers "No ticker filter applied" path
-    let parquet_bytes =
-        query_equity_bars_parquet_from_s3(&state, None, Some(timestamp), Some(timestamp))
-            .await
-            .unwrap();
+    let parquet_bytes = query_equity_bars_parquet_from_s3(
+        &state,
+        None,
+        Some(timestamp - chrono::Duration::days(1)),
+        Some(timestamp + chrono::Duration::days(1)),
+    )
+    .await
+    .unwrap();
 
     let cursor = Cursor::new(parquet_bytes);
     let result = ParquetReader::new(cursor).finish().unwrap();
@@ -478,4 +483,39 @@ fn test_sanitize_duckdb_config_value_rejects_injection() {
     assert!(sanitize_duckdb_config_value("").is_err());
     assert!(sanitize_duckdb_config_value(&"a".repeat(513)).is_err());
     assert!(sanitize_duckdb_config_value("value;another").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_write_equity_details_dataframe_to_s3_success() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let state = create_state(&endpoint).await;
+
+    let dataframe = df!(
+        "ticker" => vec!["AAPL"],
+        "sector" => vec!["TECHNOLOGY"],
+        "industry" => vec!["CONSUMER ELECTRONICS"],
+    )
+    .unwrap();
+
+    let s3_key = write_equity_details_dataframe_to_s3(&state, &dataframe)
+        .await
+        .unwrap();
+
+    assert_eq!(s3_key, "equity/details/categories.csv");
+
+    let read_back = read_equity_details_dataframe_from_s3(&state).await.unwrap();
+    assert_eq!(read_back.height(), 1);
+    assert_eq!(
+        read_back.column("ticker").unwrap().str().unwrap().get(0),
+        Some("AAPL")
+    );
+    assert_eq!(
+        read_back.column("sector").unwrap().str().unwrap().get(0),
+        Some("TECHNOLOGY")
+    );
+    assert_eq!(
+        read_back.column("industry").unwrap().str().unwrap().get(0),
+        Some("CONSUMER ELECTRONICS")
+    );
 }

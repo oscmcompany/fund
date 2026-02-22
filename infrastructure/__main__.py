@@ -1466,6 +1466,10 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                             "name": "ENVIRONMENT",
                             "value": "production",
                         },
+                        {
+                            "name": "RUST_LOG",
+                            "value": "datamanager=info,tower_http=info",
+                        },
                     ],
                     "secrets": [
                         {

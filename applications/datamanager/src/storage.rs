@@ -13,6 +13,8 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tracing::{debug, error, info, warn};
 
+const EQUITY_DETAILS_CATEGORIES_KEY: &str = "equity/details/categories.csv";
+
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
     dataframe: &DataFrame,
@@ -35,6 +37,51 @@ pub async fn write_predictions_dataframe_to_s3(
     timestamp: &DateTime<Utc>,
 ) -> Result<String, Error> {
     write_dataframe_to_s3(state, dataframe, timestamp, "predictions".to_string()).await
+}
+
+pub async fn write_equity_details_dataframe_to_s3(
+    state: &State,
+    dataframe: &DataFrame,
+) -> Result<String, Error> {
+    info!("Uploading equity details DataFrame to S3 as CSV");
+
+    let key = EQUITY_DETAILS_CATEGORIES_KEY.to_string();
+
+    let mut buffer = Vec::new();
+    let mut writer = CsvWriter::new(&mut buffer);
+    match writer.finish(&mut dataframe.clone()) {
+        Ok(_) => {
+            info!(
+                "DataFrame successfully converted to CSV, size: {} bytes",
+                buffer.len()
+            );
+        }
+        Err(err) => {
+            return Err(Error::Other(format!("Failed to write CSV: {}", err)));
+        }
+    }
+
+    let body = ByteStream::from(buffer);
+
+    match state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .body(body)
+        .content_type("text/csv")
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Successfully uploaded CSV to s3://{}/{}",
+                state.bucket_name, key
+            );
+            Ok(key)
+        }
+        Err(err) => Err(Error::Other(format!("Failed to upload to S3: {}", err))),
+    }
 }
 
 pub fn is_valid_ticker(ticker: &str) -> bool {
@@ -199,8 +246,12 @@ async fn create_duckdb_connection() -> Result<Connection, Error> {
         let sanitized_endpoint = sanitize_duckdb_config_value(&duckdb_s3_endpoint)?;
         s3_configuration_statements.push(format!("SET s3_endpoint='{}';", sanitized_endpoint));
 
+        // Defaults to false because custom endpoints are typically local (e.g. LocalStack) and don't use SSL
         let duckdb_s3_use_ssl = std::env::var("DUCKDB_S3_USE_SSL")
-            .unwrap_or_else(|_| "true".to_string())
+            .unwrap_or_else(|_| {
+                debug!("DUCKDB_S3_USE_SSL not set, defaulting to false");
+                "false".to_string()
+            })
             .to_lowercase();
 
         if duckdb_s3_use_ssl != "true" && duckdb_s3_use_ssl != "false" {
@@ -706,7 +757,7 @@ fn execute_portfolio_query_without_action(
 pub async fn read_equity_details_dataframe_from_s3(state: &State) -> Result<DataFrame, Error> {
     info!("Reading equity details CSV from S3");
 
-    let key = "equity/details/categories.csv";
+    let key = EQUITY_DETAILS_CATEGORIES_KEY;
 
     let response = state
         .s3_client
