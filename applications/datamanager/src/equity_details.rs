@@ -83,6 +83,17 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
 
     let mut all_tickers: Vec<TickerResult> = Vec::new();
     let mut current_url = base_url;
+    let expected_origin = match reqwest::Url::parse(&current_url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            warn!("Failed to parse base URL: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid base URL configuration",
+            )
+                .into_response();
+        }
+    };
     let mut is_first_page = true;
     let mut page_count: usize = 0;
     const MAX_PAGES: usize = 1000;
@@ -173,11 +184,25 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
         all_tickers.extend(results);
 
         match page.next_url {
-            Some(next_url) if !next_url.is_empty() => {
-                current_url = next_url;
-                is_first_page = false;
-                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
-            }
+            Some(next_url) if !next_url.is_empty() => match reqwest::Url::parse(&next_url) {
+                Ok(parsed)
+                    if parsed.scheme() == expected_origin.scheme()
+                        && parsed.host() == expected_origin.host()
+                        && parsed.port() == expected_origin.port() =>
+                {
+                    current_url = next_url;
+                    is_first_page = false;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                }
+                Ok(_) => {
+                    warn!("Next URL origin does not match expected origin, stopping pagination");
+                    break;
+                }
+                Err(err) => {
+                    warn!("Failed to parse next URL: {}", err);
+                    break;
+                }
+            },
             _ => break,
         }
     }
