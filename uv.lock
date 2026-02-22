@@ -324,6 +324,7 @@ dependencies = [
     { name = "internal" },
     { name = "mypy-boto3-s3" },
     { name = "numpy" },
+    { name = "polars" },
     { name = "requests" },
     { name = "sagemaker" },
     { name = "structlog" },
@@ -344,6 +345,7 @@ requires-dist = [
     { name = "internal", editable = "libraries/python" },
     { name = "mypy-boto3-s3", specifier = ">=1.42.37" },
     { name = "numpy", specifier = ">=1.26.4" },
+    { name = "polars" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "sagemaker", specifier = ">=2.256.0,<3" },
     { name = "structlog", specifier = ">=25.5.0" },
@@ -580,20 +582,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5b/f5/4ec618ed16cc4f8fb3b701563655a69816155e79e24a17b651541804721d/markdown_it_py-4.0.0.tar.gz", hash = "sha256:cb0a2b4aa34f932c007117b194e945bd74e0ec24133ceb5bac59009cda1cb9f3", size = 73070, upload-time = "2025-08-11T12:57:52.854Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/94/54/e7d793b573f298e1c9013b8c4dade17d481164aa517d1d7148619c2cedbf/markdown_it_py-4.0.0-py3-none-any.whl", hash = "sha256:87327c59b172c5011896038353a81343b6754500a08cd7a4973bb48c6d578147", size = 87321, upload-time = "2025-08-11T12:57:51.923Z" },
-]
-
-[[package]]
-name = "massive"
-version = "2.1.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "certifi" },
-    { name = "urllib3" },
-    { name = "websockets" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c8/b8/ef2d6c3d18cebd3fd1cf979162cbee1ed38183afac147a3d8c77a5a94cc5/massive-2.1.0.tar.gz", hash = "sha256:807596db9269c608462b6c83af2b2f7c6e91383eb02e46e7187d22a481a775b8", size = 46435, upload-time = "2026-01-26T09:36:30.98Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/c1/5bd916dabfe1c53c51756202a632dd97d425d14cc7732d2f500a0ca198fc/massive-2.1.0-py3-none-any.whl", hash = "sha256:920e81f5b96057081f33c05867d05b4fc790889a2937db2ad0b7e1baf01d2834", size = 63992, upload-time = "2026-01-26T09:36:32.03Z" },
 ]
 
 [[package]]
@@ -1389,14 +1377,10 @@ version = "0.1.0"
 source = { editable = "tools" }
 dependencies = [
     { name = "boto3" },
-    { name = "massive" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "boto3", specifier = ">=1.40.74" },
-    { name = "massive", specifier = ">=2.0.2" },
-]
+requires-dist = [{ name = "boto3", specifier = ">=1.40.74" }]
 
 [[package]]
 name = "tqdm"

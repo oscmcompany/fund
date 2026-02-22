@@ -9,7 +9,7 @@ def test_download_model_artifacts_github_actions_selects_latest() -> None:
     mock_s3_client.list_objects_v2.return_value = {
         "Contents": [
             {
-                "Key": "artifacts/run_20250601/output/model.tar.gz",
+                "Key": "artifacts/equitypricemodel/run_20250601/output/model.tar.gz",
                 "LastModified": datetime(2025, 6, 1, tzinfo=UTC),
             }
         ]
@@ -39,7 +39,10 @@ def test_download_model_artifacts_github_actions_selects_latest() -> None:
     )
     mock_s3_client.download_file.assert_called_once_with(
         Bucket="test-artifacts-bucket",
-        Key="artifacts/run_20250601/output/model.tar.gz",
+        Key="artifacts/equitypricemodel/run_20250601/output/model.tar.gz",
         Filename="applications/equitypricemodel/src/equitypricemodel/model.tar.gz",
     )
-    mock_tar.extractall.assert_called_once()
+    mock_tar.extractall.assert_called_once_with(
+        path="applications/equitypricemodel/src/equitypricemodel/",
+        filter="data",
+    )

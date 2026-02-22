@@ -13,6 +13,7 @@ dependencies = [
   "tinygrad>=0.10.3",
   "requests>=2.32.5",
   "mypy-boto3-s3>=1.42.37",
+  "polars",
 ]
 
 [tool.uv.sources]
@@ -31,11 +32,7 @@ members = [
 dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
 
 [tool.pytest.ini_options]
-testpaths = [
-  "applications/*/tests",
-  "libraries/python/tests",
-  # "tools/tests", # Temporarily excluding due to low coverage
-]
+testpaths = ["applications/*/tests", "libraries/python/tests", "tools/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -53,7 +50,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 parallel = true
-omit = ["*/__init__.py", "**/test_*.py", "tools/*"]
+omit = ["*/__init__.py", "**/test_*.py", "tools/**"]
 
 [tool.coverage.report]
 show_missing = true
