@@ -7,3 +7,10 @@ updates:
       day: monday
       time: 08:00
       timezone: America/New_York
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: 08:00
+      timezone: America/New_York
