@@ -96,7 +96,7 @@ pub async fn sync(AxumState(state): AxumState<State>) -> impl IntoResponse {
             break;
         }
         page_count += 1;
-        debug!("Fetching ticker page, url: {}", current_url);
+        debug!("Fetching ticker page: {}", page_count);
 
         let mut request = state
             .http_client
