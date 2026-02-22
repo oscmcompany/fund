@@ -16,7 +16,8 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
         raise RuntimeError from e
 
     if "start_date" not in date_range or "end_date" not in date_range:
-        raise RuntimeError
+        message = "Date range JSON must contain 'start_date' and 'end_date' fields"
+        raise RuntimeError(message)
 
     try:
         start_date = datetime.strptime(date_range["start_date"], "%Y-%m-%d").replace(
@@ -39,7 +40,8 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
     end_date = min(end_date, current_date)
 
     if start_date > end_date:
-        raise RuntimeError
+        message = "Start date must be on or before end date"
+        raise RuntimeError(message)
 
     return start_date, end_date
 

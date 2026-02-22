@@ -18,7 +18,7 @@ def sync_equity_details_data(base_url: str) -> None:
     status_code, response_text = sync_equity_details(base_url)
 
     if status_code >= 400:  # noqa: PLR2004
-        message = "Sync failed"
+        message = f"Sync failed with status {status_code}: {response_text}"
         raise RuntimeError(message)
 
     logger.info(
