@@ -830,7 +830,7 @@ async fn test_equity_details_sync_with_pagination() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_equity_details_sync_returns_no_content_when_api_has_no_results() {
+async fn test_equity_details_sync_returns_ok_when_api_has_no_results() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
 
     let mut massive_server = Server::new_async().await;

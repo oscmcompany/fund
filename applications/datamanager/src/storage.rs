@@ -13,6 +13,8 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tracing::{debug, error, info, warn};
 
+const EQUITY_DETAILS_CATEGORIES_KEY: &str = "equity/details/categories.csv";
+
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
     dataframe: &DataFrame,
@@ -43,7 +45,7 @@ pub async fn write_equity_details_dataframe_to_s3(
 ) -> Result<String, Error> {
     info!("Uploading equity details DataFrame to S3 as CSV");
 
-    let key = "equity/details/categories.csv".to_string();
+    let key = EQUITY_DETAILS_CATEGORIES_KEY.to_string();
 
     let mut buffer = Vec::new();
     let mut writer = CsvWriter::new(&mut buffer);
@@ -755,7 +757,7 @@ fn execute_portfolio_query_without_action(
 pub async fn read_equity_details_dataframe_from_s3(state: &State) -> Result<DataFrame, Error> {
     info!("Reading equity details CSV from S3");
 
-    let key = "equity/details/categories.csv";
+    let key = EQUITY_DETAILS_CATEGORIES_KEY;
 
     let response = state
         .s3_client

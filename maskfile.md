@@ -376,6 +376,12 @@ case "$application_name" in
         ;;
 
     datamanager)
+        if [ -z "${data_type:-}" ]; then
+            echo "Missing required flag: --data-type"
+            echo "Valid choices: equity-bars, equity-details"
+            exit 1
+        fi
+
         if [ "$data_type" = "equity-bars" ]; then
             if [ -n "${date_range:-}" ]; then
                 uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range"
@@ -386,10 +392,6 @@ case "$application_name" in
             fi
         elif [ "$data_type" = "equity-details" ]; then
             uv run python tools/sync_equity_details_data.py "$base_url"
-        else
-            echo "Missing required flag: --data-type"
-            echo "Valid choices: equity-bars, equity-details"
-            exit 1
         fi
         ;;
 

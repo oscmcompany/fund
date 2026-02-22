@@ -13,11 +13,9 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
     try:
         date_range = json.loads(date_range_json)
     except json.JSONDecodeError as e:
-        logger.exception("JSON decoding error", error=f"{e}")
         raise RuntimeError from e
 
     if "start_date" not in date_range or "end_date" not in date_range:
-        logger.error("Missing required date fields", date_range=date_range)
         raise RuntimeError
 
     try:
@@ -28,11 +26,6 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
             tzinfo=UTC
         )
     except ValueError as e:
-        logger.exception(
-            "Date parsing error",
-            error=f"{e}",
-            required_format="YYYY-MM-DD",
-        )
         raise RuntimeError from e
 
     current_date = datetime.now(tz=UTC).replace(
@@ -46,11 +39,6 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
     end_date = min(end_date, current_date)
 
     if start_date > end_date:
-        logger.error(
-            "Invalid date range after clamping",
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-        )
         raise RuntimeError
 
     return start_date, end_date

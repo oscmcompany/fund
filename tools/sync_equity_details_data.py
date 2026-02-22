@@ -15,11 +15,7 @@ def sync_equity_details(base_url: str) -> tuple[int, str]:
 def sync_equity_details_data(base_url: str) -> None:
     logger.info("Syncing equity details", url=f"{base_url}/equity-details")
 
-    try:
-        status_code, response_text = sync_equity_details(base_url)
-    except requests.RequestException as error:
-        logger.exception("HTTP request failed", error=f"{error}")
-        raise
+    status_code, response_text = sync_equity_details(base_url)
 
     logger.info(
         "Sync completed",
@@ -28,11 +24,6 @@ def sync_equity_details_data(base_url: str) -> None:
     )
 
     if status_code >= 400:  # noqa: PLR2004
-        logger.error(
-            "Sync failed",
-            status_code=status_code,
-            response=response_text,
-        )
         message = "Sync failed"
         raise RuntimeError(message)
 

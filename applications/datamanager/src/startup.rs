@@ -22,7 +22,10 @@ pub fn initialize_sentry() -> sentry::ClientInitGuard {
 
 pub fn initialize_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()?)
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .with(tracing_subscriber::fmt::layer())
         .with(
             sentry::integrations::tracing::layer().event_filter(|metadata| {
@@ -78,6 +81,19 @@ mod tests {
             // 3. The Drop implementation ensures cleanup when guard goes out of scope
             unsafe {
                 std::env::set_var(name, value);
+            }
+
+            Self {
+                name: name.to_string(),
+                original_value,
+            }
+        }
+
+        fn remove(name: &str) -> Self {
+            let original_value = std::env::var(name).ok();
+            // SAFETY: See set() method - protected by #[serial] annotation
+            unsafe {
+                std::env::remove_var(name);
             }
 
             Self {
@@ -144,6 +160,23 @@ mod tests {
         let _sentry_guard = initialize_sentry();
         let _ = initialize_tracing();
         let _ = initialize_tracing();
+    }
+
+    #[test]
+    #[serial]
+    fn test_initialize_tracing_without_rust_log() {
+        let _rust_log_guard = EnvironmentVariableGuard::remove("RUST_LOG");
+        let result = initialize_tracing();
+        // Either success (first initialization) or already-initialized error is acceptable.
+        // Any other error would mean the RUST_LOG fallback in initialize_tracing is broken.
+        if let Err(ref error) = result {
+            let message = error.to_string();
+            assert!(
+                message.contains("global default trace dispatcher"),
+                "Unexpected error from initialize_tracing: {}",
+                message
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
