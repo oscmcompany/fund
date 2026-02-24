@@ -43,14 +43,14 @@ def download_model_artifacts(  # noqa: C901, PLR0915
 
         file_object_name_parts = file_object_name.split("/")
 
-        if len(file_object_name_parts) < 2:  # noqa: PLR2004
+        if len(file_object_name_parts) < 3:  # noqa: PLR2004
             logger.warning("Skipping malformed path", path=file_object_name)
             continue
 
-        options.add(file_object_name_parts[1])
+        options.add(file_object_name_parts[2])
         file_objects_with_timestamps.append(
             {
-                "name": file_object_name_parts[1],
+                "name": file_object_name_parts[2],
                 "last_modified": file_object["LastModified"],
             }
         )
@@ -88,7 +88,7 @@ def download_model_artifacts(  # noqa: C901, PLR0915
 
     logger.info("Selected artifact", selected_option=selected_option)
 
-    target_path = f"artifacts/{selected_option}/output/model.tar.gz"
+    target_path = f"artifacts/{application_name}/{selected_option}/output/model.tar.gz"
     destination_directory = f"applications/{application_name}/src/{application_name}/"
     destination_path = os.path.join(destination_directory, "model.tar.gz")  # noqa: PTH118
 
