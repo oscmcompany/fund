@@ -6,9 +6,6 @@ requires-python = "==3.12.10"
 dependencies = [
   "boto3>=1.40.74",
   "sagemaker>=2.256.0,<3.0.0",
-  "structlog>=25.5.0",
-  "requests>=2.32.5",
-  "polars>=1.29.0",
 ]
 
 [dependency-groups]

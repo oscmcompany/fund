@@ -20,7 +20,10 @@ members = [
 dev = [
     { name = "behave", specifier = ">=1.2.6" },
     { name = "coverage", specifier = ">=7.8.0" },
+    { name = "polars", specifier = ">=1.29.0" },
     { name = "pytest", specifier = ">=8.3.5" },
+    { name = "requests", specifier = ">=2.32.5" },
+    { name = "structlog", specifier = ">=25.5.0" },
 ]
 
 [[package]]
@@ -1379,10 +1382,7 @@ version = "0.0.1"
 source = { editable = "tools" }
 dependencies = [
     { name = "boto3" },
-    { name = "polars" },
-    { name = "requests" },
     { name = "sagemaker" },
-    { name = "structlog" },
 ]
 
 [package.dev-dependencies]
@@ -1393,10 +1393,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.74" },
-    { name = "polars", specifier = ">=1.29.0" },
-    { name = "requests", specifier = ">=2.32.5" },
     { name = "sagemaker", specifier = ">=2.256.0,<3.0.0" },
-    { name = "structlog", specifier = ">=25.5.0" },
 ]
 
 [package.metadata.requires-dev]
