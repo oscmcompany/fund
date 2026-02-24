@@ -1,10 +1,10 @@
 [project]
 name = "equitypricemodel"
-version = "0.1.0"
+version = "0.0.1"
 description = "Equity price time-series dense encoder model architecture"
 requires-python = "==3.12.10"
 dependencies = [
-  "internal>=0.1.0",
+  "internal>=0.0.1",
   "boto3>=1.35.0",
   "python-dotenv>=1.2.1",
   "sentry-sdk[fastapi]>=2.0.0",

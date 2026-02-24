@@ -3,7 +3,7 @@ import sys
 import polars as pl
 import structlog
 
-from .categories_schema import categories_schema
+from .equity_details_schema import equity_details_schema
 
 
 def combine_data(
@@ -22,7 +22,7 @@ def combine_data(
         raise
 
     try:
-        categories_data = categories_schema.validate(categories_data)
+        equity_details_data = equity_details_schema.validate(categories_data)
     except Exception as e:
         logger.exception("Categories data validation failed", error=str(e))
         raise
@@ -35,7 +35,9 @@ def combine_data(
         )
         raise
 
-    consolidated_data = categories_data.join(equity_bars_data, on="ticker", how="inner")
+    consolidated_data = equity_details_data.join(
+        equity_bars_data, on="ticker", how="inner"
+    )
 
     retained_columns = (
         "ticker",
