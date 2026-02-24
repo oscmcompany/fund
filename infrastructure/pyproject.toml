@@ -1,6 +1,6 @@
 [project]
 name = "infrastructure"
-version = "0.1.0"
+version = "0.0.1"
 description = "Infrastructure management with Pulumi"
 requires-python = "==3.12.10"
 dependencies = [

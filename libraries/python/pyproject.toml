@@ -1,6 +1,6 @@
 [project]
 name = "internal"
-version = "0.1.0"
+version = "0.0.1"
 description = "Shared Python resources"
 requires-python = "==3.12.10"
 dependencies = ["polars>=1.29.0", "pandera[polars]>=0.26.0"]

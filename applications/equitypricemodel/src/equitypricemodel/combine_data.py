@@ -3,28 +3,30 @@ import sys
 import polars as pl
 import structlog
 
-from .categories_schema import categories_schema
+from .equity_details_schema import equity_details_schema
 
 
 def combine_data(
-    categories_csv_path: str,
+    equity_details_csv_path: str,
     equity_bars_csv_path: str,
     output_csv_path: str,
 ) -> None:
     logger = structlog.get_logger()
 
     try:
-        categories_data = pl.read_csv(categories_csv_path)
+        equity_details_data = pl.read_csv(equity_details_csv_path)
     except Exception as e:
         logger.exception(
-            "Failed to read categories CSV", path=categories_csv_path, error=str(e)
+            "Failed to read equity details CSV",
+            path=equity_details_csv_path,
+            error=str(e),
         )
         raise
 
     try:
-        categories_data = categories_schema.validate(categories_data)
+        equity_details_data = equity_details_schema.validate(equity_details_data)
     except Exception as e:
-        logger.exception("Categories data validation failed", error=str(e))
+        logger.exception("Equity details data validation failed", error=str(e))
         raise
 
     try:
@@ -35,7 +37,9 @@ def combine_data(
         )
         raise
 
-    consolidated_data = categories_data.join(equity_bars_data, on="ticker", how="inner")
+    consolidated_data = equity_details_data.join(
+        equity_bars_data, on="ticker", how="inner"
+    )
 
     retained_columns = (
         "ticker",
@@ -79,7 +83,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) != 4:  # noqa: PLR2004
         logger.error(
-            "Requires categories CSV, equity bars CSV, and output CSV paths as arguments",  # noqa: E501
+            "Requires equity details CSV, equity bars CSV, and output CSV paths as arguments",  # noqa: E501
         )
         sys.exit(1)
 
