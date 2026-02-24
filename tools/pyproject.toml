@@ -5,12 +5,14 @@ description = "Project tools and scripts"
 requires-python = "==3.12.10"
 dependencies = [
   "boto3>=1.40.74",
-  "massive>=2.0.2",
-  "sagemaker>=2.256.0",
+  "sagemaker>=2.256.0,<3.0.0",
   "structlog>=25.5.0",
   "requests>=2.32.5",
   "polars>=1.29.0",
 ]
+
+[dependency-groups]
+dev = ["boto3-stubs[s3]>=1.38.0"]
 
 [tool.uv]
 package = true
