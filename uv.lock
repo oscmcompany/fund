@@ -2894,15 +2894,21 @@ source = { editable = "tools" }
 dependencies = [
     { name = "boto3" },
     { name = "massive" },
+    { name = "polars" },
+    { name = "requests" },
     { name = "sagemaker", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'win32'" },
     { name = "sagemaker", version = "3.4.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
+    { name = "structlog" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.40.74" },
     { name = "massive", specifier = ">=2.0.2" },
+    { name = "polars", specifier = ">=1.29.0" },
+    { name = "requests", specifier = ">=2.32.5" },
     { name = "sagemaker", specifier = ">=2.256.0" },
+    { name = "structlog", specifier = ">=25.5.0" },
 ]
 
 [[package]]
