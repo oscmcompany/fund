@@ -26,7 +26,7 @@ def combine_data(
     try:
         equity_details_data = equity_details_schema.validate(equity_details_data)
     except Exception as e:
-        logger.exception("Categories data validation failed", error=str(e))
+        logger.exception("Equity details data validation failed", error=str(e))
         raise
 
     try:
@@ -83,7 +83,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) != 4:  # noqa: PLR2004
         logger.error(
-            "Requires categories CSV, equity bars CSV, and output CSV paths as arguments",  # noqa: E501
+            "Requires equity details CSV, equity bars CSV, and output CSV paths as arguments",  # noqa: E501
         )
         sys.exit(1)
 

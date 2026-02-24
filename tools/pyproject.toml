@@ -3,4 +3,4 @@ name = "tools"
 version = "0.0.1"
 description = "Project tools and scripts"
 requires-python = "==3.12.10"
-dependencies = ["boto3>=1.40.74", "massive>=2.0.2"]
+dependencies = ["boto3>=1.40.74", "massive>=2.0.2", "sagemaker>=2.256.0"]
