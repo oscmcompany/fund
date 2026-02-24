@@ -111,6 +111,7 @@ include = ["infrastructure/**"]
 [tool.ty.overrides.rules]
 invalid-argument-type = "ignore"
 missing-argument = "ignore"
+possibly-missing-attribute = "ignore"
 
 [tool.pyright]
 reportMissingImports = "none"
