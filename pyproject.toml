@@ -11,7 +11,7 @@ members = [
 dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
 
 [tool.pytest.ini_options]
-testpaths = ["applications/*/tests", "libraries/python/tests"]
+testpaths = ["applications/*/tests", "libraries/python/tests", "tools/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
@@ -29,7 +29,7 @@ filterwarnings = [
 
 [tool.coverage.run]
 parallel = true
-omit = ["*/__init__.py", "**/test_*.py"]
+omit = ["*/__init__.py", "**/test_*.py", "tools/**"]
 
 [tool.coverage.report]
 show_missing = true
