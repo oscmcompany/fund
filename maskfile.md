@@ -384,14 +384,14 @@ case "$application_name" in
 
         if [ "$data_type" = "equity-bars" ]; then
             if [ -n "${date_range:-}" ]; then
-                uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range"
+                uv run python -m tools.sync_equity_bars_data "$base_url" "$date_range"
             else
                 current_date=$(date -u +"%Y-%m-%d")
                 date_range_json="{\"start_date\": \"$current_date\", \"end_date\": \"$current_date\"}"
-                uv run python tools/sync_equity_bars_data.py "$base_url" "$date_range_json"
+                uv run python -m tools.sync_equity_bars_data "$base_url" "$date_range_json"
             fi
         elif [ "$data_type" = "equity-details" ]; then
-            uv run python tools/sync_equity_details_data.py "$base_url"
+            uv run python -m tools.sync_equity_details_data "$base_url"
         fi
         ;;
 
@@ -591,7 +591,7 @@ echo "Running dead code analysis"
 uvx vulture \
     --min-confidence 80 \
     --exclude '.flox,.venv,target' \
-    . tools/vulture_whitelist.py
+    . tools/src/tools/vulture_whitelist.py
 
 echo "Dead code check completed"
 ```
@@ -778,7 +778,7 @@ export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 
 cd ../
 
-uv run python tools/prepare_training_data.py
+uv run python -m tools.prepare_training_data
 ```
 
 ### train (application_name) [instance_preset]
@@ -856,7 +856,7 @@ export AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH="s3://${AWS_S3_MODEL_ARTIFAC
 
 cd ../
 
-uv run python tools/run_training_job.py
+uv run python -m tools.run_training_job
 ```
 
 ### artifacts
@@ -872,7 +872,7 @@ set -euo pipefail
 
 export APPLICATION_NAME="${application_name}"
 
-uv run python tools/download_model_artifacts.py
+uv run python -m tools.download_model_artifacts
 ```
 
 ## mcp

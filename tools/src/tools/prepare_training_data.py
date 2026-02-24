@@ -1,13 +1,3 @@
-"""Prepare consolidated training data from equity bars and categories.
-
-This script:
-1. Reads equity bars from S3 (partitioned parquet)
-2. Reads categories CSV from S3
-3. Joins them on ticker
-4. Filters by minimum price/volume thresholds
-5. Outputs consolidated parquet to S3 for SageMaker training
-"""
-
 import io
 import os
 import sys
