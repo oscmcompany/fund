@@ -37,15 +37,16 @@ impl State {
 
         let s3_client = S3Client::new(&config);
 
-        let bucket_name =
-            std::env::var("AWS_S3_DATA_BUCKET_NAME").unwrap_or_else(|_| "fund-data".to_string());
+        let bucket_name = std::env::var("AWS_S3_DATA_BUCKET_NAME")
+            .expect("AWS_S3_DATA_BUCKET_NAME environment variable must be set");
         info!("Using S3 bucket: {}", bucket_name);
 
         let massive_base_url = std::env::var("MASSIVE_BASE_URL")
-            .unwrap_or_else(|_| "https://api.massive.io".to_string());
+            .expect("MASSIVE_BASE_URL environment variable must be set");
         info!("Using Massive API base URL: {}", massive_base_url);
 
-        let massive_api_key = std::env::var("MASSIVE_API_KEY").unwrap_or_else(|_| String::new());
+        let massive_api_key = std::env::var("MASSIVE_API_KEY")
+            .expect("MASSIVE_API_KEY environment variable must be set");
 
         info!("Application state initialized successfully");
 

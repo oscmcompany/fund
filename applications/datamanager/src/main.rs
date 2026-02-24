@@ -52,6 +52,9 @@ mod tests {
             std::env::set_var("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
+            std::env::set_var("SENTRY_DSN", "");
+            std::env::set_var("ENVIRONMENT", "test");
+            std::env::set_var("RUST_LOG", "datamanager=debug,tower_http=debug");
         }
 
         let exit_code = run_with_bind_address("invalid-address").await;
@@ -62,6 +65,9 @@ mod tests {
             std::env::remove_var("AWS_S3_DATA_BUCKET_NAME");
             std::env::remove_var("MASSIVE_BASE_URL");
             std::env::remove_var("MASSIVE_API_KEY");
+            std::env::remove_var("SENTRY_DSN");
+            std::env::remove_var("ENVIRONMENT");
+            std::env::remove_var("RUST_LOG");
         }
     }
 }
