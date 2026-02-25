@@ -47,6 +47,8 @@ aws_config = pulumi.Config("aws")
 
 region = aws_config.require("region")
 
+random_suffix = stack_config.require_secret("randomSuffix")
+
 github_actions_role_name = stack_config.require("githubActionsRoleName")
 github_repository = stack_config.require("githubRepository")
 github_branch = stack_config.require("githubBranch")
@@ -235,7 +237,7 @@ aws.budgets.Budget(
 # S3 Data Bucket for storing equity bars, predictions, portfolios
 data_bucket = aws.s3.Bucket(
     "data_bucket",
-    bucket_prefix="fund-data-",
+    bucket=pulumi.Output.concat("fund-data-", random_suffix),
     opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
@@ -250,6 +252,7 @@ aws.s3.BucketServerSideEncryptionConfiguration(
             ),
         )
     ],
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.s3.BucketPublicAccessBlock(
@@ -259,6 +262,7 @@ aws.s3.BucketPublicAccessBlock(
     block_public_policy=True,
     ignore_public_acls=True,
     restrict_public_buckets=True,
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.s3.BucketVersioning(
@@ -267,12 +271,13 @@ aws.s3.BucketVersioning(
     versioning_configuration=aws.s3.BucketVersioningVersioningConfigurationArgs(
         status="Enabled",
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 # S3 Model Artifacts Bucket for storing trained model weights and checkpoints
 model_artifacts_bucket = aws.s3.Bucket(
     "model_artifacts_bucket",
-    bucket_prefix="fund-model-artifacts-",
+    bucket=pulumi.Output.concat("fund-model-artifacts-", random_suffix),
     opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
@@ -287,6 +292,7 @@ aws.s3.BucketServerSideEncryptionConfiguration(
             ),
         )
     ],
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.s3.BucketPublicAccessBlock(
@@ -296,6 +302,7 @@ aws.s3.BucketPublicAccessBlock(
     block_public_policy=True,
     ignore_public_acls=True,
     restrict_public_buckets=True,
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 aws.s3.BucketVersioning(
@@ -304,13 +311,18 @@ aws.s3.BucketVersioning(
     versioning_configuration=aws.s3.BucketVersioningVersioningConfigurationArgs(
         status="Enabled",
     ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
 )
 
 # ECR Repositories - these must exist before images can be pushed
+# force_delete allows repositories containing images to be deleted on stack teardown.
+# If image rebuild and push times become prohibitive on daily down/up cycles, switch to
+# retain_on_delete=True and add pulumi import statements to the maskfile up command.
 datamanager_repository = aws.ecr.Repository(
     "datamanager_repository",
     name="fund/datamanager-server",
     image_tag_mutability="MUTABLE",
+    force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
         scan_on_push=True,
     ),
@@ -321,6 +333,7 @@ portfoliomanager_repository = aws.ecr.Repository(
     "portfoliomanager_repository",
     name="fund/portfoliomanager-server",
     image_tag_mutability="MUTABLE",
+    force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
         scan_on_push=True,
     ),
@@ -331,6 +344,7 @@ equitypricemodel_repository = aws.ecr.Repository(
     "equitypricemodel_repository",
     name="fund/equitypricemodel-server",
     image_tag_mutability="MUTABLE",
+    force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
         scan_on_push=True,
     ),
@@ -341,6 +355,7 @@ equitypricemodel_trainer_repository = aws.ecr.Repository(
     "equitypricemodel_trainer_repository",
     name="fund/equitypricemodel-trainer",
     image_tag_mutability="MUTABLE",
+    force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
         scan_on_push=True,
     ),

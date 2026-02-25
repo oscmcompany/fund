@@ -1,4 +1,3 @@
----
 # yamllint disable rule:line-length
 config:
   aws:region: us-east-1
@@ -24,3 +23,5 @@ config:
     secure: AAABAN+AOhwp6jr/FKgLoyOBHVEeiG8kxzGJrsTr30gnj5JiuQs+YJmmFRSd0cdOHJotfJ8Y
   fund:sharedSecretValue:
     secure: AAABACKTBgsKXMGiDo/WXf5/WTwxHIKAKYUGOMhCecEe09+g/huViXxO1fYA+I2EdIcxBk8zerAoxkOGNUMkik+45skuj3vUYHraOLiKmzSt9h7Z1R56ixPoNMrTSbCMjpHOHZSji0G7lH2qCdCj6jGH/aouZjZRsnPLGa5/pxjhe+1aUtuvwLoqr6IlyuPEkw==
+  fund:randomSuffix:
+    secure: AAABAPl47ORoO6t8NqEn8I/e49nYu7cuGBwRgA59mBFIKX7RyHTk1w==
