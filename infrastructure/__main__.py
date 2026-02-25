@@ -1796,8 +1796,11 @@ pulumi.export(
 pulumi.export(
     "aws_ecr_equitypricemodel_repository", equitypricemodel_repository.repository_url
 )
-pulumi.export("aws_s3_data_bucket_name", data_bucket.bucket)
-pulumi.export("aws_s3_model_artifacts_bucket_name", model_artifacts_bucket.bucket)
+pulumi.export("aws_s3_data_bucket_name", pulumi.Output.unsecret(data_bucket.bucket))
+pulumi.export(
+    "aws_s3_model_artifacts_bucket_name",
+    pulumi.Output.unsecret(model_artifacts_bucket.bucket),
+)
 pulumi.export(
     "aws_ecr_equitypricemodel_trainer_repository",
     equitypricemodel_trainer_repository.repository_url,
