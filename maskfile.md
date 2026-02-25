@@ -193,21 +193,37 @@ fi
 
 pulumi stack select ${organization_name}/fund/production --create
 
+if ! pulumi config get fund:randomSuffix >/dev/null 2>&1; then
+  pulumi config set --secret fund:randomSuffix "$(openssl rand -hex 4)"
+fi
+
+RANDOM_SUFFIX=$(pulumi config get fund:randomSuffix)
+
 echo "Importing existing resources into Pulumi state (if they exist)"
 
-pulumi import --yes aws:iam/role:Role github_actions_infrastructure_role fund-github-actions-infrastructure-role 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:iam/role:Role github_actions_infrastructure_role fund-github-actions-infrastructure-role 2>/dev/null || true
 
 GITHUB_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-github-actions-infrastructure-policy`].Arn' --output text 2>/dev/null || echo "")
 if [ -n "$GITHUB_POLICY_ARN" ]; then
-  pulumi import --yes aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
+  pulumi import --yes --generate-code=false aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
 fi
 
-pulumi import --yes aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
 
 SAGEMAKER_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-sagemaker-execution-policy`].Arn' --output text 2>/dev/null || echo "")
 if [ -n "$SAGEMAKER_POLICY_ARN" ]; then
-  pulumi import --yes aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
+  pulumi import --yes --generate-code=false aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
 fi
+
+pulumi import --yes --generate-code=false aws:s3/bucket:Bucket data_bucket "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration data_bucket_encryption "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock data_bucket_public_access_block "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning data_bucket_versioning "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
+
+pulumi import --yes --generate-code=false aws:s3/bucket:Bucket model_artifacts_bucket "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration model_artifacts_bucket_encryption "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock model_artifacts_bucket_public_access_block "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning model_artifacts_bucket_versioning "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 
 echo "Importing resources complete"
 
@@ -699,7 +715,7 @@ set -euo pipefail
 
 echo "Running Markdown lint checks"
 
-markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" --ignore "target"
+markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" --ignore "target" --ignore ".scratchpad"
 
 echo "Markdown linting completed successfully"
 ```
