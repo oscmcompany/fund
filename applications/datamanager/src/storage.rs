@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tracing::{debug, error, info, warn};
 
-const EQUITY_DETAILS_CATEGORIES_KEY: &str = "equity/details/categories.csv";
+const EQUITY_DETAILS_KEY: &str = "equity/details/details.csv";
 
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
@@ -45,7 +45,7 @@ pub async fn write_equity_details_dataframe_to_s3(
 ) -> Result<String, Error> {
     info!("Uploading equity details DataFrame to S3 as CSV");
 
-    let key = EQUITY_DETAILS_CATEGORIES_KEY.to_string();
+    let key = EQUITY_DETAILS_KEY.to_string();
 
     let mut buffer = Vec::new();
     let mut writer = CsvWriter::new(&mut buffer);
@@ -754,10 +754,42 @@ fn execute_portfolio_query_without_action(
     Ok(portfolios)
 }
 
+pub async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Error> {
+    info!("Reading equity details CSV from S3");
+
+    let key = EQUITY_DETAILS_KEY;
+
+    let response = state
+        .s3_client
+        .get_object()
+        .bucket(&state.bucket_name)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to get object from S3: {}", e)))?;
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to read response body: {}", e)))?
+        .into_bytes();
+
+    let csv_content = String::from_utf8(bytes.to_vec())
+        .map_err(|e| Error::Other(format!("Failed to convert bytes to UTF-8: {}", e)))?;
+
+    info!(
+        "Successfully read CSV from S3, size: {} bytes",
+        csv_content.len()
+    );
+
+    Ok(csv_content)
+}
+
 pub async fn read_equity_details_dataframe_from_s3(state: &State) -> Result<DataFrame, Error> {
     info!("Reading equity details CSV from S3");
 
-    let key = EQUITY_DETAILS_CATEGORIES_KEY;
+    let key = EQUITY_DETAILS_KEY;
 
     let response = state
         .s3_client

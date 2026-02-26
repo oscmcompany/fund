@@ -6,7 +6,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc, Weekday};
 use polars::prelude::*;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -123,6 +123,16 @@ pub async fn sync(
 ) -> impl IntoResponse {
     info!("Sync date: {}", payload.date);
 
+    let weekday = payload.date.weekday();
+    if weekday == Weekday::Sat || weekday == Weekday::Sun {
+        info!("Skipping weekend date: {}", payload.date.format("%Y-%m-%d"));
+        return (
+            StatusCode::NO_CONTENT,
+            "Skipping weekend, no trading data available",
+        )
+            .into_response();
+    }
+
     let massive_api_key = state.massive.key.clone();
 
     let date = payload.date.format("%Y-%m-%d").to_string();
@@ -149,7 +159,10 @@ pub async fn sync(
             resp
         }
         Err(err) => {
-            warn!("Failed to send request to Massive API: {}", err);
+            warn!(
+                "Failed to send request to Massive API: {}",
+                err.without_url()
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to send API request",
