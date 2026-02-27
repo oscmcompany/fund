@@ -328,6 +328,7 @@ dependencies = [
     { name = "sentry-sdk", extra = ["fastapi"] },
     { name = "structlog" },
     { name = "tinygrad" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -347,6 +348,7 @@ requires-dist = [
     { name = "sentry-sdk", extras = ["fastapi"], specifier = ">=2.0.0" },
     { name = "structlog", specifier = ">=25.5.0" },
     { name = "tinygrad", specifier = ">=0.10.3" },
+    { name = "uvicorn", specifier = ">=0.34.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -883,6 +885,7 @@ dependencies = [
     { name = "requests" },
     { name = "sentry-sdk", extra = ["fastapi"] },
     { name = "structlog" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -896,6 +899,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.5" },
     { name = "sentry-sdk", extras = ["fastapi"], specifier = ">=2.0.0" },
     { name = "structlog", specifier = ">=25.5.0" },
+    { name = "uvicorn", specifier = ">=0.34.0" },
 ]
 
 [[package]]

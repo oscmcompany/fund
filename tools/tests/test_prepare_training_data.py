@@ -132,7 +132,7 @@ def test_read_categories_from_s3_returns_dataframe() -> None:
     assert result["ticker"][0] == "AAPL"
     mock_s3_client.get_object.assert_called_once_with(
         Bucket="test-bucket",
-        Key="equity/details/categories.csv",
+        Key="equity/details/details.csv",
     )
 
 
