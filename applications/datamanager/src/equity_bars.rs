@@ -127,7 +127,7 @@ pub async fn sync(
     if weekday == Weekday::Sat || weekday == Weekday::Sun {
         info!("Skipping weekend date: {}", payload.date.format("%Y-%m-%d"));
         return (
-            StatusCode::NO_CONTENT,
+            StatusCode::OK,
             "Skipping weekend, no trading data available",
         )
             .into_response();

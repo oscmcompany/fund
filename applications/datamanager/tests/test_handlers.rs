@@ -721,7 +721,7 @@ async fn test_portfolios_get_returns_internal_server_error_when_storage_query_fa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_equity_bars_sync_returns_no_content_for_weekend_date() {
+async fn test_equity_bars_sync_returns_ok_for_weekend_date() {
     // 2025-01-04 is a Saturday, 2025-01-05 is a Sunday — no API or S3 calls expected
     let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
@@ -733,7 +733,7 @@ async fn test_equity_bars_sync_returns_no_content_for_weekend_date() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 
     let response = client
         .post(app.url("/equity-bars"))
@@ -742,7 +742,7 @@ async fn test_equity_bars_sync_returns_no_content_for_weekend_date() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
