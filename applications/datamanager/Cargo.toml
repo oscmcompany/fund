@@ -33,7 +33,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 aws-config = "1.5"
 aws-sdk-s3 = "1.112"
-aws-credential-types = "1.2.6"
+aws-credential-types = "1.2.13"
 duckdb = { version = "1.4.3", features = ["r2d2", "chrono"] }
 validator = { version = "0.20", features = ["derive"] }
 thiserror = "2.0.3"
