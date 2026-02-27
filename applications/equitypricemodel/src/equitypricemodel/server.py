@@ -59,6 +59,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+MODEL_VERSION_SSM_PARAMETER = "/fund/equitypricemodel/model_version"
 
 
 def find_latest_artifact_key(
@@ -175,11 +176,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             if artifact_path.endswith(".tar.gz"):
                 artifact_key = artifact_path
             else:
-                artifact_key = find_latest_artifact_key(
-                    s3_client=s3_client,
-                    bucket=bucket,
-                    prefix=artifact_path,
-                )
+                model_version = ""
+                try:
+                    ssm_client = boto3.client("ssm")
+                    response = ssm_client.get_parameter(
+                        Name=MODEL_VERSION_SSM_PARAMETER
+                    )
+                    model_version = response["Parameter"]["Value"].strip()
+                    if model_version:
+                        logger.info("using_pinned_model_version", version=model_version)
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "ssm_parameter_read_failed",
+                        parameter=MODEL_VERSION_SSM_PARAMETER,
+                    )
+
+                if model_version:
+                    artifact_key = f"{artifact_path}{model_version}/output/model.tar.gz"
+                else:
+                    artifact_key = find_latest_artifact_key(
+                        s3_client=s3_client,
+                        bucket=bucket,
+                        prefix=artifact_path,
+                    )
 
             download_and_extract_artifacts(
                 s3_client=s3_client,

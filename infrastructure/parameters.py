@@ -22,3 +22,17 @@ uncertainty_threshold = aws.ssm.Parameter(
     description="Maximum inter-quartile range for predictions to be considered valid",
     tags=tags,
 )
+
+# Equity Price Model Configuration
+equitypricemodel_model_version = aws.ssm.Parameter(
+    "ssm_equitypricemodel_model_version",
+    name="/fund/equitypricemodel/model_version",
+    type="String",
+    value="",
+    description=(
+        "Artifact folder name for the equity price model. "
+        "Empty string uses the latest available artifact."
+    ),
+    tags=tags,
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
+)
