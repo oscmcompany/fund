@@ -787,33 +787,7 @@ pub async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Er
 }
 
 pub async fn read_equity_details_dataframe_from_s3(state: &State) -> Result<DataFrame, Error> {
-    info!("Reading equity details CSV from S3");
-
-    let key = EQUITY_DETAILS_KEY;
-
-    let response = state
-        .s3_client
-        .get_object()
-        .bucket(&state.bucket_name)
-        .key(key)
-        .send()
-        .await
-        .map_err(|e| Error::Other(format!("Failed to get object from S3: {}", e)))?;
-
-    let bytes = response
-        .body
-        .collect()
-        .await
-        .map_err(|e| Error::Other(format!("Failed to read response body: {}", e)))?
-        .into_bytes();
-
-    let csv_content = String::from_utf8(bytes.to_vec())
-        .map_err(|e| Error::Other(format!("Failed to convert bytes to UTF-8: {}", e)))?;
-
-    info!(
-        "Successfully read CSV from S3, size: {} bytes",
-        csv_content.len()
-    );
+    let csv_content = read_equity_details_csv_from_s3(state).await?;
 
     let dataframe = create_equity_details_dataframe(csv_content)?;
 
