@@ -83,7 +83,7 @@ def read_categories_from_s3(
     bucket_name: str,
 ) -> pl.DataFrame:
     """Read categories CSV from S3."""
-    key = "equity/details/categories.csv"
+    key = "equity/details/details.csv"
 
     logger.info("Reading categories from S3", bucket=bucket_name, key=key)
 
