@@ -346,6 +346,7 @@ class Model:
         total_batches = len(train_batches)
 
         best_loss = float("inf")
+        best_saved_loss = float("inf")
         epochs_without_improvement = 0
         best_checkpoint_saved = False
 
@@ -419,13 +420,6 @@ class Model:
                         "New best loss",
                         best_loss=f"{best_loss:.4f}",
                     )
-                    if checkpoint_directory is not None:
-                        Path(checkpoint_directory).mkdir(parents=True, exist_ok=True)
-                        safe_save(
-                            get_state_dict(self),
-                            str(Path(checkpoint_directory) / "tide_states.safetensor"),
-                        )
-                        best_checkpoint_saved = True
                 else:
                     epochs_without_improvement += 1
                     if early_stopping_patience is not None:
@@ -434,6 +428,15 @@ class Model:
                             epochs_without_improvement=epochs_without_improvement,
                             patience=early_stopping_patience,
                         )
+
+                if checkpoint_directory is not None and epoch_loss < best_saved_loss:
+                    best_saved_loss = epoch_loss
+                    Path(checkpoint_directory).mkdir(parents=True, exist_ok=True)
+                    safe_save(
+                        get_state_dict(self),
+                        str(Path(checkpoint_directory) / "tide_states.safetensor"),
+                    )
+                    best_checkpoint_saved = True
 
                 if (
                     early_stopping_patience is not None

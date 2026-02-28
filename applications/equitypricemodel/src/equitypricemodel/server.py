@@ -169,12 +169,15 @@ def _resolve_artifact_key(
         response = ssm_client.get_parameter(Name=MODEL_VERSION_SSM_PARAMETER)
         model_version = response["Parameter"]["Value"].strip().strip("/")
         if model_version and model_version != "latest":
-            logger.info("using_pinned_model_version", version=model_version)
+            logger.info(
+                "Starting data sync with SSM version pinning",
+                version=model_version,
+            )
         else:
             model_version = ""
     except Exception:
         logger.exception(
-            "Ssm parameter read failed",
+            "SSM parameter read failed",
             parameter=MODEL_VERSION_SSM_PARAMETER,
         )
 

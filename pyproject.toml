@@ -38,6 +38,9 @@ skip_covered = true
 [tool.coverage.xml]
 output = ".coverage_output/python.xml"
 
+[tool.ruff]
+target-version = "py312"
+
 [tool.ruff.lint]
 select = [
   "A",     # flake8 builtins
@@ -112,6 +115,3 @@ include = ["infrastructure/**"]
 invalid-argument-type = "ignore"
 missing-argument = "ignore"
 possibly-missing-attribute = "ignore"
-
-[tool.pyright]
-reportMissingImports = "none"
