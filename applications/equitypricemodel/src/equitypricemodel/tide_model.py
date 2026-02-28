@@ -310,6 +310,9 @@ class Model:
             early_stopping_patience: Stop if no improvement for N epochs
                 (None to disable)
             early_stopping_min_delta: Minimum improvement to reset patience counter
+            checkpoint_directory: Directory to save best-loss checkpoints during
+                training. If provided, the best checkpoint is automatically restored
+                after training completes. Defaults to None (no checkpointing).
 
         Performance Notes:
             - Data validation runs once before training starts

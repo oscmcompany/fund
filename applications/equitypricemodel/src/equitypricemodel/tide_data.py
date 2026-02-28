@@ -415,6 +415,7 @@ class Data:
             for i in window_indices:
                 sample = {
                     "past_continuous": cont_array[i : i + input_length].copy(),
+                    # Calendar features are known for both lookback and forecast windows
                     "past_categorical": cat_array[
                         i : i + input_length + output_length
                     ].copy(),

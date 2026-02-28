@@ -163,6 +163,7 @@ def _resolve_artifact_key(
     artifact_path: str,
 ) -> str:
     """Resolve the S3 artifact key using SSM version pinning or latest artifact."""
+    normalized_artifact_prefix = artifact_path.rstrip("/") + "/"
     model_version = ""
     try:
         ssm_client = boto3.client("ssm")
@@ -170,25 +171,32 @@ def _resolve_artifact_key(
         model_version = response["Parameter"]["Value"].strip().strip("/")
         if model_version and model_version != "latest":
             logger.info(
-                "Starting data sync with SSM version pinning",
+                "Resolved artifact key from pinned model version",
                 version=model_version,
             )
         else:
             model_version = ""
-    except Exception:
-        logger.exception(
-            "SSM parameter read failed",
-            parameter=MODEL_VERSION_SSM_PARAMETER,
-        )
+    except ClientError as error:
+        error_code = error.response["Error"]["Code"]
+        if error_code == "ParameterNotFound":
+            logger.info(
+                "SSM parameter not found, falling back to latest model artifact",
+                parameter=MODEL_VERSION_SSM_PARAMETER,
+            )
+        else:
+            logger.exception(
+                "SSM parameter read failed",
+                parameter=MODEL_VERSION_SSM_PARAMETER,
+                error_code=error_code,
+            )
 
     if model_version:
-        artifact_prefix = artifact_path.rstrip("/")
-        return f"{artifact_prefix}/{model_version}/output/model.tar.gz"
+        return f"{normalized_artifact_prefix}{model_version}/output/model.tar.gz"
 
     return find_latest_artifact_key(
         s3_client=s3_client,
         bucket=bucket,
-        prefix=artifact_path,
+        prefix=normalized_artifact_prefix,
     )
 
 
