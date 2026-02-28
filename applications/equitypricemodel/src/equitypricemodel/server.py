@@ -59,6 +59,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+MODEL_VERSION_SSM_PARAMETER = "/fund/equitypricemodel/model_version"
 
 
 def find_latest_artifact_key(
@@ -156,6 +157,49 @@ def download_and_extract_artifacts(
         temp_path.unlink(missing_ok=True)
 
 
+def _resolve_artifact_key(
+    s3_client: "S3Client",
+    bucket: str,
+    artifact_path: str,
+) -> str:
+    """Resolve the S3 artifact key using SSM version pinning or latest artifact."""
+    normalized_artifact_prefix = artifact_path.rstrip("/") + "/"
+    model_version = ""
+    try:
+        ssm_client = boto3.client("ssm")
+        response = ssm_client.get_parameter(Name=MODEL_VERSION_SSM_PARAMETER)
+        model_version = response["Parameter"]["Value"].strip().strip("/")
+        if model_version and model_version != "latest":
+            logger.info(
+                "Resolved artifact key from pinned model version",
+                version=model_version,
+            )
+        else:
+            model_version = ""
+    except ClientError as error:
+        error_code = error.response["Error"]["Code"]
+        if error_code == "ParameterNotFound":
+            logger.info(
+                "SSM parameter not found, falling back to latest model artifact",
+                parameter=MODEL_VERSION_SSM_PARAMETER,
+            )
+        else:
+            logger.exception(
+                "SSM parameter read failed",
+                parameter=MODEL_VERSION_SSM_PARAMETER,
+                error_code=error_code,
+            )
+
+    if model_version:
+        return f"{normalized_artifact_prefix}{model_version}/output/model.tar.gz"
+
+    return find_latest_artifact_key(
+        s3_client=s3_client,
+        bucket=bucket,
+        prefix=normalized_artifact_prefix,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
@@ -175,10 +219,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             if artifact_path.endswith(".tar.gz"):
                 artifact_key = artifact_path
             else:
-                artifact_key = find_latest_artifact_key(
+                artifact_key = _resolve_artifact_key(
                     s3_client=s3_client,
                     bucket=bucket,
-                    prefix=artifact_path,
+                    artifact_path=artifact_path,
                 )
 
             download_and_extract_artifacts(

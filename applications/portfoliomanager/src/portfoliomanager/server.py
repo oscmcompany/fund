@@ -193,7 +193,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                         "reason": "position_not_found",
                     }
                 )
-        except Exception as e:  # noqa: PERF203
+        except Exception as e:
             logger.exception(
                 "Failed to close position",
                 ticker=close_position["ticker"],

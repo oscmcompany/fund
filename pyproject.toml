@@ -1,3 +1,8 @@
+[project]
+name = "fund"
+version = "0.0.0"
+requires-python = "==3.12.10"
+
 [tool.uv.workspace]
 members = [
   "applications/portfoliomanager",
@@ -37,6 +42,9 @@ skip_covered = true
 
 [tool.coverage.xml]
 output = ".coverage_output/python.xml"
+
+[tool.ruff]
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
@@ -112,6 +120,3 @@ include = ["infrastructure/**"]
 invalid-argument-type = "ignore"
 missing-argument = "ignore"
 possibly-missing-attribute = "ignore"
-
-[tool.pyright]
-reportMissingImports = "none"

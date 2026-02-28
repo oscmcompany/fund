@@ -317,12 +317,9 @@ class Data:
 
     def get_dimensions(self) -> dict[str, int]:
         return {
-            "encoder_categorical_features": len(self.categorical_columns),
-            "encoder_continuous_features": len(self.continuous_columns),
-            "decoder_categorical_features": len(self.categorical_columns),
-            "decoder_continuous_features": 0,  # not using decoder_continuous_features for now  # noqa: E501
+            "past_continuous_features": len(self.continuous_columns),
+            "past_categorical_features": len(self.categorical_columns),
             "static_categorical_features": len(self.static_categorical_columns),
-            "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
 
     def get_batches(  # noqa: C901
@@ -417,10 +414,10 @@ class Data:
             # Use numpy slicing (much faster than DataFrame slicing)
             for i in window_indices:
                 sample = {
-                    "encoder_categorical": cat_array[i : i + input_length].copy(),
-                    "encoder_continuous": cont_array[i : i + input_length].copy(),
-                    "decoder_categorical": cat_array[
-                        i + input_length : i + input_length + output_length
+                    "past_continuous": cont_array[i : i + input_length].copy(),
+                    # Calendar features are known for both lookback and forecast windows
+                    "past_categorical": cat_array[
+                        i : i + input_length + output_length
                     ].copy(),
                     "static_categorical": static_array.copy(),
                 }
@@ -441,14 +438,11 @@ class Data:
             batch_samples = samples[i : i + batch_size]
 
             batch = {
-                "encoder_categorical_features": Tensor(
-                    np.stack([s["encoder_categorical"] for s in batch_samples])
+                "past_continuous_features": Tensor(
+                    np.stack([s["past_continuous"] for s in batch_samples])
                 ),
-                "encoder_continuous_features": Tensor(
-                    np.stack([s["encoder_continuous"] for s in batch_samples])
-                ),
-                "decoder_categorical_features": Tensor(
-                    np.stack([s["decoder_categorical"] for s in batch_samples])
+                "past_categorical_features": Tensor(
+                    np.stack([s["past_categorical"] for s in batch_samples])
                 ),
                 "static_categorical_features": Tensor(
                     np.stack([s["static_categorical"] for s in batch_samples])

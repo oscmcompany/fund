@@ -1,6 +1,7 @@
 import json
 import os
 import random
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -197,10 +198,11 @@ class Model:
         return predictions_first.stack(*predictions_rest, dim=1)
 
     def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
-        """Check a batch for NaN/Inf values and return statistics."""
+        """Check a batch for NaN/Inf values, shape consistency, rank, and dtype."""
+        numpy_cache = {key: tensor.numpy() for key, tensor in batch.items()}
+
         issues = {}
-        for key, tensor in batch.items():
-            data = tensor.numpy()
+        for key, data in numpy_cache.items():
             nan_count = int(np.isnan(data).sum())
             inf_count = int(np.isinf(data).sum())
             if nan_count > 0 or inf_count > 0:
@@ -210,6 +212,34 @@ class Model:
                     "total_elements": data.size,
                     "nan_pct": f"{(nan_count / data.size) * 100:.2f}%",
                 }
+
+        feature_keys = [k for k in batch if k != "targets"]
+
+        batch_sizes = {k: numpy_cache[k].shape[0] for k in feature_keys}
+        if len(set(batch_sizes.values())) > 1:
+            issues["shape_mismatch"] = {"batch_sizes": batch_sizes}
+
+        for key in feature_keys:
+            data = numpy_cache[key]
+            if data.ndim != 3:  # noqa: PLR2004
+                issues.setdefault("rank_errors", {})[key] = {
+                    "ndim": data.ndim,
+                    "expected": 3,
+                }
+
+        for key in feature_keys:
+            data = numpy_cache[key]
+            if "continuous" in key and data.dtype != np.float32:
+                issues.setdefault("dtype_errors", {})[key] = {
+                    "dtype": str(data.dtype),
+                    "expected": "float32",
+                }
+            if "categorical" in key and not np.issubdtype(data.dtype, np.integer):
+                issues.setdefault("dtype_errors", {})[key] = {
+                    "dtype": str(data.dtype),
+                    "expected": "integer",
+                }
+
         return issues
 
     def validate_training_data(
@@ -261,6 +291,7 @@ class Model:
         validation_sample_size: int = 10,
         early_stopping_patience: int | None = 3,
         early_stopping_min_delta: float = 0.001,
+        checkpoint_directory: str | None = None,
     ) -> list:
         """Train the TiDE model using quantile loss.
 
@@ -275,10 +306,13 @@ class Model:
                 Set to False to skip validation if data quality is already guaranteed.
             validation_sample_size: Number of batches to sample during validation.
                 Larger values provide more thorough validation but take longer.
-                The first and last batches are always checked. Default is 10.
+                Default is 10.
             early_stopping_patience: Stop if no improvement for N epochs
                 (None to disable)
             early_stopping_min_delta: Minimum improvement to reset patience counter
+            checkpoint_directory: Directory to save best-loss checkpoints during
+                training. If provided, the best checkpoint is automatically restored
+                after training completes. Defaults to None (no checkpointing).
 
         Performance Notes:
             - Data validation runs once before training starts
@@ -291,6 +325,10 @@ class Model:
         """
         if validation_sample_size <= 0:
             message = "validation_sample_size must be positive"
+            raise ValueError(message)
+
+        if not train_batches:
+            message = "train_batches must not be empty"
             raise ValueError(message)
 
         if validate_data:
@@ -311,7 +349,9 @@ class Model:
         total_batches = len(train_batches)
 
         best_loss = float("inf")
+        best_saved_loss = float("inf")
         epochs_without_improvement = 0
+        best_checkpoint_saved = False
 
         try:
             for epoch in range(epochs):
@@ -376,32 +416,54 @@ class Model:
 
                 losses.append(epoch_loss)
 
-                if early_stopping_patience is not None:
-                    if epoch_loss < best_loss - early_stopping_min_delta:
-                        best_loss = epoch_loss
-                        epochs_without_improvement = 0
-                        logger.info(
-                            "New best loss",
-                            best_loss=f"{best_loss:.4f}",
-                        )
-                    else:
-                        epochs_without_improvement += 1
+                if epoch_loss < best_loss - early_stopping_min_delta:
+                    best_loss = epoch_loss
+                    epochs_without_improvement = 0
+                    logger.info(
+                        "New best loss",
+                        best_loss=f"{best_loss:.4f}",
+                    )
+                else:
+                    epochs_without_improvement += 1
+                    if early_stopping_patience is not None:
                         logger.info(
                             "No improvement",
                             epochs_without_improvement=epochs_without_improvement,
                             patience=early_stopping_patience,
                         )
 
-                    if epochs_without_improvement >= early_stopping_patience:
-                        logger.info(
-                            "Early stopping triggered",
-                            epoch=epoch + 1,
-                            best_loss=f"{best_loss:.4f}",
-                            epochs_without_improvement=epochs_without_improvement,
-                        )
-                        break
+                if checkpoint_directory is not None and epoch_loss < best_saved_loss:
+                    best_saved_loss = epoch_loss
+                    Path(checkpoint_directory).mkdir(parents=True, exist_ok=True)
+                    safe_save(
+                        get_state_dict(self),
+                        str(Path(checkpoint_directory) / "tide_states.safetensor"),
+                    )
+                    best_checkpoint_saved = True
+
+                if (
+                    early_stopping_patience is not None
+                    and epochs_without_improvement >= early_stopping_patience
+                ):
+                    logger.info(
+                        "Early stopping triggered",
+                        epoch=epoch + 1,
+                        best_loss=f"{best_loss:.4f}",
+                        epochs_without_improvement=epochs_without_improvement,
+                    )
+                    break
         finally:
             Tensor.training = prev_training
+
+        if checkpoint_directory is not None and best_checkpoint_saved:
+            load_state_dict(
+                self,
+                safe_load(str(Path(checkpoint_directory) / "tide_states.safetensor")),
+            )
+            logger.info(
+                "Restored best checkpoint weights",
+                checkpoint_directory=checkpoint_directory,
+            )
 
         return losses
 
@@ -484,20 +546,11 @@ class Model:
         self,
         inputs: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor | None, int]:
-        batch_size = inputs["encoder_continuous_features"].shape[0]
+        batch_size = inputs["past_continuous_features"].shape[0]
 
-        encoder_cont_flat = inputs["encoder_continuous_features"].reshape(
-            batch_size, -1
-        )
-        encoder_cat_flat = (
-            inputs["encoder_categorical_features"]
-            .reshape(batch_size, -1)
-            .cast("float32")
-        )
-        decoder_cat_flat = (
-            inputs["decoder_categorical_features"]
-            .reshape(batch_size, -1)
-            .cast("float32")
+        past_cont_flat = inputs["past_continuous_features"].reshape(batch_size, -1)
+        past_cat_flat = (
+            inputs["past_categorical_features"].reshape(batch_size, -1).cast("float32")
         )
         static_cat_flat = (
             inputs["static_categorical_features"]
@@ -506,13 +559,7 @@ class Model:
         )
 
         return (
-            Tensor.cat(
-                encoder_cont_flat,
-                encoder_cat_flat,
-                decoder_cat_flat,
-                static_cat_flat,
-                dim=1,
-            ),
+            Tensor.cat(past_cont_flat, past_cat_flat, static_cat_flat, dim=1),
             inputs.get("targets"),
             int(batch_size),
         )

@@ -5,7 +5,7 @@ import polars as pl
 import structlog
 from equitypricemodel.tide_data import Data
 from equitypricemodel.tide_model import Model
-from tinygrad import Device
+from tinygrad.device import Device
 
 # Configure structlog for CloudWatch-friendly output
 structlog.configure(
@@ -102,18 +102,15 @@ if not train_batches:
 
 sample_batch = train_batches[0]
 
-batch_size = sample_batch["encoder_continuous_features"].shape[0]
+batch_size = sample_batch["past_continuous_features"].shape[0]
 logger.info("batch_size_determined", batch_size=batch_size)
 
 # calculate each component's flattened size - days * features (e.g. 35 * 7)
-encoder_continuous_size = (
-    sample_batch["encoder_continuous_features"].reshape(batch_size, -1).shape[1]
+past_continuous_size = (
+    sample_batch["past_continuous_features"].reshape(batch_size, -1).shape[1]
 )
-encoder_categorical_size = (
-    sample_batch["encoder_categorical_features"].reshape(batch_size, -1).shape[1]
-)
-decoder_categorical_size = (
-    sample_batch["decoder_categorical_features"].reshape(batch_size, -1).shape[1]
+past_categorical_size = (
+    sample_batch["past_categorical_features"].reshape(batch_size, -1).shape[1]
 )
 static_categorical_size = (
     sample_batch["static_categorical_features"].reshape(batch_size, -1).shape[1]
@@ -121,10 +118,7 @@ static_categorical_size = (
 
 input_size = cast(
     "int",
-    encoder_continuous_size
-    + encoder_categorical_size
-    + decoder_categorical_size
-    + static_categorical_size,
+    past_continuous_size + past_categorical_size + static_categorical_size,
 )
 
 logger.info("input_size_calculated", input_size=input_size)
@@ -146,6 +140,7 @@ losses = tide_model.train(
     train_batches=train_batches,
     epochs=int(configuration["epoch_count"]),
     learning_rate=float(configuration["learning_rate"]),
+    checkpoint_directory=model_output_path,
 )
 
 logger.info(
