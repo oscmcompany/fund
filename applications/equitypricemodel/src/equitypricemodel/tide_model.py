@@ -199,9 +199,10 @@ class Model:
 
     def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
         """Check a batch for NaN/Inf values, shape consistency, rank, and dtype."""
+        numpy_cache = {key: tensor.numpy() for key, tensor in batch.items()}
+
         issues = {}
-        for key, tensor in batch.items():
-            data = tensor.numpy()
+        for key, data in numpy_cache.items():
             nan_count = int(np.isnan(data).sum())
             inf_count = int(np.isinf(data).sum())
             if nan_count > 0 or inf_count > 0:
@@ -212,22 +213,22 @@ class Model:
                     "nan_pct": f"{(nan_count / data.size) * 100:.2f}%",
                 }
 
-        feature_keys = {k: v for k, v in batch.items() if k != "targets"}
+        feature_keys = [k for k in batch if k != "targets"]
 
-        batch_sizes = {k: v.numpy().shape[0] for k, v in feature_keys.items()}
+        batch_sizes = {k: numpy_cache[k].shape[0] for k in feature_keys}
         if len(set(batch_sizes.values())) > 1:
             issues["shape_mismatch"] = {"batch_sizes": batch_sizes}
 
-        for key, tensor in feature_keys.items():
-            data = tensor.numpy()
+        for key in feature_keys:
+            data = numpy_cache[key]
             if data.ndim != 3:  # noqa: PLR2004
                 issues.setdefault("rank_errors", {})[key] = {
                     "ndim": data.ndim,
                     "expected": 3,
                 }
 
-        for key, tensor in feature_keys.items():
-            data = tensor.numpy()
+        for key in feature_keys:
+            data = numpy_cache[key]
             if "continuous" in key and data.dtype != np.float32:
                 issues.setdefault("dtype_errors", {})[key] = {
                     "dtype": str(data.dtype),
@@ -411,42 +412,40 @@ class Model:
 
                 losses.append(epoch_loss)
 
-                if early_stopping_patience is not None:
-                    if epoch_loss < best_loss - early_stopping_min_delta:
-                        best_loss = epoch_loss
-                        epochs_without_improvement = 0
-                        logger.info(
-                            "New best loss",
-                            best_loss=f"{best_loss:.4f}",
+                if epoch_loss < best_loss - early_stopping_min_delta:
+                    best_loss = epoch_loss
+                    epochs_without_improvement = 0
+                    logger.info(
+                        "New best loss",
+                        best_loss=f"{best_loss:.4f}",
+                    )
+                    if checkpoint_directory is not None:
+                        Path(checkpoint_directory).mkdir(parents=True, exist_ok=True)
+                        safe_save(
+                            get_state_dict(self),
+                            str(Path(checkpoint_directory) / "tide_states.safetensor"),
                         )
-                        if checkpoint_directory is not None:
-                            Path(checkpoint_directory).mkdir(
-                                parents=True, exist_ok=True
-                            )
-                            safe_save(
-                                get_state_dict(self),
-                                str(
-                                    Path(checkpoint_directory)
-                                    / "tide_states.safetensor"
-                                ),
-                            )
-                            best_checkpoint_saved = True
-                    else:
-                        epochs_without_improvement += 1
+                        best_checkpoint_saved = True
+                else:
+                    epochs_without_improvement += 1
+                    if early_stopping_patience is not None:
                         logger.info(
                             "No improvement",
                             epochs_without_improvement=epochs_without_improvement,
                             patience=early_stopping_patience,
                         )
 
-                    if epochs_without_improvement >= early_stopping_patience:
-                        logger.info(
-                            "Early stopping triggered",
-                            epoch=epoch + 1,
-                            best_loss=f"{best_loss:.4f}",
-                            epochs_without_improvement=epochs_without_improvement,
-                        )
-                        break
+                if (
+                    early_stopping_patience is not None
+                    and epochs_without_improvement >= early_stopping_patience
+                ):
+                    logger.info(
+                        "Early stopping triggered",
+                        epoch=epoch + 1,
+                        best_loss=f"{best_loss:.4f}",
+                        epochs_without_improvement=epochs_without_improvement,
+                    )
+                    break
         finally:
             Tensor.training = prev_training
 

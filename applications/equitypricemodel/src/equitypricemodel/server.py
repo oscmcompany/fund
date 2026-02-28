@@ -157,6 +157,38 @@ def download_and_extract_artifacts(
         temp_path.unlink(missing_ok=True)
 
 
+def _resolve_artifact_key(
+    s3_client: "S3Client",
+    bucket: str,
+    artifact_path: str,
+) -> str:
+    """Resolve the S3 artifact key using SSM version pinning or latest artifact."""
+    model_version = ""
+    try:
+        ssm_client = boto3.client("ssm")
+        response = ssm_client.get_parameter(Name=MODEL_VERSION_SSM_PARAMETER)
+        model_version = response["Parameter"]["Value"].strip().strip("/")
+        if model_version and model_version != "latest":
+            logger.info("using_pinned_model_version", version=model_version)
+        else:
+            model_version = ""
+    except Exception:
+        logger.exception(
+            "Ssm parameter read failed",
+            parameter=MODEL_VERSION_SSM_PARAMETER,
+        )
+
+    if model_version:
+        artifact_prefix = artifact_path.rstrip("/")
+        return f"{artifact_prefix}/{model_version}/output/model.tar.gz"
+
+    return find_latest_artifact_key(
+        s3_client=s3_client,
+        bucket=bucket,
+        prefix=artifact_path,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
@@ -176,29 +208,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             if artifact_path.endswith(".tar.gz"):
                 artifact_key = artifact_path
             else:
-                model_version = ""
-                try:
-                    ssm_client = boto3.client("ssm")
-                    response = ssm_client.get_parameter(
-                        Name=MODEL_VERSION_SSM_PARAMETER
-                    )
-                    model_version = response["Parameter"]["Value"].strip()
-                    if model_version:
-                        logger.info("using_pinned_model_version", version=model_version)
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "ssm_parameter_read_failed",
-                        parameter=MODEL_VERSION_SSM_PARAMETER,
-                    )
-
-                if model_version:
-                    artifact_key = f"{artifact_path}{model_version}/output/model.tar.gz"
-                else:
-                    artifact_key = find_latest_artifact_key(
-                        s3_client=s3_client,
-                        bucket=bucket,
-                        prefix=artifact_path,
-                    )
+                artifact_key = _resolve_artifact_key(
+                    s3_client=s3_client,
+                    bucket=bucket,
+                    artifact_path=artifact_path,
+                )
 
             download_and_extract_artifacts(
                 s3_client=s3_client,
