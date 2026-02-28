@@ -2,37 +2,45 @@ import os
 import sys
 
 import structlog
+from prefect.flows import EntrypointType
 
 from tools.flows.training_flow import training_pipeline
 
 logger = structlog.get_logger()
 
 
-def run_training_job(
+def deploy_training_flow(
     base_url: str,
     data_bucket: str,
     artifacts_bucket: str,
     lookback_days: int = 365,
-) -> str:
-    """Run the TiDE training pipeline via Prefect."""
+) -> None:
+    """Register the training pipeline deployment with the Prefect server."""
     logger.info(
-        "Starting training pipeline",
+        "Deploying training pipeline",
         base_url=base_url,
         data_bucket=data_bucket,
         artifacts_bucket=artifacts_bucket,
         lookback_days=lookback_days,
     )
 
-    artifact_path = training_pipeline(
-        base_url=base_url,
-        data_bucket=data_bucket,
-        artifacts_bucket=artifacts_bucket,
-        lookback_days=lookback_days,
+    training_pipeline.deploy(
+        name="daily-training",
+        work_pool_name="training-pool",
+        cron="0 22 * * *",
+        parameters={
+            "base_url": base_url,
+            "data_bucket": data_bucket,
+            "artifacts_bucket": artifacts_bucket,
+            "lookback_days": lookback_days,
+        },
+        tags=["training", "daily"],
+        entrypoint_type=EntrypointType.MODULE_PATH,
+        build=False,
+        push=False,
     )
 
-    logger.info("Training pipeline complete", artifact_path=artifact_path)
-
-    return artifact_path
+    logger.info("Training pipeline deployed")
 
 
 if __name__ == "__main__":
@@ -52,13 +60,9 @@ if __name__ == "__main__":
         logger.error("Missing required environment variables", missing=missing)
         sys.exit(1)
 
-    try:
-        run_training_job(
-            base_url=base_url,
-            data_bucket=data_bucket,
-            artifacts_bucket=artifacts_bucket,
-            lookback_days=lookback_days,
-        )
-    except Exception as e:
-        logger.exception("Training pipeline failed", error=str(e))
-        sys.exit(1)
+    deploy_training_flow(
+        base_url=base_url,
+        data_bucket=data_bucket,
+        artifacts_bucket=artifacts_bucket,
+        lookback_days=lookback_days,
+    )

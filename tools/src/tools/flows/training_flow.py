@@ -11,6 +11,7 @@ import polars as pl
 import structlog
 from prefect import flow, task
 
+from tools.flows.notifications import send_training_notification
 from tools.prepare_training_data import prepare_training_data
 from tools.sync_equity_bars_data import sync_equity_bars_data
 from tools.sync_equity_details_data import sync_equity_details_data
@@ -19,21 +20,21 @@ logger = structlog.get_logger()
 
 
 @task(name="sync-equity-bars", retries=2, retry_delay_seconds=30)
-def sync_equity_bars(base_url: str, start_date: str, end_date: str) -> None:
+def sync_equity_bars(base_url: str, lookback_days: int = 365) -> None:
     """Trigger datamanager to sync equity bars."""
+    end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=lookback_days)
+
     logger.info(
         "Syncing equity bars",
         base_url=base_url,
-        start_date=start_date,
-        end_date=end_date,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
     )
-
-    parsed_start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC)
-    parsed_end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=UTC)
 
     sync_equity_bars_data(
         base_url=base_url,
-        date_range=(parsed_start, parsed_end),
+        date_range=(start_date, end_date),
     )
 
 
@@ -128,17 +129,20 @@ def train_tide_model(
     return f"s3://{artifacts_bucket}/{artifact_key}"
 
 
-@flow(name="tide-training-pipeline", log_prints=True)
-def training_pipeline(  # noqa: PLR0913
+@flow(  # type: ignore[no-matching-overload]
+    name="tide-training-pipeline",
+    log_prints=True,
+    on_completion=[send_training_notification],
+    on_failure=[send_training_notification],
+)
+def training_pipeline(
     base_url: str,
     data_bucket: str,
     artifacts_bucket: str,
-    start_date: str,
-    end_date: str,
     lookback_days: int = 365,
 ) -> str:
     """End-to-end training pipeline."""
-    sync_equity_bars(base_url, start_date, end_date)
+    sync_equity_bars(base_url, lookback_days)
     sync_equity_details(base_url)
     prepare_data(data_bucket, artifacts_bucket, lookback_days)
     return train_tide_model(artifacts_bucket)
@@ -161,16 +165,9 @@ if __name__ == "__main__":
         logger.error("Missing required environment variables", missing=missing)
         sys.exit(1)
 
-    end_date_dt = datetime.now(tz=UTC).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    start_date_dt = end_date_dt - timedelta(days=lookback_days)
-
     training_pipeline(
         base_url=base_url,
         data_bucket=data_bucket,
         artifacts_bucket=artifacts_bucket,
-        start_date=start_date_dt.strftime("%Y-%m-%d"),
-        end_date=end_date_dt.strftime("%Y-%m-%d"),
         lookback_days=lookback_days,
     )

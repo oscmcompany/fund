@@ -13,8 +13,6 @@ def test_run_training_job_calls_training_pipeline() -> None:
             base_url="http://datamanager:8080",
             data_bucket="fund-data-bucket",
             artifacts_bucket="fund-artifacts-bucket",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
             lookback_days=365,
         )
 
@@ -22,8 +20,6 @@ def test_run_training_job_calls_training_pipeline() -> None:
         base_url="http://datamanager:8080",
         data_bucket="fund-data-bucket",
         artifacts_bucket="fund-artifacts-bucket",
-        start_date="2024-01-01",
-        end_date="2024-12-31",
         lookback_days=365,
     )
     assert result == "s3://bucket/artifacts/model.tar.gz"
@@ -39,8 +35,6 @@ def test_run_training_job_returns_artifact_path() -> None:
             base_url="http://datamanager:8080",
             data_bucket="fund-data-bucket",
             artifacts_bucket="fund-artifacts-bucket",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
         )
 
     assert result == expected_path
@@ -58,6 +52,4 @@ def test_run_training_job_propagates_errors() -> None:
             base_url="http://datamanager:8080",
             data_bucket="fund-data-bucket",
             artifacts_bucket="fund-artifacts-bucket",
-            start_date="2024-01-01",
-            end_date="2024-12-31",
         )

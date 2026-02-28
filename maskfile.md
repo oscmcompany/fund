@@ -263,7 +263,7 @@ else
     # Note: Service names use 'fund' prefix matching the Pulumi project name.
     # These must exactly match the ECS service names created by the infrastructure code.
     # The AWS account provides environment context (one account = one environment).
-    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel; do
+    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel fund-prefect-worker; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -819,6 +819,35 @@ cd ../
 uv run python -m tools.run_training_job
 ```
 
+### deploy (application_name)
+
+> Register flow deployment with Prefect server
+
+```bash
+set -euo pipefail
+
+export APPLICATION_NAME="${application_name}"
+
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
+export FUND_DATAMANAGER_BASE_URL="http://datamanager.$(pulumi stack output aws_service_discovery_namespace):8080"
+export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
+export PREFECT_API_URL="$(pulumi stack output prefect_ui_url)/api"
+export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+
+cd ../
+
+uv run python -m tools.deploy_training_flow
+```
+
 ### artifacts
 
 > Manage model artifacts
@@ -833,6 +862,51 @@ set -euo pipefail
 export APPLICATION_NAME="${application_name}"
 
 uv run python -m tools.download_model_artifacts
+```
+
+## prefect
+
+> Prefect infrastructure management
+
+### build-worker
+
+> Build and push the Prefect worker Docker image to ECR
+
+```bash
+set -euo pipefail
+
+echo "Building Prefect worker image"
+
+aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+aws_region=${AWS_REGION}
+if [ -z "$aws_region" ]; then
+    echo "AWS_REGION environment variable is not set"
+    exit 1
+fi
+
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/prefect-worker"
+
+echo "Logging into ECR"
+aws ecr get-login-password --region ${aws_region} | docker login \
+    --username AWS \
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
+
+echo "Building image for linux/amd64"
+docker build \
+    --platform linux/amd64 \
+    --target worker \
+    --file tools/Dockerfile \
+    --tag ${image_reference}:latest \
+    .
+
+echo "Pushing image to ECR"
+docker push ${image_reference}:latest
+
+commit_hash=$(git rev-parse --short HEAD)
+docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
+docker push "${image_reference}:git-${commit_hash}"
+
+echo "Prefect worker image pushed: ${image_reference}:latest (commit: ${commit_hash})"
 ```
 
 ## mcp

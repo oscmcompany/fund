@@ -26,7 +26,11 @@ config:
   fund:randomSuffix:
     secure: AAABAPl47ORoO6t8NqEn8I/e49nYu7cuGBwRgA59mBFIKX7RyHTk1w==
   fund:prefectAllowedCidrs:
-    - 2600:4040:741f:f600:b477:f6ae:56a9:8e14/128
-    - 68.238.188.124/32
-    - 71.185.224.12/32
-    - 2600:4040:76f4:7200:8c38:6dc5:eafe:3fea/128
+    - secure: AAABALiKgrczJ7GJHyFYtUDbI+zOIUqeg4NYuNNDXbI6iP5g2CGQ1bktFy2ZzjBVZrRLPW7HOZEccMTMYNDyIlQZ7xEKMVWhOFoL
+    - secure: AAABAHTPeLTWD9IZhYCwF3s601vNqbvIiYPx6dStB1zMhFZvDq4hp0mdrExk0CnG9Q==
+    - secure: AAABAA0owr9bPUoKIJvvgmmMfFL/QHE/dq2G5UVG5nKvoC6N/Q9QM//FsmYhOVSe
+    - secure: AAABAGabwlpPzBNk/V4FHC1FBihsyHgpgDOnJMQ9bXR5dB+qxvQsPxRy9iIit9NfbTwpEpLKGPU+xnpvG5JEpXaVE5ePau+gM46H
+  fund:trainingNotificationSenderEmail:
+    secure: AAABAAUimDipynPxKiwZJM1KNHM5uSBMxNfZ6lu5CiCrT14CPI/gdt2ezaqz102km/4XgGq0MRjuDPc2
+  fund:trainingNotificationRecipientEmails:
+    secure: AAABAM/wajUzYpwBJ3J/hqxAiFRYXg6uM46l/hbYAKDs9cNwOMg3DMZg22agKg/r6MenE8lUtuxOuZr1in3QnCD9s3ypncn+cS9LxcyTAARXcDMKV2g=

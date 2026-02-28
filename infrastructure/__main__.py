@@ -96,6 +96,13 @@ if not prefect_allowed_cidrs:
 prefect_allowed_ipv4_cidrs = [c for c in prefect_allowed_cidrs if ":" not in c]
 prefect_allowed_ipv6_cidrs = [c for c in prefect_allowed_cidrs if ":" in c]
 
+training_notification_sender_email = stack_config.require_secret(
+    "trainingNotificationSenderEmail"
+)
+training_notification_recipient_emails = stack_config.require_secret(
+    "trainingNotificationRecipientEmails"
+)
+
 datamanager_secret_name = stack_config.require_secret("datamanagerSecretName")
 portfoliomanager_secret_name = stack_config.require_secret("portfoliomanagerSecretName")
 shared_secret_name = stack_config.require_secret("sharedSecretName")
@@ -385,6 +392,17 @@ prefect_server_repository = aws.ecr.Repository(
     tags=tags,
 )
 
+prefect_worker_repository = aws.ecr.Repository(
+    "prefect_worker_repository",
+    name="fund/prefect-worker",
+    image_tag_mutability="MUTABLE",
+    force_delete=True,
+    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
+        scan_on_push=True,
+    ),
+    tags=tags,
+)
+
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
 datamanager_image_uri = datamanager_repository.repository_url.apply(
@@ -402,6 +420,9 @@ equitypricemodel_trainer_image_uri = (
     )
 )
 prefect_server_image_uri = prefect_server_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+prefect_worker_image_uri = prefect_worker_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
 
@@ -1110,6 +1131,19 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         ],
                     },
                     {
+                        "Sid": "ManageSESIdentities",
+                        "Effect": "Allow",
+                        "Action": [
+                            "ses:CreateEmailIdentity",
+                            "ses:DeleteEmailIdentity",
+                            "ses:GetEmailIdentity",
+                            "ses:TagResource",
+                            "ses:UntagResource",
+                            "ses:ListTagsForResource",
+                        ],
+                        "Resource": "*",
+                    },
+                    {
                         "Sid": "CreateGithubActionsOIDCProvider",
                         "Effect": "Allow",
                         "Action": "iam:CreateOpenIDConnectProvider",
@@ -1207,6 +1241,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                                     "fund-ecs-execution-role-secrets-policy",
                                     "fund-ecs-task-role-s3-policy",
                                     "fund-ecs-task-role-ssm-policy",
+                                    "fund-ecs-task-role-ses-policy",
                                 ]
                             }
                         },
@@ -1411,6 +1446,32 @@ aws.iam.RolePolicy(
                     "Effect": "Allow",
                     "Action": ["ssm:GetParameter", "ssm:GetParameters"],
                     "Resource": f"arn:aws:ssm:{region}:{account_id}:parameter/fund/*",
+                }
+            ],
+        },
+        sort_keys=True,
+    ),
+)
+
+# SES Email Identity for training notifications
+training_notification_email_identity = aws.ses.EmailIdentity(
+    "training_notification_email_identity",
+    email=training_notification_sender_email,
+)
+
+# Allow ECS tasks to send emails via SES
+aws.iam.RolePolicy(
+    "task_role_ses_policy",
+    name="fund-ecs-task-role-ses-policy",
+    role=task_role.id,
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+                    "Resource": f"arn:aws:ses:{region}:{account_id}:identity/*",
                 }
             ],
         },
@@ -1712,22 +1773,15 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
         service_discovery_namespace.name,
         data_bucket.bucket,
         model_artifacts_bucket.bucket,
-        prefect_server_image_uri,
+        prefect_worker_image_uri,
+        training_notification_sender_email,
+        training_notification_recipient_emails,
     ).apply(
         lambda args: json.dumps(
             [
                 {
                     "name": "prefect-worker",
                     "image": args[4],
-                    "command": [
-                        "prefect",
-                        "worker",
-                        "start",
-                        "--pool",
-                        "training-pool",
-                        "--type",
-                        "process",
-                    ],
                     "environment": [
                         {
                             "name": "PREFECT_API_URL",
@@ -1740,6 +1794,22 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
                         {
                             "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME",
                             "value": args[3],
+                        },
+                        {
+                            "name": "FUND_DATAMANAGER_BASE_URL",
+                            "value": f"http://datamanager.{args[1]}:8080",
+                        },
+                        {
+                            "name": "LOOKBACK_DAYS",
+                            "value": "365",
+                        },
+                        {
+                            "name": "TRAINING_NOTIFICATION_SENDER_EMAIL",
+                            "value": args[5],
+                        },
+                        {
+                            "name": "TRAINING_NOTIFICATION_RECIPIENT_EMAILS",
+                            "value": args[6],
                         },
                     ],
                     "logConfiguration": {
@@ -2161,6 +2231,10 @@ pulumi.export(
 pulumi.export(
     "aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri
 )
+pulumi.export(
+    "aws_ecr_prefect_worker_repository", prefect_worker_repository.repository_url
+)
+pulumi.export("aws_ecr_prefect_worker_image", prefect_worker_image_uri)
 pulumi.export(
     "prefect_api_url",
     pulumi.Output.concat(
