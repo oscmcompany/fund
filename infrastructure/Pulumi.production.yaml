@@ -25,3 +25,8 @@ config:
     secure: AAABACKTBgsKXMGiDo/WXf5/WTwxHIKAKYUGOMhCecEe09+g/huViXxO1fYA+I2EdIcxBk8zerAoxkOGNUMkik+45skuj3vUYHraOLiKmzSt9h7Z1R56ixPoNMrTSbCMjpHOHZSji0G7lH2qCdCj6jGH/aouZjZRsnPLGa5/pxjhe+1aUtuvwLoqr6IlyuPEkw==
   fund:randomSuffix:
     secure: AAABAPl47ORoO6t8NqEn8I/e49nYu7cuGBwRgA59mBFIKX7RyHTk1w==
+  fund:prefectAllowedCidrs:
+    - 2600:4040:741f:f600:b477:f6ae:56a9:8e14/128
+    - 68.238.188.124/32
+    - 71.185.224.12/32
+    - 2600:4040:76f4:7200:8c38:6dc5:eafe:3fea/128

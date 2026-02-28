@@ -1,5 +1,6 @@
 import json
 import os
+from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta
 from typing import cast
 
@@ -10,6 +11,45 @@ import structlog
 from tinygrad.tensor import Tensor
 
 logger = structlog.get_logger()
+
+
+RAW_COLUMNS = (
+    "ticker",
+    "timestamp",
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume",
+    "volume_weighted_average_price",
+    "sector",
+    "industry",
+)
+
+CONTINUOUS_COLUMNS = [
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume",
+    "volume_weighted_average_price",
+    "daily_return",
+]
+
+CATEGORICAL_COLUMNS = [
+    "day_of_week",
+    "day_of_month",
+    "day_of_year",
+    "month",
+    "year",
+    "is_holiday",
+]
+
+STATIC_CATEGORICAL_COLUMNS = [
+    "ticker",
+    "sector",
+    "industry",
+]
 
 
 class Scaler:
@@ -30,57 +70,33 @@ class Scaler:
         return data * self.standard_deviations + self.means
 
 
-class Data:
-    """Time-series dense encoder data preprocessing and postprocessing."""
+class Stage(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
 
-    def __init__(self) -> None:
-        pass
+    @abstractmethod
+    def run(self, data: pl.DataFrame) -> pl.DataFrame: ...
 
-    def preprocess_and_set_data(self, data: pl.DataFrame) -> None:
-        data = data.clone()
 
-        raw_columns = (
-            "ticker",
-            "timestamp",
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "volume",
-            "volume_weighted_average_price",
-            "sector",
-            "industry",
-        )
+class ValidateColumns(Stage):
+    @property
+    def name(self) -> str:
+        return "validate_columns"
 
-        if set(data.columns) != set(raw_columns):
-            message = f"Expected columns {raw_columns} but got {data.columns}"
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
+        if set(data.columns) != set(RAW_COLUMNS):
+            message = f"Expected columns {RAW_COLUMNS} but got {data.columns}"
             raise ValueError(message)
+        return data
 
-        self.continuous_columns = [
-            "open_price",
-            "high_price",
-            "low_price",
-            "close_price",
-            "volume",
-            "volume_weighted_average_price",
-            "daily_return",
-        ]
 
-        self.categorical_columns = [
-            "day_of_week",
-            "day_of_month",
-            "day_of_year",
-            "month",
-            "year",
-            "is_holiday",
-        ]
+class ExpandDateRange(Stage):
+    @property
+    def name(self) -> str:
+        return "expand_date_range"
 
-        self.static_categorical_columns = [
-            "ticker",
-            "sector",
-            "industry",
-        ]
-
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.with_columns(
             pl.col("timestamp")
             .cast(pl.Datetime(time_unit="ms"))
@@ -107,11 +123,17 @@ class Data:
 
         dates_and_tickers = tickers.join(dates, how="cross")
 
-        data = dates_and_tickers.join(data, on=["ticker", "date"], how="left")
+        return dates_and_tickers.join(data, on=["ticker", "date"], how="left")
 
+
+class FillNulls(Stage):
+    @property
+    def name(self) -> str:
+        return "fill_nulls"
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         friday_number = 4
 
-        # set is_holiday value for missing weekdays
         data = (
             data.with_columns(pl.col("date").dt.weekday().alias("temporary_weekday"))
             .with_columns(
@@ -131,8 +153,7 @@ class Data:
             .drop("temporary_weekday")
         )
 
-        # ensure all rows have values instead of nulls
-        data = data.with_columns(
+        return data.with_columns(
             [
                 pl.col("open_price").fill_null(0.0),
                 pl.col("high_price").fill_null(0.0),
@@ -153,7 +174,13 @@ class Data:
             ]
         )
 
-        # compute new calendar columns
+
+class EngineerFeatures(Stage):
+    @property
+    def name(self) -> str:
+        return "engineer_features"
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.with_columns(
             pl.col("date").dt.weekday().alias("day_of_week").cast(pl.Int64),
             pl.col("date").dt.day().alias("day_of_month").cast(pl.Int64),
@@ -162,7 +189,6 @@ class Data:
             pl.col("date").dt.year().alias("year").cast(pl.Int64),
         )
 
-        # add time index column
         data = data.sort(["ticker", "timestamp"]).with_columns(
             pl.col("timestamp")
             .rank("dense")
@@ -171,10 +197,17 @@ class Data:
             .alias("time_idx")
         )
 
-        data = data.with_columns(
+        return data.with_columns(
             pl.col("close_price").pct_change().over("ticker").alias("daily_return")
         )
 
+
+class CleanData(Stage):
+    @property
+    def name(self) -> str:
+        return "clean_data"
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.with_columns(
             [
                 pl.col("ticker").str.to_uppercase(),
@@ -193,7 +226,7 @@ class Data:
 
         data = data.unique(subset=["ticker", "timestamp"])
 
-        for col in self.continuous_columns:
+        for col in CONTINUOUS_COLUMNS:
             nan_count = data.filter(pl.col(col).is_nan()).height
             null_count = data.filter(pl.col(col).is_null()).height
             inf_count = data.filter(~pl.col(col).is_finite()).height
@@ -205,7 +238,6 @@ class Data:
                     null_count=null_count,
                     inf_count=inf_count,
                 )
-                # Filter out rows with invalid values to prevent downstream errors
                 data = data.filter(
                     pl.col(col).is_not_nan()
                     & pl.col(col).is_not_null()
@@ -213,18 +245,28 @@ class Data:
                 )
 
         data_validated = data_schema.validate(data)
-        data = cast(
+        return cast(
             "pl.DataFrame",
             data_validated.collect()
             if isinstance(data_validated, pl.LazyFrame)
             else data_validated,
         )
 
+
+class ScaleAndEncode(Stage):
+    def __init__(self) -> None:
+        self.scaler: Scaler | None = None
+        self.mappings: dict[str, dict[str, int]] | None = None
+
+    @property
+    def name(self) -> str:
+        return "scale_and_encode"
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         self.scaler = Scaler()
+        self.scaler.fit(data[CONTINUOUS_COLUMNS])
 
-        self.scaler.fit(data[self.continuous_columns])
-
-        for col in self.continuous_columns:
+        for col in CONTINUOUS_COLUMNS:
             mean_val = self.scaler.means[col].item()
             std_val = self.scaler.standard_deviations[col].item()
             if np.isnan(mean_val) or np.isnan(std_val):
@@ -235,15 +277,15 @@ class Data:
                     std=std_val,
                 )
 
-        data = data.with_columns(  # scale continuous columns
+        data = data.with_columns(
             *[
                 (pl.col(col) - self.scaler.means[col])
                 / self.scaler.standard_deviations[col]
-                for col in self.continuous_columns
+                for col in CONTINUOUS_COLUMNS
             ]
         )
 
-        for col in self.continuous_columns:
+        for col in CONTINUOUS_COLUMNS:
             nan_count = data.filter(pl.col(col).is_nan()).height
             if nan_count > 0:
                 logger.error(
@@ -263,27 +305,98 @@ class Data:
         mappings: dict[str, dict[str, int]] = {}
 
         for column in mapping_columns:
-            data, mapping = self._create_mapping_and_encoding(data, column)
+            data, mapping = _create_mapping_and_encoding(data, column)
             mappings[column] = mapping
 
         self.mappings = mappings
 
-        self.data = data
+        return data
+
+
+def _create_mapping_and_encoding(
+    data: pl.DataFrame,
+    column: str,
+) -> tuple[pl.DataFrame, dict]:
+    unique_values = data[column].unique().to_list()
+    mapping = {val: idx for idx, val in enumerate(unique_values)}
+    data = data.with_columns(
+        pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
+    )
+    return data, mapping
+
+
+DEFAULT_STAGES: list[Stage] = [
+    ValidateColumns(),
+    ExpandDateRange(),
+    FillNulls(),
+    EngineerFeatures(),
+    CleanData(),
+    ScaleAndEncode(),
+]
+
+
+class Pipeline:
+    def __init__(self, stages: list[Stage] | None = None) -> None:
+        self.stages = stages or list(DEFAULT_STAGES)
+
+    def run(self, data: pl.DataFrame) -> pl.DataFrame:
+        data = data.clone()
+        for stage in self.stages:
+            logger.info("Running pipeline stage", stage=stage.name)
+            data = stage.run(data)
+        return data
+
+    def run_to(self, stage_name: str, data: pl.DataFrame) -> pl.DataFrame:
+        data = data.clone()
+        for stage in self.stages:
+            logger.info("Running pipeline stage", stage=stage.name)
+            data = stage.run(data)
+            if stage.name == stage_name:
+                break
+        return data
+
+    def get_stage(self, stage_name: str) -> Stage:
+        for stage in self.stages:
+            if stage.name == stage_name:
+                return stage
+        message = f"Stage '{stage_name}' not found"
+        raise ValueError(message)
+
+    @staticmethod
+    def snapshot(data: pl.DataFrame, path: str) -> None:
+        data.write_parquet(path)
+
+    @staticmethod
+    def load_snapshot(path: str) -> pl.DataFrame:
+        return pl.read_parquet(path)
+
+
+class Data:
+    """Time-series dense encoder data preprocessing and postprocessing."""
+
+    def __init__(self) -> None:
+        pass
+
+    def preprocess_and_set_data(self, data: pl.DataFrame) -> None:
+        self.continuous_columns = list(CONTINUOUS_COLUMNS)
+        self.categorical_columns = list(CATEGORICAL_COLUMNS)
+        self.static_categorical_columns = list(STATIC_CATEGORICAL_COLUMNS)
+
+        pipeline = Pipeline()
+        self.data = pipeline.run(data)
+
+        scale_and_encode = cast(
+            "ScaleAndEncode", pipeline.get_stage("scale_and_encode")
+        )
+        self.scaler = cast("Scaler", scale_and_encode.scaler)
+        self.mappings = cast("dict[str, dict[str, int]]", scale_and_encode.mappings)
 
     def _create_mapping_and_encoding(
         self,
         data: pl.DataFrame,
         column: str,
     ) -> tuple[pl.DataFrame, dict]:
-        unique_values = data[column].unique().to_list()
-
-        mapping = {val: idx for idx, val in enumerate(unique_values)}
-
-        data = data.with_columns(
-            pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
-        )
-
-        return data, mapping
+        return _create_mapping_and_encoding(data, column)
 
     def _get_training_and_validation_data(
         self,

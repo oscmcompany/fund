@@ -1,113 +1,78 @@
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 
-import boto3
 import structlog
-from sagemaker.estimator import Estimator
-from sagemaker.inputs import TrainingInput
-from sagemaker.session import Session
+
+from tools.flows.training_flow import training_pipeline
 
 logger = structlog.get_logger()
 
 
 def run_training_job(  # noqa: PLR0913
-    application_name: str,
-    trainer_image_uri: str,
-    s3_data_path: str,
-    iam_sagemaker_role_arn: str,
-    s3_artifact_path: str,
-    instance_type: str = "ml.g5.xlarge",
-) -> None:
+    base_url: str,
+    data_bucket: str,
+    artifacts_bucket: str,
+    start_date: str,
+    end_date: str,
+    lookback_days: int = 365,
+) -> str:
+    """Run the TiDE training pipeline via Prefect."""
     logger.info(
-        "Starting training job",
-        application_name=application_name,
-        instance_type=instance_type,
+        "Starting training pipeline",
+        base_url=base_url,
+        data_bucket=data_bucket,
+        artifacts_bucket=artifacts_bucket,
+        start_date=start_date,
+        end_date=end_date,
+        lookback_days=lookback_days,
     )
 
-    try:
-        session = boto3.Session()
-        sagemaker_session = Session(boto_session=session)
-
-    except Exception as e:
-        logger.exception(
-            "Error creating SageMaker session",
-            error=f"{e}",
-            application_name=application_name,
-        )
-        raise RuntimeError from e
-
-    estimator = Estimator(
-        image_uri=trainer_image_uri,
-        role=iam_sagemaker_role_arn,
-        instance_count=1,
-        instance_type=instance_type,
-        sagemaker_session=sagemaker_session,
-        output_path=s3_artifact_path,
+    artifact_path = training_pipeline(
+        base_url=base_url,
+        data_bucket=data_bucket,
+        artifacts_bucket=artifacts_bucket,
+        start_date=start_date,
+        end_date=end_date,
+        lookback_days=lookback_days,
     )
 
-    training_data_input = TrainingInput(
-        s3_data=s3_data_path,
-        content_type="application/x-parquet",
-        input_mode="File",
-    )
+    logger.info("Training pipeline complete", artifact_path=artifact_path)
 
-    try:
-        estimator.fit({"train": training_data_input})
-    except Exception as e:
-        logger.exception(
-            "Error during training job",
-            error=f"{e}",
-            application_name=application_name,
-        )
-        raise RuntimeError from e
+    return artifact_path
 
 
 if __name__ == "__main__":
-    application_name = os.getenv("APPLICATION_NAME", "")
-    trainer_image_uri = os.getenv("AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN", "")
-    s3_data_path = os.getenv("AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH", "")
-    iam_sagemaker_role_arn = os.getenv("AWS_IAM_SAGEMAKER_ROLE_ARN", "")
-    s3_artifact_path = os.getenv("AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH", "")
-    instance_type_raw = os.getenv("SAGEMAKER_INSTANCE_TYPE")
-    instance_type = (
-        instance_type_raw.strip()
-        if instance_type_raw and instance_type_raw.strip()
-        else "ml.g5.xlarge"
-    )
+    base_url = os.getenv("FUND_DATAMANAGER_BASE_URL", "")
+    data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
+    artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
 
-    environment_variables = {
-        "APPLICATION_NAME": application_name,
-        "AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN": trainer_image_uri,
-        "AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH": s3_data_path,
-        "AWS_IAM_SAGEMAKER_ROLE_ARN": iam_sagemaker_role_arn,
-        "AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH": s3_artifact_path,
+    required_vars = {
+        "FUND_DATAMANAGER_BASE_URL": base_url,
+        "AWS_S3_DATA_BUCKET_NAME": data_bucket,
+        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
     }
 
-    missing_environment_variables = [
-        key for key, value in environment_variables.items() if not value
-    ]
-    if missing_environment_variables:
-        logger.error(
-            "Missing required environment variables",
-            missing_environment_variables=missing_environment_variables,
-            **environment_variables,
-        )
+    missing = [key for key, value in required_vars.items() if not value]
+    if missing:
+        logger.error("Missing required environment variables", missing=missing)
         sys.exit(1)
+
+    end_date_dt = datetime.now(tz=UTC).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    start_date_dt = end_date_dt - timedelta(days=lookback_days)
 
     try:
         run_training_job(
-            application_name=application_name,
-            trainer_image_uri=trainer_image_uri,
-            s3_data_path=s3_data_path,
-            iam_sagemaker_role_arn=iam_sagemaker_role_arn,
-            s3_artifact_path=s3_artifact_path,
-            instance_type=instance_type,
+            base_url=base_url,
+            data_bucket=data_bucket,
+            artifacts_bucket=artifacts_bucket,
+            start_date=start_date_dt.strftime("%Y-%m-%d"),
+            end_date=end_date_dt.strftime("%Y-%m-%d"),
+            lookback_days=lookback_days,
         )
-
     except Exception as e:
-        logger.exception(
-            "Training job failed",
-            error=f"{e}",
-            application_name=application_name,
-        )
+        logger.exception("Training pipeline failed", error=str(e))
         sys.exit(1)

@@ -324,6 +324,14 @@ class Model:
                 epoch_losses = []
 
                 for step, batch in enumerate(train_batches):
+                    if batch["encoder_continuous_features"].shape[0] == 0:
+                        logger.warning(
+                            "Skipping empty batch",
+                            step=step + 1,
+                            epoch=epoch + 1,
+                        )
+                        continue
+
                     combined_input_features, targets, batch_size = (
                         self._combine_input_features(batch)
                     )
