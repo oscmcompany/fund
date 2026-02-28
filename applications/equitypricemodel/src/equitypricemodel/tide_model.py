@@ -324,6 +324,14 @@ class Model:
                 epoch_losses = []
 
                 for step, batch in enumerate(train_batches):
+                    if batch["encoder_continuous_features"].shape[0] == 0:
+                        logger.warning(
+                            "Skipping empty batch",
+                            step=step + 1,
+                            epoch=epoch + 1,
+                        )
+                        continue
+
                     combined_input_features, targets, batch_size = (
                         self._combine_input_features(batch)
                     )
@@ -407,28 +415,32 @@ class Model:
 
     def validate(self, validation_batches: list) -> float:
         """Validate the model using quantile loss"""
+        prev_training = Tensor.training
         Tensor.training = False
-        validation_losses = []
+        try:
+            validation_losses = []
 
-        for batch in validation_batches:
-            combined_input, targets, batch_size = self._combine_input_features(batch)
+            for batch in validation_batches:
+                combined_input, targets, batch_size = self._combine_input_features(batch)
 
-            if targets is None:
-                message = "Targets are required for validation batches"
-                raise ValueError(message)
+                if targets is None:
+                    message = "Targets are required for validation batches"
+                    raise ValueError(message)
 
-            predictions = self.forward(combined_input)
+                predictions = self.forward(combined_input)
 
-            targets_reshaped = targets.reshape(batch_size, self.output_length)
+                targets_reshaped = targets.reshape(batch_size, self.output_length)
 
-            loss = quantile_loss(predictions, targets_reshaped, self.quantiles)
-            validation_losses.append(loss.numpy().item())
+                loss = quantile_loss(predictions, targets_reshaped, self.quantiles)
+                validation_losses.append(loss.numpy().item())
 
-        if not validation_losses:
-            logger.warning("No validation batches provided; returning NaN loss")
-            return float("nan")
+            if not validation_losses:
+                logger.warning("No validation batches provided; returning NaN loss")
+                return float("nan")
 
-        return sum(validation_losses) / len(validation_losses)
+            return sum(validation_losses) / len(validation_losses)
+        finally:
+            Tensor.training = prev_training
 
     def save(
         self,

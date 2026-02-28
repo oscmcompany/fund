@@ -1,44 +1,55 @@
-import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-# sagemaker is a runtime dependency resolved from the workspace root; it is not
-# available in isolated test environments, so mock its modules before importing
-# the module under test to allow pytest to collect this file.
-sys.modules.setdefault("sagemaker", MagicMock())
-sys.modules.setdefault("sagemaker.estimator", MagicMock())
-sys.modules.setdefault("sagemaker.inputs", MagicMock())
-sys.modules.setdefault("sagemaker.session", MagicMock())
-
-from tools.run_training_job import run_training_job  # noqa: E402
+import pytest
+from tools.run_training_job import run_training_job
 
 
-def test_run_training_job_calls_estimator_fit() -> None:
-    mock_boto3_session = MagicMock()
-    mock_sagemaker_session = MagicMock()
-    mock_estimator_instance = MagicMock()
-
-    with (
-        patch(
-            "tools.run_training_job.boto3.Session",
-            return_value=mock_boto3_session,
-        ),
-        patch(
-            "tools.run_training_job.Session",
-            return_value=mock_sagemaker_session,
-        ),
-        patch(
-            "tools.run_training_job.Estimator",
-            return_value=mock_estimator_instance,
-        ),
-    ):
-        run_training_job(
-            application_name="equitypricemodel",
-            trainer_image_uri="123456789.dkr.ecr.us-east-1.amazonaws.com/trainer:latest",
-            s3_data_path="s3://test-bucket/training/data.parquet",
-            iam_sagemaker_role_arn="arn:aws:iam::123456789:role/SageMakerRole",
-            s3_artifact_path="s3://test-bucket/artifacts",
+def test_run_training_job_calls_training_pipeline() -> None:
+    with patch(
+        "tools.run_training_job.training_pipeline",
+        return_value="s3://bucket/artifacts/model.tar.gz",
+    ) as mock_pipeline:
+        result = run_training_job(
+            base_url="http://datamanager:8080",
+            data_bucket="fund-data-bucket",
+            artifacts_bucket="fund-artifacts-bucket",
+            lookback_days=365,
         )
 
-    mock_estimator_instance.fit.assert_called_once()
-    fit_call_args = mock_estimator_instance.fit.call_args.args[0]
-    assert "train" in fit_call_args
+    mock_pipeline.assert_called_once_with(
+        base_url="http://datamanager:8080",
+        data_bucket="fund-data-bucket",
+        artifacts_bucket="fund-artifacts-bucket",
+        lookback_days=365,
+    )
+    assert result == "s3://bucket/artifacts/model.tar.gz"
+
+
+def test_run_training_job_returns_artifact_path() -> None:
+    expected_path = "s3://my-bucket/artifacts/equitypricemodel-trainer-2024-01-01/output/model.tar.gz"
+    with patch(
+        "tools.run_training_job.training_pipeline",
+        return_value=expected_path,
+    ):
+        result = run_training_job(
+            base_url="http://datamanager:8080",
+            data_bucket="fund-data-bucket",
+            artifacts_bucket="fund-artifacts-bucket",
+        )
+
+    assert result == expected_path
+
+
+def test_run_training_job_propagates_errors() -> None:
+    with (
+        patch(
+            "tools.run_training_job.training_pipeline",
+            side_effect=RuntimeError("Training failed"),
+        ),
+        pytest.raises(RuntimeError, match="Training failed"),
+    ):
+        run_training_job(
+            base_url="http://datamanager:8080",
+            data_bucket="fund-data-bucket",
+            artifacts_bucket="fund-artifacts-bucket",
+        )

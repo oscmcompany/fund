@@ -208,13 +208,6 @@ if [ -n "$GITHUB_POLICY_ARN" ]; then
   pulumi import --yes --generate-code=false aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
 fi
 
-pulumi import --yes --generate-code=false aws:iam/role:Role sagemaker_execution_role fund-sagemaker-execution-role 2>/dev/null || true
-
-SAGEMAKER_POLICY_ARN=$(aws iam list-policies --scope Local --query 'Policies[?PolicyName==`fund-sagemaker-execution-policy`].Arn' --output text 2>/dev/null || echo "")
-if [ -n "$SAGEMAKER_POLICY_ARN" ]; then
-  pulumi import --yes --generate-code=false aws:iam/policy:Policy sagemaker_execution_policy "$SAGEMAKER_POLICY_ARN" 2>/dev/null || true
-fi
-
 pulumi import --yes --generate-code=false aws:s3/bucket:Bucket data_bucket "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration data_bucket_encryption "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock data_bucket_public_access_block "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
@@ -270,7 +263,7 @@ else
     # Note: Service names use 'fund' prefix matching the Pulumi project name.
     # These must exactly match the ECS service names created by the infrastructure code.
     # The AWS account provides environment context (one account = one environment).
-    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel; do
+    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel fund-prefect-worker; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -797,63 +790,14 @@ cd ../
 uv run python -m tools.prepare_training_data
 ```
 
-### train (application_name) [instance_preset]
+### train (application_name)
 
-> Train model on SageMaker. Presets: testing, standard (default), performance, or custom instance type
+> Train model via Prefect training pipeline
 
 ```bash
 set -euo pipefail
 
 export APPLICATION_NAME="${application_name}"
-
-preset="${instance_preset:-standard}"
-
-case "$preset" in
-    testing)
-        instance_type="ml.t3.xlarge"
-        echo "================================================"
-        echo "Training with TESTING architecture (CPU)"
-        echo "Instance: ml.t3.xlarge (~\$0.23/hr)"
-        echo "Use for: Quick iteration, debugging"
-        echo "================================================"
-        ;;
-    standard)
-        instance_type="ml.g5.xlarge"
-        echo "================================================"
-        echo "Training with STANDARD architecture (GPU)"
-        echo "Instance: ml.g5.xlarge - 1x A10G (~\$1.41/hr)"
-        echo "Use for: Regular training runs"
-        echo "================================================"
-        ;;
-    performance)
-        instance_type="ml.p3.2xlarge"
-        echo "================================================"
-        echo "Training with PERFORMANCE architecture (GPU)"
-        echo "Instance: ml.p3.2xlarge - 1x V100 (~\$3.82/hr)"
-        echo "Use for: Large datasets, faster training"
-        echo "================================================"
-        ;;
-    ml.*)
-        instance_type="$preset"
-        echo "================================================"
-        echo "Training with CUSTOM architecture"
-        echo "Instance: ${instance_type}"
-        echo "================================================"
-        ;;
-    *)
-        echo "Unknown preset: $preset"
-        echo ""
-        echo "Available presets:"
-        echo "testing     - ml.t3.xlarge (CPU, ~\$0.23/hr)"
-        echo "standard    - ml.g5.xlarge (GPU, ~\$1.41/hr) [default]"
-        echo "performance - ml.p3.2xlarge (GPU, ~\$3.82/hr)"
-        echo ""
-        echo "Or specify a custom instance type: ml.g4dn.xlarge"
-        exit 1
-        ;;
-esac
-
-export SAGEMAKER_INSTANCE_TYPE="${instance_type}"
 
 cd infrastructure
 
@@ -864,15 +808,44 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export AWS_ECR_EQUITY_PRICE_MODEL_TRAINER_IMAGE_ARN="$(pulumi stack output aws_ecr_equitypricemodel_trainer_image)"
-export AWS_IAM_SAGEMAKER_ROLE_ARN="$(pulumi stack output aws_iam_sagemaker_role_arn)"
+export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
+export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export AWS_S3_EQUITY_PRICE_MODEL_ARTIFACT_OUTPUT_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME}/artifacts"
-export AWS_S3_EQUITY_PRICE_MODEL_TRAINING_DATA_PATH="s3://${AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME}/training"
+export PREFECT_API_URL="$(pulumi stack output prefect_ui_url)/api"
+export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 
 cd ../
 
 uv run python -m tools.run_training_job
+```
+
+### deploy (application_name)
+
+> Register flow deployment with Prefect server
+
+```bash
+set -euo pipefail
+
+export APPLICATION_NAME="${application_name}"
+
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
+export FUND_DATAMANAGER_BASE_URL="http://datamanager.$(pulumi stack output aws_service_discovery_namespace):8080"
+export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
+export PREFECT_API_URL="$(pulumi stack output prefect_ui_url)/api"
+export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+
+cd ../
+
+uv run python -m tools.deploy_training_flow
 ```
 
 ### artifacts
@@ -889,6 +862,51 @@ set -euo pipefail
 export APPLICATION_NAME="${application_name}"
 
 uv run python -m tools.download_model_artifacts
+```
+
+## prefect
+
+> Prefect infrastructure management
+
+### build-worker
+
+> Build and push the Prefect worker Docker image to ECR
+
+```bash
+set -euo pipefail
+
+echo "Building Prefect worker image"
+
+aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+aws_region=${AWS_REGION}
+if [ -z "$aws_region" ]; then
+    echo "AWS_REGION environment variable is not set"
+    exit 1
+fi
+
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/prefect-worker"
+
+echo "Logging into ECR"
+aws ecr get-login-password --region ${aws_region} | docker login \
+    --username AWS \
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
+
+echo "Building image for linux/amd64"
+docker build \
+    --platform linux/amd64 \
+    --target worker \
+    --file tools/Dockerfile \
+    --tag ${image_reference}:latest \
+    .
+
+echo "Pushing image to ECR"
+docker push ${image_reference}:latest
+
+commit_hash=$(git rev-parse --short HEAD)
+docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
+docker push "${image_reference}:git-${commit_hash}"
+
+echo "Prefect worker image pushed: ${image_reference}:latest (commit: ${commit_hash})"
 ```
 
 ## mcp

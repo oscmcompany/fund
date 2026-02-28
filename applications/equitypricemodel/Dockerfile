@@ -37,8 +37,10 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 COPY --from=builder /app /app
 
 ENV PYTHONPATH=/app/applications/equitypricemodel/src
+ENV TRAINING_DATA_PATH=/opt/ml/input/data/train/filtered_tide_training_data.parquet
+ENV MODEL_OUTPUT_PATH=/opt/ml/model
 
-ENTRYPOINT ["uv", "run", "--package", "equitypricemodel", "python", "applications/equitypricemodel/src/equitypricemodel/trainer.py"]
+ENTRYPOINT ["uv", "run", "--package", "equitypricemodel", "python", "-m", "equitypricemodel.trainer"]
 
 FROM python:3.12.10-slim AS server
 

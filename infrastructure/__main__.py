@@ -82,7 +82,26 @@ if not budget_alert_email_addresses:
     raise ValueError(message)
 
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
-sagemaker_execution_role_name = stack_config.require("sagemakerExecutionRoleName")
+
+prefect_allowed_cidrs = cast(
+    "list[str]",
+    stack_config.require_object("prefectAllowedCidrs"),
+)
+if not prefect_allowed_cidrs:
+    message = (
+        "Pulumi config 'prefectAllowedCidrs' must include at least one CIDR block."
+    )
+    raise ValueError(message)
+
+prefect_allowed_ipv4_cidrs = [c for c in prefect_allowed_cidrs if ":" not in c]
+prefect_allowed_ipv6_cidrs = [c for c in prefect_allowed_cidrs if ":" in c]
+
+training_notification_sender_email = stack_config.require_secret(
+    "trainingNotificationSenderEmail"
+)
+training_notification_recipient_emails = stack_config.require_secret(
+    "trainingNotificationRecipientEmails"
+)
 
 datamanager_secret_name = stack_config.require_secret("datamanagerSecretName")
 portfoliomanager_secret_name = stack_config.require_secret("portfoliomanagerSecretName")
@@ -362,6 +381,28 @@ equitypricemodel_trainer_repository = aws.ecr.Repository(
     tags=tags,
 )
 
+prefect_server_repository = aws.ecr.Repository(
+    "prefect_server_repository",
+    name="fund/prefect-server",
+    image_tag_mutability="MUTABLE",
+    force_delete=True,
+    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
+        scan_on_push=True,
+    ),
+    tags=tags,
+)
+
+prefect_worker_repository = aws.ecr.Repository(
+    "prefect_worker_repository",
+    name="fund/prefect-worker",
+    image_tag_mutability="MUTABLE",
+    force_delete=True,
+    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
+        scan_on_push=True,
+    ),
+    tags=tags,
+)
+
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
 datamanager_image_uri = datamanager_repository.repository_url.apply(
@@ -377,6 +418,12 @@ equitypricemodel_trainer_image_uri = (
     equitypricemodel_trainer_repository.repository_url.apply(
         lambda url: f"{url}:latest"
     )
+)
+prefect_server_image_uri = prefect_server_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+prefect_worker_image_uri = prefect_worker_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
 )
 
 vpc = aws.ec2.Vpc(
@@ -534,6 +581,32 @@ alb_security_group = aws.ec2.SecurityGroup(
             to_port=443,
             cidr_blocks=["0.0.0.0/0"],
             description="Allow HTTPS",
+        ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=4200,
+                    to_port=4200,
+                    cidr_blocks=prefect_allowed_ipv4_cidrs,
+                    description="Allow Prefect dashboard from team IPv4",
+                ),
+            ]
+            if prefect_allowed_ipv4_cidrs
+            else []
+        ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=4200,
+                    to_port=4200,
+                    ipv6_cidr_blocks=prefect_allowed_ipv6_cidrs,
+                    description="Allow Prefect dashboard from team IPv6",
+                ),
+            ]
+            if prefect_allowed_ipv6_cidrs
+            else []
         ),
     ],
     egress=[
@@ -720,6 +793,38 @@ equitypricemodel_tg = aws.lb.TargetGroup(
         timeout=5,
         interval=30,
     ),
+    tags=tags,
+)
+
+prefect_tg = aws.lb.TargetGroup(
+    "prefect_tg",
+    name="fund-prefect",
+    port=4200,
+    protocol="HTTP",
+    vpc_id=vpc.id,
+    target_type="ip",
+    health_check=aws.lb.TargetGroupHealthCheckArgs(
+        path="/api/health",
+        healthy_threshold=2,
+        unhealthy_threshold=3,
+        timeout=5,
+        interval=30,
+    ),
+    tags=tags,
+)
+
+# Prefect dashboard listener on port 4200 (restricted by ALB security group)
+prefect_listener = aws.lb.Listener(
+    "prefect_listener",
+    load_balancer_arn=alb.arn,
+    port=4200,
+    protocol="HTTP",
+    default_actions=[
+        aws.lb.ListenerDefaultActionArgs(
+            type="forward",
+            target_group_arn=prefect_tg.arn,
+        )
+    ],
     tags=tags,
 )
 
@@ -1026,6 +1131,19 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         ],
                     },
                     {
+                        "Sid": "ManageSESIdentities",
+                        "Effect": "Allow",
+                        "Action": [
+                            "ses:CreateEmailIdentity",
+                            "ses:DeleteEmailIdentity",
+                            "ses:GetEmailIdentity",
+                            "ses:TagResource",
+                            "ses:UntagResource",
+                            "ses:ListTagsForResource",
+                        ],
+                        "Resource": "*",
+                    },
+                    {
                         "Sid": "CreateGithubActionsOIDCProvider",
                         "Effect": "Allow",
                         "Action": "iam:CreateOpenIDConnectProvider",
@@ -1043,7 +1161,6 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                                     "fund-ecs-execution-role",
                                     "fund-ecs-task-role",
                                     github_actions_role_name,
-                                    sagemaker_execution_role_name,
                                 ]
                             }
                         },
@@ -1091,7 +1208,6 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                             f"arn:aws:iam::{account_id}:role/fund-ecs-execution-role",
                             f"arn:aws:iam::{account_id}:role/fund-ecs-task-role",
                             f"arn:aws:iam::{account_id}:role/{github_actions_role_name}",
-                            f"arn:aws:iam::{account_id}:role/{sagemaker_execution_role_name}",
                         ],
                         "Condition": {
                             "ArnLikeIfExists": {
@@ -1104,7 +1220,6 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                                 "iam:PassedToService": [
                                     "ecs-tasks.amazonaws.com",
                                     "ecs.amazonaws.com",
-                                    "sagemaker.amazonaws.com",
                                 ]
                             },
                         },
@@ -1126,6 +1241,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                                     "fund-ecs-execution-role-secrets-policy",
                                     "fund-ecs-task-role-s3-policy",
                                     "fund-ecs-task-role-ssm-policy",
+                                    "fund-ecs-task-role-ses-policy",
                                 ]
                             }
                         },
@@ -1337,91 +1453,403 @@ aws.iam.RolePolicy(
     ),
 )
 
-# SageMaker Execution Policy
-sagemaker_execution_policy = aws.iam.Policy(
-    "sagemaker_execution_policy",
-    name="fund-sagemaker-execution-policy",
-    description="Least-privilege policy for SageMaker execution role.",
-    policy=pulumi.Output.all(
-        data_bucket.arn,
-        model_artifacts_bucket.arn,
-        equitypricemodel_trainer_repository.arn,
-    ).apply(
-        lambda args: json.dumps(
+# SES Email Identity for training notifications
+training_notification_email_identity = aws.ses.EmailIdentity(
+    "training_notification_email_identity",
+    email=training_notification_sender_email,
+)
+
+# Allow ECS tasks to send emails via SES
+aws.iam.RolePolicy(
+    "task_role_ses_policy",
+    name="fund-ecs-task-role-ses-policy",
+    role=task_role.id,
+    policy=training_notification_email_identity.arn.apply(
+        lambda identity_arn: json.dumps(
             {
                 "Version": "2012-10-17",
                 "Statement": [
                     {
-                        "Sid": "S3Access",
                         "Effect": "Allow",
-                        "Action": [
-                            "s3:GetObject",
-                            "s3:PutObject",
-                            "s3:DeleteObject",
-                            "s3:ListBucket",
-                        ],
-                        "Resource": [
-                            args[0],
-                            f"{args[0]}/*",
-                            args[1],
-                            f"{args[1]}/*",
-                        ],
-                    },
-                    {
-                        "Sid": "ECRRepositoryAccess",
-                        "Effect": "Allow",
-                        "Action": [
-                            "ecr:GetDownloadUrlForLayer",
-                            "ecr:BatchGetImage",
-                            "ecr:BatchCheckLayerAvailability",
-                        ],
-                        "Resource": args[2],
-                    },
-                    {
-                        "Sid": "ECRAuthorizationToken",
-                        "Effect": "Allow",
-                        "Action": "ecr:GetAuthorizationToken",
-                        "Resource": "*",
-                    },
-                    {
-                        "Sid": "CloudWatchLogs",
-                        "Effect": "Allow",
-                        "Action": [
-                            "logs:CreateLogGroup",
-                            "logs:CreateLogStream",
-                            "logs:PutLogEvents",
-                            "logs:DescribeLogStreams",
-                        ],
-                        "Resource": "arn:aws:logs:*:*:log-group:/aws/sagemaker/*",
-                    },
+                        "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+                        "Resource": identity_arn,
+                    }
                 ],
             },
             sort_keys=True,
         )
     ),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+)
+
+# Prefect Infrastructure
+
+# RDS Security Group - allows inbound Postgres from ECS tasks
+prefect_rds_security_group = aws.ec2.SecurityGroup(
+    "prefect_rds_sg",
+    name="fund-prefect-rds",
+    vpc_id=vpc.id,
+    description="Security group for Prefect RDS database",
     tags=tags,
 )
 
-# SageMaker Execution Role for training jobs
-sagemaker_execution_role = aws.iam.Role(
-    "sagemaker_execution_role",
-    name=sagemaker_execution_role_name,
-    assume_role_policy=json.dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
+aws.ec2.SecurityGroupRule(
+    "prefect_rds_ingress",
+    type="ingress",
+    security_group_id=prefect_rds_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=5432,
+    to_port=5432,
+    description="Allow Postgres from ECS tasks",
+)
+
+aws.ec2.SecurityGroupRule(
+    "prefect_rds_egress",
+    type="egress",
+    security_group_id=prefect_rds_security_group.id,
+    protocol="-1",
+    from_port=0,
+    to_port=0,
+    cidr_blocks=["0.0.0.0/0"],
+    description="Allow all outbound",
+)
+
+# Redis Security Group - allows inbound Redis from ECS tasks
+prefect_redis_security_group = aws.ec2.SecurityGroup(
+    "prefect_redis_sg",
+    name="fund-prefect-redis",
+    vpc_id=vpc.id,
+    description="Security group for Prefect Redis cache",
+    tags=tags,
+)
+
+aws.ec2.SecurityGroupRule(
+    "prefect_redis_ingress",
+    type="ingress",
+    security_group_id=prefect_redis_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=6379,
+    to_port=6379,
+    description="Allow Redis from ECS tasks",
+)
+
+aws.ec2.SecurityGroupRule(
+    "prefect_redis_egress",
+    type="egress",
+    security_group_id=prefect_redis_security_group.id,
+    protocol="-1",
+    from_port=0,
+    to_port=0,
+    cidr_blocks=["0.0.0.0/0"],
+    description="Allow all outbound",
+)
+
+# RDS Subnet Group
+prefect_rds_subnet_group = aws.rds.SubnetGroup(
+    "prefect_rds_subnet_group",
+    name="fund-prefect-rds",
+    subnet_ids=[private_subnet_1.id, private_subnet_2.id],
+    tags=tags,
+)
+
+# RDS PostgreSQL for Prefect database
+prefect_database = aws.rds.Instance(
+    "prefect_database",
+    identifier="fund-prefect",
+    engine="postgres",
+    engine_version="14",
+    instance_class="db.t3.micro",
+    allocated_storage=20,
+    db_name="prefect",
+    username="prefect",
+    manage_master_user_password=True,
+    db_subnet_group_name=prefect_rds_subnet_group.name,
+    vpc_security_group_ids=[prefect_rds_security_group.id],
+    skip_final_snapshot=False,
+    final_snapshot_identifier="fund-prefect-final",
+    storage_encrypted=True,
+    deletion_protection=True,
+    tags=tags,
+)
+
+# Grant ECS execution role access to the RDS-managed master password secret
+aws.iam.RolePolicy(
+    "execution_role_prefect_db_secret_policy",
+    name="fund-ecs-execution-role-prefect-db-secret",
+    role=execution_role.id,
+    policy=prefect_database.master_user_secrets[0]["secret_arn"].apply(
+        lambda arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["secretsmanager:GetSecretValue"],
+                        "Resource": arn,
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
+    ),
+)
+
+# ElastiCache Subnet Group
+prefect_elasticache_subnet_group = aws.elasticache.SubnetGroup(
+    "prefect_elasticache_subnet_group",
+    name="fund-prefect-redis",
+    subnet_ids=[private_subnet_1.id, private_subnet_2.id],
+    tags=tags,
+)
+
+# ElastiCache Redis for Prefect messaging
+prefect_redis = aws.elasticache.Cluster(
+    "prefect_redis",
+    cluster_id="fund-prefect-redis",
+    engine="redis",
+    engine_version="7.0",
+    node_type="cache.t3.micro",
+    num_cache_nodes=1,
+    subnet_group_name=prefect_elasticache_subnet_group.name,
+    security_group_ids=[prefect_redis_security_group.id],
+    tags=tags,
+)
+
+# Allow ECS tasks to communicate with Prefect server on port 4200
+aws.ec2.SecurityGroupRule(
+    "ecs_prefect_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=4200,
+    to_port=4200,
+    description="Allow Prefect server communication",
+)
+
+# Allow ALB to reach Prefect server on port 4200
+aws.ec2.SecurityGroupRule(
+    "ecs_prefect_alb_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=alb_security_group.id,
+    protocol="tcp",
+    from_port=4200,
+    to_port=4200,
+    description="Allow ALB traffic to Prefect server",
+)
+
+# Prefect Server Log Group
+prefect_server_log_group = aws.cloudwatch.LogGroup(
+    "prefect_server_logs",
+    name="/ecs/fund/prefect-server",
+    retention_in_days=7,
+    tags=tags,
+)
+
+# Prefect Worker Log Group
+prefect_worker_log_group = aws.cloudwatch.LogGroup(
+    "prefect_worker_logs",
+    name="/ecs/fund/prefect-worker",
+    retention_in_days=7,
+    tags=tags,
+)
+
+# Prefect Server Task Definition
+prefect_server_task_definition = aws.ecs.TaskDefinition(
+    "prefect_server_task",
+    family="prefect-server",
+    cpu="512",
+    memory="1024",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=pulumi.Output.all(
+        prefect_server_log_group.name,
+        prefect_database.endpoint,
+        prefect_database.master_user_secrets[0]["secret_arn"],
+        prefect_server_image_uri,
+        alb.dns_name,
+    ).apply(
+        lambda args: json.dumps(
+            [
                 {
-                    "Action": "sts:AssumeRole",
-                    "Effect": "Allow",
-                    "Principal": {"Service": "sagemaker.amazonaws.com"},
+                    "name": "prefect-server",
+                    "image": args[3],
+                    "command": [
+                        "bash",
+                        "-c",
+                        (
+                            "export PREFECT_API_DATABASE_CONNECTION_URL="
+                            '$(python3 -c "'
+                            "import os, urllib.parse;"
+                            "p=urllib.parse.quote(os.environ['PREFECT_DB_PASSWORD'],safe='');"
+                            f"print(f'postgresql+asyncpg://prefect:{{p}}@{args[1]}/prefect')"
+                            '")'
+                            " && prefect server start --host 0.0.0.0"
+                        ),
+                    ],
+                    "portMappings": [{"containerPort": 4200, "protocol": "tcp"}],
+                    "environment": [
+                        {
+                            "name": "PREFECT_UI_API_URL",
+                            "value": f"http://{args[4]}:4200/api",
+                        },
+                    ],
+                    "secrets": [
+                        {
+                            "name": "PREFECT_DB_PASSWORD",
+                            "valueFrom": f"{args[2]}:password::",
+                        },
+                    ],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": args[0],
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "prefect-server",
+                        },
+                    },
+                    "essential": True,
                 }
             ],
-        },
-        sort_keys=True,
+            sort_keys=True,
+        )
     ),
-    managed_policy_arns=[sagemaker_execution_policy.arn],
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    tags=tags,
+)
+
+# Prefect Server Service Discovery
+prefect_server_sd_service = aws.servicediscovery.Service(
+    "prefect_server_sd",
+    name="prefect-server",
+    dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
+        namespace_id=service_discovery_namespace.id,
+        dns_records=[
+            aws.servicediscovery.ServiceDnsConfigDnsRecordArgs(ttl=10, type="A")
+        ],
+    ),
+    tags=tags,
+)
+
+# Prefect Server ECS Service
+prefect_server_service = aws.ecs.Service(
+    "prefect_server_service",
+    name="fund-prefect-server",
+    cluster=cluster.arn,
+    task_definition=prefect_server_task_definition.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        subnets=[private_subnet_1.id, private_subnet_2.id],
+        security_groups=[ecs_security_group.id],
+        assign_public_ip=False,
+    ),
+    load_balancers=[
+        aws.ecs.ServiceLoadBalancerArgs(
+            target_group_arn=prefect_tg.arn,
+            container_name="prefect-server",
+            container_port=4200,
+        )
+    ],
+    service_registries=aws.ecs.ServiceServiceRegistriesArgs(
+        registry_arn=prefect_server_sd_service.arn
+    ),
+    opts=pulumi.ResourceOptions(
+        depends_on=[prefect_database, prefect_redis, prefect_listener],
+    ),
+    tags=tags,
+)
+
+# Prefect Worker Task Definition
+prefect_worker_task_definition = aws.ecs.TaskDefinition(
+    "prefect_worker_task",
+    family="prefect-worker",
+    cpu="4096",
+    memory="8192",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=pulumi.Output.all(
+        prefect_worker_log_group.name,
+        service_discovery_namespace.name,
+        data_bucket.bucket,
+        model_artifacts_bucket.bucket,
+        prefect_worker_image_uri,
+        training_notification_sender_email,
+        training_notification_recipient_emails,
+    ).apply(
+        lambda args: json.dumps(
+            [
+                {
+                    "name": "prefect-worker",
+                    "image": args[4],
+                    "environment": [
+                        {
+                            "name": "PREFECT_API_URL",
+                            "value": f"http://prefect-server.{args[1]}:4200/api",
+                        },
+                        {
+                            "name": "AWS_S3_DATA_BUCKET_NAME",
+                            "value": args[2],
+                        },
+                        {
+                            "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME",
+                            "value": args[3],
+                        },
+                        {
+                            "name": "FUND_DATAMANAGER_BASE_URL",
+                            "value": f"http://datamanager.{args[1]}:8080",
+                        },
+                        {
+                            "name": "LOOKBACK_DAYS",
+                            "value": "365",
+                        },
+                        {
+                            "name": "TRAINING_NOTIFICATION_SENDER_EMAIL",
+                            "value": args[5],
+                        },
+                        {
+                            "name": "TRAINING_NOTIFICATION_RECIPIENT_EMAILS",
+                            "value": args[6],
+                        },
+                    ],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": args[0],
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "prefect-worker",
+                        },
+                    },
+                    "essential": True,
+                }
+            ],
+            sort_keys=True,
+        )
+    ),
+    tags=tags,
+)
+
+# Prefect Worker ECS Service
+prefect_worker_service = aws.ecs.Service(
+    "prefect_worker_service",
+    name="fund-prefect-worker",
+    cluster=cluster.arn,
+    task_definition=prefect_worker_task_definition.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        subnets=[private_subnet_1.id, private_subnet_2.id],
+        security_groups=[ecs_security_group.id],
+        assign_public_ip=False,
+    ),
+    opts=pulumi.ResourceOptions(
+        depends_on=[prefect_server_service],
+    ),
     tags=tags,
 )
 
@@ -1808,7 +2236,20 @@ pulumi.export(
 pulumi.export(
     "aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri
 )
-pulumi.export("aws_iam_sagemaker_role_arn", sagemaker_execution_role.arn)
+pulumi.export(
+    "aws_ecr_prefect_worker_repository", prefect_worker_repository.repository_url
+)
+pulumi.export("aws_ecr_prefect_worker_image", prefect_worker_image_uri)
+pulumi.export(
+    "prefect_api_url",
+    pulumi.Output.concat(
+        "http://prefect-server.", service_discovery_namespace.name, ":4200/api"
+    ),
+)
+pulumi.export(
+    "prefect_ui_url",
+    pulumi.Output.concat(protocol, alb.dns_name, ":4200"),
+)
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,
