@@ -50,6 +50,7 @@ def prepare_data(
     data_bucket: str,
     artifacts_bucket: str,
     lookback_days: int = 365,
+    output_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
     logger.info(
@@ -67,6 +68,7 @@ def prepare_data(
         model_artifacts_bucket_name=artifacts_bucket,
         start_date=start_date,
         end_date=end_date,
+        output_key=output_key,
     )
 
 
@@ -142,10 +144,11 @@ def training_pipeline(
     lookback_days: int = 365,
 ) -> str:
     """End-to-end training pipeline."""
+    training_data_key = "training/filtered_tide_training_data.parquet"
     sync_equity_bars(base_url, lookback_days)
     sync_equity_details(base_url)
-    prepare_data(data_bucket, artifacts_bucket, lookback_days)
-    return train_tide_model(artifacts_bucket)
+    prepare_data(data_bucket, artifacts_bucket, lookback_days, training_data_key)
+    return train_tide_model(artifacts_bucket, training_data_key)
 
 
 if __name__ == "__main__":

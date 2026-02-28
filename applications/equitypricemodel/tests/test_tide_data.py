@@ -1,10 +1,13 @@
 import json
 import tempfile
 from datetime import UTC, date, datetime, timedelta
+from unittest.mock import patch
 
+import numpy as np
 import polars as pl
 import pytest
 from equitypricemodel.tide_data import (
+    CONTINUOUS_COLUMNS,
     CleanData,
     Data,
     EngineerFeatures,
@@ -297,3 +300,21 @@ def test_data_get_batches_train() -> None:
     assert "decoder_categorical_features" in batch
     assert "static_categorical_features" in batch
     assert "targets" in batch
+
+
+def test_scale_and_encode_raises_on_nan_scaler() -> None:
+    data = _make_raw_data(tickers=["AAPL"], days=60)
+    pipeline = Pipeline()
+    cleaned = pipeline.run_to("clean_data", data)
+    stage = ScaleAndEncode()
+    # Inject NaN into continuous column to trigger NaN in scaler means
+    nan_data = cleaned.with_columns(pl.lit(float("nan")).alias("close_price"))
+    with pytest.raises(ValueError, match="Scaler has NaN values"):
+        stage.run(nan_data)
+
+
+def test_pipeline_run_to_raises_for_unknown_stage() -> None:
+    pipeline = Pipeline()
+    data = _make_raw_data()
+    with pytest.raises(ValueError, match="Unknown stage"):
+        pipeline.run_to("nonexistent_stage", data)

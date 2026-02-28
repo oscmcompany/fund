@@ -270,12 +270,8 @@ class ScaleAndEncode(Stage):
             mean_val = self.scaler.means[col].item()
             std_val = self.scaler.standard_deviations[col].item()
             if np.isnan(mean_val) or np.isnan(std_val):
-                logger.error(
-                    "Scaler has NaN values",
-                    column=col,
-                    mean=mean_val,
-                    std=std_val,
-                )
+                message = f"Scaler has NaN values for column '{col}': mean={mean_val}, std={std_val}"
+                raise ValueError(message)
 
         data = data.with_columns(
             *[
@@ -288,12 +284,8 @@ class ScaleAndEncode(Stage):
         for col in CONTINUOUS_COLUMNS:
             nan_count = data.filter(pl.col(col).is_nan()).height
             if nan_count > 0:
-                logger.error(
-                    "NaN values after scaling",
-                    column=col,
-                    nan_count=nan_count,
-                    total_rows=data.height,
-                )
+                message = f"NaN values after scaling column '{col}': {nan_count}/{data.height} rows"
+                raise ValueError(message)
 
         mapping_columns = [
             "ticker",
@@ -325,19 +317,20 @@ def _create_mapping_and_encoding(
     return data, mapping
 
 
-DEFAULT_STAGES: list[Stage] = [
-    ValidateColumns(),
-    ExpandDateRange(),
-    FillNulls(),
-    EngineerFeatures(),
-    CleanData(),
-    ScaleAndEncode(),
-]
+def default_stages() -> list[Stage]:
+    return [
+        ValidateColumns(),
+        ExpandDateRange(),
+        FillNulls(),
+        EngineerFeatures(),
+        CleanData(),
+        ScaleAndEncode(),
+    ]
 
 
 class Pipeline:
     def __init__(self, stages: list[Stage] | None = None) -> None:
-        self.stages = stages or list(DEFAULT_STAGES)
+        self.stages = stages or default_stages()
 
     def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.clone()
@@ -347,6 +340,10 @@ class Pipeline:
         return data
 
     def run_to(self, stage_name: str, data: pl.DataFrame) -> pl.DataFrame:
+        valid_names = {s.name for s in self.stages}
+        if stage_name not in valid_names:
+            message = f"Unknown stage '{stage_name}'. Valid stages: {valid_names}"
+            raise ValueError(message)
         data = data.clone()
         for stage in self.stages:
             logger.info("Running pipeline stage", stage=stage.name)
@@ -390,13 +387,6 @@ class Data:
         )
         self.scaler = cast("Scaler", scale_and_encode.scaler)
         self.mappings = cast("dict[str, dict[str, int]]", scale_and_encode.mappings)
-
-    def _create_mapping_and_encoding(
-        self,
-        data: pl.DataFrame,
-        column: str,
-    ) -> tuple[pl.DataFrame, dict]:
-        return _create_mapping_and_encoding(data, column)
 
     def _get_training_and_validation_data(
         self,

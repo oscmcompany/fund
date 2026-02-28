@@ -1464,18 +1464,20 @@ aws.iam.RolePolicy(
     "task_role_ses_policy",
     name="fund-ecs-task-role-ses-policy",
     role=task_role.id,
-    policy=json.dumps(
-        {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": ["ses:SendEmail", "ses:SendRawEmail"],
-                    "Resource": f"arn:aws:ses:{region}:{account_id}:identity/*",
-                }
-            ],
-        },
-        sort_keys=True,
+    policy=training_notification_email_identity.arn.apply(
+        lambda identity_arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["ses:SendEmail", "ses:SendRawEmail"],
+                        "Resource": identity_arn,
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
     ),
 )
 
@@ -1564,7 +1566,10 @@ prefect_database = aws.rds.Instance(
     manage_master_user_password=True,
     db_subnet_group_name=prefect_rds_subnet_group.name,
     vpc_security_group_ids=[prefect_rds_security_group.id],
-    skip_final_snapshot=True,
+    skip_final_snapshot=False,
+    final_snapshot_identifier="fund-prefect-final",
+    storage_encrypted=True,
+    deletion_protection=True,
     tags=tags,
 )
 

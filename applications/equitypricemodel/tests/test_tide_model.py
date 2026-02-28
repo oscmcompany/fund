@@ -287,3 +287,18 @@ def test_model_validation_sample_size_must_be_positive() -> None:
             validate_data=True,
             validation_sample_size=0,
         )
+
+
+def test_model_validate_restores_training_state() -> None:
+    input_size = _compute_input_size()
+    model = Model(
+        input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
+    )
+    batches = [_make_batch()]
+    Tensor.training = True
+    model.validate(batches)
+    assert Tensor.training is True
+
+    Tensor.training = False
+    model.validate(batches)
+    assert Tensor.training is False
