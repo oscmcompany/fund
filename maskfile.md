@@ -218,6 +218,8 @@ pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfi
 pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock model_artifacts_bucket_public_access_block "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning model_artifacts_bucket_versioning "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 
+pulumi import --yes --generate-code=false aws:ssm/parameter:Parameter ssm_equitypricemodel_model_version "/fund/equitypricemodel/model_version" 2>/dev/null || true
+
 echo "Importing resources complete"
 
 pulumi up --diff --yes

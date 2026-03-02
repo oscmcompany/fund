@@ -39,7 +39,6 @@ if __name__ == "__main__":
     base_url = os.getenv("FUND_DATAMANAGER_BASE_URL", "")
     data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
     artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
-    lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
 
     required_vars = {
         "FUND_DATAMANAGER_BASE_URL": base_url,
@@ -53,6 +52,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
+        lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
         run_training_job(
             base_url=base_url,
             data_bucket=data_bucket,

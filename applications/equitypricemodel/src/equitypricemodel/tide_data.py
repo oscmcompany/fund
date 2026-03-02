@@ -308,7 +308,7 @@ class ScaleAndEncode(Stage):
 def _create_mapping_and_encoding(
     data: pl.DataFrame,
     column: str,
-) -> tuple[pl.DataFrame, dict]:
+) -> tuple[pl.DataFrame, dict[str, int]]:
     unique_values = data[column].unique().to_list()
     mapping = {val: idx for idx, val in enumerate(unique_values)}
     data = data.with_columns(
@@ -420,10 +420,10 @@ class Data:
 
     def get_dimensions(self) -> dict[str, int]:
         return {
-            "encoder_categorical_features": len(self.categorical_columns),
-            "encoder_continuous_features": len(self.continuous_columns),
-            "decoder_categorical_features": len(self.categorical_columns),
-            "decoder_continuous_features": 0,  # not using decoder_continuous_features for now  # noqa: E501
+            "past_categorical_features": len(self.categorical_columns),
+            "past_continuous_features": len(self.continuous_columns),
+            "future_categorical_features": len(self.categorical_columns),
+            "future_continuous_features": 0,  # not using future_continuous_features for now  # noqa: E501
             "static_categorical_features": len(self.static_categorical_columns),
             "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
@@ -474,17 +474,17 @@ class Data:
         has_targets = data_type in {"train", "validate"}
 
         # Partition by ticker once upfront (much faster than filtering per ticker)
-        logger.info("partitioning_data_by_ticker")
+        logger.info("Partitioning data by ticker")
         ticker_groups = self.batch_data.sort("time_idx").partition_by(
             "ticker", as_dict=True
         )
         total_tickers = len(ticker_groups)
-        logger.info("batch_creation_started", total_tickers=total_tickers)
+        logger.info("Batch creation started", total_tickers=total_tickers)
 
         for idx, ticker_df in enumerate(ticker_groups.values()):
             if idx % 25 == 0:
                 logger.info(
-                    "batch_progress", ticker_idx=idx, total_tickers=total_tickers
+                    "Batch progress", ticker_idx=idx, total_tickers=total_tickers
                 )
 
             # Convert to numpy once per ticker (avoid repeated DataFrame operations)
@@ -520,9 +520,9 @@ class Data:
             # Use numpy slicing (much faster than DataFrame slicing)
             for i in window_indices:
                 sample = {
-                    "encoder_categorical": cat_array[i : i + input_length].copy(),
-                    "encoder_continuous": cont_array[i : i + input_length].copy(),
-                    "decoder_categorical": cat_array[
+                    "past_categorical": cat_array[i : i + input_length].copy(),
+                    "past_continuous": cont_array[i : i + input_length].copy(),
+                    "future_categorical": cat_array[
                         i + input_length : i + input_length + output_length
                     ].copy(),
                     "static_categorical": static_array.copy(),
@@ -535,23 +535,23 @@ class Data:
 
                 samples.append(sample)
 
-        logger.info("sample_collection_complete", total_samples=len(samples))
+        logger.info("Sample collection complete", total_samples=len(samples))
 
         # now batch the samples
-        logger.info("batching_samples", batch_size=batch_size)
+        logger.info("Batching samples", batch_size=batch_size)
         batches = []
         for i in range(0, len(samples), batch_size):
             batch_samples = samples[i : i + batch_size]
 
             batch = {
-                "encoder_categorical_features": Tensor(
-                    np.stack([s["encoder_categorical"] for s in batch_samples])
+                "past_categorical_features": Tensor(
+                    np.stack([s["past_categorical"] for s in batch_samples])
                 ),
-                "encoder_continuous_features": Tensor(
-                    np.stack([s["encoder_continuous"] for s in batch_samples])
+                "past_continuous_features": Tensor(
+                    np.stack([s["past_continuous"] for s in batch_samples])
                 ),
-                "decoder_categorical_features": Tensor(
-                    np.stack([s["decoder_categorical"] for s in batch_samples])
+                "future_categorical_features": Tensor(
+                    np.stack([s["future_categorical"] for s in batch_samples])
                 ),
                 "static_categorical_features": Tensor(
                     np.stack([s["static_categorical"] for s in batch_samples])
@@ -565,7 +565,7 @@ class Data:
 
             batches.append(batch)
 
-        logger.info("batch_creation_complete", total_batches=len(batches))
+        logger.info("Batch creation complete", total_batches=len(batches))
         return batches
 
     def save(self, directory_path: str) -> None:

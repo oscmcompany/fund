@@ -828,7 +828,9 @@ prefect_listener = aws.lb.Listener(
     tags=tags,
 )
 
-acm_certificate_arn = None  # temporary disable HTTPS
+# TODO: Enable HTTPS for the Prefect dashboard when an ACM certificate is provisioned.
+# Set acm_certificate_arn to the certificate ARN to activate the HTTPS listener below.
+acm_certificate_arn = None
 
 if acm_certificate_arn:
     # HTTPS Listener (port 443)
@@ -1678,6 +1680,11 @@ prefect_server_task_definition = aws.ecs.TaskDefinition(
                 {
                     "name": "prefect-server",
                     "image": args[3],
+                    # Inline bash/python constructs the database URL at runtime
+                    # because the password comes from Secrets Manager and must be
+                    # URL-encoded before embedding in the connection string.
+                    # Extracting this to a separate script would require building
+                    # and deploying another Docker image.
                     "command": [
                         "bash",
                         "-c",

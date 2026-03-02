@@ -22,3 +22,13 @@ uncertainty_threshold = aws.ssm.Parameter(
     description="Maximum inter-quartile range for predictions to be considered valid",
     tags=tags,
 )
+
+# Equity Price Model Configuration
+equitypricemodel_model_version = aws.ssm.Parameter(
+    "ssm_equitypricemodel_model_version",
+    name="/fund/equitypricemodel/model_version",
+    type="String",
+    value="latest",
+    description="Model artifact version to load (S3 key suffix or 'latest' for auto-discovery)",
+    tags=tags,
+)

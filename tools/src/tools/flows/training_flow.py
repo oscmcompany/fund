@@ -147,15 +147,26 @@ def training_pipeline(
     training_data_key = "training/filtered_tide_training_data.parquet"
     sync_equity_bars(base_url, lookback_days)
     sync_equity_details(base_url)
-    prepare_data(data_bucket, artifacts_bucket, lookback_days, training_data_key)
-    return train_tide_model(artifacts_bucket, training_data_key)
+    prepared_key = prepare_data(
+        data_bucket, artifacts_bucket, lookback_days, training_data_key
+    )
+    return train_tide_model(artifacts_bucket, prepared_key)
 
 
 if __name__ == "__main__":
     base_url = os.getenv("FUND_DATAMANAGER_BASE_URL", "")
     data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
     artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
-    lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
+
+    try:
+        lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
+    except ValueError:
+        logger.exception("LOOKBACK_DAYS must be a valid integer")
+        sys.exit(1)
+
+    if lookback_days <= 0:
+        logger.error("LOOKBACK_DAYS must be positive", lookback_days=lookback_days)
+        sys.exit(1)
 
     required_vars = {
         "FUND_DATAMANAGER_BASE_URL": base_url,

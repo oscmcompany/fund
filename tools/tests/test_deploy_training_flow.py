@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+from prefect.flows import EntrypointType
 from tools.deploy_training_flow import deploy_training_flow
 
 
@@ -38,8 +39,6 @@ def test_deploy_training_flow_sets_module_path_entrypoint(
     )
 
     call_kwargs = mock_deploy.call_args.kwargs
-    from prefect.flows import EntrypointType
-
     assert call_kwargs["entrypoint_type"] == EntrypointType.MODULE_PATH
     assert call_kwargs["build"] is False
     assert call_kwargs["push"] is False

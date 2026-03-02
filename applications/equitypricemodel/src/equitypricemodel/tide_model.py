@@ -261,6 +261,7 @@ class Model:
         validation_sample_size: int = 10,
         early_stopping_patience: int | None = 3,
         early_stopping_min_delta: float = 0.001,
+        checkpoint_directory: str | None = None,
     ) -> list:
         """Train the TiDE model using quantile loss.
 
@@ -289,6 +290,9 @@ class Model:
             - Increase validation_sample_size for more thorough checking or decrease
               for faster training startup
         """
+        if not train_batches:
+            return []
+
         if validation_sample_size <= 0:
             message = "validation_sample_size must be positive"
             raise ValueError(message)
@@ -311,7 +315,15 @@ class Model:
         total_batches = len(train_batches)
 
         best_loss = float("inf")
+        best_saved_loss = float("inf")
         epochs_without_improvement = 0
+        checkpoint_path = None
+
+        if checkpoint_directory:
+            os.makedirs(checkpoint_directory, exist_ok=True)  # noqa: PTH103
+            checkpoint_path = os.path.join(  # noqa: PTH118
+                checkpoint_directory, "best_checkpoint.safetensor"
+            )
 
         try:
             for epoch in range(epochs):
@@ -324,7 +336,7 @@ class Model:
                 epoch_losses = []
 
                 for step, batch in enumerate(train_batches):
-                    if batch["encoder_continuous_features"].shape[0] == 0:
+                    if batch["past_continuous_features"].shape[0] == 0:
                         logger.warning(
                             "Skipping empty batch",
                             step=step + 1,
@@ -384,6 +396,15 @@ class Model:
 
                 losses.append(epoch_loss)
 
+                if checkpoint_path and epoch_loss < best_saved_loss:
+                    best_saved_loss = epoch_loss
+                    safe_save(get_state_dict(self), checkpoint_path)
+                    logger.info(
+                        "Saved best checkpoint",
+                        checkpoint_path=checkpoint_path,
+                        loss=f"{epoch_loss:.4f}",
+                    )
+
                 if early_stopping_patience is not None:
                     if epoch_loss < best_loss - early_stopping_min_delta:
                         best_loss = epoch_loss
@@ -411,6 +432,14 @@ class Model:
         finally:
             Tensor.training = prev_training
 
+        if checkpoint_path and os.path.exists(checkpoint_path):  # noqa: PTH110
+            logger.info(
+                "Restoring best checkpoint weights",
+                checkpoint_path=checkpoint_path,
+            )
+            best_state = safe_load(checkpoint_path)
+            load_state_dict(self, best_state)
+
         return losses
 
     def validate(self, validation_batches: list) -> float:
@@ -421,7 +450,9 @@ class Model:
             validation_losses = []
 
             for batch in validation_batches:
-                combined_input, targets, batch_size = self._combine_input_features(batch)
+                combined_input, targets, batch_size = (
+                    self._combine_input_features(batch)
+                )
 
                 if targets is None:
                     message = "Targets are required for validation batches"
@@ -496,18 +527,18 @@ class Model:
         self,
         inputs: dict[str, Tensor],
     ) -> tuple[Tensor, Tensor | None, int]:
-        batch_size = inputs["encoder_continuous_features"].shape[0]
+        batch_size = inputs["past_continuous_features"].shape[0]
 
-        encoder_cont_flat = inputs["encoder_continuous_features"].reshape(
+        past_cont_flat = inputs["past_continuous_features"].reshape(
             batch_size, -1
         )
-        encoder_cat_flat = (
-            inputs["encoder_categorical_features"]
+        past_cat_flat = (
+            inputs["past_categorical_features"]
             .reshape(batch_size, -1)
             .cast("float32")
         )
-        decoder_cat_flat = (
-            inputs["decoder_categorical_features"]
+        future_cat_flat = (
+            inputs["future_categorical_features"]
             .reshape(batch_size, -1)
             .cast("float32")
         )
@@ -519,9 +550,9 @@ class Model:
 
         return (
             Tensor.cat(
-                encoder_cont_flat,
-                encoder_cat_flat,
-                decoder_cat_flat,
+                past_cont_flat,
+                past_cat_flat,
+                future_cat_flat,
                 static_cat_flat,
                 dim=1,
             ),

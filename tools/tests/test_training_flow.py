@@ -1,9 +1,7 @@
 import io
-from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import polars as pl
-
 from tools.flows.training_flow import (
     prepare_data,
     sync_equity_bars,
@@ -81,16 +79,12 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
     mock_model = MagicMock()
     mock_data = MagicMock()
 
-    with patch(
-        "tools.flows.training_flow.train_tide_model.__wrapped__",
-        side_effect=None,
-    ):
-        with patch("equitypricemodel.trainer.train_model") as mock_train:
-            mock_train.return_value = (mock_model, mock_data)
-            result = train_tide_model.fn(
-                artifacts_bucket="artifacts-bucket",
-                training_data_key="training/data.parquet",
-            )
+    with patch("equitypricemodel.trainer.train_model") as mock_train:
+        mock_train.return_value = (mock_model, mock_data)
+        result = train_tide_model.fn(
+            artifacts_bucket="artifacts-bucket",
+            training_data_key="training/data.parquet",
+        )
 
     assert result.startswith("s3://artifacts-bucket/artifacts/")
     mock_s3.get_object.assert_called_once()
@@ -118,6 +112,6 @@ def test_training_pipeline_threads_data_key(
     mock_prepare.assert_called_once()
     mock_train.assert_called_once_with(
         "artifacts-bucket",
-        "training/filtered_tide_training_data.parquet",
+        "training/data.parquet",
     )
     assert result == "s3://bucket/model"

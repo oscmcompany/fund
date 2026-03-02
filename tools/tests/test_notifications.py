@@ -131,6 +131,12 @@ def test_send_training_notification_handles_ses_error() -> None:
             },
         ),
         patch("tools.flows.notifications.boto3") as mock_boto3,
+        patch("tools.flows.notifications.logger") as mock_logger,
     ):
         mock_boto3.client.return_value = mock_ses
         send_training_notification(flow, flow_run, state)
+
+    mock_ses.send_email.assert_called_once()
+    mock_logger.exception.assert_called_once_with(
+        "Failed to send training notification"
+    )

@@ -42,19 +42,19 @@ def _make_batch(
     if config is None:
         config = BatchConfig()
     batch: dict[str, Tensor] = {
-        "encoder_continuous_features": Tensor(
+        "past_continuous_features": Tensor(
             rng.standard_normal(
                 (config.batch_size, config.input_length, config.continuous_features)
             ).astype(np.float32)
         ),
-        "encoder_categorical_features": Tensor(
+        "past_categorical_features": Tensor(
             rng.integers(
                 0,
                 CATEGORICAL_UPPER_BOUND,
                 (config.batch_size, config.input_length, config.categorical_features),
             ).astype(np.int32)
         ),
-        "decoder_categorical_features": Tensor(
+        "future_categorical_features": Tensor(
             rng.integers(
                 0,
                 CATEGORICAL_UPPER_BOUND,
@@ -166,13 +166,13 @@ def test_model_train_skips_zero_size_batch() -> None:
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
     empty_batch = {
-        "encoder_continuous_features": Tensor(
+        "past_continuous_features": Tensor(
             np.zeros((0, INPUT_LENGTH, CONTINUOUS_FEATURES), dtype=np.float32)
         ),
-        "encoder_categorical_features": Tensor(
+        "past_categorical_features": Tensor(
             np.zeros((0, INPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32)
         ),
-        "decoder_categorical_features": Tensor(
+        "future_categorical_features": Tensor(
             np.zeros((0, OUTPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32)
         ),
         "static_categorical_features": Tensor(
