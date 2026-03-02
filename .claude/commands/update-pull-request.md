@@ -22,7 +22,7 @@ Follow these steps:
 ### 1. Fetch Pull Request Data
 
 - Accept the pull request ID from ${ARGUMENTS}; error if no argument is provided with a clear message that a pull request number is required.
-- **IMPORTANT: Environment variable persistence** - When using the Bash tool, environment variables do not persist between separate tool invocations. Combine all setup, fetch, and validation commands into a single bash execution.
+- **IMPORTANT: Environment variable persistence** - When using the Bash tool, environment variables do not persist between separate tool invocations. You must explicitly re-declare `SCRATCHPAD`, `OWNER`, and `REPO` at the top of each subsequent bash block that references them.
 - Set up the scratchpad directory, determine the repository owner and name, and fetch PR data in a single bash execution:
 
   ```bash
@@ -248,7 +248,7 @@ Follow these steps:
 
 - The structured files contain all necessary metadata:
   - `review_threads.json`: Thread ID, comment IDs (both node and database), body, author, file path/position
-  - `outdated_threads.json`: Same fields; "outdated" means the code was modified, not that the feedback is irrelevant - review each to determine if it still applies
+  - `outdated_threads.json`: Thread ID and comment metadata (body, author, file path); "outdated" means the code was modified, not that the feedback is irrelevant - review each to determine if it still applies
   - `pr_comments.json`: Comment IDs, body, author
   - `check_failures.json`: Check name, conclusion, details URL
 
@@ -381,7 +381,7 @@ Follow these steps:
       ' -f threadId="<thread_id>"
       ```
 
-    - Map each comment back to its parent thread using the data structure from step 2 parsing.
+    - Map each comment back to its parent thread using the structured files from step 1 (particularly review_threads.json).
     - Resolve both addressed and rejected feedback threads (explanation provided in response).
 
   - For issue comments (pull request-level):
