@@ -1,0 +1,18 @@
+---
+name: Assign pull request reviewers
+run-name: Assign pull request reviewers
+on:
+  pull_request:
+    types:
+      - opened
+jobs:
+  assign_pull_request_reviewers:
+    name: Assign pull request reviewers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Assign pull request reviewers
+        uses: johnmanjiro13/auto-reviewer-assign@v0.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
