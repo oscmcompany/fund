@@ -22,7 +22,7 @@ polars = { version = "0.51.0", features = [
   "serde",
   "strings",
 ] }
-reqwest = "0.12.23"
+reqwest = "0.13.2"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 urlencoding = "2.1.3"
@@ -45,7 +45,7 @@ tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1.0", features = ["full"] }
 http-body-util = "0.1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 mockito = "1.7"
 serial_test = "3.3"
 testcontainers = "0.23"
