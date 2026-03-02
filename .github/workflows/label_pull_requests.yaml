@@ -3,6 +3,7 @@ name: Label pull requests
 run-name: Label pull requests
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
 jobs:
   label_pull_request:
     name: Label pull request
