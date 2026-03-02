@@ -13,9 +13,8 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Assign pull request reviewers
-        uses: johnmanjiro13/auto-reviewer-assign@v0.2.0
+      - name: Assign pull request reviewers and assignees
+        uses: kentaro-m/auto-assign-action@v2.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          configuration-path: .github/workflows/assignment_configuration.yaml
