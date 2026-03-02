@@ -38,7 +38,7 @@ duckdb = { version = "1.4.3", features = ["r2d2", "chrono"] }
 validator = { version = "0.20", features = ["derive"] }
 thiserror = "2.0.3"
 sentry = { version = "0.35", features = ["tracing", "reqwest", "rustls"] }
-sentry-tower = { version = "0.35", features = ["http"] }
+sentry-tower = { version = "0.46", features = ["http"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
