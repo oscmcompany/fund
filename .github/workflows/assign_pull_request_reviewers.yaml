@@ -17,4 +17,4 @@ jobs:
         uses: kentaro-m/auto-assign-action@v2.0.1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          configuration-path: .github/workflows/assignment_configuration.yaml
+          configuration-path: .github/assignment_configuration.yaml
