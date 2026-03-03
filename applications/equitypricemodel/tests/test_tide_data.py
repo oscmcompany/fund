@@ -315,3 +315,12 @@ def test_pipeline_run_to_raises_for_unknown_stage(
     data = make_raw_data()
     with pytest.raises(ValueError, match="Unknown stage"):
         pipeline.run_to("nonexistent_stage", data)
+
+
+def test_pipeline_honors_explicit_empty_stage_list(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    data = make_raw_data()
+    pipeline = Pipeline(stages=[])
+    result = pipeline.run(data)
+    assert result.equals(data)

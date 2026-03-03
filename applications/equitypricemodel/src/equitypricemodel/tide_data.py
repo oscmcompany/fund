@@ -51,6 +51,10 @@ STATIC_CATEGORICAL_COLUMNS = [
     "industry",
 ]
 
+EncodedCategoryValue = str | bool
+CategoryMapping = dict[EncodedCategoryValue, int]
+FeatureMappings = dict[str, CategoryMapping]
+
 
 class Scaler:
     def __init__(self) -> None:
@@ -256,7 +260,7 @@ class CleanData(Stage):
 class ScaleAndEncode(Stage):
     def __init__(self) -> None:
         self.scaler: Scaler | None = None
-        self.mappings: dict[str, dict[str, int]] | None = None
+        self.mappings: FeatureMappings | None = None
 
     @property
     def name(self) -> str:
@@ -300,7 +304,7 @@ class ScaleAndEncode(Stage):
             "is_holiday",
         ]
 
-        mappings: dict[str, dict[str, int]] = {}
+        mappings: FeatureMappings = {}
 
         for column in mapping_columns:
             data, mapping = _create_mapping_and_encoding(data, column)
@@ -314,7 +318,7 @@ class ScaleAndEncode(Stage):
 def _create_mapping_and_encoding(
     data: pl.DataFrame,
     column: str,
-) -> tuple[pl.DataFrame, dict[str, int]]:
+) -> tuple[pl.DataFrame, CategoryMapping]:
     unique_values = sorted(data[column].unique().to_list())
     mapping = {val: idx for idx, val in enumerate(unique_values)}
     data = data.with_columns(
@@ -336,7 +340,7 @@ def default_stages() -> list[Stage]:
 
 class Pipeline:
     def __init__(self, stages: list[Stage] | None = None) -> None:
-        self.stages = stages or default_stages()
+        self.stages = stages if stages is not None else default_stages()
 
     def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.clone()
@@ -392,7 +396,7 @@ class Data:
             "ScaleAndEncode", pipeline.get_stage("scale_and_encode")
         )
         self.scaler = cast("Scaler", scale_and_encode.scaler)
-        self.mappings = cast("dict[str, dict[str, int]]", scale_and_encode.mappings)
+        self.mappings = cast("FeatureMappings", scale_and_encode.mappings)
 
     def _get_training_and_validation_data(
         self,

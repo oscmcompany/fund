@@ -1737,7 +1737,10 @@ prefect_server_task_definition = aws.ecs.TaskDefinition(
                     "environment": [
                         {
                             "name": "PREFECT_UI_API_URL",
-                            "value": f"http://{args[4]}:4200/api",
+                            "value": (
+                                f"{'https' if acm_certificate_arn else 'http'}://"
+                                f"{args[4]}:4200/api"
+                            ),
                         },
                     ],
                     "secrets": [

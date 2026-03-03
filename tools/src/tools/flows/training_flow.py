@@ -47,7 +47,16 @@ def sync_equity_bars(base_url: str, start_date: datetime, end_date: datetime) ->
 def sync_equity_details(base_url: str) -> None:
     """Trigger datamanager to sync equity details."""
     logger.info("Syncing equity details", base_url=base_url)
-    sync_equity_details_data(base_url=base_url)
+    try:
+        sync_equity_details_data(base_url=base_url)
+    except RuntimeError as error:
+        if "status 501" in str(error):
+            logger.warning(
+                "Equity details sync is not implemented, skipping",
+                base_url=base_url,
+            )
+            return
+        raise
 
 
 @task(name="prepare-training-data")

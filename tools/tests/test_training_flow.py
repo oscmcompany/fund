@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import polars as pl
+import pytest
 from tools.flows.training_flow import (
     prepare_data,
     sync_equity_bars,
@@ -35,6 +36,20 @@ def test_sync_equity_bars_calls_sync_with_date_range(mock_sync: MagicMock) -> No
 def test_sync_equity_details_calls_sync(mock_sync: MagicMock) -> None:
     sync_equity_details.fn(base_url="http://example.com")
     mock_sync.assert_called_once_with(base_url="http://example.com")
+
+
+@patch("tools.flows.training_flow.sync_equity_details_data")
+def test_sync_equity_details_ignores_not_implemented(mock_sync: MagicMock) -> None:
+    mock_sync.side_effect = RuntimeError("Sync failed with status 501: not implemented")
+    sync_equity_details.fn(base_url="http://example.com")
+    mock_sync.assert_called_once_with(base_url="http://example.com")
+
+
+@patch("tools.flows.training_flow.sync_equity_details_data")
+def test_sync_equity_details_raises_non_501_errors(mock_sync: MagicMock) -> None:
+    mock_sync.side_effect = RuntimeError("Sync failed with status 500: failure")
+    with pytest.raises(RuntimeError, match="status 500"):
+        sync_equity_details.fn(base_url="http://example.com")
 
 
 @patch("tools.flows.training_flow.prepare_training_data")

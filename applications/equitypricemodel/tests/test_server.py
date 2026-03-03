@@ -7,7 +7,15 @@ from equitypricemodel.server import _resolve_artifact_key
 def test_resolve_artifact_key_uses_latest_by_default() -> None:
     mock_s3 = MagicMock()
     mock_ssm = MagicMock()
-    mock_ssm.get_parameter.side_effect = ClientError.__new__(ClientError)
+    mock_ssm.get_parameter.side_effect = ClientError(
+        error_response={
+            "Error": {
+                "Code": "ParameterNotFound",
+                "Message": "Parameter not found",
+            }
+        },
+        operation_name="GetParameter",
+    )
 
     with (
         patch("equitypricemodel.server.boto3") as mock_boto3,
