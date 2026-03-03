@@ -165,7 +165,10 @@ def _resolve_artifact_key(
     """Resolve the model artifact S3 key using SSM Parameter Store."""
     try:
         ssm_client = boto3.client("ssm")
-        response = ssm_client.get_parameter(Name=MODEL_VERSION_SSM_PARAMETER)
+        response = ssm_client.get_parameter(
+            Name=MODEL_VERSION_SSM_PARAMETER,
+            WithDecryption=True,
+        )
         model_version = response["Parameter"]["Value"]
     except ClientError:
         logger.exception("SSM parameter not available, using default artifact path")
