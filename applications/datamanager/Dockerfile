@@ -21,9 +21,9 @@ RUN rustup toolchain install stable
 
 RUN rustup default stable
 
-ENV LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
-ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+ENV LIBRARY_PATH=/usr/local/lib
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 
 WORKDIR /app
 
@@ -51,8 +51,8 @@ COPY applications/datamanager/src/ applications/datamanager/src/
 
 ENV DUCKDB_LIB_DIR=/usr/local/lib
 ENV DUCKDB_INCLUDE_DIR=/usr/local/include
-ENV LIBRARY_PATH=/usr/local/lib${LIBRARY_PATH:+:$LIBRARY_PATH}
-ENV LD_LIBRARY_PATH=/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+ENV LIBRARY_PATH=/usr/local/lib
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
