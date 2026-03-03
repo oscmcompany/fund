@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 from prefect.flows import EntrypointType
 from tools.deploy_training_flow import deploy_training_flow
 
+LOOKBACK_DAYS = 30
+
 
 @patch("tools.deploy_training_flow.training_pipeline")
 def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
@@ -13,7 +15,7 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
         base_url="http://example.com",
         data_bucket="data-bucket",
         artifacts_bucket="artifacts-bucket",
-        lookback_days=30,
+        lookback_days=LOOKBACK_DAYS,
     )
 
     mock_deploy.assert_called_once()
@@ -22,7 +24,7 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
     assert call_kwargs["work_pool_name"] == "training-pool"
     assert call_kwargs["cron"] == "0 22 * * *"
     assert call_kwargs["parameters"]["base_url"] == "http://example.com"
-    assert call_kwargs["parameters"]["lookback_days"] == 30
+    assert call_kwargs["parameters"]["lookback_days"] == LOOKBACK_DAYS
 
 
 @patch("tools.deploy_training_flow.training_pipeline")

@@ -168,7 +168,7 @@ def _resolve_artifact_key(
         response = ssm_client.get_parameter(Name=MODEL_VERSION_SSM_PARAMETER)
         model_version = response["Parameter"]["Value"]
     except ClientError:
-        logger.info("SSM parameter not available, using default artifact path")
+        logger.exception("SSM parameter not available, using default artifact path")
         model_version = "latest"
 
     if model_version != "latest":
@@ -187,10 +187,16 @@ def _resolve_artifact_key(
     )
 
 
+def cleanup_model_directory(model_directory: str) -> None:
+    if model_directory != "." and Path(model_directory).exists():
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(model_directory, ignore_errors=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
-    import shutil  # noqa: PLC0415
 
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
     artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
@@ -229,8 +235,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    if app.state.model_directory != "." and Path(app.state.model_directory).exists():
-        shutil.rmtree(app.state.model_directory, ignore_errors=True)
+    cleanup_model_directory(app.state.model_directory)
 
 
 application = FastAPI(lifespan=lifespan)

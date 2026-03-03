@@ -61,6 +61,35 @@ def test_send_training_notification_on_completion() -> None:
     assert "1800 seconds" in call_kwargs["Message"]["Body"]["Text"]["Data"]
 
 
+def test_send_training_notification_reports_zero_second_duration() -> None:
+    flow = _make_flow()
+    timestamp = cast("DateTime", pendulum.datetime(2024, 1, 1, 12, 0, 0, tz="UTC"))
+    flow_run = _make_flow_run(
+        StateType.COMPLETED,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+    state = State(type=StateType.COMPLETED, name="Completed")
+
+    mock_ses = MagicMock()
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "TRAINING_NOTIFICATION_SENDER_EMAIL": "sender@example.com",
+                "TRAINING_NOTIFICATION_RECIPIENT_EMAILS": "recipient@example.com",
+            },
+        ),
+        patch("tools.flows.notifications.boto3") as mock_boto3,
+    ):
+        mock_boto3.client.return_value = mock_ses
+        send_training_notification(flow, flow_run, state)
+
+    call_kwargs = mock_ses.send_email.call_args[1]
+    assert "0 seconds" in call_kwargs["Message"]["Body"]["Text"]["Data"]
+
+
 def test_send_training_notification_on_failure() -> None:
     flow = _make_flow()
     flow_run = _make_flow_run(StateType.FAILED)
@@ -114,6 +143,26 @@ def test_send_training_notification_skips_when_not_configured() -> None:
     mock_boto3.client.assert_not_called()
 
 
+def test_send_training_notification_skips_when_recipients_parse_empty() -> None:
+    flow = _make_flow()
+    flow_run = _make_flow_run(StateType.COMPLETED)
+    state = State(type=StateType.COMPLETED, name="Completed")
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "TRAINING_NOTIFICATION_SENDER_EMAIL": "sender@example.com",
+                "TRAINING_NOTIFICATION_RECIPIENT_EMAILS": " , , ",
+            },
+        ),
+        patch("tools.flows.notifications.boto3") as mock_boto3,
+    ):
+        send_training_notification(flow, flow_run, state)
+
+    mock_boto3.client.assert_not_called()
+
+
 def test_send_training_notification_handles_ses_error() -> None:
     flow = _make_flow()
     flow_run = _make_flow_run(StateType.COMPLETED)
@@ -138,5 +187,8 @@ def test_send_training_notification_handles_ses_error() -> None:
 
     mock_ses.send_email.assert_called_once()
     mock_logger.exception.assert_called_once_with(
-        "Failed to send training notification"
+        "Failed to send training notification",
+        sender_email="sender@example.com",
+        recipients=["recipient@example.com"],
+        state="Completed",
     )

@@ -265,14 +265,8 @@ def test_data_get_dimensions(
     data = Data()
     data.preprocess_and_set_data(raw)
     dimensions = data.get_dimensions()
-    assert (
-        dimensions["past_continuous_features"]
-        == EXPECTED_PAST_CONTINUOUS_FEATURES
-    )
-    assert (
-        dimensions["past_categorical_features"]
-        == EXPECTED_PAST_CATEGORICAL_FEATURES
-    )
+    assert dimensions["past_continuous_features"] == EXPECTED_PAST_CONTINUOUS_FEATURES
+    assert dimensions["past_categorical_features"] == EXPECTED_PAST_CATEGORICAL_FEATURES
     assert (
         dimensions["static_categorical_features"]
         == EXPECTED_STATIC_CATEGORICAL_FEATURES

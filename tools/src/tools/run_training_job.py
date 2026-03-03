@@ -15,6 +15,10 @@ def run_training_job(
     lookback_days: int = 365,
 ) -> str:
     """Run the TiDE training pipeline via Prefect."""
+    if lookback_days <= 0:
+        message = "lookback_days must be positive"
+        raise ValueError(message)
+
     logger.info(
         "Starting training pipeline",
         base_url=base_url,
@@ -53,6 +57,15 @@ if __name__ == "__main__":
 
     try:
         lookback_days = int(os.getenv("LOOKBACK_DAYS", "365"))
+    except ValueError:
+        logger.exception("LOOKBACK_DAYS must be a valid integer")
+        sys.exit(1)
+
+    if lookback_days <= 0:
+        logger.error("LOOKBACK_DAYS must be positive", lookback_days=lookback_days)
+        sys.exit(1)
+
+    try:
         run_training_job(
             base_url=base_url,
             data_bucket=data_bucket,

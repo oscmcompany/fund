@@ -53,3 +53,13 @@ def test_run_training_job_propagates_errors() -> None:
             data_bucket="fund-data-bucket",
             artifacts_bucket="fund-artifacts-bucket",
         )
+
+
+def test_run_training_job_rejects_non_positive_lookback() -> None:
+    with pytest.raises(ValueError, match="lookback_days must be positive"):
+        run_training_job(
+            base_url="http://datamanager:8080",
+            data_bucket="fund-data-bucket",
+            artifacts_bucket="fund-artifacts-bucket",
+            lookback_days=0,
+        )

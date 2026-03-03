@@ -4,6 +4,8 @@ import polars as pl
 import pytest
 from equitypricemodel.trainer import DEFAULT_CONFIGURATION, train_model
 
+PARTIAL_HIDDEN_SIZE = 16
+
 
 def test_train_model_returns_model_and_data(
     make_raw_data: Callable[..., pl.DataFrame],
@@ -42,4 +44,19 @@ def test_train_model_uses_default_configuration(
     training_data = make_raw_data(days=90)
     model, _ = train_model(training_data)
     assert model.hidden_size == DEFAULT_CONFIGURATION["hidden_size"]
+    assert model.output_length == DEFAULT_CONFIGURATION["output_length"]
+
+
+def test_train_model_merges_partial_configuration(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_data = make_raw_data(days=90)
+    model, _ = train_model(
+        training_data,
+        configuration={
+            "epoch_count": 1,
+            "hidden_size": PARTIAL_HIDDEN_SIZE,
+        },
+    )
+    assert model.hidden_size == PARTIAL_HIDDEN_SIZE
     assert model.output_length == DEFAULT_CONFIGURATION["output_length"]

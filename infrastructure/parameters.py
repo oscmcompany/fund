@@ -29,6 +29,8 @@ equitypricemodel_model_version = aws.ssm.Parameter(
     name="/fund/equitypricemodel/model_version",
     type="String",
     value="latest",
-    description="Model artifact version to load (S3 key suffix or 'latest' for auto-discovery)",
+    description=(
+        "Model artifact version to load (S3 key suffix or 'latest' for auto-discovery)"
+    ),
     tags=tags,
 )

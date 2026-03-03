@@ -19,11 +19,16 @@ from tools.sync_equity_details_data import sync_equity_details_data
 logger = structlog.get_logger()
 
 
-@task(name="sync-equity-bars", retries=2, retry_delay_seconds=30)
-def sync_equity_bars(base_url: str, lookback_days: int = 365) -> None:
-    """Trigger datamanager to sync equity bars."""
+def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
+    """Build a UTC date range used by sync + prepare steps."""
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)
+    return start_date, end_date
+
+
+@task(name="sync-equity-bars", retries=2, retry_delay_seconds=30)
+def sync_equity_bars(base_url: str, start_date: datetime, end_date: datetime) -> None:
+    """Trigger datamanager to sync equity bars."""
 
     logger.info(
         "Syncing equity bars",
@@ -49,7 +54,8 @@ def sync_equity_details(base_url: str) -> None:
 def prepare_data(
     data_bucket: str,
     artifacts_bucket: str,
-    lookback_days: int = 365,
+    start_date: datetime,
+    end_date: datetime,
     output_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
@@ -57,19 +63,28 @@ def prepare_data(
         "Preparing training data",
         data_bucket=data_bucket,
         artifacts_bucket=artifacts_bucket,
-        lookback_days=lookback_days,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
     )
 
-    end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_date = end_date - timedelta(days=lookback_days)
-
-    return prepare_training_data(
+    training_data_uri = prepare_training_data(
         data_bucket_name=data_bucket,
         model_artifacts_bucket_name=artifacts_bucket,
         start_date=start_date,
         end_date=end_date,
         output_key=output_key,
     )
+
+    bucket_prefix = f"s3://{artifacts_bucket}/"
+    if training_data_uri.startswith(bucket_prefix):
+        return training_data_uri.removeprefix(bucket_prefix)
+
+    logger.warning(
+        "Prepared training data URI did not match expected bucket",
+        expected_bucket=artifacts_bucket,
+        training_data_uri=training_data_uri,
+    )
+    return output_key
 
 
 @task(name="train-tide-model", timeout_seconds=3600)
@@ -81,19 +96,31 @@ def train_tide_model(
     # Defer import to avoid importing tinygrad at module level (heavy GPU dependency)
     from equitypricemodel.trainer import train_model  # noqa: PLC0415
 
+    resolved_training_data_key = training_data_key
+    bucket_prefix = f"s3://{artifacts_bucket}/"
+    if training_data_key.startswith(bucket_prefix):
+        resolved_training_data_key = training_data_key.removeprefix(bucket_prefix)
+
     logger.info(
         "Starting model training",
         artifacts_bucket=artifacts_bucket,
-        training_data_key=training_data_key,
+        training_data_key=resolved_training_data_key,
     )
 
     s3_client = boto3.client("s3")
 
-    response = s3_client.get_object(Bucket=artifacts_bucket, Key=training_data_key)
+    response = s3_client.get_object(
+        Bucket=artifacts_bucket,
+        Key=resolved_training_data_key,
+    )
     training_data = pl.read_parquet(response["Body"].read())
     logger.info("Training data loaded", rows=training_data.height)
 
-    tide_model, tide_data = train_model(training_data)
+    with tempfile.TemporaryDirectory(prefix="checkpoints_") as checkpoint_directory:
+        tide_model, tide_data = train_model(
+            training_data,
+            checkpoint_directory=checkpoint_directory,
+        )
 
     timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
     artifact_folder = f"artifacts/equitypricemodel-trainer-{timestamp}"
@@ -144,11 +171,21 @@ def training_pipeline(
     lookback_days: int = 365,
 ) -> str:
     """End-to-end training pipeline."""
+    if lookback_days <= 0:
+        message = "lookback_days must be positive"
+        raise ValueError(message)
+
     training_data_key = "training/filtered_tide_training_data.parquet"
-    sync_equity_bars(base_url, lookback_days)
+    start_date, end_date = get_training_date_range(lookback_days)
+
+    sync_equity_bars(base_url, start_date, end_date)
     sync_equity_details(base_url)
     prepared_key = prepare_data(
-        data_bucket, artifacts_bucket, lookback_days, training_data_key
+        data_bucket,
+        artifacts_bucket,
+        start_date,
+        end_date,
+        training_data_key,
     )
     return train_tide_model(artifacts_bucket, prepared_key)
 

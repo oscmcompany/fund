@@ -318,6 +318,7 @@ class Model:
         best_saved_loss = float("inf")
         epochs_without_improvement = 0
         checkpoint_path = None
+        checkpoint_saved = False
 
         if checkpoint_directory:
             os.makedirs(checkpoint_directory, exist_ok=True)  # noqa: PTH103
@@ -399,6 +400,7 @@ class Model:
                 if checkpoint_path and epoch_loss < best_saved_loss:
                     best_saved_loss = epoch_loss
                     safe_save(get_state_dict(self), checkpoint_path)
+                    checkpoint_saved = True
                     logger.info(
                         "Saved best checkpoint",
                         checkpoint_path=checkpoint_path,
@@ -432,7 +434,9 @@ class Model:
         finally:
             Tensor.training = prev_training
 
-        if checkpoint_path and os.path.exists(checkpoint_path):  # noqa: PTH110
+        if (
+            checkpoint_saved and checkpoint_path and os.path.exists(checkpoint_path)  # noqa: PTH110
+        ):
             logger.info(
                 "Restoring best checkpoint weights",
                 checkpoint_path=checkpoint_path,
@@ -450,8 +454,8 @@ class Model:
             validation_losses = []
 
             for batch in validation_batches:
-                combined_input, targets, batch_size = (
-                    self._combine_input_features(batch)
+                combined_input, targets, batch_size = self._combine_input_features(
+                    batch
                 )
 
                 if targets is None:
@@ -529,13 +533,9 @@ class Model:
     ) -> tuple[Tensor, Tensor | None, int]:
         batch_size = inputs["past_continuous_features"].shape[0]
 
-        past_cont_flat = inputs["past_continuous_features"].reshape(
-            batch_size, -1
-        )
+        past_cont_flat = inputs["past_continuous_features"].reshape(batch_size, -1)
         past_cat_flat = (
-            inputs["past_categorical_features"]
-            .reshape(batch_size, -1)
-            .cast("float32")
+            inputs["past_categorical_features"].reshape(batch_size, -1).cast("float32")
         )
         future_cat_flat = (
             inputs["future_categorical_features"]

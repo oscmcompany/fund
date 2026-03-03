@@ -30,7 +30,10 @@ def train_model(
     checkpoint_directory: str | None = None,
 ) -> tuple[Model, Data]:
     """Train TiDE model and return model + data processor."""
-    configuration = configuration or dict(DEFAULT_CONFIGURATION)
+    merged_configuration = dict(DEFAULT_CONFIGURATION)
+    if configuration is not None:
+        merged_configuration.update(configuration)
+    configuration = merged_configuration
 
     logger.info("Configuration loaded", **configuration)
 
@@ -149,12 +152,12 @@ if __name__ == "__main__":
     training_data_input_path = os.environ.get(
         "TRAINING_DATA_PATH",
         os.path.join(  # noqa: PTH118
-            "/opt/ml/input/data/train",
+            "/app/training-data",
             "filtered_tide_training_data.parquet",
         ),
     )
 
-    model_output_path = os.environ.get("MODEL_OUTPUT_PATH", "/opt/ml/model")
+    model_output_path = os.environ.get("MODEL_OUTPUT_PATH", "/app/model-artifacts")
 
     logger.info(
         "Paths configured",

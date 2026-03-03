@@ -813,24 +813,40 @@ prefect_tg = aws.lb.TargetGroup(
     tags=tags,
 )
 
-# Prefect dashboard listener on port 4200 (restricted by ALB security group)
-prefect_listener = aws.lb.Listener(
-    "prefect_listener",
-    load_balancer_arn=alb.arn,
-    port=4200,
-    protocol="HTTP",
-    default_actions=[
-        aws.lb.ListenerDefaultActionArgs(
-            type="forward",
-            target_group_arn=prefect_tg.arn,
-        )
-    ],
-    tags=tags,
-)
-
-# TODO: Enable HTTPS for the Prefect dashboard when an ACM certificate is provisioned.
-# Set acm_certificate_arn to the certificate ARN to activate the HTTPS listener below.
+# Set acm_certificate_arn to enable HTTPS for the Prefect dashboard listener.
 acm_certificate_arn = None
+
+# Prefect dashboard listener on port 4200 (restricted by ALB security group)
+if acm_certificate_arn:
+    prefect_listener = aws.lb.Listener(
+        "prefect_listener",
+        load_balancer_arn=alb.arn,
+        port=4200,
+        protocol="HTTPS",
+        ssl_policy="ELBSecurityPolicy-TLS13-1-2-2021-06",
+        certificate_arn=acm_certificate_arn,
+        default_actions=[
+            aws.lb.ListenerDefaultActionArgs(
+                type="forward",
+                target_group_arn=prefect_tg.arn,
+            )
+        ],
+        tags=tags,
+    )
+else:
+    prefect_listener = aws.lb.Listener(
+        "prefect_listener",
+        load_balancer_arn=alb.arn,
+        port=4200,
+        protocol="HTTP",
+        default_actions=[
+            aws.lb.ListenerDefaultActionArgs(
+                type="forward",
+                target_group_arn=prefect_tg.arn,
+            )
+        ],
+        tags=tags,
+    )
 
 if acm_certificate_arn:
     # HTTPS Listener (port 443)
@@ -1143,7 +1159,9 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                             "ses:UntagResource",
                             "ses:ListTagsForResource",
                         ],
-                        "Resource": "*",
+                        "Resource": [
+                            f"arn:aws:ses:{region}:{account_id}:identity/*",
+                        ],
                     },
                     {
                         "Sid": "CreateGithubActionsOIDCProvider",
@@ -1461,6 +1479,22 @@ training_notification_email_identity = aws.ses.EmailIdentity(
     email=training_notification_sender_email,
 )
 
+training_notification_sender_email_parameter = aws.ssm.Parameter(
+    "training_notification_sender_email_parameter",
+    name="/fund/prefect/training_notification_sender_email",
+    type="SecureString",
+    value=training_notification_sender_email,
+    tags=tags,
+)
+
+training_notification_recipients_parameter = aws.ssm.Parameter(
+    "training_notification_recipients_parameter",
+    name="/fund/prefect/training_notification_recipients",
+    type="SecureString",
+    value=training_notification_recipient_emails,
+    tags=tags,
+)
+
 # Allow ECS tasks to send emails via SES
 aws.iam.RolePolicy(
     "task_role_ses_policy",
@@ -1569,7 +1603,8 @@ prefect_database = aws.rds.Instance(
     db_subnet_group_name=prefect_rds_subnet_group.name,
     vpc_security_group_ids=[prefect_rds_security_group.id],
     skip_final_snapshot=False,
-    final_snapshot_identifier="fund-prefect-final",
+    final_snapshot_identifier=f"fund-prefect-final-{pulumi.get_stack()}",
+    backup_retention_period=7,
     storage_encrypted=True,
     deletion_protection=True,
     tags=tags,
@@ -1786,8 +1821,8 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
         data_bucket.bucket,
         model_artifacts_bucket.bucket,
         prefect_worker_image_uri,
-        training_notification_sender_email,
-        training_notification_recipient_emails,
+        training_notification_sender_email_parameter.arn,
+        training_notification_recipients_parameter.arn,
     ).apply(
         lambda args: json.dumps(
             [
@@ -1815,13 +1850,15 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
                             "name": "LOOKBACK_DAYS",
                             "value": "365",
                         },
+                    ],
+                    "secrets": [
                         {
                             "name": "TRAINING_NOTIFICATION_SENDER_EMAIL",
-                            "value": args[5],
+                            "valueFrom": args[5],
                         },
                         {
                             "name": "TRAINING_NOTIFICATION_RECIPIENT_EMAILS",
-                            "value": args[6],
+                            "valueFrom": args[6],
                         },
                     ],
                     "logConfiguration": {
@@ -2253,10 +2290,13 @@ pulumi.export(
         "http://prefect-server.", service_discovery_namespace.name, ":4200/api"
     ),
 )
-pulumi.export(
-    "prefect_ui_url",
-    pulumi.Output.concat(protocol, alb.dns_name, ":4200"),
+prefect_ui_url = (
+    pulumi.Output.concat("https://", alb.dns_name, ":4200")
+    if acm_certificate_arn
+    else pulumi.Output.from_input("TLS certificate not configured")
 )
+pulumi.export("prefect_ui_url", prefect_ui_url)
+pulumi.export("prefect_ui_tls_enabled", bool(acm_certificate_arn))
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,

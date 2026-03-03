@@ -130,11 +130,11 @@ portfolio_schema = pa.DataFrameSchema(
     coerce=True,
     checks=[
         pa.Check(
-            check_fn=lambda df: check_position_side_counts(df),
+            check_fn=check_position_side_counts,
             error="Each side must have expected position counts",
         ),
         pa.Check(
-            check_fn=lambda df: check_position_side_sums(df),
+            check_fn=check_position_side_sums,
             error="Position side sums must be approximately equal",
         ),
     ],

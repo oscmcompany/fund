@@ -270,7 +270,10 @@ class ScaleAndEncode(Stage):
             mean_val = self.scaler.means[col].item()
             std_val = self.scaler.standard_deviations[col].item()
             if np.isnan(mean_val) or np.isnan(std_val):
-                message = f"Scaler has NaN values for column '{col}': mean={mean_val}, std={std_val}"
+                message = (
+                    f"Scaler has NaN values for column '{col}': "
+                    f"mean={mean_val}, std={std_val}"
+                )
                 raise ValueError(message)
 
         data = data.with_columns(
@@ -284,7 +287,10 @@ class ScaleAndEncode(Stage):
         for col in CONTINUOUS_COLUMNS:
             nan_count = data.filter(pl.col(col).is_nan()).height
             if nan_count > 0:
-                message = f"NaN values after scaling column '{col}': {nan_count}/{data.height} rows"
+                message = (
+                    f"NaN values after scaling column '{col}': "
+                    f"{nan_count}/{data.height} rows"
+                )
                 raise ValueError(message)
 
         mapping_columns = [
@@ -309,7 +315,7 @@ def _create_mapping_and_encoding(
     data: pl.DataFrame,
     column: str,
 ) -> tuple[pl.DataFrame, dict[str, int]]:
-    unique_values = data[column].unique().to_list()
+    unique_values = sorted(data[column].unique().to_list())
     mapping = {val: idx for idx, val in enumerate(unique_values)}
     data = data.with_columns(
         pl.col(column).replace(mapping).cast(pl.Int32).alias(column)

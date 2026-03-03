@@ -265,7 +265,7 @@ else
     # Note: Service names use 'fund' prefix matching the Pulumi project name.
     # These must exactly match the ECS service names created by the infrastructure code.
     # The AWS account provides environment context (one account = one environment).
-    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel fund-prefect-worker; do
+    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel fund-prefect-server fund-prefect-worker; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -813,7 +813,7 @@ pulumi stack select ${organization_name}/fund/production
 export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output prefect_ui_url)/api"
+export PREFECT_API_URL="$(pulumi stack output prefect_api_url)"
 export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 
 cd ../
@@ -842,7 +842,7 @@ pulumi stack select ${organization_name}/fund/production
 export FUND_DATAMANAGER_BASE_URL="http://datamanager.$(pulumi stack output aws_service_discovery_namespace):8080"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output prefect_ui_url)/api"
+export PREFECT_API_URL="$(pulumi stack output prefect_api_url)"
 export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
 
 cd ../

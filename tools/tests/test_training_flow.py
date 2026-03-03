@@ -1,4 +1,5 @@
 import io
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -10,15 +11,24 @@ from tools.flows.training_flow import (
     training_pipeline,
 )
 
+LOOKBACK_DAYS = 30
+
 
 @patch("tools.flows.training_flow.sync_equity_bars_data")
 def test_sync_equity_bars_calls_sync_with_date_range(mock_sync: MagicMock) -> None:
-    sync_equity_bars.fn(base_url="http://example.com", lookback_days=30)
+    start_date = datetime(2024, 1, 1, tzinfo=UTC)
+    end_date = datetime(2024, 1, 31, tzinfo=UTC)
+    sync_equity_bars.fn(
+        base_url="http://example.com",
+        start_date=start_date,
+        end_date=end_date,
+    )
     mock_sync.assert_called_once()
     call_kwargs = mock_sync.call_args
     assert call_kwargs.kwargs["base_url"] == "http://example.com"
     start, end = call_kwargs.kwargs["date_range"]
-    assert (end - start).days == 30
+    assert start == start_date
+    assert end == end_date
 
 
 @patch("tools.flows.training_flow.sync_equity_details_data")
@@ -29,11 +39,14 @@ def test_sync_equity_details_calls_sync(mock_sync: MagicMock) -> None:
 
 @patch("tools.flows.training_flow.prepare_training_data")
 def test_prepare_data_calls_prepare_training_data(mock_prepare: MagicMock) -> None:
-    mock_prepare.return_value = "training/output.parquet"
+    start_date = datetime(2024, 1, 1, tzinfo=UTC)
+    end_date = datetime(2024, 1, 31, tzinfo=UTC)
+    mock_prepare.return_value = "s3://artifacts-bucket/training/output.parquet"
     result = prepare_data.fn(
         data_bucket="data-bucket",
         artifacts_bucket="artifacts-bucket",
-        lookback_days=30,
+        start_date=start_date,
+        end_date=end_date,
     )
     mock_prepare.assert_called_once()
     assert result == "training/output.parquet"
@@ -41,11 +54,14 @@ def test_prepare_data_calls_prepare_training_data(mock_prepare: MagicMock) -> No
 
 @patch("tools.flows.training_flow.prepare_training_data")
 def test_prepare_data_passes_output_key(mock_prepare: MagicMock) -> None:
-    mock_prepare.return_value = "custom/key.parquet"
+    start_date = datetime(2024, 1, 1, tzinfo=UTC)
+    end_date = datetime(2024, 1, 31, tzinfo=UTC)
+    mock_prepare.return_value = "s3://artifacts-bucket/custom/key.parquet"
     prepare_data.fn(
         data_bucket="data-bucket",
         artifacts_bucket="artifacts-bucket",
-        lookback_days=30,
+        start_date=start_date,
+        end_date=end_date,
         output_key="custom/key.parquet",
     )
     call_kwargs = mock_prepare.call_args.kwargs
@@ -89,27 +105,43 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
     assert result.startswith("s3://artifacts-bucket/artifacts/")
     mock_s3.get_object.assert_called_once()
     mock_s3.put_object.assert_called_once()
+    mock_train.assert_called_once()
+    assert "checkpoint_directory" in mock_train.call_args.kwargs
 
 
 @patch("tools.flows.training_flow.train_tide_model", return_value="s3://bucket/model")
 @patch("tools.flows.training_flow.prepare_data", return_value="training/data.parquet")
 @patch("tools.flows.training_flow.sync_equity_details")
 @patch("tools.flows.training_flow.sync_equity_bars")
+@patch("tools.flows.training_flow.get_training_date_range")
 def test_training_pipeline_threads_data_key(
+    mock_date_range: MagicMock,
     mock_bars: MagicMock,
     mock_details: MagicMock,
     mock_prepare: MagicMock,
     mock_train: MagicMock,
 ) -> None:
+    start_date = datetime(2024, 1, 1, tzinfo=UTC)
+    end_date = datetime(2024, 1, 31, tzinfo=UTC)
+    mock_date_range.return_value = (start_date, end_date)
+
     result = training_pipeline.fn(
         base_url="http://example.com",
         data_bucket="data-bucket",
         artifacts_bucket="artifacts-bucket",
-        lookback_days=30,
+        lookback_days=LOOKBACK_DAYS,
     )
-    mock_bars.assert_called_once_with("http://example.com", 30)
+
+    mock_date_range.assert_called_once_with(LOOKBACK_DAYS)
+    mock_bars.assert_called_once_with("http://example.com", start_date, end_date)
     mock_details.assert_called_once_with("http://example.com")
-    mock_prepare.assert_called_once()
+    mock_prepare.assert_called_once_with(
+        "data-bucket",
+        "artifacts-bucket",
+        start_date,
+        end_date,
+        "training/filtered_tide_training_data.parquet",
+    )
     mock_train.assert_called_once_with(
         "artifacts-bucket",
         "training/data.parquet",

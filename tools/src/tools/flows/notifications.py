@@ -10,8 +10,10 @@ logger = structlog.get_logger()
 
 def send_training_notification(flow: Flow, flow_run: FlowRun, state: State) -> None:
     """Send email notification via SES on training pipeline completion or failure."""
-    sender_email = os.getenv("TRAINING_NOTIFICATION_SENDER_EMAIL", "")
-    recipient_emails_raw = os.getenv("TRAINING_NOTIFICATION_RECIPIENT_EMAILS", "")
+    sender_email = os.getenv("TRAINING_NOTIFICATION_SENDER_EMAIL", "").strip()
+    recipient_emails_raw = os.getenv(
+        "TRAINING_NOTIFICATION_RECIPIENT_EMAILS", ""
+    ).strip()
 
     if not sender_email or not recipient_emails_raw:
         logger.warning(
@@ -24,6 +26,12 @@ def send_training_notification(flow: Flow, flow_run: FlowRun, state: State) -> N
     recipient_emails = [
         email.strip() for email in recipient_emails_raw.split(",") if email.strip()
     ]
+    if not recipient_emails:
+        logger.warning(
+            "Notification recipients are empty after parsing, skipping",
+            recipient_emails_raw=recipient_emails_raw,
+        )
+        return
 
     state_name = state.name or "Unknown"
     is_failure = state.is_failed()
@@ -32,7 +40,9 @@ def send_training_notification(flow: Flow, flow_run: FlowRun, state: State) -> N
     if flow_run.start_time and flow_run.end_time:
         duration_seconds = (flow_run.end_time - flow_run.start_time).total_seconds()
 
-    duration_text = f"{duration_seconds:.0f} seconds" if duration_seconds else "unknown"
+    duration_text = (
+        f"{duration_seconds:.0f} seconds" if duration_seconds is not None else "unknown"
+    )
 
     subject = (
         f"Training pipeline {'FAILED' if is_failure else 'completed'}: "
@@ -68,4 +78,9 @@ def send_training_notification(flow: Flow, flow_run: FlowRun, state: State) -> N
             state=state_name,
         )
     except Exception:
-        logger.exception("Failed to send training notification")
+        logger.exception(
+            "Failed to send training notification",
+            sender_email=sender_email,
+            recipients=recipient_emails,
+            state=state_name,
+        )
