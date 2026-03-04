@@ -1,6 +1,6 @@
 ---
-name: Code checks
-run-name: Code checks
+name: Run code checks
+run-name: Run code checks
 on:
   pull_request:
   # Allows for Rust cache to be established on master branch

@@ -5,11 +5,11 @@ updates:
     directory: /
     schedule:
       interval: cron
-      cronjob: 0 8 * * *
+      cronjob: 0 8 * * MON
       timezone: America/New_York
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: cron
-      cronjob: 0 8 * * *
+      cronjob: 0 8 * * MON
       timezone: America/New_York

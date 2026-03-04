@@ -1,0 +1,25 @@
+---
+markdown:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+
+python:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.py"
+          - "**/pyproject.toml"
+          - "**/uv.lock"
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.rs"
+          - "**/Cargo.toml"
+          - "**/Cargo.lock"
+
+yaml:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.yml"
+          - "**/*.yaml"
