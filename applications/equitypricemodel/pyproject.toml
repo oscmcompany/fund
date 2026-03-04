@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["boto3-stubs[s3]>=1.38.0"]
+dev = ["boto3-stubs[s3,ssm]>=1.38.0"]
 
 [tool.uv.sources]
 internal = { workspace = true }

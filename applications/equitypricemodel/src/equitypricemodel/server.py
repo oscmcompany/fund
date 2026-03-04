@@ -59,6 +59,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+MODEL_VERSION_SSM_PARAMETER = "/fund/equitypricemodel/model_version"
 
 
 def find_latest_artifact_key(
@@ -156,10 +157,49 @@ def download_and_extract_artifacts(
         temp_path.unlink(missing_ok=True)
 
 
+def _resolve_artifact_key(
+    s3_client: "S3Client",
+    bucket: str,
+    artifact_path: str,
+) -> str:
+    """Resolve the model artifact S3 key using SSM Parameter Store."""
+    try:
+        ssm_client = boto3.client("ssm")
+        response = ssm_client.get_parameter(
+            Name=MODEL_VERSION_SSM_PARAMETER,
+            WithDecryption=True,
+        )
+        model_version = response["Parameter"]["Value"]
+    except ClientError:
+        logger.exception("SSM parameter not available, using default artifact path")
+        model_version = "latest"
+
+    if model_version != "latest":
+        logger.info("Using model version from SSM", model_version=model_version)
+        if model_version.endswith(".tar.gz"):
+            return model_version
+        return f"{artifact_path.rstrip('/')}/{model_version}/output/model.tar.gz"
+
+    if artifact_path.endswith(".tar.gz"):
+        return artifact_path
+
+    return find_latest_artifact_key(
+        s3_client=s3_client,
+        bucket=bucket,
+        prefix=artifact_path,
+    )
+
+
+def cleanup_model_directory(model_directory: str) -> None:
+    if model_directory != "." and Path(model_directory).exists():
+        import shutil  # noqa: PLC0415
+
+        shutil.rmtree(model_directory, ignore_errors=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
-    import shutil  # noqa: PLC0415
 
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
     artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
@@ -172,14 +212,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         extract_path = Path(model_directory)
 
         try:
-            if artifact_path.endswith(".tar.gz"):
-                artifact_key = artifact_path
-            else:
-                artifact_key = find_latest_artifact_key(
-                    s3_client=s3_client,
-                    bucket=bucket,
-                    prefix=artifact_path,
-                )
+            artifact_key = _resolve_artifact_key(
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_path=artifact_path,
+            )
 
             download_and_extract_artifacts(
                 s3_client=s3_client,
@@ -188,12 +225,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 extract_path=extract_path,
             )
         except Exception:
-            logger.exception("failed_to_download_artifacts")
+            logger.exception("Failed to download artifacts")
             raise
 
-        logger.info("loading_model", directory=model_directory)
+        logger.info("Loading model", directory=model_directory)
     else:
-        logger.info("loading_model_from_local", directory=model_directory)
+        logger.info("Loading model from local", directory=model_directory)
 
     app.state.model_directory = model_directory
     app.state.tide_model = Model.load(directory_path=model_directory)
@@ -201,8 +238,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    if app.state.model_directory != "." and Path(app.state.model_directory).exists():
-        shutil.rmtree(app.state.model_directory, ignore_errors=True)
+    cleanup_model_directory(app.state.model_directory)
 
 
 application = FastAPI(lifespan=lifespan)
