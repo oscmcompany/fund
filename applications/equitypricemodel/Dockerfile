@@ -1,6 +1,6 @@
-FROM python:3.12.10-slim AS builder 
+FROM python:3.12.10-slim AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv  
+COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
 
 WORKDIR /app
 
@@ -10,7 +10,7 @@ COPY applications/equitypricemodel/ applications/equitypricemodel/
 
 COPY libraries/python/ libraries/python/
 
-RUN uv sync --no-dev 
+RUN uv sync --no-dev
 
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS trainer
 
@@ -32,13 +32,15 @@ ENV CUDA=1
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
 
 COPY --from=builder /app /app
 
 ENV PYTHONPATH=/app/applications/equitypricemodel/src
+ENV TRAINING_DATA_PATH=/app/training-data/filtered_tide_training_data.parquet
+ENV MODEL_OUTPUT_PATH=/app/model-artifacts
 
-ENTRYPOINT ["uv", "run", "--package", "equitypricemodel", "python", "applications/equitypricemodel/src/equitypricemodel/trainer.py"]
+ENTRYPOINT ["uv", "run", "--package", "equitypricemodel", "python", "-m", "equitypricemodel.trainer"]
 
 FROM python:3.12.10-slim AS server
 
@@ -50,7 +52,7 @@ ENV PYTHONPATH=/app/applications/equitypricemodel/src
 
 WORKDIR /app
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
 
 COPY --from=builder /app /app
 

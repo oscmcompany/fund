@@ -134,7 +134,7 @@ class AlpacaClient:
             http_not_found = 404
             position_not_found = (
                 status_code == http_not_found
-                or error_code in {"position_not_found"}
+                or error_code == "position_not_found"
                 or "position not found" in error_str
                 or "position does not exist" in error_str
             )
