@@ -25,3 +25,12 @@ config:
     secure: AAABACKTBgsKXMGiDo/WXf5/WTwxHIKAKYUGOMhCecEe09+g/huViXxO1fYA+I2EdIcxBk8zerAoxkOGNUMkik+45skuj3vUYHraOLiKmzSt9h7Z1R56ixPoNMrTSbCMjpHOHZSji0G7lH2qCdCj6jGH/aouZjZRsnPLGa5/pxjhe+1aUtuvwLoqr6IlyuPEkw==
   fund:randomSuffix:
     secure: AAABAPl47ORoO6t8NqEn8I/e49nYu7cuGBwRgA59mBFIKX7RyHTk1w==
+  fund:prefectAllowedCidrs:
+    - secure: AAABALiKgrczJ7GJHyFYtUDbI+zOIUqeg4NYuNNDXbI6iP5g2CGQ1bktFy2ZzjBVZrRLPW7HOZEccMTMYNDyIlQZ7xEKMVWhOFoL
+    - secure: AAABAHTPeLTWD9IZhYCwF3s601vNqbvIiYPx6dStB1zMhFZvDq4hp0mdrExk0CnG9Q==
+    - secure: AAABAA0owr9bPUoKIJvvgmmMfFL/QHE/dq2G5UVG5nKvoC6N/Q9QM//FsmYhOVSe
+    - secure: AAABAGabwlpPzBNk/V4FHC1FBihsyHgpgDOnJMQ9bXR5dB+qxvQsPxRy9iIit9NfbTwpEpLKGPU+xnpvG5JEpXaVE5ePau+gM46H
+  fund:trainingNotificationSenderEmail:
+    secure: AAABAAUimDipynPxKiwZJM1KNHM5uSBMxNfZ6lu5CiCrT14CPI/gdt2ezaqz102km/4XgGq0MRjuDPc2
+  fund:trainingNotificationRecipientEmails:
+    secure: AAABAM/wajUzYpwBJ3J/hqxAiFRYXg6uM46l/hbYAKDs9cNwOMg3DMZg22agKg/r6MenE8lUtuxOuZr1in3QnCD9s3ypncn+cS9LxcyTAARXcDMKV2g=

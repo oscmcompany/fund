@@ -1,0 +1,20 @@
+---
+name: Assign pull request reviewers
+run-name: Assign pull request reviewers
+on:
+  pull_request:
+    types:
+      - opened
+jobs:
+  assign_pull_request_reviewers:
+    name: Assign pull request reviewers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Assign pull request reviewers and assignees
+        uses: kentaro-m/auto-assign-action@v2.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          configuration-path: .github/assignment_configuration.yaml
