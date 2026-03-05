@@ -1,9 +1,27 @@
 from datetime import UTC, datetime
+from typing import cast
 
 import polars as pl
 import pytest
 from pandera.errors import SchemaError
-from portfoliomanager.portfolio_schema import portfolio_schema
+from pandera.polars import PolarsData
+from portfoliomanager.portfolio_schema import (
+    check_pair_tickers_different,
+    check_position_side_counts,
+    check_position_side_sums,
+    pairs_schema,
+    portfolio_schema,
+)
+
+
+class _MockPolarsData:
+    def __init__(self, df: pl.DataFrame) -> None:
+        self.lazyframe = df.lazy()
+        self.key = "side"
+
+
+def _as_polars_data(df: pl.DataFrame) -> PolarsData:
+    return cast("PolarsData", _MockPolarsData(df))
 
 
 def test_portfolio_schema_valid_data() -> None:
@@ -183,3 +201,71 @@ def test_portfolio_schema_zero_timestamp_fails() -> None:
 
     with pytest.raises(SchemaError):
         portfolio_schema.validate(data)
+
+
+def test_check_position_side_counts_short_count_mismatch_raises() -> None:
+    data = pl.DataFrame(
+        {
+            "side": ["LONG"] * 10 + ["SHORT"] * 5,
+            "dollar_amount": [1000.0] * 15,
+        }
+    )
+
+    with pytest.raises(ValueError, match="Expected 10 short side positions, found: 5"):
+        check_position_side_counts(_as_polars_data(data))
+
+
+def test_check_position_side_counts_total_count_mismatch_raises() -> None:
+    data = pl.DataFrame(
+        {
+            "side": ["LONG"] * 10 + ["SHORT"] * 10,
+            "dollar_amount": [1000.0] * 20,
+        }
+    )
+
+    with pytest.raises(ValueError, match="Expected 21 total positions, found: 20"):
+        check_position_side_counts(_as_polars_data(data), total_positions_count=21)
+
+
+def test_check_position_side_sums_zero_total_raises() -> None:
+    data = pl.DataFrame(
+        {
+            "side": ["LONG"] * 10 + ["SHORT"] * 10,
+            "dollar_amount": [0.0] * 20,
+        }
+    )
+
+    with pytest.raises(ValueError, match="Total dollar amount must be > 0"):
+        check_position_side_sums(_as_polars_data(data))
+
+
+def test_pairs_schema_validates_valid_pairs() -> None:
+    data = pl.DataFrame(
+        {
+            "pair_id": ["AAPL-MSFT", "GOOG-AMZN"],
+            "long_ticker": ["AAPL", "GOOG"],
+            "short_ticker": ["MSFT", "AMZN"],
+            "z_score": [2.5, 3.1],
+            "hedge_ratio": [1.2, 0.8],
+            "signal_strength": [0.4, 0.6],
+            "long_realized_volatility": [0.02, 0.03],
+            "short_realized_volatility": [0.018, 0.025],
+        }
+    )
+
+    validated = pairs_schema.validate(data)
+    assert validated.shape[0] == len(data)
+
+
+def test_check_pair_tickers_different_same_ticker_raises() -> None:
+    data = pl.DataFrame(
+        {
+            "long_ticker": ["AAPL", "AAPL"],
+            "short_ticker": ["MSFT", "AAPL"],  # second row: same ticker
+        }
+    )
+
+    with pytest.raises(
+        ValueError, match="long_ticker and short_ticker must be different"
+    ):
+        check_pair_tickers_different(_as_polars_data(data))
