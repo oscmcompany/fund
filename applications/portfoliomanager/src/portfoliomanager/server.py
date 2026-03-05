@@ -47,7 +47,7 @@ from .exceptions import (  # noqa: E402
     InsufficientBuyingPowerError,
     InsufficientPairsError,
 )
-from .portfolio_schema import portfolio_schema  # noqa: E402
+from .portfolio_schema import pairs_schema, portfolio_schema  # noqa: E402
 from .risk_management import size_pairs_with_volatility_parity  # noqa: E402
 from .statistical_arbitrage import select_pairs  # noqa: E402
 
@@ -173,6 +173,13 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     except Exception as e:
         logger.exception("Failed to select candidate pairs", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    if candidate_pairs.height > 0:
+        try:
+            candidate_pairs = pairs_schema.validate(candidate_pairs)
+        except Exception as e:
+            logger.exception("Candidate pairs failed schema validation", error=str(e))
+            return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     regime = get_regime_state()
     logger.info("Current market regime", state=regime)

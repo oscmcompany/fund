@@ -57,7 +57,11 @@ def _compute_log_returns(
     log_returns: dict[str, np.ndarray] = {}
     for col in ticker_columns:
         prices = window[col].to_numpy()
-        if np.any(np.isnan(prices)) or len(prices) < _MINIMUM_TICKER_COUNT:
+        if (
+            np.any(np.isnan(prices))
+            or np.any(prices <= 0)
+            or len(prices) < _MINIMUM_TICKER_COUNT
+        ):
             continue
         log_returns[col] = np.diff(np.log(prices))
     return log_returns

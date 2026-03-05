@@ -215,3 +215,32 @@ def test_compute_spread_zscore_z_negative_when_a_is_cheap() -> None:
     assert (
         z_score < 0
     )  # A is cheap relative to B → z < 0 → code assigns long=A, short=B
+
+
+def test_compute_log_returns_excludes_tickers_with_zero_price() -> None:
+    rng = np.random.RandomState(7)
+    n = CORRELATION_WINDOW_DAYS + 5
+
+    # AAPL: valid prices around 100 for all n rows
+    aapl_prices = 100.0 + rng.normal(0, 1.0, n)
+
+    # ZERO: mostly valid prices, but one row within the 60-day window is zero
+    zero_prices = 80.0 + rng.normal(0, 1.0, n)
+    zero_prices[-1] = 0.0  # zero within the tail(CORRELATION_WINDOW_DAYS) window
+
+    rows = [
+        {"ticker": "AAPL", "timestamp": float(t), "close_price": float(aapl_prices[t])}
+        for t in range(n)
+    ] + [
+        {"ticker": "ZERO", "timestamp": float(t), "close_price": float(zero_prices[t])}
+        for t in range(n)
+    ]
+    historical = pl.DataFrame(rows)
+    signals = _make_signals(["AAPL", "ZERO"])
+
+    result = select_pairs(signals, historical)
+
+    # ZERO is excluded by the <= 0 guard in _compute_log_returns, leaving only AAPL.
+    # With fewer than _MINIMUM_TICKER_COUNT valid tickers, select_pairs returns empty.
+    assert result.height == 0
+    assert list(result.columns) == list(_PAIRS_OUTPUT_SCHEMA.keys())
