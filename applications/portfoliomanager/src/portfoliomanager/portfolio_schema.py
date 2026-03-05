@@ -85,6 +85,49 @@ def check_position_side_sums(
     return True
 
 
+def check_pair_tickers_different(data: PolarsData) -> bool:
+    result = cast(
+        "pl.DataFrame",
+        data.lazyframe.select(
+            (pl.col("long_ticker") != pl.col("short_ticker"))
+            .all()
+            .alias("all_different")
+        ).collect(),
+    )
+    if not result.get_column("all_different").item():
+        message = "long_ticker and short_ticker must be different for every pair"
+        raise ValueError(message)
+    return True
+
+
+pairs_schema = pa.DataFrameSchema(
+    {
+        "pair_id": pa.Column(dtype=str),
+        "long_ticker": pa.Column(dtype=str, checks=[pa.Check(is_uppercase)]),
+        "short_ticker": pa.Column(dtype=str, checks=[pa.Check(is_uppercase)]),
+        "z_score": pa.Column(dtype=float, checks=[pa.Check.greater_than(0)]),
+        "hedge_ratio": pa.Column(dtype=float),
+        "signal_strength": pa.Column(
+            dtype=float, checks=[pa.Check.greater_than_or_equal_to(0)]
+        ),
+        "long_realized_volatility": pa.Column(
+            dtype=float, checks=[pa.Check.greater_than(0)]
+        ),
+        "short_realized_volatility": pa.Column(
+            dtype=float, checks=[pa.Check.greater_than(0)]
+        ),
+    },
+    unique=["pair_id"],
+    coerce=True,
+    checks=[
+        pa.Check(
+            check_fn=lambda df: check_pair_tickers_different(df),
+            error="Long and short tickers must be different for every pair",
+        ),
+    ],
+)
+
+
 portfolio_schema = pa.DataFrameSchema(
     {
         "ticker": pa.Column(
@@ -125,6 +168,7 @@ portfolio_schema = pa.DataFrameSchema(
             ],
             required=False,
         ),
+        "pair_id": pa.Column(dtype=str, nullable=True, required=False),
     },
     unique=["ticker"],
     coerce=True,

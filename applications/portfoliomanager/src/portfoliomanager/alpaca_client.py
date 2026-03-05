@@ -5,12 +5,20 @@ import structlog
 from alpaca.common.exceptions import APIError
 from alpaca.data import StockHistoricalDataClient
 from alpaca.trading import (
+    Asset,
     ClosePositionRequest,
+    GetAssetsRequest,
     OrderRequest,
     TradeAccount,
     TradingClient,
 )
-from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+from alpaca.trading.enums import (
+    AssetClass,
+    AssetStatus,
+    OrderSide,
+    OrderType,
+    TimeInForce,
+)
 
 from .enums import TradeSide
 from .exceptions import AssetNotShortableError, InsufficientBuyingPowerError
@@ -100,14 +108,29 @@ class AlpacaClient:
 
         time.sleep(self.rate_limit_sleep)
 
+    def get_shortable_tickers(self, tickers: list[str]) -> set[str]:
+        all_assets: list[Asset] = cast(
+            "list[Asset]",
+            self.trading_client.get_all_assets(
+                GetAssetsRequest(
+                    asset_class=AssetClass.US_EQUITY,
+                    status=AssetStatus.ACTIVE,
+                    attributes="shortable,easy_to_borrow,fractional",
+                )
+            ),
+        )
+        time.sleep(self.rate_limit_sleep)
+        ticker_set = set(tickers)
+        return {
+            str(asset.symbol)
+            for asset in all_assets
+            if asset.symbol in ticker_set and asset.shortable and asset.easy_to_borrow
+        }
+
     def close_position(
         self,
         ticker: str,
     ) -> bool:
-        """Close a position for the given ticker.
-
-        Returns True if position was closed, False if position didn't exist.
-        """
         try:
             self.trading_client.close_position(
                 symbol_or_asset_id=ticker.upper(),

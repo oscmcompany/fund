@@ -39,18 +39,17 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
+from .consolidation import consolidate_predictions  # noqa: E402
+from .data_client import fetch_equity_details, fetch_historical_prices  # noqa: E402
 from .enums import PositionSide, TradeSide  # noqa: E402
 from .exceptions import (  # noqa: E402
     AssetNotShortableError,
     InsufficientBuyingPowerError,
-    InsufficientPredictionsError,
+    InsufficientPairsError,
 )
 from .portfolio_schema import portfolio_schema  # noqa: E402
-from .risk_management import (  # noqa: E402
-    UNCERTAINTY_THRESHOLD,
-    add_predictions_zscore_ranked_columns,
-    create_optimal_portfolio,
-)
+from .risk_management import size_pairs_with_volatility_parity  # noqa: E402
+from .statistical_arbitrage import select_pairs  # noqa: E402
 
 logger = structlog.get_logger()
 
@@ -109,10 +108,35 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        current_predictions = await get_current_predictions()
-        logger.info("Retrieved predictions", count=len(current_predictions))
+        historical_prices = fetch_historical_prices(
+            DATAMANAGER_BASE_URL, current_timestamp
+        )
+        equity_details = fetch_equity_details(DATAMANAGER_BASE_URL)
+        logger.info(
+            "Retrieved historical data",
+            prices_count=historical_prices.height,
+            equity_details_count=equity_details.height,
+        )
+    except Exception as e:
+        logger.exception("Failed to retrieve historical data", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        raw_predictions = await get_raw_predictions()
+        logger.info("Retrieved predictions", count=len(raw_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        consolidated_signals = consolidate_predictions(
+            model_predictions={"tide": raw_predictions},
+            historical_prices=historical_prices,
+            equity_details=equity_details,
+        )
+        logger.info("Consolidated signals", count=consolidated_signals.height)
+    except Exception as e:
+        logger.exception("Failed to consolidate predictions", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -124,25 +148,51 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         logger.exception("Failed to retrieve prior portfolio tickers", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    consolidated_signals = consolidated_signals.filter(
+        ~pl.col("ticker").is_in(prior_portfolio_tickers)
+    )
+
+    try:
+        shortable_tickers = alpaca_client.get_shortable_tickers(
+            tickers=consolidated_signals["ticker"].to_list()
+        )
+        consolidated_signals = consolidated_signals.filter(
+            pl.col("ticker").is_in(shortable_tickers)
+        )
+        logger.info("Filtered to shortable tickers", count=consolidated_signals.height)
+    except Exception as e:
+        logger.exception("Failed to retrieve shortable tickers", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        candidate_pairs = select_pairs(
+            consolidated_signals=consolidated_signals,
+            historical_prices=historical_prices,
+        )
+        logger.info("Selected candidate pairs", count=candidate_pairs.height)
+    except Exception as e:
+        logger.exception("Failed to select candidate pairs", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    regime = get_regime_state()
+    logger.info("Current market regime", state=regime)
+
     try:
         optimal_portfolio = get_optimal_portfolio(
-            current_predictions=current_predictions,
-            prior_portfolio_tickers=prior_portfolio_tickers,
+            candidate_pairs=candidate_pairs,
             maximum_capital=float(account.cash_amount),
             current_timestamp=current_timestamp,
         )
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
-    except InsufficientPredictionsError as e:
+    except InsufficientPairsError as e:
         logger.warning(
-            "Insufficient predictions to create portfolio, no trades will be made",
+            "Insufficient pairs to create portfolio, no trades will be made",
             error=str(e),
-            uncertainty_threshold=UNCERTAINTY_THRESHOLD,
-            predictions_count=len(current_predictions),
-            prior_portfolio_tickers_count=len(prior_portfolio_tickers),
+            candidate_pairs_count=candidate_pairs.height,
         )
         return Response(
             status_code=status.HTTP_204_NO_CONTENT,
-            headers={"X-Portfolio-Status": "insufficient-predictions"},
+            headers={"X-Portfolio-Status": "insufficient-pairs"},
         )
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
@@ -347,23 +397,21 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     return Response(status_code=status.HTTP_200_OK)
 
 
-async def get_current_predictions() -> pl.DataFrame:
+async def get_raw_predictions() -> pl.DataFrame:
     async with httpx.AsyncClient(timeout=60.0) as client:
-        current_predictions_response = await client.post(
+        response = await client.post(
             url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
         )
+        response.raise_for_status()
+        return pl.DataFrame(response.json()["data"])
 
-        current_predictions_response.raise_for_status()
 
-        current_predictions = pl.DataFrame(current_predictions_response.json()["data"])
-
-        return add_predictions_zscore_ranked_columns(
-            current_predictions=current_predictions
-        )
+def get_regime_state() -> str:
+    """TODO: replace with regime.classify_regime in Phase 4."""
+    return "mean_reversion"
 
 
 def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
-    """Fetch tickers from prior portfolio to exclude them (PDT avoidance)."""
     try:
         prior_portfolio_response = requests.get(
             url=f"{DATAMANAGER_BASE_URL}/portfolios",
@@ -377,7 +425,7 @@ def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
 
         if prior_portfolio_response.status_code >= HTTP_BAD_REQUEST:
             logger.warning(
-                "Failed to fetch prior portfolio from datamanager",
+                "Failed to fetch prior portfolio from data manager",
                 status_code=prior_portfolio_response.status_code,
             )
             return []
@@ -407,15 +455,12 @@ def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
 
 
 def get_optimal_portfolio(
-    current_predictions: pl.DataFrame,
-    prior_portfolio_tickers: list[str],
+    candidate_pairs: pl.DataFrame,
     maximum_capital: float,
     current_timestamp: datetime,
 ) -> pl.DataFrame:
-    """Create optimal portfolio with prediction ranking and ticker exclusion."""
-    optimal_portfolio = create_optimal_portfolio(
-        current_predictions=current_predictions,
-        prior_portfolio_tickers=prior_portfolio_tickers,
+    optimal_portfolio = size_pairs_with_volatility_parity(
+        candidate_pairs=candidate_pairs,
         maximum_capital=maximum_capital,
         current_timestamp=current_timestamp,
     )
@@ -440,7 +485,6 @@ def get_positions(
     prior_portfolio_tickers: list[str],
     optimal_portfolio: pl.DataFrame,
 ) -> tuple[list[dict], list[dict]]:
-    """Get positions to close and open."""
     close_positions = [{"ticker": ticker} for ticker in prior_portfolio_tickers]
 
     open_positions = [
