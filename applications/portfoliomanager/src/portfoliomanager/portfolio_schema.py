@@ -168,7 +168,7 @@ portfolio_schema = pa.DataFrameSchema(
             ],
             required=False,
         ),
-        "pair_id": pa.Column(dtype=str, nullable=True, required=False),
+        "pair_id": pa.Column(dtype=str),
     },
     unique=["ticker"],
     coerce=True,

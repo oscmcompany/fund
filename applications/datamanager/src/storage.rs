@@ -554,7 +554,7 @@ pub async fn query_portfolio_dataframe_from_s3(
     );
     let connection = create_duckdb_connection().await?;
 
-    let (query_with_action, query_without_action) = match timestamp {
+    let query = match timestamp {
         Some(ts) => {
             let year = ts.format("%Y");
             let month = ts.format("%m");
@@ -568,34 +568,20 @@ pub async fn query_portfolio_dataframe_from_s3(
                 year, month, day
             );
 
-            let with_action = format!(
+            format!(
                 "
                 SELECT
                     ticker,
                     timestamp,
                     side,
                     dollar_amount,
-                    action
+                    action,
+                    pair_id
                 FROM '{}'
                 ORDER BY timestamp, ticker
                 ",
                 s3_path
-            );
-
-            let without_action = format!(
-                "
-                SELECT
-                    ticker,
-                    timestamp,
-                    side,
-                    dollar_amount
-                FROM '{}'
-                ORDER BY timestamp, ticker
-                ",
-                s3_path
-            );
-
-            (with_action, without_action)
+            )
         }
         None => {
             let s3_wildcard = format!(
@@ -607,7 +593,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                 s3_wildcard
             );
 
-            let with_action = format!(
+            format!(
                 "
                 WITH partitioned_data AS (
                     SELECT
@@ -616,6 +602,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                         side,
                         dollar_amount,
                         action,
+                        pair_id,
                         year,
                         month,
                         day
@@ -630,62 +617,18 @@ pub async fn query_portfolio_dataframe_from_s3(
                     timestamp,
                     side,
                     dollar_amount,
-                    action
+                    action,
+                    pair_id
                 FROM partitioned_data
                 WHERE (year::int * 10000 + month::int * 100 + day::int) = (SELECT date_int FROM max_date)
                 ORDER BY timestamp, ticker
                 ",
                 s3_wildcard
-            );
-
-            let without_action = format!(
-                "
-                WITH partitioned_data AS (
-                    SELECT
-                        ticker,
-                        timestamp,
-                        side,
-                        dollar_amount,
-                        year,
-                        month,
-                        day
-                    FROM read_parquet('{}', hive_partitioning = true)
-                ),
-                max_date AS (
-                    SELECT MAX(year::int * 10000 + month::int * 100 + day::int) as date_int
-                    FROM partitioned_data
-                )
-                SELECT
-                    ticker,
-                    timestamp,
-                    side,
-                    dollar_amount
-                FROM partitioned_data
-                WHERE (year::int * 10000 + month::int * 100 + day::int) = (SELECT date_int FROM max_date)
-                ORDER BY timestamp, ticker
-                ",
-                s3_wildcard
-            );
-
-            (with_action, without_action)
+            )
         }
     };
 
-    // Try query with action column first, fall back to query without if column doesn't exist
-    let portfolios = match execute_portfolio_query_with_action(&connection, &query_with_action) {
-        Ok(portfolios) => portfolios,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("action") && err_str.contains("not found") {
-                info!(
-                    "Action column not found in parquet, using fallback query with default action"
-                );
-                execute_portfolio_query_without_action(&connection, &query_without_action)?
-            } else {
-                return Err(e);
-            }
-        }
-    };
+    let portfolios = execute_portfolio_query(&connection, &query)?;
 
     info!("Query returned {} portfolio records", portfolios.len());
 
@@ -700,11 +643,8 @@ pub async fn query_portfolio_dataframe_from_s3(
     Ok(portfolio_dataframe)
 }
 
-fn execute_portfolio_query_with_action(
-    connection: &Connection,
-    query: &str,
-) -> Result<Vec<Portfolio>, Error> {
-    debug!("Executing query with action column: {}", query);
+fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<Portfolio>, Error> {
+    debug!("Executing portfolio query: {}", query);
 
     let mut statement = connection.prepare(query)?;
 
@@ -716,33 +656,7 @@ fn execute_portfolio_query_with_action(
                 side: row.get::<_, String>(2)?,
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            warn!("Failed to map portfolio query results: {}", e);
-            Error::Other(format!("Failed to map query results: {}", e))
-        })?;
-
-    Ok(portfolios)
-}
-
-fn execute_portfolio_query_without_action(
-    connection: &Connection,
-    query: &str,
-) -> Result<Vec<Portfolio>, Error> {
-    debug!("Executing query without action column: {}", query);
-
-    let mut statement = connection.prepare(query)?;
-
-    let portfolios: Vec<Portfolio> = statement
-        .query_map([], |row| {
-            Ok(Portfolio {
-                ticker: row.get::<_, String>(0)?,
-                timestamp: row.get::<_, f64>(1)?,
-                side: row.get::<_, String>(2)?,
-                dollar_amount: row.get::<_, f64>(3)?,
-                action: "UNSPECIFIED".to_string(),
+                pair_id: row.get::<_, String>(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()

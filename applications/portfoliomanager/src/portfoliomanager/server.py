@@ -3,6 +3,7 @@ import os
 from datetime import UTC, datetime
 
 import httpx
+import numpy as np
 import polars as pl
 import requests
 import sentry_sdk
@@ -48,16 +49,24 @@ from .exceptions import (  # noqa: E402
     InsufficientPairsError,
 )
 from .portfolio_schema import pairs_schema, portfolio_schema  # noqa: E402
-from .risk_management import size_pairs_with_volatility_parity  # noqa: E402
-from .statistical_arbitrage import select_pairs  # noqa: E402
+from .risk_management import (  # noqa: E402
+    Z_SCORE_HOLD_THRESHOLD,
+    Z_SCORE_STOP_LOSS,
+    size_pairs_with_volatility_parity,
+)
+from .statistical_arbitrage import (  # noqa: E402
+    CORRELATION_WINDOW_DAYS,
+    compute_spread_zscore,
+    select_pairs,
+)
 
 logger = structlog.get_logger()
 
 application: FastAPI = FastAPI()
 
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
-HTTP_NOT_FOUND = 404
 HTTP_BAD_REQUEST = 400
+_MINIMUM_PAIR_PRICE_ROWS = 2
 EQUITYPRICEMODEL_BASE_URL = os.getenv(
     "FUND_EQUITYPRICEMODEL_BASE_URL",
     "http://equitypricemodel:8080",
@@ -84,6 +93,15 @@ alpaca_client = AlpacaClient(
 )
 
 logger.info("Portfolio manager initialized", is_paper=alpaca_client.is_paper)
+
+_PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
+    "ticker": pl.String,
+    "timestamp": pl.Float64,
+    "side": pl.String,
+    "dollar_amount": pl.Float64,
+    "action": pl.String,
+    "pair_id": pl.String,
+}
 
 
 @application.get("/health")
@@ -140,12 +158,22 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_portfolio_tickers = get_prior_portfolio_tickers()
+        prior_portfolio = get_prior_portfolio()
+        prior_portfolio_tickers = prior_portfolio["ticker"].unique().to_list()
+        logger.info("Retrieved prior portfolio", count=len(prior_portfolio_tickers))
+    except Exception as e:
+        logger.exception("Failed to retrieve prior portfolio", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        held_tickers = evaluate_prior_pairs(prior_portfolio, historical_prices)
         logger.info(
-            "Retrieved prior portfolio tickers", count=len(prior_portfolio_tickers)
+            "Evaluated prior pairs",
+            held_count=len(held_tickers),
+            closing_count=len(prior_portfolio_tickers) - len(held_tickers),
         )
     except Exception as e:
-        logger.exception("Failed to retrieve prior portfolio tickers", error=str(e))
+        logger.exception("Failed to evaluate prior pairs", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
@@ -198,8 +226,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             candidate_pairs_count=candidate_pairs.height,
         )
         return Response(
-            status_code=status.HTTP_204_NO_CONTENT,
-            headers={"X-Portfolio-Status": "insufficient-pairs"},
+            status_code=status.HTTP_200_OK,
+            content="Insufficient pairs to create portfolio, no trades will be made",
+            media_type="text/plain",
         )
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
@@ -208,6 +237,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     try:
         open_positions, close_positions = get_positions(
             prior_portfolio_tickers=prior_portfolio_tickers,
+            held_tickers=held_tickers,
             optimal_portfolio=optimal_portfolio,
         )
         logger.info(
@@ -418,47 +448,144 @@ def get_regime_state() -> str:
     return "mean_reversion"
 
 
-def get_prior_portfolio_tickers() -> list[str]:  # noqa: PLR0911
+def get_prior_portfolio() -> pl.DataFrame:
+    empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
     try:
-        prior_portfolio_response = requests.get(
+        response = requests.get(
             url=f"{DATAMANAGER_BASE_URL}/portfolios",
             timeout=60,
         )
 
-        # If no prior portfolio, return empty list
-        if prior_portfolio_response.status_code == HTTP_NOT_FOUND:
-            logger.info("No prior portfolio found, starting fresh")
-            return []
-
-        if prior_portfolio_response.status_code >= HTTP_BAD_REQUEST:
+        if response.status_code >= HTTP_BAD_REQUEST:
             logger.warning(
                 "Failed to fetch prior portfolio from data manager",
-                status_code=prior_portfolio_response.status_code,
+                status_code=response.status_code,
             )
-            return []
+            return empty
 
-        response_text = prior_portfolio_response.text.strip()
+        response_text = response.text.strip()
         if not response_text or response_text == "[]":
             logger.info("Prior portfolio is empty")
-            return []
+            return empty
 
-        prior_portfolio_data = prior_portfolio_response.json()
+        prior_portfolio_data = response.json()
 
         if not prior_portfolio_data:
-            return []
+            return empty
 
         prior_portfolio = pl.DataFrame(prior_portfolio_data)
 
         if prior_portfolio.is_empty():
-            return []
+            return empty
 
-        tickers = prior_portfolio["ticker"].unique().to_list()
-        logger.info("Retrieved prior portfolio tickers", count=len(tickers))
-        return tickers  # noqa: TRY300
+        logger.info("Retrieved prior portfolio", count=prior_portfolio.height)
+        return prior_portfolio  # noqa: TRY300
 
     except (ValueError, requests.exceptions.JSONDecodeError) as e:
         logger.exception("Failed to parse prior portfolio JSON", error=str(e))
-        return []
+        return empty
+
+
+def evaluate_prior_pairs(
+    prior_portfolio: pl.DataFrame,
+    historical_prices: pl.DataFrame,
+) -> set[str]:
+    held_tickers: set[str] = set()
+
+    if prior_portfolio.is_empty():
+        return held_tickers
+
+    pair_ids = prior_portfolio["pair_id"].unique().to_list()
+
+    for pair_id_value in pair_ids:
+        pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id_value)
+
+        long_rows = pair_rows.filter(pl.col("side") == PositionSide.LONG.value)
+        short_rows = pair_rows.filter(pl.col("side") == PositionSide.SHORT.value)
+
+        if long_rows.is_empty() or short_rows.is_empty():
+            logger.warning(
+                "Malformed prior pair, closing normally", pair_id=pair_id_value
+            )
+            continue
+
+        long_ticker = long_rows["ticker"][0]
+        short_ticker = short_rows["ticker"][0]
+
+        pair_price_matrix = (
+            historical_prices.filter(
+                pl.col("ticker").is_in([long_ticker, short_ticker])
+            )
+            .pivot(on="ticker", index="timestamp", values="close_price")
+            .sort("timestamp")
+            .drop_nulls()
+        )
+
+        if (
+            long_ticker not in pair_price_matrix.columns
+            or short_ticker not in pair_price_matrix.columns
+        ):
+            logger.warning(
+                "Missing price data for prior pair, closing normally",
+                pair_id=pair_id_value,
+            )
+            continue
+
+        pair_price_matrix = pair_price_matrix.tail(CORRELATION_WINDOW_DAYS)
+
+        if pair_price_matrix.height < _MINIMUM_PAIR_PRICE_ROWS:
+            logger.warning(
+                "Insufficient price history for prior pair, closing normally",
+                pair_id=pair_id_value,
+            )
+            continue
+
+        long_prices = pair_price_matrix[long_ticker].to_numpy()
+        short_prices = pair_price_matrix[short_ticker].to_numpy()
+
+        if np.any(long_prices <= 0) or np.any(short_prices <= 0):
+            logger.warning(
+                "Non-positive prices in prior pair, closing normally",
+                pair_id=pair_id_value,
+            )
+            continue
+
+        log_prices_long = np.log(long_prices)
+        log_prices_short = np.log(short_prices)
+
+        current_z, _ = compute_spread_zscore(log_prices_long, log_prices_short)
+
+        if np.isnan(current_z):
+            logger.warning(
+                "NaN z-score for prior pair, closing normally",
+                pair_id=pair_id_value,
+            )
+            continue
+
+        abs_z = abs(current_z)
+
+        if Z_SCORE_HOLD_THRESHOLD <= abs_z <= Z_SCORE_STOP_LOSS:
+            held_tickers.add(long_ticker)
+            held_tickers.add(short_ticker)
+            logger.info(
+                "Holding prior pair, spread still mean-reverting",
+                pair_id=pair_id_value,
+                z_score=current_z,
+            )
+        elif abs_z < Z_SCORE_HOLD_THRESHOLD:
+            logger.info(
+                "Closing prior pair to realize profit, spread converged",
+                pair_id=pair_id_value,
+                z_score=current_z,
+            )
+        else:
+            logger.info(
+                "Closing prior pair on stop-loss, spread diverged",
+                pair_id=pair_id_value,
+                z_score=current_z,
+            )
+
+    return held_tickers
 
 
 def get_optimal_portfolio(
@@ -490,9 +617,14 @@ def get_optimal_portfolio(
 
 def get_positions(
     prior_portfolio_tickers: list[str],
+    held_tickers: set[str],
     optimal_portfolio: pl.DataFrame,
 ) -> tuple[list[dict], list[dict]]:
-    close_positions = [{"ticker": ticker} for ticker in prior_portfolio_tickers]
+    close_positions = [
+        {"ticker": ticker}
+        for ticker in prior_portfolio_tickers
+        if ticker not in held_tickers
+    ]
 
     open_positions = [
         {
