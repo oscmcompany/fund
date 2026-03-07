@@ -10,6 +10,8 @@ logger = structlog.get_logger()
 
 REQUIRED_PAIRS = 10
 MINIMUM_PAIRS_REQUIRED = REQUIRED_PAIRS
+Z_SCORE_HOLD_THRESHOLD = 0.5
+Z_SCORE_STOP_LOSS = 4.0
 
 
 def size_pairs_with_volatility_parity(
@@ -63,6 +65,7 @@ def size_pairs_with_volatility_parity(
         pl.lit(PositionSide.LONG.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
     short_positions = pairs.select(
@@ -71,6 +74,7 @@ def size_pairs_with_volatility_parity(
         pl.lit(PositionSide.SHORT.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
     return pl.concat([long_positions, short_positions]).sort(["ticker", "side"])

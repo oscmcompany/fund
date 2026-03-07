@@ -124,6 +124,7 @@ pub struct Portfolio {
     pub side: String,
     pub dollar_amount: f64,
     pub action: String,
+    pub pair_id: String,
 }
 
 pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<DataFrame, Error> {
@@ -138,6 +139,7 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
         "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
         "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
         "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
+        "pair_id" => portfolio_rows.iter().map(|p| p.pair_id.as_str()).collect::<Vec<&str>>(),
     )?;
 
     debug!("Normalizing ticker, side, and action columns to uppercase");
