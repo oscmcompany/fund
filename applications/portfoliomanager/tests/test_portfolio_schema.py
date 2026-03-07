@@ -46,26 +46,29 @@ _TICKERS = [
     "ZM",
     "DOCU",
 ]
+
 _PAIR_IDS = [
-    "AAPL-AMD",
+    # LONG legs (indices 0-9)
     "AAPL-AMD",
     "GOOGL-INTC",
-    "GOOGL-INTC",
-    "MSFT-ORCL",
     "MSFT-ORCL",
     "AMZN-ADBE",
-    "AMZN-ADBE",
-    "TSLA-PYPL",
     "TSLA-PYPL",
     "NVDA-SHOP",
-    "NVDA-SHOP",
-    "META-SPOT",
     "META-SPOT",
     "NFLX-ROKU",
-    "NFLX-ROKU",
-    "BABA-ZM",
     "BABA-ZM",
     "CRM-DOCU",
+    # SHORT legs (indices 10-19)
+    "AAPL-AMD",
+    "GOOGL-INTC",
+    "MSFT-ORCL",
+    "AMZN-ADBE",
+    "TSLA-PYPL",
+    "NVDA-SHOP",
+    "META-SPOT",
+    "NFLX-ROKU",
+    "BABA-ZM",
     "CRM-DOCU",
 ]
 
