@@ -491,7 +491,11 @@ def get_prior_portfolio() -> pl.DataFrame:
         logger.info("Retrieved prior portfolio", count=prior_portfolio.height)
         return prior_portfolio  # noqa: TRY300
 
-    except (ValueError, requests.exceptions.JSONDecodeError) as e:
+    except (
+        ValueError,
+        requests.exceptions.JSONDecodeError,
+        pl.exceptions.PolarsError,
+    ) as e:
         logger.exception("Failed to parse prior portfolio JSON", error=str(e))
         return empty
 
