@@ -481,7 +481,9 @@ def get_prior_portfolio() -> pl.DataFrame:
         if not prior_portfolio_data:
             return empty
 
-        prior_portfolio = pl.DataFrame(prior_portfolio_data)
+        prior_portfolio = pl.DataFrame(
+            prior_portfolio_data, schema=_PRIOR_PORTFOLIO_SCHEMA
+        )
 
         if prior_portfolio.is_empty():
             return empty

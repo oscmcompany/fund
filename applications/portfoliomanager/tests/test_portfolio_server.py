@@ -126,6 +126,19 @@ def test_evaluate_prior_pairs_does_not_hold_stop_loss_pair() -> None:
     assert "MSFT" not in result
 
 
+def test_evaluate_prior_pairs_does_not_hold_pair_at_stop_loss_boundary() -> None:
+    prior = _make_prior_portfolio(
+        [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
+    )
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    with patch(
+        "portfoliomanager.server.compute_spread_zscore", return_value=(4.0, 1.0)
+    ):
+        result = evaluate_prior_pairs(prior, historical_prices)
+    assert "AAPL" not in result
+    assert "MSFT" not in result
+
+
 def test_evaluate_prior_pairs_handles_negative_z_score_in_hold_zone() -> None:
     prior = _make_prior_portfolio(
         [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
