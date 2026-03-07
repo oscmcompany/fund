@@ -530,7 +530,12 @@ def evaluate_prior_pairs(
             historical_prices.filter(
                 pl.col("ticker").is_in([long_ticker, short_ticker])
             )
-            .pivot(on="ticker", index="timestamp", values="close_price")
+            .pivot(
+                on="ticker",
+                index="timestamp",
+                values="close_price",
+                aggregate_function="last",
+            )
             .sort("timestamp")
             .drop_nulls()
         )
