@@ -66,7 +66,7 @@ logger = structlog.get_logger()
 
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 HTTP_BAD_REQUEST = 400
-_MINIMUM_PAIR_PRICE_ROWS = 2
+_MINIMUM_PAIR_PRICE_ROWS = 30
 EQUITYPRICEMODEL_BASE_URL = os.getenv(
     "FUND_EQUITYPRICEMODEL_BASE_URL",
     "http://equitypricemodel:8080",
