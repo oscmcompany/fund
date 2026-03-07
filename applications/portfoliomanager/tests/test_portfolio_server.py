@@ -4,19 +4,11 @@ from unittest.mock import MagicMock, patch
 import polars as pl
 import pytest
 from portfoliomanager.server import (
+    _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
     get_positions,
     get_prior_portfolio,
 )
-
-_PRIOR_PORTFOLIO_SCHEMA = {
-    "ticker": pl.String,
-    "timestamp": pl.Float64,
-    "side": pl.String,
-    "dollar_amount": pl.Float64,
-    "action": pl.String,
-    "pair_id": pl.String,
-}
 
 
 def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
@@ -188,6 +180,38 @@ def test_evaluate_prior_pairs_skips_pair_missing_from_price_data() -> None:
     assert result == set()
 
 
+def test_evaluate_prior_pairs_skips_pair_with_non_positive_prices() -> None:
+    prior = _make_prior_portfolio(
+        [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
+    )
+    rows = []
+    for i in range(65):
+        rows.append(
+            {
+                "ticker": "AAPL",
+                "timestamp": float(i),
+                "close_price": 0.0 if i == 0 else 100.0,
+            }
+        )
+        rows.append({"ticker": "MSFT", "timestamp": float(i), "close_price": 100.0})
+    historical_prices = pl.DataFrame(rows)
+    result = evaluate_prior_pairs(prior, historical_prices)
+    assert result == set()
+
+
+def test_evaluate_prior_pairs_skips_pair_with_nan_z_score() -> None:
+    prior = _make_prior_portfolio(
+        [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
+    )
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    with patch(
+        "portfoliomanager.server.compute_spread_zscore",
+        return_value=(float("nan"), 1.0),
+    ):
+        result = evaluate_prior_pairs(prior, historical_prices)
+    assert result == set()
+
+
 def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
     prior = _make_prior_portfolio(
         [
@@ -197,15 +221,15 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT", "GOOGL", "AMZN"])
 
+    # pair_ids are sorted: "AAPL-MSFT" < "GOOGL-AMZN"
+    # first call → AAPL-MSFT (z=2.0, held), second → GOOGL-AMZN (z=0.2, closed)
     with patch(
         "portfoliomanager.server.compute_spread_zscore",
         side_effect=[(2.0, 1.0), (0.2, 1.0)],
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
 
-    # unique() order is non-deterministic, so one pair is held and the other closed;
-    # verify exactly one complete pair is held
-    assert result in ({"AAPL", "MSFT"}, {"GOOGL", "AMZN"})
+    assert result == {"AAPL", "MSFT"}
 
 
 # --- get_prior_portfolio ---

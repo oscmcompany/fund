@@ -75,17 +75,6 @@ EQUITYPRICEMODEL_BASE_URL = os.getenv(
 ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
-if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET:
-    logger.error(
-        "Missing Alpaca credentials",
-        api_key_id_set=bool(ALPACA_API_KEY_ID),
-        api_secret_set=bool(ALPACA_API_SECRET),
-    )
-    message = (
-        "ALPACA_API_KEY_ID and ALPACA_API_SECRET environment variables are required"
-    )
-    raise ValueError(message)
-
 alpaca_client = AlpacaClient(
     api_key=ALPACA_API_KEY_ID,
     api_secret=ALPACA_API_SECRET,
@@ -495,7 +484,7 @@ def evaluate_prior_pairs(
     if prior_portfolio.is_empty():
         return held_tickers
 
-    pair_ids = prior_portfolio["pair_id"].unique().to_list()
+    pair_ids = prior_portfolio["pair_id"].unique(maintain_order=False).sort().to_list()
 
     for pair_id_value in pair_ids:
         pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id_value)
@@ -564,7 +553,7 @@ def evaluate_prior_pairs(
 
         abs_z = abs(current_z)
 
-        if Z_SCORE_HOLD_THRESHOLD <= abs_z <= Z_SCORE_STOP_LOSS:
+        if Z_SCORE_HOLD_THRESHOLD <= abs_z < Z_SCORE_STOP_LOSS:
             held_tickers.add(long_ticker)
             held_tickers.add(short_ticker)
             logger.info(

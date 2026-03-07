@@ -248,6 +248,20 @@ def test_pairs_schema_validates_valid_pairs() -> None:
     assert validated.shape[0] == len(data)
 
 
+def test_portfolio_schema_missing_pair_id_fails() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "timestamp": [datetime(2025, 1, 1, 0, 0, 0, 0, tzinfo=UTC).timestamp()],
+            "side": ["LONG"],
+            "dollar_amount": [1000.0],
+        }
+    )
+
+    with pytest.raises((SchemaError, pl.exceptions.ColumnNotFoundError)):
+        portfolio_schema.validate(data)
+
+
 def test_check_pair_tickers_different_same_ticker_raises() -> None:
     data = pl.DataFrame(
         {
