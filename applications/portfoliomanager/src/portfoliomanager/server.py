@@ -1,5 +1,7 @@
 import logging
 import os
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import httpx
@@ -62,8 +64,6 @@ from .statistical_arbitrage import (  # noqa: E402
 
 logger = structlog.get_logger()
 
-application: FastAPI = FastAPI()
-
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 HTTP_BAD_REQUEST = 400
 _MINIMUM_PAIR_PRICE_ROWS = 2
@@ -75,13 +75,31 @@ EQUITYPRICEMODEL_BASE_URL = os.getenv(
 ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
-alpaca_client = AlpacaClient(
-    api_key=ALPACA_API_KEY_ID,
-    api_secret=ALPACA_API_SECRET,
-    is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
-)
 
-logger.info("Portfolio manager initialized", is_paper=alpaca_client.is_paper)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    if not ALPACA_API_KEY_ID or not ALPACA_API_SECRET:
+        logger.error(
+            "Missing Alpaca credentials",
+            api_key_id_set=bool(ALPACA_API_KEY_ID),
+            api_secret_set=bool(ALPACA_API_SECRET),
+        )
+        message = (
+            "ALPACA_API_KEY_ID and ALPACA_API_SECRET environment variables are required"
+        )
+        raise ValueError(message)
+    _app.state.alpaca_client = AlpacaClient(
+        api_key=ALPACA_API_KEY_ID,
+        api_secret=ALPACA_API_SECRET,
+        is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
+    )
+    logger.info(
+        "Portfolio manager initialized", is_paper=_app.state.alpaca_client.is_paper
+    )
+    yield
+
+
+application: FastAPI = FastAPI(lifespan=_lifespan)
 
 _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
     "ticker": pl.String,
@@ -100,6 +118,7 @@ def health_check() -> Response:
 
 @application.post("/portfolio")
 async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    alpaca_client: AlpacaClient = application.state.alpaca_client
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
