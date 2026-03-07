@@ -184,13 +184,15 @@ def test_evaluate_prior_pairs_skips_pair_with_non_positive_prices() -> None:
     prior = _make_prior_portfolio(
         [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
     )
+    n_rows = 65
+    last_row = n_rows - 1
     rows = []
-    for i in range(65):
+    for i in range(n_rows):
         rows.append(
             {
                 "ticker": "AAPL",
                 "timestamp": float(i),
-                "close_price": 0.0 if i == 0 else 100.0,
+                "close_price": 0.0 if i == last_row else 100.0,
             }
         )
         rows.append({"ticker": "MSFT", "timestamp": float(i), "close_price": 100.0})
