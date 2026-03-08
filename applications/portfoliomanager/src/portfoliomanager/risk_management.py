@@ -104,7 +104,10 @@ def size_pairs_with_volatility_parity(
     adjusted_weights = _apply_beta_neutral_weights(
         pairs, market_betas, volatility_parity_weights
     )
-    adjusted_weights = adjusted_weights / adjusted_weights.sum()
+    if adjusted_weights.sum() == 0.0:
+        adjusted_weights = volatility_parity_weights / volatility_parity_weights.sum()
+    else:
+        adjusted_weights = adjusted_weights / adjusted_weights.sum()
 
     dollar_amounts = adjusted_weights * (maximum_capital / 2.0) * exposure_scale
     pairs = pairs.with_columns(pl.Series("dollar_amount", dollar_amounts))

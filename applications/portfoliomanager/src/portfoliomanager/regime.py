@@ -27,7 +27,8 @@ def classify_regime(
 
     returns = np.diff(np.log(spy_close))
 
-    if len(returns) < _MINIMUM_RETURN_COUNT:
+    # Sparse data defaults to trending/0.0, halving exposure in the caller.
+    if len(returns) < _MINIMUM_RETURN_COUNT + 1:
         return {"state": "trending", "confidence": 0.0}
 
     realized_volatility = float(

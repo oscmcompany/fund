@@ -228,10 +228,12 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     try:
         market_betas = compute_market_betas(historical_prices, spy_prices)
         regime = classify_regime(spy_prices)
+        # Binary scale is intentional; confidence reserved for future graduated scaling.
         exposure_scale = 1.0 if regime["state"] == "mean_reversion" else 0.5
         logger.info(
             "Computed market betas and regime",
             regime_state=regime["state"],
+            regime_confidence=regime["confidence"],
             exposure_scale=exposure_scale,
         )
     except Exception as e:

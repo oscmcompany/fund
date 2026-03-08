@@ -94,6 +94,21 @@ def test_classify_regime_returns_trending_for_exactly_one_return() -> None:
     assert result["confidence"] == 0.0
 
 
+def test_classify_regime_returns_trending_for_exactly_two_returns() -> None:
+    # 3 prices yields 2 returns; np.corrcoef on 1-element arrays produces NaN,
+    # so the guard must catch len(returns) == 2 before the autocorrelation step.
+    spy_prices = pl.DataFrame(
+        {
+            "ticker": ["SPY", "SPY", "SPY"],
+            "timestamp": [0, 1, 2],
+            "close_price": [100.0, 101.0, 102.0],
+        }
+    )
+    result = classify_regime(spy_prices)
+    assert result["state"] == "trending"
+    assert result["confidence"] == 0.0
+
+
 def test_classify_regime_mean_reversion_confidence_is_positive() -> None:
     spy_prices = _make_low_vol_negative_autocorr_spy_prices()
     result = classify_regime(spy_prices)
