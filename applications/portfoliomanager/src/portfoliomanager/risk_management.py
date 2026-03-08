@@ -62,6 +62,7 @@ def size_pairs_with_volatility_parity(
         pl.lit(PositionSide.LONG.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
     short_positions = pairs.select(
@@ -70,6 +71,7 @@ def size_pairs_with_volatility_parity(
         pl.lit(PositionSide.SHORT.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
     return pl.concat([long_positions, short_positions]).sort(["ticker", "side"])

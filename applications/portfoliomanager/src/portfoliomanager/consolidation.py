@@ -12,6 +12,7 @@ def compute_ticker_volatility(historical_prices: pl.DataFrame) -> pl.DataFrame:
         .group_by("ticker")
         .agg(
             pl.col("daily_return")
+            .sort_by("timestamp")
             .drop_nulls()
             .tail(VOLATILITY_WINDOW_DAYS)
             .std()
