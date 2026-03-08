@@ -50,6 +50,7 @@ def compute_market_betas(
     return pl.DataFrame(results)
 
 
+# Validates beta neutralization in tests; retained for future beta reporting.
 def compute_portfolio_beta(
     portfolio: pl.DataFrame,
     market_betas: pl.DataFrame,

@@ -84,6 +84,16 @@ def test_classify_regime_returns_trending_for_insufficient_data() -> None:
     assert result["confidence"] == 0.0
 
 
+def test_classify_regime_returns_trending_for_exactly_one_return() -> None:
+    # Exactly 2 prices yields 1 return, which is below the minimum return count
+    spy_prices = pl.DataFrame(
+        {"ticker": ["SPY", "SPY"], "timestamp": [0, 1], "close_price": [100.0, 101.0]}
+    )
+    result = classify_regime(spy_prices)
+    assert result["state"] == "trending"
+    assert result["confidence"] == 0.0
+
+
 def test_classify_regime_mean_reversion_confidence_is_positive() -> None:
     spy_prices = _make_low_vol_negative_autocorr_spy_prices()
     result = classify_regime(spy_prices)

@@ -25,18 +25,16 @@ def classify_regime(
         spy_prices.sort("timestamp").tail(window_days + 1)["close_price"].to_numpy()
     )
 
-    if len(spy_close) < _MINIMUM_RETURN_COUNT:
+    returns = np.diff(np.log(spy_close))
+
+    if len(returns) < _MINIMUM_RETURN_COUNT:
         return {"state": "trending", "confidence": 0.0}
 
-    returns = np.diff(np.log(spy_close))
     realized_volatility = float(
         np.std(returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR)
     )
 
-    if len(returns) >= _MINIMUM_RETURN_COUNT:
-        autocorrelation = float(np.corrcoef(returns[:-1], returns[1:])[0, 1])
-    else:
-        autocorrelation = 0.0
+    autocorrelation = float(np.corrcoef(returns[:-1], returns[1:])[0, 1])
 
     low_volatility = realized_volatility < REGIME_VOLATILITY_THRESHOLD
     mean_reverting_signal = autocorrelation < REGIME_AUTOCORRELATION_THRESHOLD
