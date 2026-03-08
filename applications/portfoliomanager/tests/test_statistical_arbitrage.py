@@ -217,6 +217,28 @@ def test_compute_spread_zscore_z_negative_when_a_is_cheap() -> None:
     )  # A is cheap relative to B → z < 0 → code assigns long=A, short=B
 
 
+def test_select_pairs_skips_pair_with_infinite_hedge_ratio() -> None:
+    rng = np.random.default_rng(8)
+    n = CORRELATION_WINDOW_DAYS + 5
+
+    # AAPL: normal random-walk prices
+    aapl_prices = np.exp(np.log(100.0) + np.cumsum(rng.normal(0, 0.01, n)))
+
+    # FLAT: nearly constant log-price series so polyfit produces an infinite hedge ratio
+    flat_prices = np.full(n, 100.0)
+
+    tickers = ["AAPL", "FLAT"]
+    historical = _make_historical_prices(tickers, [aapl_prices, flat_prices], n)
+    signals = _make_signals(tickers)
+
+    result = select_pairs(signals, historical)
+
+    # The AAPL/FLAT pair is skipped because isinf(hedge_ratio) is True.
+    # With only two tickers and that pair skipped, the result must be empty.
+    assert result.height == 0
+    assert list(result.columns) == list(_PAIRS_OUTPUT_SCHEMA.keys())
+
+
 def test_compute_log_returns_excludes_tickers_with_zero_price() -> None:
     rng = np.random.default_rng(7)
     n = CORRELATION_WINDOW_DAYS + 5

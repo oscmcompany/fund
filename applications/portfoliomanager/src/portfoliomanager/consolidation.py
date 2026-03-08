@@ -49,9 +49,15 @@ def consolidate_predictions(
 
         signals = predictions_df.with_columns(
             pl.col("quantile_50").alias("alpha"),
-            (1.0 / (1.0 + (pl.col("quantile_90") - pl.col("quantile_10")))).alias(
-                "raw_confidence"
-            ),
+            (
+                1.0
+                / (
+                    1.0
+                    + (pl.col("quantile_90") - pl.col("quantile_10")).clip(
+                        lower_bound=0.0
+                    )
+                )
+            ).alias("raw_confidence"),
         ).select(["ticker", "alpha", "raw_confidence"])
 
         per_model_signals.append(signals)

@@ -10,7 +10,7 @@ from .exceptions import PriceDataUnavailableError
 def fetch_historical_prices(
     datamanager_base_url: str,
     reference_date: datetime,
-    lookback_days: int = 90,
+    lookback_days: int = 120,
 ) -> pl.DataFrame:
     start_timestamp = reference_date - timedelta(days=lookback_days)
 
