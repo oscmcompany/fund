@@ -12,7 +12,7 @@ from portfoliomanager.statistical_arbitrage import (
 
 
 def _make_cointegrated_prices(
-    rng: np.random.RandomState,
+    rng: np.random.Generator,
     n: int = CORRELATION_WINDOW_DAYS + 5,
     entry_deviation: float = 0.15,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -61,7 +61,7 @@ def _make_signals(
 
 
 def test_build_price_matrix_correct_shape_and_columns() -> None:
-    rng = np.random.RandomState(42)
+    rng = np.random.default_rng(42)
     n = CORRELATION_WINDOW_DAYS + 5
     tickers = ["AAPL", "MSFT"]
     prices_a, prices_b = _make_cointegrated_prices(rng, n=n)
@@ -76,7 +76,7 @@ def test_build_price_matrix_correct_shape_and_columns() -> None:
 
 
 def test_build_price_matrix_excludes_tickers_with_insufficient_history() -> None:
-    rng = np.random.RandomState(42)
+    rng = np.random.default_rng(42)
     n = CORRELATION_WINDOW_DAYS + 5
     prices_a, _ = _make_cointegrated_prices(rng, n=n)
     short_prices = np.exp(np.cumsum(rng.normal(0, 0.01, 10))) * 50.0
@@ -110,7 +110,7 @@ def test_compute_spread_zscore_z_positive_when_a_is_expensive() -> None:
 
 
 def test_select_pairs_output_columns_match_schema() -> None:
-    rng = np.random.RandomState(1)
+    rng = np.random.default_rng(1)
     n = CORRELATION_WINDOW_DAYS + 5
     tickers = ["AAPL", "MSFT"]
     prices_a, prices_b = _make_cointegrated_prices(rng, n=n)
@@ -123,7 +123,7 @@ def test_select_pairs_output_columns_match_schema() -> None:
 
 
 def test_select_pairs_no_ticker_in_more_than_one_pair() -> None:
-    rng = np.random.RandomState(2)
+    rng = np.random.default_rng(2)
     n = CORRELATION_WINDOW_DAYS + 5
     # Three independent cointegrated pairs: (A,B), (C,D), (E,F)
     tickers = ["A", "B", "C", "D", "E", "F"]
@@ -141,7 +141,7 @@ def test_select_pairs_no_ticker_in_more_than_one_pair() -> None:
 
 
 def test_select_pairs_excludes_tickers_below_confidence_threshold() -> None:
-    rng = np.random.RandomState(3)
+    rng = np.random.default_rng(3)
     n = CORRELATION_WINDOW_DAYS + 5
     prices_a, prices_b = _make_cointegrated_prices(rng, n=n)
     tickers = ["AAPL", "MSFT"]
@@ -159,7 +159,7 @@ def test_select_pairs_excludes_tickers_below_confidence_threshold() -> None:
 
 
 def test_select_pairs_returns_empty_dataframe_when_only_one_eligible_ticker() -> None:
-    rng = np.random.RandomState(4)
+    rng = np.random.default_rng(4)
     n = CORRELATION_WINDOW_DAYS + 5
     prices_a, _ = _make_cointegrated_prices(rng, n=n)
     historical = _make_historical_prices(["AAPL"], [prices_a], n)
@@ -172,7 +172,7 @@ def test_select_pairs_returns_empty_dataframe_when_only_one_eligible_ticker() ->
 
 
 def test_select_pairs_pair_id_matches_long_short_tickers() -> None:
-    rng = np.random.RandomState(5)
+    rng = np.random.default_rng(5)
     n = CORRELATION_WINDOW_DAYS + 5
     tickers = ["AAPL", "MSFT"]
     prices_a, prices_b = _make_cointegrated_prices(rng, n=n)
@@ -186,7 +186,7 @@ def test_select_pairs_pair_id_matches_long_short_tickers() -> None:
 
 
 def test_select_pairs_result_never_exceeds_target_pair_count() -> None:
-    rng = np.random.RandomState(6)
+    rng = np.random.default_rng(6)
     n = CORRELATION_WINDOW_DAYS + 5
     tickers = ["T0", "T1", "T2", "T3", "T4", "T5"]
     price_arrays: list[np.ndarray] = []
@@ -218,7 +218,7 @@ def test_compute_spread_zscore_z_negative_when_a_is_cheap() -> None:
 
 
 def test_compute_log_returns_excludes_tickers_with_zero_price() -> None:
-    rng = np.random.RandomState(7)
+    rng = np.random.default_rng(7)
     n = CORRELATION_WINDOW_DAYS + 5
 
     # AAPL: valid prices around 100 for all n rows

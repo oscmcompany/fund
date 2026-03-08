@@ -1,5 +1,7 @@
 import polars as pl
 
+VOLATILITY_WINDOW_DAYS = 20
+
 
 def compute_ticker_volatility(historical_prices: pl.DataFrame) -> pl.DataFrame:
     return (
@@ -11,7 +13,7 @@ def compute_ticker_volatility(historical_prices: pl.DataFrame) -> pl.DataFrame:
         .agg(
             pl.col("daily_return")
             .drop_nulls()
-            .tail(20)
+            .tail(VOLATILITY_WINDOW_DAYS)
             .std()
             .alias("realized_volatility")
         )

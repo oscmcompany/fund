@@ -5,7 +5,7 @@ import pytest
 from portfoliomanager.exceptions import InsufficientPairsError
 from portfoliomanager.portfolio_schema import portfolio_schema
 from portfoliomanager.risk_management import (
-    MINIMUM_PAIRS_REQUIRED,
+    REQUIRED_PAIRS,
     size_pairs_with_volatility_parity,
 )
 
@@ -65,7 +65,7 @@ def test_size_pairs_with_volatility_parity_lower_volatility_receives_more_capita
 
 
 def test_size_pairs_with_volatility_parity_raises_insufficient_pairs_error() -> None:
-    pairs = _make_candidate_pairs(count=MINIMUM_PAIRS_REQUIRED - 1)
+    pairs = _make_candidate_pairs(count=REQUIRED_PAIRS - 1)
     with pytest.raises(InsufficientPairsError):
         size_pairs_with_volatility_parity(
             pairs, maximum_capital=10000.0, current_timestamp=_CURRENT_TIMESTAMP
@@ -80,4 +80,4 @@ def test_size_pairs_with_volatility_parity_output_passes_portfolio_schema_valida
         pairs, maximum_capital=10000.0, current_timestamp=_CURRENT_TIMESTAMP
     )
     validated = portfolio_schema.validate(result)
-    assert validated.height == MINIMUM_PAIRS_REQUIRED * 2
+    assert validated.height == REQUIRED_PAIRS * 2

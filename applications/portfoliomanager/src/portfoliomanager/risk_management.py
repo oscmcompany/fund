@@ -9,7 +9,6 @@ from .exceptions import InsufficientPairsError
 logger = structlog.get_logger()
 
 REQUIRED_PAIRS = 10
-MINIMUM_PAIRS_REQUIRED = REQUIRED_PAIRS
 
 
 def size_pairs_with_volatility_parity(
@@ -17,10 +16,10 @@ def size_pairs_with_volatility_parity(
     maximum_capital: float,
     current_timestamp: datetime,
 ) -> pl.DataFrame:
-    if candidate_pairs.height < MINIMUM_PAIRS_REQUIRED:
+    if candidate_pairs.height < REQUIRED_PAIRS:
         message = (
             f"Only {candidate_pairs.height} pairs available, "
-            f"need at least {MINIMUM_PAIRS_REQUIRED}."
+            f"need at least {REQUIRED_PAIRS}."
         )
         raise InsufficientPairsError(message)
 
