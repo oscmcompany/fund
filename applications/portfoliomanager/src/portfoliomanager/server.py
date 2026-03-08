@@ -42,8 +42,13 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
+from .beta import compute_market_betas  # noqa: E402
 from .consolidation import consolidate_predictions  # noqa: E402
-from .data_client import fetch_equity_details, fetch_historical_prices  # noqa: E402
+from .data_client import (  # noqa: E402
+    fetch_equity_details,
+    fetch_historical_prices,
+    fetch_spy_prices,
+)
 from .enums import PositionSide, TradeSide  # noqa: E402
 from .exceptions import (  # noqa: E402
     AssetNotShortableError,
@@ -51,6 +56,7 @@ from .exceptions import (  # noqa: E402
     InsufficientPairsError,
 )
 from .portfolio_schema import pairs_schema, portfolio_schema  # noqa: E402
+from .regime import classify_regime  # noqa: E402
 from .risk_management import (  # noqa: E402
     Z_SCORE_HOLD_THRESHOLD,
     Z_SCORE_STOP_LOSS,
@@ -138,10 +144,12 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             DATAMANAGER_BASE_URL, current_timestamp
         )
         equity_details = fetch_equity_details(DATAMANAGER_BASE_URL)
+        spy_prices = fetch_spy_prices(DATAMANAGER_BASE_URL, current_timestamp)
         logger.info(
             "Retrieved historical data",
             prices_count=historical_prices.height,
             equity_details_count=equity_details.height,
+            spy_prices_count=spy_prices.height,
         )
     except Exception as e:
         logger.exception("Failed to retrieve historical data", error=str(e))
@@ -217,14 +225,26 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             logger.exception("Candidate pairs failed schema validation", error=str(e))
             return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    regime = get_regime_state()
-    logger.info("Current market regime", state=regime)
+    try:
+        market_betas = compute_market_betas(historical_prices, spy_prices)
+        regime = classify_regime(spy_prices)
+        exposure_scale = 1.0 if regime["state"] == "mean_reversion" else 0.5
+        logger.info(
+            "Computed market betas and regime",
+            regime_state=regime["state"],
+            exposure_scale=exposure_scale,
+        )
+    except Exception as e:
+        logger.exception("Failed to compute market betas or regime", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         optimal_portfolio = get_optimal_portfolio(
             candidate_pairs=candidate_pairs,
             maximum_capital=float(account.cash_amount),
             current_timestamp=current_timestamp,
+            market_betas=market_betas,
+            exposure_scale=exposure_scale,
         )
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
     except InsufficientPairsError as e:
@@ -288,7 +308,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                         "reason": "position_not_found",
                     }
                 )
-        except Exception as e:  # noqa: PERF203
+        except Exception as e:
             logger.exception(
                 "Failed to close position",
                 ticker=close_position["ticker"],
@@ -451,11 +471,6 @@ async def get_raw_predictions() -> pl.DataFrame:
         return pl.DataFrame(response.json()["data"])
 
 
-def get_regime_state() -> str:
-    """TODO: replace with regime.classify_regime in Phase 4."""
-    return "mean_reversion"
-
-
 def get_prior_portfolio() -> pl.DataFrame:
     empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
     try:
@@ -611,11 +626,15 @@ def get_optimal_portfolio(
     candidate_pairs: pl.DataFrame,
     maximum_capital: float,
     current_timestamp: datetime,
+    market_betas: pl.DataFrame,
+    exposure_scale: float,
 ) -> pl.DataFrame:
     optimal_portfolio = size_pairs_with_volatility_parity(
         candidate_pairs=candidate_pairs,
         maximum_capital=maximum_capital,
         current_timestamp=current_timestamp,
+        market_betas=market_betas,
+        exposure_scale=exposure_scale,
     )
 
     optimal_portfolio = portfolio_schema.validate(optimal_portfolio)
