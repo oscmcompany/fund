@@ -67,6 +67,7 @@ fn sample_portfolio() -> Portfolio {
         side: "long".to_string(),
         dollar_amount: 10000.0,
         action: "hold".to_string(),
+        pair_id: "AAPL-GOOGL".to_string(),
     }
 }
 
@@ -78,6 +79,7 @@ fn sample_portfolio_lowercase() -> Portfolio {
         side: "short".to_string(),
         dollar_amount: 5000.0,
         action: "sell".to_string(),
+        pair_id: "aapl-googl".to_string(),
     }
 }
 
@@ -328,12 +330,13 @@ fn test_create_portfolio_dataframe_valid_data() {
     let df = create_portfolio_dataframe(portfolios).unwrap();
 
     assert_eq!(df.height(), 1);
-    assert_eq!(df.width(), 5);
+    assert_eq!(df.width(), 6);
     assert!(df.column("ticker").is_ok());
     assert!(df.column("timestamp").is_ok());
     assert!(df.column("side").is_ok());
     assert!(df.column("dollar_amount").is_ok());
     assert!(df.column("action").is_ok());
+    assert!(df.column("pair_id").is_ok());
 }
 
 #[test]
@@ -363,6 +366,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
             side: "long".to_string(),
             dollar_amount: 10000.0,
             action: "buy".to_string(),
+            pair_id: "AAPL-GOOGL".to_string(),
         },
         Portfolio {
             ticker: "GOOGL".to_string(),
@@ -370,6 +374,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
             side: "SHORT".to_string(),
             dollar_amount: 5000.0,
             action: "Sell".to_string(),
+            pair_id: "AAPL-GOOGL".to_string(),
         },
     ];
 
@@ -416,7 +421,7 @@ fn test_create_portfolio_dataframe_empty_vec() {
     let df = create_portfolio_dataframe(portfolios).unwrap();
 
     assert_eq!(df.height(), 0);
-    assert_eq!(df.width(), 5);
+    assert_eq!(df.width(), 6);
 }
 
 // Tests for create_equity_details_dataframe
@@ -643,7 +648,7 @@ fn test_portfolio_dataframe_parquet_roundtrip() {
     let cursor = Cursor::new(buffer);
     let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
 
-    assert_eq!(deserialized_df.width(), 5);
+    assert_eq!(deserialized_df.width(), 6);
     assert_eq!(deserialized_df.height(), 1);
 
     assert!(deserialized_df.column("ticker").is_ok());
@@ -651,9 +656,13 @@ fn test_portfolio_dataframe_parquet_roundtrip() {
     assert!(deserialized_df.column("side").is_ok());
     assert!(deserialized_df.column("dollar_amount").is_ok());
     assert!(deserialized_df.column("action").is_ok());
+    assert!(deserialized_df.column("pair_id").is_ok());
 
     let ticker_series = deserialized_df.column("ticker").unwrap();
     assert_eq!(ticker_series.str().unwrap().get(0).unwrap(), "AAPL");
+
+    let pair_id_series = deserialized_df.column("pair_id").unwrap();
+    assert_eq!(pair_id_series.str().unwrap().get(0).unwrap(), "AAPL-GOOGL");
 }
 
 #[test]
