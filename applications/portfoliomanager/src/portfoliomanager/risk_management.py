@@ -37,8 +37,6 @@ def _apply_beta_neutral_weights(
 
     def objective(weights: np.ndarray) -> float:
         total = float(np.sum(weights))
-        if total == 0.0:
-            return 0.0
         net_beta = float(np.dot(weights, pair_net_betas) / total)
         return net_beta**2
 
@@ -104,7 +102,7 @@ def size_pairs_with_volatility_parity(
     adjusted_weights = _apply_beta_neutral_weights(
         pairs, market_betas, volatility_parity_weights
     )
-    if adjusted_weights.sum() == 0.0:
+    if np.isclose(adjusted_weights.sum(), 0.0):
         adjusted_weights = volatility_parity_weights / volatility_parity_weights.sum()
     else:
         adjusted_weights = adjusted_weights / adjusted_weights.sum()
