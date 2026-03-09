@@ -1,5 +1,7 @@
 import polars as pl
 
+VOLATILITY_WINDOW_DAYS = 20
+
 
 def compute_ticker_volatility(historical_prices: pl.DataFrame) -> pl.DataFrame:
     return (
@@ -10,8 +12,9 @@ def compute_ticker_volatility(historical_prices: pl.DataFrame) -> pl.DataFrame:
         .group_by("ticker")
         .agg(
             pl.col("daily_return")
+            .sort_by("timestamp")
             .drop_nulls()
-            .tail(20)
+            .tail(VOLATILITY_WINDOW_DAYS)
             .std()
             .alias("realized_volatility")
         )
@@ -47,9 +50,15 @@ def consolidate_predictions(
 
         signals = predictions_df.with_columns(
             pl.col("quantile_50").alias("alpha"),
-            (1.0 / (1.0 + (pl.col("quantile_90") - pl.col("quantile_10")))).alias(
-                "raw_confidence"
-            ),
+            (
+                1.0
+                / (
+                    1.0
+                    + (pl.col("quantile_90") - pl.col("quantile_10")).clip(
+                        lower_bound=0.0
+                    )
+                )
+            ).alias("raw_confidence"),
         ).select(["ticker", "alpha", "raw_confidence"])
 
         per_model_signals.append(signals)

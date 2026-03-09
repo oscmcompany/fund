@@ -88,7 +88,7 @@ def _build_candidate_pairs(
 
             current_z, hedge_ratio = compute_spread_zscore(log_prices_a, log_prices_b)
 
-            if np.isnan(current_z) or np.isnan(hedge_ratio):
+            if np.isnan(current_z) or np.isnan(hedge_ratio) or np.isinf(hedge_ratio):
                 continue
 
             if abs(current_z) < Z_SCORE_ENTRY_THRESHOLD:

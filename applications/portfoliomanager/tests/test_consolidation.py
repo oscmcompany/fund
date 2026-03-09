@@ -160,6 +160,59 @@ def test_consolidate_predictions_raises_on_empty_model_dict() -> None:
         )
 
 
+def test_consolidate_predictions_all_zero_confidence_does_not_raise() -> None:
+    tickers = ["AAPL", "MSFT"]
+    predictions = pl.DataFrame(
+        {
+            "ticker": tickers,
+            "timestamp": ["2024-01-25"] * 2,
+            "quantile_10": [0.0, 0.0],
+            "quantile_50": [0.1, 0.1],
+            "quantile_90": [
+                float("inf"),
+                float("inf"),
+            ],  # raw_confidence = 1/(1+inf) = 0.0
+        }
+    )
+
+    result = consolidate_predictions(
+        model_predictions={"tide": predictions},
+        historical_prices=_make_historical_prices(tickers),
+        equity_details=_make_equity_details(tickers),
+    )
+
+    assert result.columns == [
+        "ticker",
+        "ensemble_alpha",
+        "ensemble_confidence",
+        "realized_volatility",
+        "sector",
+    ]
+    assert all(value == 0.0 for value in result["ensemble_confidence"].to_list())
+
+
+def test_consolidate_predictions_inverted_quantiles_confidence_within_bounds() -> None:
+    tickers = ["AAPL", "MSFT"]
+    predictions = pl.DataFrame(
+        {
+            "ticker": tickers,
+            "timestamp": ["2024-01-25"] * 2,
+            "quantile_10": [0.30, 0.50],  # quantile_10 > quantile_90 (inverted)
+            "quantile_50": [0.20, 0.40],
+            "quantile_90": [0.10, 0.20],
+        }
+    )
+
+    result = consolidate_predictions(
+        model_predictions={"tide": predictions},
+        historical_prices=_make_historical_prices(tickers),
+        equity_details=_make_equity_details(tickers),
+    )
+
+    confidences = result["ensemble_confidence"].to_list()
+    assert all(0.0 <= value <= 1.0 for value in confidences)
+
+
 def test_consolidate_predictions_raises_on_missing_required_columns() -> None:
     bad_predictions = pl.DataFrame(
         {
