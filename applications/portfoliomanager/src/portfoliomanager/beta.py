@@ -64,7 +64,7 @@ def compute_portfolio_beta(
     )
 
     total_gross = portfolio["dollar_amount"].sum()
-    if total_gross == 0.0:
+    if np.isclose(total_gross, 0.0):
         return 0.0
 
     net_beta = 0.0
