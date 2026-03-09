@@ -25,6 +25,9 @@ def classify_regime(
         spy_prices.sort("timestamp").tail(window_days + 1)["close_price"].to_numpy()
     )
 
+    if np.any(spy_close <= 0):
+        return {"state": "trending", "confidence": 0.0}
+
     returns = np.diff(np.log(spy_close))
 
     # Sparse data defaults to trending/0.0, halving exposure in the caller.

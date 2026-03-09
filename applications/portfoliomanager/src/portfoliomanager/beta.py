@@ -17,7 +17,7 @@ def compute_market_betas(
         spy_prices.sort("timestamp").tail(window_days + 1)["close_price"].to_numpy()
     )
 
-    if len(spy_close) < _MINIMUM_RETURN_COUNT + 1:
+    if len(spy_close) < _MINIMUM_RETURN_COUNT + 1 or np.any(spy_close <= 0):
         return pl.DataFrame(schema={"ticker": pl.String, "market_beta": pl.Float64})
 
     spy_returns = np.diff(np.log(spy_close))
