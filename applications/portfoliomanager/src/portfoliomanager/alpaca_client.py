@@ -115,7 +115,6 @@ class AlpacaClient:
                 GetAssetsRequest(
                     asset_class=AssetClass.US_EQUITY,
                     status=AssetStatus.ACTIVE,
-                    attributes="shortable,easy_to_borrow,fractional",
                 )
             ),
         )

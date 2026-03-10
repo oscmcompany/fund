@@ -1,6 +1,8 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.requests import GetAssetsRequest
 from portfoliomanager.alpaca_client import AlpacaAccount, AlpacaClient
 from portfoliomanager.enums import TradeSide
 from portfoliomanager.exceptions import (
@@ -286,3 +288,18 @@ def test_get_shortable_tickers_returns_empty_set_when_none_pass() -> None:
     result = client.get_shortable_tickers(["AAPL", "MSFT"])
 
     assert result == set()
+
+
+def test_get_shortable_tickers_does_not_pass_attributes_to_api() -> None:
+    client, mock_trading = _make_client()
+    mock_trading.get_all_assets.return_value = [
+        _make_mock_asset("AAPL", shortable=True, easy_to_borrow=True),
+    ]
+
+    client.get_shortable_tickers(["AAPL"])
+
+    expected_request = GetAssetsRequest(
+        asset_class=AssetClass.US_EQUITY,
+        status=AssetStatus.ACTIVE,
+    )
+    mock_trading.get_all_assets.assert_called_once_with(expected_request)

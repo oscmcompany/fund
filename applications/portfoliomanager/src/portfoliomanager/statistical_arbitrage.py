@@ -11,11 +11,23 @@ TARGET_PAIR_COUNT = 10
 _MINIMUM_TICKER_COUNT = 2
 
 _PAIRS_OUTPUT_SCHEMA: dict[str, type] = {
+    # Human-readable identifier combining both tickers (e.g. "AAPL-MSFT")
     "pair_id": pl.String,
+    # The leg to buy: the ticker whose price is relatively cheap vs its historical
+    # spread
     "long_ticker": pl.String,
+    # The leg to sell short: the ticker whose price is relatively expensive vs the
+    # spread
     "short_ticker": pl.String,
+    # Standard deviations the current spread has diverged from its mean; higher values
+    # indicate a more stretched and potentially higher-conviction mean-reversion
+    # opportunity
     "z_score": pl.Float64,
+    # Cointegration regression slope: shares of the short leg per share of the long leg
+    # needed to neutralize the spread; negative values indicate an inverse relationship
     "hedge_ratio": pl.Float64,
+    # Absolute difference in ensemble_alpha between the two legs; measures how strongly
+    # the model disagrees on their relative forward returns
     "signal_strength": pl.Float64,
     "long_realized_volatility": pl.Float64,
     "short_realized_volatility": pl.Float64,
@@ -35,7 +47,8 @@ def build_price_matrix(
     valid_columns = ["timestamp"] + [
         col
         for col in ticker_columns
-        if price_matrix[col].drop_nulls().len() >= CORRELATION_WINDOW_DAYS
+        if price_matrix[col].tail(CORRELATION_WINDOW_DAYS).drop_nulls().len()
+        >= CORRELATION_WINDOW_DAYS
     ]
     return price_matrix.select(valid_columns)
 
@@ -63,7 +76,10 @@ def _compute_log_returns(
             or len(prices) < _MINIMUM_TICKER_COUNT
         ):
             continue
-        log_returns[col] = np.diff(np.log(prices))
+        returns = np.diff(np.log(prices))
+        if np.isclose(np.std(returns), 0.0):
+            continue
+        log_returns[col] = returns
     return log_returns
 
 

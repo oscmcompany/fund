@@ -13,6 +13,12 @@ def compute_market_betas(
     spy_prices: pl.DataFrame,
     window_days: int = BETA_WINDOW_DAYS,
 ) -> pl.DataFrame:
+    """Compute market beta for each ticker against SPY over the trailing window.
+
+    market_beta measures the stock's sensitivity to broad market moves: values
+    near 1.0 track the market closely, >1.0 amplify moves, and negative values
+    indicate counter-cyclical or inverse behavior (e.g. gold miners).
+    """
     spy_close = (
         spy_prices.sort("timestamp").tail(window_days + 1)["close_price"].to_numpy()
     )
@@ -55,6 +61,11 @@ def compute_portfolio_beta(
     portfolio: pl.DataFrame,
     market_betas: pl.DataFrame,
 ) -> float:
+    """Compute the net market exposure of the full portfolio.
+
+    Sums the dollar-weighted beta across all positions (positive for LONG,
+    negative for SHORT). A value near 0.0 means market risk has been hedged out.
+    """
     beta_lookup = dict(
         zip(
             market_betas["ticker"].to_list(),

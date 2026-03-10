@@ -68,6 +68,15 @@ def size_pairs_with_volatility_parity(
     market_betas: pl.DataFrame,
     exposure_scale: float = 1.0,
 ) -> pl.DataFrame:
+    """Size pairs so each contributes equal risk, then optimize for beta neutrality.
+
+    Pairs with lower realized spread volatility receive more capital so that every
+    pair contributes the same risk to the portfolio (volatility parity). A SLSQP
+    optimizer then nudges the weights to drive net portfolio beta toward zero.
+    Each pair is dollar-neutral: the same dollar amount is allocated to both legs.
+    The exposure_scale parameter is a regime-driven multiplier (1.0x for
+    mean_reversion, 0.5x for trending) applied before the final dollar amounts.
+    """
     if candidate_pairs.height < REQUIRED_PAIRS:
         message = (
             f"Only {candidate_pairs.height} pairs available, "

@@ -26,6 +26,18 @@ def consolidate_predictions(
     historical_prices: pl.DataFrame,
     equity_details: pl.DataFrame,
 ) -> pl.DataFrame:
+    """Blend model predictions into per-ticker trading signals.
+
+    Output columns:
+      ensemble_alpha       - mean expected forward return across all models;
+                             drives the long/short direction decision in pair selection
+      ensemble_confidence  - how certain the ensemble is (0-1, normalized to the
+                             most confident ticker); derived from the quantile spread
+                             width: a narrow spread signals high model agreement
+      realized_volatility  - trailing daily return volatility used for volatility-
+                             parity position sizing
+      sector               - GICS sector for pair eligibility filtering
+    """
     if not model_predictions:
         message = "model_predictions must not be empty"
         raise ValueError(message)
@@ -48,7 +60,8 @@ def consolidate_predictions(
             )
             raise ValueError(message)
 
-        signals = predictions_df.with_columns(
+        latest_predictions = predictions_df.sort("timestamp").group_by("ticker").last()
+        signals = latest_predictions.with_columns(
             pl.col("quantile_50").alias("alpha"),
             (
                 1.0

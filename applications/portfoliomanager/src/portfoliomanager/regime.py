@@ -5,7 +5,11 @@ import polars as pl
 
 
 class RegimeResult(TypedDict):
+    # "mean_reversion" (prices tend to revert to their mean, favorable for stat arb)
+    # or "trending" (momentum-driven market, exposure is halved)
     state: str
+    # How strongly the classifier believes in the current state (0-1); values
+    # closer to 1.0 indicate a more decisive signal
     confidence: float
 
 
