@@ -1,123 +1,147 @@
-import os
 from datetime import datetime
 
+import numpy as np
 import polars as pl
+import scipy.optimize
 import structlog
 
 from .enums import PositionAction, PositionSide
-from .exceptions import InsufficientPredictionsError
+from .exceptions import InsufficientPairsError
 
 logger = structlog.get_logger()
 
-UNCERTAINTY_THRESHOLD = float(os.getenv("FUND_UNCERTAINTY_THRESHOLD", "0.1"))
-REQUIRED_PORTFOLIO_SIZE = 20  # 10 long + 10 short
-SIDE_SIZE = REQUIRED_PORTFOLIO_SIZE // 2
+REQUIRED_PAIRS = 10
+Z_SCORE_HOLD_THRESHOLD = 0.5
+Z_SCORE_STOP_LOSS = 4.0
+BETA_WEIGHT_LOWER_BOUND = 0.5
+BETA_WEIGHT_UPPER_BOUND = 2.0
 
 
-def add_predictions_zscore_ranked_columns(
-    current_predictions: pl.DataFrame,
-) -> pl.DataFrame:
-    current_predictions = current_predictions.clone()
+def _apply_beta_neutral_weights(
+    pairs: pl.DataFrame,
+    market_betas: pl.DataFrame,
+    volatility_parity_weights: np.ndarray,
+) -> np.ndarray:
+    beta_lookup = {
+        row["ticker"]: row["market_beta"] for row in market_betas.iter_rows(named=True)
+    }
 
-    quantile_50_mean = current_predictions.select(pl.col("quantile_50").mean()).item()
-    quantile_50_standard_deviation = (
-        current_predictions.select(pl.col("quantile_50").std()).item() or 1e-8
+    pair_net_betas = np.array(
+        [
+            beta_lookup.get(row["long_ticker"], 0.0)
+            - beta_lookup.get(row["short_ticker"], 0.0)
+            for row in pairs.iter_rows(named=True)
+        ]
     )
 
-    z_score_return = (
-        pl.col("quantile_50") - quantile_50_mean
-    ) / quantile_50_standard_deviation
+    def objective(weights: np.ndarray) -> float:
+        total = float(np.sum(weights))
+        net_beta = float(np.dot(weights, pair_net_betas) / total)
+        return net_beta**2
 
-    inter_quartile_range = pl.col("quantile_90") - pl.col("quantile_10")
+    bounds = [
+        (BETA_WEIGHT_LOWER_BOUND * weight, BETA_WEIGHT_UPPER_BOUND * weight)
+        for weight in volatility_parity_weights
+    ]
+    target_total = float(np.sum(volatility_parity_weights))
+    constraints = [{"type": "eq", "fun": lambda w: float(np.sum(w)) - target_total}]
 
-    composite_score = z_score_return / (1 + inter_quartile_range)
+    result = scipy.optimize.minimize(
+        objective,
+        x0=volatility_parity_weights.copy(),
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+    )
 
-    return current_predictions.with_columns(
-        z_score_return.alias("z_score_return"),
-        inter_quartile_range.alias("inter_quartile_range"),
-        composite_score.alias("composite_score"),
-        pl.lit(PositionAction.UNSPECIFIED.value).alias("action"),
-    ).sort(["composite_score", "inter_quartile_range"], descending=[True, False])
+    if result.success:
+        return np.array(result.x)
+
+    logger.warning("Beta-neutral optimizer did not converge, using vol-parity weights")
+    return volatility_parity_weights
 
 
-def create_optimal_portfolio(
-    current_predictions: pl.DataFrame,
-    prior_portfolio_tickers: list[str],
+def size_pairs_with_volatility_parity(
+    candidate_pairs: pl.DataFrame,
     maximum_capital: float,
     current_timestamp: datetime,
+    market_betas: pl.DataFrame,
+    exposure_scale: float = 1.0,
 ) -> pl.DataFrame:
-    current_predictions = current_predictions.clone()
+    """Size pairs so each contributes equal risk, then optimize for beta neutrality.
 
-    high_uncertainty_tickers = (
-        current_predictions.filter(
-            pl.col("inter_quartile_range") > UNCERTAINTY_THRESHOLD
-        )
-        .select("ticker")
-        .to_series()
-        .to_list()
-    )
-
-    # Excluding prior portfolio tickers to avoid pattern day trader restrictions.
-    excluded_tickers = list(set(high_uncertainty_tickers + prior_portfolio_tickers))
-
-    logger.info(
-        "Portfolio filtering breakdown",
-        total_predictions=current_predictions.height,
-        high_uncertainty_excluded=len(high_uncertainty_tickers),
-        high_uncertainty_threshold=UNCERTAINTY_THRESHOLD,
-        prior_portfolio_excluded=len(prior_portfolio_tickers),
-        total_excluded=len(excluded_tickers),
-    )
-
-    available_predictions = current_predictions.filter(
-        ~pl.col("ticker").is_in(excluded_tickers)
-    ).sort(["composite_score", "inter_quartile_range"], descending=[True, False])
-
-    logger.info(
-        "Available predictions after filtering",
-        available_count=available_predictions.height,
-        required_for_full_portfolio=REQUIRED_PORTFOLIO_SIZE,
-    )
-
-    if available_predictions.height < REQUIRED_PORTFOLIO_SIZE:
+    Pairs with lower realized spread volatility receive more capital so that every
+    pair contributes the same risk to the portfolio (volatility parity). A SLSQP
+    optimizer then nudges the weights to drive net portfolio beta toward zero.
+    Each pair is dollar-neutral: the same dollar amount is allocated to both legs.
+    The exposure_scale parameter is a regime-driven multiplier (1.0x for
+    mean_reversion, 0.5x for trending) applied before the final dollar amounts.
+    """
+    if candidate_pairs.height < REQUIRED_PAIRS:
         message = (
-            f"Only {available_predictions.height} predictions available "
-            f"after filtering, need {REQUIRED_PORTFOLIO_SIZE} (10 long + 10 short). "
-            f"Excluded: {len(high_uncertainty_tickers)} high uncertainty, "
-            f"{len(prior_portfolio_tickers)} prior portfolio tickers."
+            f"Only {candidate_pairs.height} pairs available, "
+            f"need at least {REQUIRED_PAIRS}."
         )
-        raise InsufficientPredictionsError(message)
+        raise InsufficientPairsError(message)
 
-    long_candidates = available_predictions.head(SIDE_SIZE)
-    short_candidates = available_predictions.tail(SIDE_SIZE)
+    pairs = (
+        candidate_pairs.head(REQUIRED_PAIRS)
+        .with_columns(
+            (
+                (
+                    pl.col("long_realized_volatility")
+                    + pl.col("short_realized_volatility")
+                )
+                / 2.0
+            ).alias("pair_volatility")
+        )
+        .with_columns(
+            (1.0 / pl.col("pair_volatility").clip(lower_bound=1e-8)).alias(
+                "inverse_volatility_weight"
+            )
+        )
+    )
 
-    target_side_capital = maximum_capital / 2
-    dollar_amount_per_position = target_side_capital / SIDE_SIZE
+    total_weight = pairs["inverse_volatility_weight"].sum()
+    volatility_parity_weights = (
+        pairs["inverse_volatility_weight"] / total_weight
+    ).to_numpy()
+
+    adjusted_weights = _apply_beta_neutral_weights(
+        pairs, market_betas, volatility_parity_weights
+    )
+    if np.isclose(adjusted_weights.sum(), 0.0):
+        adjusted_weights = volatility_parity_weights / volatility_parity_weights.sum()
+    else:
+        adjusted_weights = adjusted_weights / adjusted_weights.sum()
+
+    dollar_amounts = adjusted_weights * (maximum_capital / 2.0) * exposure_scale
+    pairs = pairs.with_columns(pl.Series("dollar_amount", dollar_amounts))
 
     logger.info(
-        "Portfolio allocation",
+        "Sized pairs with volatility parity",
+        pair_count=pairs.height,
         total_capital=maximum_capital,
-        long_capital=target_side_capital,
-        short_capital=target_side_capital,
-        dollar_per_position=dollar_amount_per_position,
-        long_count=SIDE_SIZE,
-        short_count=SIDE_SIZE,
+        exposure_scale=exposure_scale,
     )
 
-    long_positions = long_candidates.select(
-        pl.col("ticker"),
-        pl.lit(current_timestamp.timestamp()).cast(pl.Float64).alias("timestamp"),
+    timestamp_val = float(current_timestamp.timestamp())
+    long_positions = pairs.select(
+        pl.col("long_ticker").alias("ticker"),
+        pl.lit(timestamp_val).cast(pl.Float64).alias("timestamp"),
         pl.lit(PositionSide.LONG.value).alias("side"),
-        pl.lit(dollar_amount_per_position).alias("dollar_amount"),
+        pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
-    short_positions = short_candidates.select(
-        pl.col("ticker"),
-        pl.lit(current_timestamp.timestamp()).cast(pl.Float64).alias("timestamp"),
+    short_positions = pairs.select(
+        pl.col("short_ticker").alias("ticker"),
+        pl.lit(timestamp_val).cast(pl.Float64).alias("timestamp"),
         pl.lit(PositionSide.SHORT.value).alias("side"),
-        pl.lit(dollar_amount_per_position).alias("dollar_amount"),
+        pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
+        pl.col("pair_id"),
     )
 
     return pl.concat([long_positions, short_positions]).sort(["ticker", "side"])

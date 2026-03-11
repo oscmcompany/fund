@@ -2,359 +2,176 @@ from datetime import UTC, datetime
 
 import polars as pl
 import pytest
-from portfoliomanager.exceptions import InsufficientPredictionsError
+from portfoliomanager.beta import compute_portfolio_beta
+from portfoliomanager.exceptions import InsufficientPairsError
+from portfoliomanager.portfolio_schema import portfolio_schema
 from portfoliomanager.risk_management import (
-    add_predictions_zscore_ranked_columns,
-    create_optimal_portfolio,
+    REQUIRED_PAIRS,
+    size_pairs_with_volatility_parity,
 )
 
+_CURRENT_TIMESTAMP = datetime(2025, 1, 15, 9, 30, tzinfo=UTC)
 
-def test_add_predictions_zscore_ranked_columns_zscore_calculation() -> None:
-    predictions = pl.DataFrame(
+
+def _make_candidate_pairs(
+    count: int = 10,
+    long_vols: list[float] | None = None,
+    short_vols: list[float] | None = None,
+) -> pl.DataFrame:
+    if long_vols is None:
+        long_vols = [0.02] * count
+    if short_vols is None:
+        short_vols = [0.02] * count
+    return pl.DataFrame(
         {
-            "ticker": ["A", "B", "C"],
-            "quantile_10": [0.0, 0.0, 0.0],
-            "quantile_50": [0.05, 0.10, 0.15],  # 5%, 10%, 15% expected returns
-            "quantile_90": [0.20, 0.20, 0.20],
+            "pair_id": [f"TICK{i:02d}A-TICK{i:02d}B" for i in range(count)],
+            "long_ticker": [f"TICK{i:02d}A" for i in range(count)],
+            "short_ticker": [f"TICK{i:02d}B" for i in range(count)],
+            "z_score": [2.5] * count,
+            "hedge_ratio": [1.0] * count,
+            "signal_strength": [0.1] * count,
+            "long_realized_volatility": long_vols,
+            "short_realized_volatility": short_vols,
         }
     )
 
-    result = add_predictions_zscore_ranked_columns(predictions)
 
-    assert result["ticker"][0] == "C"  # highest expected return
-    assert result["ticker"][2] == "A"  # lowest expected return
-
-    assert "z_score_return" in result.columns
-    assert "inter_quartile_range" in result.columns
-    assert "composite_score" in result.columns
+def _make_neutral_market_betas(count: int = 10) -> pl.DataFrame:
+    tickers = []
+    for i in range(count):
+        tickers.extend([f"TICK{i:02d}A", f"TICK{i:02d}B"])
+    return pl.DataFrame({"ticker": tickers, "market_beta": [1.0] * (count * 2)})
 
 
-def test_add_predictions_zscore_ranked_columns_inter_quartile_range_calculation() -> (
-    None
-):
-    predictions = pl.DataFrame(
-        {
-            "ticker": ["A", "B"],
-            "quantile_10": [0.05, 0.10],
-            "quantile_50": [0.10, 0.15],
-            "quantile_90": [0.15, 0.30],  # a has narrow range, b has wide range
-        }
-    )
-
-    result = add_predictions_zscore_ranked_columns(predictions)
-
-    assert result["ticker"][0] == "B"  # higher expected return ranks first
-    assert result["inter_quartile_range"][0] == pytest.approx(
-        0.20
-    )  # 0.30 - 0.10 (B's range)
-    assert result["inter_quartile_range"][1] == pytest.approx(
-        0.10
-    )  # 0.15 - 0.05 (A's range)
-
-
-def test_add_predictions_zscore_ranked_columns_single_prediction() -> None:
-    predictions = pl.DataFrame(
-        {
-            "ticker": ["AAPL"],
-            "quantile_10": [0.05],
-            "quantile_50": [0.10],
-            "quantile_90": [0.15],
-        }
-    )
-
-    result = add_predictions_zscore_ranked_columns(predictions)
-
-    assert len(result) == 1
-    assert result["z_score_return"][0] == 0.0  # single value has z-score of 0
-
-
-def test_create_optimal_portfolio_fresh_start_no_prior_tickers() -> None:
-    """Test portfolio creation with no prior portfolio (fresh start)."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    # Create 30 predictions with varying scores
-    predictions = pl.DataFrame(
-        {
-            "ticker": [f"TICK{i:02d}" for i in range(30)],
-            "quantile_10": [0.0] * 30,
-            "quantile_50": [i * 0.01 for i in range(30)],  # 0%, 1%, 2%, ..., 29%
-            "quantile_90": [0.05] * 30,  # Low uncertainty (IQR = 0.05 < 0.1 threshold)
-        }
-    )
-
-    # Rank and sort predictions
-    ranked_predictions = add_predictions_zscore_ranked_columns(predictions)
-
-    result = create_optimal_portfolio(
-        current_predictions=ranked_predictions,
-        prior_portfolio_tickers=[],  # No prior portfolio
-        maximum_capital=10000.0,
-        current_timestamp=current_timestamp,
-    )
-
-    # Should create 20 positions (10 long, 10 short)
-    assert len(result) == 20  # noqa: PLR2004
-    assert result.filter(pl.col("side") == "LONG").height == 10  # noqa: PLR2004
-    assert result.filter(pl.col("side") == "SHORT").height == 10  # noqa: PLR2004
-
-    # All positions should have action=OPEN_POSITION
-    assert all(action == "OPEN_POSITION" for action in result["action"].to_list())
-
-    # Equal dollar allocation: 50% to longs, 50% to shorts
-    long_capital = result.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
-    short_capital = result.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
-    assert long_capital == pytest.approx(5000.0)
-    assert short_capital == pytest.approx(5000.0)
-
-    # Each position should get (capital / 2) / 10
-    expected_amount = 500.0
-    assert all(
-        amount == pytest.approx(expected_amount)
-        for amount in result["dollar_amount"].to_list()
-    )
-
-    # Top 10 should be long (highest composite scores)
-    long_tickers = result.filter(pl.col("side") == "LONG")["ticker"].to_list()
-    expected_long = [f"TICK{i:02d}" for i in range(29, 19, -1)]  # TICK29 to TICK20
-    assert set(long_tickers) == set(expected_long)
-
-    # Bottom 10 should be short (lowest composite scores)
-    short_tickers = result.filter(pl.col("side") == "SHORT")["ticker"].to_list()
-    expected_short = [f"TICK{i:02d}" for i in range(10)]  # TICK00 to TICK09
-    assert set(short_tickers) == set(expected_short)
-
-
-def test_create_optimal_portfolio_with_prior_ticker_exclusion() -> None:
-    """Test that prior portfolio tickers are excluded to avoid PDT violations."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    # Create 30 predictions
-    predictions = pl.DataFrame(
-        {
-            "ticker": [f"TICK{i:02d}" for i in range(30)],
-            "quantile_10": [0.0] * 30,
-            "quantile_50": [i * 0.01 for i in range(30)],
-            "quantile_90": [0.05] * 30,  # Low uncertainty (IQR = 0.05 < 0.1 threshold)
-        }
-    )
-
-    # Rank and sort predictions
-    ranked_predictions = add_predictions_zscore_ranked_columns(predictions)
-
-    # Exclude the top 5 tickers from prior portfolio
-    prior_tickers = ["TICK29", "TICK28", "TICK27", "TICK26", "TICK25"]
-
-    result = create_optimal_portfolio(
-        current_predictions=ranked_predictions,
-        prior_portfolio_tickers=prior_tickers,
-        maximum_capital=10000.0,
-        current_timestamp=current_timestamp,
-    )
-
-    # Should still create 20 positions
-    assert len(result) == 20  # noqa: PLR2004
-
-    # None of the prior tickers should appear in the new portfolio
-    result_tickers = result["ticker"].to_list()
-    for ticker in prior_tickers:
-        assert ticker not in result_tickers
-
-    # Since top 5 are excluded, next 10 should be long (TICK24 to TICK15)
-    long_tickers = result.filter(pl.col("side") == "LONG")["ticker"].to_list()
-    expected_long = [f"TICK{i:02d}" for i in range(24, 14, -1)]
-    assert set(long_tickers) == set(expected_long)
-
-
-def test_create_optimal_portfolio_unsorted_input() -> None:
-    """Test that create_optimal_portfolio handles unsorted input correctly."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    # Create predictions intentionally out of order
-    predictions = pl.DataFrame(
-        {
-            "ticker": ["TICK10", "TICK05", "TICK20", "TICK15", "TICK25"]
-            + [f"TICK{i:02d}" for i in range(30) if i not in [5, 10, 15, 20, 25]],
-            "quantile_10": [0.0] * 30,
-            "quantile_50": [0.10, 0.05, 0.20, 0.15, 0.25]
-            + [i * 0.01 for i in range(30) if i not in [5, 10, 15, 20, 25]],
-            "quantile_90": [0.05] * 30,  # Low uncertainty
-            "z_score_return": [10.0, 5.0, 20.0, 15.0, 25.0]
-            + [float(i) for i in range(30) if i not in [5, 10, 15, 20, 25]],
-            "inter_quartile_range": [0.05] * 30,
-            "composite_score": [10.0, 5.0, 20.0, 15.0, 25.0]
-            + [float(i) for i in range(30) if i not in [5, 10, 15, 20, 25]],
-            "action": ["UNSPECIFIED"] * 30,
-        }
-    )
-
-    result = create_optimal_portfolio(
-        current_predictions=predictions,
-        prior_portfolio_tickers=[],
-        maximum_capital=10000.0,
-        current_timestamp=current_timestamp,
-    )
-
-    # Should create 20 positions despite unsorted input
-    assert len(result) == 20  # noqa: PLR2004
-    assert result.filter(pl.col("side") == "LONG").height == 10  # noqa: PLR2004
-    assert result.filter(pl.col("side") == "SHORT").height == 10  # noqa: PLR2004
-
-    # Top 10 should be long (highest composite scores)
-    long_tickers = result.filter(pl.col("side") == "LONG")["ticker"].to_list()
-    assert "TICK25" in long_tickers  # Highest score should be long
-    assert "TICK20" in long_tickers
-
-    # Bottom 10 should be short (lowest composite scores)
-    short_tickers = result.filter(pl.col("side") == "SHORT")["ticker"].to_list()
-    assert "TICK00" in short_tickers  # Lowest scores should be short
-
-
-def test_create_optimal_portfolio_high_uncertainty_exclusions() -> None:
-    """Test that high uncertainty predictions are excluded.
-
-    Note: This test intentionally uses pre-computed ranking columns rather than calling
-    add_predictions_zscore_ranked_columns to verify portfolio logic in isolation.
+def _make_asymmetric_market_betas() -> pl.DataFrame:
+    """Pairs 0-7: long_beta=2.0, short_beta=1.0.
+    Pairs 8-9: long_beta=1.0, short_beta=2.0.
     """
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
+    tickers = []
+    betas = []
+    for i in range(8):
+        tickers.extend([f"TICK{i:02d}A", f"TICK{i:02d}B"])
+        betas.extend([2.0, 1.0])
+    for i in range(8, 10):
+        tickers.extend([f"TICK{i:02d}A", f"TICK{i:02d}B"])
+        betas.extend([1.0, 2.0])
+    return pl.DataFrame({"ticker": tickers, "market_beta": betas})
 
-    # Create 25 predictions: 20 low uncertainty, 5 high uncertainty
-    high_uncertainty_count = 5
-    tickers = [f"TICK{i:02d}" for i in range(25)]
-    predictions = pl.DataFrame(
-        {
-            "ticker": tickers,
-            "quantile_10": [0.0] * 25,
-            "quantile_50": [i * 0.01 for i in range(25)],
-            # First 5 have high uncertainty (IQR > 0.1), rest have low uncertainty
-            "quantile_90": [0.50] * high_uncertainty_count + [0.08] * 20,
-            "z_score_return": [float(i) for i in range(25)],
-            "inter_quartile_range": [0.50] * high_uncertainty_count + [0.08] * 20,
-            "composite_score": [
-                float(i) / 1.5 if i < high_uncertainty_count else float(i) / 1.08
-                for i in range(25)
-            ],
-            "action": ["UNSPECIFIED"] * 25,
-        }
-    )
 
-    result = create_optimal_portfolio(
-        current_predictions=predictions,
-        prior_portfolio_tickers=[],
+def test_size_pairs_with_volatility_parity_long_equals_short_dollar_totals() -> None:
+    pairs = _make_candidate_pairs()
+    result = size_pairs_with_volatility_parity(
+        pairs,
         maximum_capital=10000.0,
-        current_timestamp=current_timestamp,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=_make_neutral_market_betas(),
     )
-
-    # Should create 20 positions from the 20 low-uncertainty tickers
-    assert len(result) == 20  # noqa: PLR2004
-
-    # None of the high uncertainty tickers should appear
-    result_tickers = result["ticker"].to_list()
-    for i in range(high_uncertainty_count):
-        assert f"TICK{i:02d}" not in result_tickers
-
-
-def test_create_optimal_portfolio_insufficient_after_exclusions() -> None:
-    """Test that InsufficientPredictionsError is raised when fewer than 20 available."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    # Create 25 predictions: 15 high uncertainty, 5 prior portfolio, only 5 available
-    predictions = pl.DataFrame(
-        {
-            "ticker": [f"TICK{i:02d}" for i in range(25)],
-            "quantile_10": [0.0] * 25,
-            "quantile_50": [i * 0.01 for i in range(25)],
-            # First 15 have high uncertainty (IQR > 0.1)
-            "quantile_90": [0.50] * 15 + [0.08] * 10,
-            "z_score_return": [float(i) for i in range(25)],
-            "inter_quartile_range": [0.50] * 15 + [0.08] * 10,
-            "composite_score": [float(i) / 1.5 for i in range(25)],
-            "action": ["UNSPECIFIED"] * 25,
-        }
-    )
-
-    # Exclude 5 more tickers as prior portfolio (from the low-uncertainty ones)
-    prior_tickers = [f"TICK{i:02d}" for i in range(15, 20)]
-
-    # Should raise InsufficientPredictionsError (only 5 available, need 20)
-    with pytest.raises(InsufficientPredictionsError) as exc_info:
-        create_optimal_portfolio(
-            current_predictions=predictions,
-            prior_portfolio_tickers=prior_tickers,
-            maximum_capital=10000.0,
-            current_timestamp=current_timestamp,
-        )
-
-    assert "Only 5 predictions available" in str(exc_info.value)
-    assert "need 20" in str(exc_info.value)
-
-
-@pytest.mark.parametrize("capital", [10000.0, 25000.0, 50000.0])
-def test_create_optimal_portfolio_equal_capital_allocation(capital: float) -> None:
-    """Test that capital is allocated equally across positions."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    predictions = pl.DataFrame(
-        {
-            "ticker": [f"TICK{i:02d}" for i in range(30)],
-            "quantile_10": [0.0] * 30,
-            "quantile_50": [i * 0.01 for i in range(30)],
-            "quantile_90": [0.05] * 30,  # Low uncertainty (IQR = 0.05 < 0.1 threshold)
-        }
-    )
-
-    # Rank and sort predictions
-    ranked_predictions = add_predictions_zscore_ranked_columns(predictions)
-
-    result = create_optimal_portfolio(
-        current_predictions=ranked_predictions,
-        prior_portfolio_tickers=[],
-        maximum_capital=capital,
-        current_timestamp=current_timestamp,
-    )
-
-    expected_per_position = capital / 20
-    for amount in result["dollar_amount"].to_list():
-        assert amount == pytest.approx(expected_per_position)
-
-    # Long and short should be equal
     long_sum = result.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
     short_sum = result.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
     assert long_sum == pytest.approx(short_sum)
-    assert long_sum == pytest.approx(capital / 2)
 
 
-def test_create_optimal_portfolio_head_tail_selection() -> None:
-    """Test that top 10 are long, bottom 10 are short based on composite scores."""
-    current_timestamp = datetime(2024, 1, 15, 9, 30, tzinfo=UTC)
-
-    # Create predictions with known composite scores (via quantile_50 values)
-    tickers = [f"TICK{i:02d}" for i in range(30)]
-
-    predictions = pl.DataFrame(
-        {
-            "ticker": tickers,
-            "quantile_10": [0.0] * 30,
-            "quantile_50": [i * 0.01 for i in range(30)],  # 0, 0.01, 0.02, ..., 0.29
-            "quantile_90": [0.05] * 30,  # Low uncertainty (IQR = 0.05 < 0.1 threshold)
-        }
-    )
-
-    # Rank and sort predictions (will sort by composite score descending)
-    ranked_predictions = add_predictions_zscore_ranked_columns(predictions)
-
-    result = create_optimal_portfolio(
-        current_predictions=ranked_predictions,
-        prior_portfolio_tickers=[],
+def test_size_pairs_with_volatility_parity_lower_volatility_receives_more_capital() -> (
+    None
+):
+    long_vols = [0.01] + [0.04] * 9
+    short_vols = [0.01] + [0.04] * 9
+    pairs = _make_candidate_pairs(long_vols=long_vols, short_vols=short_vols)
+    result = size_pairs_with_volatility_parity(
+        pairs,
         maximum_capital=10000.0,
-        current_timestamp=current_timestamp,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=_make_neutral_market_betas(),
+    )
+    long_df = result.filter(pl.col("side") == "LONG")
+    low_vol_amount = long_df.filter(pl.col("ticker") == "TICK00A")[
+        "dollar_amount"
+    ].item()
+    high_vol_amount = long_df.filter(pl.col("ticker") == "TICK01A")[
+        "dollar_amount"
+    ].item()
+    assert low_vol_amount > high_vol_amount
+
+
+def test_size_pairs_with_volatility_parity_raises_insufficient_pairs_error() -> None:
+    pairs = _make_candidate_pairs(count=REQUIRED_PAIRS - 1)
+    with pytest.raises(InsufficientPairsError):
+        size_pairs_with_volatility_parity(
+            pairs,
+            maximum_capital=10000.0,
+            current_timestamp=_CURRENT_TIMESTAMP,
+            market_betas=_make_neutral_market_betas(count=REQUIRED_PAIRS - 1),
+        )
+
+
+def test_size_pairs_with_volatility_parity_output_passes_portfolio_schema_validate() -> (  # noqa: E501
+    None
+):
+    pairs = _make_candidate_pairs()
+    result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=_make_neutral_market_betas(),
+    )
+    validated = portfolio_schema.validate(result)
+    assert validated.height == REQUIRED_PAIRS * 2
+
+
+def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts() -> (
+    None
+):
+    pairs = _make_candidate_pairs()
+    market_betas = _make_neutral_market_betas()
+
+    full_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        exposure_scale=1.0,
+    )
+    half_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        exposure_scale=0.5,
     )
 
-    # Top 10 (highest composite scores: 29, 28, ..., 20) should be LONG
-    long_tickers = result.filter(pl.col("side") == "LONG")["ticker"].to_list()
-    expected_long = [f"TICK{i:02d}" for i in range(29, 19, -1)]
-    assert set(long_tickers) == set(expected_long)
+    full_amounts = full_result.sort(["ticker", "side"])["dollar_amount"].to_list()
+    half_amounts = half_result.sort(["ticker", "side"])["dollar_amount"].to_list()
 
-    # Bottom 10 (lowest composite scores: 0, 1, ..., 9) should be SHORT
-    short_tickers = result.filter(pl.col("side") == "SHORT")["ticker"].to_list()
-    expected_short = [f"TICK{i:02d}" for i in range(10)]
-    assert set(short_tickers) == set(expected_short)
+    for full, half in zip(full_amounts, half_amounts, strict=False):
+        assert half == pytest.approx(full * 0.5)
+
+
+def test_size_pairs_with_volatility_parity_beta_neutral_reduces_portfolio_beta() -> (
+    None
+):
+    # Pairs 0-7: long_beta=2.0, short_beta=1.0 (net positive contribution)
+    # Pairs 8-9: long_beta=1.0, short_beta=2.0 (net negative contribution)
+    # Equal vol-parity weights produce portfolio beta ≠ 0; optimizer drives it toward 0
+    pairs = _make_candidate_pairs()
+    asymmetric_betas = _make_asymmetric_market_betas()
+    neutral_betas = _make_neutral_market_betas()
+
+    beta_neutral_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=asymmetric_betas,
+    )
+    vol_parity_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=neutral_betas,
+    )
+
+    beta_neutral_beta = abs(
+        compute_portfolio_beta(beta_neutral_result, asymmetric_betas)
+    )
+    vol_parity_beta = abs(compute_portfolio_beta(vol_parity_result, asymmetric_betas))
+
+    assert beta_neutral_beta < vol_parity_beta
