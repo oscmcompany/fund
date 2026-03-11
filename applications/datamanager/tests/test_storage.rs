@@ -39,6 +39,7 @@ fn sample_portfolio() -> Portfolio {
         side: "LONG".to_string(),
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
+        pair_id: "AAPL-MSFT".to_string(),
     }
 }
 
@@ -265,46 +266,6 @@ async fn test_query_portfolio_without_timestamp_uses_latest_partition() {
             .unwrap()
             .get(0),
         Some("NEW")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_query_portfolio_falls_back_when_action_column_is_missing() {
-    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-    let timestamp = fixed_date_time();
-
-    let key = format_s3_key(&timestamp, "portfolios");
-
-    let mut dataframe = df!(
-        "ticker" => vec!["AAPL"],
-        "timestamp" => vec![1_735_689_600.0],
-        "side" => vec!["LONG"],
-        "dollar_amount" => vec![10_000.0],
-    )
-    .unwrap();
-
-    let mut parquet_bytes = Vec::new();
-    ParquetWriter::new(&mut parquet_bytes)
-        .finish(&mut dataframe)
-        .unwrap();
-
-    put_test_object(&s3, &key, parquet_bytes).await;
-
-    let query_results = query_portfolio_dataframe_from_s3(&state, Some(timestamp))
-        .await
-        .unwrap();
-
-    assert_eq!(query_results.height(), 1);
-    assert_eq!(
-        query_results
-            .column("action")
-            .unwrap()
-            .str()
-            .unwrap()
-            .get(0),
-        Some("UNSPECIFIED")
     );
 }
 

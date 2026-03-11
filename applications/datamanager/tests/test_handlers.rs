@@ -217,7 +217,8 @@ async fn test_portfolios_save_and_get_round_trip() {
             "timestamp": 1735689600.0,
             "side": "long",
             "dollar_amount": 10000.0,
-            "action": "buy"
+            "action": "buy",
+            "pair_id": "AAPL-MSFT"
         }],
         "timestamp": "2025-01-01T00:00:00Z"
     }"#;
@@ -257,7 +258,8 @@ async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails
             "timestamp": 1735689600.0,
             "side": "long",
             "dollar_amount": 10000.0,
-            "action": "buy"
+            "action": "buy",
+            "pair_id": "AAPL-MSFT"
         }],
         "timestamp": "2025-01-01T00:00:00Z"
     }"#;
@@ -274,7 +276,7 @@ async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_portfolios_get_returns_not_found_for_first_run_without_files() {
+async fn test_portfolios_get_returns_empty_array_for_first_run_without_files() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
 
@@ -283,12 +285,13 @@ async fn test_portfolios_get_returns_not_found_for_first_run_without_files() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "[]");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_portfolios_get_returns_not_found_when_portfolio_file_is_empty() {
+async fn test_portfolios_get_returns_empty_array_when_portfolio_file_is_empty() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
     let client = reqwest::Client::new();
@@ -312,7 +315,8 @@ async fn test_portfolios_get_returns_not_found_when_portfolio_file_is_empty() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "[]");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
