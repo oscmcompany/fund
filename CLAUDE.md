@@ -62,7 +62,7 @@ This is a collection of guidelines and references.
 - Always match existing styles and patterns in the codebase for consistency
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after the fix
 - Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone
-- Use the GitHub MCP tools for conversational GitHub queries; use GitHub's GraphQL API directly for scripts and tools where
-  token efficiency matters
-- When the user indicates PR review bots have provided feedback, suggest running /update-pull-request with the PR number
+- Use the GitHub MCP plugin (recommended Claude plugin: `mcp__plugin_github_github`) for conversational GitHub queries;
+  use GitHub's GraphQL API directly for scripts and tools where token efficiency matters
+- When the user indicates PR review bots have provided feedback, suggest running `/update-pull-request` with the PR number
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash commands
