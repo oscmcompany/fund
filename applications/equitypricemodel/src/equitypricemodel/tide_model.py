@@ -114,8 +114,12 @@ class Model:
         self.dropout_rate = dropout_rate
         self.quantiles = quantiles or [0.1, 0.5, 0.9]
 
-        self.feature_projection = Linear(
+        self.feature_projection_1 = Linear(
             in_features=self.input_size,
+            out_features=self.hidden_size * 2,
+        )
+        self.feature_projection_2 = Linear(
+            in_features=self.hidden_size * 2,
             out_features=self.hidden_size,
         )
 
@@ -160,7 +164,8 @@ class Model:
         x = x.cast("float32")  # ensure float32 precision
         batch_size = x.shape[0]
 
-        x = self.feature_projection(x).relu()
+        x = self.feature_projection_1(x).relu()
+        x = self.feature_projection_2(x).relu()
 
         for encoder_block in self.encoder_blocks:
             x = encoder_block.forward(x)
