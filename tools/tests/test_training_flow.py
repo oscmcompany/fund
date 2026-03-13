@@ -126,13 +126,9 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
 
 @patch("tools.flows.training_flow.train_tide_model", return_value="s3://bucket/model")
 @patch("tools.flows.training_flow.prepare_data", return_value="training/data.parquet")
-@patch("tools.flows.training_flow.sync_equity_details")
-@patch("tools.flows.training_flow.sync_equity_bars")
 @patch("tools.flows.training_flow.get_training_date_range")
 def test_training_pipeline_threads_data_key(
     mock_date_range: MagicMock,
-    mock_bars: MagicMock,
-    mock_details: MagicMock,
     mock_prepare: MagicMock,
     mock_train: MagicMock,
 ) -> None:
@@ -148,8 +144,6 @@ def test_training_pipeline_threads_data_key(
     )
 
     mock_date_range.assert_called_once_with(LOOKBACK_DAYS)
-    mock_bars.assert_called_once_with("http://example.com", start_date, end_date)
-    mock_details.assert_called_once_with("http://example.com")
     mock_prepare.assert_called_once_with(
         "data-bucket",
         "artifacts-bucket",

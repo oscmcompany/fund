@@ -174,7 +174,7 @@ class Model:
         x = cast("Tensor", x.add(encoder_output))
 
         # combined projection to (batch_size, output_length * num_quantiles)
-        x = self.output_projection(x)
+        x = self.output_projection(x.relu())
 
         # reshape to (batch_size, output_length, num_quantiles)
         return x.reshape(batch_size, self.output_length, len(self.quantiles))

@@ -22,6 +22,10 @@ FROM python:3.12.10-slim AS worker
 
 WORKDIR /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential clang && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system worker && useradd --system --gid worker worker
 
 COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
@@ -31,7 +35,9 @@ COPY --from=builder /app /app
 ENV PYTHONPATH=/app/tools/src:/app/applications/equitypricemodel/src:/app/libraries/python/src
 ENV HOME=/home/worker
 
-RUN mkdir -p /home/worker && chown -R worker:worker /home/worker /app && \
+RUN mkdir -p /home/worker/.aws && \
+    printf '[default]\ns3 =\n    addressing_style = path\n' > /home/worker/.aws/config && \
+    chown -R worker:worker /home/worker /app && \
     printf '%s\n' \
       '#!/usr/bin/env python3' \
       'import os' \

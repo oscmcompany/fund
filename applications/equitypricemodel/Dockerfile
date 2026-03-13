@@ -45,8 +45,10 @@ ENTRYPOINT ["uv", "run", "--package", "equitypricemodel", "python", "-m", "equit
 FROM python:3.12.10-slim AS server
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential clang && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends build-essential clang curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /root/.aws && \
+    printf '[default]\ns3 =\n    addressing_style = path\n' > /root/.aws/config
 
 ENV PYTHONPATH=/app/applications/equitypricemodel/src
 

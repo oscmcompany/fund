@@ -20,7 +20,7 @@ logger = structlog.get_logger()
 
 
 def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
-    """Build a UTC date range used by sync + prepare steps."""
+    """Build a UTC date range used by training data preparation."""
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)
     return start_date, end_date
@@ -29,7 +29,6 @@ def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
 @task(name="sync-equity-bars", retries=2, retry_delay_seconds=30)
 def sync_equity_bars(base_url: str, start_date: datetime, end_date: datetime) -> None:
     """Trigger datamanager to sync equity bars."""
-
     logger.info(
         "Syncing equity bars",
         base_url=base_url,
@@ -102,7 +101,6 @@ def train_tide_model(
     training_data_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Download training data from S3, train model, upload artifact to S3."""
-    # Defer import to avoid importing tinygrad at module level (heavy GPU dependency)
     from equitypricemodel.trainer import train_model  # noqa: PLC0415
 
     resolved_training_data_key = training_data_key
@@ -179,7 +177,7 @@ def training_pipeline(
     artifacts_bucket: str,
     lookback_days: int = 365,
 ) -> str:
-    """End-to-end training pipeline."""
+    """Train from whatever data is already available in S3."""
     if lookback_days <= 0:
         message = "lookback_days must be positive"
         raise ValueError(message)
@@ -187,8 +185,19 @@ def training_pipeline(
     training_data_key = "training/filtered_tide_training_data.parquet"
     start_date, end_date = get_training_date_range(lookback_days)
 
-    sync_equity_bars(base_url, start_date, end_date)
-    sync_equity_details(base_url)
+    skip_sync = os.getenv("SKIP_DATA_SYNC", "false").lower() == "true"
+
+    if skip_sync:
+        logger.info(
+            "Skipping datamanager sync during training",
+            base_url=base_url,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+        )
+    else:
+        sync_equity_bars(base_url, start_date, end_date)
+        sync_equity_details(base_url)
+
     prepared_key = prepare_data(
         data_bucket,
         artifacts_bucket,
@@ -215,7 +224,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     required_vars = {
-        "FUND_DATAMANAGER_BASE_URL": base_url,
         "AWS_S3_DATA_BUCKET_NAME": data_bucket,
         "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
     }

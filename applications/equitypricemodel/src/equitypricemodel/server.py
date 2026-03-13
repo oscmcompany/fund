@@ -15,7 +15,7 @@ import polars as pl
 import requests
 import sentry_sdk
 import structlog
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -170,7 +170,7 @@ def _resolve_artifact_key(
             WithDecryption=True,
         )
         model_version = response["Parameter"]["Value"]
-    except ClientError:
+    except (ClientError, NoCredentialsError):
         logger.exception("SSM parameter not available, using default artifact path")
         model_version = "latest"
 
@@ -224,6 +224,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 artifact_key=artifact_key,
                 extract_path=extract_path,
             )
+        except NoCredentialsError:
+            logger.exception("AWS credentials not available, falling back to local model")
+            cleanup_model_directory(model_directory)
+            model_directory = "."
         except Exception:
             logger.exception("Failed to download artifacts")
             raise

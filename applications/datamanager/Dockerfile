@@ -7,11 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     wget \
     unzip \
-    && wget -q https://github.com/duckdb/duckdb/releases/download/v1.4.3/libduckdb-linux-amd64.zip \
-    && unzip libduckdb-linux-amd64.zip -d /tmp/duckdb \
+    && ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then DUCKDB_ARCH="amd64"; elif [ "$ARCH" = "arm64" ]; then DUCKDB_ARCH="arm64"; else echo "Unsupported architecture: $ARCH" && exit 1; fi \
+    && wget -q "https://github.com/duckdb/duckdb/releases/download/v1.4.3/libduckdb-linux-${DUCKDB_ARCH}.zip" \
+    && unzip "libduckdb-linux-${DUCKDB_ARCH}.zip" -d /tmp/duckdb \
     && mv /tmp/duckdb/libduckdb.so /usr/local/lib/ \
     && mv /tmp/duckdb/*.h /usr/local/include/ \
-    && rm -rf /tmp/duckdb libduckdb-linux-amd64.zip \
+    && rm -rf /tmp/duckdb libduckdb-linux-*.zip \
     && ldconfig \
     && apt-get purge -y wget unzip \
     && apt-get autoremove -y \
@@ -63,6 +65,7 @@ FROM debian:trixie-slim AS server
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     openssl \
     && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*

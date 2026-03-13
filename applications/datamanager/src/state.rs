@@ -35,7 +35,15 @@ impl State {
             .unwrap_or_else(|| "not configured".to_string());
         info!("AWS region: {}", region);
 
-        let s3_client = S3Client::new(&config);
+        let s3_client = if std::env::var("AWS_ENDPOINT_URL").is_ok() {
+            info!("Custom endpoint detected, using path-style S3 access");
+            let s3_config = aws_sdk_s3::config::Builder::from(&config)
+                .force_path_style(true)
+                .build();
+            S3Client::from_conf(s3_config)
+        } else {
+            S3Client::new(&config)
+        };
 
         let bucket_name = std::env::var("AWS_S3_DATA_BUCKET_NAME")
             .expect("AWS_S3_DATA_BUCKET_NAME environment variable must be set");

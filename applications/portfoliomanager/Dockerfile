@@ -15,7 +15,7 @@ RUN uv sync --no-dev
 FROM python:3.12.10-slim AS server
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential clang && \
+    apt-get install -y --no-install-recommends build-essential clang curl && \
     rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONPATH=/app/applications/portfoliomanager/src

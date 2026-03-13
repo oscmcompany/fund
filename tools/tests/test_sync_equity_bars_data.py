@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -47,14 +48,14 @@ def test_sync_equity_bars_for_date_returns_status_and_body() -> None:
     mock_response.status_code = 200
     mock_response.text = '{"synced": true}'
 
-    target_date = datetime(2025, 6, 1, tzinfo=UTC)
+    target_date = datetime(2025, 6, 2, tzinfo=UTC)
 
     with patch(
         "tools.sync_equity_bars_data.requests.post", return_value=mock_response
     ) as mock_post:
         status_code, response_text = sync_equity_bars_for_date(
             base_url="http://localhost:8080",
-            date=target_date,
+            date_value=target_date,
         )
 
     assert status_code == 200  # noqa: PLR2004
@@ -62,16 +63,14 @@ def test_sync_equity_bars_for_date_returns_status_and_body() -> None:
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
     assert call_kwargs.args[0] == "http://localhost:8080/equity-bars"
-    assert call_kwargs.kwargs["json"]["date"] == "2025-06-01T00:00:00Z"
+    assert call_kwargs.kwargs["json"]["date"] == "2025-06-02T00:00:00Z"
 
 
 def test_sync_equity_bars_data_single_date_makes_one_request() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "ok"
-
-    now = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    target_date = now - timedelta(days=5)
+    target_date = datetime(2025, 6, 2, tzinfo=UTC)
 
     with patch(
         "tools.sync_equity_bars_data.requests.post", return_value=mock_response
@@ -82,3 +81,44 @@ def test_sync_equity_bars_data_single_date_makes_one_request() -> None:
         )
 
     assert mock_post.call_count == 1
+
+
+@patch("tools.sync_equity_bars_data.time.sleep")
+@patch("tools.sync_equity_bars_data.boto3")
+def test_sync_equity_bars_data_only_syncs_missing_dates(
+    mock_boto3: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    mock_s3 = MagicMock()
+    mock_boto3.client.return_value = mock_s3
+    mock_s3.list_objects_v2.return_value = {
+        "Contents": [
+            {
+                "Key": "equity/bars/daily/year=2025/month=06/day=02/data.parquet",
+            }
+        ],
+        "IsTruncated": False,
+    }
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = "ok"
+
+    start_date = datetime(2025, 6, 2, tzinfo=UTC)
+    end_date = datetime(2025, 6, 4, tzinfo=UTC)
+
+    with patch.dict(os.environ, {"AWS_S3_DATA_BUCKET_NAME": "data-bucket"}):
+        with patch(
+            "tools.sync_equity_bars_data.requests.post", return_value=mock_response
+        ) as mock_post:
+            sync_equity_bars_data(
+                base_url="http://localhost:8080",
+                date_range=(start_date, end_date),
+            )
+
+    assert mock_post.call_count == 2
+    synced_dates = [
+        call.kwargs["json"]["date"] for call in mock_post.call_args_list
+    ]
+    assert synced_dates == ["2025-06-03T00:00:00Z", "2025-06-04T00:00:00Z"]
+    mock_sleep.assert_called_once_with(1.0)
