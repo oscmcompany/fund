@@ -117,11 +117,13 @@ def train_model(
 
     logger.info("Training started", epochs=configuration["epoch_count"])
 
+    early_stopping_patience = configuration.get("early_stopping_patience", 3)
     losses = tide_model.train(
         train_batches=train_batches,
         epochs=int(configuration["epoch_count"]),
         learning_rate=float(configuration["learning_rate"]),
         checkpoint_directory=checkpoint_directory,
+        early_stopping_patience=int(early_stopping_patience) if early_stopping_patience is not None else None,
     )
 
     logger.info(
