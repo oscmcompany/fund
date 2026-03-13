@@ -130,7 +130,7 @@ def train_model(
         all_losses=losses,
     )
 
-    return tide_model, tide_data
+    return tide_model, tide_data, losses
 
 
 if __name__ == "__main__":
@@ -173,7 +173,7 @@ if __name__ == "__main__":
         columns=training_data.width,
     )
 
-    tide_model, tide_data = train_model(
+    tide_model, tide_data, _losses = train_model(
         training_data, checkpoint_directory=model_output_path
     )
 

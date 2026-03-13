@@ -124,7 +124,7 @@ def train_tide_model(
     logger.info("Training data loaded", rows=training_data.height)
 
     with tempfile.TemporaryDirectory(prefix="checkpoints_") as checkpoint_directory:
-        tide_model, tide_data = train_model(
+        tide_model, tide_data, _losses = train_model(
             training_data,
             checkpoint_directory=checkpoint_directory,
         )
