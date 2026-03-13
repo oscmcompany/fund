@@ -12,7 +12,7 @@ logger = structlog.get_logger()
 DEFAULT_CONFIGURATION = {
     "architecture": "TiDE",
     "learning_rate": 0.001,
-    "epoch_count": 10,
+    "epoch_count": 20,
     "validation_split": 0.8,
     "input_length": 35,
     "output_length": 7,
