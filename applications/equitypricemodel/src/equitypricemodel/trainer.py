@@ -19,7 +19,7 @@ DEFAULT_CONFIGURATION = {
     "hidden_size": 64,
     "num_encoder_layers": 3,
     "num_decoder_layers": 2,
-    "dropout_rate": 0.1,
+    "dropout_rate": 0.0,
     "batch_size": 32,
 }
 
