@@ -16,17 +16,17 @@ tags = {
 # Portfolio Manager Configuration
 uncertainty_threshold = aws.ssm.Parameter(
     "ssm_uncertainty_threshold",
-    name="/fund/portfoliomanager/uncertainty_threshold",
+    name="/fund/portfolio-manager/uncertainty_threshold",
     type="String",
     value="1.5",
     description="Maximum inter-quartile range for predictions to be considered valid",
     tags=tags,
 )
 
-# Equity Price Model Configuration
-equitypricemodel_model_version = aws.ssm.Parameter(
-    "ssm_equitypricemodel_model_version",
-    name="/fund/equitypricemodel/model_version",
+# Ensemble Manager Configuration
+ensemble_manager_model_version = aws.ssm.Parameter(
+    "ssm_ensemble_manager_model_version",
+    name="/fund/ensemble-manager/model_version",
     type="String",
     value="latest",
     description=(

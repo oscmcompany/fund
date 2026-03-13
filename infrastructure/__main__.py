@@ -103,15 +103,17 @@ training_notification_recipient_emails = stack_config.require_secret(
     "trainingNotificationRecipientEmails"
 )
 
-datamanager_secret_name = stack_config.require_secret("datamanagerSecretName")
-portfoliomanager_secret_name = stack_config.require_secret("portfoliomanagerSecretName")
+data_manager_secret_name = stack_config.require_secret("datamanagerSecretName")
+portfolio_manager_secret_name = stack_config.require_secret(
+    "portfoliomanagerSecretName"
+)
 shared_secret_name = stack_config.require_secret("sharedSecretName")
 
-datamanager_secret_values = require_secret_config_object(
+data_manager_secret_values = require_secret_config_object(
     stack_config,
     "datamanagerSecretValue",
 )
-portfoliomanager_secret_values = require_secret_config_object(
+portfolio_manager_secret_values = require_secret_config_object(
     stack_config,
     "portfoliomanagerSecretValue",
 )
@@ -153,16 +155,16 @@ github_oidc_provider_arn = pulumi.Output.concat(
     ":oidc-provider/token.actions.githubusercontent.com",
 )
 
-datamanager_secret = aws.secretsmanager.Secret(
-    "datamanager_secret",
-    name=datamanager_secret_name,
+data_manager_secret = aws.secretsmanager.Secret(
+    "data_manager_secret",
+    name=data_manager_secret_name,
     recovery_window_in_days=0,
     tags=tags,
 )
 
-portfoliomanager_secret = aws.secretsmanager.Secret(
-    "portfoliomanager_secret",
-    name=portfoliomanager_secret_name,
+portfolio_manager_secret = aws.secretsmanager.Secret(
+    "portfolio_manager_secret",
+    name=portfolio_manager_secret_name,
     recovery_window_in_days=0,
     tags=tags,
 )
@@ -175,9 +177,9 @@ shared_secret = aws.secretsmanager.Secret(
 )
 
 aws.secretsmanager.SecretVersion(
-    "datamanager_secret_version",
-    secret_id=datamanager_secret.id,
-    secret_string=datamanager_secret_values.apply(
+    "data_manager_secret_version",
+    secret_id=data_manager_secret.id,
+    secret_string=data_manager_secret_values.apply(
         lambda values: serialize_secret_config_object(
             values,
             "datamanagerSecretValue",
@@ -187,9 +189,9 @@ aws.secretsmanager.SecretVersion(
 )
 
 aws.secretsmanager.SecretVersion(
-    "portfoliomanager_secret_version",
-    secret_id=portfoliomanager_secret.id,
-    secret_string=portfoliomanager_secret_values.apply(
+    "portfolio_manager_secret_version",
+    secret_id=portfolio_manager_secret.id,
+    secret_string=portfolio_manager_secret_values.apply(
         lambda values: serialize_secret_config_object(
             values,
             "portfoliomanagerSecretValue",
@@ -254,10 +256,14 @@ aws.budgets.Budget(
 )
 
 # S3 Data Bucket for storing equity bars, predictions, portfolios
-data_bucket = aws.s3.Bucket(
+# alias: migrated from aws:s3/bucket:Bucket to aws:s3/bucketV2:BucketV2
+data_bucket = aws.s3.BucketV2(
     "data_bucket",
     bucket=pulumi.Output.concat("fund-data-", random_suffix),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    opts=pulumi.ResourceOptions(
+        retain_on_delete=True,
+        aliases=[pulumi.Alias(type_="aws:s3/bucket:Bucket")],
+    ),
     tags=tags,
 )
 
@@ -294,10 +300,14 @@ aws.s3.BucketVersioning(
 )
 
 # S3 Model Artifacts Bucket for storing trained model weights and checkpoints
-model_artifacts_bucket = aws.s3.Bucket(
+# alias: migrated from aws:s3/bucket:Bucket to aws:s3/bucketV2:BucketV2
+model_artifacts_bucket = aws.s3.BucketV2(
     "model_artifacts_bucket",
     bucket=pulumi.Output.concat("fund-model-artifacts-", random_suffix),
-    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    opts=pulumi.ResourceOptions(
+        retain_on_delete=True,
+        aliases=[pulumi.Alias(type_="aws:s3/bucket:Bucket")],
+    ),
     tags=tags,
 )
 
@@ -337,9 +347,9 @@ aws.s3.BucketVersioning(
 # force_delete allows repositories containing images to be deleted on stack teardown.
 # If image rebuild and push times become prohibitive on daily down/up cycles, switch to
 # retain_on_delete=True and add pulumi import statements to the maskfile up command.
-datamanager_repository = aws.ecr.Repository(
-    "datamanager_repository",
-    name="fund/datamanager-server",
+data_manager_repository = aws.ecr.Repository(
+    "data_manager_repository",
+    name="fund/data-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -348,9 +358,9 @@ datamanager_repository = aws.ecr.Repository(
     tags=tags,
 )
 
-portfoliomanager_repository = aws.ecr.Repository(
-    "portfoliomanager_repository",
-    name="fund/portfoliomanager-server",
+portfolio_manager_repository = aws.ecr.Repository(
+    "portfolio_manager_repository",
+    name="fund/portfolio-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -359,9 +369,9 @@ portfoliomanager_repository = aws.ecr.Repository(
     tags=tags,
 )
 
-equitypricemodel_repository = aws.ecr.Repository(
-    "equitypricemodel_repository",
-    name="fund/equitypricemodel-server",
+ensemble_manager_repository = aws.ecr.Repository(
+    "ensemble_manager_repository",
+    name="fund/ensemble-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -370,9 +380,9 @@ equitypricemodel_repository = aws.ecr.Repository(
     tags=tags,
 )
 
-equitypricemodel_trainer_repository = aws.ecr.Repository(
-    "equitypricemodel_trainer_repository",
-    name="fund/equitypricemodel-trainer",
+tide_trainer_repository = aws.ecr.Repository(
+    "tide_trainer_repository",
+    name="fund/tide-trainer",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -381,9 +391,9 @@ equitypricemodel_trainer_repository = aws.ecr.Repository(
     tags=tags,
 )
 
-prefect_server_repository = aws.ecr.Repository(
-    "prefect_server_repository",
-    name="fund/prefect-server",
+training_server_repository = aws.ecr.Repository(
+    "training_server_repository",
+    name="fund/training-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -392,9 +402,9 @@ prefect_server_repository = aws.ecr.Repository(
     tags=tags,
 )
 
-prefect_worker_repository = aws.ecr.Repository(
-    "prefect_worker_repository",
-    name="fund/prefect-worker",
+training_worker_repository = aws.ecr.Repository(
+    "training_worker_repository",
+    name="fund/training-worker",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -405,24 +415,22 @@ prefect_worker_repository = aws.ecr.Repository(
 
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
-datamanager_image_uri = datamanager_repository.repository_url.apply(
+data_manager_image_uri = data_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-portfoliomanager_image_uri = portfoliomanager_repository.repository_url.apply(
+portfolio_manager_image_uri = portfolio_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-equitypricemodel_image_uri = equitypricemodel_repository.repository_url.apply(
+ensemble_manager_image_uri = ensemble_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-equitypricemodel_trainer_image_uri = (
-    equitypricemodel_trainer_repository.repository_url.apply(
-        lambda url: f"{url}:latest"
-    )
-)
-prefect_server_image_uri = prefect_server_repository.repository_url.apply(
+tide_trainer_image_uri = tide_trainer_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-prefect_worker_image_uri = prefect_worker_repository.repository_url.apply(
+training_server_image_uri = training_server_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+training_worker_image_uri = training_worker_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
 
@@ -745,9 +753,9 @@ alb = aws.lb.LoadBalancer(
     tags=tags,
 )
 
-datamanager_tg = aws.lb.TargetGroup(
-    "datamanager_tg",
-    name="fund-datamanager",
+data_manager_tg = aws.lb.TargetGroup(
+    "data_manager_tg",
+    name="fund-data-manager",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -762,9 +770,9 @@ datamanager_tg = aws.lb.TargetGroup(
     tags=tags,
 )
 
-portfoliomanager_tg = aws.lb.TargetGroup(
-    "portfoliomanager_tg",
-    name="fund-portfoliomanager",
+portfolio_manager_tg = aws.lb.TargetGroup(
+    "portfolio_manager_tg",
+    name="fund-portfolio-manager",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -779,9 +787,9 @@ portfoliomanager_tg = aws.lb.TargetGroup(
     tags=tags,
 )
 
-equitypricemodel_tg = aws.lb.TargetGroup(
-    "equitypricemodel_tg",
-    name="fund-equitypricemodel",
+ensemble_manager_tg = aws.lb.TargetGroup(
+    "ensemble_manager_tg",
+    name="fund-ensemble-manager",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -796,9 +804,9 @@ equitypricemodel_tg = aws.lb.TargetGroup(
     tags=tags,
 )
 
-prefect_tg = aws.lb.TargetGroup(
-    "prefect_tg",
-    name="fund-prefect",
+training_tg = aws.lb.TargetGroup(
+    "training_tg",
+    name="fund-training",
     port=4200,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -828,7 +836,7 @@ if acm_certificate_arn:
         default_actions=[
             aws.lb.ListenerDefaultActionArgs(
                 type="forward",
-                target_group_arn=prefect_tg.arn,
+                target_group_arn=training_tg.arn,
             )
         ],
         tags=tags,
@@ -842,7 +850,7 @@ else:
         default_actions=[
             aws.lb.ListenerDefaultActionArgs(
                 type="forward",
-                target_group_arn=prefect_tg.arn,
+                target_group_arn=training_tg.arn,
             )
         ],
         tags=tags,
@@ -913,13 +921,13 @@ else:
 
 # Listener Rules for routing attached to primary listener
 aws.lb.ListenerRule(
-    "portfoliomanager_rule",
+    "portfolio_manager_rule",
     listener_arn=alb_listener.arn,
     priority=200,  # Ensures that the more specific data manager paths take precedence
     actions=[
         aws.lb.ListenerRuleActionArgs(
             type="forward",
-            target_group_arn=portfoliomanager_tg.arn,
+            target_group_arn=portfolio_manager_tg.arn,
         )
     ],
     conditions=[
@@ -933,13 +941,13 @@ aws.lb.ListenerRule(
 )
 
 aws.lb.ListenerRule(
-    "datamanager_rule",
+    "data_manager_rule",
     listener_arn=alb_listener.arn,
     priority=100,
     actions=[
         aws.lb.ListenerRuleActionArgs(
             type="forward",
-            target_group_arn=datamanager_tg.arn,
+            target_group_arn=data_manager_tg.arn,
         )
     ],
     conditions=[
@@ -958,13 +966,13 @@ aws.lb.ListenerRule(
 )
 
 aws.lb.ListenerRule(
-    "equitypricemodel_rule",
+    "ensemble_manager_rule",
     listener_arn=alb_listener.arn,
     priority=150,
     actions=[
         aws.lb.ListenerRuleActionArgs(
             type="forward",
-            target_group_arn=equitypricemodel_tg.arn,
+            target_group_arn=ensemble_manager_tg.arn,
         )
     ],
     conditions=[
@@ -991,8 +999,8 @@ github_actions_infrastructure_policy = aws.iam.Policy(
         "Least-privilege policy for GitHub Actions infrastructure deployments."
     ),
     policy=pulumi.Output.all(
-        datamanager_secret_name,
-        portfoliomanager_secret_name,
+        data_manager_secret_name,
+        portfolio_manager_secret_name,
         shared_secret_name,
         github_oidc_provider_arn,
     ).apply(
@@ -1387,8 +1395,8 @@ aws.iam.RolePolicy(
     name="fund-ecs-execution-role-secrets-policy",
     role=execution_role.id,
     policy=pulumi.Output.all(
-        datamanager_secret.arn,
-        portfoliomanager_secret.arn,
+        data_manager_secret.arn,
+        portfolio_manager_secret.arn,
         shared_secret.arn,
     ).apply(
         lambda args: json.dumps(
@@ -1481,7 +1489,7 @@ training_notification_email_identity = aws.ses.EmailIdentity(
 
 training_notification_sender_email_parameter = aws.ssm.Parameter(
     "training_notification_sender_email_parameter",
-    name="/fund/prefect/training_notification_sender_email",
+    name="/fund/training/training_notification_sender_email",
     type="SecureString",
     value=training_notification_sender_email,
     tags=tags,
@@ -1489,7 +1497,7 @@ training_notification_sender_email_parameter = aws.ssm.Parameter(
 
 training_notification_recipients_parameter = aws.ssm.Parameter(
     "training_notification_recipients_parameter",
-    name="/fund/prefect/training_notification_recipients",
+    name="/fund/training/training_notification_recipients",
     type="SecureString",
     value=training_notification_recipient_emails,
     tags=tags,
@@ -1678,25 +1686,25 @@ aws.ec2.SecurityGroupRule(
 )
 
 # Prefect Server Log Group
-prefect_server_log_group = aws.cloudwatch.LogGroup(
-    "prefect_server_logs",
-    name="/ecs/fund/prefect-server",
+training_server_log_group = aws.cloudwatch.LogGroup(
+    "training_server_logs",
+    name="/ecs/fund/training-server",
     retention_in_days=7,
     tags=tags,
 )
 
 # Prefect Worker Log Group
-prefect_worker_log_group = aws.cloudwatch.LogGroup(
-    "prefect_worker_logs",
-    name="/ecs/fund/prefect-worker",
+training_worker_log_group = aws.cloudwatch.LogGroup(
+    "training_worker_logs",
+    name="/ecs/fund/training-worker",
     retention_in_days=7,
     tags=tags,
 )
 
 # Prefect Server Task Definition
-prefect_server_task_definition = aws.ecs.TaskDefinition(
-    "prefect_server_task",
-    family="prefect-server",
+training_server_task_definition = aws.ecs.TaskDefinition(
+    "training_server_task",
+    family="training-server",
     cpu="512",
     memory="1024",
     network_mode="awsvpc",
@@ -1704,16 +1712,16 @@ prefect_server_task_definition = aws.ecs.TaskDefinition(
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
-        prefect_server_log_group.name,
+        training_server_log_group.name,
         prefect_database.endpoint,
         prefect_database.master_user_secrets[0]["secret_arn"],
-        prefect_server_image_uri,
+        training_server_image_uri,
         alb.dns_name,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "prefect-server",
+                    "name": "training-server",
                     "image": args[3],
                     # Inline bash/python constructs the database URL at runtime
                     # because the password comes from Secrets Manager and must be
@@ -1754,7 +1762,7 @@ prefect_server_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "prefect-server",
+                            "awslogs-stream-prefix": "training-server",
                         },
                     },
                     "essential": True,
@@ -1767,9 +1775,9 @@ prefect_server_task_definition = aws.ecs.TaskDefinition(
 )
 
 # Prefect Server Service Discovery
-prefect_server_sd_service = aws.servicediscovery.Service(
-    "prefect_server_sd",
-    name="prefect-server",
+training_server_sd_service = aws.servicediscovery.Service(
+    "training_server_sd",
+    name="training-server",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -1780,11 +1788,11 @@ prefect_server_sd_service = aws.servicediscovery.Service(
 )
 
 # Prefect Server ECS Service
-prefect_server_service = aws.ecs.Service(
-    "prefect_server_service",
-    name="fund-prefect-server",
+training_server_service = aws.ecs.Service(
+    "training_server_service",
+    name="fund-training-server",
     cluster=cluster.arn,
-    task_definition=prefect_server_task_definition.arn,
+    task_definition=training_server_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
@@ -1794,13 +1802,13 @@ prefect_server_service = aws.ecs.Service(
     ),
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=prefect_tg.arn,
-            container_name="prefect-server",
+            target_group_arn=training_tg.arn,
+            container_name="training-server",
             container_port=4200,
         )
     ],
     service_registries=aws.ecs.ServiceServiceRegistriesArgs(
-        registry_arn=prefect_server_sd_service.arn
+        registry_arn=training_server_sd_service.arn
     ),
     opts=pulumi.ResourceOptions(
         depends_on=[prefect_database, prefect_redis, prefect_listener],
@@ -1809,9 +1817,9 @@ prefect_server_service = aws.ecs.Service(
 )
 
 # Prefect Worker Task Definition
-prefect_worker_task_definition = aws.ecs.TaskDefinition(
-    "prefect_worker_task",
-    family="prefect-worker",
+training_worker_task_definition = aws.ecs.TaskDefinition(
+    "training_worker_task",
+    family="training-worker",
     cpu="4096",
     memory="8192",
     network_mode="awsvpc",
@@ -1819,23 +1827,23 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
-        prefect_worker_log_group.name,
+        training_worker_log_group.name,
         service_discovery_namespace.name,
         data_bucket.bucket,
         model_artifacts_bucket.bucket,
-        prefect_worker_image_uri,
+        training_worker_image_uri,
         training_notification_sender_email_parameter.arn,
         training_notification_recipients_parameter.arn,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "prefect-worker",
+                    "name": "training-worker",
                     "image": args[4],
                     "environment": [
                         {
                             "name": "PREFECT_API_URL",
-                            "value": f"http://prefect-server.{args[1]}:4200/api",
+                            "value": f"http://training-server.{args[1]}:4200/api",
                         },
                         {
                             "name": "AWS_S3_DATA_BUCKET_NAME",
@@ -1847,20 +1855,20 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[1]}:8080",
+                            "value": f"http://data-manager.{args[1]}:8080",
                         },
                         {
-                            "name": "LOOKBACK_DAYS",
+                            "name": "FUND_LOOKBACK_DAYS",
                             "value": "365",
                         },
                     ],
                     "secrets": [
                         {
-                            "name": "TRAINING_NOTIFICATION_SENDER_EMAIL",
+                            "name": "FUND_TRAINING_NOTIFICATION_SENDER_EMAIL",
                             "valueFrom": args[5],
                         },
                         {
-                            "name": "TRAINING_NOTIFICATION_RECIPIENT_EMAILS",
+                            "name": "FUND_TRAINING_NOTIFICATION_RECIPIENT_EMAILS",
                             "valueFrom": args[6],
                         },
                     ],
@@ -1869,7 +1877,7 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "prefect-worker",
+                            "awslogs-stream-prefix": "training-worker",
                         },
                     },
                     "essential": True,
@@ -1882,11 +1890,11 @@ prefect_worker_task_definition = aws.ecs.TaskDefinition(
 )
 
 # Prefect Worker ECS Service
-prefect_worker_service = aws.ecs.Service(
-    "prefect_worker_service",
-    name="fund-prefect-worker",
+training_worker_service = aws.ecs.Service(
+    "training_worker_service",
+    name="fund-training-worker",
     cluster=cluster.arn,
-    task_definition=prefect_worker_task_definition.arn,
+    task_definition=training_worker_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
@@ -1895,35 +1903,35 @@ prefect_worker_service = aws.ecs.Service(
         assign_public_ip=False,
     ),
     opts=pulumi.ResourceOptions(
-        depends_on=[prefect_server_service],
+        depends_on=[training_server_service],
     ),
     tags=tags,
 )
 
-datamanager_log_group = aws.cloudwatch.LogGroup(
-    "datamanager_logs",
-    name="/ecs/fund/datamanager",
+data_manager_log_group = aws.cloudwatch.LogGroup(
+    "data_manager_logs",
+    name="/ecs/fund/data-manager",
     retention_in_days=7,
     tags=tags,
 )
 
-portfoliomanager_log_group = aws.cloudwatch.LogGroup(
-    "portfoliomanager_logs",
-    name="/ecs/fund/portfoliomanager",
+portfolio_manager_log_group = aws.cloudwatch.LogGroup(
+    "portfolio_manager_logs",
+    name="/ecs/fund/portfolio-manager",
     retention_in_days=7,
     tags=tags,
 )
 
-equitypricemodel_log_group = aws.cloudwatch.LogGroup(
-    "equitypricemodel_logs",
-    name="/ecs/fund/equitypricemodel",
+ensemble_manager_log_group = aws.cloudwatch.LogGroup(
+    "ensemble_manager_logs",
+    name="/ecs/fund/ensemble-manager",
     retention_in_days=7,
     tags=tags,
 )
 
-datamanager_task_definition = aws.ecs.TaskDefinition(
-    "datamanager_task",
-    family="datamanager",
+data_manager_task_definition = aws.ecs.TaskDefinition(
+    "data_manager_task",
+    family="data-manager",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -1931,16 +1939,16 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
-        datamanager_log_group.name,
-        datamanager_image_uri,
-        datamanager_secret.arn,
+        data_manager_log_group.name,
+        data_manager_image_uri,
+        data_manager_secret.arn,
         shared_secret.arn,
         data_bucket.bucket,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "datamanager",
+                    "name": "data-manager",
                     "image": args[1],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
@@ -1953,12 +1961,12 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                             "value": args[4],
                         },
                         {
-                            "name": "ENVIRONMENT",
+                            "name": "FUND_ENVIRONMENT",
                             "value": "production",
                         },
                         {
                             "name": "RUST_LOG",
-                            "value": "datamanager=info,tower_http=info",
+                            "value": "data_manager=info,tower_http=info",
                         },
                     ],
                     "secrets": [
@@ -1976,7 +1984,7 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "datamanager",
+                            "awslogs-stream-prefix": "data-manager",
                         },
                     },
                     "essential": True,
@@ -1988,9 +1996,9 @@ datamanager_task_definition = aws.ecs.TaskDefinition(
     tags=tags,
 )
 
-portfoliomanager_task_definition = aws.ecs.TaskDefinition(
-    "portfoliomanager_task",
-    family="portfoliomanager",
+portfolio_manager_task_definition = aws.ecs.TaskDefinition(
+    "portfolio_manager_task",
+    family="portfolio-manager",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -1998,30 +2006,30 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
-        portfoliomanager_log_group.name,
+        portfolio_manager_log_group.name,
         service_discovery_namespace.name,
-        portfoliomanager_image_uri,
-        portfoliomanager_secret.arn,
+        portfolio_manager_image_uri,
+        portfolio_manager_secret.arn,
         shared_secret.arn,
         parameters.uncertainty_threshold.value,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "portfoliomanager",
+                    "name": "portfolio-manager",
                     "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[1]}:8080",
+                            "value": f"http://data-manager.{args[1]}:8080",
                         },
                         {
-                            "name": "FUND_EQUITYPRICEMODEL_BASE_URL",
-                            "value": f"http://equitypricemodel.{args[1]}:8080",
+                            "name": "FUND_ENSEMBLE_MANAGER_BASE_URL",
+                            "value": f"http://ensemble-manager.{args[1]}:8080",
                         },
                         {
-                            "name": "ENVIRONMENT",
+                            "name": "FUND_ENVIRONMENT",
                             "value": "production",
                         },
                         {
@@ -2052,7 +2060,7 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "portfoliomanager",
+                            "awslogs-stream-prefix": "portfolio-manager",
                         },
                     },
                     "essential": True,
@@ -2064,9 +2072,9 @@ portfoliomanager_task_definition = aws.ecs.TaskDefinition(
     tags=tags,
 )
 
-equitypricemodel_task_definition = aws.ecs.TaskDefinition(
-    "equitypricemodel_task",
-    family="equitypricemodel",
+ensemble_manager_task_definition = aws.ecs.TaskDefinition(
+    "ensemble_manager_task",
+    family="ensemble-manager",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -2074,29 +2082,29 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
-        equitypricemodel_log_group.name,
+        ensemble_manager_log_group.name,
         service_discovery_namespace.name,
-        equitypricemodel_image_uri,
+        ensemble_manager_image_uri,
         model_artifacts_bucket.bucket,
         shared_secret.arn,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "equitypricemodel",
+                    "name": "ensemble-manager",
                     "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://datamanager.{args[1]}:8080",
+                            "value": f"http://data-manager.{args[1]}:8080",
                         },
                         {
                             "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME",
                             "value": args[3],
                         },
                         {
-                            "name": "ENVIRONMENT",
+                            "name": "FUND_ENVIRONMENT",
                             "value": "production",
                         },
                         {
@@ -2115,7 +2123,7 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "equitypricemodel",
+                            "awslogs-stream-prefix": "ensemble-manager",
                         },
                     },
                     "essential": True,
@@ -2127,9 +2135,9 @@ equitypricemodel_task_definition = aws.ecs.TaskDefinition(
     tags=tags,
 )
 
-datamanager_sd_service = aws.servicediscovery.Service(
-    "datamanager_sd",
-    name="datamanager",
+data_manager_sd_service = aws.servicediscovery.Service(
+    "data_manager_sd",
+    name="data-manager",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -2139,9 +2147,9 @@ datamanager_sd_service = aws.servicediscovery.Service(
     tags=tags,
 )
 
-portfoliomanager_sd_service = aws.servicediscovery.Service(
-    "portfoliomanager_sd",
-    name="portfoliomanager",
+portfolio_manager_sd_service = aws.servicediscovery.Service(
+    "portfolio_manager_sd",
+    name="portfolio-manager",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -2151,9 +2159,9 @@ portfoliomanager_sd_service = aws.servicediscovery.Service(
     tags=tags,
 )
 
-equitypricemodel_sd_service = aws.servicediscovery.Service(
-    "equitypricemodel_sd",
-    name="equitypricemodel",
+ensemble_manager_sd_service = aws.servicediscovery.Service(
+    "ensemble_manager_sd",
+    name="ensemble-manager",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -2163,11 +2171,11 @@ equitypricemodel_sd_service = aws.servicediscovery.Service(
     tags=tags,
 )
 
-datamanager_service = aws.ecs.Service(
-    "datamanager_service",
-    name="fund-datamanager",
+data_manager_service = aws.ecs.Service(
+    "data_manager_service",
+    name="fund-data-manager",
     cluster=cluster.arn,
-    task_definition=datamanager_task_definition.arn,
+    task_definition=data_manager_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
@@ -2177,23 +2185,23 @@ datamanager_service = aws.ecs.Service(
     ),
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=datamanager_tg.arn,
-            container_name="datamanager",
+            target_group_arn=data_manager_tg.arn,
+            container_name="data-manager",
             container_port=8080,
         )
     ],
     service_registries=aws.ecs.ServiceServiceRegistriesArgs(
-        registry_arn=datamanager_sd_service.arn
+        registry_arn=data_manager_sd_service.arn
     ),
     opts=pulumi.ResourceOptions(depends_on=[alb_listener]),
     tags=tags,
 )
 
-portfoliomanager_service = aws.ecs.Service(
-    "portfoliomanager_service",
-    name="fund-portfoliomanager",
+portfolio_manager_service = aws.ecs.Service(
+    "portfolio_manager_service",
+    name="fund-portfolio-manager",
     cluster=cluster.arn,
-    task_definition=portfoliomanager_task_definition.arn,
+    task_definition=portfolio_manager_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
@@ -2203,23 +2211,23 @@ portfoliomanager_service = aws.ecs.Service(
     ),
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=portfoliomanager_tg.arn,
-            container_name="portfoliomanager",
+            target_group_arn=portfolio_manager_tg.arn,
+            container_name="portfolio-manager",
             container_port=8080,
         )
     ],
     service_registries=aws.ecs.ServiceServiceRegistriesArgs(
-        registry_arn=portfoliomanager_sd_service.arn
+        registry_arn=portfolio_manager_sd_service.arn
     ),
-    opts=pulumi.ResourceOptions(depends_on=[alb_listener, datamanager_service]),
+    opts=pulumi.ResourceOptions(depends_on=[alb_listener, data_manager_service]),
     tags=tags,
 )
 
-equitypricemodel_service = aws.ecs.Service(
-    "equitypricemodel_service",
-    name="fund-equitypricemodel",
+ensemble_manager_service = aws.ecs.Service(
+    "ensemble_manager_service",
+    name="fund-ensemble-manager",
     cluster=cluster.arn,
-    task_definition=equitypricemodel_task_definition.arn,
+    task_definition=ensemble_manager_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
@@ -2229,15 +2237,15 @@ equitypricemodel_service = aws.ecs.Service(
     ),
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=equitypricemodel_tg.arn,
-            container_name="equitypricemodel",
+            target_group_arn=ensemble_manager_tg.arn,
+            container_name="ensemble-manager",
             container_port=8080,
         )
     ],
     service_registries=aws.ecs.ServiceServiceRegistriesArgs(
-        registry_arn=equitypricemodel_sd_service.arn
+        registry_arn=ensemble_manager_sd_service.arn
     ),
-    opts=pulumi.ResourceOptions(depends_on=[alb_listener, datamanager_service]),
+    opts=pulumi.ResourceOptions(depends_on=[alb_listener, data_manager_service]),
     tags=tags,
 )
 
@@ -2261,15 +2269,15 @@ pulumi.export("aws_ecs_cluster_name", cluster.name)
 pulumi.export("aws_alb_dns_name", alb.dns_name)
 pulumi.export("aws_alb_url", pulumi.Output.concat(protocol, alb.dns_name))
 pulumi.export("aws_service_discovery_namespace", service_discovery_namespace.name)
-pulumi.export("aws_ecr_datamanager_image", datamanager_image_uri)
-pulumi.export("aws_ecr_portfoliomanager_image", portfoliomanager_image_uri)
-pulumi.export("aws_ecr_equitypricemodel_image", equitypricemodel_image_uri)
-pulumi.export("aws_ecr_datamanager_repository", datamanager_repository.repository_url)
+pulumi.export("aws_ecr_data_manager_image", data_manager_image_uri)
+pulumi.export("aws_ecr_portfolio_manager_image", portfolio_manager_image_uri)
+pulumi.export("aws_ecr_ensemble_manager_image", ensemble_manager_image_uri)
+pulumi.export("aws_ecr_data_manager_repository", data_manager_repository.repository_url)
 pulumi.export(
-    "aws_ecr_portfoliomanager_repository", portfoliomanager_repository.repository_url
+    "aws_ecr_portfolio_manager_repository", portfolio_manager_repository.repository_url
 )
 pulumi.export(
-    "aws_ecr_equitypricemodel_repository", equitypricemodel_repository.repository_url
+    "aws_ecr_ensemble_manager_repository", ensemble_manager_repository.repository_url
 )
 pulumi.export("aws_s3_data_bucket_name", pulumi.Output.unsecret(data_bucket.bucket))
 pulumi.export(
@@ -2277,20 +2285,18 @@ pulumi.export(
     pulumi.Output.unsecret(model_artifacts_bucket.bucket),
 )
 pulumi.export(
-    "aws_ecr_equitypricemodel_trainer_repository",
-    equitypricemodel_trainer_repository.repository_url,
+    "aws_ecr_tide_trainer_repository",
+    tide_trainer_repository.repository_url,
 )
+pulumi.export("aws_ecr_tide_trainer_image", tide_trainer_image_uri)
 pulumi.export(
-    "aws_ecr_equitypricemodel_trainer_image", equitypricemodel_trainer_image_uri
+    "aws_ecr_training_worker_repository", training_worker_repository.repository_url
 )
-pulumi.export(
-    "aws_ecr_prefect_worker_repository", prefect_worker_repository.repository_url
-)
-pulumi.export("aws_ecr_prefect_worker_image", prefect_worker_image_uri)
+pulumi.export("aws_ecr_training_worker_image", training_worker_image_uri)
 pulumi.export(
     "prefect_api_url",
     pulumi.Output.concat(
-        "http://prefect-server.", service_discovery_namespace.name, ":4200/api"
+        "http://training-server.", service_discovery_namespace.name, ":4200/api"
     ),
 )
 prefect_ui_url = (

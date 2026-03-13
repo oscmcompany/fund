@@ -10,7 +10,7 @@ pub fn initialize_sentry() -> sentry::ClientInitGuard {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             environment: Some(
-                env::var("ENVIRONMENT")
+                env::var("FUND_ENVIRONMENT")
                     .unwrap_or_else(|_| "development".to_string()) // Defaults to development so local runs don't require this
                     .into(),
             ),
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_initialize_observability_functions() {
-        let _environment_guard = EnvironmentVariableGuard::set("ENVIRONMENT", "test");
+        let _environment_guard = EnvironmentVariableGuard::set("FUND_ENVIRONMENT", "test");
         let _sentry_dsn_guard = EnvironmentVariableGuard::set("SENTRY_DSN", "");
         let _rust_log_guard =
             EnvironmentVariableGuard::set("RUST_LOG", "data_manager=debug,tower_http=debug");

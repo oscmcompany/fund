@@ -208,12 +208,12 @@ if [ -n "$GITHUB_POLICY_ARN" ]; then
   pulumi import --yes --generate-code=false aws:iam/policy:Policy github_actions_infrastructure_policy "$GITHUB_POLICY_ARN" 2>/dev/null || true
 fi
 
-pulumi import --yes --generate-code=false aws:s3/bucket:Bucket data_bucket "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketV2:BucketV2 data_bucket "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration data_bucket_encryption "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock data_bucket_public_access_block "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning data_bucket_versioning "fund-data-${RANDOM_SUFFIX}" 2>/dev/null || true
 
-pulumi import --yes --generate-code=false aws:s3/bucket:Bucket model_artifacts_bucket "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:s3/bucketV2:BucketV2 model_artifacts_bucket "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration model_artifacts_bucket_encryption "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock model_artifacts_bucket_public_access_block "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning model_artifacts_bucket_versioning "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true

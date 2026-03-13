@@ -73,9 +73,9 @@ logger = structlog.get_logger()
 DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
 HTTP_BAD_REQUEST = 400
 _MINIMUM_PAIR_PRICE_ROWS = 30
-EQUITYPRICEMODEL_BASE_URL = os.getenv(
-    "FUND_EQUITYPRICEMODEL_BASE_URL",
-    "http://equitypricemodel:8080",
+ENSEMBLE_MANAGER_BASE_URL = os.getenv(
+    "FUND_ENSEMBLE_MANAGER_BASE_URL",
+    "http://ensemble-manager:8080",
 )
 
 ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
@@ -467,7 +467,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
 async def get_raw_predictions() -> pl.DataFrame:
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
-            url=f"{EQUITYPRICEMODEL_BASE_URL}/predictions",
+            url=f"{ENSEMBLE_MANAGER_BASE_URL}/predictions",
         )
         response.raise_for_status()
         return pl.DataFrame(response.json()["data"])

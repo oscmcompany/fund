@@ -53,7 +53,7 @@ mod tests {
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
             std::env::set_var("SENTRY_DSN", "");
-            std::env::set_var("ENVIRONMENT", "test");
+            std::env::set_var("FUND_ENVIRONMENT", "test");
             std::env::set_var("RUST_LOG", "data_manager=debug,tower_http=debug");
         }
 
@@ -66,7 +66,7 @@ mod tests {
             std::env::remove_var("MASSIVE_BASE_URL");
             std::env::remove_var("MASSIVE_API_KEY");
             std::env::remove_var("SENTRY_DSN");
-            std::env::remove_var("ENVIRONMENT");
+            std::env::remove_var("FUND_ENVIRONMENT");
             std::env::remove_var("RUST_LOG");
         }
     }
