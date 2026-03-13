@@ -66,11 +66,13 @@ def main() -> None:
             checkpoint_directory=checkpoint_dir,
         )
 
+    best_loss = min(losses) if losses else None
     final_loss = losses[-1] if losses else None
 
     result = {
         "config": merged_config,
-        "quantile_loss": final_loss,
+        "quantile_loss": best_loss,
+        "final_epoch_loss": final_loss,
         "all_losses": losses,
         "status": "OK",
     }

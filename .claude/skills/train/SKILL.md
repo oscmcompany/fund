@@ -7,8 +7,9 @@ description: >
   metric, and keeps or reverts changes to find the best model. Uses parallel Agent
   workers for hyperparameter search and sequential iterations for architecture changes.
   Use when the user wants to optimize a model, run autoresearch, find the best
-  architecture, or improve training metrics. Optionally accepts `--metric <name>` to
-  specify the optimization target.
+  architecture, or improve training metrics. Includes epoch escalation (Mode C) for
+  pushing past plateaus. Optionally accepts `--metric <name>` to specify the
+  optimization target.
 ---
 
 # Autoresearch Training Loop
@@ -58,8 +59,15 @@ uv run --package tools python -m tools.run_training \
 
 Outputs a single JSON line to **stdout** (logs go to stderr):
 ```json
-{"config": {...}, "quantile_loss": 0.2541, "all_losses": [0.2541], "status": "OK"}
+{"config": {...}, "quantile_loss": 0.0206, "final_epoch_loss": 0.0298, "all_losses": [0.05, 0.03, 0.02, 0.03], "status": "OK"}
 ```
+
+**Important**: `quantile_loss` is `min(all_losses)` -- the best epoch's loss. This matches
+the actual model state because `run_training.py` uses checkpointing: the model saves its
+best weights during training and restores them before returning. `final_epoch_loss` is
+provided for reference but should NOT be used for KEEP/DISCARD decisions.
+
+Use `quantile_loss` for all KEEP/DISCARD comparisons.
 
 ## Startup Procedure
 
@@ -99,28 +107,23 @@ Run indefinitely until the user interrupts. Two modes of operation:
 ### Mode A: Parallel Hyperparameter Search
 
 For config-only changes (learning rate, hidden size, dropout, batch size, etc.),
-run **multiple experiments in parallel** using background Agent workers.
+run **multiple experiments in parallel** using Bash background jobs.
 
 **Orchestrator pattern:**
 
 1. **Design a batch** of 3-4 config variants to test, each exploring a different
    hypothesis. Include the reasoning for each.
 
-2. **Spawn parallel agents** using the Agent tool with `run_in_background: true`.
-   Each agent gets a prompt like:
+2. **Spawn parallel training runs** using the Bash tool with `run_in_background: true`:
 
-   ```
-   Run this training command and return the full JSON output:
-
-   cd /path/to/repo && uv run --package tools python -m tools.run_training \
+   ```bash
+   uv run --package tools python -m tools.run_training \
      --data-path results/equitypricemodel/training_data.parquet \
-     --config '<JSON config>'
-
-   Return the stdout JSON result.
+     --config '<JSON config>' 2>/dev/null
    ```
 
-3. **Collect results** as agents complete (you'll be notified automatically).
-   Do NOT poll or sleep -- continue with other work or wait for notifications.
+3. **Collect results** using `TaskOutput` with `block: true` on each task ID.
+   All tasks can be awaited in parallel.
 
 4. **Log all results** to `results.jsonl` and identify the best performer.
 
@@ -148,14 +151,36 @@ For code changes (model architecture, loss function, layer structure), run
 6. **Decide**: KEEP (new baseline) or DISCARD (`git reset --hard HEAD~1`)
 7. **Log to results.jsonl**
 
+### Mode C: Epoch Escalation
+
+When improvements plateau at the current epoch count, **escalate training depth**
+before concluding that the search is exhausted:
+
+1. **Detect plateau**: If 2+ consecutive batches produce no new KEEP at the current
+   epoch count, the search is likely exhausted at this training depth.
+
+2. **Sweep epochs**: Run parallel experiments at 2x, 3x, 5x, and 10x the current
+   epoch count to find the next useful training depth.
+
+3. **Re-tune hyperparameters**: After increasing epochs, LR and dropout must be
+   re-tuned because their optimal values shift:
+   - **LR decreases** with more epochs (e.g., 0.003 at 1 epoch -> 0.001 at 10 epochs)
+   - **Dropout increases** with more epochs (e.g., 0.0 at 1 epoch -> 0.05 at 10 epochs)
+   - Always run Mode A after epoch escalation to find the new optimal LR/dropout.
+
+4. **Repeat**: Continue the Mode A -> Mode B -> Mode C cycle. Each epoch escalation
+   unlocks a new region of the loss landscape to explore.
+
 ### Prioritization
 
 Alternate between modes based on what the results suggest:
 - Start with Mode A to find good hyperparameters quickly
 - Switch to Mode B when architecture changes seem more promising
 - After an architecture KEEP, run Mode A again to re-tune hyperparameters
+- **When Mode A and B both plateau, use Mode C to escalate epochs**
+- After epoch escalation, return to Mode A to re-tune for the new depth
 
-Priority order: architecture > hyperparameters > loss function > data pipeline
+Priority order: architecture > hyperparameters > epoch depth > loss function > data pipeline
 
 ## Results Format
 
