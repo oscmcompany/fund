@@ -1,0 +1,26 @@
+[project]
+name = "tide"
+version = "0.0.1"
+description = "TiDE model training workflow"
+requires-python = "==3.12.10"
+dependencies = [
+  "tools>=0.0.1",
+  "boto3>=1.40.74",
+  "prefect>=3.0.0,<4.0.0",
+  "polars>=1.29.0",
+  "structlog>=25.5.0",
+  "tinygrad>=0.10.3",
+  "numpy>=1.26.4",
+  "pandera[polars]>=0.26.0",
+  "requests>=2.32.5",
+]
+
+[dependency-groups]
+dev = ["boto3-stubs[s3]>=1.38.0"]
+
+[tool.uv.sources]
+tools = { workspace = true }
+
+[tool.uv]
+package = true
+src = ["src"]
