@@ -1,0 +1,226 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: prefect
+      POSTGRES_PASSWORD: prefect
+      POSTGRES_DB: prefect
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prefect -d prefect"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fund-network
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fund-network
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/fund-data &&
+      mc mb --ignore-existing local/fund-model-artifacts &&
+      echo 'Buckets created successfully'
+      "
+    networks:
+      - fund-network
+
+  prefect-server:
+    image: prefecthq/prefect:3-python3.12
+    command:
+      - prefect
+      - server
+      - start
+      - --host
+      - "0.0.0.0"
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+      PREFECT_UI_API_URL: http://localhost:4200/api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - fund-network
+
+  prefect-worker-1:
+    build:
+      context: .
+      dockerfile: tools/Dockerfile
+      target: worker
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      AWS_S3_DATA_BUCKET_NAME: fund-data
+      AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME: fund-model-artifacts
+      FUND_DATAMANAGER_BASE_URL: http://datamanager:8080
+      LOOKBACK_DAYS: "365"
+      MASSIVE_API_KEY: ${MASSIVE_API_KEY}
+      SKIP_DATA_SYNC: "true"
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - fund-network
+
+  prefect-worker-2:
+    build:
+      context: .
+      dockerfile: tools/Dockerfile
+      target: worker
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      AWS_S3_DATA_BUCKET_NAME: fund-data
+      AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME: fund-model-artifacts
+      FUND_DATAMANAGER_BASE_URL: http://datamanager:8080
+      LOOKBACK_DAYS: "365"
+      MASSIVE_API_KEY: ${MASSIVE_API_KEY}
+      SKIP_DATA_SYNC: "true"
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      prefect-worker-1:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - fund-network
+
+  datamanager:
+    build:
+      context: .
+      dockerfile: applications/datamanager/Dockerfile
+      target: server
+    ports:
+      - "8080:8080"
+    environment:
+      MASSIVE_BASE_URL: ${MASSIVE_BASE_URL:-https://api.massive.com}
+      MASSIVE_API_KEY: ${MASSIVE_API_KEY}
+      AWS_S3_DATA_BUCKET_NAME: fund-data
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - fund-network
+
+  equitypricemodel:
+    build:
+      context: .
+      dockerfile: applications/equitypricemodel/Dockerfile
+      target: server
+    ports:
+      - "8082:8080"
+    environment:
+      FUND_DATAMANAGER_BASE_URL: http://datamanager:8080
+      AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME: fund-model-artifacts
+      ENVIRONMENT: development
+      DISABLE_DISK_CACHE: "1"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      datamanager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - fund-network
+
+  portfoliomanager:
+    build:
+      context: .
+      dockerfile: applications/portfoliomanager/Dockerfile
+      target: server
+    ports:
+      - "8081:8080"
+    environment:
+      FUND_DATAMANAGER_BASE_URL: http://datamanager:8080
+      FUND_EQUITYPRICEMODEL_BASE_URL: http://equitypricemodel:8080
+      FUND_UNCERTAINTY_THRESHOLD: "1.5"
+      ALPACA_API_KEY_ID: ${ALPACA_API_KEY_ID:-}
+      ALPACA_API_SECRET: ${ALPACA_API_SECRET:-}
+      ALPACA_IS_PAPER: ${ALPACA_IS_PAPER:-true}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      datamanager:
+        condition: service_healthy
+      equitypricemodel:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - fund-network
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  fund-network:
+    driver: bridge

@@ -141,15 +141,12 @@ class Model:
                 )
             )
 
-        self.temporal_projection = Linear(  # projects to output sequence length
+        # combined projection: hidden -> output_length * num_quantiles
+        # avoids applying Linear to 3D tensors which triggers a tinygrad
+        # CPU codegen bug in the backward pass (linearizer.py assertion)
+        self.output_projection = Linear(
             in_features=self.hidden_size,
-            out_features=self.hidden_size * self.output_length,
-        )
-
-        # final output layer for quantiles
-        self.output_layer = Linear(
-            in_features=self.hidden_size,
-            out_features=len(self.quantiles),
+            out_features=self.output_length * len(self.quantiles),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -176,25 +173,11 @@ class Model:
         # add skip connection from encoder to decoder output
         x = cast("Tensor", x.add(encoder_output))
 
-        # temporal projection to output sequence length
-        x = self.temporal_projection(x).relu()
+        # combined projection to (batch_size, output_length * num_quantiles)
+        x = self.output_projection(x)
 
-        # reshape to (batch_size, output_length, hidden_size)
-        x = x.reshape(batch_size, self.output_length, self.hidden_size)
-
-        # apply output layer across the sequence dimension
-        predictions: list[Tensor] = []
-        for t in range(self.output_length):
-            prediction_batch = self.output_layer(
-                x[:, t, :]
-            )  # (batch_size, num_quantiles)
-            predictions.append(prediction_batch)
-
-        predictions_first = predictions[0]
-        predictions_rest = predictions[1:]
-
-        # stack predictions: (batch_size, output_length, num_quantiles e.g. (32, 7, 3))
-        return predictions_first.stack(*predictions_rest, dim=1)
+        # reshape to (batch_size, output_length, num_quantiles)
+        return x.reshape(batch_size, self.output_length, len(self.quantiles))
 
     def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
         """Check a batch for NaN/Inf values and return statistics."""
