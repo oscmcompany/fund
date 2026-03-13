@@ -68,10 +68,15 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
+if [ "${application_name}" = "training" ]; then
+    dockerfile="tools/Dockerfile"
+else
+    dockerfile="applications/${application_name}/Dockerfile"
+fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/${application_name}-${stage_name}"
 cache_reference="${image_reference}:buildcache"
 
-# Use GHA backend for caching when running in GitHub Actions 
+# Use GHA backend for caching when running in GitHub Actions
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
     scope="${application_name}-${stage_name}"
     echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
@@ -99,7 +104,7 @@ echo "Building with caching (will continue if cache doesn't exist)"
 docker buildx build \
     --platform linux/amd64 \
     --target ${stage_name} \
-    --file applications/${application_name}/Dockerfile \
+    --file ${dockerfile} \
     --tag ${image_reference}:latest \
     ${cache_from_arguments} \
     ${cache_to_arguments} \
@@ -218,7 +223,7 @@ pulumi import --yes --generate-code=false aws:s3/bucketServerSideEncryptionConfi
 pulumi import --yes --generate-code=false aws:s3/bucketPublicAccessBlock:BucketPublicAccessBlock model_artifacts_bucket_public_access_block "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 pulumi import --yes --generate-code=false aws:s3/bucketVersioning:BucketVersioning model_artifacts_bucket_versioning "fund-model-artifacts-${RANDOM_SUFFIX}" 2>/dev/null || true
 
-pulumi import --yes --generate-code=false aws:ssm/parameter:Parameter ssm_equitypricemodel_model_version "/fund/equitypricemodel/model_version" 2>/dev/null || true
+pulumi import --yes --generate-code=false aws:ssm/parameter:Parameter ssm_ensemble_manager_model_version "/fund/ensemble-manager/model_version" 2>/dev/null || true
 
 echo "Importing resources complete"
 
@@ -265,7 +270,7 @@ else
     # Note: Service names use 'fund' prefix matching the Pulumi project name.
     # These must exactly match the ECS service names created by the infrastructure code.
     # The AWS account provides environment context (one account = one environment).
-    for service in fund-datamanager fund-portfoliomanager fund-equitypricemodel fund-prefect-server fund-prefect-worker; do
+    for service in fund-data-manager fund-portfolio-manager fund-ensemble-manager fund-training-server fund-training-worker; do
         echo "Checking if $service exists and is ready"
 
         # Wait up to 60 seconds for service to be active
@@ -309,7 +314,7 @@ else
     done
 
     echo "Stack update complete - ECS is performing rolling deployments"
-    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services fund-portfoliomanager"
+    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services fund-portfolio-manager"
 fi
 
 echo "Infrastructure launched successfully"
@@ -369,7 +374,7 @@ fi
 cd "${MASKFILE_DIR}"
 
 case "$application_name" in
-    portfoliomanager)
+    portfolio-manager)
         full_url="${base_url}/portfolio"
         echo "Creating portfolio: $full_url"
 
@@ -386,7 +391,7 @@ case "$application_name" in
         fi
         ;;
 
-    datamanager)
+    data-manager)
         if [ -z "${data_type:-}" ]; then
             echo "Missing required flag: --data-type"
             echo "Valid choices: equity-bars, equity-details"
@@ -408,7 +413,7 @@ case "$application_name" in
 
     *)
         echo "Unknown application name: ${application_name}"
-        echo "Valid options: portfoliomanager, datamanager"
+        echo "Valid options: portfolio-manager, data-manager"
         exit 1
         ;;
 esac
@@ -761,45 +766,16 @@ mask development yaml lint
 echo "YAML development checks completed successfully"
 ```
 
-## models
+## model
 
 > Model management commands
 
-### prepare (application_name)
-
-> Prepare training data by consolidating equity bars with categories
-
-```bash
-set -euo pipefail
-
-export APPLICATION_NAME="${application_name}"
-
-cd infrastructure
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
-
-cd ../
-
-uv run python -m tools.prepare_training_data
-```
-
-### train (application_name)
+### train
 
 > Train model via Prefect training pipeline
 
 ```bash
 set -euo pipefail
-
-export APPLICATION_NAME="${application_name}"
 
 cd infrastructure
 
@@ -813,22 +789,20 @@ pulumi stack select ${organization_name}/fund/production
 export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output prefect_api_url)"
-export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+export PREFECT_API_URL="$(pulumi stack output training_api_url)"
+export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../
 
-uv run python -m tools.run_training_job
+uv run python -m tide.run
 ```
 
-### deploy (application_name)
+### deploy
 
 > Register flow deployment with Prefect server
 
 ```bash
 set -euo pipefail
-
-export APPLICATION_NAME="${application_name}"
 
 cd infrastructure
 
@@ -839,22 +813,18 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export FUND_DATAMANAGER_BASE_URL="http://datamanager.$(pulumi stack output aws_service_discovery_namespace):8080"
+export FUND_DATAMANAGER_BASE_URL="http://data-manager.$(pulumi stack output aws_service_discovery_namespace):8080"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output prefect_api_url)"
-export LOOKBACK_DAYS="${LOOKBACK_DAYS:-365}"
+export PREFECT_API_URL="$(pulumi stack output training_api_url)"
+export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../
 
-uv run python -m tools.deploy_training_flow
+uv run python -m tide.deploy
 ```
 
-### artifacts
-
-> Manage model artifacts
-
-#### download (application_name)
+### download (application_name)
 
 > Download model artifacts
 
@@ -864,51 +834,6 @@ set -euo pipefail
 export APPLICATION_NAME="${application_name}"
 
 uv run python -m tools.download_model_artifacts
-```
-
-## prefect
-
-> Prefect infrastructure management
-
-### build-worker
-
-> Build and push the Prefect worker Docker image to ECR
-
-```bash
-set -euo pipefail
-
-echo "Building Prefect worker image"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region=${AWS_REGION}
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
-fi
-
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/prefect-worker"
-
-echo "Logging into ECR"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
-
-echo "Building image for linux/amd64"
-docker build \
-    --platform linux/amd64 \
-    --target worker \
-    --file tools/Dockerfile \
-    --tag ${image_reference}:latest \
-    .
-
-echo "Pushing image to ECR"
-docker push ${image_reference}:latest
-
-commit_hash=$(git rev-parse --short HEAD)
-docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
-docker push "${image_reference}:git-${commit_hash}"
-
-echo "Prefect worker image pushed: ${image_reference}:latest (commit: ${commit_hash})"
 ```
 
 ## mcp

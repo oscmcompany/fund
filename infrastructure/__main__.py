@@ -2294,18 +2294,18 @@ pulumi.export(
 )
 pulumi.export("aws_ecr_training_worker_image", training_worker_image_uri)
 pulumi.export(
-    "prefect_api_url",
+    "training_api_url",
     pulumi.Output.concat(
         "http://training-server.", service_discovery_namespace.name, ":4200/api"
     ),
 )
-prefect_ui_url = (
+training_ui_url = (
     pulumi.Output.concat("https://", alb.dns_name, ":4200")
     if acm_certificate_arn
     else pulumi.Output.from_input("TLS certificate not configured")
 )
-pulumi.export("prefect_ui_url", prefect_ui_url)
-pulumi.export("prefect_ui_tls_enabled", bool(acm_certificate_arn))
+pulumi.export("training_ui_url", training_ui_url)
+pulumi.export("training_ui_tls_enabled", bool(acm_certificate_arn))
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,
