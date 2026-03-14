@@ -1,0 +1,13 @@
+FROM python:3.12.10-slim
+
+RUN pip install --no-cache-dir mlflow==3.10.1 psycopg2-binary boto3
+
+EXPOSE 8080
+
+CMD exec mlflow server \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --workers 1 \
+    --backend-store-uri "${MLFLOW_BACKEND_STORE_URI:-sqlite:///mlflow.db}" \
+    --default-artifact-root "${MLFLOW_DEFAULT_ARTIFACT_ROOT:-./mlartifacts}" \
+    --serve-artifacts

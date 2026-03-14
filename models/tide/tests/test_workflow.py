@@ -6,50 +6,11 @@ import polars as pl
 import pytest
 from tide.workflow import (
     prepare_data,
-    sync_equity_bars,
-    sync_equity_details,
     train_tide_model,
     training_pipeline,
 )
 
 LOOKBACK_DAYS = 30
-
-
-@patch("tide.workflow.sync_equity_bars_data")
-def test_sync_equity_bars_calls_sync_with_date_range(mock_sync: MagicMock) -> None:
-    start_date = datetime(2024, 1, 1, tzinfo=UTC)
-    end_date = datetime(2024, 1, 31, tzinfo=UTC)
-    sync_equity_bars.fn(
-        base_url="http://example.com",
-        start_date=start_date,
-        end_date=end_date,
-    )
-    mock_sync.assert_called_once()
-    call_kwargs = mock_sync.call_args
-    assert call_kwargs.kwargs["base_url"] == "http://example.com"
-    start, end = call_kwargs.kwargs["date_range"]
-    assert start == start_date
-    assert end == end_date
-
-
-@patch("tide.workflow.sync_equity_details_data")
-def test_sync_equity_details_calls_sync(mock_sync: MagicMock) -> None:
-    sync_equity_details.fn(base_url="http://example.com")
-    mock_sync.assert_called_once_with(base_url="http://example.com")
-
-
-@patch("tide.workflow.sync_equity_details_data")
-def test_sync_equity_details_ignores_not_implemented(mock_sync: MagicMock) -> None:
-    mock_sync.side_effect = RuntimeError("Sync failed with status 501: not implemented")
-    sync_equity_details.fn(base_url="http://example.com")
-    mock_sync.assert_called_once_with(base_url="http://example.com")
-
-
-@patch("tide.workflow.sync_equity_details_data")
-def test_sync_equity_details_raises_non_501_errors(mock_sync: MagicMock) -> None:
-    mock_sync.side_effect = RuntimeError("Sync failed with status 500: failure")
-    with pytest.raises(RuntimeError, match="status 500"):
-        sync_equity_details.fn(base_url="http://example.com")
 
 
 @patch("tide.workflow.prepare_training_data")
@@ -111,7 +72,7 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
     mock_data = MagicMock()
 
     with patch("tide.trainer.train_model") as mock_train:
-        mock_train.return_value = (mock_model, mock_data)
+        mock_train.return_value = (mock_model, mock_data, [0.5, 0.3, 0.2])
         result = train_tide_model.fn(
             artifacts_bucket="artifacts-bucket",
             training_data_key="training/data.parquet",
@@ -126,8 +87,6 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
 
 @patch("tide.workflow.train_tide_model", return_value="s3://bucket/model")
 @patch("tide.workflow.prepare_data", return_value="training/data.parquet")
-@patch("tide.workflow.sync_equity_details")
-@patch("tide.workflow.sync_equity_bars")
 @patch("tide.workflow.get_training_date_range")
 def test_training_pipeline_threads_data_key(
     mock_date_range: MagicMock,
@@ -139,7 +98,6 @@ def test_training_pipeline_threads_data_key(
     mock_date_range.return_value = (start_date, end_date)
 
     result = training_pipeline.fn(
-        base_url="http://example.com",
         data_bucket="data-bucket",
         artifacts_bucket="artifacts-bucket",
         lookback_days=LOOKBACK_DAYS,
@@ -158,3 +116,12 @@ def test_training_pipeline_threads_data_key(
         "training/data.parquet",
     )
     assert result == "s3://bucket/model"
+
+
+def test_training_pipeline_rejects_nonpositive_lookback() -> None:
+    with pytest.raises(ValueError, match="lookback_days must be positive"):
+        training_pipeline.fn(
+            data_bucket="data-bucket",
+            artifacts_bucket="artifacts-bucket",
+            lookback_days=0,
+        )

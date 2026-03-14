@@ -52,7 +52,8 @@ def main() -> None:
     training_data = pl.read_parquet(args.data_path)
     logger.info("Training data loaded", rows=training_data.height)
 
-    from equitypricemodel.trainer import DEFAULT_CONFIGURATION, train_model
+    from tide.tracking import end_run
+    from tide.trainer import DEFAULT_CONFIGURATION, train_model
 
     merged_config = dict(DEFAULT_CONFIGURATION)
     merged_config.update(config_overrides)
@@ -64,7 +65,10 @@ def main() -> None:
             training_data,
             configuration=merged_config,
             checkpoint_directory=checkpoint_dir,
+            tags={"source": "cli", "task": "autoresearch"},
         )
+
+    end_run()
 
     best_loss = min(losses) if losses else None
     final_loss = losses[-1] if losses else None

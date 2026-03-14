@@ -10,11 +10,10 @@ import boto3
 import polars as pl
 import structlog
 from prefect import flow, task
-from tools.sync_equity_bars_data import sync_equity_bars_data
-from tools.sync_equity_details_data import sync_equity_details_data
 
 from tide.notifications import send_training_notification
 from tide.tasks import prepare_training_data
+from tide.tracking import end_run, log_model_artifact
 
 logger = structlog.get_logger()
 
@@ -24,38 +23,6 @@ def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
     end_date = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=lookback_days)
     return start_date, end_date
-
-
-@task(name="sync-equity-bars", retries=2, retry_delay_seconds=30)
-def sync_equity_bars(base_url: str, start_date: datetime, end_date: datetime) -> None:
-    """Trigger datamanager to sync equity bars."""
-    logger.info(
-        "Syncing equity bars",
-        base_url=base_url,
-        start_date=start_date.isoformat(),
-        end_date=end_date.isoformat(),
-    )
-
-    sync_equity_bars_data(
-        base_url=base_url,
-        date_range=(start_date, end_date),
-    )
-
-
-@task(name="sync-equity-details", retries=2, retry_delay_seconds=30)
-def sync_equity_details(base_url: str) -> None:
-    """Trigger datamanager to sync equity details."""
-    logger.info("Syncing equity details", base_url=base_url)
-    try:
-        sync_equity_details_data(base_url=base_url)
-    except RuntimeError as error:
-        if "status 501" in str(error):
-            logger.warning(
-                "Equity details sync is not implemented, skipping",
-                base_url=base_url,
-            )
-            return
-        raise
 
 
 @task(name="prepare-training-data")
@@ -128,6 +95,7 @@ def train_tide_model(
         tide_model, tide_data, _losses = train_model(
             training_data,
             checkpoint_directory=checkpoint_directory,
+            tags={"source": "prefect", "task": "train-tide-model"},
         )
 
     timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
@@ -137,6 +105,8 @@ def train_tide_model(
     with tempfile.TemporaryDirectory() as tmpdir:
         tide_model.save(directory_path=tmpdir)
         tide_data.save(directory_path=tmpdir)
+
+        log_model_artifact(tmpdir)
 
         tar_buffer = io.BytesIO()
         with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
@@ -163,6 +133,8 @@ def train_tide_model(
         artifact_path=f"s3://{artifacts_bucket}/{artifact_key}",
     )
 
+    end_run()
+
     return f"s3://{artifacts_bucket}/{artifact_key}"
 
 
@@ -173,7 +145,6 @@ def train_tide_model(
     on_failure=[send_training_notification],
 )
 def training_pipeline(
-    base_url: str,
     data_bucket: str,
     artifacts_bucket: str,
     lookback_days: int = 365,
@@ -186,19 +157,6 @@ def training_pipeline(
     training_data_key = "training/filtered_tide_training_data.parquet"
     start_date, end_date = get_training_date_range(lookback_days)
 
-    skip_sync = os.getenv("SKIP_DATA_SYNC", "false").lower() == "true"
-
-    if skip_sync:
-        logger.info(
-            "Skipping datamanager sync during training",
-            base_url=base_url,
-            start_date=start_date.isoformat(),
-            end_date=end_date.isoformat(),
-        )
-    else:
-        sync_equity_bars(base_url, start_date, end_date)
-        sync_equity_details(base_url)
-
     prepared_key = prepare_data(
         data_bucket,
         artifacts_bucket,
@@ -210,7 +168,6 @@ def training_pipeline(
 
 
 if __name__ == "__main__":
-    base_url = os.getenv("FUND_DATAMANAGER_BASE_URL", "")
     data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
     artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
 
@@ -235,7 +192,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     training_pipeline(
-        base_url=base_url,
         data_bucket=data_bucket,
         artifacts_bucket=artifacts_bucket,
         lookback_days=lookback_days,

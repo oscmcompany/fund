@@ -11,7 +11,7 @@ def test_train_model_returns_model_and_data(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     training_data = make_raw_data(days=90)
-    model, data = train_model(training_data)
+    model, data, _losses = train_model(training_data)
     assert model is not None
     assert data is not None
     assert hasattr(data, "scaler")
@@ -26,7 +26,7 @@ def test_train_model_uses_custom_configuration(
     custom_hidden_size = 32
     custom_config["epoch_count"] = 1
     custom_config["hidden_size"] = custom_hidden_size
-    model, _data = train_model(training_data, configuration=custom_config)
+    model, _data, _losses = train_model(training_data, configuration=custom_config)
     assert model.hidden_size == custom_hidden_size
 
 
@@ -42,7 +42,7 @@ def test_train_model_uses_default_configuration(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     training_data = make_raw_data(days=90)
-    model, _ = train_model(training_data)
+    model, _, _losses = train_model(training_data)
     assert model.hidden_size == DEFAULT_CONFIGURATION["hidden_size"]
     assert model.output_length == DEFAULT_CONFIGURATION["output_length"]
 
@@ -51,7 +51,7 @@ def test_train_model_merges_partial_configuration(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     training_data = make_raw_data(days=90)
-    model, _ = train_model(
+    model, _, _losses = train_model(
         training_data,
         configuration={
             "epoch_count": 1,

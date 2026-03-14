@@ -94,7 +94,9 @@ Use `quantile_loss` for all KEEP/DISCARD comparisons.
 3. If `--metric` not provided, read the model's training code to infer available metrics.
    Default: `quantile_loss` (minimize).
 
-4. Read existing `results/<model-name>/results.jsonl` if present to understand prior runs.
+4. Check MLflow for prior runs in the experiment to understand baseline performance.
+   All training runs are automatically logged to MLflow when `MLFLOW_TRACKING_URI` is set.
+   Local runs are tagged with `source=cli, task=autoresearch, environment=development`.
 
 5. Create a dated branch: `autoresearch/<model-name>/<YYYY-MM-DD>`
 
@@ -125,7 +127,8 @@ run **multiple experiments in parallel** using Bash background jobs.
 3. **Collect results** using `TaskOutput` with `block: true` on each task ID.
    All tasks can be awaited in parallel.
 
-4. **Log all results** to `results.jsonl` and identify the best performer.
+4. **Collect results** and identify the best performer. All runs are automatically
+   logged to MLflow with params, epoch-by-epoch loss curves, and best_quantile_loss.
 
 5. **Apply the winning config** to `DEFAULT_CONFIGURATION` in trainer.py if it beat
    the previous best. Commit with description.
@@ -149,7 +152,7 @@ For code changes (model architecture, loss function, layer structure), run
    ```
 5. **Parse stdout JSON** for `quantile_loss`
 6. **Decide**: KEEP (new baseline) or DISCARD (`git reset --hard HEAD~1`)
-7. **Log to results.jsonl**
+   Results are automatically tracked in MLflow.
 
 ### Mode C: Epoch Escalation
 
@@ -182,25 +185,20 @@ Alternate between modes based on what the results suggest:
 
 Priority order: architecture > hyperparameters > epoch depth > loss function > data pipeline
 
-## Results Format
+## Experiment Tracking
 
-Append JSON lines to `results/<model-name>/results.jsonl`:
+All experiments are automatically tracked in MLflow (centralized on Fly.io at
+`https://fund-mlflow.fly.dev`). Each training run logs:
 
-```json
-{
-  "experiment": 4,
-  "commit": "abc1234",
-  "quantile_loss": 0.2541,
-  "status": "KEEP",
-  "description": "increase learning rate to 0.01",
-  "config": {"learning_rate": 0.01, "hidden_size": 64, "...": "..."},
-  "changes": "changed learning_rate from 0.003 to 0.01",
-  "reasoning": "with 1 epoch, higher LR extracts more from single pass. result confirmed hypothesis"
-}
-```
+- **Parameters**: Full configuration dict (learning_rate, hidden_size, etc.)
+- **Metrics**: Per-epoch `quantile_loss`, `best_quantile_loss`, `final_quantile_loss`, `total_epochs`
+- **Tags**: `environment` (development/production), `source` (cli/prefect), `host`, `task`
 
-Every experiment gets logged, including DISCARDs and CRASHes, so the full search
-history is preserved for analysis.
+The MLflow experiment name is `tide`. Use the MLflow UI to compare runs, view loss
+curves, and track the full search history.
+
+stdout JSON output from `run_training.py` is still used for KEEP/DISCARD decisions
+in the autoresearch loop (fast, no network dependency).
 
 ## Error Handling
 
@@ -230,4 +228,5 @@ Only when fixing bugs:
 - **Training CLI**: `tools/src/tools/run_training.py` -- lightweight local runner
 - **Data cache**: `tools/src/tools/cache_training_data.py` -- downloads from MinIO
 - **Cached data**: `results/equitypricemodel/training_data.parquet`
-- **Results log**: `results/equitypricemodel/results.jsonl`
+- **MLflow tracking**: `models/tide/src/tide/tracking.py` -- MLflow integration module
+- **MLflow UI**: `https://fund-mlflow.fly.dev` -- centralized experiment tracking

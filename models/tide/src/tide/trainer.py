@@ -5,6 +5,7 @@ import structlog
 
 from tide.tide_data import Data
 from tide.tide_model import Model
+from tide.tracking import log_epoch_loss, log_training_result, start_run
 
 logger = structlog.get_logger()
 
@@ -28,7 +29,8 @@ def train_model(
     training_data: pl.DataFrame,
     configuration: dict | None = None,
     checkpoint_directory: str | None = None,
-) -> tuple[Model, Data]:
+    tags: dict[str, str] | None = None,
+) -> tuple[Model, Data, list[float]]:
     """Train TiDE model and return model + data processor."""
     merged_configuration = dict(DEFAULT_CONFIGURATION)
     if configuration is not None:
@@ -117,6 +119,8 @@ def train_model(
 
     logger.info("Training started", epochs=configuration["epoch_count"])
 
+    start_run(configuration=configuration, tags=tags)
+
     early_stopping_patience = configuration.get("early_stopping_patience", 3)
     losses = tide_model.train(
         train_batches=train_batches,
@@ -126,10 +130,21 @@ def train_model(
         early_stopping_patience=int(early_stopping_patience) if early_stopping_patience is not None else None,
     )
 
+    for epoch_index, loss in enumerate(losses):
+        log_epoch_loss(epoch=epoch_index, loss=loss)
+
+    best_loss = min(losses) if losses else 0.0
+    log_training_result(
+        best_loss=best_loss,
+        all_losses=losses,
+        total_epochs=len(losses),
+    )
+
     logger.info(
         "Training complete",
         final_loss=losses[-1] if losses else None,
+        best_loss=best_loss if losses else None,
         all_losses=losses,
     )
 
-    return tide_model, tide_data
+    return tide_model, tide_data, losses
