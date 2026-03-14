@@ -48,6 +48,7 @@ This is a collection of guidelines and references.
 - `applications/` folder contains deployable services and training workflows
 - `libraries/` folder contains shared code resources
 - `infrastructure/` folder contains Pulumi infrastructure as code
+- `models/` folder contains model definitions and training code
 - See `README.md` "Principles" section for developer philosophy
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
