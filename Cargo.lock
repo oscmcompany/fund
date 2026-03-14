@@ -1570,7 +1570,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "datamanager"
+name = "data_manager"
 version = "0.0.1"
 dependencies = [
  "aws-config",

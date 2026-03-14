@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 
 COPY tools/ tools/
 
-COPY applications/equitypricemodel/ applications/equitypricemodel/
+COPY applications/ensemble_manager/ applications/ensemble_manager/
 
 COPY libraries/python/ libraries/python/
 
@@ -28,7 +28,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
 
 COPY --from=builder /app /app
 
-ENV PYTHONPATH=/app/tools/src:/app/applications/equitypricemodel/src:/app/libraries/python/src
+ENV PYTHONPATH=/app/tools/src:/app/applications/ensemble_manager/src:/app/libraries/python/src
 ENV HOME=/home/worker
 
 RUN mkdir -p /home/worker && chown -R worker:worker /home/worker /app && \
