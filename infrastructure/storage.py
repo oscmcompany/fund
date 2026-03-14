@@ -96,7 +96,7 @@ aws.s3.BucketVersioning(
 # retain_on_delete=True and add pulumi import statements to the maskfile up command.
 data_manager_repository = aws.ecr.Repository(
     "data_manager_repository",
-    name="fund/data-manager-server",
+    name="fund/data_manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -107,7 +107,7 @@ data_manager_repository = aws.ecr.Repository(
 
 portfolio_manager_repository = aws.ecr.Repository(
     "portfolio_manager_repository",
-    name="fund/portfolio-manager-server",
+    name="fund/portfolio_manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -118,7 +118,7 @@ portfolio_manager_repository = aws.ecr.Repository(
 
 ensemble_manager_repository = aws.ecr.Repository(
     "ensemble_manager_repository",
-    name="fund/ensemble-manager-server",
+    name="fund/ensemble_manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(

@@ -59,7 +59,9 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-DATAMANAGER_BASE_URL = os.getenv("FUND_DATAMANAGER_BASE_URL", "http://datamanager:8080")
+DATAMANAGER_BASE_URL = os.getenv(
+    "FUND_DATAMANAGER_BASE_URL", "http://data-manager:8080"
+)
 MODEL_VERSION_SSM_PARAMETER = "/fund/ensemble_manager/model_version"
 
 

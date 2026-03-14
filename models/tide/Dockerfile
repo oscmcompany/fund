@@ -40,4 +40,9 @@ COPY --from=builder /app /app
 
 ENV PYTHONPATH=/app/models/tide/src
 
+RUN useradd --system --uid 10001 --create-home appuser && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
 ENTRYPOINT ["uv", "run", "--package", "tide", "python", "-m", "tide.workflow"]
