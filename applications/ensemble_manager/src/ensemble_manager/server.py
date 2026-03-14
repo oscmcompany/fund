@@ -62,7 +62,8 @@ logger = structlog.get_logger()
 DATAMANAGER_BASE_URL = os.getenv(
     "FUND_DATAMANAGER_BASE_URL", "http://data-manager:8080"
 )
-MODEL_VERSION_SSM_PARAMETER = "/fund/ensemble_manager/model_version"
+_environment = os.environ.get("FUND_ENVIRONMENT", "development")
+MODEL_VERSION_SSM_PARAMETER = f"/fund/{_environment}/ensemble-manager/model-version"
 
 
 def find_latest_artifact_key(

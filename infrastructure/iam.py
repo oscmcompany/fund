@@ -23,6 +23,7 @@ from config import (
     github_repository,
     github_workflow_refs,
     region,
+    stack_name,
     tags,
     training_notification_recipient_emails,
     training_notification_sender_email,
@@ -533,7 +534,7 @@ training_notification_email_identity = aws.ses.EmailIdentity(
 
 training_notification_sender_email_parameter = aws.ssm.Parameter(
     "training_notification_sender_email_parameter",
-    name="/fund/training/training_notification_sender_email",
+    name=f"/fund/{stack_name}/training/notification-sender-email",
     type="SecureString",
     value=training_notification_sender_email,
     tags=tags,
@@ -541,7 +542,7 @@ training_notification_sender_email_parameter = aws.ssm.Parameter(
 
 training_notification_recipients_parameter = aws.ssm.Parameter(
     "training_notification_recipients_parameter",
-    name="/fund/training/training_notification_recipients",
+    name=f"/fund/{stack_name}/training/notification-recipients",
     type="SecureString",
     value=training_notification_recipient_emails,
     tags=tags,
