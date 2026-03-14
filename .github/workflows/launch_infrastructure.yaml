@@ -24,12 +24,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - service: datamanager
-            paths: applications/datamanager/**
-          - service: portfoliomanager
-            paths: applications/portfoliomanager/**
-          - service: equitypricemodel
-            paths: applications/equitypricemodel/**
+          - service: data_manager
+            paths: applications/data_manager/**
+          - service: portfolio_manager
+            paths: applications/portfolio_manager/**
+          - service: ensemble_manager
+            paths: applications/ensemble_manager/**
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

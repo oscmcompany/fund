@@ -1,0 +1,76 @@
+import polars as pl
+import structlog
+
+from .equity_details_schema import equity_details_schema
+
+
+def combine_equity_bars_and_details(
+    equity_details_csv_path: str,
+    equity_bars_csv_path: str,
+    output_csv_path: str,
+) -> None:
+    logger = structlog.get_logger()
+
+    try:
+        equity_details_data = pl.read_csv(equity_details_csv_path)
+    except Exception as e:
+        logger.exception(
+            "Failed to read equity details CSV",
+            path=equity_details_csv_path,
+            error=str(e),
+        )
+        raise
+
+    try:
+        equity_details_data = equity_details_schema.validate(equity_details_data)
+    except Exception as e:
+        logger.exception("Equity details data validation failed", error=str(e))
+        raise
+
+    try:
+        equity_bars_data = pl.read_csv(equity_bars_csv_path)
+    except Exception as e:
+        logger.exception(
+            "Failed to read equity bars CSV", path=equity_bars_csv_path, error=str(e)
+        )
+        raise
+
+    consolidated_data = equity_details_data.join(
+        equity_bars_data, on="ticker", how="inner"
+    )
+
+    retained_columns = (
+        "ticker",
+        "timestamp",
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "volume",
+        "volume_weighted_average_price",
+        "sector",
+        "industry",
+    )
+
+    missing_columns = [
+        col for col in retained_columns if col not in consolidated_data.columns
+    ]
+    if missing_columns:
+        logger.error(
+            "Missing required columns in consolidated data",
+            missing_columns=missing_columns,
+        )
+        message = f"Missing required columns: {', '.join(missing_columns)}"
+        raise ValueError(message)
+
+    filtered_data = consolidated_data.select(retained_columns)
+
+    try:
+        filtered_data.write_csv(output_csv_path)
+    except Exception as e:
+        logger.exception(
+            "Failed to write output CSV",
+            output_csv_path=output_csv_path,
+            error=str(e),
+        )
+        raise

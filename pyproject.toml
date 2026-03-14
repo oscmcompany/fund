@@ -1,17 +1,23 @@
 [tool.uv.workspace]
 members = [
-  "applications/portfoliomanager",
-  "applications/equitypricemodel",
+  "applications/portfolio_manager",
+  "applications/ensemble_manager",
   "libraries/python",
   "infrastructure",
   "tools",
+  "models/tide",
 ]
 
 [dependency-groups]
 dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
 
 [tool.pytest.ini_options]
-testpaths = ["applications/*/tests", "libraries/python/tests", "tools/tests"]
+testpaths = [
+  "applications/*/tests",
+  "libraries/python/tests",
+  "tools/tests",
+  "models/tide/tests",
+]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
