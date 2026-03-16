@@ -13,6 +13,10 @@ If you need to accept edits during execution:
 - Choose "accept edits and continue" (NOT "clear context")
 - Or wait until the "Commit and Push Changes" step to accept all edits at once
 
+## Important: API Usage
+
+**Do NOT use MCP GitHub tools during this command.** They have shown session reliability issues. All GitHub API interactions must use `gh api` (REST) or Python `urllib.request` (GraphQL mutations only). See step 8 for details on which operations require Python.
+
 ## Instructions
 
 Analyze and address all feedback and failing checks on a GitHub pull request, then respond to and resolve all comments.
@@ -49,172 +53,102 @@ Follow these steps:
 
   echo "Repository: ${OWNER}/${REPO}"
 
-  # Fetch PR data
-  gh api graphql -f query='
-    query($owner: String!, $repo: String!, $number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $number) {
-          id
-          title
-          headRefName
-          headRefOid
-          baseRefName
+  # Fetch PR data via REST — raw responses saved to scratchpad, never read directly into context
+  gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}"          > "${SCRATCHPAD}/pr_meta_raw.json"
+  gh api "repos/${OWNER}/${REPO}/issues/${ARGUMENTS}/comments" > "${SCRATCHPAD}/pr_comments_raw.json"
+  gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/reviews"   > "${SCRATCHPAD}/pr_reviews_raw.json"
+  gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/comments"  > "${SCRATCHPAD}/pr_review_comments_raw.json"
 
-          reviewThreads(first: 100) {
-            nodes {
-              id
-              isResolved
-              isOutdated
-              comments(first: 100) {
-                nodes {
-                  id
-                  databaseId
-                  body
-                  author { login }
-                  path
-                  position
-                  createdAt
-                }
-              }
-            }
-          }
+  HEAD_SHA=$(jq -r '.head.sha' "${SCRATCHPAD}/pr_meta_raw.json")
+  gh api "repos/${OWNER}/${REPO}/commits/${HEAD_SHA}/check-runs" > "${SCRATCHPAD}/check_runs_raw.json"
 
-          comments(first: 100) {
-            nodes {
-              id
-              databaseId
-              body
-              author { login }
-              createdAt
-            }
-          }
+  # Fetch review thread node IDs (PRRT_* format) needed for resolving threads later.
+  # Uses an inline GraphQL query with values embedded as literals (no $variable syntax),
+  # which avoids the bash ! history-expansion issue that breaks parameterized GraphQL queries.
+  INLINE_QUERY=$(printf '{repository(owner:"%s",name:"%s"){pullRequest(number:%s){reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}' \
+    "${OWNER}" "${REPO}" "${ARGUMENTS}")
+  gh api graphql -f query="${INLINE_QUERY}" > "${SCRATCHPAD}/thread_ids_raw.json"
 
-          reviews(first: 50) {
-            nodes {
-              id
-              state
-              body
-              author { login }
-              submittedAt
-            }
-          }
-
-          commits(last: 1) {
-            nodes {
-              commit {
-                checkSuites(first: 50) {
-                  nodes {
-                    workflowRun {
-                      id
-                      databaseId
-                    }
-                    checkRuns(first: 50) {
-                      nodes {
-                        name
-                        status
-                        conclusion
-                        detailsUrl
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  ' -f owner="${OWNER}" -f repo="${REPO}" -F number=${ARGUMENTS} > "${SCRATCHPAD}/pr_data.json"
-
-  echo "PR data fetched to ${SCRATCHPAD}/pr_data.json"
+  echo "PR data fetched to ${SCRATCHPAD}/"
+  echo "SCRATCHPAD=${SCRATCHPAD}"
   ```
 
 - Validate the fetched data:
 
   ```bash
-  # Check jq is installed
+  SCRATCHPAD="<value printed above>"
+
   if ! command -v jq >/dev/null 2>&1; then
     echo "Error: jq is required but not installed. Install with: brew install jq (macOS) or apt-get install jq (Linux)"
     exit 1
   fi
 
-  # Check file exists and contains valid JSON
-  if [ ! -f "${SCRATCHPAD}/pr_data.json" ] || ! jq empty "${SCRATCHPAD}/pr_data.json" 2>/dev/null; then
-    echo "Error: Failed to fetch valid pull request data. Check that pull request #${ARGUMENTS} exists, run 'gh auth status' to verify authentication, then retry."
+  for f in pr_meta_raw pr_comments_raw pr_reviews_raw pr_review_comments_raw check_runs_raw thread_ids_raw; do
+    if [ ! -f "${SCRATCHPAD}/${f}.json" ] || ! jq empty "${SCRATCHPAD}/${f}.json" 2>/dev/null; then
+      echo "Error: Failed to fetch ${f}.json. Check that pull request #${ARGUMENTS} exists, run 'gh auth status' to verify authentication, then retry."
+      exit 1
+    fi
+  done
+
+  if ! jq -e '.number' "${SCRATCHPAD}/pr_meta_raw.json" >/dev/null 2>&1; then
+    echo "Error: Pull request data missing expected fields. Check pull request #${ARGUMENTS} exists and you have access."
     exit 1
   fi
 
-  # Validate GraphQL response structure
-  if ! jq -e '.data.repository.pullRequest.id and (.errors | not)' "${SCRATCHPAD}/pr_data.json" >/dev/null 2>&1; then
-    echo "Error: Pull request data missing expected fields or contains GraphQL errors. Check pull request #${ARGUMENTS} exists and you have access."
-    jq -r '.errors[]?.message // "No specific error message available"' "${SCRATCHPAD}/pr_data.json"
-    exit 1
-  fi
+  echo "Validation passed"
   ```
 
-- **Critical**: The pull request data file will be too large to read directly with the Read tool. Extract structured data once into smaller files:
+- **Critical**: The raw files will be too large to read directly with the Read tool. Extract structured data once into smaller files:
 
   ```bash
-  echo "Extracting structured data from PR response..."
+  SCRATCHPAD="<value printed above>"
 
-  # Extract PR metadata
-  jq '.data.repository.pullRequest | {
-    id: .id,
+  echo "Extracting structured data from raw responses..."
+
+  # PR metadata
+  jq '{
+    number: .number,
     title: .title,
-    headRefName: .headRefName,
-    baseRefName: .baseRefName
-  }' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/metadata.json"
+    headRefName: .head.ref,
+    baseRefName: .base.ref,
+    headSha: .head.sha
+  }' "${SCRATCHPAD}/pr_meta_raw.json" > "${SCRATCHPAD}/metadata.json"
 
-  # Extract unresolved review threads
-  jq '[.data.repository.pullRequest.reviewThreads.nodes[] |
-    select(.isResolved == false and .isOutdated == false) | {
-    threadId: .id,
-    comments: [.comments.nodes[] | {
-      id: .id,
-      databaseId: .databaseId,
-      body: .body,
-      author: .author.login,
-      path: .path,
-      position: .position
-    }]
-  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/review_threads.json"
+  # PR-level (issue) comments — REST uses .user.login, not .author.login
+  jq '[.[] | {id: .id, databaseId: .id, body: .body, author: .user.login}]' \
+    "${SCRATCHPAD}/pr_comments_raw.json" > "${SCRATCHPAD}/pr_comments.json"
 
-  # Extract outdated threads
-  jq '[.data.repository.pullRequest.reviewThreads.nodes[] |
-    select(.isResolved == false and .isOutdated == true) | {
-    threadId: .id,
-    comments: [.comments.nodes[] | {
-      id: .id,
-      body: .body,
-      author: .author.login,
-      path: .path
-    }]
-  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/outdated_threads.json"
-
-  # Extract PR-level comments
-  jq '[.data.repository.pullRequest.comments.nodes[] | {
-    id: .id,
-    databaseId: .databaseId,
+  # Inline review comments — root threads only (in_reply_to_id == null)
+  # rootCommentId is the integer ID used to post replies via REST
+  jq '[.[] | select(.in_reply_to_id == null) | {
+    rootCommentId: .id,
+    path: .path,
+    line: (.line // .original_line),
     body: .body,
-    author: .author.login
-  }]' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/pr_comments.json"
+    author: .user.login
+  }]' "${SCRATCHPAD}/pr_review_comments_raw.json" > "${SCRATCHPAD}/review_comments.json"
 
-  # Extract check failures
-  jq '[.data.repository.pullRequest.commits.nodes[].commit.checkSuites.nodes[] as $suite |
-    $suite.checkRuns.nodes[] |
-    select(.conclusion == "FAILURE" or .conclusion == "TIMED_OUT") | {
+  # Check failures — REST uses lowercase conclusion values ("failure", "timed_out")
+  jq '[.check_runs[] |
+    select(.conclusion == "failure" or .conclusion == "timed_out") | {
     name: .name,
     conclusion: .conclusion,
-    detailsUrl: .detailsUrl,
-    workflowRunId: ($suite.workflowRun.databaseId // null)
-  }] | unique_by(.name)' "${SCRATCHPAD}/pr_data.json" > "${SCRATCHPAD}/check_failures.json"
+    detailsUrl: .details_url
+  }] | unique_by(.name)' "${SCRATCHPAD}/check_runs_raw.json" > "${SCRATCHPAD}/check_failures.json"
+
+  # Thread node IDs — links PRRT_* IDs to root comment database IDs for resolution
+  jq '[.data.repository.pullRequest.reviewThreads.nodes[] | {
+    threadId: .id,
+    isResolved: .isResolved,
+    rootCommentId: .comments.nodes[0].databaseId
+  }]' "${SCRATCHPAD}/thread_ids_raw.json" > "${SCRATCHPAD}/thread_ids.json"
 
   echo "Data extraction complete:"
-  echo "  - metadata.json (PR info)"
-  echo "  - review_threads.json ($(jq 'length' "${SCRATCHPAD}/review_threads.json") unresolved threads)"
-  echo "  - outdated_threads.json ($(jq 'length' "${SCRATCHPAD}/outdated_threads.json") outdated threads)"
-  echo "  - pr_comments.json ($(jq 'length' "${SCRATCHPAD}/pr_comments.json") PR comments)"
-  echo "  - check_failures.json ($(jq 'length' "${SCRATCHPAD}/check_failures.json") failed checks)"
+  echo "  - metadata.json"
+  echo "  - pr_comments.json        ($(jq 'length' "${SCRATCHPAD}/pr_comments.json") comments)"
+  echo "  - review_comments.json    ($(jq 'length' "${SCRATCHPAD}/review_comments.json") root review threads)"
+  echo "  - check_failures.json     ($(jq 'length' "${SCRATCHPAD}/check_failures.json") failed checks)"
+  echo "  - thread_ids.json         ($(jq 'length' "${SCRATCHPAD}/thread_ids.json") threads)"
   ```
 
 - These smaller structured files can be read with the Read tool if needed, and eliminate redundant jq parsing throughout the command.
@@ -224,35 +158,42 @@ Follow these steps:
 - Review all extracted data to build a complete picture of what needs to be addressed:
 
   ```bash
+  SCRATCHPAD="<value printed above>"
+
   echo "=== Check Failures ==="
   jq -r '.[] | "[\(.conclusion)] \(.name) - \(.detailsUrl)"' "${SCRATCHPAD}/check_failures.json"
 
   echo ""
-  echo "=== Unresolved Review Threads ==="
-  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author)"' "${SCRATCHPAD}/review_threads.json"
-
-  echo ""
-  echo "=== Outdated Threads (require manual review) ==="
-  jq -r '.[] | "\(.threadId) | \(.comments[0].path // "N/A") | \(.comments[0].author) | \(.comments[0].body[:80])"' "${SCRATCHPAD}/outdated_threads.json"
+  echo "=== Review Comments (root threads only) ==="
+  jq -r '.[] | "[\(.rootCommentId)] @\(.author) on \(.path):\(.line // "?"): \(.body[:80])"' \
+    "${SCRATCHPAD}/review_comments.json"
 
   echo ""
   echo "=== PR-level Comments ==="
   jq -r '.[] | "\(.databaseId) | \(.author) | \(.body[:80])"' "${SCRATCHPAD}/pr_comments.json"
+
+  echo ""
+  echo "=== Thread Resolution Status ==="
+  jq -r '.[] | "\(.threadId) | rootComment=\(.rootCommentId) | resolved=\(.isResolved)"' \
+    "${SCRATCHPAD}/thread_ids.json"
   ```
 
-- For detailed review of specific threads, use:
+- For full comment bodies:
 
   ```bash
-  jq '.[] | select(.threadId == "PRRT_xxx")' "${SCRATCHPAD}/review_threads.json"
+  SCRATCHPAD="<value printed above>"
+  jq -r '.[] | "=== [\(.rootCommentId)] @\(.author) on \(.path) ===\n\(.body)\n"' \
+    "${SCRATCHPAD}/review_comments.json"
   ```
 
 - The structured files contain all necessary metadata:
-  - `review_threads.json`: Thread ID, comment IDs (both node and database), body, author, file path/position
-  - `outdated_threads.json`: Thread ID and comment metadata (body, author, file path); "outdated" means the code was modified, not that the feedback is irrelevant - review each to determine if it still applies
+  - `review_comments.json`: Root comment ID (integer), path, line, body, author — one entry per thread
+  - `thread_ids.json`: Thread node IDs (`PRRT_*`), resolution status, root comment database ID — join with `review_comments.json` on `rootCommentId`
   - `pr_comments.json`: Comment IDs, body, author
   - `check_failures.json`: Check name, conclusion, details URL
+  - `pr_review_comments_raw.json`: Full flat array of all review comments including replies (use for full context if needed)
 
-- Note that check-runs and workflow runs are distinct; to fetch logs, first obtain the workflow run ID, then use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs`. If logs are inaccessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors.
+- Note that check-runs and workflow runs are distinct; to fetch logs, obtain the workflow run ID from `check_runs_raw.json` and use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs`. If logs are inaccessible via API, run `mask development python all` or `mask development rust all` locally to replicate the errors.
 - Group all feedback (check failures, review threads, outdated threads, PR-level comments) using judgement: by file, by theme, by type of change, or whatever makes most sense for the specific pull request; ensure each group maintains the full metadata for all items it contains.
 - Analyze dependencies between feedback groups to determine which are independent (can be worked in parallel) and which are interdependent (must be handled sequentially).
 - For each piece of feedback, evaluate whether to address it (make code changes) or reject it (explain why the feedback doesn't apply); provide clear reasoning for each decision.
@@ -322,77 +263,86 @@ Follow these steps:
 ### 8. Respond to and Resolve Comments
 
 - For each piece of feedback (both addressed and rejected), draft a response comment explaining what was done or why it was rejected, using the commenter name for personalization.
-- Post all response comments to their respective threads:
-  - For review comments (code-level), use GraphQL `addPullRequestReviewThreadReply` mutation to post comments directly to threads (NOT as pending review):
 
-    ```bash
-    # IMPORTANT: Keep response text simple - avoid newlines, code blocks, and special characters
-    # GraphQL string literals cannot contain raw newlines; use spaces or simple sentences
-    # If complex formatting is needed, save response to a variable first and ensure proper escaping
+#### Posting replies to review threads
 
-    gh api graphql -f query='
-      mutation($pullRequestReviewThreadId: ID!, $body: String!) {
-        addPullRequestReviewThreadReply(input: {
-          pullRequestReviewThreadId: $pullRequestReviewThreadId,
-          body: $body
-        }) {
-          comment { id }
-        }
-      }
-    ' -f pullRequestReviewThreadId="<thread_id>" -f body="<response_text>"
-    ```
+Use the REST reply endpoint with the root comment's integer ID from `review_comments.json`:
 
-    Use the thread ID (format: `PRRT_*`) from `review_threads.json` for `pullRequestReviewThreadId` parameter.
+```bash
+SCRATCHPAD="<value printed above>"
+OWNER="..."; REPO="..."; PR="${ARGUMENTS}"
 
-    Example to get thread ID:
+post_reply() {
+    local comment_id="$1"
+    local body="$2"
+    gh api "repos/${OWNER}/${REPO}/pulls/${PR}/comments/${comment_id}/replies" \
+        -f body="${body}" --jq '.id'
+}
 
-    ```bash
-    THREAD_ID=$(jq -r '.[] | select(.comments[0].body | contains("some text")) | .threadId' "${SCRATCHPAD}/review_threads.json")
-    ```
+# Example — call once per thread:
+post_reply 1234567 "Fixed in abc1234. Updated the Dockerfile path to translate hyphens to underscores."
+post_reply 1234568 "Intentional — kept as-is by design."
+```
 
-    **Response formatting guidelines**:
-    - Keep responses concise and single-line when possible
-    - Avoid embedding code blocks or complex markdown in mutation strings
-    - Use simple sentences: "Fixed in the latest commit" or "Updated to use GraphQL approach"
-    - For longer responses, reference line numbers or file paths instead of quoting code
+**Response formatting guidelines**:
+- Keep responses concise and single-line when possible
+- Avoid newlines, code blocks, or special characters in the body string
+- Reference commit hashes or file paths rather than quoting code inline
 
-  - For issue comments (pull request-level), use REST API:
+#### Posting PR-level (issue) comments
 
-    ```bash
-    gh api repos/${OWNER}/${REPO}/issues/"${ARGUMENTS}"/comments -f body="<response_text>"
-    ```
+```bash
+gh api "repos/${OWNER}/${REPO}/issues/${ARGUMENTS}/comments" -f body="<response_text>"
+```
 
-- For each response posted, capture the returned comment ID for verification.
-- Auto-resolve all comment threads after posting responses:
-  - For review comment threads:
-    - Use the thread ID (format: `PRRT_*`) from `review_threads.json`.
-    - Resolve thread using GraphQL mutation:
+Issue comments have no thread state and do not need a resolution step.
 
-      ```bash
-      gh api graphql -f query='
-        mutation($threadId: ID!) {
-          resolveReviewThread(input: {threadId: $threadId}) {
-            thread {
-              id
-              isResolved
-            }
-          }
-        }
-      ' -f threadId="<thread_id>"
-      ```
+#### Resolving review threads
 
-    - Map each comment back to its parent thread using the structured files from step 1 (particularly review_threads.json).
-    - Resolve both addressed and rejected feedback threads (explanation provided in response).
+**Use Python `urllib.request`** — `gh api graphql` is broken for parameterized GraphQL mutations because bash history expansion mangles the `!` in type annotations like `ID!`. Python string literals are not subject to this, making it the reliable path for mutations.
 
-  - For issue comments (pull request-level):
-    - No resolution mechanism (issue comments don't have thread states).
-    - Only post response; no resolution step needed.
+```bash
+SCRATCHPAD="<value printed above>"
+
+python3 - << 'PYEOF'
+import json, urllib.request, subprocess
+
+token = subprocess.check_output(["gh", "auth", "token"]).decode().strip()
+mutation = "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
+
+# Populate from thread_ids.json — unresolved threads to resolve
+threads = [
+    "PRRT_xxx",
+    "PRRT_yyy",
+]
+
+for thread_id in threads:
+    body = json.dumps({"query": mutation, "variables": {"threadId": thread_id}}).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+    thread = data.get("data", {}).get("resolveReviewThread", {}).get("thread", {})
+    print(f"{thread_id}: isResolved={thread.get('isResolved')}")
+PYEOF
+```
+
+To extract the list of unresolved thread IDs from the scratchpad:
+
+```bash
+jq -r '.[] | select(.isResolved == false) | .threadId' "${SCRATCHPAD}/thread_ids.json"
+```
+
+Resolve both addressed and rejected threads — the response comment explains the outcome either way.
 
 ### 9. Final Summary
 
 - Provide a comprehensive summary showing:
-  - Total feedback items processed (with count of addressed vs rejected), including any outdated threads that were reviewed.
+  - Total feedback items processed (with count of addressed vs rejected).
   - Which checks were fixed.
   - Confirmation that all comments have been responded to and resolved.
   - Final verification status (all local checks passing; remote continuous integration is now running against the pushed changes).
-- For check failures that were fixed, note that no comments were posted - the fixes will be reflected in re-run checks which are now in progress.
+- For check failures that were fixed, note that no comments were posted — the fixes will be reflected in re-run checks which are now in progress.
