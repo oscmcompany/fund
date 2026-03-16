@@ -1,202 +1,48 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
-  flyRegion = "ewr";
-  flyOrg = "personal";
+  awsRegion = "us-east-1";
 
-  # Fly.io app definitions — single source of truth for all services
-  flyApps = {
+  # ECS service definitions — maps service names to their Docker build context
+  ecsServices = {
     data-manager = {
-      name = "fund-datamanager";
       dockerfile = "applications/data_manager/Dockerfile";
       context = ".";
-      port = 8080;
-      metrics = true;
-      env = {
-        ENVIRONMENT = "production";
-        RUST_LOG = "info";
-        AWS_REGION = "us-east-1";
-      };
-      secrets = [
-        "AWS_S3_DATA_BUCKET_NAME"
-        "AWS_ENDPOINT_URL_S3"
-        "AWS_ENDPOINT_URL"
-        "AWS_ACCESS_KEY_ID"
-        "AWS_SECRET_ACCESS_KEY"
-        "MASSIVE_BASE_URL"
-        "MASSIVE_API_KEY"
-      ];
-      vm = { size = "shared-cpu-1x"; memory = "512mb"; };
+      ecrRepo = "fund/data_manager-server";
     };
-
     ensemble-manager = {
-      name = "fund-ensemblemanager";
       dockerfile = "applications/ensemble_manager/Dockerfile";
       context = ".";
-      port = 8080;
-      metrics = true;
-      env = {
-        ENVIRONMENT = "production";
-        FUND_DATAMANAGER_BASE_URL = "http://fund-datamanager.internal:8080";
-      };
-      secrets = [
-        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
-        "AWS_ENDPOINT_URL_S3"
-        "AWS_ACCESS_KEY_ID"
-        "AWS_SECRET_ACCESS_KEY"
-      ];
-      vm = { size = "shared-cpu-1x"; memory = "512mb"; };
+      ecrRepo = "fund/ensemble_manager-server";
     };
-
     portfolio-manager = {
-      name = "fund-portfoliomanager";
       dockerfile = "applications/portfolio_manager/Dockerfile";
       context = ".";
-      port = 8080;
-      metrics = true;
-      env = {
-        ENVIRONMENT = "production";
-        FUND_DATAMANAGER_BASE_URL = "http://fund-datamanager.internal:8080";
-        FUND_ENSEMBLEMANAGER_BASE_URL = "http://fund-ensemblemanager.internal:8080";
-      };
-      secrets = [
-        "ALPACA_API_KEY_ID"
-        "ALPACA_API_SECRET"
-        "AWS_ACCESS_KEY_ID"
-        "AWS_SECRET_ACCESS_KEY"
-      ];
-      vm = { size = "shared-cpu-1x"; memory = "512mb"; };
+      ecrRepo = "fund/portfolio_manager-server";
     };
-
-    prefect-server = {
-      name = "fund-prefect-server";
+    training-server = {
       dockerfile = "tools/Dockerfile.prefect-server";
       context = ".";
-      port = 4200;
-      env = {
-        PREFECT_UI_API_URL = "http://fund-prefect-server.internal:4200/api";
-      };
-      secrets = [
-        "PREFECT_API_DATABASE_CONNECTION_URL"
-      ];
-      vm = { size = "shared-cpu-1x"; memory = "1024mb"; };
+      ecrRepo = "fund/training-server";
     };
-
-    prefect-worker = {
-      name = "fund-prefect-worker";
+    training-worker = {
       dockerfile = "tools/Dockerfile";
       context = ".";
-      port = 8080;
-      env = {
-        PREFECT_API_URL = "http://fund-prefect-server.internal:4200/api";
-        ENVIRONMENT = "production";
-      };
-      secrets = [
-        "AWS_S3_DATA_BUCKET_NAME"
-        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
-        "AWS_ENDPOINT_URL_S3"
-        "AWS_ACCESS_KEY_ID"
-        "AWS_SECRET_ACCESS_KEY"
-        "MLFLOW_TRACKING_URI"
-      ];
-      vm = { size = "performance-2x"; memory = "4096mb"; };
+      ecrRepo = "fund/training-worker";
     };
-
     mlflow = {
-      name = "fund-mlflow";
       dockerfile = "tools/Dockerfile.mlflow";
       context = ".";
-      port = 8080;
-      metrics = false;
-      env = {
-        MLFLOW_HOST = "0.0.0.0";
-        MLFLOW_PORT = "8080";
-        MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE = "true";
-      };
-      secrets = [
-        "MLFLOW_BACKEND_STORE_URI"
-        "MLFLOW_DEFAULT_ARTIFACT_ROOT"
-        "AWS_ACCESS_KEY_ID"
-        "AWS_SECRET_ACCESS_KEY"
-        "AWS_ENDPOINT_URL_S3"
-      ];
-      vm = { size = "shared-cpu-2x"; memory = "2048mb"; };
+      ecrRepo = "fund/mlflow-server";
     };
-
     grafana = {
-      name = "fund-grafana";
       dockerfile = "Dockerfile";
       context = "dashboards";
-      port = 8080;
-      env = {
-        GF_SERVER_HTTP_PORT = "8080";
-        GF_AUTH_ANONYMOUS_ENABLED = "false";
-      };
-      secrets = [
-        "GF_SECURITY_ADMIN_PASSWORD"
-        "FLY_PROMETHEUS_TOKEN"
-      ];
-      vm = { size = "shared-cpu-1x"; memory = "256mb"; };
+      ecrRepo = "fund/grafana";
     };
   };
 
-  # Services that get deployed via `deploy <name|all>`
-  deployableServices = [ "data-manager" "ensemble-manager" "portfolio-manager" "prefect-server" "prefect-worker" "mlflow" "grafana" ];
-
-  # Generate fly.toml content for a service
-  mkFlyToml = name: app: let
-    envLines = lib.concatStringsSep "\n" (
-      lib.mapAttrsToList (k: v: "  ${k} = \"${v}\"") app.env
-    );
-    autoStop = if name == "prefect-server" || name == "prefect-worker" || name == "mlflow"
-      then "off" else "suspend";
-    minMachines = if name == "prefect-server" || name == "mlflow" then "1" else "0";
-    metricsBlock = if app ? metrics then ''
-
-[metrics]
-  port = ${toString app.port}
-  path = "/metrics"
-'' else "";
-    restartBlock = if name == "prefect-worker" then ''
-
-[[restart]]
-  policy = "always"
-'' else "";
-    # All services except prefect-worker get [http_service] for internal routing
-    # and fly proxy access. Only Grafana has public IPs allocated (in fly-init),
-    # so only Grafana is publicly reachable. Internal services don't force HTTPS
-    # since fly proxy uses plain HTTP over WireGuard.
-    forceHttps = if name == "grafana" || name == "mlflow" then "true" else "false";
-    httpBlock = if name == "prefect-worker" then "" else ''
-
-[http_service]
-  internal_port = ${toString app.port}
-  force_https = ${forceHttps}
-  auto_stop_machines = "${autoStop}"
-  auto_start_machines = true
-  min_machines_running = ${minMachines}
-
-  [[http_service.checks]]
-    grace_period = "60s"
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    timeout = "10s"
-'';
-  in ''
-app = "${app.name}"
-primary_region = "${flyRegion}"
-
-[build]
-  dockerfile = "${app.dockerfile}"
-
-[env]
-${envLines}
-${httpBlock}${metricsBlock}${restartBlock}
-[[vm]]
-  size = "${app.vm.size}"
-  memory = "${app.vm.memory}"
-  '';
+  deployableServices = builtins.attrNames ecsServices;
 
 in {
   env = {
@@ -205,21 +51,22 @@ in {
     MINIO_ROOT_PASSWORD = "minioadmin";
 
     # AWS env vars pointing to local MinIO
-    AWS_REGION = "us-east-1";
-    AWS_DEFAULT_REGION = "us-east-1";
+    AWS_REGION = awsRegion;
+    AWS_DEFAULT_REGION = awsRegion;
     AWS_ACCESS_KEY_ID = "minioadmin";
     AWS_SECRET_ACCESS_KEY = "minioadmin";
     AWS_ENDPOINT_URL = "http://localhost:9000";
     AWS_S3_DATA_BUCKET_NAME = "fund-data";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-model-artifacts";
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-data";
 
     # Service URLs (localhost, not container names)
     FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
     FUND_ENSEMBLEMANAGER_BASE_URL = "http://localhost:8082";
     PREFECT_API_URL = "http://localhost:4200/api";
 
-    # MLflow tracking (centralized on Fly.io)
-    MLFLOW_TRACKING_URI = "https://fund-mlflow.fly.dev";
+    # MLflow tracking (production ALB, set after pulumi-up)
+    # Override in .envrc with the actual ALB URL: http://<alb-dns>:5000
+    MLFLOW_TRACKING_URI = "";
 
     # Development defaults
     ENVIRONMENT = "development";
@@ -234,8 +81,10 @@ in {
     pkgs.minio-client
     pkgs.rustup
     pkgs.cargo-watch
-    pkgs.flyctl
+    pkgs.awscli2
     pkgs.grafana
+    pkgs.pulumiPackages.pulumi-language-python
+    pkgs.pulumi-bin
   ];
 
   # PostgreSQL for Prefect (local)
@@ -286,223 +135,145 @@ in {
     secretKey = "minioadmin";
     buckets = [
       "fund-data"
-      "fund-model-artifacts"
     ];
   };
 
-  # --- Fly.io commands ---
+  # --- AWS / Pulumi commands ---
 
-  # Deploy services to Fly.io
+  # Bring up AWS infrastructure with Pulumi
+  scripts.infra-up.exec = ''
+    cd "$DEVENV_ROOT/infrastructure"
+    pulumi up --stack production --yes
+  '';
+
+  # Tear down AWS infrastructure with Pulumi
+  scripts.infra-down.exec = ''
+    cd "$DEVENV_ROOT/infrastructure"
+    pulumi down --stack production --yes
+  '';
+
+  # Show Pulumi stack outputs (ALB URL, ECR repos, bucket names, etc.)
+  scripts.infra-outputs.exec = ''
+    cd "$DEVENV_ROOT/infrastructure"
+    pulumi stack output --stack production --json
+  '';
+
+  # Get the ALB base URL from Pulumi outputs
+  scripts.infra-url.exec = ''
+    cd "$DEVENV_ROOT/infrastructure"
+    pulumi stack output --stack production aws_alb_url 2>/dev/null || echo "Not deployed yet"
+  '';
+
+  # Build and push a Docker image to ECR
+  scripts.ecr-push.exec = ''
+    SERVICE="$1"
+    if [ -z "$SERVICE" ]; then
+      echo "Usage: ecr-push <${lib.concatStringsSep "|" deployableServices}|all>"
+      exit 1
+    fi
+
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    REGISTRY="$ACCOUNT_ID.dkr.ecr.${awsRegion}.amazonaws.com"
+
+    echo "Logging into ECR..."
+    aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY"
+
+    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
+    push_${builtins.replaceStrings ["-"] ["_"] svc}() {
+      local repo="${def.ecrRepo}"
+      local image="$REGISTRY/$repo:latest"
+      local ctx_dir="$DEVENV_ROOT/${def.context}"
+      echo "=== Building ${svc} ==="
+      docker build -t "$image" -f "$DEVENV_ROOT/${def.dockerfile}" "$ctx_dir"
+      echo "=== Pushing ${svc} ==="
+      docker push "$image"
+      echo "OK: ${svc}"
+    }
+    '') ecsServices)}
+
+    case "$SERVICE" in
+      ${lib.concatStringsSep "\n" (map (svc: ''
+      ${svc}) push_${builtins.replaceStrings ["-"] ["_"] svc} ;;'') deployableServices)}
+      all)
+        ${lib.concatStringsSep "\n        " (map (svc: ''
+        push_${builtins.replaceStrings ["-"] ["_"] svc}'') deployableServices)}
+        echo "All images pushed"
+        ;;
+      *) echo "Unknown service: $SERVICE"; exit 1 ;;
+    esac
+  '';
+
+  # Force ECS services to redeploy with latest image
+  scripts.ecs-deploy.exec = ''
+    SERVICE="$1"
+    CLUSTER="fund-application"
+
+    if [ -z "$SERVICE" ]; then
+      echo "Usage: ecs-deploy <${lib.concatStringsSep "|" deployableServices}|all>"
+      exit 1
+    fi
+
+    deploy_ecs_service() {
+      local ecs_name="$1"
+      echo "=== Redeploying $ecs_name ==="
+      aws ecs update-service \
+        --cluster "$CLUSTER" \
+        --service "$ecs_name" \
+        --force-new-deployment \
+        --region ${awsRegion} \
+        --query 'service.serviceName' \
+        --output text
+      echo "OK: $ecs_name"
+    }
+
+    case "$SERVICE" in
+      data-manager) deploy_ecs_service "fund-data-manager" ;;
+      ensemble-manager) deploy_ecs_service "fund-ensemble-manager" ;;
+      portfolio-manager) deploy_ecs_service "fund-portfolio-manager" ;;
+      training-server) deploy_ecs_service "fund-training-server" ;;
+      training-worker) deploy_ecs_service "fund-training-worker" ;;
+      mlflow) deploy_ecs_service "fund-mlflow" ;;
+      grafana) deploy_ecs_service "fund-grafana" ;;
+      all)
+        for svc in fund-data-manager fund-ensemble-manager fund-portfolio-manager fund-training-server fund-training-worker fund-mlflow fund-grafana; do
+          deploy_ecs_service "$svc"
+        done
+        echo "All services redeployed"
+        ;;
+      *) echo "Unknown service: $SERVICE"; exit 1 ;;
+    esac
+  '';
+
+  # Build, push, and redeploy a service (combines ecr-push + ecs-deploy)
   scripts.deploy.exec = ''
     SERVICE="$1"
     if [ -z "$SERVICE" ]; then
       echo "Usage: deploy <${lib.concatStringsSep "|" deployableServices}|all>"
       exit 1
     fi
-
-    ${lib.concatStringsSep "\n" (map (svc: let app = flyApps.${svc}; ctx = if app ? context then app.context else "."; in ''
-    deploy_${builtins.replaceStrings ["-"] ["_"] svc}() {
-      local ctx_dir="$DEVENV_ROOT/${ctx}"
-      local fly_toml
-      fly_toml=$(mktemp "$ctx_dir/.fly-${svc}-XXXXXX.toml")
-      cat > "$fly_toml" << 'FLYEOF'
-${mkFlyToml svc app}
-FLYEOF
-      echo "=== Deploying ${svc} ==="
-      cd "$DEVENV_ROOT" && fly deploy "$ctx_dir" --config "$fly_toml"
-      local rc=$?
-      rm -f "$fly_toml"
-      if [ $rc -ne 0 ]; then
-        echo "FAILED: ${svc}"
-        return $rc
-      fi
-      echo "OK: ${svc}"
-    }
-    '') deployableServices)}
-
-    ensure_tigris_buckets() {
-      echo "=== Ensuring Tigris storage buckets ==="
-      fly storage create -a fund-datamanager -n fund-data 2>/dev/null || echo "  fund-data already exists"
-      fly storage create -a fund-prefect-worker -n fund-model-artifacts 2>/dev/null || echo "  fund-model-artifacts already exists"
-    }
-
-    case "$SERVICE" in
-      ${lib.concatStringsSep "\n" (map (svc: ''
-      ${svc}) deploy_${builtins.replaceStrings ["-"] ["_"] svc} ;;'') deployableServices)}
-      all)
-        ensure_tigris_buckets
-        pids=""
-        failed=""
-        ${lib.concatStringsSep "\n        " (map (svc: ''
-        deploy_${builtins.replaceStrings ["-"] ["_"] svc} &
-        pids="$pids $!"'') deployableServices)}
-        for pid in $pids; do
-          if ! wait "$pid"; then
-            failed="$failed $pid"
-          fi
-        done
-        if [ -n "$failed" ]; then
-          echo "Some deploys failed"
-          exit 1
-        fi
-        echo "All services deployed"
-
-        echo ""
-        echo "=== Setting up Prefect ==="
-        echo "Starting proxy to Prefect server..."
-        fly proxy 4201:4200 -a fund-prefect-server &
-        PROXY_PID=$!
-        sleep 3
-        PROD_URL="http://localhost:4201/api"
-        for i in 1 2 3 4 5; do
-          curl -sf "$PROD_URL/health" > /dev/null 2>&1 && break
-          echo "  Waiting for Prefect server..."
-          sleep 5
-        done
-        PREFECT_API_URL="$PROD_URL" \
-          uv run --package tools prefect work-pool create "training-pool" --type process 2>/dev/null \
-          || echo "  training-pool already exists"
-        PREFECT_API_URL="$PROD_URL" \
-        AWS_S3_DATA_BUCKET_NAME="fund-data" \
-        AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="fund-model-artifacts" \
-          uv run --package tide python -m tide.deploy
-        kill $PROXY_PID 2>/dev/null || true
-        echo "Prefect deployment registered"
-        ;;
-      *) echo "Unknown service: $SERVICE"; exit 1 ;;
-    esac
+    ecr-push "$SERVICE" && ecs-deploy "$SERVICE"
   '';
 
-  # First-time Fly.io setup: create apps, postgres, storage, secrets, and Prefect
-  scripts.fly-init.exec = ''
-    echo "=== Creating Fly.io apps ==="
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: app: ''
-      echo "  ${app.name}"
-      fly apps create "${app.name}" 2>/dev/null || echo "    already exists"
-    '') flyApps)}
-
+  # Show ECS service status
+  scripts.ecs-status.exec = ''
+    CLUSTER="fund-application"
+    echo "=== ECS Services ==="
+    aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
     echo ""
-    echo "=== Allocating public IPs (Grafana + MLflow) ==="
-    fly ips allocate-v4 --shared -a fund-grafana 2>/dev/null || echo "  already exists"
-    fly ips allocate-v6 -a fund-grafana 2>/dev/null || echo "  already exists"
-    fly ips allocate-v4 --shared -a fund-mlflow 2>/dev/null || echo "  already exists"
-    fly ips allocate-v6 -a fund-mlflow 2>/dev/null || echo "  already exists"
-
-    echo ""
-    echo "=== Creating Fly Postgres (for Prefect) ==="
-    pg_output=$(fly postgres create --name fund-prefect-db --region ${flyRegion} --vm-size shared-cpu-1x --vm-memory 1024 --initial-cluster-size 1 --volume-size 1 2>&1) \
-      && echo "$pg_output" \
-      || echo "  already exists"
-
-    attach_output=$(fly postgres attach fund-prefect-db -a fund-prefect-server 2>&1) \
-      && echo "$attach_output" \
-      || echo "  already attached"
-
-    # Extract credentials from attach output and set Prefect-compatible connection URL
-    db_url=$(echo "$attach_output" | grep DATABASE_URL | sed 's/.*DATABASE_URL=//' | xargs)
-    if [ -n "$db_url" ]; then
-      # Convert postgres://user:pass@host:port/db?sslmode=disable
-      # to postgresql+asyncpg://user:pass@host.internal:5433/db (direct, no SSL)
-      pg_user=$(echo "$db_url" | sed 's|postgres://||' | cut -d: -f1)
-      pg_pass=$(echo "$db_url" | sed 's|postgres://||' | cut -d: -f2 | cut -d@ -f1)
-      pg_db=$(echo "$db_url" | sed 's|.*/||' | cut -d? -f1)
-      asyncpg_url="postgresql+asyncpg://''${pg_user}:''${pg_pass}@fund-prefect-db.internal:5433/''${pg_db}"
-      echo "  Setting PREFECT_API_DATABASE_CONNECTION_URL"
-      fly secrets set -a fund-prefect-server "PREFECT_API_DATABASE_CONNECTION_URL=$asyncpg_url"
-    else
-      echo "  Postgres already attached, skipping connection URL setup"
-    fi
-
-    echo ""
-    echo "=== Creating Fly Postgres (for MLflow) ==="
-    mlflow_pg_output=$(fly postgres create --name fund-mlflow-db --region ${flyRegion} --vm-size shared-cpu-1x --vm-memory 256 --initial-cluster-size 1 --volume-size 1 2>&1) \
-      && echo "$mlflow_pg_output" \
-      || echo "  already exists"
-
-    mlflow_attach_output=$(fly postgres attach fund-mlflow-db -a fund-mlflow 2>&1) \
-      && echo "$mlflow_attach_output" \
-      || echo "  already attached"
-
-    mlflow_db_url=$(echo "$mlflow_attach_output" | grep DATABASE_URL | sed 's/.*DATABASE_URL=//' | sed 's/?sslmode=disable//' | xargs)
-    if [ -n "$mlflow_db_url" ]; then
-      # MLflow requires postgresql:// scheme, not postgres://
-      mlflow_db_url=$(echo "$mlflow_db_url" | sed 's|^postgres://|postgresql://|')
-      echo "  Setting MLFLOW_BACKEND_STORE_URI"
-      fly secrets set -a fund-mlflow "MLFLOW_BACKEND_STORE_URI=$mlflow_db_url"
-    else
-      echo "  Postgres already attached, skipping connection URL setup"
-    fi
-
-    echo ""
-    echo "=== Creating Tigris storage buckets ==="
-    tigris_output=$(fly storage create -a fund-datamanager -n fund-data 2>&1) \
-      && echo "$tigris_output" \
-      || echo "  fund-data already exists"
-
-    fly storage create -a fund-prefect-worker -n fund-model-artifacts 2>/dev/null || echo "  fund-model-artifacts already exists"
-    fly storage create -a fund-mlflow -n fund-mlflow-artifacts 2>/dev/null || echo "  fund-mlflow-artifacts already exists"
-
-    # Share Tigris credentials with apps that need S3 access
-    tigris_key=$(echo "$tigris_output" | grep AWS_ACCESS_KEY_ID | awk '{print $2}')
-    tigris_secret=$(echo "$tigris_output" | grep AWS_SECRET_ACCESS_KEY | awk '{print $2}')
-    if [ -n "$tigris_key" ] && [ -n "$tigris_secret" ]; then
-      echo ""
-      echo "=== Sharing Tigris credentials ==="
-      for app in fund-datamanager fund-ensemblemanager fund-prefect-worker fund-mlflow; do
-        echo "  $app"
-        fly secrets set -a "$app" \
-          AWS_ACCESS_KEY_ID="$tigris_key" \
-          AWS_SECRET_ACCESS_KEY="$tigris_secret" \
-          AWS_ENDPOINT_URL_S3="https://fly.storage.tigris.dev" \
-          AWS_REGION="us-east-1" \
-          2>/dev/null || true
-      done
-      fly secrets set -a fund-datamanager \
-        AWS_S3_DATA_BUCKET_NAME="fund-data" \
-        AWS_ENDPOINT_URL="https://fly.storage.tigris.dev" \
-        2>/dev/null || true
-      fly secrets set -a fund-ensemblemanager \
-        AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="fund-model-artifacts" \
-        2>/dev/null || true
-      fly secrets set -a fund-prefect-worker \
-        AWS_S3_DATA_BUCKET_NAME="fund-data" \
-        AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="fund-model-artifacts" \
-        2>/dev/null || true
-      fly secrets set -a fund-mlflow \
-        MLFLOW_DEFAULT_ARTIFACT_ROOT="s3://fund-mlflow-artifacts" \
-        2>/dev/null || true
-      fly secrets set -a fund-prefect-worker \
-        MLFLOW_TRACKING_URI="https://fund-mlflow.fly.dev" \
-        2>/dev/null || true
-    else
-      echo "  Tigris already exists, push credentials manually with fly-secrets"
-    fi
-
-    echo ""
-    echo "=== Setting up Grafana secrets ==="
-    PROM_TOKEN=$(echo "${flyOrg}" | fly tokens create readonly -n "grafana-prometheus" 2>/dev/null | tail -1)
-    if [ -n "$PROM_TOKEN" ]; then
-      fly secrets set -a fund-grafana \
-        "GF_SECURITY_ADMIN_PASSWORD=$(openssl rand -base64 24)" \
-        "FLY_PROMETHEUS_TOKEN=FlyV1 $PROM_TOKEN" \
-        2>/dev/null || echo "  secrets already set"
-    else
-      echo "  Failed to create Prometheus token, set FLY_PROMETHEUS_TOKEN manually"
-    fi
-
-    echo ""
-    echo "Done. Next steps:"
-    echo "  1. pull-secrets      (fetch secrets from AWS Secrets Manager)"
-    echo "  2. direnv allow      (reload environment)"
-    echo "  3. fly-secrets       (push remaining secrets to Fly apps)"
-    echo "  4. deploy all        (deploy everything)"
-    echo "  5. prefect-init      (create work pool and register deployment)"
+    for svc in fund-data-manager fund-ensemble-manager fund-portfolio-manager fund-training-server fund-training-worker fund-mlflow fund-grafana; do
+      STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" --region ${awsRegion} --query 'services[0].{status:status,running:runningCount,desired:desiredCount}' --output text 2>/dev/null)
+      if [ -n "$STATUS" ]; then
+        echo "  $svc: $STATUS"
+      else
+        echo "  $svc: not found"
+      fi
+    done
   '';
 
   # Pull secrets from AWS Secrets Manager into .envrc
   scripts.pull-secrets.exec = ''
     ENVRC="$DEVENV_ROOT/.envrc"
-    AWS_CMD="aws --region us-east-1"
+    AWS_CMD="aws --region ${awsRegion}"
     unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     export AWS_PROFILE=default
 
@@ -526,76 +297,31 @@ FLYEOF
     echo "Done. Run 'direnv allow' to reload."
   '';
 
-  # Push secrets from current environment to Fly.io apps
-  scripts.fly-secrets.exec = ''
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: app: let
-      secretChecks = lib.concatStringsSep "\n" (map (s: ''
-        val="''${${s}:-}"
-        if [ -z "$val" ]; then
-          echo "  WARNING: ${s} is not set in environment, skipping"
-          missing=1
-        else
-          args="$args ${s}=$val"
-        fi
-      '') app.secrets);
-    in ''
-      echo "=== ${app.name} ==="
-      args=""
-      missing=0
-      ${secretChecks}
-      if [ -n "$args" ]; then
-        fly secrets set -a "${app.name}" $args
-        echo "  Secrets pushed"
-      fi
-      if [ "$missing" = "1" ]; then
-        echo "  Some secrets missing - set them in your environment and re-run"
-      fi
-      echo ""
-    '') flyApps)}
-  '';
-
-  # Show Fly.io app status
-  scripts.fly-status.exec = ''
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: app: ''
-      echo "=== ${app.name} ==="
-      fly status -a "${app.name}" 2>/dev/null || echo "  not deployed"
-      echo ""
-    '') flyApps)}
-  '';
-
-  # Tear down all Fly.io resources
-  scripts.fly-destroy.exec = ''
-    echo "This will destroy ALL Fly.io apps, database, and storage. Are you sure? (y/N)"
-    read -r confirm
-    if [ "$confirm" = "y" ]; then
-      ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: app: ''
-        echo "Destroying ${app.name}..."
-        fly apps destroy "${app.name}" --yes 2>/dev/null || true
-      '') flyApps)}
-      echo "Destroying fund-prefect-db..."
-      fly apps destroy fund-prefect-db --yes 2>/dev/null || true
-      echo "Destroying fund-mlflow-db..."
-      fly apps destroy fund-mlflow-db --yes 2>/dev/null || true
-    fi
-  '';
-
-  # Deploy Grafana dashboards (shortcut for deploy grafana)
-  scripts.dashboards-push.exec = ''
-    deploy grafana
-  '';
-
   # Create Prefect work pool and register deployment on production
-  # Requires: fly-proxy prefect (running in another terminal)
   scripts.prefect-init.exec = ''
-    PROD_URL="http://localhost:4201/api"
-
-    echo "Checking Prefect server via fly proxy..."
-    echo "(Make sure 'fly-proxy prefect' is running in another terminal)"
-    if ! curl -sf "$PROD_URL/health" > /dev/null 2>&1; then
-      echo "Prefect server not reachable at $PROD_URL"
-      echo "Run 'fly-proxy prefect' in another terminal first"
+    cd "$DEVENV_ROOT/infrastructure"
+    ALB_URL=$(pulumi stack output --stack production aws_alb_url 2>/dev/null)
+    if [ -z "$ALB_URL" ]; then
+      echo "ALB URL not found. Run 'infra-up' first."
       exit 1
     fi
+
+    PROD_URL="''${ALB_URL%/}:4200/api"
+
+    echo "Checking Prefect server at $PROD_URL..."
+    for i in 1 2 3 4 5; do
+      curl -sf "$PROD_URL/health" > /dev/null 2>&1 && break
+      echo "  Waiting for Prefect server..."
+      sleep 5
+    done
+
+    if ! curl -sf "$PROD_URL/health" > /dev/null 2>&1; then
+      echo "Prefect server not reachable at $PROD_URL"
+      exit 1
+    fi
+
+    S3_DATA=$(pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
+    S3_ARTIFACTS=$(pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
 
     echo "Creating training-pool work pool..."
     PREFECT_API_URL="$PROD_URL" \
@@ -604,38 +330,12 @@ FLYEOF
 
     echo "Registering daily-training deployment..."
     PREFECT_API_URL="$PROD_URL" \
-    AWS_S3_DATA_BUCKET_NAME="fund-data" \
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="fund-model-artifacts" \
+    AWS_S3_DATA_BUCKET_NAME="$S3_DATA" \
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$S3_ARTIFACTS" \
       uv run --package tide python -m tide.deploy
 
     echo ""
-    echo "Done. Dashboard: http://localhost:4201 (via fly-proxy prefect)"
-  '';
-
-  # Proxy to internal Fly.io services for local access
-  scripts.fly-proxy.exec = ''
-    SERVICE="$1"
-    case "$SERVICE" in
-      mlflow)
-        echo "MLflow UI: http://localhost:5050"
-        fly proxy 5050:8080 -a fund-mlflow
-        ;;
-      prefect)
-        echo "Prefect UI: http://localhost:4201"
-        fly proxy 4201:4200 -a fund-prefect-server
-        ;;
-      data-manager)
-        echo "Data Manager: http://localhost:8090"
-        fly proxy 8090:8080 -a fund-datamanager
-        ;;
-      *)
-        echo "Usage: fly-proxy <mlflow|prefect|data-manager>"
-        echo ""
-        echo "Proxies to internal Fly.io services (no public endpoints)."
-        echo "MLflow tracking URI is already set to http://localhost:5050"
-        echo "so run 'fly-proxy mlflow' before training locally."
-        ;;
-    esac
+    echo "Done. Dashboard: $ALB_URL:4200"
   '';
 
   # --- Local dev commands ---
@@ -792,7 +492,6 @@ FLYEOF
       echo "  MinIO Console:    localhost:9001"
       echo "  Prometheus:       localhost:9090"
       echo "  Grafana:          localhost:3000  (admin/admin)"
-      echo "  MLflow:           https://fund-mlflow.fly.dev"
       echo "  Prefect UI:       localhost:4200"
       echo "  Data Manager:     localhost:8080"
       echo "  Ensemble Manager: localhost:8082"
@@ -818,18 +517,17 @@ FLYEOF
     echo "    Ensemble Manager: localhost:8082"
     echo "    Portfolio Manager: localhost:8081"
     echo ""
-    echo "    MLflow:           https://fund-mlflow.fly.dev"
-    echo ""
-    echo "  Fly.io:"
-    echo "    fly-init          Create apps, Postgres, Tigris, secrets"
+    echo "  AWS (Pulumi):"
+    echo "    infra-up          Create all AWS infrastructure"
+    echo "    infra-down        Tear down all AWS infrastructure"
+    echo "    infra-outputs     Show Pulumi stack outputs"
+    echo "    infra-url         Show ALB base URL"
     echo "    pull-secrets      AWS Secrets Manager -> .envrc"
-    echo "    fly-secrets       Environment -> Fly.io secrets"
-    echo "    deploy <svc|all>  Deploy to production"
+    echo "    ecr-push <svc>   Build and push Docker image to ECR"
+    echo "    ecs-deploy <svc>  Force ECS service redeployment"
+    echo "    deploy <svc|all>  Build, push, and redeploy (ecr-push + ecs-deploy)"
+    echo "    ecs-status        Show ECS service status"
     echo "    prefect-init      Create work pool + register deployment (prod)"
-    echo "    fly-proxy <svc>   Proxy to internal Fly.io service"
-    echo "    fly-status        Show app status"
-    echo "    fly-destroy       Tear down everything"
-    echo "    dashboards-push   Deploy Grafana with dashboards"
     echo ""
     echo "  Local:"
     echo "    prefect-setup     Create work pool + register deployment (local)"

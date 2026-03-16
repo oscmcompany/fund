@@ -187,8 +187,8 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 
 ## Experiment Tracking
 
-All experiments are automatically tracked in MLflow (centralized on Fly.io at
-`https://fund-mlflow.fly.dev`). Each training run logs:
+All experiments are automatically tracked in MLflow (centralized on AWS at
+`http://<alb-dns>:5000`). Each training run logs:
 
 - **Parameters**: Full configuration dict (learning_rate, hidden_size, etc.)
 - **Metrics**: Per-epoch `quantile_loss`, `best_quantile_loss`, `final_quantile_loss`, `total_epochs`
@@ -229,4 +229,4 @@ Only when fixing bugs:
 - **Data cache**: `tools/src/tools/cache_training_data.py` -- downloads from MinIO
 - **Cached data**: `results/equitypricemodel/training_data.parquet`
 - **MLflow tracking**: `models/tide/src/tide/tracking.py` -- MLflow integration module
-- **MLflow UI**: `https://fund-mlflow.fly.dev` -- centralized experiment tracking
+- **MLflow UI**: `http://<alb-dns>:5000` -- centralized experiment tracking (AWS ALB)
