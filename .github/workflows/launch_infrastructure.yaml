@@ -29,10 +29,7 @@ jobs:
             stage: server
             paths: applications/ensemble_manager/**
           - application: model-trainer
-            stage: server
-            paths: models/**
-          - application: model-trainer
-            stage: worker
+            stage: server-worker
             paths: models/**
     steps:
       - name: Checkout code
