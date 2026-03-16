@@ -30,10 +30,10 @@ jobs:
             paths: applications/ensemble_manager/**
           - application: model-trainer
             stage: server
-            paths: models/Dockerfile,models/__init__.py
+            paths: models/**
           - application: model-trainer
             stage: worker
-            paths: models/Dockerfile,models/__init__.py
+            paths: models/**
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

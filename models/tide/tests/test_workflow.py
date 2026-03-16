@@ -172,7 +172,7 @@ def test_train_model_returns_model_and_data(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     training_data = make_raw_data(days=90)
-    model, data = train_model(training_data)
+    model, data = train_model(training_data, configuration={"epoch_count": 1})
     assert model is not None
     assert data is not None
     assert hasattr(data, "scaler")
@@ -202,7 +202,7 @@ def test_train_model_uses_default_configuration(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     training_data = make_raw_data(days=90)
-    model, _ = train_model(training_data)
+    model, _ = train_model(training_data, configuration={"epoch_count": 1})
     assert model.hidden_size == DEFAULT_CONFIGURATION["hidden_size"]
     assert model.output_length == DEFAULT_CONFIGURATION["output_length"]
 

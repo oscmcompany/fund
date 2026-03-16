@@ -62,7 +62,7 @@ set -euo pipefail
 echo "Building image"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region=${AWS_REGION}
+aws_region="${AWS_REGION:-}"
 if [ -z "$aws_region" ]; then
     echo "AWS_REGION environment variable is not set"
     exit 1
@@ -70,6 +70,9 @@ fi
 
 commit_hash=$(git rev-parse --short HEAD)
 repository_name="fund/${package_name}-${stage_name}"
+if [ "${package_name}" = "model-trainer" ]; then
+    repository_name="fund/model-trainer-server-worker"
+fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 
 echo "Logging into ECR"
@@ -95,7 +98,8 @@ elif [ -f "models/${package_name}/Dockerfile" ]; then
     dockerfile="models/${package_name}/Dockerfile"
     build_target="${stage_name}"
 else
-    dockerfile="applications/${package_name}/Dockerfile"
+    resolved_name=$(echo "${package_name}" | tr '-' '_')
+    dockerfile="applications/${resolved_name}/Dockerfile"
     build_target="${stage_name}"
 fi
 cache_reference="${image_reference}:buildcache"
@@ -143,13 +147,16 @@ set -euo pipefail
 echo "Pushing image to ECR"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region=${AWS_REGION}
+aws_region="${AWS_REGION:-}"
 if [ -z "$aws_region" ]; then
     echo "AWS_REGION environment variable is not set"
     exit 1
 fi
 
 repository_name="fund/${package_name}-${stage_name}"
+if [ "${package_name}" = "model-trainer" ]; then
+    repository_name="fund/model-trainer-server-worker"
+fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 commit_hash=$(git rev-parse --short HEAD)
 

@@ -23,6 +23,7 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
     assert call_kwargs["name"] == "daily-training"
     assert call_kwargs["work_pool_name"] == "training-pool"
     assert call_kwargs["cron"] == "0 22 * * 1-5"
+    assert call_kwargs["timezone"] == "America/New_York"
     assert call_kwargs["parameters"]["base_url"] == "http://example.com"
     assert call_kwargs["parameters"]["lookback_days"] == LOOKBACK_DAYS
 

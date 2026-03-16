@@ -5,7 +5,7 @@ import tarfile
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 import polars as pl
@@ -40,7 +40,7 @@ DEFAULT_CONFIGURATION = {
 
 def train_model(
     training_data: pl.DataFrame,
-    configuration: dict | None = None,
+    configuration: dict[str, Any] | None = None,
     checkpoint_directory: str | None = None,
 ) -> "tuple[Model, Data]":
     """Train TiDE model and return model + data processor."""
