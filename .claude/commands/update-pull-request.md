@@ -55,16 +55,18 @@ Follow these steps:
 
   # Fetch PR data via REST — raw responses saved to scratchpad, never read directly into context
   gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}"          > "${SCRATCHPAD}/pr_meta_raw.json"
-  gh api "repos/${OWNER}/${REPO}/issues/${ARGUMENTS}/comments" > "${SCRATCHPAD}/pr_comments_raw.json"
-  gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/reviews"   > "${SCRATCHPAD}/pr_reviews_raw.json"
-  gh api "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/comments"  > "${SCRATCHPAD}/pr_review_comments_raw.json"
+  gh api --paginate "repos/${OWNER}/${REPO}/issues/${ARGUMENTS}/comments" | jq -s 'add' > "${SCRATCHPAD}/pr_comments_raw.json"
+  gh api --paginate "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/reviews"   | jq -s 'add' > "${SCRATCHPAD}/pr_reviews_raw.json"
+  gh api --paginate "repos/${OWNER}/${REPO}/pulls/${ARGUMENTS}/comments"  | jq -s 'add' > "${SCRATCHPAD}/pr_review_comments_raw.json"
 
   HEAD_SHA=$(jq -r '.head.sha' "${SCRATCHPAD}/pr_meta_raw.json")
-  gh api "repos/${OWNER}/${REPO}/commits/${HEAD_SHA}/check-runs" > "${SCRATCHPAD}/check_runs_raw.json"
+  gh api --paginate "repos/${OWNER}/${REPO}/commits/${HEAD_SHA}/check-runs" | jq -s 'add' > "${SCRATCHPAD}/check_runs_raw.json"
 
   # Fetch review thread node IDs (PRRT_* format) needed for resolving threads later.
   # Uses an inline GraphQL query with values embedded as literals (no $variable syntax),
   # which avoids the bash ! history-expansion issue that breaks parameterized GraphQL queries.
+  # Capped at 100 threads — cursor pagination requires parameterized GraphQL ($variables with !),
+  # which bash history expansion breaks, so this limit is intentional for practical use.
   INLINE_QUERY=$(printf '{repository(owner:"%s",name:"%s"){pullRequest(number:%s){reviewThreads(first:100){nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}' \
     "${OWNER}" "${REPO}" "${ARGUMENTS}")
   gh api graphql -f query="${INLINE_QUERY}" > "${SCRATCHPAD}/thread_ids_raw.json"
@@ -305,16 +307,15 @@ Issue comments have no thread state and do not need a resolution step.
 SCRATCHPAD="<value printed above>"
 
 python3 - << 'PYEOF'
-import json, urllib.request, subprocess
+import json, os, urllib.request, subprocess
+from pathlib import Path
 
 token = subprocess.check_output(["gh", "auth", "token"]).decode().strip()
 mutation = "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}"
 
-# Populate from thread_ids.json — unresolved threads to resolve
-threads = [
-    "PRRT_xxx",
-    "PRRT_yyy",
-]
+scratchpad = Path(os.environ["SCRATCHPAD"])
+threads_data = json.loads((scratchpad / "thread_ids.json").read_text())
+threads = [t["threadId"] for t in threads_data if not t.get("isResolved")]
 
 for thread_id in threads:
     body = json.dumps({"query": mutation, "variables": {"threadId": thread_id}}).encode()
@@ -323,18 +324,17 @@ for thread_id in threads:
         data=body,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read())
+    if "errors" in data:
+        print(f"{thread_id}: ERROR — {data['errors']}")
+        continue
     thread = data.get("data", {}).get("resolveReviewThread", {}).get("thread", {})
     print(f"{thread_id}: isResolved={thread.get('isResolved')}")
 PYEOF
 ```
 
-To extract the list of unresolved thread IDs from the scratchpad:
-
-```bash
-jq -r '.[] | select(.isResolved == false) | .threadId' "${SCRATCHPAD}/thread_ids.json"
-```
+The script reads `thread_ids.json` from the scratchpad automatically to determine which threads to resolve.
 
 Resolve both addressed and rejected threads — the response comment explains the outcome either way.
 

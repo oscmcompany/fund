@@ -210,7 +210,12 @@ esac
 
 cd infrastructure/
 
-cluster=$(pulumi stack output aws_ecs_cluster_name --stack production)
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <org>"
+    exit 1
+fi
+pulumi stack select "${organization_name}/fund/production"
+cluster=$(pulumi stack output aws_ecs_cluster_name)
 
 cd "${MASKFILE_DIR}"
 

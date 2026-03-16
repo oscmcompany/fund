@@ -74,6 +74,8 @@ jobs:
       - name: Deploy ${{ matrix.application }}-${{ matrix.stage }}
         if: steps.changes.outputs.service == 'true'
         uses: flox/activate-action@v1
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
           command: mask infrastructure image deploy ${{ matrix.application }} ${{ matrix.stage }}
   launch_infrastructure:
