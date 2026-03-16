@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build_and_push_images:
-    name: Build, push, and deploy ${{ matrix.application }}-${{ matrix.stage }}
+    name: Build and push ${{ matrix.application }}-${{ matrix.stage }}
     runs-on: ubuntu-latest
     environment: pulumi
     permissions:
@@ -71,13 +71,6 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask infrastructure image push ${{ matrix.application }} ${{ matrix.stage }}
-      - name: Deploy ${{ matrix.application }}-${{ matrix.stage }}
-        if: steps.changes.outputs.service == 'true'
-        uses: flox/activate-action@v1
-        env:
-          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
-        with:
-          command: mask infrastructure image deploy ${{ matrix.application }} ${{ matrix.stage }}
   launch_infrastructure:
     name: Deploy with Pulumi
     needs: build_and_push_images
@@ -102,3 +95,60 @@ jobs:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
           command: mask infrastructure stack up
+  deploy_images:
+    name: Deploy ${{ matrix.application }}-${{ matrix.stage }}
+    needs: launch_infrastructure
+    runs-on: ubuntu-latest
+    environment: pulumi
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - application: data-manager
+            stage: server
+            paths: applications/data_manager/**
+          - application: portfolio-manager
+            stage: server
+            paths: applications/portfolio_manager/**
+          - application: ensemble-manager
+            stage: server
+            paths: applications/ensemble_manager/**
+          - application: model-trainer
+            stage: server
+            paths: models/**
+          - application: model-trainer
+            stage: worker
+            paths: models/**
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Check for service changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            service:
+              - '${{ matrix.paths }}'
+              - 'libraries/python/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'pyproject.toml'
+              - 'uv.lock'
+      - name: Configure AWS credentials
+        if: steps.changes.outputs.service == 'true'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_INFRASTRUCTURE_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - name: Install Flox
+        if: steps.changes.outputs.service == 'true'
+        uses: flox/install-flox-action@v2
+      - name: Deploy ${{ matrix.application }}-${{ matrix.stage }}
+        if: steps.changes.outputs.service == 'true'
+        uses: flox/activate-action@v1
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        with:
+          command: mask infrastructure image deploy ${{ matrix.application }} ${{ matrix.stage }}
