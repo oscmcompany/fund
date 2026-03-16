@@ -48,11 +48,11 @@ echo "Development environment setup completed successfully"
 
 > Manage infrastructure resources
 
-### images
+### image
 
 > Manage Docker images for applications
 
-#### build (application_name) (stage_name)
+#### build (package_name) (stage_name)
 
 > Build Docker images with optional cache pull
 
@@ -68,17 +68,41 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-if [ "${application_name}" = "training" ]; then
-    dockerfile="tools/Dockerfile"
-else
-    dockerfile="applications/${application_name}/Dockerfile"
+commit_hash=$(git rev-parse --short HEAD)
+repository_name="fund/${package_name}-${stage_name}"
+image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
+
+echo "Logging into ECR"
+aws ecr get-login-password --region ${aws_region} | docker login \
+    --username AWS \
+    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR (will build without cache)"
+
+echo "Checking if image for commit ${commit_hash} already exists in ECR"
+existing_image=$(aws ecr describe-images \
+    --repository-name "${repository_name}" \
+    --image-ids "imageTag=git-${commit_hash}" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text 2>/dev/null || echo "NONE")
+if [ "$existing_image" != "NONE" ] && [ "$existing_image" != "None" ] && [ -n "$existing_image" ]; then
+    echo "Image for commit ${commit_hash} already exists in ECR, skipping build"
+    exit 0
 fi
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/fund/${application_name}-${stage_name}"
+
+if [ "${package_name}" = "model-trainer" ]; then
+    dockerfile="models/Dockerfile"
+    build_target="server-worker"
+elif [ -f "models/${package_name}/Dockerfile" ]; then
+    dockerfile="models/${package_name}/Dockerfile"
+    build_target="${stage_name}"
+else
+    dockerfile="applications/${package_name}/Dockerfile"
+    build_target="${stage_name}"
+fi
 cache_reference="${image_reference}:buildcache"
 
 # Use GHA backend for caching when running in GitHub Actions
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    scope="${application_name}-${stage_name}"
+    scope="${package_name}-${stage_name}"
     echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
     cache_from_arguments="--cache-from type=gha,scope=${scope} --cache-from type=registry,ref=${cache_reference}"
     cache_to_arguments="--cache-to type=gha,scope=${scope},mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
@@ -95,15 +119,10 @@ else
     docker buildx create --use --name fund-builder 2>/dev/null || docker buildx use fund-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
-echo "Logging into ECR (to pull cache if available)"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR for cache (will build without cache)"
-
 echo "Building with caching (will continue if cache doesn't exist)"
 docker buildx build \
     --platform linux/amd64 \
-    --target ${stage_name} \
+    --target ${build_target} \
     --file ${dockerfile} \
     --tag ${image_reference}:latest \
     ${cache_from_arguments} \
@@ -111,10 +130,10 @@ docker buildx build \
     --load \
     .
 
-echo "Image built: ${application_name} ${stage_name}"
+echo "Image built: ${package_name} ${stage_name}"
 ```
 
-#### push (application_name) (stage_name)
+#### push (package_name) (stage_name)
 
 > Push Docker image to ECR
 
@@ -130,7 +149,7 @@ if [ -z "$aws_region" ]; then
     exit 1
 fi
 
-repository_name="fund/${application_name}-${stage_name}"
+repository_name="fund/${package_name}-${stage_name}"
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 commit_hash=$(git rev-parse --short HEAD)
 
@@ -151,7 +170,7 @@ fi
 
 if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
     echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
-    echo "Image pushed: ${application_name} ${stage_name} (cached)"
+    echo "Image pushed: ${package_name} ${stage_name} (cached)"
     exit 0
 fi
 
@@ -160,7 +179,41 @@ docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
 docker push "${image_reference}:latest"
 docker push "${image_reference}:git-${commit_hash}"
 
-echo "Image pushed: ${application_name} ${stage_name} (commit: ${commit_hash})"
+echo "Image pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
+```
+
+#### deploy (package_name) (stage_name)
+
+> Deploy ECS service with latest image
+
+```bash
+set -euo pipefail
+
+echo "Deploying ${package_name} ${stage_name}"
+
+case "${package_name}-${stage_name}" in
+    data-manager-server)      service="fund-data-manager-server" ;;
+    portfolio-manager-server) service="fund-portfolio-manager-server" ;;
+    ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
+    model-trainer-server)     service="fund-model-trainer-server" ;;
+    model-trainer-worker)     service="fund-model-trainer-worker" ;;
+    tide-runner)              echo "No ECS service for tide runner" && exit 0 ;;
+    *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
+esac
+
+cd infrastructure/
+
+cluster=$(pulumi stack output aws_ecs_cluster_name --stack production)
+
+cd "${MASKFILE_DIR}"
+
+aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager
+
+echo "Waiting for ${service} to stabilize"
+aws ecs wait services-stable --cluster "$cluster" --services "$service" \
+    --waiter-config '{"Delay": 10, "MaxAttempts": 6}'
+
+echo "Deployment complete: ${service} (${package_name} ${stage_name})"
 ```
 
 ### stack
@@ -260,63 +313,6 @@ if [[ "$BOOTSTRAP" == "true" ]]; then
   fi
 fi
 
-echo "Forcing ECS service deployments to pull latest images"
-
-cluster=$(pulumi stack output aws_ecs_cluster_name --stack production 2>/dev/null || echo "")
-
-if [ -z "$cluster" ]; then
-    echo "Cluster not found - skipping service deployments (initial setup)"
-else
-    # Note: Service names use 'fund' prefix matching the Pulumi project name.
-    # These must exactly match the ECS service names created by the infrastructure code.
-    # The AWS account provides environment context (one account = one environment).
-    for service in fund-data-manager fund-portfolio-manager fund-ensemble-manager fund-training-server fund-training-worker; do
-        echo "Checking if $service exists and is ready"
-
-        # Wait up to 60 seconds for service to be active
-        retry_count=0
-        maximum_retries=12
-        retry_wait_seconds=5
-        service_is_ready=false
-
-        while [ $retry_count -lt $maximum_retries ]; do
-            service_status=$(aws ecs describe-services \
-                --cluster "$cluster" \
-                --services "$service" \
-                --query 'services[0].status' \
-                --output text 2>/dev/null || echo "NONE")
-
-            if [ "$service_status" = "ACTIVE" ]; then
-                service_is_ready=true
-                echo "Service $service is ACTIVE"
-                break
-            elif [ "$service_status" = "NONE" ]; then
-                echo "Service not found, waiting ($((retry_count + 1))/$maximum_retries)"
-            else
-                echo "Service status: $service_status, waiting ($((retry_count + 1))/$maximum_retries)"
-            fi
-
-            sleep $retry_wait_seconds
-            retry_count=$((retry_count + 1))
-        done
-
-        if [ "$service_is_ready" = true ]; then
-            echo "Forcing new deployment for $service"
-            aws ecs update-service \
-                --cluster "$cluster" \
-                --service "$service" \
-                --force-new-deployment \
-                --no-cli-pager \
-                --output text > /dev/null 2>&1 && echo "Deployment initiated" || echo "Failed to force deployment"
-        else
-            echo "Skipping $service (not ready after 60s - may be initial deployment)"
-        fi
-    done
-
-    echo "Stack update complete - ECS is performing rolling deployments"
-    echo "Monitor progress: aws ecs describe-services --cluster $cluster --services fund-portfolio-manager"
-fi
-
 echo "Infrastructure launched successfully"
 ```
 
@@ -336,7 +332,7 @@ pulumi down --yes --stack production
 echo "Infrastructure torn down successfully"
 ```
 
-### services
+### service
 
 > Manage infrastructure services
 
@@ -770,7 +766,7 @@ echo "YAML development checks completed successfully"
 
 > Model management commands
 
-### train
+### train (model_name)
 
 > Train model via Prefect training pipeline
 
@@ -794,10 +790,18 @@ export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../
 
-uv run python -m tide.run
+case "${model_name}" in
+    tide)
+        uv run python -m tide.run
+        ;;
+    *)
+        echo "Unknown model: ${model_name}"
+        exit 1
+        ;;
+esac
 ```
 
-### deploy
+### deploy (model_name)
 
 > Register flow deployment with Prefect server
 
@@ -813,7 +817,7 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export FUND_DATAMANAGER_BASE_URL="http://data-manager.$(pulumi stack output aws_service_discovery_namespace):8080"
+export FUND_DATAMANAGER_BASE_URL="http://data-manager-server.$(pulumi stack output aws_service_discovery_namespace):8080"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export PREFECT_API_URL="$(pulumi stack output training_api_url)"
@@ -821,19 +825,34 @@ export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../
 
-uv run python -m tide.deploy
+case "${model_name}" in
+    tide)
+        uv run python -m tide.deploy
+        ;;
+    *)
+        echo "Unknown model: ${model_name}"
+        exit 1
+        ;;
+esac
 ```
 
-### download (application_name)
+### download (model_name)
 
 > Download model artifacts
 
 ```bash
 set -euo pipefail
 
-export APPLICATION_NAME="${application_name}"
-
-uv run python -m tools.download_model_artifacts
+case "${model_name}" in
+    tide)
+        export APPLICATION_NAME="${model_name}"
+        uv run python -m tools.download_model_artifacts
+        ;;
+    *)
+        echo "Unknown model: ${model_name}"
+        exit 1
+        ;;
+esac
 ```
 
 ## mcp

@@ -2,20 +2,15 @@
 name: Launch infrastructure
 run-name: Launch infrastructure
 on:
-  schedule:
-    # Runs at 12:00 UTC weekdays (7:00 AM EST / 8:00 AM EDT)
-    # Launches infrastructure 2.5 hours before market open (EST) or 1.5 hours before (EDT)
-    - cron: 0 12 * * 1-5
   push:
     branches:
       - master
-  workflow_dispatch:
 concurrency:
   group: infrastructure-deployment
   cancel-in-progress: false
 jobs:
   build_and_push_images:
-    name: Build and push ${{ matrix.service }}
+    name: Build, push, and deploy ${{ matrix.application }}-${{ matrix.stage }}
     runs-on: ubuntu-latest
     environment: pulumi
     permissions:
@@ -24,12 +19,21 @@ jobs:
     strategy:
       matrix:
         include:
-          - service: data_manager
+          - application: data-manager
+            stage: server
             paths: applications/data_manager/**
-          - service: portfolio_manager
+          - application: portfolio-manager
+            stage: server
             paths: applications/portfolio_manager/**
-          - service: ensemble_manager
+          - application: ensemble-manager
+            stage: server
             paths: applications/ensemble_manager/**
+          - application: model-trainer
+            stage: server
+            paths: models/Dockerfile,models/__init__.py
+          - application: model-trainer
+            stage: worker
+            paths: models/Dockerfile,models/__init__.py
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,27 +50,32 @@ jobs:
               - 'pyproject.toml'
               - 'uv.lock'
       - name: Configure AWS credentials
-        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+        if: steps.changes.outputs.service == 'true'
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_IAM_INFRASTRUCTURE_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Set up Docker Buildx
-        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+        if: steps.changes.outputs.service == 'true'
         uses: docker/setup-buildx-action@v3
       - name: Install Flox
-        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+        if: steps.changes.outputs.service == 'true'
         uses: flox/install-flox-action@v2
-      - name: Build ${{ matrix.service }} image
-        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+      - name: Build ${{ matrix.application }}-${{ matrix.stage }} image
+        if: steps.changes.outputs.service == 'true'
         uses: flox/activate-action@v1
         with:
-          command: mask infrastructure images build ${{ matrix.service }} server
-      - name: Push ${{ matrix.service }} image
-        if: steps.changes.outputs.service == 'true' || github.event_name == 'schedule'
+          command: mask infrastructure image build ${{ matrix.application }} ${{ matrix.stage }}
+      - name: Push ${{ matrix.application }}-${{ matrix.stage }} image
+        if: steps.changes.outputs.service == 'true'
         uses: flox/activate-action@v1
         with:
-          command: mask infrastructure images push ${{ matrix.service }} server
+          command: mask infrastructure image push ${{ matrix.application }} ${{ matrix.stage }}
+      - name: Deploy ${{ matrix.application }}-${{ matrix.stage }}
+        if: steps.changes.outputs.service == 'true'
+        uses: flox/activate-action@v1
+        with:
+          command: mask infrastructure image deploy ${{ matrix.application }} ${{ matrix.stage }}
   launch_infrastructure:
     name: Deploy with Pulumi
     needs: build_and_push_images
@@ -91,15 +100,3 @@ jobs:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
           command: mask infrastructure stack up
-  trigger_data_sync:
-    name: Trigger sync data workflow
-    needs: launch_infrastructure
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Trigger sync data workflow
-        uses: peter-evans/repository-dispatch@v4
-        with:
-          event-type: sync-data-after-scheduled-launch-infrastructure

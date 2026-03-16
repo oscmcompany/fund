@@ -1,18 +1,22 @@
 import io
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
 from tide.workflow import (
+    DEFAULT_CONFIGURATION,
     prepare_data,
     sync_equity_bars,
     sync_equity_details,
+    train_model,
     train_tide_model,
     training_pipeline,
 )
 
 LOOKBACK_DAYS = 30
+PARTIAL_HIDDEN_SIZE = 16
 
 
 @patch("tide.workflow.sync_equity_bars_data")
@@ -110,7 +114,7 @@ def test_train_tide_model_downloads_trains_uploads(mock_boto3: MagicMock) -> Non
     mock_model = MagicMock()
     mock_data = MagicMock()
 
-    with patch("tide.trainer.train_model") as mock_train:
+    with patch("tide.workflow.train_model") as mock_train:
         mock_train.return_value = (mock_model, mock_data)
         result = train_tide_model.fn(
             artifacts_bucket="artifacts-bucket",
@@ -162,3 +166,57 @@ def test_training_pipeline_threads_data_key(
         "training/data.parquet",
     )
     assert result == "s3://bucket/model"
+
+
+def test_train_model_returns_model_and_data(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_data = make_raw_data(days=90)
+    model, data = train_model(training_data)
+    assert model is not None
+    assert data is not None
+    assert hasattr(data, "scaler")
+    assert hasattr(data, "mappings")
+
+
+def test_train_model_uses_custom_configuration(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_data = make_raw_data(days=90)
+    custom_config = dict(DEFAULT_CONFIGURATION)
+    custom_config["epoch_count"] = 1
+    custom_config["hidden_size"] = PARTIAL_HIDDEN_SIZE * 2
+    model, _data = train_model(training_data, configuration=custom_config)
+    assert model.hidden_size == PARTIAL_HIDDEN_SIZE * 2
+
+
+def test_train_model_raises_on_insufficient_data(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    short_data = make_raw_data(tickers=["AAPL"], days=5)
+    with pytest.raises(ValueError, match="Total days available"):
+        train_model(short_data)
+
+
+def test_train_model_uses_default_configuration(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_data = make_raw_data(days=90)
+    model, _ = train_model(training_data)
+    assert model.hidden_size == DEFAULT_CONFIGURATION["hidden_size"]
+    assert model.output_length == DEFAULT_CONFIGURATION["output_length"]
+
+
+def test_train_model_merges_partial_configuration(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_data = make_raw_data(days=90)
+    model, _ = train_model(
+        training_data,
+        configuration={
+            "epoch_count": 1,
+            "hidden_size": PARTIAL_HIDDEN_SIZE,
+        },
+    )
+    assert model.hidden_size == PARTIAL_HIDDEN_SIZE
+    assert model.output_length == DEFAULT_CONFIGURATION["output_length"]

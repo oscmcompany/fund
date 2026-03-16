@@ -116,7 +116,7 @@ aws.s3.BucketVersioning(
 # retain_on_delete=True and add pulumi import statements to the maskfile up command.
 data_manager_repository = aws.ecr.Repository(
     "data_manager_repository",
-    name="fund/data_manager-server",
+    name="fund/data-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -133,7 +133,7 @@ aws.ecr.LifecyclePolicy(
 
 portfolio_manager_repository = aws.ecr.Repository(
     "portfolio_manager_repository",
-    name="fund/portfolio_manager-server",
+    name="fund/portfolio-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -150,7 +150,7 @@ aws.ecr.LifecyclePolicy(
 
 ensemble_manager_repository = aws.ecr.Repository(
     "ensemble_manager_repository",
-    name="fund/ensemble_manager-server",
+    name="fund/ensemble-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -165,9 +165,9 @@ aws.ecr.LifecyclePolicy(
     policy=_ecr_lifecycle_policy,
 )
 
-tide_trainer_repository = aws.ecr.Repository(
-    "tide_trainer_repository",
-    name="fund/tide-trainer",
+tide_runner_repository = aws.ecr.Repository(
+    "tide_runner_repository",
+    name="fund/tide-runner",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -177,14 +177,14 @@ tide_trainer_repository = aws.ecr.Repository(
 )
 
 aws.ecr.LifecyclePolicy(
-    "tide_trainer_repository_lifecycle",
-    repository=tide_trainer_repository.name,
+    "tide_runner_repository_lifecycle",
+    repository=tide_runner_repository.name,
     policy=_ecr_lifecycle_policy,
 )
 
-training_server_repository = aws.ecr.Repository(
-    "training_server_repository",
-    name="fund/training-server",
+model_trainer_server_worker_repository = aws.ecr.Repository(
+    "model_trainer_server_worker_repository",
+    name="fund/model-trainer-server-worker",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -194,25 +194,8 @@ training_server_repository = aws.ecr.Repository(
 )
 
 aws.ecr.LifecyclePolicy(
-    "training_server_repository_lifecycle",
-    repository=training_server_repository.name,
-    policy=_ecr_lifecycle_policy,
-)
-
-training_worker_repository = aws.ecr.Repository(
-    "training_worker_repository",
-    name="fund/training-worker",
-    image_tag_mutability="MUTABLE",
-    force_delete=True,
-    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
-        scan_on_push=True,
-    ),
-    tags=tags,
-)
-
-aws.ecr.LifecyclePolicy(
-    "training_worker_repository_lifecycle",
-    repository=training_worker_repository.name,
+    "model_trainer_server_worker_repository_lifecycle",
+    repository=model_trainer_server_worker_repository.name,
     policy=_ecr_lifecycle_policy,
 )
 
@@ -227,12 +210,11 @@ portfolio_manager_image_uri = portfolio_manager_repository.repository_url.apply(
 ensemble_manager_image_uri = ensemble_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-tide_trainer_image_uri = tide_trainer_repository.repository_url.apply(
+tide_runner_image_uri = tide_runner_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-training_server_image_uri = training_server_repository.repository_url.apply(
-    lambda url: f"{url}:latest"
-)
-training_worker_image_uri = training_worker_repository.repository_url.apply(
-    lambda url: f"{url}:latest"
+model_trainer_server_worker_image_uri = (
+    model_trainer_server_worker_repository.repository_url.apply(
+        lambda url: f"{url}:latest"
+    )
 )

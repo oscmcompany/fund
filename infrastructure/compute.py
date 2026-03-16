@@ -25,9 +25,8 @@ from storage import (
     data_manager_image_uri,
     ensemble_manager_image_uri,
     model_artifacts_bucket,
+    model_trainer_server_worker_image_uri,
     portfolio_manager_image_uri,
-    training_server_image_uri,
-    training_worker_image_uri,
 )
 
 cluster = aws.ecs.Cluster(
@@ -58,7 +57,7 @@ alb = aws.lb.LoadBalancer(
 
 data_manager_tg = aws.lb.TargetGroup(
     "data_manager_tg",
-    name="fund-data-manager",
+    name="fund-data-manager-server",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -75,7 +74,7 @@ data_manager_tg = aws.lb.TargetGroup(
 
 portfolio_manager_tg = aws.lb.TargetGroup(
     "portfolio_manager_tg",
-    name="fund-portfolio-manager",
+    name="fund-portfolio-manager-server",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -92,7 +91,7 @@ portfolio_manager_tg = aws.lb.TargetGroup(
 
 ensemble_manager_tg = aws.lb.TargetGroup(
     "ensemble_manager_tg",
-    name="fund-ensemble-manager",
+    name="fund-ensemble-manager-server",
     port=8080,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -107,9 +106,9 @@ ensemble_manager_tg = aws.lb.TargetGroup(
     tags=tags,
 )
 
-training_tg = aws.lb.TargetGroup(
-    "training_tg",
-    name="fund-training",
+model_trainer_tg = aws.lb.TargetGroup(
+    "model_trainer_tg",
+    name="fund-model-trainer",
     port=4200,
     protocol="HTTP",
     vpc_id=vpc.id,
@@ -139,7 +138,7 @@ if acm_certificate_arn:
         default_actions=[
             aws.lb.ListenerDefaultActionArgs(
                 type="forward",
-                target_group_arn=training_tg.arn,
+                target_group_arn=model_trainer_tg.arn,
             )
         ],
         tags=tags,
@@ -153,7 +152,7 @@ else:
         default_actions=[
             aws.lb.ListenerDefaultActionArgs(
                 type="forward",
-                target_group_arn=training_tg.arn,
+                target_group_arn=model_trainer_tg.arn,
             )
         ],
         tags=tags,
@@ -293,7 +292,7 @@ aws.lb.ListenerRule(
 # RDS Security Group - allows inbound Postgres from ECS tasks
 prefect_rds_security_group = aws.ec2.SecurityGroup(
     "prefect_rds_sg",
-    name="fund-prefect-rds",
+    name="fund-model-trainer-state",
     vpc_id=vpc.id,
     description="Security group for Prefect RDS database",
     tags=tags,
@@ -324,7 +323,7 @@ aws.ec2.SecurityGroupRule(
 # Redis Security Group - allows inbound Redis from ECS tasks
 prefect_redis_security_group = aws.ec2.SecurityGroup(
     "prefect_redis_sg",
-    name="fund-prefect-redis",
+    name="fund-model-trainer-broker",
     vpc_id=vpc.id,
     description="Security group for Prefect Redis cache",
     tags=tags,
@@ -355,15 +354,15 @@ aws.ec2.SecurityGroupRule(
 # RDS Subnet Group
 prefect_rds_subnet_group = aws.rds.SubnetGroup(
     "prefect_rds_subnet_group",
-    name="fund-prefect-rds",
+    name="fund-model-trainer-state",
     subnet_ids=[private_subnet_1.id, private_subnet_2.id],
     tags=tags,
 )
 
 # RDS PostgreSQL for Prefect database
-prefect_database = aws.rds.Instance(
-    "prefect_database",
-    identifier="fund-prefect",
+model_trainer_state = aws.rds.Instance(
+    "model_trainer_state",
+    identifier="fund-model-trainer-state",
     engine="postgres",
     engine_version="14",
     instance_class="db.t3.micro",
@@ -374,7 +373,7 @@ prefect_database = aws.rds.Instance(
     db_subnet_group_name=prefect_rds_subnet_group.name,
     vpc_security_group_ids=[prefect_rds_security_group.id],
     skip_final_snapshot=False,
-    final_snapshot_identifier=f"fund-prefect-final-{pulumi.get_stack()}",
+    final_snapshot_identifier=f"fund-model-trainer-state-final-{pulumi.get_stack()}",
     backup_retention_period=7,
     storage_encrypted=True,
     deletion_protection=True,
@@ -386,7 +385,7 @@ aws.iam.RolePolicy(
     "execution_role_prefect_db_secret_policy",
     name="fund-ecs-execution-role-prefect-db-secret",
     role=execution_role.id,
-    policy=prefect_database.master_user_secrets[0]["secret_arn"].apply(
+    policy=model_trainer_state.master_user_secrets[0]["secret_arn"].apply(
         lambda arn: json.dumps(
             {
                 "Version": "2012-10-17",
@@ -406,15 +405,15 @@ aws.iam.RolePolicy(
 # ElastiCache Subnet Group
 prefect_elasticache_subnet_group = aws.elasticache.SubnetGroup(
     "prefect_elasticache_subnet_group",
-    name="fund-prefect-redis",
+    name="fund-model-trainer-broker",
     subnet_ids=[private_subnet_1.id, private_subnet_2.id],
     tags=tags,
 )
 
 # ElastiCache Redis for Prefect messaging
-prefect_redis = aws.elasticache.Cluster(
-    "prefect_redis",
-    cluster_id="fund-prefect-redis",
+model_trainer_broker = aws.elasticache.Cluster(
+    "model_trainer_broker",
+    cluster_id="fund-model-trainer-broker",
     engine="redis",
     engine_version="7.0",
     node_type="cache.t3.micro",
@@ -451,7 +450,7 @@ aws.ec2.SecurityGroupRule(
 # Prefect Server Log Group
 training_server_log_group = aws.cloudwatch.LogGroup(
     "training_server_logs",
-    name="/ecs/fund/training-server",
+    name="/ecs/fund/model-trainer-server",
     retention_in_days=7,
     tags=tags,
 )
@@ -459,7 +458,7 @@ training_server_log_group = aws.cloudwatch.LogGroup(
 # Prefect Worker Log Group
 training_worker_log_group = aws.cloudwatch.LogGroup(
     "training_worker_logs",
-    name="/ecs/fund/training-worker",
+    name="/ecs/fund/model-trainer-worker",
     retention_in_days=7,
     tags=tags,
 )
@@ -467,7 +466,7 @@ training_worker_log_group = aws.cloudwatch.LogGroup(
 # Prefect Server Task Definition
 training_server_task_definition = aws.ecs.TaskDefinition(
     "training_server_task",
-    family="training-server",
+    family="model-trainer-server",
     cpu="512",
     memory="1024",
     network_mode="awsvpc",
@@ -476,15 +475,15 @@ training_server_task_definition = aws.ecs.TaskDefinition(
     task_role_arn=task_role.arn,
     container_definitions=pulumi.Output.all(
         training_server_log_group.name,
-        prefect_database.endpoint,
-        prefect_database.master_user_secrets[0]["secret_arn"],
-        training_server_image_uri,
+        model_trainer_state.endpoint,
+        model_trainer_state.master_user_secrets[0]["secret_arn"],
+        model_trainer_server_worker_image_uri,
         alb.dns_name,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "training-server",
+                    "name": "model-trainer-server",
                     "image": args[3],
                     # Inline bash/python constructs the database URL at runtime
                     # because the password comes from Secrets Manager and must be
@@ -525,7 +524,7 @@ training_server_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "training-server",
+                            "awslogs-stream-prefix": "model-trainer-server",
                         },
                     },
                     "essential": True,
@@ -540,7 +539,7 @@ training_server_task_definition = aws.ecs.TaskDefinition(
 # Prefect Server Service Discovery
 training_server_sd_service = aws.servicediscovery.Service(
     "training_server_sd",
-    name="training-server",
+    name="model-trainer-server",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -553,7 +552,7 @@ training_server_sd_service = aws.servicediscovery.Service(
 # Prefect Server ECS Service
 training_server_service = aws.ecs.Service(
     "training_server_service",
-    name="fund-training-server",
+    name="fund-model-trainer-server",
     cluster=cluster.arn,
     task_definition=training_server_task_definition.arn,
     desired_count=1,
@@ -565,8 +564,8 @@ training_server_service = aws.ecs.Service(
     ),
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
-            target_group_arn=training_tg.arn,
-            container_name="training-server",
+            target_group_arn=model_trainer_tg.arn,
+            container_name="model-trainer-server",
             container_port=4200,
         )
     ],
@@ -574,7 +573,7 @@ training_server_service = aws.ecs.Service(
         registry_arn=training_server_sd_service.arn
     ),
     opts=pulumi.ResourceOptions(
-        depends_on=[prefect_database, prefect_redis, prefect_listener],
+        depends_on=[model_trainer_state, model_trainer_broker, prefect_listener],
     ),
     tags=tags,
 )
@@ -582,7 +581,7 @@ training_server_service = aws.ecs.Service(
 # Prefect Worker Task Definition
 training_worker_task_definition = aws.ecs.TaskDefinition(
     "training_worker_task",
-    family="training-worker",
+    family="model-trainer-worker",
     cpu="4096",
     memory="8192",
     network_mode="awsvpc",
@@ -594,19 +593,19 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
         service_discovery_namespace.name,
         data_bucket.bucket,
         model_artifacts_bucket.bucket,
-        training_worker_image_uri,
+        model_trainer_server_worker_image_uri,
         training_notification_sender_email_parameter.arn,
         training_notification_recipients_parameter.arn,
     ).apply(
         lambda args: json.dumps(
             [
                 {
-                    "name": "training-worker",
+                    "name": "model-trainer-worker",
                     "image": args[4],
                     "environment": [
                         {
                             "name": "PREFECT_API_URL",
-                            "value": f"http://training-server.{args[1]}:4200/api",
+                            "value": f"http://model-trainer-server.{args[1]}:4200/api",
                         },
                         {
                             "name": "AWS_S3_DATA_BUCKET_NAME",
@@ -618,7 +617,7 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
                         },
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://data-manager.{args[1]}:8080",
+                            "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {
                             "name": "FUND_LOOKBACK_DAYS",
@@ -640,7 +639,7 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "training-worker",
+                            "awslogs-stream-prefix": "model-trainer-worker",
                         },
                     },
                     "essential": True,
@@ -655,7 +654,7 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
 # Prefect Worker ECS Service
 training_worker_service = aws.ecs.Service(
     "training_worker_service",
-    name="fund-training-worker",
+    name="fund-model-trainer-worker",
     cluster=cluster.arn,
     task_definition=training_worker_task_definition.arn,
     desired_count=1,
@@ -673,28 +672,28 @@ training_worker_service = aws.ecs.Service(
 
 data_manager_log_group = aws.cloudwatch.LogGroup(
     "data_manager_logs",
-    name="/ecs/fund/data-manager",
+    name="/ecs/fund/data-manager-server",
     retention_in_days=7,
     tags=tags,
 )
 
 portfolio_manager_log_group = aws.cloudwatch.LogGroup(
     "portfolio_manager_logs",
-    name="/ecs/fund/portfolio-manager",
+    name="/ecs/fund/portfolio-manager-server",
     retention_in_days=7,
     tags=tags,
 )
 
 ensemble_manager_log_group = aws.cloudwatch.LogGroup(
     "ensemble_manager_logs",
-    name="/ecs/fund/ensemble-manager",
+    name="/ecs/fund/ensemble-manager-server",
     retention_in_days=7,
     tags=tags,
 )
 
 data_manager_task_definition = aws.ecs.TaskDefinition(
     "data_manager_task",
-    family="data-manager",
+    family="data-manager-server",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -711,7 +710,7 @@ data_manager_task_definition = aws.ecs.TaskDefinition(
         lambda args: json.dumps(
             [
                 {
-                    "name": "data-manager",
+                    "name": "data-manager-server",
                     "image": args[1],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
@@ -747,7 +746,7 @@ data_manager_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "data-manager",
+                            "awslogs-stream-prefix": "data-manager-server",
                         },
                     },
                     "essential": True,
@@ -761,7 +760,7 @@ data_manager_task_definition = aws.ecs.TaskDefinition(
 
 portfolio_manager_task_definition = aws.ecs.TaskDefinition(
     "portfolio_manager_task",
-    family="portfolio-manager",
+    family="portfolio-manager-server",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -779,17 +778,17 @@ portfolio_manager_task_definition = aws.ecs.TaskDefinition(
         lambda args: json.dumps(
             [
                 {
-                    "name": "portfolio-manager",
+                    "name": "portfolio-manager-server",
                     "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://data-manager.{args[1]}:8080",
+                            "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {
                             "name": "FUND_ENSEMBLE_MANAGER_BASE_URL",
-                            "value": f"http://ensemble-manager.{args[1]}:8080",
+                            "value": f"http://ensemble-manager-server.{args[1]}:8080",
                         },
                         {
                             "name": "FUND_ENVIRONMENT",
@@ -823,7 +822,7 @@ portfolio_manager_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "portfolio-manager",
+                            "awslogs-stream-prefix": "portfolio-manager-server",
                         },
                     },
                     "essential": True,
@@ -837,7 +836,7 @@ portfolio_manager_task_definition = aws.ecs.TaskDefinition(
 
 ensemble_manager_task_definition = aws.ecs.TaskDefinition(
     "ensemble_manager_task",
-    family="ensemble-manager",
+    family="ensemble-manager-server",
     cpu="256",
     memory="512",
     network_mode="awsvpc",
@@ -854,13 +853,13 @@ ensemble_manager_task_definition = aws.ecs.TaskDefinition(
         lambda args: json.dumps(
             [
                 {
-                    "name": "ensemble-manager",
+                    "name": "ensemble-manager-server",
                     "image": args[2],
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
                             "name": "FUND_DATAMANAGER_BASE_URL",
-                            "value": f"http://data-manager.{args[1]}:8080",
+                            "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {
                             "name": "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME",
@@ -886,7 +885,7 @@ ensemble_manager_task_definition = aws.ecs.TaskDefinition(
                         "options": {
                             "awslogs-group": args[0],
                             "awslogs-region": region,
-                            "awslogs-stream-prefix": "ensemble-manager",
+                            "awslogs-stream-prefix": "ensemble-manager-server",
                         },
                     },
                     "essential": True,
@@ -900,7 +899,7 @@ ensemble_manager_task_definition = aws.ecs.TaskDefinition(
 
 data_manager_sd_service = aws.servicediscovery.Service(
     "data_manager_sd",
-    name="data-manager",
+    name="data-manager-server",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -912,7 +911,7 @@ data_manager_sd_service = aws.servicediscovery.Service(
 
 portfolio_manager_sd_service = aws.servicediscovery.Service(
     "portfolio_manager_sd",
-    name="portfolio-manager",
+    name="portfolio-manager-server",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -924,7 +923,7 @@ portfolio_manager_sd_service = aws.servicediscovery.Service(
 
 ensemble_manager_sd_service = aws.servicediscovery.Service(
     "ensemble_manager_sd",
-    name="ensemble-manager",
+    name="ensemble-manager-server",
     dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
         namespace_id=service_discovery_namespace.id,
         dns_records=[
@@ -936,7 +935,7 @@ ensemble_manager_sd_service = aws.servicediscovery.Service(
 
 data_manager_service = aws.ecs.Service(
     "data_manager_service",
-    name="fund-data-manager",
+    name="fund-data-manager-server",
     cluster=cluster.arn,
     task_definition=data_manager_task_definition.arn,
     desired_count=1,
@@ -949,7 +948,7 @@ data_manager_service = aws.ecs.Service(
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
             target_group_arn=data_manager_tg.arn,
-            container_name="data-manager",
+            container_name="data-manager-server",
             container_port=8080,
         )
     ],
@@ -962,7 +961,7 @@ data_manager_service = aws.ecs.Service(
 
 portfolio_manager_service = aws.ecs.Service(
     "portfolio_manager_service",
-    name="fund-portfolio-manager",
+    name="fund-portfolio-manager-server",
     cluster=cluster.arn,
     task_definition=portfolio_manager_task_definition.arn,
     desired_count=1,
@@ -975,7 +974,7 @@ portfolio_manager_service = aws.ecs.Service(
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
             target_group_arn=portfolio_manager_tg.arn,
-            container_name="portfolio-manager",
+            container_name="portfolio-manager-server",
             container_port=8080,
         )
     ],
@@ -988,7 +987,7 @@ portfolio_manager_service = aws.ecs.Service(
 
 ensemble_manager_service = aws.ecs.Service(
     "ensemble_manager_service",
-    name="fund-ensemble-manager",
+    name="fund-ensemble-manager-server",
     cluster=cluster.arn,
     task_definition=ensemble_manager_task_definition.arn,
     desired_count=1,
@@ -1001,7 +1000,7 @@ ensemble_manager_service = aws.ecs.Service(
     load_balancers=[
         aws.ecs.ServiceLoadBalancerArgs(
             target_group_arn=ensemble_manager_tg.arn,
-            container_name="ensemble-manager",
+            container_name="ensemble-manager-server",
             container_port=8080,
         )
     ],

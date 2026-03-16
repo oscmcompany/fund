@@ -14,7 +14,7 @@ COPY tools/ tools/
 
 RUN uv sync --no-dev --package tide
 
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS trainer
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS runner
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC

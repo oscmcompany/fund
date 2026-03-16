@@ -27,7 +27,8 @@ def deploy_training_flow(
     training_pipeline.deploy(
         name="daily-training",
         work_pool_name="training-pool",
-        cron="0 22 * * *",
+        cron="0 22 * * 1-5",
+        timezone="America/New_York",
         parameters={
             "base_url": base_url,
             "data_bucket": data_bucket,
