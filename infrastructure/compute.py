@@ -376,11 +376,11 @@ prefect_database = aws.rds.Instance(
     manage_master_user_password=True,
     db_subnet_group_name=prefect_rds_subnet_group.name,
     vpc_security_group_ids=[prefect_rds_security_group.id],
-    skip_final_snapshot=False,
-    final_snapshot_identifier=f"fund-prefect-final-{pulumi.get_stack()}",
-    backup_retention_period=7,
-    storage_encrypted=True,
-    deletion_protection=True,
+    skip_final_snapshot=True,
+    backup_retention_period=0,
+    storage_encrypted=False,
+    deletion_protection=False,
+    apply_immediately=True,
     tags=tags,
 )
 

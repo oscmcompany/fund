@@ -139,33 +139,39 @@ in {
   };
 
   # --- AWS / Pulumi commands ---
+  # All infra scripts unset MinIO env vars so the real AWS credentials are used.
 
   # Bring up AWS infrastructure with Pulumi
   scripts.infra-up.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     pulumi up --stack production --yes
   '';
 
   # Tear down AWS infrastructure with Pulumi
   scripts.infra-down.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     pulumi down --stack production --yes
   '';
 
   # Show Pulumi stack outputs (ALB URL, ECR repos, bucket names, etc.)
   scripts.infra-outputs.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     pulumi stack output --stack production --json
   '';
 
   # Get the ALB base URL from Pulumi outputs
   scripts.infra-url.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     pulumi stack output --stack production aws_alb_url 2>/dev/null || echo "Not deployed yet"
   '';
 
   # Build and push a Docker image to ECR
   scripts.ecr-push.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     SERVICE="$1"
     if [ -z "$SERVICE" ]; then
       echo "Usage: ecr-push <${lib.concatStringsSep "|" deployableServices}|all>"
@@ -205,6 +211,7 @@ in {
 
   # Force ECS services to redeploy with latest image
   scripts.ecs-deploy.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     SERVICE="$1"
     CLUSTER="fund-application"
 
@@ -256,6 +263,7 @@ in {
 
   # Show ECS service status
   scripts.ecs-status.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     CLUSTER="fund-application"
     echo "=== ECS Services ==="
     aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
@@ -272,9 +280,9 @@ in {
 
   # Pull secrets from AWS Secrets Manager into .envrc
   scripts.pull-secrets.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     ENVRC="$DEVENV_ROOT/.envrc"
     AWS_CMD="aws --region ${awsRegion}"
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     export AWS_PROFILE=default
 
     echo "Fetching secrets from AWS Secrets Manager..."
@@ -299,6 +307,7 @@ in {
 
   # Create Prefect work pool and register deployment on production
   scripts.prefect-init.exec = ''
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     ALB_URL=$(pulumi stack output --stack production aws_alb_url 2>/dev/null)
     if [ -z "$ALB_URL" ]; then
