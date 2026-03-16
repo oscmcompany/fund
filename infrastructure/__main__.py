@@ -9,6 +9,11 @@ from storage import (
     data_manager_repository,
     ensemble_manager_image_uri,
     ensemble_manager_repository,
+    grafana_image_uri,
+    grafana_repository,
+    mlflow_artifacts_bucket,
+    mlflow_image_uri,
+    mlflow_repository,
     model_artifacts_bucket,
     portfolio_manager_image_uri,
     portfolio_manager_repository,
@@ -82,6 +87,14 @@ pulumi.export(
 pulumi.export(
     "aws_iam_github_actions_oidc_provider_arn",
     github_actions_oidc_provider.arn,
+)
+pulumi.export("aws_ecr_mlflow_repository", mlflow_repository.repository_url)
+pulumi.export("aws_ecr_mlflow_image", mlflow_image_uri)
+pulumi.export("aws_ecr_grafana_repository", grafana_repository.repository_url)
+pulumi.export("aws_ecr_grafana_image", grafana_image_uri)
+pulumi.export(
+    "aws_s3_mlflow_artifacts_bucket_name",
+    pulumi.Output.unsecret(mlflow_artifacts_bucket.bucket),
 )
 pulumi.export("fund_base_url", fund_base_url)
 pulumi.export("readme", pulumi.Output.format(readme_content, fund_base_url))

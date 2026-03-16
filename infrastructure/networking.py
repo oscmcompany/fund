@@ -192,6 +192,58 @@ alb_security_group = aws.ec2.SecurityGroup(
             if prefect_allowed_ipv6_cidrs
             else []
         ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=5000,
+                    to_port=5000,
+                    cidr_blocks=prefect_allowed_ipv4_cidrs,
+                    description="Allow MLflow dashboard from team IPv4",
+                ),
+            ]
+            if prefect_allowed_ipv4_cidrs
+            else []
+        ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=5000,
+                    to_port=5000,
+                    ipv6_cidr_blocks=prefect_allowed_ipv6_cidrs,
+                    description="Allow MLflow dashboard from team IPv6",
+                ),
+            ]
+            if prefect_allowed_ipv6_cidrs
+            else []
+        ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=3000,
+                    to_port=3000,
+                    cidr_blocks=prefect_allowed_ipv4_cidrs,
+                    description="Allow Grafana dashboard from team IPv4",
+                ),
+            ]
+            if prefect_allowed_ipv4_cidrs
+            else []
+        ),
+        *(
+            [
+                aws.ec2.SecurityGroupIngressArgs(
+                    protocol="tcp",
+                    from_port=3000,
+                    to_port=3000,
+                    ipv6_cidr_blocks=prefect_allowed_ipv6_cidrs,
+                    description="Allow Grafana dashboard from team IPv6",
+                ),
+            ]
+            if prefect_allowed_ipv6_cidrs
+            else []
+        ),
     ],
     egress=[
         aws.ec2.SecurityGroupEgressArgs(
@@ -235,6 +287,30 @@ aws.ec2.SecurityGroupRule(
     from_port=8080,
     to_port=8080,
     description="Allow inter-service communication",
+)
+
+# Allow ALB to reach ECS tasks on port 3000 (Grafana)
+aws.ec2.SecurityGroupRule(
+    "ecs_from_alb_grafana",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=alb_security_group.id,
+    protocol="tcp",
+    from_port=3000,
+    to_port=3000,
+    description="Allow ALB traffic to Grafana",
+)
+
+# Allow ECS tasks to communicate with each other on port 3000 (Grafana)
+aws.ec2.SecurityGroupRule(
+    "ecs_self_ingress_grafana",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=3000,
+    to_port=3000,
+    description="Allow inter-service communication on Grafana port",
 )
 
 # Allow all outbound traffic from ECS tasks

@@ -28,7 +28,7 @@ from config import (
     training_notification_recipient_emails,
     training_notification_sender_email,
 )
-from storage import data_bucket, model_artifacts_bucket
+from storage import data_bucket, mlflow_artifacts_bucket, model_artifacts_bucket
 
 github_actions_oidc_provider = aws.iam.OpenIdConnectProvider(
     "github_actions_oidc_provider",
@@ -136,6 +136,8 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                             "arn:aws:s3:::fund-data-*/*",
                             "arn:aws:s3:::fund-model-artifacts-*",
                             "arn:aws:s3:::fund-model-artifacts-*/*",
+                            "arn:aws:s3:::fund-mlflow-artifacts-*",
+                            "arn:aws:s3:::fund-mlflow-artifacts-*/*",
                         ],
                     },
                     # CreateSecret requires wildcard resources before an ARN exists.
@@ -312,6 +314,8 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                             "StringEquals": {
                                 "iam:PolicyName": [
                                     "fund-ecs-execution-role-secrets-policy",
+                                    "fund-ecs-execution-role-prefect-db-secret",
+                                    "fund-ecs-execution-role-mlflow-db-secret",
                                     "fund-ecs-task-role-s3-policy",
                                     "fund-ecs-task-role-ssm-policy",
                                     "fund-ecs-task-role-ses-policy",
@@ -485,7 +489,9 @@ aws.iam.RolePolicy(
     "task_role_s3_policy",
     name="fund-ecs-task-role-s3-policy",
     role=task_role.id,
-    policy=pulumi.Output.all(data_bucket.arn, model_artifacts_bucket.arn).apply(
+    policy=pulumi.Output.all(
+        data_bucket.arn, model_artifacts_bucket.arn, mlflow_artifacts_bucket.arn
+    ).apply(
         lambda args: json.dumps(
             {
                 "Version": "2012-10-17",
@@ -498,6 +504,8 @@ aws.iam.RolePolicy(
                             f"{args[0]}/*",
                             args[1],
                             f"{args[1]}/*",
+                            args[2],
+                            f"{args[2]}/*",
                         ],
                     }
                 ],

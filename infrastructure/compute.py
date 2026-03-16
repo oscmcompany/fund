@@ -24,6 +24,9 @@ from storage import (
     data_bucket,
     data_manager_image_uri,
     ensemble_manager_image_uri,
+    grafana_image_uri,
+    mlflow_artifacts_bucket,
+    mlflow_image_uri,
     model_artifacts_bucket,
     portfolio_manager_image_uri,
     training_server_image_uri,
@@ -624,6 +627,10 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
                             "name": "FUND_LOOKBACK_DAYS",
                             "value": "365",
                         },
+                        {
+                            "name": "MLFLOW_TRACKING_URI",
+                            "value": f"http://mlflow.{args[1]}:8080",
+                        },
                     ],
                     "secrets": [
                         {
@@ -667,6 +674,415 @@ training_worker_service = aws.ecs.Service(
     ),
     opts=pulumi.ResourceOptions(
         depends_on=[training_server_service],
+    ),
+    tags=tags,
+)
+
+# MLflow Infrastructure
+
+# MLflow RDS Security Group - allows inbound Postgres from ECS tasks
+mlflow_rds_security_group = aws.ec2.SecurityGroup(
+    "mlflow_rds_sg",
+    name="fund-mlflow-rds",
+    vpc_id=vpc.id,
+    description="Security group for MLflow RDS database",
+    tags=tags,
+)
+
+aws.ec2.SecurityGroupRule(
+    "mlflow_rds_ingress",
+    type="ingress",
+    security_group_id=mlflow_rds_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=5432,
+    to_port=5432,
+    description="Allow Postgres from ECS tasks",
+)
+
+aws.ec2.SecurityGroupRule(
+    "mlflow_rds_egress",
+    type="egress",
+    security_group_id=mlflow_rds_security_group.id,
+    protocol="-1",
+    from_port=0,
+    to_port=0,
+    cidr_blocks=["0.0.0.0/0"],
+    description="Allow all outbound",
+)
+
+# MLflow RDS Subnet Group
+mlflow_rds_subnet_group = aws.rds.SubnetGroup(
+    "mlflow_rds_subnet_group",
+    name="fund-mlflow-rds",
+    subnet_ids=[private_subnet_1.id, private_subnet_2.id],
+    tags=tags,
+)
+
+# RDS PostgreSQL for MLflow database
+mlflow_database = aws.rds.Instance(
+    "mlflow_database",
+    identifier="fund-mlflow",
+    engine="postgres",
+    engine_version="14",
+    instance_class="db.t3.micro",
+    allocated_storage=20,
+    db_name="mlflow",
+    username="mlflow",
+    manage_master_user_password=True,
+    db_subnet_group_name=mlflow_rds_subnet_group.name,
+    vpc_security_group_ids=[mlflow_rds_security_group.id],
+    skip_final_snapshot=False,
+    final_snapshot_identifier=f"fund-mlflow-final-{pulumi.get_stack()}",
+    backup_retention_period=7,
+    storage_encrypted=True,
+    deletion_protection=True,
+    tags=tags,
+)
+
+# Grant ECS execution role access to the MLflow RDS-managed master password secret
+aws.iam.RolePolicy(
+    "execution_role_mlflow_db_secret_policy",
+    name="fund-ecs-execution-role-mlflow-db-secret",
+    role=execution_role.id,
+    policy=mlflow_database.master_user_secrets[0]["secret_arn"].apply(
+        lambda arn: json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["secretsmanager:GetSecretValue"],
+                        "Resource": arn,
+                    }
+                ],
+            },
+            sort_keys=True,
+        )
+    ),
+)
+
+# Allow ECS tasks to communicate with MLflow on port 8080
+aws.ec2.SecurityGroupRule(
+    "ecs_mlflow_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=8080,
+    to_port=8080,
+    description="Allow MLflow server communication",
+)
+
+# Allow ALB to reach MLflow on port 8080
+aws.ec2.SecurityGroupRule(
+    "ecs_mlflow_alb_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=alb_security_group.id,
+    protocol="tcp",
+    from_port=8080,
+    to_port=8080,
+    description="Allow ALB traffic to MLflow server",
+)
+
+mlflow_tg = aws.lb.TargetGroup(
+    "mlflow_tg",
+    name="fund-mlflow",
+    port=8080,
+    protocol="HTTP",
+    vpc_id=vpc.id,
+    target_type="ip",
+    health_check=aws.lb.TargetGroupHealthCheckArgs(
+        path="/health",
+        healthy_threshold=2,
+        unhealthy_threshold=3,
+        timeout=5,
+        interval=30,
+    ),
+    tags=tags,
+)
+
+mlflow_listener = aws.lb.Listener(
+    "mlflow_listener",
+    load_balancer_arn=alb.arn,
+    port=5000,
+    protocol="HTTP",
+    default_actions=[
+        aws.lb.ListenerDefaultActionArgs(
+            type="forward",
+            target_group_arn=mlflow_tg.arn,
+        )
+    ],
+    tags=tags,
+)
+
+# MLflow Log Group
+mlflow_log_group = aws.cloudwatch.LogGroup(
+    "mlflow_logs",
+    name="/ecs/fund/mlflow",
+    retention_in_days=7,
+    tags=tags,
+)
+
+# MLflow Task Definition
+mlflow_task_definition = aws.ecs.TaskDefinition(
+    "mlflow_task",
+    family="mlflow",
+    cpu="512",
+    memory="2048",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=pulumi.Output.all(
+        mlflow_log_group.name,
+        mlflow_database.endpoint,
+        mlflow_database.master_user_secrets[0]["secret_arn"],
+        mlflow_image_uri,
+        mlflow_artifacts_bucket.bucket,
+    ).apply(
+        lambda args: json.dumps(
+            [
+                {
+                    "name": "mlflow",
+                    "image": args[3],
+                    "command": [
+                        "bash",
+                        "-c",
+                        (
+                            "export MLFLOW_BACKEND_STORE_URI="
+                            '$(python3 -c "'
+                            "import os, urllib.parse;"
+                            "p=urllib.parse.quote(os.environ['MLFLOW_DB_PASSWORD'],safe='');"
+                            f"print(f'postgresql://mlflow:{{p}}@{args[1]}/mlflow')"
+                            '")'
+                            " && exec mlflow server"
+                            " --host 0.0.0.0"
+                            " --port 8080"
+                            " --workers 1"
+                            " --backend-store-uri $MLFLOW_BACKEND_STORE_URI"
+                            f" --default-artifact-root s3://{args[4]}"
+                            " --serve-artifacts"
+                        ),
+                    ],
+                    "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
+                    "environment": [
+                        {
+                            "name": "MLFLOW_DEFAULT_ARTIFACT_ROOT",
+                            "value": f"s3://{args[4]}",
+                        },
+                        {
+                            "name": "MLFLOW_SERVER_DISABLE_SECURITY_MIDDLEWARE",
+                            "value": "true",
+                        },
+                    ],
+                    "secrets": [
+                        {
+                            "name": "MLFLOW_DB_PASSWORD",
+                            "valueFrom": f"{args[2]}:password::",
+                        },
+                    ],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": args[0],
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "mlflow",
+                        },
+                    },
+                    "essential": True,
+                }
+            ],
+            sort_keys=True,
+        )
+    ),
+    tags=tags,
+)
+
+# MLflow Service Discovery
+mlflow_sd_service = aws.servicediscovery.Service(
+    "mlflow_sd",
+    name="mlflow",
+    dns_config=aws.servicediscovery.ServiceDnsConfigArgs(
+        namespace_id=service_discovery_namespace.id,
+        dns_records=[
+            aws.servicediscovery.ServiceDnsConfigDnsRecordArgs(ttl=10, type="A")
+        ],
+    ),
+    tags=tags,
+)
+
+# MLflow ECS Service
+mlflow_service = aws.ecs.Service(
+    "mlflow_service",
+    name="fund-mlflow",
+    cluster=cluster.arn,
+    task_definition=mlflow_task_definition.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        subnets=[private_subnet_1.id, private_subnet_2.id],
+        security_groups=[ecs_security_group.id],
+        assign_public_ip=False,
+    ),
+    load_balancers=[
+        aws.ecs.ServiceLoadBalancerArgs(
+            target_group_arn=mlflow_tg.arn,
+            container_name="mlflow",
+            container_port=8080,
+        )
+    ],
+    service_registries=aws.ecs.ServiceServiceRegistriesArgs(
+        registry_arn=mlflow_sd_service.arn
+    ),
+    opts=pulumi.ResourceOptions(
+        depends_on=[mlflow_database, mlflow_listener],
+    ),
+    tags=tags,
+)
+
+# Grafana Infrastructure
+
+grafana_tg = aws.lb.TargetGroup(
+    "grafana_tg",
+    name="fund-grafana",
+    port=3000,
+    protocol="HTTP",
+    vpc_id=vpc.id,
+    target_type="ip",
+    health_check=aws.lb.TargetGroupHealthCheckArgs(
+        path="/api/health",
+        healthy_threshold=2,
+        unhealthy_threshold=3,
+        timeout=5,
+        interval=30,
+    ),
+    tags=tags,
+)
+
+grafana_listener = aws.lb.Listener(
+    "grafana_listener",
+    load_balancer_arn=alb.arn,
+    port=3000,
+    protocol="HTTP",
+    default_actions=[
+        aws.lb.ListenerDefaultActionArgs(
+            type="forward",
+            target_group_arn=grafana_tg.arn,
+        )
+    ],
+    tags=tags,
+)
+
+# Allow ECS tasks to communicate with Grafana on port 3000
+aws.ec2.SecurityGroupRule(
+    "ecs_grafana_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=ecs_security_group.id,
+    protocol="tcp",
+    from_port=3000,
+    to_port=3000,
+    description="Allow Grafana communication",
+)
+
+# Allow ALB to reach Grafana on port 3000
+aws.ec2.SecurityGroupRule(
+    "ecs_grafana_alb_ingress",
+    type="ingress",
+    security_group_id=ecs_security_group.id,
+    source_security_group_id=alb_security_group.id,
+    protocol="tcp",
+    from_port=3000,
+    to_port=3000,
+    description="Allow ALB traffic to Grafana",
+)
+
+# Grafana Log Group
+grafana_log_group = aws.cloudwatch.LogGroup(
+    "grafana_logs",
+    name="/ecs/fund/grafana",
+    retention_in_days=7,
+    tags=tags,
+)
+
+# Grafana Task Definition
+grafana_task_definition = aws.ecs.TaskDefinition(
+    "grafana_task",
+    family="grafana",
+    cpu="256",
+    memory="512",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=pulumi.Output.all(
+        grafana_log_group.name,
+        grafana_image_uri,
+        shared_secret.arn,
+    ).apply(
+        lambda args: json.dumps(
+            [
+                {
+                    "name": "grafana",
+                    "image": args[1],
+                    "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+                    "environment": [
+                        {
+                            "name": "GF_SERVER_HTTP_PORT",
+                            "value": "3000",
+                        },
+                        {
+                            "name": "GF_AUTH_ANONYMOUS_ENABLED",
+                            "value": "false",
+                        },
+                    ],
+                    "secrets": [
+                        {
+                            "name": "GF_SECURITY_ADMIN_PASSWORD",
+                            "valueFrom": f"{args[2]}:GF_SECURITY_ADMIN_PASSWORD::",
+                        },
+                    ],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": args[0],
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "grafana",
+                        },
+                    },
+                    "essential": True,
+                }
+            ],
+            sort_keys=True,
+        )
+    ),
+    tags=tags,
+)
+
+# Grafana ECS Service
+grafana_service = aws.ecs.Service(
+    "grafana_service",
+    name="fund-grafana",
+    cluster=cluster.arn,
+    task_definition=grafana_task_definition.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        subnets=[private_subnet_1.id, private_subnet_2.id],
+        security_groups=[ecs_security_group.id],
+        assign_public_ip=False,
+    ),
+    load_balancers=[
+        aws.ecs.ServiceLoadBalancerArgs(
+            target_group_arn=grafana_tg.arn,
+            container_name="grafana",
+            container_port=3000,
+        )
+    ],
+    opts=pulumi.ResourceOptions(
+        depends_on=[grafana_listener],
     ),
     tags=tags,
 )

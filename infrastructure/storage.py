@@ -216,6 +216,68 @@ aws.ecr.LifecyclePolicy(
     policy=_ecr_lifecycle_policy,
 )
 
+mlflow_repository = aws.ecr.Repository(
+    "mlflow_repository",
+    name="fund/mlflow-server",
+    image_tag_mutability="MUTABLE",
+    force_delete=True,
+    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
+        scan_on_push=True,
+    ),
+    tags=tags,
+)
+
+aws.ecr.LifecyclePolicy(
+    "mlflow_repository_lifecycle",
+    repository=mlflow_repository.name,
+    policy=_ecr_lifecycle_policy,
+)
+
+grafana_repository = aws.ecr.Repository(
+    "grafana_repository",
+    name="fund/grafana",
+    image_tag_mutability="MUTABLE",
+    force_delete=True,
+    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
+        scan_on_push=True,
+    ),
+    tags=tags,
+)
+
+aws.ecr.LifecyclePolicy(
+    "grafana_repository_lifecycle",
+    repository=grafana_repository.name,
+    policy=_ecr_lifecycle_policy,
+)
+
+# S3 MLflow Artifacts Bucket
+mlflow_artifacts_bucket = aws.s3.BucketV2(
+    "mlflow_artifacts_bucket",
+    bucket=pulumi.Output.concat("fund-mlflow-artifacts-", random_suffix),
+    tags=tags,
+)
+
+aws.s3.BucketServerSideEncryptionConfiguration(
+    "mlflow_artifacts_bucket_encryption",
+    bucket=mlflow_artifacts_bucket.id,
+    rules=[
+        aws.s3.BucketServerSideEncryptionConfigurationRuleArgs(
+            apply_server_side_encryption_by_default=aws.s3.BucketServerSideEncryptionConfigurationRuleApplyServerSideEncryptionByDefaultArgs(
+                sse_algorithm="AES256",
+            ),
+        )
+    ],
+)
+
+aws.s3.BucketPublicAccessBlock(
+    "mlflow_artifacts_bucket_public_access_block",
+    bucket=mlflow_artifacts_bucket.id,
+    block_public_acls=True,
+    block_public_policy=True,
+    ignore_public_acls=True,
+    restrict_public_buckets=True,
+)
+
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
 data_manager_image_uri = data_manager_repository.repository_url.apply(
@@ -234,5 +296,11 @@ training_server_image_uri = training_server_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
 training_worker_image_uri = training_worker_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+mlflow_image_uri = mlflow_repository.repository_url.apply(
+    lambda url: f"{url}:latest"
+)
+grafana_image_uri = grafana_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
