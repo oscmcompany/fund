@@ -52,6 +52,8 @@ alb = aws.lb.LoadBalancer(
     security_groups=[alb_security_group.id],
     internal=False,
     load_balancer_type="application",
+    ip_address_type="ipv4",
+    enable_cross_zone_load_balancing=True,
     tags=tags,
 )
 

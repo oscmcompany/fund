@@ -14,7 +14,7 @@ _ecr_lifecycle_policy = json.dumps(
                     "tagStatus": "untagged",
                     "countType": "sinceImagePushed",
                     "countUnit": "days",
-                    "countNumber": 0,
+                    "countNumber": 1,
                 },
                 "action": {"type": "expire"},
             }
@@ -23,14 +23,10 @@ _ecr_lifecycle_policy = json.dumps(
 )
 
 # S3 Data Bucket for storing equity bars, predictions, portfolios
-# alias: migrated from aws:s3/bucket:Bucket to aws:s3/bucketV2:BucketV2
-data_bucket = aws.s3.BucketV2(
+data_bucket = aws.s3.Bucket(
     "data_bucket",
     bucket=pulumi.Output.concat("fund-data-", random_suffix),
-    opts=pulumi.ResourceOptions(
-        retain_on_delete=True,
-        aliases=[pulumi.Alias(type_="aws:s3/bucket:Bucket")],
-    ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
@@ -67,14 +63,10 @@ aws.s3.BucketVersioning(
 )
 
 # S3 Model Artifacts Bucket for storing trained model weights and checkpoints
-# alias: migrated from aws:s3/bucket:Bucket to aws:s3/bucketV2:BucketV2
-model_artifacts_bucket = aws.s3.BucketV2(
+model_artifacts_bucket = aws.s3.Bucket(
     "model_artifacts_bucket",
     bucket=pulumi.Output.concat("fund-model-artifacts-", random_suffix),
-    opts=pulumi.ResourceOptions(
-        retain_on_delete=True,
-        aliases=[pulumi.Alias(type_="aws:s3/bucket:Bucket")],
-    ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )
 
