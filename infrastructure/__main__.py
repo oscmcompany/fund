@@ -10,8 +10,6 @@ from storage import (
     ensemble_manager_image_uri,
     ensemble_manager_repository,
     model_artifacts_bucket,
-    model_trainer_server_worker_image_uri,
-    model_trainer_server_worker_repository,
     portfolio_manager_image_uri,
     portfolio_manager_repository,
     tide_runner_image_uri,
@@ -58,26 +56,6 @@ pulumi.export(
     tide_runner_repository.repository_url,
 )
 pulumi.export("aws_ecr_tide_runner_image", tide_runner_image_uri)
-pulumi.export(
-    "aws_ecr_model_trainer_server_worker_repository",
-    model_trainer_server_worker_repository.repository_url,
-)
-pulumi.export(
-    "aws_ecr_model_trainer_server_worker_image", model_trainer_server_worker_image_uri
-)
-pulumi.export(
-    "training_api_url",
-    pulumi.Output.concat(
-        "http://model-trainer-server.", service_discovery_namespace.name, ":4200/api"
-    ),
-)
-training_ui_url = (
-    pulumi.Output.concat("https://", alb.dns_name, ":4200")
-    if acm_certificate_arn
-    else pulumi.Output.from_input("TLS certificate not configured")
-)
-pulumi.export("training_ui_url", training_ui_url)
-pulumi.export("training_ui_tls_enabled", bool(acm_certificate_arn))
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,

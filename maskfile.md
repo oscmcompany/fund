@@ -70,9 +70,6 @@ fi
 
 commit_hash=$(git rev-parse --short HEAD)
 repository_name="fund/${package_name}-${stage_name}"
-if [ "${package_name}" = "model-trainer" ]; then
-    repository_name="fund/model-trainer-server-worker"
-fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 
 echo "Logging into ECR"
@@ -91,10 +88,7 @@ if [ "$existing_image" != "NONE" ] && [ "$existing_image" != "None" ] && [ -n "$
     exit 0
 fi
 
-if [ "${package_name}" = "model-trainer" ]; then
-    dockerfile="models/Dockerfile"
-    build_target="server-worker"
-elif [ -f "models/${package_name}/Dockerfile" ]; then
+if [ -f "models/${package_name}/Dockerfile" ]; then
     dockerfile="models/${package_name}/Dockerfile"
     build_target="${stage_name}"
 else
@@ -154,9 +148,6 @@ if [ -z "$aws_region" ]; then
 fi
 
 repository_name="fund/${package_name}-${stage_name}"
-if [ "${package_name}" = "model-trainer" ]; then
-    repository_name="fund/model-trainer-server-worker"
-fi
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 commit_hash=$(git rev-parse --short HEAD)
 
@@ -202,8 +193,6 @@ case "${package_name}-${stage_name}" in
     data-manager-server)      service="fund-data-manager-server" ;;
     portfolio-manager-server) service="fund-portfolio-manager-server" ;;
     ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
-    model-trainer-server)     service="fund-model-trainer-server" ;;
-    model-trainer-worker)     service="fund-model-trainer-worker" ;;
     tide-runner)              echo "No ECS service for tide runner" && exit 0 ;;
     *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
 esac
@@ -796,7 +785,6 @@ pulumi stack select ${organization_name}/fund/production
 export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output training_api_url)"
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../
@@ -804,41 +792,6 @@ cd ../
 case "${model_name}" in
     tide)
         uv run python -m tide.run
-        ;;
-    *)
-        echo "Unknown model: ${model_name}"
-        exit 1
-        ;;
-esac
-```
-
-### deploy (model_name)
-
-> Register flow deployment with Prefect server
-
-```bash
-set -euo pipefail
-
-cd infrastructure
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export FUND_DATAMANAGER_BASE_URL="http://data-manager-server.$(pulumi stack output aws_service_discovery_namespace):8080"
-export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export PREFECT_API_URL="$(pulumi stack output training_api_url)"
-export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
-
-cd ../
-
-case "${model_name}" in
-    tide)
-        uv run python -m tide.deploy
         ;;
     *)
         echo "Unknown model: ${model_name}"
