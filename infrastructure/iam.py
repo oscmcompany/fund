@@ -452,18 +452,7 @@ aws.iam.RolePolicy(
                         "Effect": "Allow",
                         "Action": ["secretsmanager:GetSecretValue"],
                         "Resource": [args[0], args[1], args[2]],
-                    },
-                    {
-                        "Effect": "Allow",
-                        "Action": [
-                            "ssm:GetParameters",
-                            "ssm:GetParameter",
-                        ],
-                        "Resource": (
-                            f"arn:aws:ssm:{region}:{account_id}"
-                            ":parameter/fund/*"
-                        ),
-                    },
+                    }
                 ],
             },
             sort_keys=True,

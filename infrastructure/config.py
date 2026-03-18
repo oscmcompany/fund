@@ -82,9 +82,6 @@ if not budget_alert_email_addresses:
 
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
 
-prefect_cloud_api_url = stack_config.require_secret("prefectCloudApiUrl")
-prefect_cloud_api_key = stack_config.require_secret("prefectCloudApiKey")
-
 training_notification_sender_email = stack_config.require_secret(
     "trainingNotificationSenderEmail"
 )
