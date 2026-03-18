@@ -7,6 +7,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+# Add the tide package source directory to the path so the managed runner
+# can resolve tide.tide_data and tide.tide_model after cloning the repo.
+_tide_src = os.path.join(os.path.dirname(__file__), "..")  # noqa: PTH118, PTH120
+if _tide_src not in sys.path:
+    sys.path.insert(0, _tide_src)
+
 import polars as pl
 import structlog
 from botocore.exceptions import ClientError
