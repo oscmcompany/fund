@@ -1,0 +1,12 @@
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/oscmcompany/fund.git
+
+deployments:
+  - name: tide-training
+    entrypoint: models/tide/src/tide/workflow.py:training_pipeline
+    work_pool:
+      name: fund-work-pool-ecs
+    parameters: {}
+    build: null
+    push: null

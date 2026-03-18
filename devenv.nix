@@ -16,22 +16,10 @@
 
   tasks = {
     "models:tide:deploy".exec = ''
-      branch=$(git rev-parse --abbrev-ref HEAD)
-      uvx prefect-cloud deploy models/tide/src/tide/workflow.py:training_pipeline \
-        --from "oscmcompany/fund/tree/$branch" \
-        --name tide-training \
-        --with boto3 \
-        --with polars \
-        --with structlog \
-        --with prefect \
-        --with tinygrad \
-        --with numpy \
-        --with "pandera[polars]" \
-        --with requests \
-        --with prefect-aws
+      uv run prefect --no-prompt deploy --name tide-training
       '';
     "models:tide:train".exec = ''
-      uvx prefect-cloud run training_pipeline/tide-training --follow
+      uv run prefect deployment run tide-training-pipeline/tide-training
       '';
   };
 
