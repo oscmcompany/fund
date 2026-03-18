@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import polars as pl
 import structlog
 from prefect import flow, task
-from prefect_aws import AwsCredentials
+from prefect_aws.s3 import S3Bucket
 
 from tide.notifications import send_training_notification
 from tide.tasks import prepare_training_data
@@ -158,40 +158,39 @@ def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
 
 @task(name="prepare-training-data")
 def prepare_data(
-    data_bucket: str,
-    artifacts_bucket: str,
     start_date: datetime,
     end_date: datetime,
     output_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
+    data_block = S3Bucket.load("data-bucket")
+    artifact_block = S3Bucket.load("artifact-bucket")
+    s3_client = data_block.credentials.get_boto3_session().client("s3")
+
     logger.info(
         "Preparing training data",
-        data_bucket=data_bucket,
-        artifacts_bucket=artifacts_bucket,
+        data_bucket=data_block.bucket_name,
+        artifacts_bucket=artifact_block.bucket_name,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
     )
 
-    aws_credentials = AwsCredentials.load("fund-aws")
-    s3_client = aws_credentials.get_boto3_session().client("s3")
-
     training_data_uri = prepare_training_data(
-        data_bucket_name=data_bucket,
-        model_artifacts_bucket_name=artifacts_bucket,
+        data_bucket_name=data_block.bucket_name,
+        model_artifacts_bucket_name=artifact_block.bucket_name,
         start_date=start_date,
         end_date=end_date,
         output_key=output_key,
         s3_client=s3_client,
     )
 
-    bucket_prefix = f"s3://{artifacts_bucket}/"
+    bucket_prefix = f"s3://{artifact_block.bucket_name}/"
     if training_data_uri.startswith(bucket_prefix):
         return training_data_uri.removeprefix(bucket_prefix)
 
     logger.warning(
         "Prepared training data URI did not match expected bucket",
-        expected_bucket=artifacts_bucket,
+        expected_bucket=artifact_block.bucket_name,
         training_data_uri=training_data_uri,
     )
     return output_key
@@ -199,10 +198,13 @@ def prepare_data(
 
 @task(name="train-tide-model", timeout_seconds=3600)
 def train_tide_model(
-    artifacts_bucket: str,
     training_data_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Download training data from S3, train model, upload artifact to S3."""
+    artifact_block = S3Bucket.load("artifact-bucket")
+    s3_client = artifact_block.credentials.get_boto3_session().client("s3")
+    artifacts_bucket = artifact_block.bucket_name
+
     resolved_training_data_key = training_data_key
     bucket_prefix = f"s3://{artifacts_bucket}/"
     if training_data_key.startswith(bucket_prefix):
@@ -213,9 +215,6 @@ def train_tide_model(
         artifacts_bucket=artifacts_bucket,
         training_data_key=resolved_training_data_key,
     )
-
-    aws_credentials = AwsCredentials.load("fund-aws")
-    s3_client = aws_credentials.get_boto3_session().client("s3")
 
     response = s3_client.get_object(
         Bucket=artifacts_bucket,
@@ -273,8 +272,6 @@ def train_tide_model(
     on_failure=[send_training_notification],
 )
 def training_pipeline(
-    data_bucket: str,
-    artifacts_bucket: str,
     lookback_days: int = 365,
 ) -> str:
     """End-to-end training pipeline."""
@@ -286,19 +283,14 @@ def training_pipeline(
     start_date, end_date = get_training_date_range(lookback_days)
 
     prepared_key = prepare_data(
-        data_bucket,
-        artifacts_bucket,
         start_date,
         end_date,
         training_data_key,
     )
-    return train_tide_model(artifacts_bucket, prepared_key)
+    return train_tide_model(prepared_key)
 
 
 if __name__ == "__main__":
-    data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
-    artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
-
     try:
         lookback_days = int(os.getenv("FUND_LOOKBACK_DAYS", "365"))
     except ValueError:
@@ -309,18 +301,6 @@ if __name__ == "__main__":
         logger.error("FUND_LOOKBACK_DAYS must be positive", lookback_days=lookback_days)
         sys.exit(1)
 
-    required_vars = {
-        "AWS_S3_DATA_BUCKET_NAME": data_bucket,
-        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
-    }
-
-    missing = [key for key, value in required_vars.items() if not value]
-    if missing:
-        logger.error("Missing required environment variables", missing=missing)
-        sys.exit(1)
-
     training_pipeline(
-        data_bucket=data_bucket,
-        artifacts_bucket=artifacts_bucket,
         lookback_days=lookback_days,
     )
