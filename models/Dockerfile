@@ -14,11 +14,13 @@ COPY tools/ tools/
 
 COPY applications/ensemble_manager/ applications/ensemble_manager/
 
+COPY models/tide/ models/tide/
+
 COPY libraries/python/ libraries/python/
 
 RUN uv sync --no-dev
 
-FROM python:3.12.10-slim AS worker
+FROM python:3.12.10-slim AS server-worker
 
 WORKDIR /app
 

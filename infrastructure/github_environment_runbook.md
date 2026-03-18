@@ -8,29 +8,8 @@ Required environment secrets for operations with Pulumi:
 - `AWS_REGION`
 - `PULUMI_ACCESS_TOKEN`
 
-## Update `AWS_IAM_INFRASTRUCTURE_ROLE_ARN` from Pulumi output
-
-Run from repository root:
-
-```bash
-cd infrastructure
-pulumi stack select "$(pulumi org get-default)/fund/production"
-role_arn="$(pulumi stack output aws_iam_github_actions_infrastructure_role_arn --stack production)"
-cd ..
-gh secret set AWS_IAM_INFRASTRUCTURE_ROLE_ARN --env pulumi --body "$role_arn"
-```
-
-## Update `AWS_REGION` from Pulumi stack config
-
-Run from repository root:
-
-```bash
-cd infrastructure
-pulumi stack select "$(pulumi org get-default)/fund/production"
-region="$(pulumi config get aws:region --stack production --show-secrets)"
-cd ..
-gh secret set AWS_REGION --env pulumi --body "$region"
-```
+`AWS_IAM_INFRASTRUCTURE_ROLE_ARN` and `AWS_REGION` are set automatically when running
+`mask infrastructure stack up --bootstrap` from a local machine with `gh` authenticated.
 
 ## Update `PULUMI_ACCESS_TOKEN` from Pulumi account
 
