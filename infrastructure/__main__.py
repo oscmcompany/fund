@@ -10,12 +10,12 @@ from storage import (
     ensemble_manager_image_uri,
     ensemble_manager_repository,
     model_artifacts_bucket,
+    model_trainer_server_worker_image_uri,
+    model_trainer_server_worker_repository,
     portfolio_manager_image_uri,
     portfolio_manager_repository,
-    tide_trainer_image_uri,
-    tide_trainer_repository,
-    training_worker_image_uri,
-    training_worker_repository,
+    tide_runner_image_uri,
+    tide_runner_repository,
 )
 
 protocol = "https://" if acm_certificate_arn else "http://"
@@ -54,18 +54,21 @@ pulumi.export(
     pulumi.Output.unsecret(model_artifacts_bucket.bucket),
 )
 pulumi.export(
-    "aws_ecr_tide_trainer_repository",
-    tide_trainer_repository.repository_url,
+    "aws_ecr_tide_runner_repository",
+    tide_runner_repository.repository_url,
 )
-pulumi.export("aws_ecr_tide_trainer_image", tide_trainer_image_uri)
+pulumi.export("aws_ecr_tide_runner_image", tide_runner_image_uri)
 pulumi.export(
-    "aws_ecr_training_worker_repository", training_worker_repository.repository_url
+    "aws_ecr_model_trainer_server_worker_repository",
+    model_trainer_server_worker_repository.repository_url,
 )
-pulumi.export("aws_ecr_training_worker_image", training_worker_image_uri)
+pulumi.export(
+    "aws_ecr_model_trainer_server_worker_image", model_trainer_server_worker_image_uri
+)
 pulumi.export(
     "training_api_url",
     pulumi.Output.concat(
-        "http://training-server.", service_discovery_namespace.name, ":4200/api"
+        "http://model-trainer-server.", service_discovery_namespace.name, ":4200/api"
     ),
 )
 training_ui_url = (

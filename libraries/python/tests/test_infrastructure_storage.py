@@ -28,6 +28,7 @@ def test_storage_contains_ecr_lifecycle_policy_resources() -> None:
     assert '"data_manager_repository_lifecycle"' in infrastructure_storage
     assert '"portfolio_manager_repository_lifecycle"' in infrastructure_storage
     assert '"ensemble_manager_repository_lifecycle"' in infrastructure_storage
-    assert '"tide_trainer_repository_lifecycle"' in infrastructure_storage
-    assert '"training_server_repository_lifecycle"' in infrastructure_storage
-    assert '"training_worker_repository_lifecycle"' in infrastructure_storage
+    assert '"tide_runner_repository_lifecycle"' in infrastructure_storage
+    assert (
+        '"model_trainer_server_worker_repository_lifecycle"' in infrastructure_storage
+    )

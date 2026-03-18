@@ -12,6 +12,7 @@ dependencies = [
   "polars>=1.29.0",
   "requests>=2.32.5",
   "alpaca-py>=0.42.1",
+  "pytz>=2025.1",
   "sentry-sdk[fastapi]>=2.0.0",
   "structlog>=25.5.0",
   "scipy>=1.17.1",
