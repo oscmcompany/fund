@@ -7,7 +7,7 @@ config:
   fund:sagemakerExecutionRoleName: fund-sagemaker-execution-role
   fund:githubRepository: oscmcompany/fund
   fund:githubBranch: master
-  fund:monthlyBudgetLimitUsd: "25"
+  fund:monthlyBudgetLimitUsd: "250"
   fund:githubWorkflowFiles:
     - launch_infrastructure.yaml
     - teardown_infrastructure.yaml

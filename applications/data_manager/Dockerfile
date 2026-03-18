@@ -37,6 +37,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
+ENV CARGO_BUILD_JOBS=4
+
 COPY --from=planner /app/recipe.json recipe.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

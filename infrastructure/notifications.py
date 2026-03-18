@@ -23,6 +23,8 @@ for notification_email_index, notification_email_address in enumerate(
         endpoint=notification_email_address,
     )
 
+# This can be updated by setting the monthlyBudgetLimitUsd Pulumi configuration
+# variable.
 aws.budgets.Budget(
     "production_cost_budget",
     account_id=account_id,

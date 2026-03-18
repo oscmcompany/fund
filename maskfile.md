@@ -54,7 +54,7 @@ echo "Development environment setup completed successfully"
 
 #### build (package_name) (stage_name)
 
-> Build Docker images with optional cache pull
+> Build Docker images with optional cache pull (e.g. `portfolio-manager server`, `tide runner`)
 
 ```bash
 set -euo pipefail
@@ -139,7 +139,7 @@ echo "Image built: ${package_name} ${stage_name}"
 
 #### push (package_name) (stage_name)
 
-> Push Docker image to ECR
+> Push Docker image to ECR (e.g. `portfolio-manager server`, `tide runner`)
 
 ```bash
 set -euo pipefail
@@ -191,7 +191,7 @@ echo "Image pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
 
 #### deploy (package_name) (stage_name)
 
-> Deploy ECS service with latest image
+> Deploy ECS service with latest image (e.g. `portfolio-manager server`, `data-manager server`)
 
 ```bash
 set -euo pipefail
@@ -219,11 +219,12 @@ cluster=$(pulumi stack output aws_ecs_cluster_name)
 
 cd "${MASKFILE_DIR}"
 
-aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager
+aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager > /dev/null
+echo "Deployment started: ${service}"
 
 echo "Waiting for ${service} to stabilize"
-aws ecs wait services-stable --cluster "$cluster" --services "$service" \
-    --waiter-config '{"Delay": 10, "MaxAttempts": 6}'
+
+aws ecs wait services-stable --cluster "$cluster" --services "$service"
 
 echo "Deployment complete: ${service} (${package_name} ${stage_name})"
 ```

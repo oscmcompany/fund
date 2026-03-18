@@ -14,6 +14,8 @@ COPY tools/ tools/
 
 COPY applications/ensemble_manager/ applications/ensemble_manager/
 
+COPY models/tide/ models/tide/
+
 COPY libraries/python/ libraries/python/
 
 RUN uv sync --no-dev
