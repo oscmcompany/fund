@@ -4,7 +4,7 @@ from secrets import data_manager_secret, portfolio_manager_secret, shared_secret
 import parameters
 import pulumi
 import pulumi_aws as aws
-from config import region, tags
+from config import prefect_cloud_api_key, prefect_cloud_api_url, region, tags
 from iam import (
     execution_role,
     task_role,
@@ -24,6 +24,7 @@ from storage import (
     ensemble_manager_image_uri,
     model_artifacts_bucket,
     portfolio_manager_image_uri,
+    tide_runner_image_uri,
 )
 
 cluster = aws.ecs.Cluster(
@@ -575,5 +576,92 @@ ensemble_manager_service = aws.ecs.Service(
         registry_arn=ensemble_manager_sd_service.arn
     ),
     opts=pulumi.ResourceOptions(depends_on=[alb_listener, data_manager_service]),
+    tags=tags,
+)
+
+# Prefect Cloud Worker
+
+prefect_cloud_api_url_parameter = aws.ssm.Parameter(
+    "prefect_cloud_api_url_parameter",
+    name="/fund/production/prefect/api-url",
+    type="SecureString",
+    value=prefect_cloud_api_url,
+    tags=tags,
+)
+
+prefect_cloud_api_key_parameter = aws.ssm.Parameter(
+    "prefect_cloud_api_key_parameter",
+    name="/fund/production/prefect/api-key",
+    type="SecureString",
+    value=prefect_cloud_api_key,
+    tags=tags,
+)
+
+training_worker_log_group = aws.cloudwatch.LogGroup(
+    "training_worker_logs",
+    name="/ecs/fund/training-worker",
+    retention_in_days=7,
+    tags=tags,
+)
+
+training_worker_task_definition = aws.ecs.TaskDefinition(
+    "training_worker_task",
+    family="training-worker",
+    cpu="4096",
+    memory="8192",
+    network_mode="awsvpc",
+    requires_compatibilities=["FARGATE"],
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=pulumi.Output.all(
+        training_worker_log_group.name,
+        tide_runner_image_uri,
+        prefect_cloud_api_url_parameter.arn,
+        prefect_cloud_api_key_parameter.arn,
+    ).apply(
+        lambda args: json.dumps(
+            [
+                {
+                    "name": "training-worker",
+                    "image": args[1],
+                    "secrets": [
+                        {
+                            "name": "PREFECT_API_URL",
+                            "valueFrom": args[2],
+                        },
+                        {
+                            "name": "PREFECT_API_KEY",
+                            "valueFrom": args[3],
+                        },
+                    ],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": args[0],
+                            "awslogs-region": region,
+                            "awslogs-stream-prefix": "training-worker",
+                        },
+                    },
+                    "essential": True,
+                }
+            ],
+            sort_keys=True,
+        )
+    ),
+    tags=tags,
+)
+
+training_worker_service = aws.ecs.Service(
+    "training_worker_service",
+    name="fund-training-worker",
+    cluster=cluster.arn,
+    task_definition=training_worker_task_definition.arn,
+    desired_count=1,
+    launch_type="FARGATE",
+    network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
+        subnets=[private_subnet_1.id, private_subnet_2.id],
+        security_groups=[ecs_security_group.id],
+        assign_public_ip=False,
+    ),
     tags=tags,
 )

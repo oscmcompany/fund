@@ -60,4 +60,4 @@ USER worker
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "/usr/local/bin/prefect_worker_healthcheck.py"]
 
-ENTRYPOINT ["uv", "run", "--package", "tools", "prefect", "worker", "start", "--pool", "training-pool", "--type", "process"]
+ENTRYPOINT ["uv", "run", "--package", "tools", "prefect", "worker", "start", "--pool", "fund-work-pool", "--type", "process"]
