@@ -27,10 +27,11 @@
         --with tinygrad \
         --with numpy \
         --with "pandera[polars]" \
-        --with requests
+        --with requests \
+        --with prefect-aws
       '';
     "models:tide:train".exec = ''
-      uvx prefect-cloud run training_pipeline/tide-training
+      uvx prefect-cloud run training_pipeline/tide-training --follow
       '';
   };
 
