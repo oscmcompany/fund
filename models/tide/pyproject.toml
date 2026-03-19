@@ -6,6 +6,7 @@ requires-python = "==3.12.10"
 dependencies = [
   "tools>=0.0.1",
   "boto3>=1.40.74",
+  "mlflow>=2.21.0",
   "prefect>=3.0.0,<4.0.0",
   "prefect-aws>=0.5.0",
   "polars>=1.29.0",

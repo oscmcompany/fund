@@ -33,7 +33,7 @@ def read_equity_bars_from_s3(
 
     all_dataframes = []
     current_date = start_date
-    batch_dataframes = []
+    batch_dataframes: list[pl.DataFrame] = []
     days_in_batch = 0
 
     while current_date <= end_date:

@@ -74,7 +74,7 @@ def find_latest_artifact_key(
     """Find the latest model artifact under a prefix.
 
     Assumes folder names contain timestamps that sort alphabetically.
-    E.g., artifacts/equitypricemodel-trainer-2026-01-14-15-00-26-204/
+    E.g., artifacts/tide/2026-03-19-21-28-12-557/
     Only considers folders that contain output/model.tar.gz.
     """
     logger.info("listing_artifact_folders", bucket=bucket, prefix=prefix)
