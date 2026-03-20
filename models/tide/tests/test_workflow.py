@@ -69,9 +69,8 @@ def test_train_tide_model_downloads_trains_uploads(mock_s3_bucket: MagicMock) ->
     mock_artifact_block = MagicMock()
     mock_artifact_block.bucket_name = "artifacts-bucket"
     mock_s3 = MagicMock()
-    mock_artifact_block.credentials.get_boto3_session.return_value.client.return_value = (
-        mock_s3
-    )
+    mock_session = mock_artifact_block.credentials.get_boto3_session
+    mock_session.return_value.client.return_value = mock_s3
     mock_s3_bucket.load.return_value = mock_artifact_block
 
     sample_data = pl.DataFrame(

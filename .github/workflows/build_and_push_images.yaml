@@ -31,9 +31,6 @@ jobs:
           - service: portfolio-manager
             dockerfile: applications/portfolio_manager/Dockerfile
             context: .
-          - service: mlflow
-            dockerfile: tools/Dockerfile.mlflow
-            context: .
           - service: grafana
             dockerfile: dashboards/Dockerfile
             context: dashboards

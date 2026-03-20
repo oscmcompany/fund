@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-EXPERIMENT_NAME = "tide"
+DEFAULT_EXPERIMENT_NAME = "tide"
 
 
 def get_environment_tag() -> str:
@@ -35,6 +35,7 @@ def start_run(
     configuration: dict,
     run_name: str | None = None,
     tags: dict[str, str] | None = None,
+    experiment_name: str = DEFAULT_EXPERIMENT_NAME,
 ) -> ActiveRun | None:
     """Start an MLflow run and log parameters.
 
@@ -47,7 +48,7 @@ def start_run(
 
     import mlflow  # noqa: PLC0415
 
-    mlflow.set_experiment(EXPERIMENT_NAME)
+    mlflow.set_experiment(experiment_name)
 
     run_tags = {
         "environment": get_environment_tag(),
@@ -63,7 +64,7 @@ def start_run(
     logger.info(
         "MLflow run started",
         run_id=run.info.run_id,
-        experiment=EXPERIMENT_NAME,
+        experiment=experiment_name,
     )
 
     return run

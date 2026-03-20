@@ -1,6 +1,7 @@
 use axum::response::IntoResponse;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::sync::OnceLock;
+use tracing::warn;
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -16,6 +17,9 @@ pub fn setup_metrics() {
 pub async fn get_metrics() -> impl IntoResponse {
     match PROMETHEUS_HANDLE.get() {
         Some(handle) => handle.render(),
-        None => String::new(),
+        None => {
+            warn!("Metrics requested but Prometheus recorder not initialized");
+            String::new()
+        }
     }
 }

@@ -12,14 +12,14 @@ _tide_src = os.path.join(os.path.dirname(__file__), "..")  # noqa: PTH118, PTH12
 if _tide_src not in sys.path:
     sys.path.insert(0, _tide_src)
 
-import polars as pl
-import structlog
-from prefect import flow, task
-from prefect_aws.s3 import S3Bucket
+import polars as pl  # noqa: E402
+import structlog  # noqa: E402
+from prefect import flow, task  # noqa: E402
+from prefect_aws.s3 import S3Bucket  # noqa: E402
 
-from tide.notifications import send_training_notification
-from tide.tasks import prepare_training_data
-from tide.tracking import end_run, log_model_artifact
+from tide.notifications import send_training_notification  # noqa: E402
+from tide.tasks import prepare_training_data  # noqa: E402
+from tide.tracking import log_model_artifact  # noqa: E402
 
 logger = structlog.get_logger()
 
@@ -38,8 +38,15 @@ def prepare_data(
     output_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
-    data_block = S3Bucket.load("data-bucket")
-    artifact_block = S3Bucket.load("artifact-bucket")
+    try:
+        data_block = S3Bucket.load("data-bucket")
+        artifact_block = S3Bucket.load("artifact-bucket")
+    except ValueError:
+        message = (
+            "Prefect S3Bucket blocks 'data-bucket' and 'artifact-bucket' not found. "
+            "Create them in Prefect Cloud or run 'prefect block register'."
+        )
+        raise ValueError(message) from None
     s3_client = data_block.credentials.get_boto3_session().client("s3")
 
     logger.info(
@@ -78,7 +85,14 @@ def train_tide_model(
     """Download training data from S3, train model, upload artifact to S3."""
     from tide.trainer import train_model  # noqa: PLC0415
 
-    artifact_block = S3Bucket.load("artifact-bucket")
+    try:
+        artifact_block = S3Bucket.load("artifact-bucket")
+    except ValueError:
+        message = (
+            "Prefect S3Bucket block 'artifact-bucket' not found. "
+            "Create it in Prefect Cloud or run 'prefect block register'."
+        )
+        raise ValueError(message) from None
     s3_client = artifact_block.credentials.get_boto3_session().client("s3")
     artifacts_bucket = artifact_block.bucket_name
 
@@ -141,8 +155,6 @@ def train_tide_model(
         "Model artifact uploaded",
         artifact_path=f"s3://{artifacts_bucket}/{artifact_key}",
     )
-
-    end_run()
 
     return f"s3://{artifacts_bucket}/{artifact_key}"
 

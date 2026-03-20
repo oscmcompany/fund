@@ -1,5 +1,5 @@
 ---
-name: devenv-deploy
+name: deploy
 description: >
   Set up and manage devenv + AWS infrastructure from devenv.nix and Pulumi.
   Covers both local development (devenv up) and production deployment to AWS

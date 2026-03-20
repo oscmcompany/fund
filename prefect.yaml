@@ -1,6 +1,8 @@
+---
 pull:
   - prefect.deployments.steps.git_clone:
       repository: https://github.com/oscmcompany/fund.git
+      branch: master
 
 deployments:
   - name: tide-training

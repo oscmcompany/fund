@@ -63,8 +63,8 @@ devenv tasks run models:tide:train
    # Prefect Cloud connection works
    uv run prefect config view
 
-   # Quick smoke test (1 epoch)
-   uv run python models/tide/src/tide/workflow.py
+   # Quick smoke test (1 epoch) -- override epoch_count in trainer.py DEFAULT_CONFIGURATION
+   uv run python -c "from tide.trainer import train_model; ..."
    ```
 
 3. If `--metric` not provided, read the model's training code to infer available metrics.
@@ -98,10 +98,13 @@ run **multiple experiments in parallel** using Bash background jobs.
 
 4. **Identify the best performer**.
 
-5. **Apply the winning config** to `DEFAULT_CONFIGURATION` in workflow.py if it beat
-   the previous best. Commit with description.
+5. **Apply the winning config** to `DEFAULT_CONFIGURATION` in `models/tide/src/tide/trainer.py`
+   if it beat the previous best. Commit with description.
 
-6. **Design the next batch** based on what worked.
+6. **Log result** to `autotrain/<model-name>/experiments.jsonl` with fields:
+   `commit`, `metric_value`, `status`, `change`, `hypothesis`, `rationale`.
+
+7. **Design the next batch** based on what worked.
 
 ### Mode B: Sequential Architecture Changes
 
@@ -117,6 +120,8 @@ For code changes (model architecture, loss function, layer structure), run
    ```
 5. **Parse output** for `quantile_loss`
 6. **Decide**: KEEP (new baseline) or DISCARD (`git reset --hard HEAD~1`)
+7. **Log result** to `autotrain/<model-name>/experiments.jsonl` with fields:
+   `commit`, `metric_value`, `status`, `change`, `hypothesis`, `rationale`
 
 ### Mode C: Epoch Escalation
 
@@ -150,12 +155,14 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 Primarily:
 - `models/tide/src/tide/tide_model.py` (model architecture)
 - `models/tide/src/tide/tide_data.py` (data processing)
-- `models/tide/src/tide/workflow.py` (DEFAULT_CONFIGURATION)
+- `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION, training hyperparameters)
 
 ## Key Files
 
+- **Trainer**: `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION lives here)
 - **Workflow**: `models/tide/src/tide/workflow.py`
 - **Model**: `models/tide/src/tide/tide_model.py`
 - **Data**: `models/tide/src/tide/tide_data.py`
+- **Experiment log**: `autotrain/<model-name>/experiments.jsonl`
 - **Prefect config**: `prefect.yaml`
 - **devenv tasks**: `devenv.nix`

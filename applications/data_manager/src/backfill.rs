@@ -4,7 +4,7 @@ use chrono::{Datelike, Duration, Utc, Weekday};
 use metrics::{counter, gauge};
 use tracing::{error, info, warn};
 
-const DEFAULT_LOOKBACK_DAYS: i64 = 1460; // 4 years
+const DEFAULT_LOOKBACK_DAYS: i64 = 730; // 2 years (Massive subscription limit)
 const MAX_BACKOFF_SECONDS: u64 = 300; // 5 minutes
 const BASE_DELAY_MILLIS: u64 = 500;
 const HOURLY_SYNC_LOOKBACK_DAYS: i64 = 5;
@@ -43,6 +43,8 @@ pub fn spawn_backfill(state: State) {
     });
 }
 
+const STORAGE_READY_TIMEOUT_SECONDS: u64 = 120;
+
 async fn wait_for_storage(state: &State) {
     let endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap_or_default();
     let is_local = endpoint.contains("localhost") || endpoint.contains("127.0.0.1");
@@ -53,6 +55,8 @@ async fn wait_for_storage(state: &State) {
     }
 
     info!("Waiting for local object storage to be ready");
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(STORAGE_READY_TIMEOUT_SECONDS);
     loop {
         if state
             .s3_client
@@ -62,6 +66,13 @@ async fn wait_for_storage(state: &State) {
             .await
             .is_ok()
         {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            error!(
+                "Object storage not ready after {}s, proceeding anyway",
+                STORAGE_READY_TIMEOUT_SECONDS
+            );
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -154,6 +165,6 @@ async fn run_backfill(state: &State, lookback_days: i64) {
 }
 
 fn calculate_backoff(consecutive_failures: u32) -> u64 {
-    let backoff = 2u64.saturating_pow(consecutive_failures).saturating_mul(1);
+    let backoff = 2u64.saturating_pow(consecutive_failures);
     backoff.min(MAX_BACKOFF_SECONDS)
 }

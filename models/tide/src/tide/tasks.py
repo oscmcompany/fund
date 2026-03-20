@@ -191,7 +191,7 @@ def write_training_data_to_s3(
     return s3_uri
 
 
-def prepare_training_data(
+def prepare_training_data(  # noqa: PLR0913
     data_bucket_name: str,
     model_artifacts_bucket_name: str,
     start_date: datetime,

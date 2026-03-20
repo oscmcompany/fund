@@ -15,7 +15,7 @@ evaluates a target metric, and keeps or reverts changes based on improvement.
 5. **Run** training via Docker Compose Prefect pipeline
 6. **Extract** the target metric from training logs
 7. **Decide**: if metric improved, KEEP; otherwise REVERT via `git reset`
-8. **Log** result to `results.tsv`
+8. **Log** result to `experiments.jsonl`
 9. **Repeat**
 
 ## Decision Rules
@@ -35,14 +35,21 @@ evaluates a target metric, and keeps or reverts changes based on improvement.
 
 ## Results Logging Format
 
-Log to `results/<model-name>/results.tsv`:
+Log to `autotrain/<model-name>/experiments.jsonl` (one JSON object per line):
 
+```jsonl
+{"commit": "abc1234", "metric_value": 0.0342, "status": "KEEP", "change": "Increased hidden_size from 64 to 128", "hypothesis": "Larger hidden dim captures more complex feature interactions", "rationale": "Loss improved 3.2% -- wider layers help at this data scale"}
+{"commit": "def5678", "metric_value": 0.0351, "status": "DISCARD", "change": "Added third encoder layer", "hypothesis": "Deeper encoder extracts richer temporal representations", "rationale": "Loss regressed 2.6% -- model likely overfitting with added depth at current data size"}
+{"commit": "ghi9012", "metric_value": null, "status": "CRASH", "change": "Switched to GeLU activation", "hypothesis": "Smoother gradient flow improves convergence", "rationale": "TypeError in forward pass -- tinygrad GeLU not compatible with cast pattern, fixed"}
 ```
-commit	metric_value	status	description
-abc1234	0.0342	KEEP	Increased hidden_size from 64 to 128
-def5678	0.0351	DISCARD	Added third encoder layer
-ghi9012	N/A	CRASH	TypeError in forward pass - fixed
-```
+
+Fields:
+- `commit`: git commit hash
+- `metric_value`: measured metric (null if crash)
+- `status`: KEEP, DISCARD, or CRASH
+- `change`: what was changed
+- `hypothesis`: why this change was expected to improve the model
+- `rationale`: why the change was kept or rejected (post-experiment reasoning)
 
 ## Key Constraints
 

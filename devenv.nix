@@ -30,11 +30,6 @@ let
       context = ".";
       ecrRepo = "fund/training-worker";
     };
-    mlflow = {
-      dockerfile = "tools/Dockerfile.mlflow";
-      context = ".";
-      ecrRepo = "fund/mlflow-server";
-    };
     grafana = {
       dockerfile = "Dockerfile";
       context = "dashboards";
@@ -54,18 +49,9 @@ in {
   };
 
   env = {
-    # MinIO credentials
-    MINIO_ROOT_USER = "minioadmin";
-    MINIO_ROOT_PASSWORD = "minioadmin";
-
-    # AWS env vars pointing to local MinIO
+    # AWS region
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
-    AWS_ACCESS_KEY_ID = "minioadmin";
-    AWS_SECRET_ACCESS_KEY = "minioadmin";
-    AWS_ENDPOINT_URL = "http://localhost:9000";
-    AWS_S3_DATA_BUCKET_NAME = "fund-data";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-data";
 
     # Service URLs (localhost, not container names)
     FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
@@ -79,14 +65,13 @@ in {
     # Development defaults
     ENVIRONMENT = "development";
     DISABLE_DISK_CACHE = "1";
-    BACKFILL_LOOKBACK_DAYS = "1460";
+    BACKFILL_LOOKBACK_DAYS = "730";
   };
 
   packages = [
     pkgs.git
     pkgs.curl
     pkgs.jq
-    pkgs.minio-client
     pkgs.rustup
     pkgs.cargo-watch
     pkgs.awscli2
@@ -133,16 +118,6 @@ in {
         metrics_path = "/metrics";
         scrape_interval = "15s";
       }
-    ];
-  };
-
-  # MinIO for S3-compatible object storage (local)
-  services.minio = {
-    enable = true;
-    accessKey = "minioadmin";
-    secretKey = "minioadmin";
-    buckets = [
-      "fund-data"
     ];
   };
 
@@ -242,15 +217,14 @@ in {
     }
 
     case "$SERVICE" in
-      data-manager) deploy_ecs_service "fund-data-manager" ;;
-      ensemble-manager) deploy_ecs_service "fund-ensemble-manager" ;;
-      portfolio-manager) deploy_ecs_service "fund-portfolio-manager" ;;
+      data-manager) deploy_ecs_service "fund-data-manager-server" ;;
+      ensemble-manager) deploy_ecs_service "fund-ensemble-manager-server" ;;
+      portfolio-manager) deploy_ecs_service "fund-portfolio-manager-server" ;;
       training-server) deploy_ecs_service "fund-training-server" ;;
       training-worker) deploy_ecs_service "fund-training-worker" ;;
-      mlflow) deploy_ecs_service "fund-mlflow" ;;
       grafana) deploy_ecs_service "fund-grafana" ;;
       all)
-        for svc in fund-data-manager fund-ensemble-manager fund-portfolio-manager fund-training-server fund-training-worker fund-mlflow fund-grafana; do
+        for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server fund-training-server fund-training-worker fund-grafana; do
           deploy_ecs_service "$svc"
         done
         echo "All services redeployed"
@@ -276,7 +250,7 @@ in {
     echo "=== ECS Services ==="
     aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
     echo ""
-    for svc in fund-data-manager fund-ensemble-manager fund-portfolio-manager fund-training-server fund-training-worker fund-mlflow fund-grafana; do
+    for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server fund-training-server fund-training-worker fund-grafana; do
       STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" --region ${awsRegion} --query 'services[0].{status:status,running:runningCount,desired:desiredCount}' --output text 2>/dev/null)
       if [ -n "$STATUS" ]; then
         echo "  $svc: $STATUS"
@@ -303,7 +277,7 @@ in {
         if grep -q "^export $key=" "$ENVRC" 2>/dev/null; then
           echo "    $key (already set, skipping)"
         else
-          echo "export $key=$val" >> "$ENVRC"
+          echo "export $key=\"$val\"" >> "$ENVRC"
           echo "    $key (added)"
         fi
       done
@@ -314,7 +288,7 @@ in {
   '';
 
   # Create Prefect work pool and register deployment on production
-  scripts.prefect-init.exec = ''
+  scripts.training-init.exec = ''
     unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
     ALB_URL=$(pulumi stack output --stack production aws_alb_url 2>/dev/null)
@@ -340,9 +314,9 @@ in {
     S3_DATA=$(pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
     S3_ARTIFACTS=$(pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
 
-    echo "Creating training-pool work pool..."
+    echo "Creating fund-work-pool-local work pool..."
     PREFECT_API_URL="$PROD_URL" \
-      uv run --package tools prefect work-pool create "training-pool" --type process 2>/dev/null \
+      uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null \
       || echo "  already exists"
 
     echo "Registering daily-training deployment..."
@@ -358,15 +332,15 @@ in {
   # --- Local dev commands ---
 
   # Create Prefect work pool and register deployment locally
-  scripts.prefect-setup.exec = ''
+  scripts.training-setup.exec = ''
     echo "Waiting for Prefect server..."
     while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
       sleep 2
     done
 
-    echo "Creating training-pool work pool..."
+    echo "Creating fund-work-pool-local work pool..."
     PREFECT_API_URL="http://localhost:4200/api" \
-      uv run --package tools prefect work-pool create "training-pool" --type process 2>/dev/null \
+      uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null \
       || echo "  already exists"
 
     echo "Registering daily-training deployment..."
@@ -379,7 +353,7 @@ in {
   '';
 
   scripts.cleanup-services.exec = ''
-    for PORT in 3000 4200 5432 8080 8081 8082 9000 9001 9090; do
+    for PORT in 3000 4200 5432 8080 8081 8082 9090; do
       PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
       if [ -n "$PID" ]; then
         echo "Killing stale process on port $PORT (PID $PID)"
@@ -429,12 +403,12 @@ in {
 
       # Create work pool and register deployment on first startup
       PREFECT_API_URL="http://localhost:4200/api" \
-        uv run --package tools prefect work-pool create "training-pool" --type process 2>/dev/null || true
+        uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null || true
       PREFECT_API_URL="http://localhost:4200/api" \
         uv run --package tide python -m tide.deploy 2>/dev/null || true
 
       cd tools
-      exec uv run prefect worker start --pool training-pool --name worker-1
+      exec uv run prefect worker start --pool fund-work-pool-local --name worker-1
     '';
 
     prefect-worker-2.exec = ''
@@ -443,13 +417,10 @@ in {
       done
       sleep 3
       cd tools
-      exec uv run prefect worker start --pool training-pool --name worker-2
+      exec uv run prefect worker start --pool fund-work-pool-local --name worker-2
     '';
 
     data-manager.exec = ''
-      while ! curl -sf http://localhost:9000/minio/health/live > /dev/null 2>&1; do
-        sleep 1
-      done
       cd applications/data_manager
       exec cargo watch -x run
     '';
@@ -517,8 +488,6 @@ in {
       echo "========================================"
       echo ""
       echo "  PostgreSQL:       localhost:5432"
-      echo "  MinIO API:        localhost:9000"
-      echo "  MinIO Console:    localhost:9001"
       echo "  Prometheus:       localhost:9090"
       echo "  Grafana:          localhost:3000  (admin/admin)"
       echo "  Prefect UI:       localhost:4200"
@@ -537,8 +506,6 @@ in {
     echo ""
     echo "  Local (devenv up):"
     echo "    PostgreSQL:       localhost:5432"
-    echo "    MinIO API:        localhost:9000"
-    echo "    MinIO Console:    localhost:9001"
     echo "    Prometheus:       localhost:9090"
     echo "    Grafana:          localhost:3000  (admin/admin)"
     echo "    Prefect UI:       localhost:4200"
@@ -556,10 +523,10 @@ in {
     echo "    ecs-deploy <svc>  Force ECS service redeployment"
     echo "    deploy <svc|all>  Build, push, and redeploy (ecr-push + ecs-deploy)"
     echo "    ecs-status        Show ECS service status"
-    echo "    prefect-init      Create work pool + register deployment (prod)"
+    echo "    training-init     Create work pool + register deployment (prod)"
     echo ""
     echo "  Local:"
-    echo "    prefect-setup     Create work pool + register deployment (local)"
+    echo "    training-setup    Create work pool + register deployment (local)"
     echo "    cleanup-services  Kill stale local processes"
   '';
 

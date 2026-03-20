@@ -455,14 +455,19 @@ aws.iam.RolePolicy(
                     },
                     {
                         "Effect": "Allow",
+                        "Action": ["logs:CreateLogGroup"],
+                        "Resource": "*",
+                    },
+                    {
+                        "Effect": "Allow",
                         "Action": [
-                            "logs:CreateLogGroup",
                             "logs:CreateLogStream",
                             "logs:PutLogEvents",
                         ],
-                        "Resource": (
-                            f"arn:aws:logs:{region}:{account_id}:log-group:*"
-                        ),
+                        "Resource": [
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*",
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/ecs/fund/*:*",
+                        ],
                     },
                 ],
             },

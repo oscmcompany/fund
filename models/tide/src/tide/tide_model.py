@@ -32,6 +32,10 @@ def quantile_loss(
         message = "All quantiles must be between 0 and 1"
         raise ValueError(message)
 
+    if huber_delta < 0:
+        message = f"huber_delta must be non-negative, got {huber_delta}"
+        raise ValueError(message)
+
     errors_total = Tensor(0.0)
     for index, quantile in enumerate(quantiles):
         error = targets.sub(predictions[:, :, index])
@@ -125,6 +129,7 @@ class Model:
         output_length: int = 7,  # number of days to forecast
         dropout_rate: float = 0.1,
         quantiles: list[float] | None = None,
+        huber_delta: float = 0.0,
     ) -> None:
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -133,6 +138,7 @@ class Model:
         self.output_length = output_length
         self.dropout_rate = dropout_rate
         self.quantiles = quantiles or [0.1, 0.5, 0.9]
+        self.huber_delta = huber_delta
 
         self.feature_projection_1 = Linear(
             in_features=self.input_size,
@@ -375,7 +381,7 @@ class Model:
                     # reshape targets to (batch_size, output_length)
                     targets_reshaped = targets.reshape(batch_size, self.output_length)
 
-                    loss = quantile_loss(predictions, targets_reshaped, self.quantiles, huber_delta=0.5)
+                    loss = quantile_loss(predictions, targets_reshaped, self.quantiles, huber_delta=self.huber_delta)
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -511,6 +517,7 @@ class Model:
             "output_length": self.output_length,
             "dropout_rate": self.dropout_rate,
             "quantiles": self.quantiles,
+            "huber_delta": self.huber_delta,
         }
 
         parameters_file_path = os.path.join(directory_path, "tide_parameters.json")  # noqa: PTH118

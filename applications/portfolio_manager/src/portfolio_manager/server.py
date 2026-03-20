@@ -14,6 +14,21 @@ from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 from .alpaca_client import AlpacaClient
+from .metrics import (
+    account_buying_power,
+    account_cash,
+    exposure_scale_value,
+    get_metrics,
+    observe_duration,
+    pairs_selected_count,
+    positions_closed_count,
+    positions_opened_count,
+    rebalance_errors_total,
+    rebalance_requests_total,
+    regime_state,
+    start_timer,
+    trades_submitted_total,
+)
 
 sentry_sdk.init(
     dsn=os.environ.get("SENTRY_DSN"),
@@ -122,20 +137,30 @@ def health_check() -> Response:
     return Response(status_code=status.HTTP_200_OK)
 
 
+@application.get("/metrics")
+def metrics_endpoint() -> Response:
+    return get_metrics()
+
+
 @application.post("/portfolio")
 async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    rebalance_requests_total.inc()
+    timer_start = start_timer()
     alpaca_client: AlpacaClient = application.state.alpaca_client
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
     try:
         account = alpaca_client.get_account()
+        account_cash.set(account.cash_amount)
+        account_buying_power.set(account.buying_power)
         logger.info(
             "Retrieved account",
             cash_amount=account.cash_amount,
             buying_power=account.buying_power,
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="account").inc()
         logger.exception("Failed to retrieve account", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -213,8 +238,10 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             consolidated_signals=consolidated_signals,
             historical_prices=historical_prices,
         )
+        pairs_selected_count.set(candidate_pairs.height)
         logger.info("Selected candidate pairs", count=candidate_pairs.height)
     except Exception as e:
+        rebalance_errors_total.labels(stage="pair_selection").inc()
         logger.exception("Failed to select candidate pairs", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -230,6 +257,8 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         regime = classify_regime(spy_prices)
         # Binary scale is intentional; confidence reserved for future graduated scaling.
         exposure_scale = 1.0 if regime["state"] == "mean_reversion" else 0.5
+        regime_state.set(1.0 if regime["state"] == "mean_reversion" else 0.0)
+        exposure_scale_value.set(exposure_scale)
         logger.info(
             "Computed market betas and regime",
             regime_state=regime["state"],
@@ -451,6 +480,10 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
+
+    positions_opened_count.set(len(open_results))
+    positions_closed_count.set(len(close_results))
+    observe_duration(timer_start)
 
     logger.info(
         "Portfolio rebalance completed",
