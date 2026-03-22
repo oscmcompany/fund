@@ -128,7 +128,7 @@
       }
     },
     "hook": {
-      "on-activate": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n\nif [[ ! -d .venv ]]; then\n  uv venv\nfi\n\nsource .venv/bin/activate\n\nif [[ ! -f .git/hooks/pre-commit ]]; then\n  pre-commit install\nfi\n\nmask development python install\n"
+      "on-activate": "if [[ -f .env ]]; then\n  set -a\n  source .env\n  set +a\nfi\n\nif [[ -z \"${CI}\" ]]; then\n  if [[ ! -d .venv ]]; then\n    uv venv\n  fi\n\n  source .venv/bin/activate\n\n  if [[ ! -f .git/hooks/pre-commit ]]; then\n    pre-commit install\n  fi\n\n  mask development python install\nfi\n"
     },
     "options": {
       "systems": [
