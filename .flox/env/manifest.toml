@@ -55,6 +55,18 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
+
+if [[ ! -d .venv ]]; then
+  uv venv
+fi
+
+source .venv/bin/activate
+
+if [[ ! -f .git/hooks/pre-commit ]]; then
+  pre-commit install
+fi
+
+mask development python install
 '''
 
 [build]

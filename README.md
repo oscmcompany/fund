@@ -20,14 +20,10 @@ Below are resources for the project and repository.
 Run the commands below in the root directory.  
 
 ```sh
-brew install flox # https://flox.dev/ for more information
-flox activate
-uv venv
-source .venv/bin/activate
-pre-commit install
-mask --help # see all available Mask tasks
-mask setup
-mask development python install
+brew install flox # see https://flox.dev/ for more information
+flox activate     # configure repository environment 
+mask setup        # check for required tools
+mask --help       # list available Mask tasks
 ```
 
 ### Principles
