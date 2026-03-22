@@ -21,7 +21,7 @@ Run the commands below in the root directory.
 
 ```sh
 brew install flox # see https://flox.dev/ for more information
-flox activate     # configure repository environment 
+flox activate     # configure repository environment
 mask setup        # check for required tools
 mask --help       # list available Mask tasks
 ```
