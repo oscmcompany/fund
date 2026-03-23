@@ -5,7 +5,7 @@ pull:
       branch: master
 
 deployments:
-  - name: tide-training
+  - name: tide-trainer-remote
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline
     work_pool:
       name: fund-work-pool-ecs
@@ -13,7 +13,7 @@ deployments:
     build: null
     push: null
 
-  - name: tide-training-local
+  - name: tide-trainer-local
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline
     work_pool:
       name: fund-work-pool-local

@@ -64,8 +64,14 @@ def test_prepare_data_passes_output_key(
     assert call_kwargs["output_key"] == "custom/key.parquet"
 
 
+@patch("tide.workflow.end_run")
+@patch("tide.workflow.start_run")
 @patch("tide.workflow.S3Bucket")
-def test_train_tide_model_downloads_trains_uploads(mock_s3_bucket: MagicMock) -> None:
+def test_train_tide_model_downloads_trains_uploads(
+    mock_s3_bucket: MagicMock,
+    mock_start_run: MagicMock,
+    mock_end_run: MagicMock,
+) -> None:
     mock_artifact_block = MagicMock()
     mock_artifact_block.bucket_name = "artifacts-bucket"
     mock_s3 = MagicMock()
@@ -106,6 +112,65 @@ def test_train_tide_model_downloads_trains_uploads(mock_s3_bucket: MagicMock) ->
     mock_s3.put_object.assert_called_once()
     mock_train.assert_called_once()
     assert "checkpoint_directory" in mock_train.call_args.kwargs
+    mock_start_run.assert_called_once()
+    mock_end_run.assert_called_once_with()
+
+
+@patch("tide.workflow.end_run")
+@patch("tide.workflow.start_run")
+@patch("tide.workflow.S3Bucket")
+def test_train_tide_model_calls_end_run_failed_on_error(
+    mock_s3_bucket: MagicMock,
+    mock_start_run: MagicMock,
+    mock_end_run: MagicMock,
+) -> None:
+    mock_artifact_block = MagicMock()
+    mock_artifact_block.bucket_name = "artifacts-bucket"
+    mock_s3 = MagicMock()
+    mock_session = mock_artifact_block.credentials.get_boto3_session
+    mock_session.return_value.client.return_value = mock_s3
+    mock_s3_bucket.load.return_value = mock_artifact_block
+
+    sample_data = pl.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "timestamp": [1000000],
+            "open_price": [100.0],
+            "high_price": [101.0],
+            "low_price": [99.0],
+            "close_price": [100.5],
+            "volume": [1000000],
+            "volume_weighted_average_price": [100.3],
+            "sector": ["Technology"],
+            "industry": ["Software"],
+        }
+    )
+    parquet_buffer = io.BytesIO()
+    sample_data.write_parquet(parquet_buffer)
+    parquet_bytes = parquet_buffer.getvalue()
+    mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: parquet_bytes)}
+
+    with (
+        patch("tide.trainer.train_model") as mock_train,
+        pytest.raises(RuntimeError, match="Training failed"),
+    ):
+        mock_train.side_effect = RuntimeError("Training failed")
+        train_tide_model.fn(training_data_key="training/data.parquet")
+
+    mock_start_run.assert_called_once()
+    mock_end_run.assert_called_once_with(status="FAILED")
+
+
+@patch("tide.workflow.S3Bucket")
+def test_prepare_data_raises_on_missing_blocks(
+    mock_s3_bucket: MagicMock,
+) -> None:
+    mock_s3_bucket.load.side_effect = ValueError("Block not found")
+    with pytest.raises(ValueError, match="not found"):
+        prepare_data.fn(
+            start_date=datetime(2024, 1, 1, tzinfo=UTC),
+            end_date=datetime(2024, 1, 31, tzinfo=UTC),
+        )
 
 
 @patch("tide.workflow.train_tide_model", return_value="s3://bucket/model")

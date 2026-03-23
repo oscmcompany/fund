@@ -381,7 +381,12 @@ class Model:
                     # reshape targets to (batch_size, output_length)
                     targets_reshaped = targets.reshape(batch_size, self.output_length)
 
-                    loss = quantile_loss(predictions, targets_reshaped, self.quantiles, huber_delta=self.huber_delta)
+                    loss = quantile_loss(
+                        predictions,
+                        targets_reshaped,
+                        self.quantiles,
+                        huber_delta=self.huber_delta,
+                    )
 
                     optimizer.zero_grad()
                     loss.backward()

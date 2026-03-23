@@ -20,21 +20,6 @@ let
       context = ".";
       ecrRepo = "fund/portfolio_manager-server";
     };
-    training-server = {
-      dockerfile = "tools/Dockerfile.prefect-server";
-      context = ".";
-      ecrRepo = "fund/training-server";
-    };
-    training-worker = {
-      dockerfile = "tools/Dockerfile";
-      context = ".";
-      ecrRepo = "fund/training-worker";
-    };
-    grafana = {
-      dockerfile = "Dockerfile";
-      context = "dashboards";
-      ecrRepo = "fund/grafana";
-    };
   };
 
   deployableServices = builtins.attrNames ecsServices;
@@ -75,12 +60,11 @@ in {
     pkgs.rustup
     pkgs.cargo-watch
     pkgs.awscli2
-    pkgs.grafana
     pkgs.pulumiPackages.pulumi-language-python
     pkgs.pulumi-bin
   ];
 
-  # PostgreSQL for Prefect (local)
+  # PostgreSQL for orchestration server (local)
   services.postgres = {
     enable = true;
     package = pkgs.postgresql_16;
@@ -220,11 +204,8 @@ in {
       data-manager) deploy_ecs_service "fund-data-manager-server" ;;
       ensemble-manager) deploy_ecs_service "fund-ensemble-manager-server" ;;
       portfolio-manager) deploy_ecs_service "fund-portfolio-manager-server" ;;
-      training-server) deploy_ecs_service "fund-training-server" ;;
-      training-worker) deploy_ecs_service "fund-training-worker" ;;
-      grafana) deploy_ecs_service "fund-grafana" ;;
       all)
-        for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server fund-training-server fund-training-worker fund-grafana; do
+        for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server; do
           deploy_ecs_service "$svc"
         done
         echo "All services redeployed"
@@ -250,7 +231,7 @@ in {
     echo "=== ECS Services ==="
     aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
     echo ""
-    for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server fund-training-server fund-training-worker fund-grafana; do
+    for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server; do
       STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" --region ${awsRegion} --query 'services[0].{status:status,running:runningCount,desired:desiredCount}' --output text 2>/dev/null)
       if [ -n "$STATUS" ]; then
         echo "  $svc: $STATUS"
@@ -287,7 +268,7 @@ in {
     echo "Done. Run 'direnv allow' to reload."
   '';
 
-  # Create Prefect work pool and register deployment on production
+  # Create work pool and register training deployment on production
   scripts.training-init.exec = ''
     unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     cd "$DEVENV_ROOT/infrastructure"
@@ -299,15 +280,15 @@ in {
 
     PROD_URL="''${ALB_URL%/}:4200/api"
 
-    echo "Checking Prefect server at $PROD_URL..."
+    echo "Checking orchestrator at $PROD_URL..."
     for i in 1 2 3 4 5; do
       curl -sf "$PROD_URL/health" > /dev/null 2>&1 && break
-      echo "  Waiting for Prefect server..."
+      echo "  Waiting for orchestrator..."
       sleep 5
     done
 
     if ! curl -sf "$PROD_URL/health" > /dev/null 2>&1; then
-      echo "Prefect server not reachable at $PROD_URL"
+      echo "Orchestrator not reachable at $PROD_URL"
       exit 1
     fi
 
@@ -331,9 +312,9 @@ in {
 
   # --- Local dev commands ---
 
-  # Create Prefect work pool and register deployment locally
+  # Create work pool and register training deployment locally
   scripts.training-setup.exec = ''
-    echo "Waiting for Prefect server..."
+    echo "Waiting for orchestrator..."
     while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
       sleep 2
     done
@@ -348,12 +329,12 @@ in {
       uv run --package tide python -m tide.deploy
 
     echo ""
-    echo "Done. Visit http://localhost:4200 to see the Prefect dashboard."
+    echo "Done. Visit http://localhost:4200 to see the orchestrator dashboard."
     echo "Run 'devenv up' to start workers that will pick up scheduled runs."
   '';
 
   scripts.cleanup-services.exec = ''
-    for PORT in 3000 4200 5432 8080 8081 8082 9090; do
+    for PORT in 4200 5432 8080 8081 8082 9090; do
       PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
       if [ -n "$PID" ]; then
         echo "Killing stale process on port $PORT (PID $PID)"
@@ -376,17 +357,17 @@ in {
       uv run prefect --no-prompt deploy --all
       '';
     "models:tide:train".exec = ''
-      uv run prefect deployment run tide-training-pipeline/tide-training
+      uv run prefect deployment run tide-training-pipeline/tide-trainer-remote
       '';
     "models:tide:train:local".exec = ''
-      uv run prefect deployment run tide-training-pipeline/tide-training-local
+      uv run prefect deployment run tide-training-pipeline/tide-trainer-local
       '';
   };
 
   # --- Local processes ---
 
   processes = {
-    prefect-server.exec = ''
+    orchestrator.exec = ''
       while ! pg_isready -h 127.0.0.1 -p 5432 -U prefect -q 2>/dev/null; do
         sleep 1
       done
@@ -396,7 +377,7 @@ in {
       exec uv run prefect server start --host 0.0.0.0
     '';
 
-    prefect-worker-1.exec = ''
+    training-worker-1.exec = ''
       while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
         sleep 2
       done
@@ -411,7 +392,7 @@ in {
       exec uv run prefect worker start --pool fund-work-pool-local --name worker-1
     '';
 
-    prefect-worker-2.exec = ''
+    training-worker-2.exec = ''
       while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
         sleep 2
       done
@@ -444,42 +425,8 @@ in {
       exec uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081 --reload
     '';
 
-    grafana.exec = ''
-      GRAFANA_DATA="$DEVENV_STATE/grafana"
-      GRAFANA_PROV="$GRAFANA_DATA/provisioning"
-      mkdir -p "$GRAFANA_PROV/datasources" "$GRAFANA_PROV/dashboards"
-
-      cp "$DEVENV_ROOT/dashboards/local/datasources/prometheus.yaml" "$GRAFANA_PROV/datasources/"
-
-      cat > "$GRAFANA_PROV/dashboards/dashboards.yaml" << EOF
-      apiVersion: 1
-      providers:
-        - name: fund
-          orgId: 1
-          folder: Fund
-          type: file
-          disableDeletion: false
-          updateIntervalSeconds: 10
-          allowUiUpdates: true
-          options:
-            path: $DEVENV_ROOT/dashboards
-            foldersFromFilesStructure: false
-      EOF
-
-      exec grafana server \
-        --homepath "${pkgs.grafana}/share/grafana" \
-        --config /dev/null \
-        cfg:server.http_port=3000 \
-        cfg:server.http_addr=0.0.0.0 \
-        cfg:paths.data="$GRAFANA_DATA" \
-        cfg:paths.provisioning="$GRAFANA_PROV" \
-        cfg:security.admin_password=admin \
-        cfg:auth.anonymous_enabled=true \
-        cfg:auth.anonymous_org_role=Viewer
-    '';
-
     ready.exec = ''
-      while ! curl -sf http://localhost:3000/api/health > /dev/null 2>&1; do
+      while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
         sleep 2
       done
       echo ""
@@ -489,8 +436,7 @@ in {
       echo ""
       echo "  PostgreSQL:       localhost:5432"
       echo "  Prometheus:       localhost:9090"
-      echo "  Grafana:          localhost:3000  (admin/admin)"
-      echo "  Prefect UI:       localhost:4200"
+      echo "  Orchestrator UI:  localhost:4200"
       echo "  Data Manager:     localhost:8080"
       echo "  Ensemble Manager: localhost:8082"
       echo "  Portfolio Manager: localhost:8081"
@@ -507,8 +453,7 @@ in {
     echo "  Local (devenv up):"
     echo "    PostgreSQL:       localhost:5432"
     echo "    Prometheus:       localhost:9090"
-    echo "    Grafana:          localhost:3000  (admin/admin)"
-    echo "    Prefect UI:       localhost:4200"
+    echo "    Orchestrator UI:  localhost:4200"
     echo "    Data Manager:     localhost:8080"
     echo "    Ensemble Manager: localhost:8082"
     echo "    Portfolio Manager: localhost:8081"

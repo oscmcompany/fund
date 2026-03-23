@@ -27,6 +27,16 @@ from internal.equity_details_schema import equity_details_schema
 from tide.tide_data import Data
 from tide.tide_model import Model
 
+from .metrics import (
+    get_metrics,
+    model_load_timestamp,
+    observe_duration,
+    prediction_batch_count,
+    prediction_errors_total,
+    prediction_requests_total,
+    prediction_row_count,
+    start_timer,
+)
 from .predictions_schema import predictions_schema
 from .preprocess import filter_equity_bars
 
@@ -238,6 +248,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     app.state.model_directory = model_directory
     app.state.tide_model = Model.load(directory_path=model_directory)
+    model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
     logger.info("model_loaded_successfully")
 
     yield
@@ -253,9 +264,16 @@ def health_check() -> Response:
     return Response(status_code=status.HTTP_200_OK)
 
 
+@application.get("/metrics")
+def metrics_endpoint() -> Response:
+    return get_metrics()
+
+
 @application.post("/model/predictions")
 @application.post("/predictions")
-def create_predictions(request: Request) -> Response:
+def create_predictions(request: Request) -> Response:  # noqa: PLR0915
+    prediction_requests_total.inc()
+    timer_start = start_timer()
     logger.info("Starting prediction generation process")
 
     end_date = datetime.now(tz=UTC)
@@ -276,12 +294,14 @@ def create_predictions(request: Request) -> Response:
         equity_bars_response.raise_for_status()
 
     except Exception as e:
+        prediction_errors_total.labels(stage="fetch_equity_bars").inc()
         logger.exception(
             "Failed to fetch equity bars data",
             start_date=start_date.isoformat(),
             end_date=end_date.isoformat(),
             error=f"{e}",
         )
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -293,10 +313,12 @@ def create_predictions(request: Request) -> Response:
         equity_details_response.raise_for_status()
 
     except Exception as e:
+        prediction_errors_total.labels(stage="fetch_equity_details").inc()
         logger.exception(
             "Failed to fetch equity details data",
             error=f"{e}",
         )
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -305,10 +327,12 @@ def create_predictions(request: Request) -> Response:
             equity_details_response=equity_details_response,
         )
     except Exception as e:
+        prediction_errors_total.labels(stage="parse_responses").inc()
         logger.exception(
             "Failed to parse and consolidate data responses",
             error=f"{e}",
         )
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     current_timestamp = datetime.now(tz=UTC)
@@ -320,7 +344,9 @@ def create_predictions(request: Request) -> Response:
     batches = tide_data.get_batches(data_type="predict")
 
     if not batches:
+        prediction_errors_total.labels(stage="batch_creation").inc()
         logger.error("No data batches available for prediction")
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     logger.info(
@@ -363,7 +389,9 @@ def create_predictions(request: Request) -> Response:
             else validated_result,
         )
     except Exception:
+        prediction_errors_total.labels(stage="schema_validation").inc()
         logger.exception("Predictions failed schema validation")
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -385,6 +413,10 @@ def create_predictions(request: Request) -> Response:
             error=f"{e}",
         )
         raise
+
+    prediction_batch_count.set(len(batches))
+    prediction_row_count.set(validated_predictions.height)
+    observe_duration(timer_start)
 
     logger.info("Successfully generated and saved predictions")
 

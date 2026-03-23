@@ -6,8 +6,8 @@ import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# Add the tide package source directory to the path so the managed runner
-# can resolve tide.tide_data and tide.tide_model after cloning the repo.
+# Required for Prefect's ECS managed runner: after git-cloning the repo,
+# models/tide/src/ is not on sys.path, so tide.* imports would fail.
 _tide_src = os.path.join(os.path.dirname(__file__), "..")  # noqa: PTH118, PTH120
 if _tide_src not in sys.path:
     sys.path.insert(0, _tide_src)
@@ -19,9 +19,12 @@ from prefect_aws.s3 import S3Bucket  # noqa: E402
 
 from tide.notifications import send_training_notification  # noqa: E402
 from tide.tasks import prepare_training_data  # noqa: E402
-from tide.tracking import log_model_artifact  # noqa: E402
+from tide.tracking import end_run, log_model_artifact, start_run  # noqa: E402
 
 logger = structlog.get_logger()
+
+DATA_BLOCK_NAME = "data-bucket"
+ARTIFACT_BLOCK_NAME = "artifact-bucket"
 
 
 def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
@@ -39,14 +42,15 @@ def prepare_data(
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
     try:
-        data_block = S3Bucket.load("data-bucket")
-        artifact_block = S3Bucket.load("artifact-bucket")
-    except ValueError:
+        data_block = S3Bucket.load(DATA_BLOCK_NAME)
+        artifact_block = S3Bucket.load(ARTIFACT_BLOCK_NAME)
+    except ValueError as err:
         message = (
-            "Prefect S3Bucket blocks 'data-bucket' and 'artifact-bucket' not found. "
-            "Create them in Prefect Cloud or run 'prefect block register'."
+            f"Prefect S3Bucket blocks '{DATA_BLOCK_NAME}' and '{ARTIFACT_BLOCK_NAME}' "
+            "not found. Create them in Prefect Cloud or run 'prefect block register'. "
+            "Check that credentials are configured on each block."
         )
-        raise ValueError(message) from None
+        raise ValueError(message) from err
     s3_client = data_block.credentials.get_boto3_session().client("s3")
 
     logger.info(
@@ -86,13 +90,14 @@ def train_tide_model(
     from tide.trainer import train_model  # noqa: PLC0415
 
     try:
-        artifact_block = S3Bucket.load("artifact-bucket")
-    except ValueError:
+        artifact_block = S3Bucket.load(ARTIFACT_BLOCK_NAME)
+    except ValueError as err:
         message = (
-            "Prefect S3Bucket block 'artifact-bucket' not found. "
-            "Create it in Prefect Cloud or run 'prefect block register'."
+            f"Prefect S3Bucket block '{ARTIFACT_BLOCK_NAME}' not found. "
+            "Create it in Prefect Cloud or run 'prefect block register'. "
+            "Check that credentials are configured on the block."
         )
-        raise ValueError(message) from None
+        raise ValueError(message) from err
     s3_client = artifact_block.credentials.get_boto3_session().client("s3")
     artifacts_bucket = artifact_block.bucket_name
 
@@ -114,47 +119,57 @@ def train_tide_model(
     training_data = pl.read_parquet(response["Body"].read())
     logger.info("Training data loaded", rows=training_data.height)
 
-    with tempfile.TemporaryDirectory(prefix="checkpoints_") as checkpoint_directory:
-        tide_model, tide_data, _losses = train_model(
-            training_data,
-            checkpoint_directory=checkpoint_directory,
-            tags={"source": "prefect", "task": "train-tide-model"},
+    start_run(
+        configuration={},
+        tags={"source": "prefect", "task": "train-tide-model"},
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="checkpoints_") as checkpoint_directory:
+            tide_model, tide_data, _losses = train_model(
+                training_data,
+                checkpoint_directory=checkpoint_directory,
+            )
+
+        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
+        artifact_folder = f"artifacts/tide/{timestamp}"
+        artifact_key = f"{artifact_folder}/output/model.tar.gz"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tide_model.save(directory_path=tmpdir)
+            tide_data.save(directory_path=tmpdir)
+
+            log_model_artifact(tmpdir)
+
+            tar_buffer = io.BytesIO()
+            with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
+                for entry in Path(tmpdir).iterdir():
+                    tar.add(entry, arcname=entry.name)
+            tar_bytes = tar_buffer.getvalue()
+
+        logger.info(
+            "Uploading model artifact",
+            bucket=artifacts_bucket,
+            key=artifact_key,
+            size_bytes=len(tar_bytes),
         )
 
-    timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
-    artifact_folder = f"artifacts/tide/{timestamp}"
-    artifact_key = f"{artifact_folder}/output/model.tar.gz"
+        s3_client.put_object(
+            Bucket=artifacts_bucket,
+            Key=artifact_key,
+            Body=tar_bytes,
+            ContentType="application/gzip",
+        )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tide_model.save(directory_path=tmpdir)
-        tide_data.save(directory_path=tmpdir)
+        logger.info(
+            "Model artifact uploaded",
+            artifact_path=f"s3://{artifacts_bucket}/{artifact_key}",
+        )
 
-        log_model_artifact(tmpdir)
-
-        tar_buffer = io.BytesIO()
-        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
-            for entry in Path(tmpdir).iterdir():
-                tar.add(entry, arcname=entry.name)
-        tar_bytes = tar_buffer.getvalue()
-
-    logger.info(
-        "Uploading model artifact",
-        bucket=artifacts_bucket,
-        key=artifact_key,
-        size_bytes=len(tar_bytes),
-    )
-
-    s3_client.put_object(
-        Bucket=artifacts_bucket,
-        Key=artifact_key,
-        Body=tar_bytes,
-        ContentType="application/gzip",
-    )
-
-    logger.info(
-        "Model artifact uploaded",
-        artifact_path=f"s3://{artifacts_bucket}/{artifact_key}",
-    )
+        end_run()
+    except Exception:
+        end_run(status="FAILED")
+        raise
 
     return f"s3://{artifacts_bucket}/{artifact_key}"
 
