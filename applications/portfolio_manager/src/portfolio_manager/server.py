@@ -333,7 +333,35 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    close_results = []
+    close_results = _execute_close_positions(alpaca_client, close_positions)
+    open_results = _execute_open_positions(alpaca_client, open_positions, account)
+
+    all_results = close_results + open_results
+    failed_trades = [r for r in all_results if r["status"] == "failed"]
+
+    successful_opens = [r for r in open_results if r["status"] == "success"]
+    successful_closes = [r for r in close_results if r["status"] == "success"]
+    positions_opened_count.set(len(successful_opens))
+    positions_closed_count.set(len(successful_closes))
+    observe_duration(timer_start)
+
+    logger.info(
+        "Portfolio rebalance completed",
+        total_trades=len(all_results),
+        failed_trades=len(failed_trades),
+    )
+
+    if failed_trades:
+        return Response(status_code=status.HTTP_207_MULTI_STATUS)
+
+    return Response(status_code=status.HTTP_200_OK)
+
+
+def _execute_close_positions(
+    alpaca_client: AlpacaClient,
+    close_positions: list[dict],
+) -> list[dict]:
+    results: list[dict] = []
     for close_position in close_positions:
         try:
             was_closed = alpaca_client.close_position(
@@ -341,7 +369,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             )
             if was_closed:
                 logger.info("Closed position", ticker=close_position["ticker"])
-                close_results.append(
+                results.append(
                     {
                         "ticker": close_position["ticker"],
                         "action": "close",
@@ -353,7 +381,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                     "Position already closed or did not exist",
                     ticker=close_position["ticker"],
                 )
-                close_results.append(
+                results.append(
                     {
                         "ticker": close_position["ticker"],
                         "action": "close",
@@ -367,7 +395,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 ticker=close_position["ticker"],
                 error=str(e),
             )
-            close_results.append(
+            results.append(
                 {
                     "ticker": close_position["ticker"],
                     "action": "close",
@@ -375,8 +403,15 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                     "error": str(e),
                 }
             )
+    return results
 
-    open_results = []
+
+def _execute_open_positions(
+    alpaca_client: AlpacaClient,
+    open_positions: list[dict],
+    account: object,
+) -> list[dict]:
+    results: list[dict] = []
     remaining_buying_power = account.buying_power
     skipped_insufficient_buying_power = 0
     skipped_not_shortable = 0
@@ -395,7 +430,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 remaining_buying_power=remaining_buying_power,
             )
             skipped_insufficient_buying_power += 1
-            open_results.append(
+            results.append(
                 {
                     "ticker": ticker,
                     "action": "open",
@@ -419,10 +454,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 side=side,
                 dollar_amount=dollar_amount,
             )
-            # Refresh remaining buying power from the account after a successful order
             try:
-                account = alpaca_client.get_account()
-                remaining_buying_power = account.buying_power
+                refreshed_account = alpaca_client.get_account()
+                remaining_buying_power = refreshed_account.buying_power
             except Exception:
                 logger.exception(
                     "Failed to refresh buying power from account, using estimate",
@@ -430,7 +464,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                     deducting=dollar_amount,
                 )
                 remaining_buying_power -= dollar_amount
-            open_results.append(
+            results.append(
                 {
                     "ticker": ticker,
                     "action": "open",
@@ -448,7 +482,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 error=str(e),
             )
             skipped_insufficient_buying_power += 1
-            open_results.append(
+            results.append(
                 {
                     "ticker": ticker,
                     "action": "open",
@@ -466,7 +500,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 error=str(e),
             )
             skipped_not_shortable += 1
-            open_results.append(
+            results.append(
                 {
                     "ticker": ticker,
                     "action": "open",
@@ -482,7 +516,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
                 ticker=ticker,
                 error=str(e),
             )
-            open_results.append(
+            results.append(
                 {
                     "ticker": ticker,
                     "action": "open",
@@ -500,25 +534,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             skipped_not_shortable=skipped_not_shortable,
         )
 
-    all_results = close_results + open_results
-    failed_trades = [r for r in all_results if r["status"] == "failed"]
-
-    successful_opens = [r for r in open_results if r["status"] == "success"]
-    successful_closes = [r for r in close_results if r["status"] == "success"]
-    positions_opened_count.set(len(successful_opens))
-    positions_closed_count.set(len(successful_closes))
-    observe_duration(timer_start)
-
-    logger.info(
-        "Portfolio rebalance completed",
-        total_trades=len(all_results),
-        failed_trades=len(failed_trades),
-    )
-
-    if failed_trades:
-        return Response(status_code=status.HTTP_207_MULTI_STATUS)
-
-    return Response(status_code=status.HTTP_200_OK)
+    return results
 
 
 async def get_raw_predictions() -> pl.DataFrame:
