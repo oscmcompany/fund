@@ -197,8 +197,9 @@ def test_training_pipeline_threads_data_key(
     assert result == "s3://bucket/model"
 
 
-def test_training_pipeline_rejects_nonpositive_lookback() -> None:
+@pytest.mark.parametrize("lookback_days", [0, -1, -100])
+def test_training_pipeline_rejects_nonpositive_lookback(lookback_days: int) -> None:
     with pytest.raises(ValueError, match="lookback_days must be positive"):
         training_pipeline.fn(
-            lookback_days=0,
+            lookback_days=lookback_days,
         )

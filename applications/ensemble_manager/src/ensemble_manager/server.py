@@ -407,11 +407,13 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
         save_predictions_response.raise_for_status()
 
     except Exception as e:
+        prediction_errors_total.labels(stage="save_predictions").inc()
         logger.exception(
             "Failed to save predictions data",
             timestamp=current_timestamp.isoformat(),
             error=f"{e}",
         )
+        observe_duration(timer_start)
         raise
 
     prediction_batch_count.set(len(batches))

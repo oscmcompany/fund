@@ -59,7 +59,11 @@ def start_run(
 
     run = mlflow.start_run(run_name=run_name, tags=run_tags)
 
-    mlflow.log_params(configuration)
+    safe_params = {
+        k: str(v) if isinstance(v, list) else v
+        for k, v in configuration.items()
+    }
+    mlflow.log_params(safe_params)
 
     logger.info(
         "MLflow run started",

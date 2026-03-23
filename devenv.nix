@@ -275,6 +275,9 @@ in {
       exit 1
     fi
 
+    # Override the local dev PREFECT_API_URL so the CLI targets Prefect Cloud
+    unset PREFECT_API_URL
+
     echo "Creating fund-work-pool-ecs work pool on Prefect Cloud..."
     uv run --package tools prefect work-pool create "fund-work-pool-ecs" --type ecs 2>/dev/null \
       || echo "  already exists"
