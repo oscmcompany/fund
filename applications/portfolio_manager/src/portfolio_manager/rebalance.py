@@ -148,12 +148,11 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         logger.exception("Failed to select candidate pairs", error=str(e))
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    if candidate_pairs.height > 0:
-        try:
-            candidate_pairs = pairs_schema.validate(candidate_pairs)
-        except Exception as e:
-            logger.exception("Candidate pairs failed schema validation", error=str(e))
-            return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    try:
+        candidate_pairs = pairs_schema.validate(candidate_pairs)
+    except Exception as e:
+        logger.exception("Candidate pairs failed schema validation", error=str(e))
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         market_betas = compute_market_betas(historical_prices, spy_prices)
@@ -381,7 +380,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
-    save_portfolio(final_portfolio, current_timestamp)
+    save_succeeded = save_portfolio(final_portfolio, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -390,9 +389,10 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         "Portfolio rebalance completed",
         total_trades=len(all_results),
         failed_trades=len(failed_trades),
+        save_succeeded=save_succeeded,
     )
 
-    if failed_trades:
+    if failed_trades or not save_succeeded:
         return Response(status_code=status.HTTP_207_MULTI_STATUS)
 
     return Response(status_code=status.HTTP_200_OK)
