@@ -41,7 +41,6 @@ ENSEMBLE_MANAGER_BASE_URL = os.getenv(
     "http://ensemble-manager:8080",
 )
 
-HTTP_BAD_REQUEST = 400
 _MINIMUM_PAIR_PRICE_ROWS = 30
 
 _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
@@ -409,24 +408,18 @@ async def get_raw_predictions() -> pl.DataFrame:
 
 def get_prior_portfolio() -> pl.DataFrame:
     empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    response = requests.get(
+        url=f"{DATA_MANAGER_BASE_URL}/portfolios",
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    response_text = response.text.strip()
+    if not response_text or response_text == "[]":
+        logger.info("Prior portfolio is empty")
+        return empty
+
     try:
-        response = requests.get(
-            url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-            timeout=60,
-        )
-
-        if response.status_code >= HTTP_BAD_REQUEST:
-            logger.warning(
-                "Failed to fetch prior portfolio from data manager",
-                status_code=response.status_code,
-            )
-            return empty
-
-        response_text = response.text.strip()
-        if not response_text or response_text == "[]":
-            logger.info("Prior portfolio is empty")
-            return empty
-
         prior_portfolio_data = response.json()
 
         if not prior_portfolio_data:
@@ -448,7 +441,7 @@ def get_prior_portfolio() -> pl.DataFrame:
         pl.exceptions.PolarsError,
     ) as e:
         logger.exception("Failed to parse prior portfolio JSON", error=str(e))
-        return empty
+        raise
 
 
 def evaluate_prior_pairs(

@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
+import requests
 from portfolio_manager.rebalance import (
     _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
@@ -282,13 +283,30 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     assert result["pair_id"][0] == "AAPL-MSFT"
 
 
-def test_get_prior_portfolio_returns_empty_dataframe_on_error_response() -> None:
+def test_get_prior_portfolio_raises_on_error_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
-    with patch("portfolio_manager.rebalance.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
-    assert result.is_empty()
-    assert "pair_id" in result.columns
+    mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
+        response=mock_response
+    )
+    with (
+        patch("portfolio_manager.rebalance.requests.get", return_value=mock_response),
+        pytest.raises(requests.exceptions.HTTPError),
+    ):
+        get_prior_portfolio()
+
+
+def test_get_prior_portfolio_raises_on_parse_error() -> None:
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status.return_value = None
+    mock_response.text = '{"not": "a list"}'
+    mock_response.json.side_effect = ValueError("invalid json")
+    with (
+        patch("portfolio_manager.rebalance.requests.get", return_value=mock_response),
+        pytest.raises(ValueError, match="invalid json"),
+    ):
+        get_prior_portfolio()
 
 
 def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() -> None:

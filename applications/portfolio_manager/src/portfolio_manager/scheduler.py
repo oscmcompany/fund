@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import requests
 import sentry_sdk
 import structlog
+from fastapi import status
 
 from .alpaca_client import AlpacaClient
 from .rebalance import run_rebalance
@@ -79,18 +80,29 @@ async def spawn_rebalance_scheduler(
     return task
 
 
-async def _rebalance_loop(
+async def _rebalance_loop(  # noqa: C901
     alpaca_client: AlpacaClient,
     data_manager_base_url: str,
 ) -> None:
+    now_eastern = datetime.now(tz=UTC).astimezone(_EASTERN)
+    catch_up = (
+        now_eastern.weekday() < _WEEKEND_WEEKDAY_MIN
+        and now_eastern.hour >= _REBALANCE_HOUR
+        and not _already_rebalanced_today(data_manager_base_url)
+    )
+    if catch_up:
+        logger.info("Missed rebalance window detected, running immediately")
+
     while True:
         try:
-            wait_seconds = _seconds_until_next_rebalance()
-            logger.info(
-                "Waiting for next portfolio rebalance",
-                seconds_until_rebalance=int(wait_seconds),
-            )
-            await asyncio.sleep(wait_seconds)
+            if not catch_up:
+                wait_seconds = _seconds_until_next_rebalance()
+                logger.info(
+                    "Waiting for next portfolio rebalance",
+                    seconds_until_rebalance=int(wait_seconds),
+                )
+                await asyncio.sleep(wait_seconds)
+            catch_up = False
 
             try:
                 market_open = alpaca_client.is_market_open()
@@ -109,7 +121,12 @@ async def _rebalance_loop(
 
             logger.info("Starting scheduled portfolio rebalance")
             try:
-                await run_rebalance(alpaca_client)
+                response = await run_rebalance(alpaca_client)
+                if response.status_code != status.HTTP_200_OK:
+                    logger.warning(
+                        "Scheduled rebalance completed with non-200 status",
+                        status_code=response.status_code,
+                    )
             except Exception as error:
                 logger.exception(
                     "Scheduled portfolio rebalance failed", error=str(error)
@@ -118,3 +135,9 @@ async def _rebalance_loop(
         except asyncio.CancelledError:
             logger.info("Rebalance scheduler cancelled")
             return
+        except Exception as error:
+            logger.exception(
+                "Unexpected error in rebalance loop, retrying next cycle",
+                error=str(error),
+            )
+            sentry_sdk.capture_exception(error)
