@@ -45,7 +45,7 @@ def deploy_training_flow(
 
 
 if __name__ == "__main__":
-    base_url = os.getenv("FUND_DATAMANAGER_BASE_URL", "")
+    base_url = os.getenv("FUND_DATA_MANAGER_BASE_URL", "")
     data_bucket = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
     artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
 
@@ -60,7 +60,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     required_vars = {
-        "FUND_DATAMANAGER_BASE_URL": base_url,
+        "FUND_DATA_MANAGER_BASE_URL": base_url,
         "AWS_S3_DATA_BUCKET_NAME": data_bucket,
         "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": artifacts_bucket,
     }

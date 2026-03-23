@@ -793,7 +793,7 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
+export FUND_DATA_MANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export PREFECT_API_URL="$(pulumi stack output training_api_url)"
@@ -828,7 +828,7 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export FUND_DATAMANAGER_BASE_URL="http://data-manager-server.$(pulumi stack output aws_service_discovery_namespace):8080"
+export FUND_DATA_MANAGER_BASE_URL="http://data-manager-server.$(pulumi stack output aws_service_discovery_namespace):8080"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export PREFECT_API_URL="$(pulumi stack output training_api_url)"

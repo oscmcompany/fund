@@ -6,6 +6,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.data import StockHistoricalDataClient
 from alpaca.trading import (
     Asset,
+    Clock,
     ClosePositionRequest,
     GetAssetsRequest,
     OrderRequest,
@@ -57,6 +58,11 @@ class AlpacaClient:
         )
 
         self.is_paper = is_paper
+
+    def is_market_open(self) -> bool:
+        clock: Clock = cast("Clock", self.trading_client.get_clock())
+        time.sleep(self.rate_limit_sleep)
+        return bool(clock.is_open)
 
     def get_account(self) -> AlpacaAccount:
         account: TradeAccount = cast("TradeAccount", self.trading_client.get_account())

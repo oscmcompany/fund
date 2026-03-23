@@ -618,7 +618,7 @@ training_worker_task_definition = aws.ecs.TaskDefinition(
                             "value": args[3],
                         },
                         {
-                            "name": "FUND_DATAMANAGER_BASE_URL",
+                            "name": "FUND_DATA_MANAGER_BASE_URL",
                             "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {
@@ -785,7 +785,7 @@ portfolio_manager_task_definition = aws.ecs.TaskDefinition(
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
-                            "name": "FUND_DATAMANAGER_BASE_URL",
+                            "name": "FUND_DATA_MANAGER_BASE_URL",
                             "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {
@@ -860,7 +860,7 @@ ensemble_manager_task_definition = aws.ecs.TaskDefinition(
                     "portMappings": [{"containerPort": 8080, "protocol": "tcp"}],
                     "environment": [
                         {
-                            "name": "FUND_DATAMANAGER_BASE_URL",
+                            "name": "FUND_DATA_MANAGER_BASE_URL",
                             "value": f"http://data-manager-server.{args[1]}:8080",
                         },
                         {

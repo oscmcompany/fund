@@ -53,6 +53,36 @@ EXPECTED_CASH = 1000.0
 EXPECTED_BUYING_POWER = 2000.0
 
 
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_is_market_open_returns_true_when_market_is_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = True
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.is_market_open()
+
+    assert result is True
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_is_market_open_returns_false_when_market_is_closed(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = False
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.is_market_open()
+
+    assert result is False
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
 def test_alpaca_account_stores_values() -> None:
     account = AlpacaAccount(
         cash_amount=EXPECTED_CASH, buying_power=EXPECTED_BUYING_POWER
