@@ -503,8 +503,8 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
 
-    successful_opens = [r for r in open_results if r["status"] == "submitted"]
-    successful_closes = [r for r in close_results if r["status"] == "submitted"]
+    successful_opens = [r for r in open_results if r["status"] == "success"]
+    successful_closes = [r for r in close_results if r["status"] == "success"]
     positions_opened_count.set(len(successful_opens))
     positions_closed_count.set(len(successful_closes))
     observe_duration(timer_start)
@@ -516,7 +516,6 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     )
 
     if failed_trades:
-        observe_duration(timer_start)
         return Response(status_code=status.HTTP_207_MULTI_STATUS)
 
     return Response(status_code=status.HTTP_200_OK)

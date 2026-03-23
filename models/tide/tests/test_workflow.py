@@ -23,9 +23,8 @@ def test_prepare_data_calls_prepare_training_data(
     mock_data_block.bucket_name = "data-bucket"
     mock_artifact_block = MagicMock()
     mock_artifact_block.bucket_name = "artifacts-bucket"
-    mock_s3_bucket.load.side_effect = lambda name: (
-        mock_data_block if name == "data-bucket" else mock_artifact_block
-    )
+    block_map = {"data-bucket": mock_data_block, "artifact-bucket": mock_artifact_block}
+    mock_s3_bucket.load.side_effect = lambda name: block_map[name]
 
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
@@ -48,9 +47,8 @@ def test_prepare_data_passes_output_key(
     mock_data_block.bucket_name = "data-bucket"
     mock_artifact_block = MagicMock()
     mock_artifact_block.bucket_name = "artifacts-bucket"
-    mock_s3_bucket.load.side_effect = lambda name: (
-        mock_data_block if name == "data-bucket" else mock_artifact_block
-    )
+    block_map = {"data-bucket": mock_data_block, "artifact-bucket": mock_artifact_block}
+    mock_s3_bucket.load.side_effect = lambda name: block_map[name]
 
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
