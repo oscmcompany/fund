@@ -27,7 +27,6 @@ from .metrics import (
     rebalance_requests_total,
     regime_state,
     start_timer,
-    trades_submitted_total,
 )
 
 sentry_sdk.init(
@@ -162,6 +161,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     except Exception as e:
         rebalance_errors_total.labels(stage="account").inc()
         logger.exception("Failed to retrieve account", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -177,14 +177,18 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             spy_prices_count=spy_prices.height,
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="historical_data").inc()
         logger.exception("Failed to retrieve historical data", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         raw_predictions = await get_raw_predictions()
         logger.info("Retrieved predictions", count=len(raw_predictions))
     except Exception as e:
+        rebalance_errors_total.labels(stage="predictions").inc()
         logger.exception("Failed to retrieve predictions", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -195,7 +199,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         )
         logger.info("Consolidated signals", count=consolidated_signals.height)
     except Exception as e:
+        rebalance_errors_total.labels(stage="consolidation").inc()
         logger.exception("Failed to consolidate predictions", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -203,7 +209,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         prior_portfolio_tickers = prior_portfolio["ticker"].unique().to_list()
         logger.info("Retrieved prior portfolio", count=len(prior_portfolio_tickers))
     except Exception as e:
+        rebalance_errors_total.labels(stage="prior_portfolio").inc()
         logger.exception("Failed to retrieve prior portfolio", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -214,7 +222,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             closing_count=len(prior_portfolio_tickers) - len(held_tickers),
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="evaluate_pairs").inc()
         logger.exception("Failed to evaluate prior pairs", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
@@ -230,7 +240,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
         )
         logger.info("Filtered to shortable tickers", count=consolidated_signals.height)
     except Exception as e:
+        rebalance_errors_total.labels(stage="shortable_tickers").inc()
         logger.exception("Failed to retrieve shortable tickers", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -243,13 +255,16 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     except Exception as e:
         rebalance_errors_total.labels(stage="pair_selection").inc()
         logger.exception("Failed to select candidate pairs", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     if candidate_pairs.height > 0:
         try:
             candidate_pairs = pairs_schema.validate(candidate_pairs)
         except Exception as e:
+            rebalance_errors_total.labels(stage="schema_validation").inc()
             logger.exception("Candidate pairs failed schema validation", error=str(e))
+            observe_duration(timer_start)
             return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -266,7 +281,9 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             exposure_scale=exposure_scale,
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="market_betas").inc()
         logger.exception("Failed to compute market betas or regime", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -284,13 +301,16 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             error=str(e),
             candidate_pairs_count=candidate_pairs.height,
         )
+        observe_duration(timer_start)
         return Response(
             status_code=status.HTTP_200_OK,
             content="Insufficient pairs to create portfolio, no trades will be made",
             media_type="text/plain",
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="optimal_portfolio").inc()
         logger.exception("Failed to create optimal portfolio", error=str(e))
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -305,10 +325,12 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
             close_count=len(close_positions),
         )
     except Exception as e:
+        rebalance_errors_total.labels(stage="positions").inc()
         logger.exception(
             "Failed to determine positions to open and close",
             error=str(e),
         )
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     close_results = []
@@ -481,8 +503,10 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
 
-    positions_opened_count.set(len(open_results))
-    positions_closed_count.set(len(close_results))
+    successful_opens = [r for r in open_results if r["status"] == "submitted"]
+    successful_closes = [r for r in close_results if r["status"] == "submitted"]
+    positions_opened_count.set(len(successful_opens))
+    positions_closed_count.set(len(successful_closes))
     observe_duration(timer_start)
 
     logger.info(
@@ -492,6 +516,7 @@ async def create_portfolio() -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C9
     )
 
     if failed_trades:
+        observe_duration(timer_start)
         return Response(status_code=status.HTTP_207_MULTI_STATUS)
 
     return Response(status_code=status.HTTP_200_OK)

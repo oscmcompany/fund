@@ -150,12 +150,10 @@ def test_train_tide_model_calls_end_run_failed_on_error(
     parquet_bytes = parquet_buffer.getvalue()
     mock_s3.get_object.return_value = {"Body": MagicMock(read=lambda: parquet_bytes)}
 
-    with (
-        patch("tide.trainer.train_model") as mock_train,
-        pytest.raises(RuntimeError, match="Training failed"),
-    ):
+    with patch("tide.trainer.train_model") as mock_train:
         mock_train.side_effect = RuntimeError("Training failed")
-        train_tide_model.fn(training_data_key="training/data.parquet")
+        with pytest.raises(RuntimeError, match="Training failed"):
+            train_tide_model.fn(training_data_key="training/data.parquet")
 
     mock_start_run.assert_called_once()
     mock_end_run.assert_called_once_with(status="FAILED")

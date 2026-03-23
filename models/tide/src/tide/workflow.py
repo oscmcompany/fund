@@ -87,7 +87,7 @@ def train_tide_model(
     training_data_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
     """Download training data from S3, train model, upload artifact to S3."""
-    from tide.trainer import train_model  # noqa: PLC0415
+    from tide.trainer import DEFAULT_CONFIGURATION, train_model  # noqa: PLC0415
 
     try:
         artifact_block = S3Bucket.load(ARTIFACT_BLOCK_NAME)
@@ -120,7 +120,7 @@ def train_tide_model(
     logger.info("Training data loaded", rows=training_data.height)
 
     start_run(
-        configuration={},
+        configuration=DEFAULT_CONFIGURATION,
         tags={"source": "prefect", "task": "train-tide-model"},
     )
 

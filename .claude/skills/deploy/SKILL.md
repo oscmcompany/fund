@@ -20,9 +20,10 @@ manages AWS production infrastructure. Training orchestration uses Prefect Cloud
 
 ## Architecture
 
-```
+```text
 devenv.nix (local development)
-├── processes.prefect-worker (local Prefect worker)
+├── processes.training-worker-1 (local training worker 1)
+├── processes.training-worker-2 (local training worker 2)
 ├── tasks.models:tide:deploy (register deployments)
 ├── tasks.models:tide:train (trigger ECS training)
 ├── tasks.models:tide:train:local (trigger local training)
@@ -48,6 +49,7 @@ Prefect Cloud (training orchestration)
 ## AWS Services
 
 ECS Fargate services on a single ALB:
+
 | Service | ALB Route | Health Check | CPU/Memory |
 |---------|-----------|-------------|------------|
 | data-manager | path: `/equity-bars*`, etc. | `/health` | 256/512 |
@@ -72,24 +74,21 @@ Training uses Prefect Cloud with two work pools:
 - **fund-work-pool-ecs**: Production training on ECS Fargate (4096 CPU, 8192 MB)
   - Image: `<account>.dkr.ecr.us-east-1.amazonaws.com/fund/tide-runner:worker`
   - Configured in Prefect Cloud UI
-- **fund-work-pool-local**: Local development training via process worker
-  - Started by `devenv up` (runs `prefect worker start`)
+- **fund-work-pool-local**: Local development training via training worker
+  - Started by `devenv up` (runs training workers)
 
 Deployments defined in `prefect.yaml`:
-- `tide-training`: ECS pool, pulls code via git clone
-- `tide-training-local`: Local pool, uses working directory
+- `tide-trainer-remote`: ECS pool, pulls code via git clone
+- `tide-trainer-local`: Local pool, uses working directory
 
 ## Deployment Commands (devenv tasks)
 
 ```bash
-# Infrastructure lifecycle (from infrastructure/ directory)
-mask infrastructure stack up    # pulumi up
-mask infrastructure stack down  # pulumi down
-
-# Docker + ECS deployment
-mask infrastructure image build <pkg> <stage>   # build Docker image
-mask infrastructure image push <pkg> <stage>    # push to ECR
-mask infrastructure image deploy <pkg> <stage>  # force ECS redeployment
+# Infrastructure lifecycle
+infra-up      # pulumi up
+ecr-push      # push Docker images to ECR
+ecs-deploy    # force ECS redeployment
+deploy        # full deploy pipeline
 
 # Training
 devenv tasks run models:tide:deploy       # register Prefect deployments
@@ -97,7 +96,7 @@ devenv tasks run models:tide:train        # trigger ECS training run
 devenv tasks run models:tide:train:local  # trigger local training run
 
 # Local development
-devenv up                                 # start local Prefect worker
+devenv up                                 # start local training workers
 ```
 
 ## Adding a New Service
@@ -124,7 +123,7 @@ devenv up                                 # start local Prefect worker
 ## Common Issues
 
 - **ECR login expired**: `aws ecr get-login-password` tokens last 12 hours
-- **ECS service stuck**: force new deployment with `mask infrastructure image deploy`
+- **ECS service stuck**: force new deployment with `ecs-deploy`
 - **Pulumi state lock**: another `pulumi up` is running, wait or cancel
 - **NAT Gateway costs**: runs 24/7, budget alarm set
 - **Prefect Cloud auth**: ensure PREFECT_API_URL in .envrc points to Cloud, not localhost

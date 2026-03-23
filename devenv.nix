@@ -8,17 +8,17 @@ let
     data-manager = {
       dockerfile = "applications/data_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/data_manager-server";
+      ecrRepo = "fund/data-manager-server";
     };
     ensemble-manager = {
       dockerfile = "applications/ensemble_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/ensemble_manager-server";
+      ecrRepo = "fund/ensemble-manager-server";
     };
     portfolio-manager = {
       dockerfile = "applications/portfolio_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/portfolio_manager-server";
+      ecrRepo = "fund/portfolio-manager-server";
     };
   };
 
@@ -268,46 +268,22 @@ in {
     echo "Done. Run 'direnv allow' to reload."
   '';
 
-  # Create work pool and register training deployment on production
+  # Create ECS work pool and register training deployment on Prefect Cloud
   scripts.training-init.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-    cd "$DEVENV_ROOT/infrastructure"
-    ALB_URL=$(pulumi stack output --stack production aws_alb_url 2>/dev/null)
-    if [ -z "$ALB_URL" ]; then
-      echo "ALB URL not found. Run 'infra-up' first."
+    if [ -z "$PREFECT_API_KEY" ]; then
+      echo "PREFECT_API_KEY not set. Add it to .envrc and run 'direnv allow'."
       exit 1
     fi
 
-    PROD_URL="''${ALB_URL%/}:4200/api"
-
-    echo "Checking orchestrator at $PROD_URL..."
-    for i in 1 2 3 4 5; do
-      curl -sf "$PROD_URL/health" > /dev/null 2>&1 && break
-      echo "  Waiting for orchestrator..."
-      sleep 5
-    done
-
-    if ! curl -sf "$PROD_URL/health" > /dev/null 2>&1; then
-      echo "Orchestrator not reachable at $PROD_URL"
-      exit 1
-    fi
-
-    S3_DATA=$(pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
-    S3_ARTIFACTS=$(pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
-
-    echo "Creating fund-work-pool-local work pool..."
-    PREFECT_API_URL="$PROD_URL" \
-      uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null \
+    echo "Creating fund-work-pool-ecs work pool on Prefect Cloud..."
+    uv run --package tools prefect work-pool create "fund-work-pool-ecs" --type ecs 2>/dev/null \
       || echo "  already exists"
 
-    echo "Registering daily-training deployment..."
-    PREFECT_API_URL="$PROD_URL" \
-    AWS_S3_DATA_BUCKET_NAME="$S3_DATA" \
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$S3_ARTIFACTS" \
-      uv run --package tide python -m tide.deploy
+    echo "Registering training deployments..."
+    uv run prefect --no-prompt deploy --all
 
     echo ""
-    echo "Done. Dashboard: $ALB_URL:4200"
+    echo "Done. Visit Prefect Cloud dashboard to view deployments."
   '';
 
   # --- Local dev commands ---
