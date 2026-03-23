@@ -34,7 +34,7 @@ from .statistical_arbitrage import (
 logger = structlog.get_logger()
 
 DATA_MANAGER_BASE_URL = os.getenv(
-    "FUND_DATA_MANAGER_BASE_URL", "http://datamanager:8080"
+    "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
 ENSEMBLE_MANAGER_BASE_URL = os.getenv(
     "FUND_ENSEMBLE_MANAGER_BASE_URL",
@@ -379,6 +379,10 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             skipped_not_shortable=skipped_not_shortable,
         )
 
+    held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
+    final_portfolio = pl.concat([optimal_portfolio, held_rows])
+    save_portfolio(final_portfolio, current_timestamp)
+
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
 
@@ -569,20 +573,25 @@ def get_optimal_portfolio(
         exposure_scale=exposure_scale,
     )
 
-    optimal_portfolio = portfolio_schema.validate(optimal_portfolio)
+    return portfolio_schema.validate(optimal_portfolio)
 
-    save_portfolio_response = requests.post(
-        url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-        json={
-            "timestamp": current_timestamp.isoformat(),
-            "data": optimal_portfolio.to_dicts(),
-        },
-        timeout=60,
-    )
 
-    save_portfolio_response.raise_for_status()
-
-    return optimal_portfolio
+def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -> bool:
+    try:
+        response = requests.post(
+            url=f"{DATA_MANAGER_BASE_URL}/portfolios",
+            json={
+                "timestamp": current_timestamp.isoformat(),
+                "data": portfolio.to_dicts(),
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        logger.info("Saved portfolio state", count=portfolio.height)
+        return True  # noqa: TRY300
+    except Exception as e:
+        logger.exception("Failed to save portfolio state", error=str(e))
+        return False
 
 
 def get_positions(

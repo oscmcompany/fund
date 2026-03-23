@@ -36,63 +36,85 @@ def _seconds_until_next_rebalance() -> float:
     return (target - now).total_seconds()
 
 
-def _already_rebalanced_today(datamanager_base_url: str) -> bool:
-    today = datetime.now(tz=UTC).date()
+def _already_rebalanced_today(data_manager_base_url: str) -> bool:
+    today = datetime.now(tz=_EASTERN).date()
     try:
         response = requests.get(
-            url=f"{datamanager_base_url}/portfolios",
+            url=f"{data_manager_base_url}/portfolios",
             timeout=60,
         )
         if response.status_code >= 400:  # noqa: PLR2004
-            return False
+            logger.warning(
+                "Data manager error for portfolio check, skipping rebalance",
+                status_code=response.status_code,
+            )
+            return True
         data = response.json()
         if not data:
             return False
         for row in data:
             timestamp_value = row.get("timestamp")
             if timestamp_value is not None:
-                row_date = datetime.fromtimestamp(float(timestamp_value), tz=UTC).date()
+                row_date = datetime.fromtimestamp(
+                    float(timestamp_value), tz=_EASTERN
+                ).date()
                 if row_date == today:
                     return True
     except Exception as error:
         logger.exception(
-            "Failed to check prior portfolio for idempotency guard", error=str(error)
+            "Failed to check prior portfolio for idempotency guard, skipping rebalance",
+            error=str(error),
         )
+        return True
     return False
 
 
 async def spawn_rebalance_scheduler(
     alpaca_client: AlpacaClient,
-    datamanager_base_url: str,
-) -> None:
-    task = asyncio.create_task(_rebalance_loop(alpaca_client, datamanager_base_url))
+    data_manager_base_url: str,
+) -> asyncio.Task:
+    task = asyncio.create_task(_rebalance_loop(alpaca_client, data_manager_base_url))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 async def _rebalance_loop(
     alpaca_client: AlpacaClient,
-    datamanager_base_url: str,
+    data_manager_base_url: str,
 ) -> None:
     while True:
-        wait_seconds = _seconds_until_next_rebalance()
-        logger.info(
-            "Waiting for next portfolio rebalance",
-            seconds_until_rebalance=int(wait_seconds),
-        )
-        await asyncio.sleep(wait_seconds)
-
-        if not alpaca_client.is_market_open():
-            logger.info("Market is closed, skipping scheduled rebalance")
-            continue
-
-        if _already_rebalanced_today(datamanager_base_url):
-            logger.info("Portfolio already rebalanced today, skipping")
-            continue
-
-        logger.info("Starting scheduled portfolio rebalance")
         try:
-            await run_rebalance(alpaca_client)
-        except Exception as error:
-            logger.exception("Scheduled portfolio rebalance failed", error=str(error))
-            sentry_sdk.capture_exception(error)
+            wait_seconds = _seconds_until_next_rebalance()
+            logger.info(
+                "Waiting for next portfolio rebalance",
+                seconds_until_rebalance=int(wait_seconds),
+            )
+            await asyncio.sleep(wait_seconds)
+
+            try:
+                market_open = alpaca_client.is_market_open()
+            except Exception as error:
+                logger.exception("Failed to check market open status", error=str(error))
+                sentry_sdk.capture_exception(error)
+                continue
+
+            if not market_open:
+                logger.info("Market is closed, skipping scheduled rebalance")
+                continue
+
+            if _already_rebalanced_today(data_manager_base_url):
+                logger.info("Portfolio already rebalanced today, skipping")
+                continue
+
+            logger.info("Starting scheduled portfolio rebalance")
+            try:
+                await run_rebalance(alpaca_client)
+            except Exception as error:
+                logger.exception(
+                    "Scheduled portfolio rebalance failed", error=str(error)
+                )
+                sentry_sdk.capture_exception(error)
+        except asyncio.CancelledError:
+            logger.info("Rebalance scheduler cancelled")
+            return

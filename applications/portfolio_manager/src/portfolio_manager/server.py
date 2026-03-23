@@ -65,12 +65,14 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "Portfolio manager initialized", is_paper=_app.state.alpaca_client.is_paper
     )
-    await spawn_rebalance_scheduler(
+    _app.state.scheduler_task = await spawn_rebalance_scheduler(
         alpaca_client=_app.state.alpaca_client,
-        datamanager_base_url=DATA_MANAGER_BASE_URL,
+        data_manager_base_url=DATA_MANAGER_BASE_URL,
     )
     logger.info("Portfolio rebalance scheduler started")
     yield
+    _app.state.scheduler_task.cancel()
+    await _app.state.scheduler_task
 
 
 application: FastAPI = FastAPI(lifespan=_lifespan)

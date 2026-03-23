@@ -85,14 +85,19 @@ def test_seconds_until_next_rebalance_skips_sunday_to_monday() -> None:
 
 
 def test_already_rebalanced_today_returns_true_when_todays_portfolio_exists() -> None:
-    today = datetime.now(tz=UTC)
-    data = [{"ticker": "AAPL", "timestamp": today.timestamp()}]
+    frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
+    data = [{"ticker": "AAPL", "timestamp": frozen_now.timestamp()}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
 
-    with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://datamanager:8080")
+    with patch("portfolio_manager.scheduler.datetime") as mock_dt:
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        with patch(
+            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+        ):
+            result = _already_rebalanced_today("http://data-manager:8080")
 
     assert result is True
 
@@ -100,16 +105,42 @@ def test_already_rebalanced_today_returns_true_when_todays_portfolio_exists() ->
 def test_already_rebalanced_today_returns_false_when_portfolio_is_from_yesterday() -> (
     None
 ):
-    yesterday = datetime.now(tz=UTC) - timedelta(days=1)
+    frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
+    yesterday = frozen_now - timedelta(days=1)
     data = [{"ticker": "AAPL", "timestamp": yesterday.timestamp()}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
 
-    with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://datamanager:8080")
+    with patch("portfolio_manager.scheduler.datetime") as mock_dt:
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        with patch(
+            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+        ):
+            result = _already_rebalanced_today("http://data-manager:8080")
 
     assert result is False
+
+
+def test_already_rebalanced_today_handles_eastern_utc_day_boundary() -> None:
+    # Timestamp recorded at Monday 20:30 ET (= Tuesday 00:30 UTC).
+    # "now" is also Monday 20:30 ET — should detect already rebalanced for that ET day.
+    monday_eastern = datetime(2026, 3, 23, 20, 30, 0, tzinfo=_EASTERN)
+    data = [{"ticker": "AAPL", "timestamp": monday_eastern.timestamp()}]
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = data
+
+    with patch("portfolio_manager.scheduler.datetime") as mock_dt:
+        mock_dt.now.return_value = monday_eastern
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        with patch(
+            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+        ):
+            result = _already_rebalanced_today("http://data-manager:8080")
+
+    assert result is True
 
 
 def test_already_rebalanced_today_returns_false_on_empty_response() -> None:
@@ -118,29 +149,29 @@ def test_already_rebalanced_today_returns_false_on_empty_response() -> None:
     mock_response.json.return_value = []
 
     with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://datamanager:8080")
+        result = _already_rebalanced_today("http://data-manager:8080")
 
     assert result is False
 
 
-def test_already_rebalanced_today_returns_false_on_error_status() -> None:
+def test_already_rebalanced_today_returns_true_on_error_status() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
 
     with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://datamanager:8080")
+        result = _already_rebalanced_today("http://data-manager:8080")
 
-    assert result is False
+    assert result is True
 
 
-def test_already_rebalanced_today_returns_false_on_request_exception() -> None:
+def test_already_rebalanced_today_returns_true_on_request_exception() -> None:
     with patch(
         "portfolio_manager.scheduler.requests.get",
         side_effect=Exception("network error"),
     ):
-        result = _already_rebalanced_today("http://datamanager:8080")
+        result = _already_rebalanced_today("http://data-manager:8080")
 
-    assert result is False
+    assert result is True
 
 
 def test_already_rebalanced_today_returns_false_when_timestamp_field_is_missing() -> (
@@ -152,6 +183,6 @@ def test_already_rebalanced_today_returns_false_when_timestamp_field_is_missing(
     mock_response.json.return_value = data
 
     with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://datamanager:8080")
+        result = _already_rebalanced_today("http://data-manager:8080")
 
     assert result is False
