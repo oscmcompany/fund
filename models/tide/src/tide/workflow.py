@@ -5,6 +5,7 @@ import tarfile
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 # Required for Prefect's ECS managed runner: after git-cloning the repo,
 # models/tide/src/ is not on sys.path, so tide.* imports would fail.
@@ -42,8 +43,8 @@ def prepare_data(
 ) -> str:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
     try:
-        data_block = S3Bucket.load(DATA_BLOCK_NAME)
-        artifact_block = S3Bucket.load(ARTIFACT_BLOCK_NAME)
+        data_block = cast("S3Bucket", S3Bucket.load(DATA_BLOCK_NAME))
+        artifact_block = cast("S3Bucket", S3Bucket.load(ARTIFACT_BLOCK_NAME))
     except ValueError as err:
         message = (
             f"Prefect S3Bucket blocks '{DATA_BLOCK_NAME}' and '{ARTIFACT_BLOCK_NAME}' "
@@ -90,7 +91,7 @@ def train_tide_model(
     from tide.trainer import DEFAULT_CONFIGURATION, train_model  # noqa: PLC0415
 
     try:
-        artifact_block = S3Bucket.load(ARTIFACT_BLOCK_NAME)
+        artifact_block = cast("S3Bucket", S3Bucket.load(ARTIFACT_BLOCK_NAME))
     except ValueError as err:
         message = (
             f"Prefect S3Bucket block '{ARTIFACT_BLOCK_NAME}' not found. "

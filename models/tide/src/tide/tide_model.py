@@ -45,7 +45,7 @@ def quantile_loss(
             delta_t = Tensor(huber_delta)
             huber_error = Tensor.where(
                 abs_error <= delta_t,
-                cast("Tensor", (error ** 2) / (Tensor(2.0) * delta_t)),
+                cast("Tensor", (error**2) / (Tensor(2.0) * delta_t)),
                 cast("Tensor", abs_error - delta_t / Tensor(2.0)),
             )
             quantile_tensor = Tensor(quantile)

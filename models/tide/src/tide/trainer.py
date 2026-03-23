@@ -1,4 +1,4 @@
-from typing import cast
+from typing import Any, cast
 
 import polars as pl
 import structlog
@@ -9,7 +9,7 @@ from tide.tracking import log_epoch_loss, log_training_result
 
 logger = structlog.get_logger()
 
-DEFAULT_CONFIGURATION = {
+DEFAULT_CONFIGURATION: dict[str, Any] = {
     "architecture": "TiDE",
     "learning_rate": 0.0005,
     "epoch_count": 200,
