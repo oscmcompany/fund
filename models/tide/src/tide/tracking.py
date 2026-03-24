@@ -60,8 +60,7 @@ def start_run(
     run = mlflow.start_run(run_name=run_name, tags=run_tags)
 
     safe_params = {
-        k: str(v) if isinstance(v, list) else v
-        for k, v in configuration.items()
+        k: str(v) if isinstance(v, list) else v for k, v in configuration.items()
     }
     mlflow.log_params(safe_params)
 

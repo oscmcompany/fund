@@ -13,7 +13,7 @@ import structlog
 from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
-from .alpaca_client import AlpacaClient
+from .alpaca_client import AlpacaAccount, AlpacaClient
 from .metrics import (
     account_buying_power,
     account_cash,
@@ -409,7 +409,7 @@ def _execute_close_positions(
 def _execute_open_positions(
     alpaca_client: AlpacaClient,
     open_positions: list[dict],
-    account: object,
+    account: AlpacaAccount,
 ) -> list[dict]:
     results: list[dict] = []
     remaining_buying_power = account.buying_power
