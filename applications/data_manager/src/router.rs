@@ -29,5 +29,5 @@ pub fn create_app_with_state(state: State) -> Router {
         .route("/equity-details", post(equity_details::sync))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(SentryHttpLayer::with_transaction())
+        .layer(SentryHttpLayer::new().enable_transaction())
 }
