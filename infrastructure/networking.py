@@ -3,8 +3,6 @@ import pulumi_aws as aws
 from config import (
     availability_zone_a,
     availability_zone_b,
-    prefect_allowed_ipv4_cidrs,
-    prefect_allowed_ipv6_cidrs,
     region,
     tags,
 )
@@ -165,32 +163,6 @@ alb_security_group = aws.ec2.SecurityGroup(
             to_port=443,
             cidr_blocks=["0.0.0.0/0"],
             description="Allow HTTPS",
-        ),
-        *(
-            [
-                aws.ec2.SecurityGroupIngressArgs(
-                    protocol="tcp",
-                    from_port=4200,
-                    to_port=4200,
-                    cidr_blocks=prefect_allowed_ipv4_cidrs,
-                    description="Allow Prefect dashboard from team IPv4",
-                ),
-            ]
-            if prefect_allowed_ipv4_cidrs
-            else []
-        ),
-        *(
-            [
-                aws.ec2.SecurityGroupIngressArgs(
-                    protocol="tcp",
-                    from_port=4200,
-                    to_port=4200,
-                    ipv6_cidr_blocks=prefect_allowed_ipv6_cidrs,
-                    description="Allow Prefect dashboard from team IPv6",
-                ),
-            ]
-            if prefect_allowed_ipv6_cidrs
-            else []
         ),
     ],
     egress=[
