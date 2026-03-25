@@ -119,6 +119,65 @@ def test_quantile_loss_rejects_invalid_quantiles() -> None:
         quantile_loss(predictions, targets, quantiles=[0.1, 1.5, 0.9])
 
 
+def test_quantile_loss_huber_path_returns_nonnegative() -> None:
+    predictions = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH, NUM_QUANTILES)).astype(
+            np.float32
+        )
+    )
+    targets = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH)).astype(np.float32)
+    )
+    loss = quantile_loss(predictions, targets, huber_delta=0.5)
+    assert loss.numpy().item() >= 0
+
+
+def test_quantile_loss_huber_differs_from_pinball() -> None:
+    predictions = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH, NUM_QUANTILES)).astype(
+            np.float32
+        )
+    )
+    targets = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH)).astype(np.float32)
+    )
+    pinball_loss = quantile_loss(predictions, targets, huber_delta=0.0)
+    huber_loss = quantile_loss(predictions, targets, huber_delta=0.5)
+    assert pinball_loss.numpy().item() != huber_loss.numpy().item()
+
+
+def test_quantile_loss_rejects_negative_huber_delta() -> None:
+    predictions = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH, NUM_QUANTILES)).astype(
+            np.float32
+        )
+    )
+    targets = Tensor(
+        rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH)).astype(np.float32)
+    )
+    with pytest.raises(ValueError, match="huber_delta must be non-negative"):
+        quantile_loss(predictions, targets, huber_delta=-0.5)
+
+
+def test_model_train_with_huber_delta() -> None:
+    input_size = _compute_input_size()
+    model = Model(
+        input_size=input_size,
+        hidden_size=HIDDEN_SIZE,
+        output_length=OUTPUT_LENGTH,
+        huber_delta=0.5,
+    )
+    batches = [_make_batch()]
+    losses = model.train(
+        train_batches=batches,
+        epochs=EPOCHS_SHORT,
+        learning_rate=LEARNING_RATE,
+        validate_data=False,
+    )
+    assert len(losses) == EPOCHS_SHORT
+    assert all(isinstance(loss, float) for loss in losses)
+
+
 def test_model_forward_output_shape() -> None:
     input_size = _compute_input_size()
     model = Model(
