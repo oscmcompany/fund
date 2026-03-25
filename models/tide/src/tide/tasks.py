@@ -33,7 +33,7 @@ def read_equity_bars_from_s3(
 
     all_dataframes = []
     current_date = start_date
-    batch_dataframes = []
+    batch_dataframes: list[pl.DataFrame] = []
     days_in_batch = 0
 
     while current_date <= end_date:
@@ -191,12 +191,13 @@ def write_training_data_to_s3(
     return s3_uri
 
 
-def prepare_training_data(
+def prepare_training_data(  # noqa: PLR0913
     data_bucket_name: str,
     model_artifacts_bucket_name: str,
     start_date: datetime,
     end_date: datetime,
     output_key: str = "training/filtered_tide_training_data.parquet",
+    s3_client: "S3Client | None" = None,
 ) -> str:
     """Main function to prepare training data."""
     logger.info(
@@ -207,7 +208,8 @@ def prepare_training_data(
         end_date=end_date.strftime("%Y-%m-%d"),
     )
 
-    s3_client = boto3.client("s3")
+    if s3_client is None:
+        s3_client = boto3.client("s3")
 
     equity_bars = read_equity_bars_from_s3(
         s3_client=s3_client,
