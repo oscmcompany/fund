@@ -16,7 +16,7 @@ fn sample_equity_bar() -> EquityBar {
         high_price: Some(105.0),
         low_price: Some(99.0),
         close_price: Some(103.0),
-        volume: Some(1000000.0),
+        volume: Some(1000000),
         volume_weighted_average_price: Some(102.0),
         transactions: Some(5000),
     }
@@ -31,7 +31,7 @@ fn sample_equity_bar_lowercase() -> EquityBar {
         high_price: Some(2050.0),
         low_price: Some(1990.0),
         close_price: Some(2030.0),
-        volume: Some(500000.0),
+        volume: Some(500000),
         volume_weighted_average_price: Some(2020.0),
         transactions: Some(2500),
     }
@@ -63,7 +63,7 @@ fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
 fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
-        timestamp: 1234567890.0,
+        timestamp: 1234567890,
         side: "long".to_string(),
         dollar_amount: 10000.0,
         action: "hold".to_string(),
@@ -75,7 +75,7 @@ fn sample_portfolio() -> Portfolio {
 fn sample_portfolio_lowercase() -> Portfolio {
     Portfolio {
         ticker: "aapl".to_string(),
-        timestamp: 1234567890.0,
+        timestamp: 1234567890,
         side: "short".to_string(),
         dollar_amount: 5000.0,
         action: "sell".to_string(),
@@ -362,7 +362,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
     let portfolios = vec![
         Portfolio {
             ticker: "aapl".to_string(),
-            timestamp: 1234567890.0,
+            timestamp: 1234567890,
             side: "long".to_string(),
             dollar_amount: 10000.0,
             action: "buy".to_string(),
@@ -370,7 +370,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
         },
         Portfolio {
             ticker: "GOOGL".to_string(),
-            timestamp: 1234567890.0,
+            timestamp: 1234567890,
             side: "SHORT".to_string(),
             dollar_amount: 5000.0,
             action: "Sell".to_string(),

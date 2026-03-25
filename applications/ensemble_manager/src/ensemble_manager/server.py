@@ -18,6 +18,7 @@ import structlog
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
+from internal.timestamps import to_timestamp_milliseconds
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 if TYPE_CHECKING:
@@ -373,10 +374,10 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
     processed_prediction_timestamp = current_timestamp + timedelta(days=6)
     processed_predictions = predictions.filter(
         pl.col("timestamp")
-        == int(
+        == to_timestamp_milliseconds(
             processed_prediction_timestamp.replace(
                 hour=0, minute=0, second=0, microsecond=0
-            ).timestamp()
+            )
         )
     )
 

@@ -171,7 +171,7 @@ def test_equity_bars_schema_type_coercion() -> None:
     data = pl.DataFrame(
         {
             "ticker": ["AAPL"],
-            "timestamp": ["1674000000.0"],  # string that can be coerced to float
+            "timestamp": ["1674000000"],  # string that can be coerced to int
             "open_price": ["150.0"],  # string that can be coerced to float
             "high_price": [155],  # int that can be coerced to float
             "low_price": [149.0],
@@ -183,7 +183,7 @@ def test_equity_bars_schema_type_coercion() -> None:
     )
 
     validated_df = equity_bars_schema.validate(data)
-    assert validated_df["timestamp"].dtype == pl.Float64
+    assert validated_df["timestamp"].dtype == pl.Int64
     assert validated_df["open_price"].dtype == pl.Float64
     assert validated_df["high_price"].dtype == pl.Float64
     assert validated_df["volume"].dtype == pl.Int64

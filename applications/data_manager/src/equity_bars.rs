@@ -256,7 +256,7 @@ pub async fn sync(
     };
 
     let tickers: Vec<String> = bars.iter().map(|b| b.ticker.clone()).collect();
-    let volumes: Vec<Option<f64>> = bars.iter().map(|b| b.v).collect();
+    let volumes: Vec<Option<i64>> = bars.iter().map(|b| b.v.map(|v| v.round() as i64)).collect();
     let volume_weighted_average_prices: Vec<Option<f64>> = bars.iter().map(|b| b.vw).collect();
     let open_prices: Vec<Option<f64>> = bars.iter().map(|b| b.o).collect();
     let close_prices: Vec<Option<f64>> = bars.iter().map(|b| b.c).collect();

@@ -430,7 +430,9 @@ pub async fn query_equity_bars_parquet_from_s3(
 #[derive(Deserialize)]
 pub struct PredictionQuery {
     pub ticker: String,
-    pub timestamp: f64, // Unix timestamp as float
+    /// Unix timestamp in milliseconds used to locate the S3 partition
+    /// (year/month/day). See EquityBar.timestamp for the rationale.
+    pub timestamp: i64,
 }
 
 pub async fn query_predictions_dataframe_from_s3(
@@ -447,10 +449,7 @@ pub async fn query_predictions_dataframe_from_s3(
     let mut tickers = Vec::new();
 
     for prediction_query in predictions_query.iter() {
-        let timestamp_seconds = prediction_query.timestamp;
-        let seconds = timestamp_seconds.trunc() as i64;
-        let nanos = ((timestamp_seconds.fract()) * 1_000_000_000_f64).round() as u32;
-        let timestamp = DateTime::<Utc>::from_timestamp(seconds, nanos)
+        let timestamp = DateTime::<Utc>::from_timestamp_millis(prediction_query.timestamp)
             .ok_or_else(|| Error::Other("Invalid timestamp".into()))?;
         let year = timestamp.format("%Y");
         let month = timestamp.format("%m");
@@ -652,7 +651,7 @@ fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<P
         .query_map([], |row| {
             Ok(Portfolio {
                 ticker: row.get::<_, String>(0)?,
-                timestamp: row.get::<_, f64>(1)?,
+                timestamp: row.get::<_, i64>(1)?,
                 side: row.get::<_, String>(2)?,
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,

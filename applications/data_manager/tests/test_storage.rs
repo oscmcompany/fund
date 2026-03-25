@@ -35,7 +35,7 @@ fn sample_prediction() -> Prediction {
 fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600.0,
+        timestamp: 1_735_689_600,
         side: "LONG".to_string(),
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
@@ -51,7 +51,7 @@ fn sample_equity_bar() -> EquityBar {
         high_price: Some(110.0),
         low_price: Some(99.0),
         close_price: Some(105.0),
-        volume: Some(2_000_000.0),
+        volume: Some(2_000_000),
         volume_weighted_average_price: Some(104.0),
         transactions: Some(1_000),
     }
@@ -130,7 +130,7 @@ async fn test_write_and_query_predictions_round_trip() {
         &state,
         vec![PredictionQuery {
             ticker: "AAPL".to_string(),
-            timestamp: timestamp.timestamp() as f64,
+            timestamp: timestamp.timestamp_millis(),
         }],
     )
     .await
@@ -164,7 +164,7 @@ async fn test_query_predictions_returns_empty_dataframe_when_no_rows_match() {
         &state,
         vec![PredictionQuery {
             ticker: "MSFT".to_string(),
-            timestamp: timestamp.timestamp() as f64,
+            timestamp: timestamp.timestamp_millis(),
         }],
     )
     .await
