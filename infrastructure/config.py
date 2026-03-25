@@ -82,19 +82,6 @@ if not budget_alert_email_addresses:
 
 monthly_budget_limit_usd = stack_config.require_float("monthlyBudgetLimitUsd")
 
-prefect_allowed_cidrs = cast(
-    "list[str]",
-    stack_config.require_object("prefectAllowedCidrs"),
-)
-if not prefect_allowed_cidrs:
-    message = (
-        "Pulumi config 'prefectAllowedCidrs' must include at least one CIDR block."
-    )
-    raise ValueError(message)
-
-prefect_allowed_ipv4_cidrs = [c for c in prefect_allowed_cidrs if ":" not in c]
-prefect_allowed_ipv6_cidrs = [c for c in prefect_allowed_cidrs if ":" in c]
-
 training_notification_sender_email = stack_config.require_secret(
     "trainingNotificationSenderEmail"
 )

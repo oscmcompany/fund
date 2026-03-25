@@ -23,6 +23,7 @@ def quantile_loss(
     predictions: Tensor,
     targets: Tensor,
     quantiles: list[float] | None = None,
+    huber_delta: float = 0.0,
 ) -> Tensor:
     if quantiles is None:
         quantiles = [0.1, 0.5, 0.9]
@@ -31,17 +32,40 @@ def quantile_loss(
         message = "All quantiles must be between 0 and 1"
         raise ValueError(message)
 
+    if huber_delta < 0:
+        message = f"huber_delta must be non-negative, got {huber_delta}"
+        raise ValueError(message)
+
     errors_total = Tensor(0.0)
     for index, quantile in enumerate(quantiles):
         error = targets.sub(predictions[:, :, index])
-        quantile_tensor = Tensor(quantile)
-        errors_total = errors_total.add(
-            Tensor.where(
+
+        if huber_delta > 0:
+            abs_error = error.abs()
+            delta_t = Tensor(huber_delta)
+            huber_error = Tensor.where(
+                abs_error <= delta_t,
+                cast("Tensor", (error**2) / (Tensor(2.0) * delta_t)),
+                cast("Tensor", abs_error - delta_t / Tensor(2.0)),
+            )
+            quantile_tensor = Tensor(quantile)
+            sign_weight = Tensor.where(
                 error > 0,
-                cast("Tensor", quantile_tensor.mul(error)),
-                cast("Tensor", (quantile_tensor.sub(1)).mul(error)),
-            ).mean()
-        )
+                quantile_tensor,
+                cast("Tensor", Tensor(1.0) - quantile_tensor),
+            )
+            errors_total = errors_total.add(
+                cast("Tensor", sign_weight * huber_error).mean()
+            )
+        else:
+            quantile_tensor = Tensor(quantile)
+            errors_total = errors_total.add(
+                Tensor.where(
+                    error > 0,
+                    cast("Tensor", quantile_tensor.mul(error)),
+                    cast("Tensor", (quantile_tensor.sub(1)).mul(error)),
+                ).mean()
+            )
 
     return cast("Tensor", errors_total.div(len(quantiles)))
 
@@ -105,6 +129,7 @@ class Model:
         output_length: int = 7,  # number of days to forecast
         dropout_rate: float = 0.1,
         quantiles: list[float] | None = None,
+        huber_delta: float = 0.0,
     ) -> None:
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -113,9 +138,14 @@ class Model:
         self.output_length = output_length
         self.dropout_rate = dropout_rate
         self.quantiles = quantiles or [0.1, 0.5, 0.9]
+        self.huber_delta = huber_delta
 
-        self.feature_projection = Linear(
+        self.feature_projection_1 = Linear(
             in_features=self.input_size,
+            out_features=self.hidden_size * 2,
+        )
+        self.feature_projection_2 = Linear(
+            in_features=self.hidden_size * 2,
             out_features=self.hidden_size,
         )
 
@@ -141,15 +171,12 @@ class Model:
                 )
             )
 
-        self.temporal_projection = Linear(  # projects to output sequence length
+        # combined projection: hidden -> output_length * num_quantiles
+        # avoids applying Linear to 3D tensors which triggers a tinygrad
+        # CPU codegen bug in the backward pass (linearizer.py assertion)
+        self.output_projection = Linear(
             in_features=self.hidden_size,
-            out_features=self.hidden_size * self.output_length,
-        )
-
-        # final output layer for quantiles
-        self.output_layer = Linear(
-            in_features=self.hidden_size,
-            out_features=len(self.quantiles),
+            out_features=self.output_length * len(self.quantiles),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -163,7 +190,8 @@ class Model:
         x = x.cast("float32")  # ensure float32 precision
         batch_size = x.shape[0]
 
-        x = self.feature_projection(x).relu()
+        x = self.feature_projection_1(x).relu()
+        x = self.feature_projection_2(x).relu()
 
         for encoder_block in self.encoder_blocks:
             x = encoder_block.forward(x)
@@ -176,25 +204,19 @@ class Model:
         # add skip connection from encoder to decoder output
         x = cast("Tensor", x.add(encoder_output))
 
-        # temporal projection to output sequence length
-        x = self.temporal_projection(x).relu()
+        # layer normalization after skip connection
+        mean = x.mean(axis=-1, keepdim=True)
+        variance = ((x.sub(mean)) ** 2).mean(axis=-1, keepdim=True)
+        x = cast(
+            "Tensor",
+            (x - mean) / (variance + Tensor(1e-5).cast("float32")).sqrt(),
+        )
 
-        # reshape to (batch_size, output_length, hidden_size)
-        x = x.reshape(batch_size, self.output_length, self.hidden_size)
+        # combined projection to (batch_size, output_length * num_quantiles)
+        x = self.output_projection(x.relu())
 
-        # apply output layer across the sequence dimension
-        predictions: list[Tensor] = []
-        for t in range(self.output_length):
-            prediction_batch = self.output_layer(
-                x[:, t, :]
-            )  # (batch_size, num_quantiles)
-            predictions.append(prediction_batch)
-
-        predictions_first = predictions[0]
-        predictions_rest = predictions[1:]
-
-        # stack predictions: (batch_size, output_length, num_quantiles e.g. (32, 7, 3))
-        return predictions_first.stack(*predictions_rest, dim=1)
+        # reshape to (batch_size, output_length, num_quantiles)
+        return x.reshape(batch_size, self.output_length, len(self.quantiles))
 
     def _validate_batch(self, batch: dict[str, Tensor], _batch_idx: int) -> dict:
         """Check a batch for NaN/Inf values and return statistics."""
@@ -359,7 +381,12 @@ class Model:
                     # reshape targets to (batch_size, output_length)
                     targets_reshaped = targets.reshape(batch_size, self.output_length)
 
-                    loss = quantile_loss(predictions, targets_reshaped, self.quantiles)
+                    loss = quantile_loss(
+                        predictions,
+                        targets_reshaped,
+                        self.quantiles,
+                        huber_delta=self.huber_delta,
+                    )
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -495,6 +522,7 @@ class Model:
             "output_length": self.output_length,
             "dropout_rate": self.dropout_rate,
             "quantiles": self.quantiles,
+            "huber_delta": self.huber_delta,
         }
 
         parameters_file_path = os.path.join(directory_path, "tide_parameters.json")  # noqa: PTH118

@@ -174,23 +174,6 @@ aws.ecr.LifecyclePolicy(
     policy=_ecr_lifecycle_policy,
 )
 
-model_trainer_server_worker_repository = aws.ecr.Repository(
-    "model_trainer_server_worker_repository",
-    name="fund/model-trainer-server-worker",
-    image_tag_mutability="MUTABLE",
-    force_delete=True,
-    image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
-        scan_on_push=True,
-    ),
-    tags=tags,
-)
-
-aws.ecr.LifecyclePolicy(
-    "model_trainer_server_worker_repository_lifecycle",
-    repository=model_trainer_server_worker_repository.name,
-    policy=_ecr_lifecycle_policy,
-)
-
 # Generate image URIs - these will be used in task definitions
 # For initial deployment, use a placeholder that will be updated when images are pushed
 data_manager_image_uri = data_manager_repository.repository_url.apply(
@@ -204,9 +187,4 @@ ensemble_manager_image_uri = ensemble_manager_repository.repository_url.apply(
 )
 tide_runner_image_uri = tide_runner_repository.repository_url.apply(
     lambda url: f"{url}:latest"
-)
-model_trainer_server_worker_image_uri = (
-    model_trainer_server_worker_repository.repository_url.apply(
-        lambda url: f"{url}:latest"
-    )
 )
