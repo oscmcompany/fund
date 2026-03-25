@@ -175,7 +175,7 @@ def train_tide_model(
     return f"s3://{artifacts_bucket}/{artifact_key}"
 
 
-@flow(  # type: ignore[no-matching-overload]
+@flow(  # type: ignore
     name="tide-training-pipeline",
     log_prints=True,
     on_completion=[send_training_notification],

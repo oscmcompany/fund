@@ -11,12 +11,7 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
     mock_deploy = MagicMock()
     mock_pipeline.deploy = mock_deploy
 
-    deploy_training_flow(
-        base_url="http://example.com",
-        data_bucket="data-bucket",
-        artifacts_bucket="artifacts-bucket",
-        lookback_days=LOOKBACK_DAYS,
-    )
+    deploy_training_flow(lookback_days=LOOKBACK_DAYS)
 
     mock_deploy.assert_called_once()
     call_kwargs = mock_deploy.call_args.kwargs
@@ -24,7 +19,6 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
     assert call_kwargs["work_pool_name"] == "training-pool"
     assert call_kwargs["cron"] == "0 22 * * 1-5"
     assert call_kwargs["timezone"] == "America/New_York"
-    assert call_kwargs["parameters"]["base_url"] == "http://example.com"
     assert call_kwargs["parameters"]["lookback_days"] == LOOKBACK_DAYS
 
 
@@ -35,11 +29,7 @@ def test_deploy_training_flow_sets_module_path_entrypoint(
     mock_deploy = MagicMock()
     mock_pipeline.deploy = mock_deploy
 
-    deploy_training_flow(
-        base_url="http://example.com",
-        data_bucket="data-bucket",
-        artifacts_bucket="artifacts-bucket",
-    )
+    deploy_training_flow()
 
     call_kwargs = mock_deploy.call_args.kwargs
     assert call_kwargs["entrypoint_type"] == EntrypointType.MODULE_PATH
