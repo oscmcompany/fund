@@ -123,7 +123,7 @@ application: FastAPI = FastAPI(lifespan=_lifespan)
 
 _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
     "ticker": pl.String,
-    "timestamp": pl.Float64,
+    "timestamp": pl.Int64,
     "side": pl.String,
     "dollar_amount": pl.Float64,
     "action": pl.String,

@@ -65,7 +65,7 @@ async fn test_predictions_save_and_query_round_trip() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -82,7 +82,7 @@ async fn test_predictions_save_and_query_round_trip() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let encoded_query = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600.0}]");
+    let encoded_query = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600000}]");
     let response = client
         .get(app.url(&format!(
             "/predictions?tickers_and_timestamps={}",
@@ -106,7 +106,7 @@ async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fail
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -163,7 +163,7 @@ async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -180,7 +180,7 @@ async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let encoded = urlencoding::encode("[{\"ticker\":\"MSFT\",\"timestamp\":1735689600.0}]");
+    let encoded = urlencoding::encode("[{\"ticker\":\"MSFT\",\"timestamp\":1735689600000}]");
     let response = client
         .get(app.url(&format!("/predictions?tickers_and_timestamps={}", encoded)))
         .send()
@@ -195,7 +195,7 @@ async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
 async fn test_predictions_query_returns_internal_server_error_when_storage_query_fails() {
     let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 
-    let encoded = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600.0}]");
+    let encoded = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600000}]");
     let response = reqwest::Client::new()
         .get(app.url(&format!("/predictions?tickers_and_timestamps={}", encoded)))
         .send()
@@ -214,7 +214,7 @@ async fn test_portfolios_save_and_get_round_trip() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600.0,
+            "timestamp": 1735689600000,
             "side": "long",
             "dollar_amount": 10000.0,
             "action": "buy",
@@ -255,7 +255,7 @@ async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600.0,
+            "timestamp": 1735689600000,
             "side": "long",
             "dollar_amount": 10000.0,
             "action": "buy",
