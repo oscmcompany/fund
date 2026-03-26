@@ -30,6 +30,22 @@ pub async fn save(
     AxumState(state): AxumState<State>,
     Json(payload): Json<SavePayload>,
 ) -> impl IntoResponse {
+    // 2000-01-01T00:00:00Z in milliseconds. Values below this are almost
+    // certainly Unix seconds rather than milliseconds, which would silently
+    // place the partition in 1970.
+    const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
+
+    for prediction in &payload.data {
+        if prediction.timestamp < MIN_VALID_TIMESTAMP_MS {
+            let message = format!(
+                "Prediction timestamp {} is below minimum valid value {}; timestamps must be in milliseconds",
+                prediction.timestamp, MIN_VALID_TIMESTAMP_MS
+            );
+            warn!("{}", message);
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    }
+
     let predictions = match create_predictions_dataframe(payload.data) {
         Ok(df) => df,
         Err(err) => {

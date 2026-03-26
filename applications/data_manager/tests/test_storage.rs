@@ -303,6 +303,38 @@ async fn test_write_and_query_equity_bars_round_trip() {
             .get(0),
         Some("AAPL")
     );
+
+    // Prove timestamp survives the round-trip as millisecond Int64.
+    // A regression to Float64 or seconds would cause downstream consumers
+    // to silently receive wrong values.
+    assert_eq!(
+        *result_dataframe.column("timestamp").unwrap().dtype(),
+        DataType::Int64
+    );
+    assert_eq!(
+        result_dataframe
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .get(0),
+        Some(1_735_689_600_000i64)
+    );
+
+    // Prove volume survives as whole-share Int64.
+    assert_eq!(
+        *result_dataframe.column("volume").unwrap().dtype(),
+        DataType::Int64
+    );
+    assert_eq!(
+        result_dataframe
+            .column("volume")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .get(0),
+        Some(2_000_000i64)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

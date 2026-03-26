@@ -100,6 +100,36 @@ async fn test_predictions_save_and_query_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn test_predictions_save_returns_bad_request_for_seconds_precision_timestamp() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    // 1735689600 is 2025-01-01T00:00:00Z in Unix seconds.
+    // As a milliseconds timestamp it represents 1970-01-21T02:08:09.600Z,
+    // which would silently land in a 1970 S3 partition. The server must reject it.
+    let save_payload = r#"{
+        "data": [{
+            "ticker": "AAPL",
+            "timestamp": 1735689600,
+            "quantile_10": 190.0,
+            "quantile_50": 200.0,
+            "quantile_90": 210.0
+        }],
+        "timestamp": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let response = reqwest::Client::new()
+        .post(app.url("/predictions"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fails() {
     let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
 

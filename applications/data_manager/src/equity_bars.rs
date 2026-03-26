@@ -260,8 +260,13 @@ pub async fn sync(
         .iter()
         .map(|b| {
             b.v.and_then(|v| {
-                if v.is_finite() && v >= i64::MIN as f64 && v <= i64::MAX as f64 {
-                    Some(v.round() as i64)
+                if v.is_finite() && v >= 0.0 {
+                    let rounded = v.round();
+                    if rounded <= i64::MAX as f64 {
+                        Some(rounded as i64)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
