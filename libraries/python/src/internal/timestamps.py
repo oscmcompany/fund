@@ -16,5 +16,11 @@ def to_timestamp_milliseconds(dt: datetime) -> int:
     Use this helper at every site that converts a Python datetime to a stored
     or transmitted timestamp value. Do not use `int(dt.timestamp())` directly
     as that produces seconds, not milliseconds.
+
+    Raises ValueError if dt is not timezone-aware, as naive datetimes produce
+    system-timezone-dependent results.
     """
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        message = "Datetime must be timezone-aware"
+        raise ValueError(message)
     return int(dt.timestamp() * 1000)

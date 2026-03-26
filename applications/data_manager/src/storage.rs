@@ -571,7 +571,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                 "
                 SELECT
                     ticker,
-                    timestamp,
+                    CAST(timestamp AS BIGINT) AS timestamp,
                     side,
                     dollar_amount,
                     action,
@@ -597,7 +597,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                 WITH partitioned_data AS (
                     SELECT
                         ticker,
-                        timestamp,
+                        CAST(timestamp AS BIGINT) AS timestamp,
                         side,
                         dollar_amount,
                         action,

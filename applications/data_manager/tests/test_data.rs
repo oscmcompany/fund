@@ -11,7 +11,7 @@ use polars::prelude::*;
 fn sample_equity_bar() -> EquityBar {
     EquityBar {
         ticker: "AAPL".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         open_price: Some(100.0),
         high_price: Some(105.0),
         low_price: Some(99.0),
@@ -26,7 +26,7 @@ fn sample_equity_bar() -> EquityBar {
 fn sample_equity_bar_lowercase() -> EquityBar {
     EquityBar {
         ticker: "googl".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         open_price: Some(2000.0),
         high_price: Some(2050.0),
         low_price: Some(1990.0),
@@ -41,7 +41,7 @@ fn sample_equity_bar_lowercase() -> EquityBar {
 fn sample_prediction() -> Prediction {
     Prediction {
         ticker: "AAPL".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         quantile_10: 95.0,
         quantile_50: 100.0,
         quantile_90: 105.0,
@@ -63,7 +63,7 @@ fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
 fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         side: "long".to_string(),
         dollar_amount: 10000.0,
         action: "hold".to_string(),
@@ -75,7 +75,7 @@ fn sample_portfolio() -> Portfolio {
 fn sample_portfolio_lowercase() -> Portfolio {
     Portfolio {
         ticker: "aapl".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         side: "short".to_string(),
         dollar_amount: 5000.0,
         action: "sell".to_string(),
@@ -152,7 +152,7 @@ fn test_create_equity_bar_dataframe_with_none_prices() {
     initialize_test_tracing();
     let bars = vec![EquityBar {
         ticker: "TEST".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         open_price: None,
         high_price: None,
         low_price: None,
@@ -206,7 +206,7 @@ fn test_create_predictions_dataframe_uppercase_normalization() {
     initialize_test_tracing();
     let predictions = vec![Prediction {
         ticker: "aapl".to_string(),
-        timestamp: 1234567890,
+        timestamp: 1234567890000,
         quantile_10: 95.0,
         quantile_50: 100.0,
         quantile_90: 105.0,
@@ -362,7 +362,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
     let portfolios = vec![
         Portfolio {
             ticker: "aapl".to_string(),
-            timestamp: 1234567890,
+            timestamp: 1234567890000,
             side: "long".to_string(),
             dollar_amount: 10000.0,
             action: "buy".to_string(),
@@ -370,7 +370,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
         },
         Portfolio {
             ticker: "GOOGL".to_string(),
-            timestamp: 1234567890,
+            timestamp: 1234567890000,
             side: "SHORT".to_string(),
             dollar_amount: 5000.0,
             action: "Sell".to_string(),

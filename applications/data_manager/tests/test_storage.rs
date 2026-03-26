@@ -25,7 +25,7 @@ use common::{create_test_s3_client, put_test_object, setup_test_bucket, test_buc
 fn sample_prediction() -> Prediction {
     Prediction {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600,
+        timestamp: 1_735_689_600_000,
         quantile_10: 190.0,
         quantile_50: 200.0,
         quantile_90: 210.0,
@@ -35,7 +35,7 @@ fn sample_prediction() -> Prediction {
 fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600,
+        timestamp: 1_735_689_600_000,
         side: "LONG".to_string(),
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
@@ -46,7 +46,7 @@ fn sample_portfolio() -> Portfolio {
 fn sample_equity_bar() -> EquityBar {
     EquityBar {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600,
+        timestamp: 1_735_689_600_000,
         open_price: Some(100.0),
         high_price: Some(110.0),
         low_price: Some(99.0),

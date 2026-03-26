@@ -171,7 +171,7 @@ def test_equity_bars_schema_type_coercion() -> None:
     data = pl.DataFrame(
         {
             "ticker": ["AAPL"],
-            "timestamp": ["1674000000"],  # string that can be coerced to int
+            "timestamp": ["1674000000000"],  # string that can be coerced to int
             "open_price": ["150.0"],  # string that can be coerced to float
             "high_price": [155],  # int that can be coerced to float
             "low_price": [149.0],

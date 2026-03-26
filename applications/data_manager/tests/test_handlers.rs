@@ -65,7 +65,7 @@ async fn test_predictions_save_and_query_round_trip() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -106,7 +106,7 @@ async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fail
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -163,7 +163,7 @@ async fn test_predictions_query_returns_empty_json_array_when_no_rows_match() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "quantile_10": 190.0,
             "quantile_50": 200.0,
             "quantile_90": 210.0
@@ -214,7 +214,7 @@ async fn test_portfolios_save_and_get_round_trip() {
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "side": "long",
             "dollar_amount": 10000.0,
             "action": "buy",
@@ -255,7 +255,7 @@ async fn test_portfolios_save_returns_internal_server_error_when_s3_upload_fails
     let save_payload = r#"{
         "data": [{
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "side": "long",
             "dollar_amount": 10000.0,
             "action": "buy",

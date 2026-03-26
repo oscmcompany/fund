@@ -17,7 +17,7 @@ def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
         rows.append(
             {
                 "ticker": pair["long_ticker"],
-                "timestamp": 1735689600,
+                "timestamp": 1735689600000,
                 "side": "LONG",
                 "dollar_amount": 1000.0,
                 "action": "OPEN_POSITION",
@@ -27,7 +27,7 @@ def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
         rows.append(
             {
                 "ticker": pair["short_ticker"],
-                "timestamp": 1735689600,
+                "timestamp": 1735689600000,
                 "side": "SHORT",
                 "dollar_amount": 1000.0,
                 "action": "OPEN_POSITION",
@@ -55,7 +55,7 @@ def _make_optimal_portfolio() -> pl.DataFrame:
     return pl.DataFrame(
         {
             "ticker": ["NVDA", "AMD"],
-            "timestamp": [1735689600, 1735689600],
+            "timestamp": [1735689600000, 1735689600000],
             "side": ["LONG", "SHORT"],
             "dollar_amount": [1000.0, 1000.0],
             "action": ["OPEN_POSITION", "OPEN_POSITION"],
@@ -156,7 +156,7 @@ def test_evaluate_prior_pairs_skips_malformed_pair_missing_long_leg() -> None:
     prior = pl.DataFrame(
         {
             "ticker": ["MSFT"],
-            "timestamp": [1735689600],
+            "timestamp": [1735689600000],
             "side": ["SHORT"],
             "dollar_amount": [1000.0],
             "action": ["OPEN_POSITION"],
@@ -264,7 +264,7 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     data = [
         {
             "ticker": "AAPL",
-            "timestamp": 1735689600,
+            "timestamp": 1735689600000,
             "side": "LONG",
             "dollar_amount": 1000.0,
             "action": "OPEN_POSITION",
