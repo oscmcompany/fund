@@ -816,7 +816,7 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export PREFECT_API_URL="$(pulumi stack output training_api_url)"
+export PREFECT_API_URL="$(pulumi stack output fund_base_url)"
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
 cd ../

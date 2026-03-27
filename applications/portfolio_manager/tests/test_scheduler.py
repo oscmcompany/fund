@@ -28,7 +28,10 @@ def _make_eastern_datetime(
 
 
 def test_seconds_until_next_rebalance_returns_positive_value() -> None:
-    result = _seconds_until_next_rebalance()
+    now_utc = _make_eastern_datetime(weekday_offset=0, hour=9).astimezone(UTC)
+    with patch("portfolio_manager.scheduler.datetime") as mock_dt:
+        mock_dt.now.return_value = now_utc
+        result = _seconds_until_next_rebalance()
     assert result > 0
 
 

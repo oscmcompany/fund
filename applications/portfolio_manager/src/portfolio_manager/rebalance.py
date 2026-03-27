@@ -71,6 +71,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to retrieve account", error=str(e))
         metrics.rebalance_errors_total.labels(stage="account").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -88,6 +89,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to retrieve historical data", error=str(e))
         metrics.rebalance_errors_total.labels(stage="historical_data").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -96,6 +98,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
         metrics.rebalance_errors_total.labels(stage="predictions").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -108,6 +111,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to consolidate predictions", error=str(e))
         metrics.rebalance_errors_total.labels(stage="consolidate_signals").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -117,6 +121,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to retrieve prior portfolio", error=str(e))
         metrics.rebalance_errors_total.labels(stage="prior_portfolio").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -129,6 +134,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to evaluate prior pairs", error=str(e))
         metrics.rebalance_errors_total.labels(stage="evaluate_pairs").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
@@ -146,6 +152,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to retrieve shortable tickers", error=str(e))
         metrics.rebalance_errors_total.labels(stage="shortable_tickers").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -157,6 +164,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to select candidate pairs", error=str(e))
         metrics.rebalance_errors_total.labels(stage="candidate_pairs").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -165,6 +173,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Candidate pairs failed schema validation", error=str(e))
         metrics.rebalance_errors_total.labels(stage="pairs_schema").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -183,6 +192,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to compute market betas or regime", error=str(e))
         metrics.rebalance_errors_total.labels(stage="market_regime").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -200,6 +210,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             error=str(e),
             candidate_pairs_count=candidate_pairs.height,
         )
+        metrics.observe_duration(start)
         return Response(
             status_code=status.HTTP_200_OK,
             content="Insufficient pairs to create portfolio, no trades will be made",
@@ -208,6 +219,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
         metrics.rebalance_errors_total.labels(stage="optimal_portfolio").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -216,8 +228,6 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             held_tickers=held_tickers,
             optimal_portfolio=optimal_portfolio,
         )
-        metrics.positions_opened_count.set(len(open_positions))
-        metrics.positions_closed_count.set(len(close_positions))
         logger.info(
             "Determined positions to open and close",
             open_count=len(open_positions),
@@ -229,15 +239,18 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             error=str(e),
         )
         metrics.rebalance_errors_total.labels(stage="positions").inc()
+        metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     close_results = []
+    closed_count = 0
     for close_position in close_positions:
         try:
             was_closed = alpaca_client.close_position(
                 ticker=close_position["ticker"],
             )
             if was_closed:
+                closed_count += 1
                 logger.info("Closed position", ticker=close_position["ticker"])
                 metrics.trades_submitted_total.labels(
                     action="close", status="success"
@@ -282,6 +295,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             )
 
     open_results = []
+    opened_count = 0
     remaining_buying_power = account.buying_power
     skipped_insufficient_buying_power = 0
     skipped_not_shortable = 0
@@ -325,8 +339,9 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 side=side,
                 dollar_amount=dollar_amount,
             )
+            opened_count += 1
             metrics.trades_submitted_total.labels(action="open", status="success").inc()
-            metrics.trade_dollar_amount_total.labels(side=str(side)).inc(dollar_amount)
+            metrics.trade_dollar_amount_total.labels(side=side.value).inc(dollar_amount)
             # Refresh remaining buying power from the account after a successful order
             try:
                 account = alpaca_client.get_account()
@@ -410,6 +425,9 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             skipped_insufficient_buying_power=skipped_insufficient_buying_power,
             skipped_not_shortable=skipped_not_shortable,
         )
+
+    metrics.positions_opened_count.set(opened_count)
+    metrics.positions_closed_count.set(closed_count)
 
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
