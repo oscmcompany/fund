@@ -9,6 +9,9 @@ from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
 from .alpaca_client import AlpacaClient
+from .metrics import (
+    get_metrics,
+)
 from .rebalance import DATA_MANAGER_BASE_URL, run_rebalance
 from .scheduler import spawn_rebalance_scheduler
 
@@ -81,6 +84,11 @@ application: FastAPI = FastAPI(lifespan=_lifespan)
 @application.get("/health")
 def health_check() -> Response:
     return Response(status_code=status.HTTP_200_OK)
+
+
+@application.get("/metrics")
+def metrics_endpoint() -> Response:
+    return get_metrics()
 
 
 @application.post("/portfolio")
