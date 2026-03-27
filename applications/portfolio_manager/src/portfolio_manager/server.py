@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -44,6 +45,8 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
+_rebalance_lock: asyncio.Lock = asyncio.Lock()
+
 ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
 ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET", "")
 
@@ -71,6 +74,7 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     _app.state.scheduler_task = await spawn_rebalance_scheduler(
         alpaca_client=_app.state.alpaca_client,
         data_manager_base_url=DATA_MANAGER_BASE_URL,
+        rebalance_lock=_rebalance_lock,
     )
     logger.info("Portfolio rebalance scheduler started")
     yield
@@ -93,4 +97,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/portfolio")
 async def create_portfolio() -> Response:
-    return await run_rebalance(application.state.alpaca_client)
+    if _rebalance_lock.locked():
+        return Response(status_code=status.HTTP_409_CONFLICT)
+    async with _rebalance_lock:
+        return await run_rebalance(application.state.alpaca_client)

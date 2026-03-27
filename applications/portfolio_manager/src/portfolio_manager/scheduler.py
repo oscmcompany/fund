@@ -71,8 +71,11 @@ async def _already_rebalanced_today(data_manager_base_url: str) -> bool:
 async def spawn_rebalance_scheduler(
     alpaca_client: AlpacaClient,
     data_manager_base_url: str,
+    rebalance_lock: asyncio.Lock,
 ) -> asyncio.Task:
-    task = asyncio.create_task(_rebalance_loop(alpaca_client, data_manager_base_url))
+    task = asyncio.create_task(
+        _rebalance_loop(alpaca_client, data_manager_base_url, rebalance_lock)
+    )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     return task
@@ -81,6 +84,7 @@ async def spawn_rebalance_scheduler(
 async def _rebalance_loop(  # noqa: C901
     alpaca_client: AlpacaClient,
     data_manager_base_url: str,
+    rebalance_lock: asyncio.Lock,
 ) -> None:
     now_eastern = datetime.now(tz=UTC).astimezone(_EASTERN)
     catch_up = (
@@ -117,9 +121,14 @@ async def _rebalance_loop(  # noqa: C901
                 logger.info("Portfolio already rebalanced today, skipping")
                 continue
 
+            if rebalance_lock.locked():
+                logger.info("Rebalance already in progress, skipping scheduled run")
+                continue
+
             logger.info("Starting scheduled portfolio rebalance")
             try:
-                response = await run_rebalance(alpaca_client)
+                async with rebalance_lock:
+                    response = await run_rebalance(alpaca_client)
                 if response.status_code != status.HTTP_200_OK:
                     logger.warning(
                         "Scheduled rebalance completed with non-200 status",
