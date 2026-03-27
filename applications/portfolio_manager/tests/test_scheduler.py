@@ -1,5 +1,6 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from portfolio_manager.scheduler import (
@@ -84,20 +85,28 @@ def test_seconds_until_next_rebalance_skips_sunday_to_monday() -> None:
 # --- _already_rebalanced_today ---
 
 
+def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.get.return_value = mock_response
+    return mock_client
+
+
 def test_already_rebalanced_today_returns_true_when_todays_portfolio_exists() -> None:
     frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
     data = [{"ticker": "AAPL", "timestamp": frozen_now.timestamp()}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
+    mock_client = _make_mock_http_client(mock_response)
 
     with patch("portfolio_manager.scheduler.datetime") as mock_dt:
         mock_dt.now.return_value = frozen_now
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         with patch(
-            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+            "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
         ):
-            result = _already_rebalanced_today("http://data-manager:8080")
+            result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is True
 
@@ -111,14 +120,15 @@ def test_already_rebalanced_today_returns_false_when_portfolio_is_from_yesterday
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
+    mock_client = _make_mock_http_client(mock_response)
 
     with patch("portfolio_manager.scheduler.datetime") as mock_dt:
         mock_dt.now.return_value = frozen_now
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         with patch(
-            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+            "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
         ):
-            result = _already_rebalanced_today("http://data-manager:8080")
+            result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is False
 
@@ -131,14 +141,15 @@ def test_already_rebalanced_today_handles_eastern_utc_day_boundary() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
+    mock_client = _make_mock_http_client(mock_response)
 
     with patch("portfolio_manager.scheduler.datetime") as mock_dt:
         mock_dt.now.return_value = monday_eastern
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         with patch(
-            "portfolio_manager.scheduler.requests.get", return_value=mock_response
+            "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
         ):
-            result = _already_rebalanced_today("http://data-manager:8080")
+            result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is True
 
@@ -147,9 +158,12 @@ def test_already_rebalanced_today_returns_false_on_empty_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = []
+    mock_client = _make_mock_http_client(mock_response)
 
-    with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://data-manager:8080")
+    with patch(
+        "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is False
 
@@ -157,19 +171,25 @@ def test_already_rebalanced_today_returns_false_on_empty_response() -> None:
 def test_already_rebalanced_today_returns_true_on_error_status() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
+    mock_client = _make_mock_http_client(mock_response)
 
-    with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://data-manager:8080")
+    with patch(
+        "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is True
 
 
 def test_already_rebalanced_today_returns_true_on_request_exception() -> None:
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.get.side_effect = Exception("network error")
+
     with patch(
-        "portfolio_manager.scheduler.requests.get",
-        side_effect=Exception("network error"),
+        "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
     ):
-        result = _already_rebalanced_today("http://data-manager:8080")
+        result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is True
 
@@ -181,8 +201,11 @@ def test_already_rebalanced_today_returns_false_when_timestamp_field_is_missing(
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
+    mock_client = _make_mock_http_client(mock_response)
 
-    with patch("portfolio_manager.scheduler.requests.get", return_value=mock_response):
-        result = _already_rebalanced_today("http://data-manager:8080")
+    with patch(
+        "portfolio_manager.scheduler.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(_already_rebalanced_today("http://data-manager:8080"))
 
     assert result is False

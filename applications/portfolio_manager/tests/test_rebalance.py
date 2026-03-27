@@ -1,9 +1,10 @@
+import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import polars as pl
 import pytest
-import requests
 from portfolio_manager.rebalance import (
     _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
@@ -251,12 +252,23 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
 # --- get_prior_portfolio ---
 
 
+def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.get.return_value = mock_response
+    mock_client.post.return_value = mock_response
+    return mock_client
+
+
 def test_get_prior_portfolio_returns_empty_dataframe_on_empty_array_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "[]"
-    with patch("portfolio_manager.rebalance.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.is_empty()
     assert "pair_id" in result.columns
 
@@ -276,8 +288,11 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     mock_response.status_code = 200
     mock_response.text = json.dumps(data)
     mock_response.json.return_value = data
-    with patch("portfolio_manager.rebalance.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.height == 1
     assert "pair_id" in result.columns
     assert result["pair_id"][0] == "AAPL-MSFT"
@@ -286,14 +301,19 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
 def test_get_prior_portfolio_raises_on_error_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
-    mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
-        response=mock_response
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        message="500 Internal Server Error",
+        request=MagicMock(),
+        response=mock_response,
     )
+    mock_client = _make_mock_http_client(mock_response)
     with (
-        patch("portfolio_manager.rebalance.requests.get", return_value=mock_response),
-        pytest.raises(requests.exceptions.HTTPError),
+        patch(
+            "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+        ),
+        pytest.raises(httpx.HTTPStatusError),
     ):
-        get_prior_portfolio()
+        asyncio.run(get_prior_portfolio())
 
 
 def test_get_prior_portfolio_raises_on_parse_error() -> None:
@@ -302,19 +322,25 @@ def test_get_prior_portfolio_raises_on_parse_error() -> None:
     mock_response.raise_for_status.return_value = None
     mock_response.text = '{"not": "a list"}'
     mock_response.json.side_effect = ValueError("invalid json")
+    mock_client = _make_mock_http_client(mock_response)
     with (
-        patch("portfolio_manager.rebalance.requests.get", return_value=mock_response),
+        patch(
+            "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+        ),
         pytest.raises(ValueError, match="invalid json"),
     ):
-        get_prior_portfolio()
+        asyncio.run(get_prior_portfolio())
 
 
 def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "  "
-    with patch("portfolio_manager.rebalance.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.is_empty()
 
 

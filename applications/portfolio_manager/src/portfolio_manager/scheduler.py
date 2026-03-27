@@ -2,7 +2,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import requests
+import httpx
 import sentry_sdk
 import structlog
 from fastapi import status
@@ -37,13 +37,11 @@ def _seconds_until_next_rebalance() -> float:
     return (target - now).total_seconds()
 
 
-def _already_rebalanced_today(data_manager_base_url: str) -> bool:
+async def _already_rebalanced_today(data_manager_base_url: str) -> bool:
     today = datetime.now(tz=_EASTERN).date()
     try:
-        response = requests.get(
-            url=f"{data_manager_base_url}/portfolios",
-            timeout=60,
-        )
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(url=f"{data_manager_base_url}/portfolios")
         if response.status_code >= 400:  # noqa: PLR2004
             logger.warning(
                 "Data manager error for portfolio check, skipping rebalance",
@@ -88,7 +86,7 @@ async def _rebalance_loop(  # noqa: C901
     catch_up = (
         now_eastern.weekday() < _WEEKEND_WEEKDAY_MIN
         and now_eastern.hour >= _REBALANCE_HOUR
-        and not _already_rebalanced_today(data_manager_base_url)
+        and not await _already_rebalanced_today(data_manager_base_url)
     )
     if catch_up:
         logger.info("Missed rebalance window detected, running immediately")
@@ -115,7 +113,7 @@ async def _rebalance_loop(  # noqa: C901
                 logger.info("Market is closed, skipping scheduled rebalance")
                 continue
 
-            if _already_rebalanced_today(data_manager_base_url):
+            if await _already_rebalanced_today(data_manager_base_url):
                 logger.info("Portfolio already rebalanced today, skipping")
                 continue
 

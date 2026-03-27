@@ -4,10 +4,10 @@ from datetime import UTC, datetime
 import httpx
 import numpy as np
 import polars as pl
-import requests
 import structlog
 from fastapi import Response, status
 
+from . import metrics
 from .alpaca_client import AlpacaClient
 from .beta import compute_market_betas
 from .consolidation import consolidate_predictions
@@ -54,6 +54,8 @@ _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
 
 
 async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+    metrics.rebalance_requests_total.inc()
+    start = metrics.start_timer()
     current_timestamp = datetime.now(tz=UTC)
     logger.info("Starting portfolio rebalance", timestamp=current_timestamp.isoformat())
 
@@ -64,8 +66,11 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             cash_amount=account.cash_amount,
             buying_power=account.buying_power,
         )
+        metrics.account_cash.set(float(account.cash_amount))
+        metrics.account_buying_power.set(float(account.buying_power))
     except Exception as e:
         logger.exception("Failed to retrieve account", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="account").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -82,6 +87,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         )
     except Exception as e:
         logger.exception("Failed to retrieve historical data", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="historical_data").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -89,6 +95,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         logger.info("Retrieved predictions", count=len(raw_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="predictions").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -100,14 +107,16 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         logger.info("Consolidated signals", count=consolidated_signals.height)
     except Exception as e:
         logger.exception("Failed to consolidate predictions", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="consolidate_signals").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_portfolio = get_prior_portfolio()
+        prior_portfolio = await get_prior_portfolio()
         prior_portfolio_tickers = prior_portfolio["ticker"].unique().to_list()
         logger.info("Retrieved prior portfolio", count=len(prior_portfolio_tickers))
     except Exception as e:
         logger.exception("Failed to retrieve prior portfolio", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="prior_portfolio").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -119,6 +128,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         )
     except Exception as e:
         logger.exception("Failed to evaluate prior pairs", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="evaluate_pairs").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
@@ -135,6 +145,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         logger.info("Filtered to shortable tickers", count=consolidated_signals.height)
     except Exception as e:
         logger.exception("Failed to retrieve shortable tickers", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="shortable_tickers").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -145,12 +156,15 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         logger.info("Selected candidate pairs", count=candidate_pairs.height)
     except Exception as e:
         logger.exception("Failed to select candidate pairs", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="candidate_pairs").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         candidate_pairs = pairs_schema.validate(candidate_pairs)
+        metrics.pairs_selected_count.set(candidate_pairs.height)
     except Exception as e:
         logger.exception("Candidate pairs failed schema validation", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="pairs_schema").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -158,6 +172,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         regime = classify_regime(spy_prices)
         # Binary scale is intentional; confidence reserved for future graduated scaling.
         exposure_scale = 1.0 if regime["state"] == "mean_reversion" else 0.5
+        metrics.regime_state.set(int(regime["state"] == "mean_reversion"))
+        metrics.exposure_scale_value.set(exposure_scale)
         logger.info(
             "Computed market betas and regime",
             regime_state=regime["state"],
@@ -166,6 +182,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         )
     except Exception as e:
         logger.exception("Failed to compute market betas or regime", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="market_regime").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -190,6 +207,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         )
     except Exception as e:
         logger.exception("Failed to create optimal portfolio", error=str(e))
+        metrics.rebalance_errors_total.labels(stage="optimal_portfolio").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
@@ -198,6 +216,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             held_tickers=held_tickers,
             optimal_portfolio=optimal_portfolio,
         )
+        metrics.positions_opened_count.set(len(open_positions))
+        metrics.positions_closed_count.set(len(close_positions))
         logger.info(
             "Determined positions to open and close",
             open_count=len(open_positions),
@@ -208,6 +228,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             "Failed to determine positions to open and close",
             error=str(e),
         )
+        metrics.rebalance_errors_total.labels(stage="positions").inc()
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     close_results = []
@@ -218,6 +239,9 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             )
             if was_closed:
                 logger.info("Closed position", ticker=close_position["ticker"])
+                metrics.trades_submitted_total.labels(
+                    action="close", status="success"
+                ).inc()
                 close_results.append(
                     {
                         "ticker": close_position["ticker"],
@@ -230,6 +254,9 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                     "Position already closed or did not exist",
                     ticker=close_position["ticker"],
                 )
+                metrics.trades_submitted_total.labels(
+                    action="close", status="skipped"
+                ).inc()
                 close_results.append(
                     {
                         "ticker": close_position["ticker"],
@@ -244,6 +271,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 ticker=close_position["ticker"],
                 error=str(e),
             )
+            metrics.trades_submitted_total.labels(action="close", status="failed").inc()
             close_results.append(
                 {
                     "ticker": close_position["ticker"],
@@ -272,6 +300,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 remaining_buying_power=remaining_buying_power,
             )
             skipped_insufficient_buying_power += 1
+            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
             open_results.append(
                 {
                     "ticker": ticker,
@@ -296,6 +325,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 side=side,
                 dollar_amount=dollar_amount,
             )
+            metrics.trades_submitted_total.labels(action="open", status="success").inc()
+            metrics.trade_dollar_amount_total.labels(side=str(side)).inc(dollar_amount)
             # Refresh remaining buying power from the account after a successful order
             try:
                 account = alpaca_client.get_account()
@@ -325,6 +356,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 error=str(e),
             )
             skipped_insufficient_buying_power += 1
+            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
             open_results.append(
                 {
                     "ticker": ticker,
@@ -343,6 +375,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 error=str(e),
             )
             skipped_not_shortable += 1
+            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
             open_results.append(
                 {
                     "ticker": ticker,
@@ -359,6 +392,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
                 ticker=ticker,
                 error=str(e),
             )
+            metrics.trades_submitted_total.labels(action="open", status="failed").inc()
             open_results.append(
                 {
                     "ticker": ticker,
@@ -379,7 +413,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
-    save_succeeded = save_portfolio(final_portfolio, current_timestamp)
+    save_succeeded = await save_portfolio(final_portfolio, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -390,6 +424,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         failed_trades=len(failed_trades),
         save_succeeded=save_succeeded,
     )
+
+    metrics.observe_duration(start)
 
     if failed_trades or not save_succeeded:
         return Response(status_code=status.HTTP_207_MULTI_STATUS)
@@ -406,12 +442,10 @@ async def get_raw_predictions() -> pl.DataFrame:
         return pl.DataFrame(response.json()["data"])
 
 
-def get_prior_portfolio() -> pl.DataFrame:
+async def get_prior_portfolio() -> pl.DataFrame:
     empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
-    response = requests.get(
-        url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-        timeout=60,
-    )
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.get(url=f"{DATA_MANAGER_BASE_URL}/portfolios")
     response.raise_for_status()
 
     response_text = response.text.strip()
@@ -437,7 +471,6 @@ def get_prior_portfolio() -> pl.DataFrame:
 
     except (
         ValueError,
-        requests.exceptions.JSONDecodeError,
         pl.exceptions.PolarsError,
     ) as e:
         logger.exception("Failed to parse prior portfolio JSON", error=str(e))
@@ -569,16 +602,16 @@ def get_optimal_portfolio(
     return portfolio_schema.validate(optimal_portfolio)
 
 
-def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -> bool:
+async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -> bool:
     try:
-        response = requests.post(
-            url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-            json={
-                "timestamp": current_timestamp.isoformat(),
-                "data": portfolio.to_dicts(),
-            },
-            timeout=60,
-        )
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url=f"{DATA_MANAGER_BASE_URL}/portfolios",
+                json={
+                    "timestamp": current_timestamp.isoformat(),
+                    "data": portfolio.to_dicts(),
+                },
+            )
         response.raise_for_status()
         logger.info("Saved portfolio state", count=portfolio.height)
         return True  # noqa: TRY300
