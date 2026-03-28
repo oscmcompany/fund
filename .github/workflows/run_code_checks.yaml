@@ -7,6 +7,10 @@ on:
   push:
     branches:
       - master
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
 jobs:
   detect_changes:
     name: Detect file changes
@@ -28,10 +32,16 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
             python:
               - '**/*.py'
               - '**/pyproject.toml'
               - 'uv.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
             markdown:
               - '**/*.md'
             yaml:
@@ -155,6 +165,7 @@ jobs:
   verify_all_checks_passed:
     name: Verify all checks passed
     needs:
+      - detect_changes
       - run_rust_code_checks
       - run_python_code_checks
       - run_markdown_code_checks
@@ -166,6 +177,7 @@ jobs:
       - name: Check all jobs passed
         run: |
           results=(
+            "${{ needs.detect_changes.result }}"
             "${{ needs.run_rust_code_checks.result }}"
             "${{ needs.run_python_code_checks.result }}"
             "${{ needs.run_markdown_code_checks.result }}"
