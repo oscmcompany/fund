@@ -96,15 +96,12 @@ jobs:
         with:
           command: mask development rust all
       - name: Check Rust coverage file exists
-        id: check-rust-coverage
         run: |
-          if [ -f .coverage_output/rust.xml ]; then
-            echo "rust_exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust_exists=false" >> "$GITHUB_OUTPUT"
+          if [ ! -f .coverage_output/rust.xml ]; then
+            echo "Rust coverage file not found: .coverage_output/rust.xml"
+            exit 1
           fi
       - name: Upload coverage to Coveralls
-        if: steps.check-rust-coverage.outputs.rust_exists == 'true'
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -125,6 +122,12 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development python all
+      - name: Check Python coverage file exists
+        run: |
+          if [ ! -f .coverage_output/python.xml ]; then
+            echo "Python coverage file not found: .coverage_output/python.xml"
+            exit 1
+          fi
       - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@v2
         with:
