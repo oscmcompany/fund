@@ -8,8 +8,39 @@ on:
     branches:
       - master
 jobs:
+  detect_changes:
+    name: Detect file changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      markdown: ${{ steps.filter.outputs.markdown }}
+      yaml: ${{ steps.filter.outputs.yaml }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Detect changed files
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+            python:
+              - '**/*.py'
+              - '**/pyproject.toml'
+              - 'uv.lock'
+            markdown:
+              - '**/*.md'
+            yaml:
+              - '**/*.yaml'
+              - '**/*.yml'
   run_rust_code_checks:
     name: Run Rust code checks
+    needs: detect_changes
+    if: needs.detect_changes.outputs.rust == 'true' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -46,15 +77,17 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development rust all
-      - name: Upload test coverage results
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
         with:
-          name: ${{ github.job }}_test_coverage
-          path: .coverage_output/rust.xml
-          if-no-files-found: error
-          overwrite: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          flag-name: rust
+          file: .coverage_output/rust.xml
+          parallel: true
   run_python_code_checks:
     name: Run Python code checks
+    needs: detect_changes
+    if: needs.detect_changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -65,15 +98,17 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development python all
-      - name: Upload test coverage results
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
         with:
-          name: ${{ github.job }}_test_coverage
-          path: .coverage_output/python.xml
-          if-no-files-found: error
-          overwrite: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          flag-name: python
+          file: .coverage_output/python.xml
+          parallel: true
   run_markdown_code_checks:
     name: Run Markdown code checks
+    needs: detect_changes
+    if: needs.detect_changes.outputs.markdown == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -86,6 +121,8 @@ jobs:
           command: mask development markdown all
   run_yaml_code_checks:
     name: Run YAML code checks
+    needs: detect_changes
+    if: needs.detect_changes.outputs.yaml == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -96,28 +133,49 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development yaml all
-  upload_test_coverage:
+  finish_coverage_upload:
+    name: Finish Coveralls coverage upload
     needs:
       - run_rust_code_checks
       - run_python_code_checks
     if: |
       always() &&
       (
-        needs.run_rust_code_checks.result == 'success' &&
+        needs.run_rust_code_checks.result == 'success' ||
         needs.run_python_code_checks.result == 'success'
       )
-    name: Upload coverage to Coveralls
     runs-on: ubuntu-latest
     steps:
-      - name: Download test coverage results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: '*_test_coverage'
-          path: .coverage_output/
-          merge-multiple: true
-          run-id: ${{ github.run_id }}
-      - name: Upload coverage to Coveralls
+      - name: Finalize coverage upload
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          files: .coverage_output/python.xml .coverage_output/rust.xml
+          parallel-finished: true
+          carryforward: rust,python
+  verify_all_checks_passed:
+    name: Verify all checks passed
+    needs:
+      - run_rust_code_checks
+      - run_python_code_checks
+      - run_markdown_code_checks
+      - run_yaml_code_checks
+      - finish_coverage_upload
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs passed
+        run: |
+          results=(
+            "${{ needs.run_rust_code_checks.result }}"
+            "${{ needs.run_python_code_checks.result }}"
+            "${{ needs.run_markdown_code_checks.result }}"
+            "${{ needs.run_yaml_code_checks.result }}"
+            "${{ needs.finish_coverage_upload.result }}"
+          )
+          for result in "${results[@]}"; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "A required job failed or was cancelled: $result"
+              exit 1
+            fi
+          done
+          echo "All checks passed or were skipped"
