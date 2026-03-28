@@ -162,8 +162,8 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           parallel-finished: true
           carryforward: rust,python
-  verify_all_checks_passed:
-    name: Verify all checks passed
+  verify_code_checks_passed:
+    name: Verify code checks passed
     needs:
       - detect_changes
       - run_rust_code_checks
