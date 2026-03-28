@@ -176,17 +176,18 @@ jobs:
     steps:
       - name: Check all jobs passed
         run: |
-          results=(
-            "${{ needs.detect_changes.result }}"
-            "${{ needs.run_rust_code_checks.result }}"
-            "${{ needs.run_python_code_checks.result }}"
-            "${{ needs.run_markdown_code_checks.result }}"
-            "${{ needs.run_yaml_code_checks.result }}"
-            "${{ needs.finish_coverage_upload.result }}"
+          declare -A job_results=(
+            [detect_changes]="${{ needs.detect_changes.result }}"
+            [run_rust_code_checks]="${{ needs.run_rust_code_checks.result }}"
+            [run_python_code_checks]="${{ needs.run_python_code_checks.result }}"
+            [run_markdown_code_checks]="${{ needs.run_markdown_code_checks.result }}"
+            [run_yaml_code_checks]="${{ needs.run_yaml_code_checks.result }}"
+            [finish_coverage_upload]="${{ needs.finish_coverage_upload.result }}"
           )
-          for result in "${results[@]}"; do
+          for job_name in "${!job_results[@]}"; do
+            result="${job_results[$job_name]}"
             if [[ "$result" != "success" && "$result" != "skipped" ]]; then
-              echo "A required job failed or was cancelled: $result"
+              echo "Job '$job_name' failed or was cancelled: $result"
               exit 1
             fi
           done
