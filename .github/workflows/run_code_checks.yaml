@@ -35,6 +35,7 @@ jobs:
               - 'maskfile.md'
               - '.flox/**'
               - 'devenv.*'
+              - '.github/**'
             python:
               - '**/*.py'
               - '**/pyproject.toml'
@@ -42,11 +43,18 @@ jobs:
               - 'maskfile.md'
               - '.flox/**'
               - 'devenv.*'
+              - '.github/**'
             markdown:
               - '**/*.md'
+              - '.flox/**'
+              - 'devenv.*'
+              - '.github/**'
             yaml:
               - '**/*.yaml'
               - '**/*.yml'
+              - '.flox/**'
+              - 'devenv.*'
+              - '.github/**'
   run_rust_code_checks:
     name: Run Rust code checks
     needs: detect_changes
@@ -87,7 +95,16 @@ jobs:
         uses: flox/activate-action@v1
         with:
           command: mask development rust all
+      - name: Check Rust coverage file exists
+        id: check-rust-coverage
+        run: |
+          if [ -f .coverage_output/rust.xml ]; then
+            echo "rust_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust_exists=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Upload coverage to Coveralls
+        if: steps.check-rust-coverage.outputs.rust_exists == 'true'
         uses: coverallsapp/github-action@v2
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
