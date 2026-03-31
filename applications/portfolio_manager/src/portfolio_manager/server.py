@@ -4,7 +4,6 @@ import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-import polars as pl
 import sentry_sdk
 import structlog
 from fastapi import FastAPI, Response, status
@@ -84,15 +83,6 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 application: FastAPI = FastAPI(lifespan=_lifespan)
-
-_PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
-    "ticker": pl.String,
-    "timestamp": pl.Int64,
-    "side": pl.String,
-    "dollar_amount": pl.Float64,
-    "action": pl.String,
-    "pair_id": pl.String,
-}
 
 
 @application.get("/health")

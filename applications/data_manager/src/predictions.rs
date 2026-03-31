@@ -110,6 +110,22 @@ pub async fn query(
         }
     };
 
+    // 2000-01-01T00:00:00Z in milliseconds. Values below this are almost
+    // certainly Unix seconds rather than milliseconds, which would silently
+    // query 1970 partitions and return empty results.
+    const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
+
+    for prediction_query in &predictions_query {
+        if prediction_query.timestamp < MIN_VALID_TIMESTAMP_MS {
+            let message = format!(
+                "Query timestamp {} is below minimum valid value {}; timestamps must be in milliseconds",
+                prediction_query.timestamp, MIN_VALID_TIMESTAMP_MS
+            );
+            warn!("{}", message);
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
+    }
+
     match query_predictions_dataframe_from_s3(&state, predictions_query).await {
         Ok(dataframe) => {
             if dataframe.height() == 0 {
