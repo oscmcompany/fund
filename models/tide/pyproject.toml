@@ -4,6 +4,7 @@ version = "0.0.1"
 description = "TiDE model training workflow"
 requires-python = "==3.12.10"
 dependencies = [
+  "internal>=0.0.1",
   "tools>=0.0.1",
   "boto3>=1.40.74",
   "mlflow>=2.21.0",
@@ -21,6 +22,7 @@ dependencies = [
 dev = ["boto3-stubs[s3]>=1.38.0"]
 
 [tool.uv.sources]
+internal = { workspace = true }
 tools = { workspace = true }
 
 [tool.uv]

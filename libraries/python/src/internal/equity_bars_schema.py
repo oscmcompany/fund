@@ -13,8 +13,12 @@ equity_bars_schema = pa.DataFrameSchema(
                 )
             ],
         ),
+        # Unix milliseconds (Int64). Massive sends bar timestamps natively in
+        # milliseconds; Alpaca RFC-3339 strings resolve to the same precision for
+        # OHLCV bars. Use internal.timestamps.to_timestamp_milliseconds() to
+        # produce this value. Do not use int(dt.timestamp()) — that produces seconds.
         "timestamp": pa.Column(
-            dtype=pl.Float64,
+            dtype=pl.Int64,
             checks=[pa.Check.greater_than(0)],
         ),
         "open_price": pa.Column(
@@ -35,6 +39,9 @@ equity_bars_schema = pa.DataFrameSchema(
             dtype=float,
             checks=[pa.Check.greater_than(0)],
         ),
+        # Whole share units (Int64). Massive sends volume as a float but bar
+        # volumes are always whole shares; fractional values are rounded on
+        # ingestion in the data manager.
         "volume": pa.Column(
             dtype=int,
             checks=[pa.Check.greater_than_or_equal_to(0)],

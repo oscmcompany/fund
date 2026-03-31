@@ -134,8 +134,11 @@ portfolio_schema = pa.DataFrameSchema(
             dtype=str,
             checks=[pa.Check(is_uppercase)],
         ),
+        # Unix milliseconds (Int64). Records when the portfolio allocation was
+        # computed. Use internal.timestamps.to_timestamp_milliseconds() to produce this
+        # value. See equity_bars_schema for the full rationale.
         "timestamp": pa.Column(
-            dtype=pl.Float64,
+            dtype=pl.Int64,
             checks=[pa.Check.greater_than(0)],
         ),
         "side": pa.Column(

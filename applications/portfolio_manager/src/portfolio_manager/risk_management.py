@@ -4,6 +4,7 @@ import numpy as np
 import polars as pl
 import scipy.optimize
 import structlog
+from internal.timestamps import to_timestamp_milliseconds
 
 from .enums import PositionAction, PositionSide
 from .exceptions import InsufficientPairsError
@@ -125,10 +126,10 @@ def size_pairs_with_volatility_parity(
         exposure_scale=exposure_scale,
     )
 
-    timestamp_val = float(current_timestamp.timestamp())
+    timestamp_val = to_timestamp_milliseconds(current_timestamp)
     long_positions = pairs.select(
         pl.col("long_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Float64).alias("timestamp"),
+        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.LONG.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
@@ -137,7 +138,7 @@ def size_pairs_with_volatility_parity(
 
     short_positions = pairs.select(
         pl.col("short_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Float64).alias("timestamp"),
+        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.SHORT.value).alias("side"),
         pl.col("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),

@@ -66,6 +66,9 @@ predictions_schema = pa.DataFrameSchema(
                 )
             ],
         ),
+        # Unix milliseconds (Int64). Represents midnight UTC on the date the
+        # prediction targets. Use internal.timestamps.to_timestamp_milliseconds() to
+        # produce this value. See equity_bars_schema for the full rationale.
         "timestamp": pa.Column(
             dtype=pl.Int64,
             checks=[pa.Check.greater_than(0)],
