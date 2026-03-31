@@ -70,8 +70,8 @@ structlog.configure(
 
 logger = structlog.get_logger()
 
-DATAMANAGER_BASE_URL = os.getenv(
-    "FUND_DATAMANAGER_BASE_URL", "http://data-manager:8080"
+DATA_MANAGER_BASE_URL = os.getenv(
+    "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
 _environment = os.environ.get("FUND_ENVIRONMENT", "development")
 MODEL_VERSION_SSM_PARAMETER = f"/fund/{_environment}/ensemble-manager/model-version"
@@ -284,7 +284,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     try:
         equity_bars_response = requests.get(
-            url=f"{DATAMANAGER_BASE_URL}/equity-bars",
+            url=f"{DATA_MANAGER_BASE_URL}/equity-bars",
             params={
                 "start_timestamp": start_date.isoformat(),
                 "end_timestamp": end_date.isoformat(),
@@ -307,7 +307,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     try:
         equity_details_response = requests.get(
-            url=f"{DATAMANAGER_BASE_URL}/equity-details",
+            url=f"{DATA_MANAGER_BASE_URL}/equity-details",
             timeout=60,
         )
 
@@ -397,7 +397,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     try:
         save_predictions_response = requests.post(
-            url=f"{DATAMANAGER_BASE_URL}/predictions",
+            url=f"{DATA_MANAGER_BASE_URL}/predictions",
             json={
                 "timestamp": current_timestamp.isoformat(),
                 "data": validated_predictions.to_dicts(),

@@ -782,7 +782,7 @@ fi
 
 pulumi stack select ${organization_name}/fund/production
 
-export FUND_DATAMANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
+export FUND_DATA_MANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
 export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
 export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
@@ -792,6 +792,38 @@ cd ../
 case "${model_name}" in
     tide)
         uv run python -m tide.run
+        ;;
+    *)
+        echo "Unknown model: ${model_name}"
+        exit 1
+        ;;
+esac
+```
+
+### deploy (model_name)
+
+> Register flow deployment with Prefect server
+
+```bash
+set -euo pipefail
+
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select ${organization_name}/fund/production
+
+export PREFECT_API_URL="$(pulumi stack output fund_base_url)"
+export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
+
+cd ../
+
+case "${model_name}" in
+    tide)
+        uv run python -m tide.deploy
         ;;
     *)
         echo "Unknown model: ${model_name}"

@@ -46,4 +46,6 @@ if __name__ == "__main__":
         logger.error("FUND_LOOKBACK_DAYS must be positive", lookback_days=lookback_days)
         sys.exit(1)
 
-    deploy_training_flow(lookback_days=lookback_days)
+    deploy_training_flow(
+        lookback_days=lookback_days,
+    )
