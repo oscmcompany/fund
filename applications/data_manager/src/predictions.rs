@@ -15,6 +15,11 @@ use std::io::Cursor;
 use tracing::{info, warn};
 use urlencoding::decode;
 
+// 2000-01-01T00:00:00Z in milliseconds. Values below this are almost
+// certainly Unix seconds rather than milliseconds, which would silently
+// place the partition in 1970 or return empty query results.
+const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
+
 #[derive(Deserialize)]
 pub struct SavePayload {
     pub data: Vec<Prediction>,
@@ -30,11 +35,6 @@ pub async fn save(
     AxumState(state): AxumState<State>,
     Json(payload): Json<SavePayload>,
 ) -> impl IntoResponse {
-    // 2000-01-01T00:00:00Z in milliseconds. Values below this are almost
-    // certainly Unix seconds rather than milliseconds, which would silently
-    // place the partition in 1970.
-    const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
-
     for prediction in &payload.data {
         if prediction.timestamp < MIN_VALID_TIMESTAMP_MS {
             let message = format!(
@@ -109,11 +109,6 @@ pub async fn query(
                 .into_response();
         }
     };
-
-    // 2000-01-01T00:00:00Z in milliseconds. Values below this are almost
-    // certainly Unix seconds rather than milliseconds, which would silently
-    // query 1970 partitions and return empty results.
-    const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
 
     for prediction_query in &predictions_query {
         if prediction_query.timestamp < MIN_VALID_TIMESTAMP_MS {
