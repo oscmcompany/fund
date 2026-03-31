@@ -19,6 +19,10 @@ use urlencoding::decode;
 // certainly Unix seconds rather than milliseconds, which would silently
 // place the partition in 1970 or return empty query results.
 const MIN_VALID_TIMESTAMP_MS: i64 = 946_684_800_000;
+// 2100-01-01T00:00:00Z in milliseconds. Values above this are almost
+// certainly microseconds or nanoseconds, which would be misinterpreted as
+// far-future milliseconds and produce wrong partitions.
+const MAX_VALID_TIMESTAMP_MS: i64 = 4_102_444_800_000;
 
 #[derive(Deserialize)]
 pub struct SavePayload {
@@ -36,10 +40,12 @@ pub async fn save(
     Json(payload): Json<SavePayload>,
 ) -> impl IntoResponse {
     for prediction in &payload.data {
-        if prediction.timestamp < MIN_VALID_TIMESTAMP_MS {
+        if prediction.timestamp < MIN_VALID_TIMESTAMP_MS
+            || prediction.timestamp > MAX_VALID_TIMESTAMP_MS
+        {
             let message = format!(
-                "Prediction timestamp {} is below minimum valid value {}; timestamps must be in milliseconds",
-                prediction.timestamp, MIN_VALID_TIMESTAMP_MS
+                "Prediction timestamp {} is outside valid range [{}, {}]; timestamps must be in milliseconds",
+                prediction.timestamp, MIN_VALID_TIMESTAMP_MS, MAX_VALID_TIMESTAMP_MS
             );
             warn!("{}", message);
             return (StatusCode::BAD_REQUEST, message).into_response();
@@ -111,10 +117,12 @@ pub async fn query(
     };
 
     for prediction_query in &predictions_query {
-        if prediction_query.timestamp < MIN_VALID_TIMESTAMP_MS {
+        if prediction_query.timestamp < MIN_VALID_TIMESTAMP_MS
+            || prediction_query.timestamp > MAX_VALID_TIMESTAMP_MS
+        {
             let message = format!(
-                "Query timestamp {} is below minimum valid value {}; timestamps must be in milliseconds",
-                prediction_query.timestamp, MIN_VALID_TIMESTAMP_MS
+                "Query timestamp {} is outside valid range [{}, {}]; timestamps must be in milliseconds",
+                prediction_query.timestamp, MIN_VALID_TIMESTAMP_MS, MAX_VALID_TIMESTAMP_MS
             );
             warn!("{}", message);
             return (StatusCode::BAD_REQUEST, message).into_response();

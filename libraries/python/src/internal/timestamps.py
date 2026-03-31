@@ -1,4 +1,6 @@
-from datetime import datetime
+from datetime import UTC, datetime
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def to_timestamp_milliseconds(dt: datetime) -> int:
@@ -13,9 +15,9 @@ def to_timestamp_milliseconds(dt: datetime) -> int:
       costs nothing extra and keeps the format consistent with the live-data
       WebSocket feeds we plan to add.
 
-    Use this helper at every site that converts a Python datetime to a stored
-    or transmitted timestamp value. Do not use `int(dt.timestamp())` directly
-    as that produces seconds, not milliseconds.
+    Uses integer-only timedelta arithmetic to avoid floating-point truncation
+    errors. Do not use int(dt.timestamp() * 1000) as the float intermediate
+    can yield off-by-1ms results for some datetimes.
 
     Raises ValueError if dt is not timezone-aware, as naive datetimes produce
     system-timezone-dependent results.
@@ -23,4 +25,5 @@ def to_timestamp_milliseconds(dt: datetime) -> int:
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
         message = "Datetime must be timezone-aware"
         raise ValueError(message)
-    return int(dt.timestamp() * 1000)
+    delta = dt - _EPOCH
+    return delta.days * 86_400_000 + delta.seconds * 1000 + delta.microseconds // 1000
