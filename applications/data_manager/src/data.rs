@@ -7,12 +7,20 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Deserialize, Clone)]
 pub struct EquityBar {
     pub ticker: String,
+    /// Unix timestamp in milliseconds. Massive sends bar timestamps natively
+    /// in milliseconds; storing them as-is avoids any conversion loss. Alpaca
+    /// uses RFC-3339 strings which also resolve to millisecond precision for
+    /// OHLCV bars. Use `chrono::DateTime::timestamp_millis()` to produce this
+    /// value and `DateTime::from_timestamp_millis()` to reconstruct it.
     pub timestamp: i64,
     pub open_price: Option<f64>,
     pub high_price: Option<f64>,
     pub low_price: Option<f64>,
     pub close_price: Option<f64>,
-    pub volume: Option<f64>,
+    /// Whole share units. Massive sends volume as a floating-point number but
+    /// bar volumes are always whole shares; fractional values are rounded on
+    /// ingestion. Stored as i64 to match the Int64 Polars/Parquet column type.
+    pub volume: Option<i64>,
     pub volume_weighted_average_price: Option<f64>,
     pub transactions: Option<u64>,
 }
@@ -55,6 +63,8 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
 #[derive(Debug, Deserialize, Clone)]
 pub struct Prediction {
     pub ticker: String,
+    /// Unix timestamp in milliseconds. Represents the date the prediction
+    /// targets (midnight UTC). See EquityBar.timestamp for the rationale.
     pub timestamp: i64,
     pub quantile_10: f64,
     pub quantile_50: f64,
@@ -120,7 +130,9 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
 #[derive(Debug, Deserialize, Clone)]
 pub struct Portfolio {
     pub ticker: String,
-    pub timestamp: f64,
+    /// Unix timestamp in milliseconds. Records when the portfolio allocation
+    /// was computed. See EquityBar.timestamp for the rationale.
+    pub timestamp: i64,
     pub side: String,
     pub dollar_amount: f64,
     pub action: String,
@@ -135,7 +147,7 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
 
     let portfolio_dataframe = df!(
         "ticker" => portfolio_rows.iter().map(|p| p.ticker.as_str()).collect::<Vec<&str>>(),
-        "timestamp" => portfolio_rows.iter().map(|p| p.timestamp).collect::<Vec<f64>>(),
+        "timestamp" => portfolio_rows.iter().map(|p| p.timestamp).collect::<Vec<i64>>(),
         "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
         "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
         "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
