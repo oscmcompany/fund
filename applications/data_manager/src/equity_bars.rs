@@ -256,7 +256,23 @@ pub async fn sync(
     };
 
     let tickers: Vec<String> = bars.iter().map(|b| b.ticker.clone()).collect();
-    let volumes: Vec<Option<f64>> = bars.iter().map(|b| b.v).collect();
+    let volumes: Vec<Option<i64>> = bars
+        .iter()
+        .map(|b| {
+            b.v.and_then(|v| {
+                if v.is_finite() && v >= 0.0 {
+                    let rounded = v.round();
+                    if rounded <= i64::MAX as f64 {
+                        Some(rounded as i64)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
     let volume_weighted_average_prices: Vec<Option<f64>> = bars.iter().map(|b| b.vw).collect();
     let open_prices: Vec<Option<f64>> = bars.iter().map(|b| b.o).collect();
     let close_prices: Vec<Option<f64>> = bars.iter().map(|b| b.c).collect();

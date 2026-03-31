@@ -25,7 +25,7 @@ use common::{create_test_s3_client, put_test_object, setup_test_bucket, test_buc
 fn sample_prediction() -> Prediction {
     Prediction {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600,
+        timestamp: 1_735_689_600_000,
         quantile_10: 190.0,
         quantile_50: 200.0,
         quantile_90: 210.0,
@@ -35,7 +35,7 @@ fn sample_prediction() -> Prediction {
 fn sample_portfolio() -> Portfolio {
     Portfolio {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600.0,
+        timestamp: 1_735_689_600_000,
         side: "LONG".to_string(),
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
@@ -46,12 +46,12 @@ fn sample_portfolio() -> Portfolio {
 fn sample_equity_bar() -> EquityBar {
     EquityBar {
         ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600,
+        timestamp: 1_735_689_600_000,
         open_price: Some(100.0),
         high_price: Some(110.0),
         low_price: Some(99.0),
         close_price: Some(105.0),
-        volume: Some(2_000_000.0),
+        volume: Some(2_000_000),
         volume_weighted_average_price: Some(104.0),
         transactions: Some(1_000),
     }
@@ -130,7 +130,7 @@ async fn test_write_and_query_predictions_round_trip() {
         &state,
         vec![PredictionQuery {
             ticker: "AAPL".to_string(),
-            timestamp: timestamp.timestamp() as f64,
+            timestamp: timestamp.timestamp_millis(),
         }],
     )
     .await
@@ -164,7 +164,7 @@ async fn test_query_predictions_returns_empty_dataframe_when_no_rows_match() {
         &state,
         vec![PredictionQuery {
             ticker: "MSFT".to_string(),
-            timestamp: timestamp.timestamp() as f64,
+            timestamp: timestamp.timestamp_millis(),
         }],
     )
     .await
@@ -302,6 +302,38 @@ async fn test_write_and_query_equity_bars_round_trip() {
             .unwrap()
             .get(0),
         Some("AAPL")
+    );
+
+    // Prove timestamp survives the round-trip as millisecond Int64.
+    // A regression to Float64 or seconds would cause downstream consumers
+    // to silently receive wrong values.
+    assert_eq!(
+        *result_dataframe.column("timestamp").unwrap().dtype(),
+        DataType::Int64
+    );
+    assert_eq!(
+        result_dataframe
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .get(0),
+        Some(1_735_689_600_000i64)
+    );
+
+    // Prove volume survives as whole-share Int64.
+    assert_eq!(
+        *result_dataframe.column("volume").unwrap().dtype(),
+        DataType::Int64
+    );
+    assert_eq!(
+        result_dataframe
+            .column("volume")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .get(0),
+        Some(2_000_000i64)
     );
 }
 

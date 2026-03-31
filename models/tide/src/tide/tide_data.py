@@ -8,6 +8,7 @@ import numpy as np
 import pandera.polars as pa
 import polars as pl
 import structlog
+from internal.timestamps import to_timestamp_milliseconds
 from tinygrad.tensor import Tensor
 
 logger = structlog.get_logger()
@@ -163,7 +164,7 @@ class FillNulls(Stage):
                 pl.col("high_price").fill_null(0.0),
                 pl.col("low_price").fill_null(0.0),
                 pl.col("close_price").fill_null(0.0),
-                pl.col("volume").fill_null(0.0),
+                pl.col("volume").fill_null(0),
                 pl.col("volume_weighted_average_price").fill_null(0.0),
                 pl.col("sector").fill_null("NOT AVAILABLE"),
                 pl.col("industry").fill_null("NOT AVAILABLE"),
@@ -648,15 +649,13 @@ class Data:
             ticker_str = ticker_reverse_mapping[ticker_encoded]
 
             for time_idx in range(output_length):
-                timestamp = int(
-                    (current_datetime + timedelta(days=time_idx))
-                    .replace(
+                timestamp = to_timestamp_milliseconds(
+                    (current_datetime + timedelta(days=time_idx)).replace(
                         hour=0,
                         minute=0,
                         second=0,
                         microsecond=0,
                     )
-                    .timestamp()
                 )
 
                 quantile_values = predictions_array[batch_idx, time_idx, :]
@@ -688,6 +687,8 @@ data_schema = pa.DataFrameSchema(
             dtype=str,
             checks=pa.Check.str_matches(r"^[A-Z0-9.\-]+$"),
         ),
+        # Unix milliseconds (Int64). Values sourced from equity_bars_schema;
+        # use internal.timestamps.to_timestamp_milliseconds() for any synthetic rows.
         "timestamp": pa.Column(
             dtype=int,
             checks=pa.Check.greater_than(0),
@@ -710,6 +711,7 @@ data_schema = pa.DataFrameSchema(
             dtype=float,
             checks=pa.Check.greater_than_or_equal_to(0),
         ),
+        # Whole share units (Int64). See equity_bars_schema for the rationale.
         "volume": pa.Column(
             dtype=int,
             checks=pa.Check.greater_than_or_equal_to(0),
