@@ -1,9 +1,11 @@
+import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import polars as pl
 import pytest
-from portfolio_manager.server import (
+from portfolio_manager.rebalance import (
     _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
     get_positions,
@@ -80,7 +82,7 @@ def test_evaluate_prior_pairs_holds_pair_in_intermediate_zone() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(2.0, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(2.0, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" in result
@@ -93,7 +95,7 @@ def test_evaluate_prior_pairs_holds_pair_at_lower_bound_of_hold_zone() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(0.5, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(0.5, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" in result
@@ -106,7 +108,7 @@ def test_evaluate_prior_pairs_does_not_hold_converged_pair() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(0.2, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(0.2, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" not in result
@@ -119,7 +121,7 @@ def test_evaluate_prior_pairs_does_not_hold_stop_loss_pair() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(5.0, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(5.0, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" not in result
@@ -132,7 +134,7 @@ def test_evaluate_prior_pairs_does_not_hold_pair_at_stop_loss_boundary() -> None
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(4.0, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(4.0, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" not in result
@@ -145,7 +147,7 @@ def test_evaluate_prior_pairs_handles_negative_z_score_in_hold_zone() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore", return_value=(-2.0, 1.0)
+        "portfolio_manager.rebalance.compute_spread_zscore", return_value=(-2.0, 1.0)
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
     assert "AAPL" in result
@@ -220,7 +222,7 @@ def test_evaluate_prior_pairs_skips_pair_with_nan_z_score() -> None:
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     with patch(
-        "portfolio_manager.server.compute_spread_zscore",
+        "portfolio_manager.rebalance.compute_spread_zscore",
         return_value=(float("nan"), 1.0),
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
@@ -239,7 +241,7 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
     # pair_ids are sorted: "AAPL-MSFT" < "GOOGL-AMZN"
     # first call → AAPL-MSFT (z=2.0, held), second → GOOGL-AMZN (z=0.2, closed)
     with patch(
-        "portfolio_manager.server.compute_spread_zscore",
+        "portfolio_manager.rebalance.compute_spread_zscore",
         side_effect=[(2.0, 1.0), (0.2, 1.0)],
     ):
         result = evaluate_prior_pairs(prior, historical_prices)
@@ -250,12 +252,23 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
 # --- get_prior_portfolio ---
 
 
+def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
+    mock_client = AsyncMock()
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.get.return_value = mock_response
+    mock_client.post.return_value = mock_response
+    return mock_client
+
+
 def test_get_prior_portfolio_returns_empty_dataframe_on_empty_array_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "[]"
-    with patch("portfolio_manager.server.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.is_empty()
     assert "pair_id" in result.columns
 
@@ -275,28 +288,59 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     mock_response.status_code = 200
     mock_response.text = json.dumps(data)
     mock_response.json.return_value = data
-    with patch("portfolio_manager.server.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.height == 1
     assert "pair_id" in result.columns
     assert result["pair_id"][0] == "AAPL-MSFT"
 
 
-def test_get_prior_portfolio_returns_empty_dataframe_on_error_response() -> None:
+def test_get_prior_portfolio_raises_on_error_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
-    with patch("portfolio_manager.server.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
-    assert result.is_empty()
-    assert "pair_id" in result.columns
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        message="500 Internal Server Error",
+        request=MagicMock(),
+        response=mock_response,
+    )
+    mock_client = _make_mock_http_client(mock_response)
+    with (
+        patch(
+            "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+        ),
+        pytest.raises(httpx.HTTPStatusError),
+    ):
+        asyncio.run(get_prior_portfolio())
+
+
+def test_get_prior_portfolio_raises_on_parse_error() -> None:
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.raise_for_status.return_value = None
+    mock_response.text = '{"not": "a list"}'
+    mock_response.json.side_effect = ValueError("invalid json")
+    mock_client = _make_mock_http_client(mock_response)
+    with (
+        patch(
+            "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+        ),
+        pytest.raises(ValueError, match="invalid json"),
+    ):
+        asyncio.run(get_prior_portfolio())
 
 
 def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "  "
-    with patch("portfolio_manager.server.requests.get", return_value=mock_response):
-        result = get_prior_portfolio()
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.rebalance.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
     assert result.is_empty()
 
 
