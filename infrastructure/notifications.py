@@ -49,4 +49,5 @@ aws.budgets.Budget(
             subscriber_email_addresses=budget_alert_email_addresses,
         ),
     ],
+    tags=tags,
 )
