@@ -28,8 +28,8 @@ jobs:
           - application: ensemble-manager
             stage: server
             paths: applications/ensemble_manager/**
-          - application: model-trainer
-            stage: server-worker
+          - application: tide
+            stage: model-runner
             paths: models/**
     steps:
       - name: Checkout code
@@ -112,12 +112,6 @@ jobs:
           - application: ensemble-manager
             stage: server
             paths: applications/ensemble_manager/**
-          - application: model-trainer
-            stage: server
-            paths: models/**
-          - application: model-trainer
-            stage: worker
-            paths: models/**
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

@@ -193,7 +193,7 @@ case "${package_name}-${stage_name}" in
     data-manager-server)      service="fund-data-manager-server" ;;
     portfolio-manager-server) service="fund-portfolio-manager-server" ;;
     ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
-    tide-runner)              echo "No ECS service for tide runner" && exit 0 ;;
+    tide-model-runner)        echo "No ECS service for tide model runner" && exit 0 ;;
     *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
 esac
 

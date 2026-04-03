@@ -12,8 +12,8 @@ from storage import (
     model_artifacts_bucket,
     portfolio_manager_image_uri,
     portfolio_manager_repository,
-    tide_runner_image_uri,
-    tide_runner_repository,
+    tide_model_runner_image_uri,
+    tide_model_runner_repository,
 )
 
 protocol = "https://" if acm_certificate_arn else "http://"
@@ -52,10 +52,10 @@ pulumi.export(
     pulumi.Output.unsecret(model_artifacts_bucket.bucket),
 )
 pulumi.export(
-    "aws_ecr_tide_runner_repository",
-    tide_runner_repository.repository_url,
+    "aws_ecr_tide_model_runner_repository",
+    tide_model_runner_repository.repository_url,
 )
-pulumi.export("aws_ecr_tide_runner_image", tide_runner_image_uri)
+pulumi.export("aws_ecr_tide_model_runner_image", tide_model_runner_image_uri)
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,
