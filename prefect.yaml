@@ -8,7 +8,7 @@ deployments:
   - name: tide-trainer-remote
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline
     work_pool:
-      name: fund-work-pool-ecs
+      name: fund-models-remote
     parameters: {}
     build: null
     push: null
@@ -16,7 +16,7 @@ deployments:
   - name: tide-trainer-local
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline
     work_pool:
-      name: fund-work-pool-local
+      name: fund-models-local
     parameters: {}
     build: null
     push: null

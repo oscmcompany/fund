@@ -415,6 +415,47 @@ case "$application_name" in
 esac
 ```
 
+### models
+
+> Manage Prefect Cloud model resources
+
+#### initialize (environment)
+
+> Create work pool and register deployments (environment: remote, local)
+
+```bash
+set -euo pipefail
+
+case "${environment}" in
+    remote)
+        unset PREFECT_API_URL
+
+        echo "Creating fund-models-remote work pool on Prefect Cloud..."
+        uv run --package tools prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
+            || echo "  already exists"
+
+        echo "Registering training deployments..."
+        uv run prefect --no-prompt deploy --all
+
+        echo ""
+        echo "Done. Visit Prefect Cloud dashboard to view deployments."
+        ;;
+    local)
+        echo "Creating fund-models-local work pool..."
+        uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
+            || echo "  already exists"
+
+        echo "Registering training deployment..."
+        uv run --package tide python -m tide.deploy
+        ;;
+    *)
+        echo "Unknown environment: ${environment}"
+        echo "Valid options: remote, local"
+        exit 1
+        ;;
+esac
+```
+
 ## development
 
 > Python and Rust development tools and code quality checks
@@ -807,19 +848,8 @@ esac
 ```bash
 set -euo pipefail
 
-cd infrastructure
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export PREFECT_API_URL="$(pulumi stack output fund_base_url)"
+unset PREFECT_API_URL
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
-
-cd ../
 
 case "${model_name}" in
     tide)

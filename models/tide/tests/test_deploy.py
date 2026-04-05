@@ -15,8 +15,8 @@ def test_deploy_training_flow_calls_deploy(mock_pipeline: MagicMock) -> None:
 
     mock_deploy.assert_called_once()
     call_kwargs = mock_deploy.call_args.kwargs
-    assert call_kwargs["name"] == "daily-training"
-    assert call_kwargs["work_pool_name"] == "training-pool"
+    assert call_kwargs["name"] == "tide-trainer-remote"
+    assert call_kwargs["work_pool_name"] == "fund-models-remote"
     assert call_kwargs["cron"] == "0 22 * * 1-5"
     assert call_kwargs["timezone"] == "America/New_York"
     assert call_kwargs["parameters"]["lookback_days"] == LOOKBACK_DAYS
