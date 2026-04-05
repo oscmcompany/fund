@@ -193,7 +193,7 @@ case "${package_name}-${stage_name}" in
     data-manager-server)      service="fund-data-manager-server" ;;
     portfolio-manager-server) service="fund-portfolio-manager-server" ;;
     ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
-    tide-model-runner)        echo "No ECS service for tide model runner" && exit 0 ;;
+    tide-model-runner)        echo "tide-model-runner is used for Prefect training jobs, not an ECS service" && exit 0 ;;
     *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
 esac
 
@@ -441,11 +441,13 @@ case "${environment}" in
         echo "Done. Visit Prefect Cloud dashboard to view deployments."
         ;;
     local)
+        export PREFECT_API_URL="http://localhost:4200/api"
+
         echo "Creating fund-models-local work pool..."
         uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
             || echo "  already exists"
 
-        echo "Registering training deployment..."
+        echo "Registering local training deployment..."
         uv run prefect --no-prompt deploy --name tide-trainer-local
         ;;
     *)
@@ -843,7 +845,7 @@ esac
 
 ### deploy (model_name)
 
-> Register flow deployment with Prefect server
+> Register flow deployment with Prefect Cloud
 
 ```bash
 set -euo pipefail

@@ -58,6 +58,10 @@ models_launch_template = aws.ec2.LaunchTemplate(
     name="fund-models-gpu",
     image_id=models_ami_id,
     instance_type="g4dn.xlarge",
+    metadata_options=aws.ec2.LaunchTemplateMetadataOptionsArgs(
+        http_endpoint="enabled",
+        http_tokens="required",
+    ),
     iam_instance_profile=aws.ec2.LaunchTemplateIamInstanceProfileArgs(
         arn=models_instance_profile.arn,
     ),

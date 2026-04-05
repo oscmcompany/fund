@@ -296,8 +296,8 @@ in {
     uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
       || echo "  already exists"
 
-    echo "Registering training deployment..."
-    uv run --package tide python -m tide.deploy
+    echo "Registering local training deployment..."
+    uv run prefect --no-prompt deploy --name tide-trainer-local
 
     echo ""
     echo "Done. Visit http://localhost:4200 to see the orchestrator dashboard."
