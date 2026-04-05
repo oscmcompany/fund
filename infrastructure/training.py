@@ -45,21 +45,18 @@ models_instance_profile = aws.iam.InstanceProfile(
     tags=tags,
 )
 
-models_ami = aws.ec2.get_ami_output(
-    most_recent=True,
-    owners=["amazon"],
-    filters=[
-        aws.ec2.GetAmiFilterArgs(
-            name="name",
-            values=["amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs"],
-        ),
-    ],
+models_ami_parameter = aws.ssm.get_parameter_output(
+    name="/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended",
+)
+
+models_ami_id = models_ami_parameter.value.apply(
+    lambda value: json.loads(value)["image_id"]
 )
 
 models_launch_template = aws.ec2.LaunchTemplate(
     "models_launch_template",
     name="fund-models-gpu",
-    image_id=models_ami.id,
+    image_id=models_ami_id,
     instance_type="g4dn.xlarge",
     iam_instance_profile=aws.ec2.LaunchTemplateIamInstanceProfileArgs(
         arn=models_instance_profile.arn,
@@ -107,6 +104,14 @@ models_asg = aws.autoscaling.Group(
             value="fund-models-gpu",
             propagate_at_launch=True,
         ),
+    ]
+    + [
+        aws.autoscaling.GroupTagArgs(
+            key=key,
+            value=value,
+            propagate_at_launch=True,
+        )
+        for key, value in tags.items()
     ],
 )
 

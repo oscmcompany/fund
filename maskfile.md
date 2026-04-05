@@ -54,7 +54,7 @@ echo "Development environment setup completed successfully"
 
 #### build (package_name) (stage_name)
 
-> Build Docker images with optional cache pull (e.g. `portfolio-manager server`, `tide runner`)
+> Build Docker images with optional cache pull (e.g. `portfolio-manager server`, `tide model-runner`)
 
 ```bash
 set -euo pipefail
@@ -133,7 +133,7 @@ echo "Image built: ${package_name} ${stage_name}"
 
 #### push (package_name) (stage_name)
 
-> Push Docker image to ECR (e.g. `portfolio-manager server`, `tide runner`)
+> Push Docker image to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
 
 ```bash
 set -euo pipefail
@@ -446,7 +446,7 @@ case "${environment}" in
             || echo "  already exists"
 
         echo "Registering training deployment..."
-        uv run --package tide python -m tide.deploy
+        uv run prefect --no-prompt deploy --name tide-trainer-local
         ;;
     *)
         echo "Unknown environment: ${environment}"

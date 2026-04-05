@@ -20,7 +20,7 @@ def test_trainer_uses_gpu_instance_type() -> None:
     infrastructure_training = load_infrastructure_training()
 
     assert 'instance_type="g4dn.xlarge"' in infrastructure_training
-    assert "amzn2-ami-ecs-gpu-hvm-*-x86_64-ebs" in infrastructure_training
+    assert "amazon-linux-2023/gpu/recommended" in infrastructure_training
 
 
 def test_trainer_asg_scales_to_zero() -> None:
