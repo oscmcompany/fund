@@ -157,9 +157,9 @@ aws.ecr.LifecyclePolicy(
     policy=_ecr_lifecycle_policy,
 )
 
-tide_runner_repository = aws.ecr.Repository(
-    "tide_runner_repository",
-    name="fund/tide-runner",
+tide_model_runner_repository = aws.ecr.Repository(
+    "tide_model_runner_repository",
+    name="fund/tide-model-runner",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -169,8 +169,8 @@ tide_runner_repository = aws.ecr.Repository(
 )
 
 aws.ecr.LifecyclePolicy(
-    "tide_runner_repository_lifecycle",
-    repository=tide_runner_repository.name,
+    "tide_model_runner_repository_lifecycle",
+    repository=tide_model_runner_repository.name,
     policy=_ecr_lifecycle_policy,
 )
 
@@ -185,6 +185,6 @@ portfolio_manager_image_uri = portfolio_manager_repository.repository_url.apply(
 ensemble_manager_image_uri = ensemble_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-tide_runner_image_uri = tide_runner_repository.repository_url.apply(
+tide_model_runner_image_uri = tide_model_runner_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )

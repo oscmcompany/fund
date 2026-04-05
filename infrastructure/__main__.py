@@ -12,9 +12,10 @@ from storage import (
     model_artifacts_bucket,
     portfolio_manager_image_uri,
     portfolio_manager_repository,
-    tide_runner_image_uri,
-    tide_runner_repository,
+    tide_model_runner_image_uri,
+    tide_model_runner_repository,
 )
+from training import models_cluster
 
 protocol = "https://" if acm_certificate_arn else "http://"
 
@@ -33,6 +34,7 @@ readme_content = """
 pulumi.export("aws_account_id", account_id)
 pulumi.export("aws_vpc_id", vpc.id)
 pulumi.export("aws_ecs_cluster_name", cluster.name)
+pulumi.export("aws_ecs_models_cluster_name", models_cluster.name)
 pulumi.export("aws_alb_dns_name", alb.dns_name)
 pulumi.export("aws_alb_url", pulumi.Output.concat(protocol, alb.dns_name))
 pulumi.export("aws_service_discovery_namespace", service_discovery_namespace.name)
@@ -52,10 +54,10 @@ pulumi.export(
     pulumi.Output.unsecret(model_artifacts_bucket.bucket),
 )
 pulumi.export(
-    "aws_ecr_tide_runner_repository",
-    tide_runner_repository.repository_url,
+    "aws_ecr_tide_model_runner_repository",
+    tide_model_runner_repository.repository_url,
 )
-pulumi.export("aws_ecr_tide_runner_image", tide_runner_image_uri)
+pulumi.export("aws_ecr_tide_model_runner_image", tide_model_runner_image_uri)
 pulumi.export(
     "aws_iam_github_actions_infrastructure_role_arn",
     github_actions_infrastructure_role.arn,

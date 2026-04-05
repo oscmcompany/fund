@@ -28,7 +28,7 @@ from storage import (
 
 cluster = aws.ecs.Cluster(
     "ecs_cluster",
-    name="fund-application",
+    name="fund-applications",
     settings=[aws.ecs.ClusterSettingArgs(name="containerInsights", value="enabled")],
     tags=tags,
 )

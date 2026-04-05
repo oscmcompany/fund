@@ -94,6 +94,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         "Sid": "ManageEC2ECSELBBudgetsAndServiceDiscovery",
                         "Effect": "Allow",
                         "Action": [
+                            "autoscaling:*",
                             "ec2:*",
                             "ecs:*",
                             "elasticloadbalancing:*",
@@ -259,6 +260,7 @@ github_actions_infrastructure_policy = aws.iam.Policy(
                         "Condition": {
                             "StringEquals": {
                                 "iam:AWSServiceName": [
+                                    "autoscaling.amazonaws.com",
                                     "ecs.amazonaws.com",
                                     "elasticloadbalancing.amazonaws.com",
                                 ]
@@ -372,6 +374,77 @@ github_actions_infrastructure_policy = aws.iam.Policy(
     tags=tags,
 )
 
+github_actions_trainer_policy = aws.iam.Policy(
+    "github_actions_trainer_policy",
+    name="fund-github-actions-trainer-policy",
+    description="Trainer infrastructure permissions for GitHub Actions deployments.",
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "CreateTrainerRole",
+                    "Effect": "Allow",
+                    "Action": "iam:CreateRole",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:RoleName": "fund-models-instance-role",
+                        }
+                    },
+                },
+                {
+                    "Sid": "ManageTrainerRole",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:AttachRolePolicy",
+                        "iam:DeleteRole",
+                        "iam:DetachRolePolicy",
+                        "iam:PassRole",
+                        "iam:TagRole",
+                        "iam:UntagRole",
+                        "iam:UpdateAssumeRolePolicy",
+                    ],
+                    "Resource": (
+                        f"arn:aws:iam::{account_id}:role/fund-models-instance-role"
+                    ),
+                    "Condition": {
+                        "ArnLikeIfExists": {
+                            "iam:PolicyARN": [
+                                "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role",
+                                f"arn:aws:iam::{account_id}:policy/fund-*",
+                            ]
+                        },
+                        "StringLikeIfExists": {
+                            "iam:PassedToService": "ec2.amazonaws.com",
+                        },
+                    },
+                },
+                {
+                    "Sid": "ManageTrainingInstanceProfile",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:AddRoleToInstanceProfile",
+                        "iam:CreateInstanceProfile",
+                        "iam:DeleteInstanceProfile",
+                        "iam:GetInstanceProfile",
+                        "iam:RemoveRoleFromInstanceProfile",
+                        "iam:TagInstanceProfile",
+                        "iam:UntagInstanceProfile",
+                    ],
+                    "Resource": (
+                        f"arn:aws:iam::{account_id}:instance-profile"
+                        "/fund-models-instance-profile"
+                    ),
+                },
+            ],
+        },
+        sort_keys=True,
+    ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    tags=tags,
+)
+
 github_actions_infrastructure_role = aws.iam.Role(
     "github_actions_infrastructure_role",
     name=github_actions_role_name,
@@ -403,7 +476,10 @@ github_actions_infrastructure_role = aws.iam.Role(
             sort_keys=True,
         )
     ),
-    managed_policy_arns=[github_actions_infrastructure_policy.arn],
+    managed_policy_arns=[
+        github_actions_infrastructure_policy.arn,
+        github_actions_trainer_policy.arn,
+    ],
     opts=pulumi.ResourceOptions(retain_on_delete=True),
     tags=tags,
 )

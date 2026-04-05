@@ -180,7 +180,7 @@ in {
   scripts.ecs-deploy.exec = ''
     unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
     SERVICE="$1"
-    CLUSTER="fund-application"
+    CLUSTER="fund-applications"
 
     if [ -z "$SERVICE" ]; then
       echo "Usage: ecs-deploy <${lib.concatStringsSep "|" deployableServices}|all>"
@@ -227,7 +227,7 @@ in {
   # Show ECS service status
   scripts.ecs-status.exec = ''
     unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-    CLUSTER="fund-application"
+    CLUSTER="fund-applications"
     echo "=== ECS Services ==="
     aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
     echo ""
@@ -269,17 +269,11 @@ in {
   '';
 
   # Create ECS work pool and register training deployment on Prefect Cloud
-  scripts.training-init.exec = ''
-    if [ -z "$PREFECT_API_KEY" ]; then
-      echo "PREFECT_API_KEY not set. Add it to .envrc and run 'direnv allow'."
-      exit 1
-    fi
-
-    # Override the local dev PREFECT_API_URL so the CLI targets Prefect Cloud
+  scripts.initialize-remote-trainer.exec = ''
     unset PREFECT_API_URL
 
-    echo "Creating fund-work-pool-ecs work pool on Prefect Cloud..."
-    uv run --package tools prefect work-pool create "fund-work-pool-ecs" --type ecs 2>/dev/null \
+    echo "Creating fund-models-remote work pool on Prefect Cloud..."
+    uv run --package tools prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
       || echo "  already exists"
 
     echo "Registering training deployments..."
@@ -292,20 +286,18 @@ in {
   # --- Local dev commands ---
 
   # Create work pool and register training deployment locally
-  scripts.training-setup.exec = ''
+  scripts.initialize-local-trainer.exec = ''
     echo "Waiting for orchestrator..."
     while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
       sleep 2
     done
 
-    echo "Creating fund-work-pool-local work pool..."
-    PREFECT_API_URL="http://localhost:4200/api" \
-      uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null \
+    echo "Creating fund-models-local work pool..."
+    uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
       || echo "  already exists"
 
-    echo "Registering daily-training deployment..."
-    PREFECT_API_URL="http://localhost:4200/api" \
-      uv run --package tide python -m tide.deploy
+    echo "Registering local training deployment..."
+    uv run prefect --no-prompt deploy --name tide-trainer-local
 
     echo ""
     echo "Done. Visit http://localhost:4200 to see the orchestrator dashboard."
@@ -363,12 +355,12 @@ in {
 
       # Create work pool and register deployment on first startup
       PREFECT_API_URL="http://localhost:4200/api" \
-        uv run --package tools prefect work-pool create "fund-work-pool-local" --type process 2>/dev/null || true
+        uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null || true
       PREFECT_API_URL="http://localhost:4200/api" \
         uv run --package tide python -m tide.deploy 2>/dev/null || true
 
       cd tools
-      exec uv run prefect worker start --pool fund-work-pool-local --name worker-1
+      exec uv run prefect worker start --pool fund-models-local --name worker-1
     '';
 
     training-worker-2.exec = ''
@@ -377,7 +369,7 @@ in {
       done
       sleep 3
       cd tools
-      exec uv run prefect worker start --pool fund-work-pool-local --name worker-2
+      exec uv run prefect worker start --pool fund-models-local --name worker-2
     '';
 
     data-manager.exec = ''
@@ -447,10 +439,10 @@ in {
     echo "    ecs-deploy <svc>  Force ECS service redeployment"
     echo "    deploy <svc|all>  Build, push, and redeploy (ecr-push + ecs-deploy)"
     echo "    ecs-status        Show ECS service status"
-    echo "    training-init     Create work pool + register deployment (prod)"
+    echo "    initialize-remote-trainer  Create work pool + register deployment (prod)"
     echo ""
     echo "  Local:"
-    echo "    training-setup    Create work pool + register deployment (local)"
+    echo "    initialize-local-trainer   Create work pool + register deployment (local)"
     echo "    cleanup-services  Kill stale local processes"
   '';
 

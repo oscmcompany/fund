@@ -18,10 +18,9 @@ def test_iam_attaches_custom_github_actions_policy() -> None:
     infrastructure_iam = load_infrastructure_iam()
 
     assert '"github_actions_infrastructure_policy"' in infrastructure_iam
-    assert (
-        "managed_policy_arns=[github_actions_infrastructure_policy.arn]"
-        in infrastructure_iam
-    )
+    assert '"github_actions_trainer_policy"' in infrastructure_iam
+    assert "github_actions_infrastructure_policy.arn" in infrastructure_iam
+    assert "github_actions_trainer_policy.arn" in infrastructure_iam
 
 
 def test_iam_scopes_oidc_provider_creation_statement() -> None:
