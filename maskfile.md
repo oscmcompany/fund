@@ -435,6 +435,15 @@ cluster=$(pulumi stack output aws_ecs_cluster_name)
 
 cd "${MASKFILE_DIR}"
 
+case "${service_name}" in
+    data-manager|portfolio-manager|ensemble-manager) ;;
+    *)
+        echo "Unknown service: ${service_name}"
+        echo "Valid options: data-manager, portfolio-manager, ensemble-manager"
+        exit 1
+        ;;
+esac
+
 service="fund-${service_name}-server"
 
 aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager > /dev/null
