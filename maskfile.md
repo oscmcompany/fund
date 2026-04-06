@@ -431,7 +431,7 @@ case "${environment}" in
         unset PREFECT_API_URL
 
         echo "Creating fund-models-remote work pool on Prefect Cloud"
-        uv run --package tools prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
+        uv run prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
             || echo "  already exists"
 
         echo "Registering remote training deployment"
@@ -444,7 +444,7 @@ case "${environment}" in
         export PREFECT_API_URL="http://localhost:4200/api"
 
         echo "Creating fund-models-local work pool"
-        uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
+        uv run prefect work-pool create "fund-models-local" --type process 2>/dev/null \
             || echo "  already exists"
 
         echo "Registering local training deployment"
