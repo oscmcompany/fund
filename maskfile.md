@@ -430,12 +430,12 @@ case "${environment}" in
     remote)
         unset PREFECT_API_URL
 
-        echo "Creating fund-models-remote work pool on Prefect Cloud..."
+        echo "Creating fund-models-remote work pool on Prefect Cloud"
         uv run --package tools prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
             || echo "  already exists"
 
-        echo "Registering training deployments..."
-        uv run prefect --no-prompt deploy --all
+        echo "Registering remote training deployment"
+        uv run prefect --no-prompt deploy --name tide-trainer-remote
 
         echo ""
         echo "Done. Visit Prefect Cloud dashboard to view deployments."
@@ -443,11 +443,11 @@ case "${environment}" in
     local)
         export PREFECT_API_URL="http://localhost:4200/api"
 
-        echo "Creating fund-models-local work pool..."
+        echo "Creating fund-models-local work pool"
         uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
             || echo "  already exists"
 
-        echo "Registering local training deployment..."
+        echo "Registering local training deployment"
         uv run prefect --no-prompt deploy --name tide-trainer-local
         ;;
     *)
