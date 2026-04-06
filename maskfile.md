@@ -200,7 +200,7 @@ esac
 cd infrastructure/
 
 if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <org>"
+    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <organization>"
     exit 1
 fi
 pulumi stack select "${organization_name}/fund/production"
@@ -413,6 +413,36 @@ case "$application_name" in
         exit 1
         ;;
 esac
+```
+
+#### update (service_name)
+
+> Force redeploy an ECS service with the latest image (e.g. `ensemble-manager`)
+
+```bash
+set -euo pipefail
+
+echo "Updating ${service_name} service"
+
+cd infrastructure/
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <organization>"
+    exit 1
+fi
+pulumi stack select "${organization_name}/fund/production"
+cluster=$(pulumi stack output aws_ecs_cluster_name)
+
+cd "${MASKFILE_DIR}"
+
+service="fund-${service_name}-server"
+
+aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager > /dev/null
+echo "Deployment started: ${service}"
+
+echo "Waiting for ${service} to stabilize"
+aws ecs wait services-stable --cluster "$cluster" --services "$service"
+echo "Deployment complete: ${service}"
 ```
 
 ### models
