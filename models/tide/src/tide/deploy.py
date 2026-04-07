@@ -11,6 +11,7 @@ logger = structlog.get_logger()
 
 def deploy_training_flow(
     lookback_days: int = 365,
+    image: str | None = None,
 ) -> None:
     """Register the training pipeline deployment with the Prefect server."""
     logger.info(
@@ -21,6 +22,7 @@ def deploy_training_flow(
     training_pipeline.deploy(
         name="tide-trainer-remote",
         work_pool_name="fund-models-remote",
+        image=image,
         schedule=Schedule(cron="0 22 * * 1-5", timezone="America/New_York"),
         parameters={
             "lookback_days": lookback_days,
@@ -44,6 +46,12 @@ if __name__ == "__main__":
         logger.error("FUND_LOOKBACK_DAYS must be positive", lookback_days=lookback_days)
         sys.exit(1)
 
+    image = os.getenv("FUND_TIDE_IMAGE_URI")
+    if not image:
+        logger.error("FUND_TIDE_IMAGE_URI environment variable is required")
+        sys.exit(1)
+
     deploy_training_flow(
         lookback_days=lookback_days,
+        image=image,
     )

@@ -31,8 +31,10 @@ def test_deploy_training_flow_sets_build_options(
     mock_deploy = MagicMock()
     mock_pipeline.deploy = mock_deploy
 
-    deploy_training_flow()
+    image = "123456789.dkr.ecr.us-east-1.amazonaws.com/fund/tide-model-runner:latest"
+    deploy_training_flow(image=image)
 
     call_kwargs = mock_deploy.call_args.kwargs
+    assert call_kwargs["image"] == image
     assert call_kwargs["build"] is False
     assert call_kwargs["push"] is False

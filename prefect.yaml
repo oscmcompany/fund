@@ -9,8 +9,6 @@ deployments:
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline
     work_pool:
       name: fund-models-remote
-      job_variables:
-        image: "{{ $FUND_TIDE_IMAGE_URI }}"
     parameters: {}
     build: null
     push: null
