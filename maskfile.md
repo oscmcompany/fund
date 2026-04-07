@@ -469,9 +469,24 @@ case "${environment}" in
     remote)
         unset PREFECT_API_URL
 
+        pulumi stack select "$(pulumi org get-default)/fund/production"
+        models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
+        cd "${MASKFILE_DIR}"
+
         echo "Creating fund-models-remote work pool on Prefect Cloud"
-        uv run prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
-            || echo "  already exists"
+        aws_credentials_block_id=$(uv run prefect block inspect "aws-credentials/fund-aws" --output json | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+        base_job_template=$(uv run prefect work-pool get-default-base-job-template --type ecs \
+            | python3 -c "
+import json, sys
+tmpl = json.load(sys.stdin)
+tmpl['variables']['properties']['cluster']['default'] = '${models_cluster}'
+tmpl['variables']['properties']['aws_credentials']['default'] = {'\$ref': {'block_document_id': '${aws_credentials_block_id}'}}
+print(json.dumps(tmpl))
+")
+        uv run prefect work-pool create "fund-models-remote" --type ecs \
+            --base-job-template <(echo "${base_job_template}") 2>/dev/null \
+            || uv run prefect work-pool update "fund-models-remote" \
+                --base-job-template <(echo "${base_job_template}")
 
         echo "Registering remote training deployment"
         uv run prefect --no-prompt deploy --name tide-trainer-remote
@@ -892,8 +907,21 @@ set -euo pipefail
 unset PREFECT_API_URL
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select "${organization_name}/fund/production"
+tide_image_uri=$(pulumi stack output aws_ecr_tide_model_runner_image)
+
+cd "${MASKFILE_DIR}"
+
 case "${model_name}" in
     tide)
+        export FUND_TIDE_IMAGE_URI="${tide_image_uri}"
         uv run python -m tide.deploy
         ;;
     *)

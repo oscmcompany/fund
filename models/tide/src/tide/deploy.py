@@ -2,7 +2,7 @@ import os
 import sys
 
 import structlog
-from prefect.flows import EntrypointType
+from prefect.schedules import Schedule
 
 from tide.workflow import training_pipeline
 
@@ -21,13 +21,11 @@ def deploy_training_flow(
     training_pipeline.deploy(
         name="tide-trainer-remote",
         work_pool_name="fund-models-remote",
-        cron="0 22 * * 1-5",
-        timezone="America/New_York",
+        schedule=Schedule(cron="0 22 * * 1-5", timezone="America/New_York"),
         parameters={
             "lookback_days": lookback_days,
         },
         tags=["training", "daily"],
-        entrypoint_type=EntrypointType.MODULE_PATH,
         build=False,
         push=False,
     )
