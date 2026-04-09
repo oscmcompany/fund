@@ -56,9 +56,11 @@ def read_equity_bars_from_s3(
             parquet_bytes = response["Body"].read()
             dataframe = pl.read_parquet(parquet_bytes)
             dataframe = dataframe.with_columns(
-                pl.col(col).cast(pl.Float64)
-                for col in _FLOAT_COLUMNS
-                if col in dataframe.columns
+                [
+                    pl.col(col).cast(pl.Float64)
+                    for col in _FLOAT_COLUMNS
+                    if col in dataframe.columns
+                ]
             )
             batch_dataframes.append(dataframe)
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
