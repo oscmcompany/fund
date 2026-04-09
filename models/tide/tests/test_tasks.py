@@ -1,5 +1,5 @@
 import io
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -113,6 +113,33 @@ def test_consolidate_data_excludes_unmatched_tickers() -> None:
     result = consolidate_data(_SAMPLE_EQUITY_BARS, categories)
 
     assert len(result) == 0
+
+
+def test_read_equity_bars_from_s3_normalizes_column_types_across_files() -> None:
+    day1 = _SAMPLE_EQUITY_BARS.with_columns(pl.col("volume").cast(pl.Float64))
+    day2 = _SAMPLE_EQUITY_BARS.with_columns(pl.col("volume").cast(pl.Int64))
+
+    mock_body_1 = MagicMock()
+    mock_body_1.read.return_value = _to_parquet_bytes(day1)
+    mock_body_2 = MagicMock()
+    mock_body_2.read.return_value = _to_parquet_bytes(day2)
+
+    mock_s3_client = MagicMock()
+    mock_s3_client.get_object.side_effect = [
+        {"Body": mock_body_1},
+        {"Body": mock_body_2},
+    ]
+
+    result = read_equity_bars_from_s3(
+        s3_client=mock_s3_client,
+        bucket_name="test-bucket",
+        start_date=_TARGET_DATE,
+        end_date=_TARGET_DATE + timedelta(days=1),
+    )
+
+    expected_rows = len(day1) + len(day2)
+    assert len(result) == expected_rows
+    assert result["volume"].dtype == pl.Int64
 
 
 def test_read_equity_bars_from_s3_returns_dataframe() -> None:

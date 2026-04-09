@@ -15,13 +15,15 @@ logger = structlog.get_logger()
 MINIMUM_CLOSE_PRICE = 1.0
 MINIMUM_VOLUME = 100_000
 
-_FLOAT_COLUMNS = [
-    "open_price",
-    "high_price",
-    "low_price",
-    "close_price",
-    "volume_weighted_average_price",
-]
+_COLUMN_TYPES: dict[str, type[pl.DataType]] = {
+    "open_price": pl.Float64,
+    "high_price": pl.Float64,
+    "low_price": pl.Float64,
+    "close_price": pl.Float64,
+    "volume_weighted_average_price": pl.Float64,
+    "volume": pl.Int64,
+    "transactions": pl.Int64,
+}
 
 
 def read_equity_bars_from_s3(
@@ -57,8 +59,8 @@ def read_equity_bars_from_s3(
             dataframe = pl.read_parquet(parquet_bytes)
             dataframe = dataframe.with_columns(
                 [
-                    pl.col(col).cast(pl.Float64)
-                    for col in _FLOAT_COLUMNS
+                    pl.col(col).cast(dtype)
+                    for col, dtype in _COLUMN_TYPES.items()
                     if col in dataframe.columns
                 ]
             )
