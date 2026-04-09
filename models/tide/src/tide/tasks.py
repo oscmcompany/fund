@@ -15,6 +15,14 @@ logger = structlog.get_logger()
 MINIMUM_CLOSE_PRICE = 1.0
 MINIMUM_VOLUME = 100_000
 
+_FLOAT_COLUMNS = [
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume_weighted_average_price",
+]
+
 
 def read_equity_bars_from_s3(
     s3_client: "S3Client",
@@ -47,6 +55,11 @@ def read_equity_bars_from_s3(
             response = s3_client.get_object(Bucket=bucket_name, Key=key)
             parquet_bytes = response["Body"].read()
             dataframe = pl.read_parquet(parquet_bytes)
+            dataframe = dataframe.with_columns(
+                pl.col(col).cast(pl.Float64)
+                for col in _FLOAT_COLUMNS
+                if col in dataframe.columns
+            )
             batch_dataframes.append(dataframe)
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
         except s3_client.exceptions.NoSuchKey:
@@ -110,6 +123,7 @@ def filter_equity_bars(
     filtered = data.filter(
         (pl.col("close_price") >= minimum_close_price)
         & (pl.col("volume") >= minimum_volume)
+        & ~pl.col("ticker").str.contains("p")
     )
 
     logger.info("Filtered equity bars", output_rows=filtered.height)

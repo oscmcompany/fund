@@ -27,6 +27,10 @@ def deploy_training_flow(
         parameters={
             "lookback_days": lookback_days,
         },
+        job_variables={
+            "cpu": 4096,
+            "memory": 14336,
+        },
         tags=["training", "daily"],
         build=False,
         push=False,

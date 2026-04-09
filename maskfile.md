@@ -481,6 +481,9 @@ import json, sys
 tmpl = json.load(sys.stdin)
 tmpl['variables']['properties']['cluster']['default'] = '${models_cluster}'
 tmpl['variables']['properties']['aws_credentials']['default'] = {'\$ref': {'block_document_id': '${aws_credentials_block_id}'}}
+tmpl['variables']['properties']['capacity_provider_strategy']['default'] = [{'capacityProvider': 'fund-models-gpu', 'weight': 1}]
+for container in tmpl.get('job_configuration', {}).get('task_definition', {}).get('containerDefinitions', []):
+    container['resourceRequirements'] = [{'type': 'GPU', 'value': '1'}]
 print(json.dumps(tmpl))
 ")
         uv run prefect work-pool create "fund-models-remote" --type ecs \

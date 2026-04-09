@@ -51,6 +51,7 @@ def _to_csv_bytes(data: pl.DataFrame) -> bytes:
 def test_filter_equity_bars_keeps_rows_above_thresholds() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL", "LOW"],
             "close_price": [MINIMUM_CLOSE_PRICE + 1.0, 0.5],
             "volume": [MINIMUM_VOLUME + 1, 50_000],
         }
@@ -62,9 +63,28 @@ def test_filter_equity_bars_keeps_rows_above_thresholds() -> None:
     assert result["close_price"][0] == MINIMUM_CLOSE_PRICE + 1.0
 
 
+def test_filter_equity_bars_excludes_preferred_stocks() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "JPMpC", "NEEpR"],
+            "close_price": [
+                MINIMUM_CLOSE_PRICE + 1.0,
+                MINIMUM_CLOSE_PRICE + 1.0,
+                MINIMUM_CLOSE_PRICE + 1.0,
+            ],
+            "volume": [MINIMUM_VOLUME + 1, MINIMUM_VOLUME + 1, MINIMUM_VOLUME + 1],
+        }
+    )
+
+    result = filter_equity_bars(data)
+
+    assert len(result) == 1
+    assert result["ticker"][0] == "AAPL"
+
+
 def test_filter_equity_bars_empty_input_returns_empty() -> None:
-    data = pl.DataFrame({"close_price": [], "volume": []}).cast(
-        {"close_price": pl.Float64, "volume": pl.Int64}
+    data = pl.DataFrame({"ticker": [], "close_price": [], "volume": []}).cast(
+        {"ticker": pl.String, "close_price": pl.Float64, "volume": pl.Int64}
     )
 
     result = filter_equity_bars(data)
