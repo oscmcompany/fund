@@ -469,30 +469,29 @@ case "${environment}" in
     remote)
         unset PREFECT_API_URL
 
+        cd infrastructure/
         pulumi stack select "$(pulumi org get-default)/fund/production"
         models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
         cd "${MASKFILE_DIR}"
 
         echo "Creating fund-models-remote work pool on Prefect Cloud"
-        aws_credentials_block_id=$(uv run prefect block inspect "aws-credentials/fund-aws" --output json | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+        aws_credentials_block_id=$(uv run prefect block inspect "aws-credentials/fund-aws" | grep "Block id" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
         base_job_template=$(uv run prefect work-pool get-default-base-job-template --type ecs \
             | python3 -c "
-import json, sys
+import json, os, sys
 tmpl = json.load(sys.stdin)
 tmpl['variables']['properties']['cluster']['default'] = '${models_cluster}'
 tmpl['variables']['properties']['aws_credentials']['default'] = {'\$ref': {'block_document_id': '${aws_credentials_block_id}'}}
 tmpl['variables']['properties']['capacity_provider_strategy']['default'] = [{'capacityProvider': 'fund-models-gpu', 'weight': 1}]
 for container in tmpl.get('job_configuration', {}).get('task_definition', {}).get('containerDefinitions', []):
     container['resourceRequirements'] = [{'type': 'GPU', 'value': '1'}]
+    container['logConfiguration'] = {'logDriver': 'awslogs', 'options': {'awslogs-group': '/ecs/fund/models', 'awslogs-region': os.environ.get('AWS_REGION', 'us-east-1'), 'awslogs-stream-prefix': 'tide'}}
 print(json.dumps(tmpl))
 ")
         uv run prefect work-pool create "fund-models-remote" --type ecs \
             --base-job-template <(echo "${base_job_template}") 2>/dev/null \
             || uv run prefect work-pool update "fund-models-remote" \
                 --base-job-template <(echo "${base_job_template}")
-
-        echo "Registering remote training deployment"
-        uv run prefect --no-prompt deploy --name tide-trainer-remote
 
         echo ""
         echo "Done. Visit Prefect Cloud dashboard to view deployments."
