@@ -391,6 +391,7 @@ class Model:
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                    Tensor.realize(*get_parameters(self))
 
                     step_loss = loss.numpy().item()
                     epoch_losses.append(step_loss)
