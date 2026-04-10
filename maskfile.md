@@ -472,6 +472,7 @@ case "${environment}" in
         cd infrastructure/
         pulumi stack select "$(pulumi org get-default)/fund/production"
         models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
+        tide_trainer_task_definition_arn=$(pulumi stack output aws_ecs_tide_trainer_task_definition_arn)
         cd "${MASKFILE_DIR}"
 
         echo "Creating fund-models-remote work pool on Prefect Cloud"
@@ -483,7 +484,13 @@ tmpl = json.load(sys.stdin)
 tmpl['variables']['properties']['cluster']['default'] = '${models_cluster}'
 tmpl['variables']['properties']['aws_credentials']['default'] = {'\$ref': {'block_document_id': '${aws_credentials_block_id}'}}
 tmpl['variables']['properties']['capacity_provider_strategy']['default'] = [{'capacityProvider': 'fund-models-gpu', 'weight': 1}]
-for container in tmpl.get('job_configuration', {}).get('task_definition', {}).get('containerDefinitions', []):
+tmpl['variables']['properties']['launch_type']['default'] = None
+tmpl['variables']['properties']['task_definition_arn']['default'] = '${tide_trainer_task_definition_arn}'
+task_def = tmpl.setdefault('job_configuration', {}).setdefault('task_definition', {})
+containers = task_def.setdefault('containerDefinitions', [{}])
+if not containers:
+    containers.append({})
+for container in containers:
     container['resourceRequirements'] = [{'type': 'GPU', 'value': '1'}]
     container['logConfiguration'] = {'logDriver': 'awslogs', 'options': {'awslogs-group': '/ecs/fund/models', 'awslogs-region': os.environ.get('AWS_REGION', 'us-east-1'), 'awslogs-stream-prefix': 'tide'}}
 print(json.dumps(tmpl))

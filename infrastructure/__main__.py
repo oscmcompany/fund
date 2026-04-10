@@ -15,7 +15,7 @@ from storage import (
     tide_model_runner_image_uri,
     tide_model_runner_repository,
 )
-from training import models_cluster
+from training import models_cluster, tide_trainer_task_definition
 
 protocol = "https://" if acm_certificate_arn else "http://"
 
@@ -35,6 +35,9 @@ pulumi.export("aws_account_id", account_id)
 pulumi.export("aws_vpc_id", vpc.id)
 pulumi.export("aws_ecs_cluster_name", cluster.name)
 pulumi.export("aws_ecs_models_cluster_name", models_cluster.name)
+pulumi.export(
+    "aws_ecs_tide_trainer_task_definition_arn", tide_trainer_task_definition.arn
+)
 pulumi.export("aws_alb_dns_name", alb.dns_name)
 pulumi.export("aws_alb_url", pulumi.Output.concat(protocol, alb.dns_name))
 pulumi.export("aws_service_discovery_namespace", service_discovery_namespace.name)

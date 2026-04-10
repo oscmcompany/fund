@@ -5,6 +5,7 @@ import pulumi_aws as aws
 from config import tags
 from iam import execution_role, task_role
 from networking import ecs_security_group, private_subnet_1, private_subnet_2
+from storage import tide_model_runner_image_uri
 
 models_cluster = aws.ecs.Cluster(
     "models_cluster",
@@ -154,9 +155,42 @@ models_log_group = aws.cloudwatch.LogGroup(
     tags=tags,
 )
 
+tide_trainer_task_definition = aws.ecs.TaskDefinition(
+    "tide_trainer_task_definition",
+    family="fund-tide-trainer",
+    requires_compatibilities=["EC2"],
+    network_mode="awsvpc",
+    cpu="4096",
+    memory="14336",
+    execution_role_arn=execution_role.arn,
+    task_role_arn=task_role.arn,
+    container_definitions=tide_model_runner_image_uri.apply(
+        lambda image_uri: json.dumps(
+            [
+                {
+                    "name": "prefect",
+                    "image": image_uri,
+                    "essential": True,
+                    "resourceRequirements": [{"type": "GPU", "value": "1"}],
+                    "logConfiguration": {
+                        "logDriver": "awslogs",
+                        "options": {
+                            "awslogs-group": "/ecs/fund/models",
+                            "awslogs-region": "us-east-1",
+                            "awslogs-stream-prefix": "tide",
+                        },
+                    },
+                }
+            ]
+        )
+    ),
+    tags=tags,
+)
+
 __all__ = [
     "execution_role",
     "models_cluster",
     "models_log_group",
     "task_role",
+    "tide_trainer_task_definition",
 ]

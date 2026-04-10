@@ -83,7 +83,7 @@ def prepare_data(
     return output_key
 
 
-@task(name="train-tide-model", timeout_seconds=3600)
+@task(name="train-tide-model", timeout_seconds=14400)
 def train_tide_model(
     training_data_key: str = "training/filtered_tide_training_data.parquet",
 ) -> str:
