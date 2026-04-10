@@ -2,7 +2,7 @@ import pulumi
 from compute import acm_certificate_arn, alb, cluster, service_discovery_namespace
 from config import account_id
 from iam import github_actions_infrastructure_role, github_actions_oidc_provider
-from networking import vpc
+from networking import ecs_security_group, private_subnet_1, private_subnet_2, vpc
 from storage import (
     data_bucket,
     data_manager_image_uri,
@@ -33,6 +33,9 @@ readme_content = """
 
 pulumi.export("aws_account_id", account_id)
 pulumi.export("aws_vpc_id", vpc.id)
+pulumi.export("aws_ecs_private_subnet_1_id", private_subnet_1.id)
+pulumi.export("aws_ecs_private_subnet_2_id", private_subnet_2.id)
+pulumi.export("aws_ecs_security_group_id", ecs_security_group.id)
 pulumi.export("aws_ecs_cluster_name", cluster.name)
 pulumi.export("aws_ecs_models_cluster_name", models_cluster.name)
 pulumi.export(

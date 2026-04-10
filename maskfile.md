@@ -473,6 +473,10 @@ case "${environment}" in
         pulumi stack select "$(pulumi org get-default)/fund/production"
         models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
         tide_trainer_task_definition_arn=$(pulumi stack output aws_ecs_tide_trainer_task_definition_arn)
+        vpc_id=$(pulumi stack output aws_vpc_id)
+        private_subnet_1_id=$(pulumi stack output aws_ecs_private_subnet_1_id)
+        private_subnet_2_id=$(pulumi stack output aws_ecs_private_subnet_2_id)
+        ecs_security_group_id=$(pulumi stack output aws_ecs_security_group_id)
         cd "${MASKFILE_DIR}"
 
         echo "Creating fund-models-remote work pool on Prefect Cloud"
@@ -486,6 +490,8 @@ tmpl['variables']['properties']['aws_credentials']['default'] = {'\$ref': {'bloc
 tmpl['variables']['properties']['capacity_provider_strategy']['default'] = [{'capacityProvider': 'fund-models-gpu', 'weight': 1}]
 tmpl['variables']['properties']['launch_type']['default'] = None
 tmpl['variables']['properties']['task_definition_arn']['default'] = '${tide_trainer_task_definition_arn}'
+tmpl['variables']['properties']['vpc_id']['default'] = '${vpc_id}'
+tmpl['variables']['properties']['network_configuration']['default'] = {'subnets': ['${private_subnet_1_id}', '${private_subnet_2_id}'], 'securityGroups': ['${ecs_security_group_id}'], 'assignPublicIp': 'DISABLED'}
 task_def = tmpl.setdefault('job_configuration', {}).setdefault('task_definition', {})
 containers = task_def.setdefault('containerDefinitions', [{}])
 if not containers:
