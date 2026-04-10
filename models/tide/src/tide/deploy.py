@@ -30,7 +30,9 @@ def deploy_training_flow(
         job_variables={
             "cpu": 4096,
             "memory": 14336,
+            "env": {"CUDA": "1"},
         },
+        concurrency_limit=1,
         tags=["training", "daily"],
         build=False,
         push=False,

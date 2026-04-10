@@ -12,8 +12,8 @@ logger = structlog.get_logger()
 DEFAULT_CONFIGURATION: dict[str, Any] = {
     "architecture": "TiDE",
     "learning_rate": 0.0005,
-    "epoch_count": 200,
-    "early_stopping_patience": 25,
+    "epoch_count": 50,
+    "early_stopping_patience": 10,
     "validation_split": 0.8,
     "input_length": 35,
     "output_length": 7,
@@ -21,7 +21,7 @@ DEFAULT_CONFIGURATION: dict[str, Any] = {
     "num_encoder_layers": 3,
     "num_decoder_layers": 2,
     "dropout_rate": 0.1,
-    "batch_size": 32,
+    "batch_size": 128,
     "huber_delta": 0.5,
     "quantiles": [0.1, 0.5, 0.9],
 }
