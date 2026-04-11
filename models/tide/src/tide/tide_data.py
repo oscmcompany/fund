@@ -1,15 +1,18 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pandera.polars as pa
 import polars as pl
 import structlog
 from internal.timestamps import to_timestamp_milliseconds
-from tinygrad.tensor import Tensor
+
+if TYPE_CHECKING:
+    from tinygrad.tensor import Tensor
 
 logger = structlog.get_logger()
 
@@ -43,7 +46,6 @@ CATEGORICAL_COLUMNS = [
     "day_of_year",
     "month",
     "year",
-    "is_holiday",
 ]
 
 STATIC_CATEGORICAL_COLUMNS = [
@@ -55,6 +57,18 @@ STATIC_CATEGORICAL_COLUMNS = [
 EncodedCategoryValue = str | bool
 CategoryMapping = dict[EncodedCategoryValue, int]
 FeatureMappings = dict[str, CategoryMapping]
+
+
+@dataclass
+class TrainingDataset:
+    past_continuous: np.ndarray  # [N, input_length, n_continuous_features]
+    past_categorical: np.ndarray  # [N, input_length, n_categorical_features]
+    future_categorical: np.ndarray  # [N, output_length, n_categorical_features]
+    static_categorical: np.ndarray  # [N, 1, n_static_features]
+    targets: np.ndarray | None  # [N, output_length, 1] — None for predict
+
+    def __len__(self) -> int:
+        return len(self.past_continuous)
 
 
 class Scaler:
@@ -96,10 +110,10 @@ class ValidateColumns(Stage):
         return data
 
 
-class ExpandDateRange(Stage):
+class EngineerFeatures(Stage):
     @property
     def name(self) -> str:
-        return "expand_date_range"
+        return "engineer_features"
 
     def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.with_columns(
@@ -107,85 +121,8 @@ class ExpandDateRange(Stage):
             .cast(pl.Datetime(time_unit="ms"))
             .dt.date()
             .alias("date"),
-            pl.lit(False).alias("is_holiday"),  # noqa: FBT003
         )
 
-        tickers = data.select(pl.col("ticker").unique())
-
-        minimum_date: date = data.select(pl.col("date").min()).item()
-        maximum_date: date = data.select(pl.col("date").max()).item()
-
-        dates = pl.DataFrame(
-            {
-                "date": pl.date_range(
-                    minimum_date,
-                    maximum_date,
-                    "1d",
-                    eager=True,
-                )
-            }
-        )
-
-        dates_and_tickers = tickers.join(dates, how="cross")
-
-        return dates_and_tickers.join(data, on=["ticker", "date"], how="left")
-
-
-class FillNulls(Stage):
-    @property
-    def name(self) -> str:
-        return "fill_nulls"
-
-    def run(self, data: pl.DataFrame) -> pl.DataFrame:
-        friday_number = 4
-
-        data = (
-            data.with_columns(pl.col("date").dt.weekday().alias("temporary_weekday"))
-            .with_columns(
-                pl.when(
-                    pl.col("is_holiday").is_null()
-                    & (pl.col("temporary_weekday") <= friday_number)
-                )
-                .then(True)  # noqa: FBT003
-                .when(
-                    pl.col("is_holiday").is_null()
-                    & (pl.col("temporary_weekday") > friday_number)
-                )
-                .then(False)  # noqa: FBT003
-                .otherwise(pl.col("is_holiday"))  # keep existing values
-                .alias("is_holiday")
-            )
-            .drop("temporary_weekday")
-        )
-
-        return data.with_columns(
-            [
-                pl.col("open_price").fill_null(0.0),
-                pl.col("high_price").fill_null(0.0),
-                pl.col("low_price").fill_null(0.0),
-                pl.col("close_price").fill_null(0.0),
-                pl.col("volume").fill_null(0),
-                pl.col("volume_weighted_average_price").fill_null(0.0),
-                pl.col("sector").fill_null("NOT AVAILABLE"),
-                pl.col("industry").fill_null("NOT AVAILABLE"),
-                pl.col("ticker").fill_null("UNKNOWN"),
-                pl.col("timestamp").fill_null(
-                    pl.col("date")
-                    .cast(pl.Datetime)
-                    .dt.replace_time_zone("UTC")
-                    .cast(pl.Int64)
-                    .floordiv(1000)
-                ),
-            ]
-        )
-
-
-class EngineerFeatures(Stage):
-    @property
-    def name(self) -> str:
-        return "engineer_features"
-
-    def run(self, data: pl.DataFrame) -> pl.DataFrame:
         data = data.with_columns(
             pl.col("date").dt.weekday().alias("day_of_week").cast(pl.Int64),
             pl.col("date").dt.day().alias("day_of_month").cast(pl.Int64),
@@ -302,7 +239,6 @@ class ScaleAndEncode(Stage):
             "ticker",
             "sector",
             "industry",
-            "is_holiday",
         ]
 
         mappings: FeatureMappings = {}
@@ -331,8 +267,6 @@ def _create_mapping_and_encoding(
 def default_stages() -> list[Stage]:
     return [
         ValidateColumns(),
-        ExpandDateRange(),
-        FillNulls(),
         EngineerFeatures(),
         CleanData(),
         ScaleAndEncode(),
@@ -439,14 +373,13 @@ class Data:
             "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
 
-    def get_batches(  # noqa: C901
+    def get_dataset(  # noqa: C901
         self,
-        data_type: str = "train",  # "train", "validate", or "predict"
+        data_type: str = "train",
         validation_split: float = 0.8,
         input_length: int = 35,
-        output_length: int = 7,
-        batch_size: int = 32,
-    ) -> list[dict[str, Tensor]]:
+        output_length: int = 5,
+    ) -> TrainingDataset:
         if data_type not in {"train", "validate", "predict"}:
             message = f"Invalid data type: {data_type}. Must be 'train', 'validate', or 'predict'."  # noqa: E501
             raise ValueError(message)
@@ -455,12 +388,10 @@ class Data:
             self.batch_data, _ = self._get_training_and_validation_data(
                 validation_split
             )
-
         elif data_type == "validate":
             _, self.batch_data = self._get_training_and_validation_data(
                 validation_split
             )
-
         elif data_type == "predict":
             self.batch_data = self._get_prediction_data(input_length + output_length)
 
@@ -480,26 +411,26 @@ class Data:
             )
             raise ValueError(message)
 
-        # collect all samples first
-        samples = []
+        all_past_continuous: list[np.ndarray] = []
+        all_past_categorical: list[np.ndarray] = []
+        all_future_categorical: list[np.ndarray] = []
+        all_static_categorical: list[np.ndarray] = []
+        all_targets: list[np.ndarray] = []
         has_targets = data_type in {"train", "validate"}
 
-        # Partition by ticker once upfront (much faster than filtering per ticker)
         logger.info("Partitioning data by ticker")
         ticker_groups = self.batch_data.sort("time_idx").partition_by(
             "ticker", as_dict=True
         )
         total_tickers = len(ticker_groups)
-        logger.info("Batch creation started", total_tickers=total_tickers)
+        logger.info("Dataset creation started", total_tickers=total_tickers)
 
         for idx, ticker_df in enumerate(ticker_groups.values()):
             if idx % 25 == 0:
                 logger.info(
-                    "Batch progress", ticker_idx=idx, total_tickers=total_tickers
+                    "Dataset progress", ticker_idx=idx, total_tickers=total_tickers
                 )
 
-            # Convert to numpy once per ticker (avoid repeated DataFrame operations)
-            # Use float32 for GPU compatibility (Metal doesn't support float64)
             cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
             cont_array = (
                 ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
@@ -522,62 +453,53 @@ class Data:
             if num_windows <= 0:
                 continue
 
-            # For prediction, only use the last window (most recent data)
-            # For training/validation, use all windows
             window_indices = (
                 [num_windows - 1] if data_type == "predict" else range(num_windows)
             )
 
-            # Use numpy slicing (much faster than DataFrame slicing)
             for i in window_indices:
-                sample = {
-                    "past_categorical": cat_array[i : i + input_length].copy(),
-                    "past_continuous": cont_array[i : i + input_length].copy(),
-                    "future_categorical": cat_array[
-                        i + input_length : i + input_length + output_length
-                    ].copy(),
-                    "static_categorical": static_array.copy(),
-                }
-
-                if has_targets and target_array is not None:
-                    sample["targets"] = target_array[
+                all_past_continuous.append(cont_array[i : i + input_length].copy())
+                all_past_categorical.append(cat_array[i : i + input_length].copy())
+                all_future_categorical.append(
+                    cat_array[
                         i + input_length : i + input_length + output_length
                     ].copy()
-
-                samples.append(sample)
-
-        logger.info("Sample collection complete", total_samples=len(samples))
-
-        # now batch the samples
-        logger.info("Batching samples", batch_size=batch_size)
-        batches = []
-        for i in range(0, len(samples), batch_size):
-            batch_samples = samples[i : i + batch_size]
-
-            batch = {
-                "past_categorical_features": Tensor(
-                    np.stack([s["past_categorical"] for s in batch_samples])
-                ),
-                "past_continuous_features": Tensor(
-                    np.stack([s["past_continuous"] for s in batch_samples])
-                ),
-                "future_categorical_features": Tensor(
-                    np.stack([s["future_categorical"] for s in batch_samples])
-                ),
-                "static_categorical_features": Tensor(
-                    np.stack([s["static_categorical"] for s in batch_samples])
-                ),
-            }
-
-            if data_type in {"train", "validate"}:
-                batch["targets"] = Tensor(
-                    np.stack([s["targets"] for s in batch_samples])
                 )
+                all_static_categorical.append(static_array.copy())
 
-            batches.append(batch)
+                if has_targets and target_array is not None:
+                    all_targets.append(
+                        target_array[
+                            i + input_length : i + input_length + output_length
+                        ].copy()
+                    )
 
-        logger.info("Batch creation complete", total_batches=len(batches))
-        return batches
+        logger.info(
+            "Sample collection complete", total_samples=len(all_past_continuous)
+        )
+
+        n_cont = len(self.continuous_columns)
+        n_cat = len(self.categorical_columns)
+        n_static = len(self.static_categorical_columns)
+
+        if not all_past_continuous:
+            return TrainingDataset(
+                past_continuous=np.zeros((0, input_length, n_cont), dtype=np.float32),
+                past_categorical=np.zeros((0, input_length, n_cat), dtype=np.int32),
+                future_categorical=np.zeros((0, output_length, n_cat), dtype=np.int32),
+                static_categorical=np.zeros((0, 1, n_static), dtype=np.int32),
+                targets=None
+                if not has_targets
+                else np.zeros((0, output_length, 1), dtype=np.float32),
+            )
+
+        return TrainingDataset(
+            past_continuous=np.stack(all_past_continuous),
+            past_categorical=np.stack(all_past_categorical),
+            future_categorical=np.stack(all_future_categorical),
+            static_categorical=np.stack(all_static_categorical),
+            targets=np.stack(all_targets) if all_targets else None,
+        )
 
     def save(self, directory_path: str) -> None:
         os.makedirs(directory_path, exist_ok=True)  # noqa: PTH103
@@ -629,10 +551,8 @@ class Data:
 
     def postprocess_predictions(
         self,
-        input_batch: dict[
-            str, Tensor
-        ],  # batch dictionary with static_categorical_features
-        predictions: Tensor,  # quantiles
+        input_batch: dict[str, "Tensor"],
+        predictions: "Tensor",
         current_datetime: datetime,
     ) -> pl.DataFrame:
         predictions_array = predictions.numpy()
@@ -695,9 +615,7 @@ data_schema = pa.DataFrameSchema(
         ),
         "open_price": pa.Column(
             dtype=float,
-            checks=pa.Check.greater_than_or_equal_to(
-                0
-            ),  # zeros are allowed for missing days
+            checks=pa.Check.greater_than_or_equal_to(0),
         ),
         "high_price": pa.Column(
             dtype=float,
@@ -728,7 +646,6 @@ data_schema = pa.DataFrameSchema(
         "day_of_year": pa.Column(dtype=int),
         "month": pa.Column(dtype=int),
         "year": pa.Column(dtype=int),
-        "is_holiday": pa.Column(dtype=bool),
         "time_idx": pa.Column(dtype=int),
         "daily_return": pa.Column(dtype=float),
     },

@@ -342,30 +342,31 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     tide_data.preprocess_and_set_data(data=data)
 
-    batches = tide_data.get_batches(data_type="predict")
+    from tinygrad.tensor import Tensor  # noqa: PLC0415
 
-    if not batches:
+    dataset = tide_data.get_dataset(data_type="predict")
+
+    if len(dataset) == 0:
         prediction_errors_total.labels(stage="batch_creation").inc()
-        logger.error("No data batches available for prediction")
+        logger.error("No data samples available for prediction")
         observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    logger.info(
-        "Processing prediction batches",
-        num_batches=len(batches),
+    logger.info("Processing prediction dataset", num_samples=len(dataset))
+
+    batch = {
+        "past_continuous_features": Tensor(dataset.past_continuous),
+        "past_categorical_features": Tensor(dataset.past_categorical),
+        "future_categorical_features": Tensor(dataset.future_categorical),
+        "static_categorical_features": Tensor(dataset.static_categorical),
+    }
+
+    raw_predictions = request.app.state.tide_model.predict(inputs=batch)
+    predictions = tide_data.postprocess_predictions(
+        input_batch=batch,
+        predictions=raw_predictions,
+        current_datetime=current_timestamp,
     )
-
-    all_predictions = []
-    for batch in batches:
-        raw_predictions = request.app.state.tide_model.predict(inputs=batch)
-        batch_predictions = tide_data.postprocess_predictions(
-            input_batch=batch,
-            predictions=raw_predictions,
-            current_datetime=current_timestamp,
-        )
-        all_predictions.append(batch_predictions)
-
-    predictions = pl.concat(all_predictions)
     logger.info(
         "Combined predictions from all batches",
         total_predictions=predictions.height,
@@ -417,7 +418,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
         observe_duration(timer_start)
         raise
 
-    prediction_batch_count.set(len(batches))
+    prediction_batch_count.set(len(dataset))
     prediction_row_count.set(validated_predictions.height)
     observe_duration(timer_start)
 
