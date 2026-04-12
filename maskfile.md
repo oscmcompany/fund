@@ -52,14 +52,14 @@ echo "Development environment setup completed successfully"
 
 > Manage Docker images for applications
 
-#### build (package_name) (stage_name)
+#### build-and-push (package_name) (stage_name)
 
-> Build Docker images with optional cache pull (e.g. `portfolio-manager server`, `tide model-runner`)
+> Build and push Docker image directly to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
 
 ```bash
 set -euo pipefail
 
-echo "Building image"
+echo "Building and pushing image"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
 aws_region="${AWS_REGION:-}"
@@ -117,105 +117,19 @@ else
     docker buildx create --use --name fund-builder 2>/dev/null || docker buildx use fund-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
-echo "Building with caching (will continue if cache doesn't exist)"
+echo "Building and pushing with caching (will continue if cache doesn't exist)"
 docker buildx build \
     --platform linux/amd64 \
     --target ${build_target} \
     --file ${dockerfile} \
     --tag ${image_reference}:latest \
+    --tag ${image_reference}:git-${commit_hash} \
     ${cache_from_arguments} \
     ${cache_to_arguments} \
-    --load \
+    --push \
     .
 
-echo "Image built: ${package_name} ${stage_name}"
-```
-
-#### push (package_name) (stage_name)
-
-> Push Docker image to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
-
-```bash
-set -euo pipefail
-
-echo "Pushing image to ECR"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region="${AWS_REGION:-}"
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
-fi
-
-repository_name="fund/${package_name}-${stage_name}"
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
-commit_hash=$(git rev-parse --short HEAD)
-
-echo "Logging into ECR"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
-
-echo "Checking if image for commit ${commit_hash} already exists in ECR"
-existing_tag="NONE"
-if image_digest=$(aws ecr describe-images \
-    --repository-name "${repository_name}" \
-    --image-ids "imageTag=git-${commit_hash}" \
-    --query 'imageDetails[0].imageDigest' \
-    --output text 2>/dev/null); then
-    existing_tag="${image_digest}"
-fi
-
-if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
-    echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
-    echo "Image pushed: ${package_name} ${stage_name} (cached)"
-    exit 0
-fi
-
-echo "Pushing image"
-docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
-docker push "${image_reference}:latest"
-docker push "${image_reference}:git-${commit_hash}"
-
-echo "Image pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
-```
-
-#### deploy (package_name) (stage_name)
-
-> Deploy ECS service with latest image (e.g. `portfolio-manager server`, `data-manager server`)
-
-```bash
-set -euo pipefail
-
-echo "Deploying ${package_name} ${stage_name}"
-
-case "${package_name}-${stage_name}" in
-    data-manager-server)      service="fund-data-manager-server" ;;
-    portfolio-manager-server) service="fund-portfolio-manager-server" ;;
-    ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
-    tide-model-runner)        echo "tide-model-runner is used for Prefect training jobs, not an ECS service" && exit 0 ;;
-    *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
-esac
-
-cd infrastructure/
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <organization>"
-    exit 1
-fi
-pulumi stack select "${organization_name}/fund/production"
-cluster=$(pulumi stack output aws_ecs_cluster_name)
-
-cd "${MASKFILE_DIR}"
-
-aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager > /dev/null
-echo "Deployment started: ${service}"
-
-echo "Waiting for ${service} to stabilize"
-
-aws ecs wait services-stable --cluster "$cluster" --services "$service"
-
-echo "Deployment complete: ${service} (${package_name} ${stage_name})"
+echo "Image built and pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
 ```
 
 ### stack
