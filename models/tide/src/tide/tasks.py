@@ -128,7 +128,7 @@ def filter_equity_bars(
     filtered = data.filter(
         (pl.col("close_price") >= minimum_close_price)
         & (pl.col("volume") >= minimum_volume)
-        & ~pl.col("ticker").str.contains("p")
+        & ~pl.col("ticker").str.contains("[a-z]")
     )
 
     logger.info("Filtered equity bars", output_rows=filtered.height)
