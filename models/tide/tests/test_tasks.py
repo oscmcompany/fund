@@ -201,6 +201,50 @@ def test_write_training_data_to_s3_returns_s3_uri() -> None:
     assert call_kwargs["Key"] == "training/data.parquet"
 
 
+def test_prepare_training_data_succeeds_when_raw_data_contains_preferred_tickers() -> (
+    None
+):
+    preferred_ticker_bars = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "DLNGpB"],
+            "timestamp": [
+                int(_TARGET_DATE.timestamp()) * 1000,
+                int(_TARGET_DATE.timestamp()) * 1000,
+            ],
+            "open_price": [148.0, 20.0],
+            "high_price": [152.0, 21.0],
+            "low_price": [147.0, 19.0],
+            "close_price": [150.0, 20.5],
+            "volume": [1_000_000, 500_000],
+            "volume_weighted_average_price": [151.0, 20.3],
+            "transactions": [5_000, 1_000],
+        }
+    )
+    parquet_bytes = _to_parquet_bytes(preferred_ticker_bars)
+    csv_bytes = _to_csv_bytes(_SAMPLE_CATEGORIES)
+
+    mock_body_bars = MagicMock()
+    mock_body_bars.read.return_value = parquet_bytes
+    mock_body_categories = MagicMock()
+    mock_body_categories.read.return_value = csv_bytes
+
+    mock_s3_client = MagicMock()
+    mock_s3_client.get_object.side_effect = [
+        {"Body": mock_body_bars},
+        {"Body": mock_body_categories},
+    ]
+
+    with patch("tide.tasks.boto3.client", return_value=mock_s3_client):
+        result = prepare_training_data(
+            data_bucket_name="test-data-bucket",
+            model_artifacts_bucket_name="test-artifacts-bucket",
+            start_date=_TARGET_DATE,
+            end_date=_TARGET_DATE,
+        )
+
+    assert result.startswith("s3://test-artifacts-bucket/")
+
+
 def test_prepare_training_data_returns_s3_uri() -> None:
     parquet_bytes = _to_parquet_bytes(_SAMPLE_EQUITY_BARS)
     csv_bytes = _to_csv_bytes(_SAMPLE_CATEGORIES)

@@ -909,6 +909,8 @@ echo "     ${log_stream_prefix}/<task-id>"
 ```bash
 set -euo pipefail
 
+echo "Deploying ${model_name} model"
+
 unset PREFECT_API_URL
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
@@ -934,6 +936,8 @@ case "${model_name}" in
         exit 1
         ;;
 esac
+
+echo "Deployment complete: ${model_name}"
 ```
 
 ### download (model_name)

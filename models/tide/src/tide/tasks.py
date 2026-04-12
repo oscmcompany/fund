@@ -237,14 +237,14 @@ def prepare_training_data(  # noqa: PLR0913
         end_date=end_date,
     )
 
-    equity_bars_schema.validate(equity_bars)
-
     categories = read_categories_from_s3(
         s3_client=s3_client,
         bucket_name=data_bucket_name,
     )
 
     filtered_bars = filter_equity_bars(equity_bars)
+
+    equity_bars_schema.validate(filtered_bars)
 
     consolidated = consolidate_data(
         equity_bars=filtered_bars,
