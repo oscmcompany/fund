@@ -5,7 +5,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-from tide.tide_data import (
+from tide.data import (
     CleanData,
     Data,
     EngineerFeatures,

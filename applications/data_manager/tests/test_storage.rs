@@ -466,6 +466,8 @@ fn test_sanitize_duckdb_config_value_valid() {
     assert!(sanitize_duckdb_config_value("true").is_ok());
     assert!(sanitize_duckdb_config_value("false").is_ok());
     assert!(sanitize_duckdb_config_value("http://127.0.0.1:9000").is_ok());
+    // AWS ECS session tokens can exceed 1000 characters
+    assert!(sanitize_duckdb_config_value(&"a".repeat(1052)).is_ok());
 }
 
 #[test]
@@ -474,7 +476,7 @@ fn test_sanitize_duckdb_config_value_rejects_injection() {
     assert!(sanitize_duckdb_config_value("localhost'; --").is_err());
     assert!(sanitize_duckdb_config_value("\"malicious\"").is_err());
     assert!(sanitize_duckdb_config_value("").is_err());
-    assert!(sanitize_duckdb_config_value(&"a".repeat(513)).is_err());
+    assert!(sanitize_duckdb_config_value(&"a".repeat(4097)).is_err());
     assert!(sanitize_duckdb_config_value("value;another").is_err());
 }
 

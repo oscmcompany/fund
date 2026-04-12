@@ -15,7 +15,7 @@ from tinygrad.nn.state import (
 )
 from tinygrad.tensor import Tensor
 
-from tide.tide_data import TrainingDataset
+from tide.data import TrainingDataset
 
 logger = structlog.get_logger()
 

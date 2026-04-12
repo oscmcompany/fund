@@ -39,6 +39,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.2 /uv /bin/uv
 COPY --from=builder /app /app
 
 ENV PYTHONPATH=/app/models/tide/src
+ENV PATH="/app/.venv/bin:$PATH"
 
 RUN useradd --system --uid 10001 --create-home appuser && \
     chown -R appuser:appuser /app

@@ -454,9 +454,9 @@ aws ecs wait services-stable --cluster "$cluster" --services "$service"
 echo "Deployment complete: ${service}"
 ```
 
-### models
+### trainer
 
-> Manage Prefect Cloud model resources
+> Manage Prefect Cloud model training resources
 
 #### initialize (environment)
 
@@ -469,12 +469,31 @@ case "${environment}" in
     remote)
         unset PREFECT_API_URL
 
-        echo "Creating fund-models-remote work pool on Prefect Cloud"
-        uv run prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
-            || echo "  already exists"
+        cd infrastructure/
+        pulumi stack select "$(pulumi org get-default)/fund/production"
+        models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
+        tide_trainer_task_definition_arn=$(pulumi stack output aws_ecs_tide_trainer_task_definition_arn)
+        vpc_id=$(pulumi stack output aws_vpc_id)
+        private_subnet_1_id=$(pulumi stack output aws_ecs_private_subnet_1_id)
+        private_subnet_2_id=$(pulumi stack output aws_ecs_private_subnet_2_id)
+        ecs_security_group_id=$(pulumi stack output aws_ecs_security_group_id)
+        cd "${MASKFILE_DIR}"
 
-        echo "Registering remote training deployment"
-        uv run prefect --no-prompt deploy --name tide-trainer-remote
+        echo "Creating fund-models-remote work pool on Prefect Cloud"
+        aws_credentials_block_id=$(uv run prefect block inspect "aws-credentials/fund-aws" | grep "Block id" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        base_job_template=$(uv run prefect work-pool get-default-base-job-template --type ecs \
+            | uv run python -m tools.build_work_pool_template \
+                "${models_cluster}" \
+                "${aws_credentials_block_id}" \
+                "${tide_trainer_task_definition_arn}" \
+                "${vpc_id}" \
+                "${private_subnet_1_id}" \
+                "${private_subnet_2_id}" \
+                "${ecs_security_group_id}")
+        uv run prefect work-pool create "fund-models-remote" --type ecs \
+            --base-job-template <(echo "${base_job_template}") 2>/dev/null \
+            || uv run prefect work-pool update "fund-models-remote" \
+                --base-job-template <(echo "${base_job_template}")
 
         echo ""
         echo "Done. Visit Prefect Cloud dashboard to view deployments."
@@ -850,36 +869,37 @@ echo "YAML development checks completed successfully"
 
 ### train (model_name)
 
-> Train model via Prefect training pipeline
+> Trigger model training run via Prefect Cloud deployment
 
 ```bash
 set -euo pipefail
 
-cd infrastructure
+unset PREFECT_API_URL
 
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export FUND_DATA_MANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
-export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
-
-cd ../
+lookback_days="${FUND_LOOKBACK_DAYS:-365}"
 
 case "${model_name}" in
     tide)
-        uv run python -m tide.run
+        deployment="tide-training-pipeline/tide-trainer-remote"
+        log_group="/ecs/fund/models"
+        log_stream_prefix="tide/prefect"
         ;;
     *)
         echo "Unknown model: ${model_name}"
+        echo "Valid options: tide"
         exit 1
         ;;
 esac
+
+echo "Triggering training run for ${model_name} (lookback_days=${lookback_days})"
+prefect deployment run "${deployment}" --param "lookback_days=${lookback_days}"
+
+echo ""
+echo "To find logs once the run starts (GPU provisioning takes ~3-5 minutes):"
+echo "  1. Open the flow run in Prefect Cloud and note the ECS task ARN under Infrastructure"
+echo "  2. The task ID is the last segment of the ARN (after the final '/')"
+echo "  3. Find the log stream in CloudWatch log group '${log_group}':"
+echo "     ${log_stream_prefix}/<task-id>"
 ```
 
 ### deploy (model_name)
@@ -892,8 +912,21 @@ set -euo pipefail
 unset PREFECT_API_URL
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select "${organization_name}/fund/production"
+tide_image_uri=$(pulumi stack output aws_ecr_tide_model_runner_image)
+
+cd "${MASKFILE_DIR}"
+
 case "${model_name}" in
     tide)
+        export FUND_TIDE_IMAGE_URI="${tide_image_uri}"
         uv run python -m tide.deploy
         ;;
     *)

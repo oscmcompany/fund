@@ -6,6 +6,7 @@ import boto3
 import polars as pl
 import structlog
 from botocore.exceptions import ClientError
+from internal.equity_bars_schema import equity_bars_schema
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -14,6 +15,16 @@ logger = structlog.get_logger()
 
 MINIMUM_CLOSE_PRICE = 1.0
 MINIMUM_VOLUME = 100_000
+
+_COLUMN_TYPES: dict[str, type[pl.DataType]] = {
+    "open_price": pl.Float64,
+    "high_price": pl.Float64,
+    "low_price": pl.Float64,
+    "close_price": pl.Float64,
+    "volume_weighted_average_price": pl.Float64,
+    "volume": pl.Int64,
+    "transactions": pl.Int64,
+}
 
 
 def read_equity_bars_from_s3(
@@ -47,6 +58,13 @@ def read_equity_bars_from_s3(
             response = s3_client.get_object(Bucket=bucket_name, Key=key)
             parquet_bytes = response["Body"].read()
             dataframe = pl.read_parquet(parquet_bytes)
+            dataframe = dataframe.with_columns(
+                [
+                    pl.col(col).cast(dtype)
+                    for col, dtype in _COLUMN_TYPES.items()
+                    if col in dataframe.columns
+                ]
+            )
             batch_dataframes.append(dataframe)
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
         except s3_client.exceptions.NoSuchKey:
@@ -110,6 +128,7 @@ def filter_equity_bars(
     filtered = data.filter(
         (pl.col("close_price") >= minimum_close_price)
         & (pl.col("volume") >= minimum_volume)
+        & ~pl.col("ticker").str.contains("p")
     )
 
     logger.info("Filtered equity bars", output_rows=filtered.height)
@@ -217,6 +236,8 @@ def prepare_training_data(  # noqa: PLR0913
         start_date=start_date,
         end_date=end_date,
     )
+
+    equity_bars_schema.validate(equity_bars)
 
     categories = read_categories_from_s3(
         s3_client=s3_client,

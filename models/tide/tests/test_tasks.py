@@ -1,5 +1,5 @@
 import io
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import polars as pl
@@ -19,13 +19,14 @@ _TARGET_DATE = datetime(2025, 6, 1, tzinfo=UTC)
 _SAMPLE_EQUITY_BARS = pl.DataFrame(
     {
         "ticker": ["AAPL"],
-        "timestamp": [_TARGET_DATE],
+        "timestamp": [int(_TARGET_DATE.timestamp()) * 1000],
         "open_price": [148.0],
         "high_price": [152.0],
         "low_price": [147.0],
         "close_price": [150.0],
         "volume": [1_000_000],
         "volume_weighted_average_price": [151.0],
+        "transactions": [5_000],
     }
 )
 
@@ -51,6 +52,7 @@ def _to_csv_bytes(data: pl.DataFrame) -> bytes:
 def test_filter_equity_bars_keeps_rows_above_thresholds() -> None:
     data = pl.DataFrame(
         {
+            "ticker": ["AAPL", "LOW"],
             "close_price": [MINIMUM_CLOSE_PRICE + 1.0, 0.5],
             "volume": [MINIMUM_VOLUME + 1, 50_000],
         }
@@ -62,9 +64,28 @@ def test_filter_equity_bars_keeps_rows_above_thresholds() -> None:
     assert result["close_price"][0] == MINIMUM_CLOSE_PRICE + 1.0
 
 
+def test_filter_equity_bars_excludes_preferred_stocks() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "JPMpC", "NEEpR"],
+            "close_price": [
+                MINIMUM_CLOSE_PRICE + 1.0,
+                MINIMUM_CLOSE_PRICE + 1.0,
+                MINIMUM_CLOSE_PRICE + 1.0,
+            ],
+            "volume": [MINIMUM_VOLUME + 1, MINIMUM_VOLUME + 1, MINIMUM_VOLUME + 1],
+        }
+    )
+
+    result = filter_equity_bars(data)
+
+    assert len(result) == 1
+    assert result["ticker"][0] == "AAPL"
+
+
 def test_filter_equity_bars_empty_input_returns_empty() -> None:
-    data = pl.DataFrame({"close_price": [], "volume": []}).cast(
-        {"close_price": pl.Float64, "volume": pl.Int64}
+    data = pl.DataFrame({"ticker": [], "close_price": [], "volume": []}).cast(
+        {"ticker": pl.String, "close_price": pl.Float64, "volume": pl.Int64}
     )
 
     result = filter_equity_bars(data)
@@ -93,6 +114,33 @@ def test_consolidate_data_excludes_unmatched_tickers() -> None:
     result = consolidate_data(_SAMPLE_EQUITY_BARS, categories)
 
     assert len(result) == 0
+
+
+def test_read_equity_bars_from_s3_normalizes_column_types_across_files() -> None:
+    day1 = _SAMPLE_EQUITY_BARS.with_columns(pl.col("volume").cast(pl.Float64))
+    day2 = _SAMPLE_EQUITY_BARS.with_columns(pl.col("volume").cast(pl.Int64))
+
+    mock_body_1 = MagicMock()
+    mock_body_1.read.return_value = _to_parquet_bytes(day1)
+    mock_body_2 = MagicMock()
+    mock_body_2.read.return_value = _to_parquet_bytes(day2)
+
+    mock_s3_client = MagicMock()
+    mock_s3_client.get_object.side_effect = [
+        {"Body": mock_body_1},
+        {"Body": mock_body_2},
+    ]
+
+    result = read_equity_bars_from_s3(
+        s3_client=mock_s3_client,
+        bucket_name="test-bucket",
+        start_date=_TARGET_DATE,
+        end_date=_TARGET_DATE + timedelta(days=1),
+    )
+
+    expected_rows = len(day1) + len(day2)
+    assert len(result) == expected_rows
+    assert result["volume"].dtype == pl.Int64
 
 
 def test_read_equity_bars_from_s3_returns_dataframe() -> None:

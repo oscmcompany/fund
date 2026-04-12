@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
 
 from internal.equity_details_schema import equity_details_schema
-from tide.tide_data import Data
-from tide.tide_model import Model
+from tide.data import Data
+from tide.model import Model
 
 from .metrics import (
     get_metrics,

@@ -2,8 +2,8 @@ import tempfile
 
 import numpy as np
 import pytest
-from tide.tide_data import TrainingDataset
-from tide.tide_model import Model, quantile_loss
+from tide.data import TrainingDataset
+from tide.model import Model, quantile_loss
 from tinygrad.tensor import Tensor
 
 BATCH_SIZE = 4

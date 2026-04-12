@@ -3,8 +3,8 @@ from typing import Any, cast
 import polars as pl
 import structlog
 
-from tide.tide_data import Data
-from tide.tide_model import Model
+from tide.data import Data
+from tide.model import Model
 from tide.tracking import log_epoch_loss, log_training_result
 
 logger = structlog.get_logger()

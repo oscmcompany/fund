@@ -130,8 +130,8 @@ pub fn sanitize_duckdb_config_value(value: &str) -> Result<String, Error> {
         return Err(Error::Other(message));
     }
 
-    // Reasonable length limit
-    if value.len() > 512 {
+    // Reasonable length limit (4096 accommodates AWS session tokens which can exceed 1000 characters)
+    if value.len() > 4096 {
         let message = format!("Configuration value too long: {} characters", value.len());
         error!("{}", message);
         return Err(Error::Other(message));
