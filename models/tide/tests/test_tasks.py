@@ -127,6 +127,38 @@ def test_consolidate_data_joins_on_ticker_and_retains_columns() -> None:
     assert "industry" in result.columns
 
 
+def test_consolidate_data_excludes_tickers_with_null_sector_or_industry() -> None:
+    categories = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT", "GOOG"],
+            "sector": ["Technology", None, "Technology"],
+            "industry": ["Consumer Electronics", "Software", None],
+        }
+    )
+    equity_bars = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT", "GOOG"],
+            "timestamp": [
+                int(_TARGET_DATE.timestamp()) * 1000,
+                int(_TARGET_DATE.timestamp()) * 1000,
+                int(_TARGET_DATE.timestamp()) * 1000,
+            ],
+            "open_price": [148.0, 200.0, 100.0],
+            "high_price": [152.0, 205.0, 105.0],
+            "low_price": [147.0, 198.0, 99.0],
+            "close_price": [150.0, 202.0, 102.0],
+            "volume": [1_000_000, 500_000, 750_000],
+            "volume_weighted_average_price": [151.0, 201.0, 101.0],
+            "transactions": [5_000, 2_000, 3_000],
+        }
+    )
+
+    result = consolidate_data(equity_bars, categories)
+
+    assert len(result) == 1
+    assert result["ticker"][0] == "AAPL"
+
+
 def test_consolidate_data_excludes_unmatched_tickers() -> None:
     categories = pl.DataFrame(
         {
