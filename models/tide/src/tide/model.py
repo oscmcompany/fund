@@ -4,6 +4,7 @@ from typing import cast
 
 import numpy as np
 import structlog
+from tinygrad import Device
 from tinygrad.nn import Linear
 from tinygrad.nn.optim import Adam
 from tinygrad.nn.state import (
@@ -329,6 +330,8 @@ class Model:
             checkpoint_path = os.path.join(  # noqa: PTH118
                 checkpoint_directory, "best_checkpoint.safetensor"
             )
+
+        logger.info("Training device", device=Device.DEFAULT)
 
         try:
             for epoch in range(epochs):
