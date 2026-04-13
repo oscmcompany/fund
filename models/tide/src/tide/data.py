@@ -168,23 +168,39 @@ class CleanData(Stage):
 
         data = data.unique(subset=["ticker", "timestamp"])
 
+        # Collect stats across all columns before filtering so counts reflect the
+        # original data and rows with multiple bad columns are reported accurately
+        column_stats: dict[str, dict[str, int]] = {}
         for col in CONTINUOUS_COLUMNS:
-            nan_count = data.filter(pl.col(col).is_nan()).height
-            null_count = data.filter(pl.col(col).is_null()).height
-            inf_count = data.filter(~pl.col(col).is_finite()).height
+            series = data[col]
+            nan_count = int(series.is_nan().sum() or 0)
+            null_count = int(series.is_null().sum() or 0)
+            inf_count = int(series.is_infinite().sum() or 0)
             if nan_count > 0 or null_count > 0 or inf_count > 0:
-                logger.warning(
-                    "Invalid values in continuous column before scaling",
-                    column=col,
-                    nan_count=nan_count,
-                    null_count=null_count,
-                    inf_count=inf_count,
+                column_stats[col] = {
+                    "nan_count": nan_count,
+                    "null_count": null_count,
+                    "inf_count": inf_count,
+                }
+
+        for col, stats in column_stats.items():
+            logger.warning(
+                "Invalid values in continuous column before scaling",
+                column=col,
+                **stats,
+            )
+
+        if column_stats:
+            data = data.filter(
+                pl.all_horizontal(
+                    [
+                        pl.col(col).is_not_nan()
+                        & pl.col(col).is_not_null()
+                        & pl.col(col).is_finite()
+                        for col in CONTINUOUS_COLUMNS
+                    ]
                 )
-                data = data.filter(
-                    pl.col(col).is_not_nan()
-                    & pl.col(col).is_not_null()
-                    & pl.col(col).is_finite()
-                )
+            )
 
         data_validated = data_schema.validate(data)
         return cast(

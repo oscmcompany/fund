@@ -333,6 +333,13 @@ class Model:
 
         logger.info("Training device", device=Device.DEFAULT)
 
+        # Pre-load dataset onto compute device once to eliminate per-step transfers
+        gpu_past_continuous = Tensor(dataset.past_continuous)
+        gpu_past_categorical = Tensor(dataset.past_categorical)
+        gpu_future_categorical = Tensor(dataset.future_categorical)
+        gpu_static_categorical = Tensor(dataset.static_categorical)
+        gpu_targets = Tensor(dataset.targets)
+
         try:
             for epoch in range(epochs):
                 logger.info(
@@ -345,21 +352,19 @@ class Model:
                 indices = _rng.permutation(num_samples)
 
                 for step in range(total_batches):
-                    batch_idx = indices[step * batch_size : (step + 1) * batch_size]
+                    batch_idx = indices[
+                        step * batch_size : (step + 1) * batch_size
+                    ].tolist()
                     batch = {
-                        "past_continuous_features": Tensor(
-                            dataset.past_continuous[batch_idx]
-                        ),
-                        "past_categorical_features": Tensor(
-                            dataset.past_categorical[batch_idx]
-                        ),
-                        "future_categorical_features": Tensor(
-                            dataset.future_categorical[batch_idx]
-                        ),
-                        "static_categorical_features": Tensor(
-                            dataset.static_categorical[batch_idx]
-                        ),
-                        "targets": Tensor(dataset.targets[batch_idx]),
+                        "past_continuous_features": gpu_past_continuous[batch_idx],
+                        "past_categorical_features": gpu_past_categorical[batch_idx],
+                        "future_categorical_features": gpu_future_categorical[
+                            batch_idx
+                        ],
+                        "static_categorical_features": gpu_static_categorical[
+                            batch_idx
+                        ],
+                        "targets": gpu_targets[batch_idx],
                     }
 
                     combined_input_features, targets, batch_size_actual = (

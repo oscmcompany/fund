@@ -97,6 +97,30 @@ def test_clean_data_removes_nan_daily_return(
     assert null_count == 0
 
 
+def test_clean_data_removes_rows_with_invalid_values_in_multiple_columns(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    data = make_raw_data(tickers=["AAPL"], days=10)
+    featured = EngineerFeatures().run(data)
+    # Inject bad values into two different continuous columns on the same row
+    bad_row = featured.head(1).with_columns(
+        pl.lit(float("nan")).alias("open_price"),
+        pl.lit(float("inf")).alias("close_price"),
+    )
+    # Inject a bad value into only a later continuous column on a different row
+    bad_row_later = featured.slice(1, 1).with_columns(
+        pl.lit(float("nan")).alias("volume_weighted_average_price"),
+    )
+    combined = pl.concat([featured.slice(2), bad_row, bad_row_later])
+
+    cleaned = CleanData().run(combined)
+
+    assert cleaned.filter(pl.col("open_price").is_nan()).height == 0
+    assert cleaned.filter(pl.col("close_price").is_infinite()).height == 0
+    assert cleaned.filter(pl.col("volume_weighted_average_price").is_nan()).height == 0
+    assert cleaned.height == featured.height - 2
+
+
 def test_scale_and_encode_produces_scaler_and_mappings(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
