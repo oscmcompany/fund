@@ -371,8 +371,9 @@ def test_prepare_training_data_returns_stage_counts() -> None:
             end_date=_TARGET_DATE,
         )
 
+    total_input_rows = 2
     total_input_tickers = 2
-    assert stage_counts["raw_rows"] == total_input_tickers
+    assert stage_counts["raw_rows"] == total_input_rows
     assert stage_counts["raw_tickers"] == total_input_tickers
     assert stage_counts["filtered_rows"] == 1
     assert stage_counts["filtered_tickers"] == 1

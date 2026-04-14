@@ -6,7 +6,7 @@ import tarfile
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 # Required for Prefect's ECS managed runner: after git-cloning the repo,
 # models/tide/src/ is not on sys.path, so tide.* imports would fail.
@@ -45,7 +45,7 @@ def prepare_data(
     start_date: datetime,
     end_date: datetime,
     artifact_timestamp: str,
-) -> tuple[str, dict]:
+) -> tuple[str, dict[str, int]]:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
     try:
         data_block = cast("S3Bucket", S3Bucket.load(DATA_BLOCK_NAME))
@@ -94,7 +94,7 @@ def prepare_data(
 @task(name="train-tide-model", timeout_seconds=14400)
 def train_tide_model(
     training_data_key: str,
-    training_summary: dict,
+    training_summary: dict[str, Any],
     artifact_timestamp: str,
 ) -> str:
     """Download training data from S3, train model, upload artifact to S3."""

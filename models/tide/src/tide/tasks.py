@@ -222,7 +222,7 @@ def prepare_training_data(  # noqa: PLR0913
     end_date: datetime,
     output_key: str = "training/filtered_tide_training_data.parquet",
     s3_client: "S3Client | None" = None,
-) -> tuple[str, dict]:
+) -> tuple[str, dict[str, int]]:
     """Main function to prepare training data."""
     logger.info(
         "Preparing training data",
