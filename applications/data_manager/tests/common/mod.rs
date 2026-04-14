@@ -102,7 +102,22 @@ pub async fn get_localstack_endpoint() -> String {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(4566).await.unwrap();
+    let port = {
+        let mut attempts = 0u32;
+        loop {
+            match container.get_host_port_ipv4(4566).await {
+                Ok(port) => break port,
+                Err(_) if attempts < 10 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(error) => panic!(
+                    "LocalStack port 4566 not available after retries: {}",
+                    error
+                ),
+            }
+        }
+    };
     let endpoint = format!("http://{}:{}", host, port);
 
     // INTENTIONAL LEAK: Container is leaked to keep it alive for entire test run.
