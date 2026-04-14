@@ -170,9 +170,12 @@ def consolidate_data(
     if missing_columns:
         logger.warning("Missing columns in consolidated data", missing=missing_columns)
 
-    result = consolidated.select(available_columns).filter(
-        pl.col("sector").is_not_null() & pl.col("industry").is_not_null()
-    )
+    if "sector" in available_columns and "industry" in available_columns:
+        result = consolidated.select(available_columns).filter(
+            pl.col("sector").is_not_null() & pl.col("industry").is_not_null()
+        )
+    else:
+        result = consolidated.select(available_columns)
 
     logger.info(
         "Consolidated data", output_rows=result.height, columns=available_columns

@@ -1,3 +1,5 @@
+import os
+
 from tools.build_work_pool_template import NetworkConfig, build_work_pool_template
 
 
@@ -103,6 +105,7 @@ def test_build_work_pool_template_configures_gpu_and_logging() -> None:
     log_opts = containers[0]["logConfiguration"]["options"]
     assert log_opts["awslogs-group"] == "/ecs/fund/models"
     assert log_opts["awslogs-stream-prefix"] == "tide"
+    assert log_opts["awslogs-region"] == os.environ.get("AWS_REGION", "us-east-1")
 
 
 def test_build_work_pool_template_populates_empty_containers_list() -> None:

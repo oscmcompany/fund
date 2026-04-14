@@ -14,6 +14,7 @@ use std::io::Cursor;
 use tracing::{debug, error, info, warn};
 
 const EQUITY_DETAILS_KEY: &str = "equity/details/details.csv";
+pub const DUCKDB_CONFIG_VALUE_MAX_LENGTH: usize = 4096;
 
 pub async fn write_equity_bars_dataframe_to_s3(
     state: &State,
@@ -131,7 +132,7 @@ pub fn sanitize_duckdb_config_value(value: &str) -> Result<String, Error> {
     }
 
     // Reasonable length limit (4096 accommodates AWS session tokens which can exceed 1000 characters)
-    if value.len() > 4096 {
+    if value.len() > DUCKDB_CONFIG_VALUE_MAX_LENGTH {
         let message = format!("Configuration value too long: {} characters", value.len());
         error!("{}", message);
         return Err(Error::Other(message));

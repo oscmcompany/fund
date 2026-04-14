@@ -32,9 +32,9 @@ _SAMPLE_EQUITY_BARS = pl.DataFrame(
 
 _SAMPLE_CATEGORIES = pl.DataFrame(
     {
-        "ticker": ["AAPL"],
-        "sector": ["Technology"],
-        "industry": ["Consumer Electronics"],
+        "ticker": ["AAPL", "DLNGpB"],
+        "sector": ["Technology", "Energy"],
+        "industry": ["Consumer Electronics", "Oil & Gas"],
     }
 )
 
@@ -233,8 +233,8 @@ def test_read_categories_from_s3_returns_dataframe() -> None:
         bucket_name="test-bucket",
     )
 
-    assert len(result) == 1
-    assert result["ticker"][0] == "AAPL"
+    assert len(result) == len(_SAMPLE_CATEGORIES)
+    assert "AAPL" in result["ticker"].to_list()
     mock_s3_client.get_object.assert_called_once_with(
         Bucket="test-bucket",
         Key="equity/details/details.csv",
@@ -300,6 +300,9 @@ def test_prepare_training_data_succeeds_when_raw_data_contains_preferred_tickers
         )
 
     assert result.startswith("s3://test-artifacts-bucket/")
+    uploaded_bytes = mock_s3_client.put_object.call_args.kwargs["Body"]
+    uploaded_df = pl.read_parquet(io.BytesIO(uploaded_bytes))
+    assert list(uploaded_df["ticker"].unique().sort()) == ["AAPL"]
 
 
 def test_prepare_training_data_returns_s3_uri() -> None:

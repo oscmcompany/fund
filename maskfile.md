@@ -806,7 +806,7 @@ case "${model_name}" in
 esac
 
 echo "Triggering training run for ${model_name} (lookback_days=${lookback_days})"
-prefect deployment run "${deployment}" --param "lookback_days=${lookback_days}"
+uv run prefect deployment run "${deployment}" --param "lookback_days=${lookback_days}"
 
 echo ""
 echo "To find logs once the run starts (GPU provisioning takes ~3-5 minutes):"

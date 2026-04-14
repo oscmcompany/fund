@@ -66,7 +66,9 @@ def train_model(
             input_length=int(configuration["input_length"]),
             output_length=int(configuration["output_length"]),
         )
-    except ValueError:
+    except ValueError as e:
+        if "Total days available" not in str(e):
+            raise
         logger.warning(
             "Validation set too small for windowing; disabling validation early stopping"  # noqa: E501
         )

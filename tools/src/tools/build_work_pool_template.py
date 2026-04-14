@@ -68,7 +68,7 @@ if __name__ == "__main__":
     expected_arg_count = 8
     if len(sys.argv) != expected_arg_count:
         usage = (
-            "Usage: python build_work_pool_template.py"
+            "Usage: python -m tools.build_work_pool_template"
             " <cluster> <aws_credentials_block_id> <task_definition_arn>"
             " <vpc_id> <private_subnet_1_id> <private_subnet_2_id>"
             " <ecs_security_group_id>"

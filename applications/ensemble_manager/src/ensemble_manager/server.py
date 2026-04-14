@@ -418,7 +418,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
         observe_duration(timer_start)
         raise
 
-    prediction_batch_count.set(len(dataset))
+    prediction_batch_count.set(1)
     prediction_row_count.set(validated_predictions.height)
     observe_duration(timer_start)
 

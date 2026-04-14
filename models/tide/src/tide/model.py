@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import cast
 
@@ -420,6 +421,8 @@ class Model:
                 # Use validation loss for early stopping if validation_dataset provided
                 if validation_dataset is not None:
                     stopping_loss = self.validate_model(validation_dataset, batch_size)
+                    if math.isnan(stopping_loss):
+                        stopping_loss = epoch_loss
                 else:
                     stopping_loss = epoch_loss
 
@@ -433,14 +436,17 @@ class Model:
 
                 losses.append(epoch_loss)
 
-                if checkpoint_path and epoch_loss < best_saved_loss:
-                    best_saved_loss = epoch_loss
+                checkpoint_metric = (
+                    stopping_loss if validation_dataset is not None else epoch_loss
+                )
+                if checkpoint_path and checkpoint_metric < best_saved_loss:
+                    best_saved_loss = checkpoint_metric
                     safe_save(get_state_dict(self), checkpoint_path)
                     checkpoint_saved = True
                     logger.info(
                         "Saved best checkpoint",
                         checkpoint_path=checkpoint_path,
-                        loss=f"{epoch_loss:.4f}",
+                        loss=f"{checkpoint_metric:.4f}",
                     )
 
                 if early_stopping_patience is not None:
@@ -531,7 +537,12 @@ class Model:
                 targets_reshaped = targets.reshape(
                     batch_size_actual, self.output_length
                 )
-                loss = quantile_loss(predictions, targets_reshaped, self.quantiles)
+                loss = quantile_loss(
+                    predictions,
+                    targets_reshaped,
+                    self.quantiles,
+                    huber_delta=self.huber_delta,
+                )
                 validation_losses.append(loss.numpy().item())
 
             if not validation_losses:
