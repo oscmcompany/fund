@@ -222,7 +222,7 @@ def prepare_training_data(  # noqa: PLR0913
     end_date: datetime,
     output_key: str = "training/filtered_tide_training_data.parquet",
     s3_client: "S3Client | None" = None,
-) -> str:
+) -> tuple[str, dict]:
     """Main function to prepare training data."""
     logger.info(
         "Preparing training data",
@@ -242,6 +242,9 @@ def prepare_training_data(  # noqa: PLR0913
         end_date=end_date,
     )
 
+    raw_rows = equity_bars.height
+    raw_tickers = equity_bars["ticker"].n_unique()
+
     categories = read_categories_from_s3(
         s3_client=s3_client,
         bucket_name=data_bucket_name,
@@ -251,14 +254,31 @@ def prepare_training_data(  # noqa: PLR0913
 
     equity_bars_schema.validate(filtered_bars)
 
+    filtered_rows = filtered_bars.height
+    filtered_tickers = filtered_bars["ticker"].n_unique()
+
     consolidated = consolidate_data(
         equity_bars=filtered_bars,
         categories=categories,
     )
 
-    return write_training_data_to_s3(
+    consolidated_rows = consolidated.height
+    consolidated_tickers = consolidated["ticker"].n_unique()
+
+    stage_counts = {
+        "raw_rows": raw_rows,
+        "raw_tickers": raw_tickers,
+        "filtered_rows": filtered_rows,
+        "filtered_tickers": filtered_tickers,
+        "consolidated_rows": consolidated_rows,
+        "consolidated_tickers": consolidated_tickers,
+    }
+
+    uri = write_training_data_to_s3(
         s3_client=s3_client,
         bucket_name=model_artifacts_bucket_name,
         data=consolidated,
         output_key=output_key,
     )
+
+    return uri, stage_counts

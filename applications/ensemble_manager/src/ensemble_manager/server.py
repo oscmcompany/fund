@@ -436,6 +436,8 @@ def parse_responses(
 ) -> pl.DataFrame:
     equity_bars_data = pl.read_parquet(io.BytesIO(equity_bars_response.content))
 
+    fetched_tickers = equity_bars_data["ticker"].n_unique()
+
     equity_bars_data = equity_bars_data.unique(
         subset=["ticker", "timestamp"],
         keep="last",
@@ -458,6 +460,8 @@ def parse_responses(
 
     equity_bars_data = filter_equity_bars(equity_bars_data)
 
+    filtered_tickers = equity_bars_data["ticker"].n_unique()
+
     equity_details_data = pl.read_csv(io.BytesIO(equity_details_response.content))
 
     equity_details_validated = equity_details_schema.validate(equity_details_data)
@@ -470,6 +474,15 @@ def parse_responses(
 
     consolidated_data = equity_details_data.join(
         equity_bars_data, on="ticker", how="inner"
+    )
+
+    consolidated_tickers = consolidated_data["ticker"].n_unique()
+
+    logger.info(
+        "Inference data consolidated",
+        fetched_tickers=fetched_tickers,
+        filtered_tickers=filtered_tickers,
+        consolidated_tickers=consolidated_tickers,
     )
 
     retained_columns = (

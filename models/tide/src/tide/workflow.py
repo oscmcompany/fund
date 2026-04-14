@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 import tarfile
@@ -19,7 +20,11 @@ from prefect import flow, task  # noqa: E402
 from prefect_aws.s3 import S3Bucket  # noqa: E402
 
 from tide.notifications import send_training_notification  # noqa: E402
-from tide.tasks import prepare_training_data  # noqa: E402
+from tide.tasks import (  # noqa: E402
+    MINIMUM_CLOSE_PRICE,
+    MINIMUM_VOLUME,
+    prepare_training_data,
+)
 from tide.tracking import end_run, log_model_artifact, start_run  # noqa: E402
 
 logger = structlog.get_logger()
@@ -39,8 +44,8 @@ def get_training_date_range(lookback_days: int) -> tuple[datetime, datetime]:
 def prepare_data(
     start_date: datetime,
     end_date: datetime,
-    output_key: str = "training/filtered_tide_training_data.parquet",
-) -> str:
+    artifact_timestamp: str,
+) -> tuple[str, dict]:
     """Read equity bars + categories from S3, filter, write consolidated parquet."""
     try:
         data_block = cast("S3Bucket", S3Bucket.load(DATA_BLOCK_NAME))
@@ -54,15 +59,18 @@ def prepare_data(
         raise ValueError(message) from err
     s3_client = data_block.credentials.get_boto3_session().client("s3")
 
+    output_key = f"data/tide/{artifact_timestamp}/filtered_data.parquet"
+
     logger.info(
         "Preparing training data",
         data_bucket=data_block.bucket_name,
         artifacts_bucket=artifact_block.bucket_name,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
+        output_key=output_key,
     )
 
-    training_data_uri = prepare_training_data(
+    training_data_uri, stage_counts = prepare_training_data(
         s3_client=s3_client,
         data_bucket_name=data_block.bucket_name,
         model_artifacts_bucket_name=artifact_block.bucket_name,
@@ -73,19 +81,21 @@ def prepare_data(
 
     bucket_prefix = f"s3://{artifact_block.bucket_name}/"
     if training_data_uri.startswith(bucket_prefix):
-        return training_data_uri.removeprefix(bucket_prefix)
+        return training_data_uri.removeprefix(bucket_prefix), stage_counts
 
     logger.warning(
         "Prepared training data URI did not match expected bucket",
         expected_bucket=artifact_block.bucket_name,
         training_data_uri=training_data_uri,
     )
-    return output_key
+    return output_key, stage_counts
 
 
 @task(name="train-tide-model", timeout_seconds=14400)
 def train_tide_model(
-    training_data_key: str = "training/filtered_tide_training_data.parquet",
+    training_data_key: str,
+    training_summary: dict,
+    artifact_timestamp: str,
 ) -> str:
     """Download training data from S3, train model, upload artifact to S3."""
     from tide.trainer import DEFAULT_CONFIGURATION, train_model  # noqa: PLC0415
@@ -132,9 +142,9 @@ def train_tide_model(
                 checkpoint_directory=checkpoint_directory,
             )
 
-        timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
-        artifact_folder = f"artifacts/tide/{timestamp}"
+        artifact_folder = f"artifacts/tide/{artifact_timestamp}"
         artifact_key = f"{artifact_folder}/output/model.tar.gz"
+        metadata_key = f"{artifact_folder}/run_metadata.json"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tide_model.save(directory_path=tmpdir)
@@ -167,6 +177,19 @@ def train_tide_model(
             artifact_path=f"s3://{artifacts_bucket}/{artifact_key}",
         )
 
+        metadata_bytes = json.dumps(training_summary, indent=2).encode()
+        s3_client.put_object(
+            Bucket=artifacts_bucket,
+            Key=metadata_key,
+            Body=metadata_bytes,
+            ContentType="application/json",
+        )
+
+        logger.info(
+            "Run metadata uploaded",
+            artifact_path=f"s3://{artifacts_bucket}/{metadata_key}",
+        )
+
         end_run()
     except Exception:
         end_run(status="FAILED")
@@ -189,15 +212,25 @@ def training_pipeline(
         message = "lookback_days must be positive"
         raise ValueError(message)
 
-    training_data_key = "training/filtered_tide_training_data.parquet"
+    artifact_timestamp = datetime.now(tz=UTC).strftime("%Y-%m-%d-%H-%M-%S-%f")[:-3]
     start_date, end_date = get_training_date_range(lookback_days)
 
-    prepared_key = prepare_data(
-        start_date,
-        end_date,
-        training_data_key,
-    )
-    return train_tide_model(prepared_key)
+    training_key, stage_counts = prepare_data(start_date, end_date, artifact_timestamp)
+
+    training_summary = {
+        "artifact_timestamp": artifact_timestamp,
+        "training_data_key": training_key,
+        "start_date": start_date.date().isoformat(),
+        "end_date": end_date.date().isoformat(),
+        "lookback_days": lookback_days,
+        "filter_thresholds": {
+            "minimum_close_price": MINIMUM_CLOSE_PRICE,
+            "minimum_volume": MINIMUM_VOLUME,
+        },
+        "stage_counts": stage_counts,
+    }
+
+    return train_tide_model(training_key, training_summary, artifact_timestamp)
 
 
 if __name__ == "__main__":
