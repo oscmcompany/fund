@@ -1,4 +1,6 @@
-use crate::router::create_app;
+use crate::router::create_app_with_state;
+use crate::scheduler::spawn_sync_scheduler;
+use crate::state::State;
 use axum::Router;
 use std::env;
 use tokio::net::TcpListener;
@@ -47,7 +49,9 @@ pub async fn serve_app(listener: TcpListener, app: Router) -> std::io::Result<()
 pub async fn run_server(bind_address: &str) -> std::io::Result<()> {
     tracing::info!("Starting data_manager service");
 
-    let app = create_app().await;
+    let state = State::from_env().await;
+    spawn_sync_scheduler(state.clone());
+    let app = create_app_with_state(state);
     let listener = TcpListener::bind(bind_address).await?;
 
     serve_app(listener, app).await

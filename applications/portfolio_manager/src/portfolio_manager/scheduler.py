@@ -106,6 +106,11 @@ async def _rebalance_loop(  # noqa: C901
                 await asyncio.sleep(wait_seconds)
             catch_up = False
 
+            now_eastern = datetime.now(tz=UTC).astimezone(_EASTERN)
+            if now_eastern.weekday() >= _WEEKEND_WEEKDAY_MIN:
+                logger.info("Weekend detected, skipping scheduled rebalance")
+                continue
+
             try:
                 market_open = alpaca_client.is_market_open()
             except Exception as error:
