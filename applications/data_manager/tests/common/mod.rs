@@ -107,10 +107,9 @@ pub async fn get_localstack_endpoint() -> String {
         loop {
             match container.get_host_port_ipv4(4566).await {
                 Ok(port) => break port,
-                Err(error) if attempts < 10 => {
+                Err(_) if attempts < 10 => {
                     attempts += 1;
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    let _ = error;
                 }
                 Err(error) => panic!(
                     "LocalStack port 4566 not available after retries: {}",
