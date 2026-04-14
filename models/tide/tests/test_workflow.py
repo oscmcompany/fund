@@ -1,6 +1,6 @@
 import io
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import polars as pl
 import pytest
@@ -28,18 +28,20 @@ def test_prepare_data_calls_prepare_training_data(
 
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
-    mock_prepare.return_value = "s3://artifacts-bucket/training/output.parquet"
-    result = prepare_data.fn(
+    mock_prepare.return_value = ("s3://artifacts-bucket/training/output.parquet", {})
+    result_key, result_counts = prepare_data.fn(
         start_date=start_date,
         end_date=end_date,
+        artifact_timestamp="2024-01-31-00-00-00-000",
     )
     mock_prepare.assert_called_once()
-    assert result == "training/output.parquet"
+    assert result_key == "training/output.parquet"
+    assert result_counts == {}
 
 
 @patch("tide.workflow.S3Bucket")
 @patch("tide.workflow.prepare_training_data")
-def test_prepare_data_passes_output_key(
+def test_prepare_data_uses_versioned_output_key(
     mock_prepare: MagicMock,
     mock_s3_bucket: MagicMock,
 ) -> None:
@@ -52,14 +54,21 @@ def test_prepare_data_passes_output_key(
 
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
-    mock_prepare.return_value = "s3://artifacts-bucket/custom/key.parquet"
+    artifact_timestamp = "2024-01-31-00-00-00-000"
+    mock_prepare.return_value = (
+        f"s3://artifacts-bucket/data/tide/{artifact_timestamp}/filtered_data.parquet",
+        {},
+    )
     prepare_data.fn(
         start_date=start_date,
         end_date=end_date,
-        output_key="custom/key.parquet",
+        artifact_timestamp=artifact_timestamp,
     )
     call_kwargs = mock_prepare.call_args.kwargs
-    assert call_kwargs["output_key"] == "custom/key.parquet"
+    assert (
+        call_kwargs["output_key"]
+        == f"data/tide/{artifact_timestamp}/filtered_data.parquet"
+    )
 
 
 @patch("tide.workflow.end_run")
@@ -103,11 +112,16 @@ def test_train_tide_model_downloads_trains_uploads(
         mock_train.return_value = (mock_model, mock_data, [0.5, 0.3, 0.2])
         result = train_tide_model.fn(
             training_data_key="training/data.parquet",
+            training_summary={"artifact_timestamp": "2024-01-31-00-00-00-000"},
+            artifact_timestamp="2024-01-31-00-00-00-000",
         )
 
-    assert result.startswith("s3://artifacts-bucket/artifacts/")
+    assert result.startswith(
+        "s3://artifacts-bucket/artifacts/tide/2024-01-31-00-00-00-000/"
+    )
     mock_s3.get_object.assert_called_once()
-    mock_s3.put_object.assert_called_once()
+    expected_put_object_calls = 2  # model.tar.gz + run_metadata.json
+    assert mock_s3.put_object.call_count == expected_put_object_calls
     mock_train.assert_called_once()
     assert "checkpoint_directory" in mock_train.call_args.kwargs
     mock_start_run.assert_called_once()
@@ -151,7 +165,11 @@ def test_train_tide_model_calls_end_run_failed_on_error(
     with patch("tide.trainer.train_model") as mock_train:
         mock_train.side_effect = RuntimeError("Training failed")
         with pytest.raises(RuntimeError, match="Training failed"):
-            train_tide_model.fn(training_data_key="training/data.parquet")
+            train_tide_model.fn(
+                training_data_key="training/data.parquet",
+                training_summary={},
+                artifact_timestamp="2024-01-31-00-00-00-000",
+            )
 
     mock_start_run.assert_called_once()
     mock_end_run.assert_called_once_with(status="FAILED")
@@ -166,11 +184,12 @@ def test_prepare_data_raises_on_missing_blocks(
         prepare_data.fn(
             start_date=datetime(2024, 1, 1, tzinfo=UTC),
             end_date=datetime(2024, 1, 31, tzinfo=UTC),
+            artifact_timestamp="2024-01-31-00-00-00-000",
         )
 
 
 @patch("tide.workflow.train_tide_model", return_value="s3://bucket/model")
-@patch("tide.workflow.prepare_data", return_value="training/data.parquet")
+@patch("tide.workflow.prepare_data", return_value=("training/data.parquet", {}))
 @patch("tide.workflow.get_training_date_range")
 def test_training_pipeline_threads_data_key(
     mock_date_range: MagicMock,
@@ -186,14 +205,8 @@ def test_training_pipeline_threads_data_key(
     )
 
     mock_date_range.assert_called_once_with(LOOKBACK_DAYS)
-    mock_prepare.assert_called_once_with(
-        start_date,
-        end_date,
-        "training/filtered_tide_training_data.parquet",
-    )
-    mock_train.assert_called_once_with(
-        "training/data.parquet",
-    )
+    mock_prepare.assert_called_once_with(start_date, end_date, ANY)
+    mock_train.assert_called_once_with("training/data.parquet", ANY, ANY)
     assert result == "s3://bucket/model"
 
 
