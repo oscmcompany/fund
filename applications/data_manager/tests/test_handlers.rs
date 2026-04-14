@@ -438,7 +438,7 @@ async fn test_equity_bars_sync_and_query_round_trip() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -494,7 +494,7 @@ async fn test_equity_bars_sync_returns_no_content_when_api_has_no_results() {
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -532,7 +532,7 @@ async fn test_equity_bars_sync_returns_internal_server_error_for_invalid_json() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_equity_bars_sync_returns_bad_gateway_for_unparseable_results() {
+async fn test_equity_bars_sync_returns_internal_server_error_for_unparseable_results() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
 
     let mut massive_server = Server::new_async().await;
@@ -561,7 +561,7 @@ async fn test_equity_bars_sync_returns_bad_gateway_for_unparseable_results() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -619,7 +619,7 @@ async fn test_equity_bars_query_without_ticker_filter_returns_data() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -665,7 +665,7 @@ async fn test_equity_bars_query_with_empty_tickers_param_returns_data() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -713,7 +713,7 @@ async fn test_equity_bars_sync_returns_internal_server_error_for_api_error_statu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_equity_bars_sync_returns_bad_gateway_when_s3_upload_fails() {
+async fn test_equity_bars_sync_returns_internal_server_error_when_s3_upload_fails() {
     let mut massive_server = Server::new_async().await;
     let _mock = massive_server
         .mock("GET", "/v2/aggs/grouped/locale/us/market/stocks/2025-01-01")
@@ -736,7 +736,7 @@ async fn test_equity_bars_sync_returns_bad_gateway_when_s3_upload_fails() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

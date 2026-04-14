@@ -6,6 +6,7 @@ pub mod health;
 pub mod portfolios;
 pub mod predictions;
 pub mod router;
+pub mod scheduler;
 pub mod startup;
 pub mod state;
 pub mod storage;
