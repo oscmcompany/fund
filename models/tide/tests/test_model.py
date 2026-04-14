@@ -1,16 +1,16 @@
 import tempfile
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
-from tide.tide_model import Model, quantile_loss
+from tide.data import TrainingDataset
+from tide.model import Model, quantile_loss
 from tinygrad.tensor import Tensor
 
 BATCH_SIZE = 4
 INPUT_LENGTH = 35
-OUTPUT_LENGTH = 7
+OUTPUT_LENGTH = 5
 CONTINUOUS_FEATURES = 7
-CATEGORICAL_FEATURES = 6
+CATEGORICAL_FEATURES = 5
 STATIC_FEATURES = 3
 HIDDEN_SIZE = 32
 NUM_QUANTILES = 3
@@ -24,56 +24,71 @@ EPOCH_SINGLE = 1
 rng = np.random.default_rng(42)
 
 
-@dataclass
-class BatchConfig:
-    batch_size: int = BATCH_SIZE
-    input_length: int = INPUT_LENGTH
-    output_length: int = OUTPUT_LENGTH
-    continuous_features: int = CONTINUOUS_FEATURES
-    categorical_features: int = CATEGORICAL_FEATURES
-    static_features: int = STATIC_FEATURES
-
-
-def _make_batch(
-    config: BatchConfig | None = None,
+def _make_dataset(
+    num_samples: int = BATCH_SIZE,
     *,
     include_targets: bool = True,
-) -> dict[str, Tensor]:
-    if config is None:
-        config = BatchConfig()
+) -> TrainingDataset:
+    return TrainingDataset(
+        past_continuous=rng.standard_normal(
+            (num_samples, INPUT_LENGTH, CONTINUOUS_FEATURES)
+        ).astype(np.float32),
+        past_categorical=rng.integers(
+            0,
+            CATEGORICAL_UPPER_BOUND,
+            (num_samples, INPUT_LENGTH, CATEGORICAL_FEATURES),
+        ).astype(np.int32),
+        future_categorical=rng.integers(
+            0,
+            CATEGORICAL_UPPER_BOUND,
+            (num_samples, OUTPUT_LENGTH, CATEGORICAL_FEATURES),
+        ).astype(np.int32),
+        static_categorical=rng.integers(
+            0,
+            CATEGORICAL_UPPER_BOUND,
+            (num_samples, 1, STATIC_FEATURES),
+        ).astype(np.int32),
+        targets=(
+            rng.standard_normal((num_samples, OUTPUT_LENGTH, 1)).astype(np.float32)
+            if include_targets
+            else None
+        ),
+    )
+
+
+def _make_batch(*, include_targets: bool = True) -> dict[str, Tensor]:
+    """Create a single dict[str, Tensor] batch for forward/predict tests."""
     batch: dict[str, Tensor] = {
         "past_continuous_features": Tensor(
-            rng.standard_normal(
-                (config.batch_size, config.input_length, config.continuous_features)
-            ).astype(np.float32)
+            rng.standard_normal((BATCH_SIZE, INPUT_LENGTH, CONTINUOUS_FEATURES)).astype(
+                np.float32
+            )
         ),
         "past_categorical_features": Tensor(
             rng.integers(
                 0,
                 CATEGORICAL_UPPER_BOUND,
-                (config.batch_size, config.input_length, config.categorical_features),
+                (BATCH_SIZE, INPUT_LENGTH, CATEGORICAL_FEATURES),
             ).astype(np.int32)
         ),
         "future_categorical_features": Tensor(
             rng.integers(
                 0,
                 CATEGORICAL_UPPER_BOUND,
-                (config.batch_size, config.output_length, config.categorical_features),
+                (BATCH_SIZE, OUTPUT_LENGTH, CATEGORICAL_FEATURES),
             ).astype(np.int32)
         ),
         "static_categorical_features": Tensor(
             rng.integers(
                 0,
                 CATEGORICAL_UPPER_BOUND,
-                (config.batch_size, 1, config.static_features),
+                (BATCH_SIZE, 1, STATIC_FEATURES),
             ).astype(np.int32)
         ),
     }
     if include_targets:
         batch["targets"] = Tensor(
-            rng.standard_normal((config.batch_size, config.output_length, 1)).astype(
-                np.float32
-            )
+            rng.standard_normal((BATCH_SIZE, OUTPUT_LENGTH, 1)).astype(np.float32)
         )
     return batch
 
@@ -167,9 +182,9 @@ def test_model_train_with_huber_delta() -> None:
         output_length=OUTPUT_LENGTH,
         huber_delta=0.5,
     )
-    batches = [_make_batch()]
+    dataset = _make_dataset()
     losses = model.train(
-        train_batches=batches,
+        dataset=dataset,
         epochs=EPOCHS_SHORT,
         learning_rate=LEARNING_RATE,
         validate_data=False,
@@ -194,9 +209,9 @@ def test_model_train_returns_losses() -> None:
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batches = [_make_batch()]
+    dataset = _make_dataset()
     losses = model.train(
-        train_batches=batches,
+        dataset=dataset,
         epochs=EPOCHS_SHORT,
         learning_rate=LEARNING_RATE,
         validate_data=False,
@@ -205,13 +220,26 @@ def test_model_train_returns_losses() -> None:
     assert all(isinstance(loss, float) for loss in losses)
 
 
-def test_model_train_empty_batch_list() -> None:
+def test_model_train_empty_dataset() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
+    empty_dataset = TrainingDataset(
+        past_continuous=np.zeros(
+            (0, INPUT_LENGTH, CONTINUOUS_FEATURES), dtype=np.float32
+        ),
+        past_categorical=np.zeros(
+            (0, INPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32
+        ),
+        future_categorical=np.zeros(
+            (0, OUTPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32
+        ),
+        static_categorical=np.zeros((0, 1, STATIC_FEATURES), dtype=np.int32),
+        targets=np.zeros((0, OUTPUT_LENGTH, 1), dtype=np.float32),
+    )
     losses = model.train(
-        train_batches=[],
+        dataset=empty_dataset,
         epochs=EPOCHS_SHORT,
         learning_rate=LEARNING_RATE,
         validate_data=False,
@@ -219,79 +247,62 @@ def test_model_train_empty_batch_list() -> None:
     assert losses == []
 
 
-def test_model_train_skips_zero_size_batch() -> None:
-    input_size = _compute_input_size()
-    model = Model(
-        input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
-    )
-    empty_batch = {
-        "past_continuous_features": Tensor(
-            np.zeros((0, INPUT_LENGTH, CONTINUOUS_FEATURES), dtype=np.float32)
-        ),
-        "past_categorical_features": Tensor(
-            np.zeros((0, INPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32)
-        ),
-        "future_categorical_features": Tensor(
-            np.zeros((0, OUTPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32)
-        ),
-        "static_categorical_features": Tensor(
-            np.zeros((0, 1, STATIC_FEATURES), dtype=np.int32)
-        ),
-        "targets": Tensor(np.zeros((0, OUTPUT_LENGTH, 1), dtype=np.float32)),
-    }
-    normal_batch = _make_batch(BatchConfig(batch_size=BATCH_SIZE))
-    losses = model.train(
-        train_batches=[empty_batch, normal_batch],
-        epochs=EPOCH_SINGLE,
-        learning_rate=LEARNING_RATE,
-        validate_data=False,
-    )
-    assert len(losses) == EPOCH_SINGLE
-
-
 def test_model_train_missing_targets_raises() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batch = _make_batch(include_targets=False)
+    dataset = _make_dataset(include_targets=False)
     with pytest.raises(ValueError, match="Targets are required"):
         model.train(
-            train_batches=[batch],
+            dataset=dataset,
             epochs=EPOCH_SINGLE,
             learning_rate=LEARNING_RATE,
             validate_data=False,
         )
 
 
-def test_model_validate_returns_loss() -> None:
+def test_model_validate_model_returns_loss() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batches = [_make_batch()]
-    loss = model.validate(batches)
+    dataset = _make_dataset()
+    loss = model.validate_model(dataset)
     assert isinstance(loss, float)
     assert loss >= 0
 
 
-def test_model_validate_empty_batches_returns_nan() -> None:
+def test_model_validate_model_empty_dataset_returns_nan() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    loss = model.validate([])
+    empty_dataset = TrainingDataset(
+        past_continuous=np.zeros(
+            (0, INPUT_LENGTH, CONTINUOUS_FEATURES), dtype=np.float32
+        ),
+        past_categorical=np.zeros(
+            (0, INPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32
+        ),
+        future_categorical=np.zeros(
+            (0, OUTPUT_LENGTH, CATEGORICAL_FEATURES), dtype=np.int32
+        ),
+        static_categorical=np.zeros((0, 1, STATIC_FEATURES), dtype=np.int32),
+        targets=np.zeros((0, OUTPUT_LENGTH, 1), dtype=np.float32),
+    )
+    loss = model.validate_model(empty_dataset)
     assert np.isnan(loss)
 
 
-def test_model_validate_missing_targets_raises() -> None:
+def test_model_validate_model_missing_targets_raises() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batch = _make_batch(include_targets=False)
+    dataset = _make_dataset(include_targets=False)
     with pytest.raises(ValueError, match="Targets are required"):
-        model.validate([batch])
+        model.validate_model(dataset)
 
 
 def test_model_predict_output_shape() -> None:
@@ -323,9 +334,9 @@ def test_model_early_stopping() -> None:
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batches = [_make_batch()]
+    dataset = _make_dataset()
     losses = model.train(
-        train_batches=batches,
+        dataset=dataset,
         epochs=EPOCHS_LONG,
         learning_rate=LEARNING_RATE,
         validate_data=False,
@@ -341,23 +352,23 @@ def test_model_validation_sample_size_must_be_positive() -> None:
     )
     with pytest.raises(ValueError, match="positive"):
         model.train(
-            train_batches=[_make_batch()],
+            dataset=_make_dataset(),
             epochs=EPOCH_SINGLE,
             validate_data=True,
             validation_sample_size=0,
         )
 
 
-def test_model_validate_restores_training_state() -> None:
+def test_model_validate_model_restores_training_state() -> None:
     input_size = _compute_input_size()
     model = Model(
         input_size=input_size, hidden_size=HIDDEN_SIZE, output_length=OUTPUT_LENGTH
     )
-    batches = [_make_batch()]
+    dataset = _make_dataset()
     Tensor.training = True
-    model.validate(batches)
+    model.validate_model(dataset)
     assert Tensor.training is True
 
     Tensor.training = False
-    model.validate(batches)
+    model.validate_model(dataset)
     assert Tensor.training is False

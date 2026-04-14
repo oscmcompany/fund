@@ -58,16 +58,11 @@ jobs:
       - name: Install Flox
         if: steps.changes.outputs.service == 'true'
         uses: flox/install-flox-action@v2
-      - name: Build ${{ matrix.application }}-${{ matrix.stage }} image
+      - name: Build and push ${{ matrix.application }}-${{ matrix.stage }} image
         if: steps.changes.outputs.service == 'true'
         uses: flox/activate-action@v1
         with:
-          command: mask infrastructure image build ${{ matrix.application }} ${{ matrix.stage }}
-      - name: Push ${{ matrix.application }}-${{ matrix.stage }} image
-        if: steps.changes.outputs.service == 'true'
-        uses: flox/activate-action@v1
-        with:
-          command: mask infrastructure image push ${{ matrix.application }} ${{ matrix.stage }}
+          command: mask infrastructure image build-and-push ${{ matrix.application }} ${{ matrix.stage }}
   launch_infrastructure:
     name: Deploy with Pulumi
     needs: build_and_push_images
@@ -142,4 +137,4 @@ jobs:
         env:
           PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
         with:
-          command: mask infrastructure image deploy ${{ matrix.application }} ${{ matrix.stage }}
+          command: mask infrastructure service update ${{ matrix.application }}

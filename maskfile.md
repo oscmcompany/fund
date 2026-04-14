@@ -52,14 +52,14 @@ echo "Development environment setup completed successfully"
 
 > Manage Docker images for applications
 
-#### build (package_name) (stage_name)
+#### build-and-push (package_name) (stage_name)
 
-> Build Docker images with optional cache pull (e.g. `portfolio-manager server`, `tide model-runner`)
+> Build and push Docker image directly to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
 
 ```bash
 set -euo pipefail
 
-echo "Building image"
+echo "Building and pushing image"
 
 aws_account_id=$(aws sts get-caller-identity --query Account --output text)
 aws_region="${AWS_REGION:-}"
@@ -117,105 +117,19 @@ else
     docker buildx create --use --name fund-builder 2>/dev/null || docker buildx use fund-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
-echo "Building with caching (will continue if cache doesn't exist)"
+echo "Building and pushing with caching (will continue if cache doesn't exist)"
 docker buildx build \
     --platform linux/amd64 \
     --target ${build_target} \
     --file ${dockerfile} \
     --tag ${image_reference}:latest \
+    --tag ${image_reference}:git-${commit_hash} \
     ${cache_from_arguments} \
     ${cache_to_arguments} \
-    --load \
+    --push \
     .
 
-echo "Image built: ${package_name} ${stage_name}"
-```
-
-#### push (package_name) (stage_name)
-
-> Push Docker image to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
-
-```bash
-set -euo pipefail
-
-echo "Pushing image to ECR"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region="${AWS_REGION:-}"
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
-fi
-
-repository_name="fund/${package_name}-${stage_name}"
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
-commit_hash=$(git rev-parse --short HEAD)
-
-echo "Logging into ECR"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com > /dev/null
-
-echo "Checking if image for commit ${commit_hash} already exists in ECR"
-existing_tag="NONE"
-if image_digest=$(aws ecr describe-images \
-    --repository-name "${repository_name}" \
-    --image-ids "imageTag=git-${commit_hash}" \
-    --query 'imageDetails[0].imageDigest' \
-    --output text 2>/dev/null); then
-    existing_tag="${image_digest}"
-fi
-
-if [ "$existing_tag" != "NONE" ] && [ "$existing_tag" != "None" ] && [ -n "$existing_tag" ]; then
-    echo "Image for commit ${commit_hash} already exists in ECR, skipping push"
-    echo "Image pushed: ${package_name} ${stage_name} (cached)"
-    exit 0
-fi
-
-echo "Pushing image"
-docker tag "${image_reference}:latest" "${image_reference}:git-${commit_hash}"
-docker push "${image_reference}:latest"
-docker push "${image_reference}:git-${commit_hash}"
-
-echo "Image pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
-```
-
-#### deploy (package_name) (stage_name)
-
-> Deploy ECS service with latest image (e.g. `portfolio-manager server`, `data-manager server`)
-
-```bash
-set -euo pipefail
-
-echo "Deploying ${package_name} ${stage_name}"
-
-case "${package_name}-${stage_name}" in
-    data-manager-server)      service="fund-data-manager-server" ;;
-    portfolio-manager-server) service="fund-portfolio-manager-server" ;;
-    ensemble-manager-server)  service="fund-ensemble-manager-server" ;;
-    tide-model-runner)        echo "tide-model-runner is used for Prefect training jobs, not an ECS service" && exit 0 ;;
-    *) echo "Unknown service: ${package_name}-${stage_name}" && exit 1 ;;
-esac
-
-cd infrastructure/
-
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Error: Pulumi default organization not set. Run: pulumi org set-default <organization>"
-    exit 1
-fi
-pulumi stack select "${organization_name}/fund/production"
-cluster=$(pulumi stack output aws_ecs_cluster_name)
-
-cd "${MASKFILE_DIR}"
-
-aws ecs update-service --cluster "$cluster" --service "$service" --force-new-deployment --no-cli-pager > /dev/null
-echo "Deployment started: ${service}"
-
-echo "Waiting for ${service} to stabilize"
-
-aws ecs wait services-stable --cluster "$cluster" --services "$service"
-
-echo "Deployment complete: ${service} (${package_name} ${stage_name})"
+echo "Image built and pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
 ```
 
 ### stack
@@ -454,9 +368,9 @@ aws ecs wait services-stable --cluster "$cluster" --services "$service"
 echo "Deployment complete: ${service}"
 ```
 
-### models
+### trainer
 
-> Manage Prefect Cloud model resources
+> Manage Prefect Cloud model training resources
 
 #### initialize (environment)
 
@@ -469,12 +383,31 @@ case "${environment}" in
     remote)
         unset PREFECT_API_URL
 
-        echo "Creating fund-models-remote work pool on Prefect Cloud"
-        uv run prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
-            || echo "  already exists"
+        cd infrastructure/
+        pulumi stack select "$(pulumi org get-default)/fund/production"
+        models_cluster=$(pulumi stack output aws_ecs_models_cluster_name)
+        tide_trainer_task_definition_arn=$(pulumi stack output aws_ecs_tide_trainer_task_definition_arn)
+        vpc_id=$(pulumi stack output aws_vpc_id)
+        private_subnet_1_id=$(pulumi stack output aws_ecs_private_subnet_1_id)
+        private_subnet_2_id=$(pulumi stack output aws_ecs_private_subnet_2_id)
+        ecs_security_group_id=$(pulumi stack output aws_ecs_security_group_id)
+        cd "${MASKFILE_DIR}"
 
-        echo "Registering remote training deployment"
-        uv run prefect --no-prompt deploy --name tide-trainer-remote
+        echo "Creating fund-models-remote work pool on Prefect Cloud"
+        aws_credentials_block_id=$(uv run prefect block inspect "aws-credentials/fund-aws" | grep "Block id" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        base_job_template=$(uv run prefect work-pool get-default-base-job-template --type ecs \
+            | uv run python -m tools.build_work_pool_template \
+                "${models_cluster}" \
+                "${aws_credentials_block_id}" \
+                "${tide_trainer_task_definition_arn}" \
+                "${vpc_id}" \
+                "${private_subnet_1_id}" \
+                "${private_subnet_2_id}" \
+                "${ecs_security_group_id}")
+        uv run prefect work-pool create "fund-models-remote" --type ecs \
+            --base-job-template <(echo "${base_job_template}") 2>/dev/null \
+            || uv run prefect work-pool update "fund-models-remote" \
+                --base-job-template <(echo "${base_job_template}")
 
         echo ""
         echo "Done. Visit Prefect Cloud dashboard to view deployments."
@@ -850,36 +783,37 @@ echo "YAML development checks completed successfully"
 
 ### train (model_name)
 
-> Train model via Prefect training pipeline
+> Trigger model training run via Prefect Cloud deployment
 
 ```bash
 set -euo pipefail
 
-cd infrastructure
+unset PREFECT_API_URL
 
-if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
-    echo "Unable to determine Pulumi organization name - ensure you are logged in"
-    exit 1
-fi
-
-pulumi stack select ${organization_name}/fund/production
-
-export FUND_DATA_MANAGER_BASE_URL="$(pulumi stack output aws_alb_url)"
-export AWS_S3_DATA_BUCKET_NAME="$(pulumi stack output aws_s3_data_bucket_name)"
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$(pulumi stack output aws_s3_model_artifacts_bucket_name)"
-export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
-
-cd ../
+lookback_days="${FUND_LOOKBACK_DAYS:-365}"
 
 case "${model_name}" in
     tide)
-        uv run python -m tide.run
+        deployment="tide-training-pipeline/tide-trainer-remote"
+        log_group="/ecs/fund/models"
+        log_stream_prefix="tide/prefect"
         ;;
     *)
         echo "Unknown model: ${model_name}"
+        echo "Valid options: tide"
         exit 1
         ;;
 esac
+
+echo "Triggering training run for ${model_name} (lookback_days=${lookback_days})"
+uv run prefect deployment run "${deployment}" --param "lookback_days=${lookback_days}"
+
+echo ""
+echo "To find logs once the run starts (GPU provisioning takes ~3-5 minutes):"
+echo "  1. Open the flow run in Prefect Cloud and note the ECS task ARN under Infrastructure"
+echo "  2. The task ID is the last segment of the ARN (after the final '/')"
+echo "  3. Find the log stream in CloudWatch log group '${log_group}':"
+echo "     ${log_stream_prefix}/<task-id>"
 ```
 
 ### deploy (model_name)
@@ -889,11 +823,26 @@ esac
 ```bash
 set -euo pipefail
 
+echo "Deploying ${model_name} model"
+
 unset PREFECT_API_URL
 export FUND_LOOKBACK_DAYS="${FUND_LOOKBACK_DAYS:-365}"
 
+cd infrastructure
+
+if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organization_name}" ]; then
+    echo "Unable to determine Pulumi organization name - ensure you are logged in"
+    exit 1
+fi
+
+pulumi stack select "${organization_name}/fund/production"
+tide_image_uri=$(pulumi stack output aws_ecr_tide_model_runner_image)
+
+cd "${MASKFILE_DIR}"
+
 case "${model_name}" in
     tide)
+        export FUND_TIDE_IMAGE_URI="${tide_image_uri}"
         uv run python -m tide.deploy
         ;;
     *)
@@ -901,6 +850,8 @@ case "${model_name}" in
         exit 1
         ;;
 esac
+
+echo "Deployment complete: ${model_name}"
 ```
 
 ### download (model_name)

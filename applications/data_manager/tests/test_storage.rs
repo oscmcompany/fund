@@ -13,7 +13,7 @@ use data_manager::{
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
         sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
         write_equity_details_dataframe_to_s3, write_portfolio_dataframe_to_s3,
-        write_predictions_dataframe_to_s3, PredictionQuery,
+        write_predictions_dataframe_to_s3, PredictionQuery, DUCKDB_CONFIG_VALUE_MAX_LENGTH,
     },
 };
 use polars::prelude::*;
@@ -466,6 +466,8 @@ fn test_sanitize_duckdb_config_value_valid() {
     assert!(sanitize_duckdb_config_value("true").is_ok());
     assert!(sanitize_duckdb_config_value("false").is_ok());
     assert!(sanitize_duckdb_config_value("http://127.0.0.1:9000").is_ok());
+    // AWS ECS session tokens can exceed 1000 characters
+    assert!(sanitize_duckdb_config_value(&"a".repeat(1052)).is_ok());
 }
 
 #[test]
@@ -474,7 +476,7 @@ fn test_sanitize_duckdb_config_value_rejects_injection() {
     assert!(sanitize_duckdb_config_value("localhost'; --").is_err());
     assert!(sanitize_duckdb_config_value("\"malicious\"").is_err());
     assert!(sanitize_duckdb_config_value("").is_err());
-    assert!(sanitize_duckdb_config_value(&"a".repeat(513)).is_err());
+    assert!(sanitize_duckdb_config_value(&"a".repeat(DUCKDB_CONFIG_VALUE_MAX_LENGTH + 1)).is_err());
     assert!(sanitize_duckdb_config_value("value;another").is_err());
 }
 

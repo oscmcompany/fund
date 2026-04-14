@@ -6,6 +6,7 @@ import boto3
 import polars as pl
 import structlog
 from botocore.exceptions import ClientError
+from internal.equity_bars_schema import equity_bars_schema
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -14,6 +15,16 @@ logger = structlog.get_logger()
 
 MINIMUM_CLOSE_PRICE = 1.0
 MINIMUM_VOLUME = 100_000
+
+_COLUMN_TYPES: dict[str, type[pl.DataType]] = {
+    "open_price": pl.Float64,
+    "high_price": pl.Float64,
+    "low_price": pl.Float64,
+    "close_price": pl.Float64,
+    "volume_weighted_average_price": pl.Float64,
+    "volume": pl.Int64,
+    "transactions": pl.Int64,
+}
 
 
 def read_equity_bars_from_s3(
@@ -47,6 +58,13 @@ def read_equity_bars_from_s3(
             response = s3_client.get_object(Bucket=bucket_name, Key=key)
             parquet_bytes = response["Body"].read()
             dataframe = pl.read_parquet(parquet_bytes)
+            dataframe = dataframe.with_columns(
+                [
+                    pl.col(col).cast(dtype)
+                    for col, dtype in _COLUMN_TYPES.items()
+                    if col in dataframe.columns
+                ]
+            )
             batch_dataframes.append(dataframe)
             logger.debug("Read parquet file", key=key, rows=dataframe.height)
         except s3_client.exceptions.NoSuchKey:
@@ -110,6 +128,7 @@ def filter_equity_bars(
     filtered = data.filter(
         (pl.col("close_price") >= minimum_close_price)
         & (pl.col("volume") >= minimum_volume)
+        & ~pl.col("ticker").str.contains("[a-z]")
     )
 
     logger.info("Filtered equity bars", output_rows=filtered.height)
@@ -151,7 +170,12 @@ def consolidate_data(
     if missing_columns:
         logger.warning("Missing columns in consolidated data", missing=missing_columns)
 
-    result = consolidated.select(available_columns)
+    if "sector" in available_columns and "industry" in available_columns:
+        result = consolidated.select(available_columns).filter(
+            pl.col("sector").is_not_null() & pl.col("industry").is_not_null()
+        )
+    else:
+        result = consolidated.select(available_columns)
 
     logger.info(
         "Consolidated data", output_rows=result.height, columns=available_columns
@@ -224,6 +248,8 @@ def prepare_training_data(  # noqa: PLR0913
     )
 
     filtered_bars = filter_equity_bars(equity_bars)
+
+    equity_bars_schema.validate(filtered_bars)
 
     consolidated = consolidate_data(
         equity_bars=filtered_bars,

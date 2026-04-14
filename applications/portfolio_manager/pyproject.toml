@@ -16,6 +16,7 @@ dependencies = [
   "sentry-sdk[fastapi]>=2.0.0",
   "structlog>=25.5.0",
   "scipy>=1.17.1",
+  "prometheus-client>=0.21.0",
 ]
 
 [tool.uv]

@@ -112,7 +112,7 @@ For code changes (model architecture, loss function, layer structure), run
 **one experiment at a time**:
 
 1. **Hypothesize** a single architecture change
-2. **Modify** the model code (tide_model.py or tide_data.py)
+2. **Modify** the model code (model.py or data.py)
 3. **Commit**: `git add -A && git commit -m "autoresearch: <description>"`
 4. **Run training**:
    ```bash
@@ -153,16 +153,16 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 ## Files Modified During Loop
 
 Primarily:
-- `models/tide/src/tide/tide_model.py` (model architecture)
-- `models/tide/src/tide/tide_data.py` (data processing)
+- `models/tide/src/tide/model.py` (model architecture)
+- `models/tide/src/tide/data.py` (data processing)
 - `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION, training hyperparameters)
 
 ## Key Files
 
 - **Trainer**: `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION lives here)
 - **Workflow**: `models/tide/src/tide/workflow.py`
-- **Model**: `models/tide/src/tide/tide_model.py`
-- **Data**: `models/tide/src/tide/tide_data.py`
+- **Model**: `models/tide/src/tide/model.py`
+- **Data**: `models/tide/src/tide/data.py`
 - **Experiment log**: `autotrain/<model-name>/experiments.jsonl`
 - **Prefect config**: `prefect.yaml`
 - **devenv tasks**: `devenv.nix`

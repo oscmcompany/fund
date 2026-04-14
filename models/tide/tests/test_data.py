@@ -2,27 +2,23 @@ import json
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
-from tide.tide_data import (
+from tide.data import (
     CleanData,
     Data,
     EngineerFeatures,
-    ExpandDateRange,
-    FillNulls,
     Pipeline,
     ScaleAndEncode,
+    TrainingDataset,
     ValidateColumns,
 )
 
-if TYPE_CHECKING:
-    from datetime import date
-
-FRIDAY_WEEKDAY = 4
 EXPECTED_PAST_CONTINUOUS_FEATURES = 7
-EXPECTED_PAST_CATEGORICAL_FEATURES = 6
+EXPECTED_INPUT_LENGTH = 35
+EXPECTED_OUTPUT_LENGTH = 5
+EXPECTED_PAST_CATEGORICAL_FEATURES = 5
 EXPECTED_STATIC_CATEGORICAL_FEATURES = 3
 
 
@@ -50,47 +46,11 @@ def test_validate_columns_rejects_extra_column(
         ValidateColumns().run(data)
 
 
-def test_expand_date_range_fills_gaps(
-    make_raw_data: Callable[..., pl.DataFrame],
-) -> None:
-    data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    unique_dates = expanded.select("date").unique().height
-    min_date: date = expanded.select(pl.col("date").min()).item()
-    max_date: date = expanded.select(pl.col("date").max()).item()
-    expected_dates = (max_date - min_date).days + 1
-    assert unique_dates == expected_dates
-
-
-def test_fill_nulls_replaces_null_prices(
-    make_raw_data: Callable[..., pl.DataFrame],
-) -> None:
-    data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    null_count = filled.select(pl.col("open_price").is_null().sum()).item()
-    assert null_count == 0
-
-
-def test_fill_nulls_sets_holidays_for_missing_weekdays(
-    make_raw_data: Callable[..., pl.DataFrame],
-) -> None:
-    data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    weekday_nulls = filled.filter(
-        (pl.col("date").dt.weekday() <= FRIDAY_WEEKDAY) & pl.col("is_holiday").is_null()
-    )
-    assert weekday_nulls.height == 0
-
-
 def test_engineer_features_adds_calendar_columns(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    featured = EngineerFeatures().run(filled)
+    featured = EngineerFeatures().run(data)
     expected_columns = {
         "day_of_week",
         "day_of_month",
@@ -99,6 +59,7 @@ def test_engineer_features_adds_calendar_columns(
         "year",
         "time_idx",
         "daily_return",
+        "date",
     }
     assert expected_columns.issubset(set(featured.columns))
 
@@ -107,9 +68,7 @@ def test_engineer_features_time_idx_is_dense_rank(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    featured = EngineerFeatures().run(filled)
+    featured = EngineerFeatures().run(data)
     time_indices = featured.sort("timestamp").select("time_idx").to_series().to_list()
     assert time_indices == sorted(time_indices)
     assert time_indices[0] == 1
@@ -119,10 +78,7 @@ def test_clean_data_removes_unknown_tickers(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    featured = EngineerFeatures().run(filled)
-    # Add an UNKNOWN ticker row
+    featured = EngineerFeatures().run(data)
     unknown_row = featured.head(1).with_columns(pl.lit("UNKNOWN").alias("ticker"))
     featured_with_unknown = pl.concat([featured, unknown_row])
     cleaned = CleanData().run(featured_with_unknown)
@@ -133,14 +89,36 @@ def test_clean_data_removes_nan_daily_return(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     data = make_raw_data(tickers=["AAPL"], days=10)
-    expanded = ExpandDateRange().run(data)
-    filled = FillNulls().run(expanded)
-    featured = EngineerFeatures().run(filled)
+    featured = EngineerFeatures().run(data)
     cleaned = CleanData().run(featured)
     nan_count = cleaned.filter(pl.col("daily_return").is_nan()).height
     null_count = cleaned.filter(pl.col("daily_return").is_null()).height
     assert nan_count == 0
     assert null_count == 0
+
+
+def test_clean_data_removes_rows_with_invalid_values_in_multiple_columns(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    data = make_raw_data(tickers=["AAPL"], days=10)
+    featured = EngineerFeatures().run(data)
+    # Inject bad values into two different continuous columns on the same row
+    bad_row = featured.head(1).with_columns(
+        pl.lit(float("nan")).alias("open_price"),
+        pl.lit(float("inf")).alias("close_price"),
+    )
+    # Inject a bad value into only a later continuous column on a different row
+    bad_row_later = featured.slice(1, 1).with_columns(
+        pl.lit(float("nan")).alias("volume_weighted_average_price"),
+    )
+    combined = pl.concat([featured.slice(2), bad_row, bad_row_later])
+
+    cleaned = CleanData().run(combined)
+
+    assert cleaned.filter(pl.col("open_price").is_nan()).height == 0
+    assert cleaned.filter(pl.col("close_price").is_infinite()).height == 0
+    assert cleaned.filter(pl.col("volume_weighted_average_price").is_nan()).height == 0
+    assert cleaned.height == featured.height - 2
 
 
 def test_scale_and_encode_produces_scaler_and_mappings(
@@ -176,7 +154,7 @@ def test_pipeline_run_to_stops_at_stage(
 ) -> None:
     data = make_raw_data()
     pipeline = Pipeline()
-    result = pipeline.run_to("fill_nulls", data)
+    result = pipeline.run_to("validate_columns", data)
     assert "day_of_week" not in result.columns
 
 
@@ -191,7 +169,7 @@ def test_pipeline_snapshot_roundtrip(
 ) -> None:
     data = make_raw_data(tickers=["AAPL"], days=10)
     pipeline = Pipeline()
-    result = pipeline.run_to("fill_nulls", data)
+    result = pipeline.run_to("engineer_features", data)
     snapshot_path = str(tmp_path / "snapshot.parquet")
     Pipeline.snapshot(result, snapshot_path)
     loaded = Pipeline.load_snapshot(snapshot_path)
@@ -228,7 +206,6 @@ def test_data_preprocess_output_columns_match_schema(
         "sector",
         "industry",
         "date",
-        "is_holiday",
         "day_of_week",
         "day_of_month",
         "day_of_year",
@@ -273,26 +250,67 @@ def test_data_get_dimensions(
     )
 
 
-def test_data_get_batches_train(
+def test_data_get_dataset_train(
     make_raw_data: Callable[..., pl.DataFrame],
 ) -> None:
     raw = make_raw_data(days=90)
     data = Data()
     data.preprocess_and_set_data(raw)
-    batches = data.get_batches(
+    dataset = data.get_dataset(
         data_type="train",
         validation_split=0.8,
         input_length=35,
-        output_length=7,
-        batch_size=32,
+        output_length=5,
     )
-    assert len(batches) > 0
-    batch = batches[0]
-    assert "past_continuous_features" in batch
-    assert "past_categorical_features" in batch
-    assert "future_categorical_features" in batch
-    assert "static_categorical_features" in batch
-    assert "targets" in batch
+    assert isinstance(dataset, TrainingDataset)
+    assert len(dataset) > 0
+    assert dataset.past_continuous.shape[1] == EXPECTED_INPUT_LENGTH
+    assert dataset.past_categorical.shape[1] == EXPECTED_INPUT_LENGTH
+    assert dataset.future_categorical.shape[1] == EXPECTED_OUTPUT_LENGTH
+    assert dataset.static_categorical.shape[2] == EXPECTED_STATIC_CATEGORICAL_FEATURES
+    assert dataset.targets is not None
+
+
+def test_data_get_dataset_validate(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    # Need enough days so the 20% validation split has > input_length+output_length days
+    raw = make_raw_data(days=300)
+    data = Data()
+    data.preprocess_and_set_data(raw)
+    dataset = data.get_dataset(
+        data_type="validate",
+        validation_split=0.8,
+        input_length=35,
+        output_length=5,
+    )
+    assert isinstance(dataset, TrainingDataset)
+    assert dataset.targets is not None
+
+
+def test_data_get_dataset_predict_has_no_targets(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    raw = make_raw_data(days=90)
+    data = Data()
+    data.preprocess_and_set_data(raw)
+    dataset = data.get_dataset(
+        data_type="predict",
+        input_length=35,
+        output_length=5,
+    )
+    assert isinstance(dataset, TrainingDataset)
+    assert dataset.targets is None
+
+
+def test_data_get_dataset_invalid_type(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    raw = make_raw_data(days=90)
+    data = Data()
+    data.preprocess_and_set_data(raw)
+    with pytest.raises(ValueError, match="Invalid data type"):
+        data.get_dataset(data_type="invalid")
 
 
 def test_scale_and_encode_raises_on_nan_scaler(

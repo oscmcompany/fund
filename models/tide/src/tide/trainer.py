@@ -3,25 +3,25 @@ from typing import Any, cast
 import polars as pl
 import structlog
 
-from tide.tide_data import Data
-from tide.tide_model import Model
+from tide.data import Data
+from tide.model import Model
 from tide.tracking import log_epoch_loss, log_training_result
 
 logger = structlog.get_logger()
 
 DEFAULT_CONFIGURATION: dict[str, Any] = {
     "architecture": "TiDE",
-    "learning_rate": 0.0005,
-    "epoch_count": 200,
-    "early_stopping_patience": 25,
+    "learning_rate": 0.001,
+    "epoch_count": 20,
+    "early_stopping_patience": 3,
     "validation_split": 0.8,
     "input_length": 35,
-    "output_length": 7,
+    "output_length": 5,
     "hidden_size": 64,
     "num_encoder_layers": 3,
     "num_decoder_layers": 2,
     "dropout_rate": 0.1,
-    "batch_size": 32,
+    "batch_size": 512,
     "huber_delta": 0.5,
     "quantiles": [0.1, 0.5, 0.9],
 }
@@ -50,51 +50,63 @@ def train_model(
     dimensions = tide_data.get_dimensions()
     logger.info("Data dimensions", **dimensions)
 
-    logger.info("Creating training batches")
-    train_batches = tide_data.get_batches(
+    logger.info("Creating training dataset")
+    train_dataset = tide_data.get_dataset(
         data_type="train",
         validation_split=float(configuration["validation_split"]),
         input_length=int(configuration["input_length"]),
         output_length=int(configuration["output_length"]),
-        batch_size=int(configuration["batch_size"]),
     )
 
-    logger.info("Training batches created", batch_count=len(train_batches))
+    logger.info("Creating validation dataset")
+    try:
+        validation_dataset = tide_data.get_dataset(
+            data_type="validate",
+            validation_split=float(configuration["validation_split"]),
+            input_length=int(configuration["input_length"]),
+            output_length=int(configuration["output_length"]),
+        )
+    except ValueError as e:
+        if "Total days available" not in str(e):
+            raise
+        logger.warning(
+            "Validation set too small for windowing; disabling validation early stopping"  # noqa: E501
+        )
+        validation_dataset = None
 
-    if not train_batches:
+    logger.info("Training dataset created", sample_count=len(train_dataset))
+
+    if len(train_dataset) == 0:
         logger.error(
-            "No training batches created",
+            "No training samples created",
             validation_split=configuration["validation_split"],
             input_length=configuration["input_length"],
             output_length=configuration["output_length"],
-            batch_size=configuration["batch_size"],
             training_data_rows=training_data.height,
         )
         message = (
-            "No training batches created - check input data and configuration. "
+            "No training samples created - check input data and configuration. "
             f"Training data has {training_data.height} rows, "
             f"input_length={configuration['input_length']}, "
-            f"output_length={configuration['output_length']}, "
-            f"batch_size={configuration['batch_size']}"
+            f"output_length={configuration['output_length']}"
         )
         raise ValueError(message)
 
-    sample_batch = train_batches[0]
-
-    batch_size = sample_batch["past_continuous_features"].shape[0]
-    logger.info("Batch size determined", batch_size=batch_size)
-
+    # Compute input_size from numpy array shapes: [N, time_steps, features]
     past_continuous_size = (
-        sample_batch["past_continuous_features"].reshape(batch_size, -1).shape[1]
+        train_dataset.past_continuous.shape[1] * train_dataset.past_continuous.shape[2]
     )
     past_categorical_size = (
-        sample_batch["past_categorical_features"].reshape(batch_size, -1).shape[1]
+        train_dataset.past_categorical.shape[1]
+        * train_dataset.past_categorical.shape[2]
     )
     future_categorical_size = (
-        sample_batch["future_categorical_features"].reshape(batch_size, -1).shape[1]
+        train_dataset.future_categorical.shape[1]
+        * train_dataset.future_categorical.shape[2]
     )
     static_categorical_size = (
-        sample_batch["static_categorical_features"].reshape(batch_size, -1).shape[1]
+        train_dataset.static_categorical.shape[1]
+        * train_dataset.static_categorical.shape[2]
     )
 
     input_size = cast(
@@ -123,9 +135,11 @@ def train_model(
 
     early_stopping_patience = configuration.get("early_stopping_patience", 25)
     losses = tide_model.train(
-        train_batches=train_batches,
+        dataset=train_dataset,
+        batch_size=int(configuration["batch_size"]),
         epochs=int(configuration["epoch_count"]),
         learning_rate=float(configuration["learning_rate"]),
+        validation_dataset=validation_dataset,
         checkpoint_directory=checkpoint_directory,
         early_stopping_patience=(
             int(early_stopping_patience)
