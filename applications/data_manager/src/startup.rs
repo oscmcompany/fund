@@ -50,9 +50,9 @@ pub async fn run_server(bind_address: &str) -> std::io::Result<()> {
     tracing::info!("Starting data_manager service");
 
     let state = State::from_env().await;
+    let listener = TcpListener::bind(bind_address).await?;
     spawn_sync_scheduler(state.clone());
     let app = create_app_with_state(state);
-    let listener = TcpListener::bind(bind_address).await?;
 
     serve_app(listener, app).await
 }

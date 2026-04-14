@@ -438,7 +438,7 @@ async fn test_equity_bars_sync_and_query_round_trip() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -494,7 +494,7 @@ async fn test_equity_bars_sync_returns_no_content_when_api_has_no_results() {
     let response = reqwest::Client::new()
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -619,7 +619,7 @@ async fn test_equity_bars_query_without_ticker_filter_returns_data() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();
@@ -665,7 +665,7 @@ async fn test_equity_bars_query_with_empty_tickers_param_returns_data() {
     let response = client
         .post(app.url("/equity-bars"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(r#"{"date":"2025-01-01T00:00:00Z"}"#)
+        .body(r#"{"date":"2025-01-01T12:00:00Z"}"#)
         .send()
         .await
         .unwrap();

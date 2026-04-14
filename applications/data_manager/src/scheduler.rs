@@ -9,7 +9,7 @@ use tracing::{error, info};
 const SYNC_HOUR: u32 = 18;
 const SYNC_MINUTE: u32 = 0;
 
-fn seconds_until_next_sync() -> u64 {
+fn duration_until_next_sync() -> Duration {
     let now_utc = Utc::now();
     let now_eastern = now_utc.with_timezone(&Eastern);
     let sync_time = NaiveTime::from_hms_opt(SYNC_HOUR, SYNC_MINUTE, 0).unwrap();
@@ -37,8 +37,8 @@ fn seconds_until_next_sync() -> u64 {
     }
 
     (target_eastern.with_timezone(&Utc) - now_utc)
-        .num_seconds()
-        .max(0) as u64
+        .to_std()
+        .unwrap_or(Duration::ZERO)
 }
 
 pub fn spawn_sync_scheduler(state: State) {
@@ -47,26 +47,26 @@ pub fn spawn_sync_scheduler(state: State) {
 
 async fn sync_loop(state: State) {
     loop {
-        let wait_seconds = seconds_until_next_sync();
+        let wait_duration = duration_until_next_sync();
         info!(
             "Waiting for next equity bar sync, seconds_until_sync: {}",
-            wait_seconds
+            wait_duration.as_secs()
         );
-        sleep(Duration::from_secs(wait_seconds)).await;
+        sleep(wait_duration).await;
 
-        let now_eastern = Utc::now().with_timezone(&Eastern);
+        let now_utc = Utc::now();
+        let now_eastern = now_utc.with_timezone(&Eastern);
         if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
             info!("Weekend detected, skipping equity bar sync");
             continue;
         }
 
-        let today = Utc::now();
         info!(
             "Starting scheduled equity bar sync for {}",
-            today.format("%Y-%m-%d")
+            now_eastern.format("%Y-%m-%d")
         );
 
-        match fetch_and_store(&state, &today).await {
+        match fetch_and_store(&state, &now_utc).await {
             Ok(Some(s3_key)) => {
                 info!("Scheduled equity bar sync completed, s3_key: {}", s3_key);
             }
@@ -82,22 +82,26 @@ async fn sync_loop(state: State) {
 
 #[cfg(test)]
 mod tests {
-    use super::seconds_until_next_sync;
+    use super::duration_until_next_sync;
 
     #[test]
-    fn test_seconds_until_next_sync_is_positive() {
-        let seconds = seconds_until_next_sync();
-        assert!(seconds > 0, "Expected positive wait time, got {}", seconds);
+    fn test_duration_until_next_sync_is_positive() {
+        let duration = duration_until_next_sync();
+        assert!(
+            duration.as_secs() > 0,
+            "Expected positive wait time, got {:?}",
+            duration
+        );
     }
 
     #[test]
-    fn test_seconds_until_next_sync_is_within_one_week() {
-        let seconds = seconds_until_next_sync();
-        let one_week_seconds = 7 * 24 * 60 * 60;
+    fn test_duration_until_next_sync_is_within_one_week() {
+        let duration = duration_until_next_sync();
+        let one_week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
         assert!(
-            seconds <= one_week_seconds,
-            "Expected wait time within one week, got {} seconds",
-            seconds
+            duration <= one_week,
+            "Expected wait time within one week, got {:?}",
+            duration
         );
     }
 }

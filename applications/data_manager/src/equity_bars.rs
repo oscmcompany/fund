@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Datelike, Utc, Weekday};
+use chrono_tz::US::Eastern;
 use polars::prelude::*;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -123,7 +124,7 @@ pub async fn fetch_and_store(
 ) -> Result<Option<String>, String> {
     let massive_api_key = state.massive.key.clone();
 
-    let date_str = date.format("%Y-%m-%d").to_string();
+    let date_str = date.with_timezone(&Eastern).format("%Y-%m-%d").to_string();
     let url = format!(
         "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
         state.massive.base, date_str
@@ -211,7 +212,7 @@ pub async fn fetch_and_store(
             if let Some(first_result) = results.as_array().and_then(|a| a.first()) {
                 warn!("First result sample: {}", first_result);
             }
-            text_content.clone()
+            "Failed to parse equity bar results".to_string()
         })?;
 
     info!("Successfully parsed {} bar results", bars.len());
@@ -256,7 +257,7 @@ pub async fn fetch_and_store(
     }
     .map_err(|err| {
         warn!("Failed to create DataFrame: {}", err);
-        text_content.clone()
+        "Failed to create equity bars DataFrame".to_string()
     })?;
 
     info!(
@@ -270,10 +271,16 @@ pub async fn fetch_and_store(
     let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
         .await
         .map_err(|err| {
-            warn!("Failed to upload to S3: {}", err);
+            warn!(
+                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
+                err,
+                data.height(),
+                data.width(),
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
+            );
             format!(
-                "DataFrame created but S3 upload failed: {}\n\n{}",
-                err, data
+                "Failed to upload equity bars to storage for date {}",
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
             )
         })?;
 
