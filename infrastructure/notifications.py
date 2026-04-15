@@ -49,7 +49,7 @@ aws.costexplorer.AnomalySubscription(
     frequency="IMMEDIATE",
     threshold_expression=json.dumps(
         {
-            "Dimension": {
+            "Dimensions": {
                 "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
                 "Values": ["25"],
                 "MatchOptions": ["GREATER_THAN_OR_EQUAL"],
