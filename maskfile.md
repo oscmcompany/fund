@@ -54,7 +54,7 @@ echo "Development environment setup completed successfully"
 
 #### build-and-push (package_name) (stage_name)
 
-> Build and push Docker image directly to ECR (e.g. `portfolio-manager server`, `tide model-runner`)
+> Build and push Docker image directly to ECR (e.g. `portfolio-manager server`, `tide runner`)
 
 ```bash
 set -euo pipefail
@@ -69,7 +69,19 @@ if [ -z "$aws_region" ]; then
 fi
 
 commit_hash=$(git rev-parse --short HEAD)
-repository_name="fund/${package_name}-${stage_name}"
+
+if [ -f "models/${package_name}/Dockerfile" ]; then
+    dockerfile="models/${package_name}/Dockerfile"
+    build_target="${stage_name}"
+    namespace="models"
+else
+    resolved_name=$(echo "${package_name}" | tr '-' '_')
+    dockerfile="applications/${resolved_name}/Dockerfile"
+    build_target="${stage_name}"
+    namespace="applications"
+fi
+
+repository_name="fund/${namespace}-${package_name}-${stage_name}"
 image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
 
 echo "Logging into ECR"
@@ -88,19 +100,11 @@ if [ "$existing_image" != "NONE" ] && [ "$existing_image" != "None" ] && [ -n "$
     exit 0
 fi
 
-if [ -f "models/${package_name}/Dockerfile" ]; then
-    dockerfile="models/${package_name}/Dockerfile"
-    build_target="${stage_name}"
-else
-    resolved_name=$(echo "${package_name}" | tr '-' '_')
-    dockerfile="applications/${resolved_name}/Dockerfile"
-    build_target="${stage_name}"
-fi
 cache_reference="${image_reference}:buildcache"
 
 # Use GHA backend for caching when running in GitHub Actions
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    scope="${package_name}-${stage_name}"
+    scope="${namespace}-${package_name}-${stage_name}"
     echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
     cache_from_arguments="--cache-from type=gha,scope=${scope} --cache-from type=registry,ref=${cache_reference}"
     cache_to_arguments="--cache-to type=gha,scope=${scope},mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
@@ -836,7 +840,7 @@ if ! organization_name=$(pulumi org get-default 2>/dev/null) || [ -z "${organiza
 fi
 
 pulumi stack select "${organization_name}/fund/production"
-tide_image_uri=$(pulumi stack output aws_ecr_tide_model_runner_image)
+tide_image_uri=$(pulumi stack output aws_ecr_models_tide_runner_image)
 
 cd "${MASKFILE_DIR}"
 
