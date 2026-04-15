@@ -31,7 +31,7 @@ def test_deploy_training_flow_sets_build_options(
     mock_deploy = MagicMock()
     mock_pipeline.deploy = mock_deploy
 
-    image = "123456789.dkr.ecr.us-east-1.amazonaws.com/fund/tide-model-runner:latest"
+    image = "123456789.dkr.ecr.us-east-1.amazonaws.com/fund/models-tide-runner:latest"
     deploy_training_flow(image=image)
 
     call_kwargs = mock_deploy.call_args.kwargs

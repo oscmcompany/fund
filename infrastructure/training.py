@@ -5,7 +5,7 @@ import pulumi_aws as aws
 from config import tags
 from iam import execution_role, task_role
 from networking import ecs_security_group, private_subnet_1, private_subnet_2
-from storage import tide_model_runner_image_uri
+from storage import tide_runner_image_uri
 
 models_cluster = aws.ecs.Cluster(
     "models_cluster",
@@ -164,7 +164,7 @@ tide_trainer_task_definition = aws.ecs.TaskDefinition(
     memory="14336",
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
-    container_definitions=tide_model_runner_image_uri.apply(
+    container_definitions=tide_runner_image_uri.apply(
         lambda image_uri: json.dumps(
             [
                 {

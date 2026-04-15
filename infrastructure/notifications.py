@@ -1,3 +1,6 @@
+import json
+
+import pulumi
 import pulumi_aws as aws
 from config import (
     account_id,
@@ -22,6 +25,48 @@ for notification_email_index, notification_email_address in enumerate(
         protocol="email",
         endpoint=notification_email_address,
     )
+
+cost_anomaly_monitor = aws.costexplorer.AnomalyMonitor(
+    "cost_anomaly_monitor",
+    name="fund-cost-anomaly-monitor",
+    monitor_type="CUSTOM",
+    monitor_specification=json.dumps(
+        {
+            "Dimensions": {
+                "Key": "LINKED_ACCOUNT",
+                "Values": [account_id],
+                "MatchOptions": ["EQUALS"],
+            }
+        }
+    ),
+    tags=tags,
+)
+
+aws.costexplorer.AnomalySubscription(
+    "cost_anomaly_subscription",
+    name="fund-cost-anomaly-subscription",
+    monitor_arn_lists=[cost_anomaly_monitor.arn],
+    frequency="IMMEDIATE",
+    threshold_expression=json.dumps(
+        {
+            "Dimensions": {
+                "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+                "Values": ["25"],
+                "MatchOptions": ["GREATER_THAN_OR_EQUAL"],
+            }
+        }
+    ),
+    subscribers=pulumi.Output.from_input(budget_alert_email_addresses).apply(
+        lambda emails: [
+            aws.costexplorer.AnomalySubscriptionSubscriberArgs(
+                address=email,
+                type="EMAIL",
+            )
+            for email in emails
+        ]
+    ),
+    tags=tags,
+)
 
 # This can be updated by setting the monthlyBudgetLimitUsd Pulumi configuration
 # variable.

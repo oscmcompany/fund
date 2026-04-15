@@ -17,7 +17,18 @@ _ecr_lifecycle_policy = json.dumps(
                     "countNumber": 1,
                 },
                 "action": {"type": "expire"},
-            }
+            },
+            {
+                "rulePriority": 2,
+                "description": "Keep last 10 tagged images",
+                "selection": {
+                    "tagStatus": "tagged",
+                    "tagPatternList": ["git-*"],
+                    "countType": "imageCountMoreThan",
+                    "countNumber": 10,
+                },
+                "action": {"type": "expire"},
+            },
         ]
     }
 )
@@ -108,7 +119,7 @@ aws.s3.BucketVersioning(
 # retain_on_delete=True and add pulumi import statements to the maskfile up command.
 data_manager_repository = aws.ecr.Repository(
     "data_manager_repository",
-    name="fund/data-manager-server",
+    name="fund/applications-data-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -125,7 +136,7 @@ aws.ecr.LifecyclePolicy(
 
 portfolio_manager_repository = aws.ecr.Repository(
     "portfolio_manager_repository",
-    name="fund/portfolio-manager-server",
+    name="fund/applications-portfolio-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -142,7 +153,7 @@ aws.ecr.LifecyclePolicy(
 
 ensemble_manager_repository = aws.ecr.Repository(
     "ensemble_manager_repository",
-    name="fund/ensemble-manager-server",
+    name="fund/applications-ensemble-manager-server",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -157,9 +168,9 @@ aws.ecr.LifecyclePolicy(
     policy=_ecr_lifecycle_policy,
 )
 
-tide_model_runner_repository = aws.ecr.Repository(
-    "tide_model_runner_repository",
-    name="fund/tide-model-runner",
+tide_runner_repository = aws.ecr.Repository(
+    "tide_runner_repository",
+    name="fund/models-tide-runner",
     image_tag_mutability="MUTABLE",
     force_delete=True,
     image_scanning_configuration=aws.ecr.RepositoryImageScanningConfigurationArgs(
@@ -169,8 +180,8 @@ tide_model_runner_repository = aws.ecr.Repository(
 )
 
 aws.ecr.LifecyclePolicy(
-    "tide_model_runner_repository_lifecycle",
-    repository=tide_model_runner_repository.name,
+    "tide_runner_repository_lifecycle",
+    repository=tide_runner_repository.name,
     policy=_ecr_lifecycle_policy,
 )
 
@@ -185,6 +196,6 @@ portfolio_manager_image_uri = portfolio_manager_repository.repository_url.apply(
 ensemble_manager_image_uri = ensemble_manager_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
-tide_model_runner_image_uri = tide_model_runner_repository.repository_url.apply(
+tide_runner_image_uri = tide_runner_repository.repository_url.apply(
     lambda url: f"{url}:latest"
 )
