@@ -47,14 +47,12 @@ aws.costexplorer.AnomalySubscription(
     name="fund-cost-anomaly-subscription",
     monitor_arn_lists=[cost_anomaly_monitor.arn],
     frequency="IMMEDIATE",
-    threshold_expression=json.dumps(
-        {
-            "Dimensions": {
-                "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
-                "Values": ["25"],
-                "MatchOptions": ["GREATER_THAN_OR_EQUAL"],
-            }
-        }
+    threshold_expression=aws.costexplorer.AnomalySubscriptionThresholdExpressionArgs(
+        dimension=aws.costexplorer.AnomalySubscriptionThresholdExpressionDimensionArgs(
+            key="ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+            values=["25"],
+            match_options=["GREATER_THAN_OR_EQUAL"],
+        )
     ),
     subscribers=pulumi.Output.from_input(budget_alert_email_addresses).apply(
         lambda emails: [
