@@ -3,7 +3,7 @@ import json
 
 import pulumi
 import pulumi_aws as aws
-from config import tags
+from config import region, tags
 from iam import execution_role, task_role
 from networking import ecs_security_group, private_subnet_1, private_subnet_2
 from storage import tide_runner_image_uri
@@ -180,7 +180,7 @@ tide_trainer_task_definition = aws.ecs.TaskDefinition(
                         "logDriver": "awslogs",
                         "options": {
                             "awslogs-group": args[0],
-                            "awslogs-region": "us-east-1",
+                            "awslogs-region": region,
                             "awslogs-stream-prefix": "tide",
                         },
                     },

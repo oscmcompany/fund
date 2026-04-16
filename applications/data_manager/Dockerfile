@@ -37,8 +37,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
+# Limit parallel jobs to avoid OOM on memory-constrained builder nodes
 ENV CARGO_BUILD_JOBS=1
 
+# opt-level=1 ensures cargo-chef cook and cargo build use the same profile,
+# preventing cache invalidation; acceptable trade-off for a data manager service
 ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=1
 
 COPY --from=planner /app/recipe.json recipe.json
