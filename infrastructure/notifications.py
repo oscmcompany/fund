@@ -26,6 +26,34 @@ for notification_email_index, notification_email_address in enumerate(
         endpoint=notification_email_address,
     )
 
+infrastructure_alerts_topic_policy = aws.sns.TopicPolicy(
+    "infrastructure_alerts_topic_policy",
+    arn=infrastructure_alerts_topic.arn,
+    policy=aws.iam.get_policy_document_output(
+        statements=[
+            aws.iam.GetPolicyDocumentStatementArgs(
+                sid="AWSCostAnomalyDetectionSNSPublishingPermissions",
+                effect="Allow",
+                actions=["SNS:Publish"],
+                principals=[
+                    aws.iam.GetPolicyDocumentStatementPrincipalArgs(
+                        type="Service",
+                        identifiers=["costalerts.amazonaws.com"],
+                    )
+                ],
+                resources=[infrastructure_alerts_topic.arn],
+                conditions=[
+                    aws.iam.GetPolicyDocumentStatementConditionArgs(
+                        test="StringEquals",
+                        variable="aws:SourceAccount",
+                        values=[account_id],
+                    )
+                ],
+            )
+        ]
+    ).json,
+)
+
 cost_anomaly_monitor = aws.costexplorer.AnomalyMonitor(
     "cost_anomaly_monitor",
     name="fund-cost-anomaly-monitor",
@@ -47,24 +75,20 @@ aws.costexplorer.AnomalySubscription(
     name="fund-cost-anomaly-subscription",
     monitor_arn_lists=[cost_anomaly_monitor.arn],
     frequency="IMMEDIATE",
-    threshold_expression=json.dumps(
-        {
-            "Dimensions": {
-                "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
-                "Values": ["25"],
-                "MatchOptions": ["GREATER_THAN_OR_EQUAL"],
-            }
-        }
+    threshold_expression=aws.costexplorer.AnomalySubscriptionThresholdExpressionArgs(
+        dimension=aws.costexplorer.AnomalySubscriptionThresholdExpressionDimensionArgs(
+            key="ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+            values=["25"],
+            match_options=["GREATER_THAN_OR_EQUAL"],
+        )
     ),
-    subscribers=pulumi.Output.from_input(budget_alert_email_addresses).apply(
-        lambda emails: [
-            aws.costexplorer.AnomalySubscriptionSubscriberArgs(
-                address=email,
-                type="EMAIL",
-            )
-            for email in emails
-        ]
-    ),
+    subscribers=[
+        aws.costexplorer.AnomalySubscriptionSubscriberArgs(
+            address=infrastructure_alerts_topic.arn,
+            type="SNS",
+        )
+    ],
+    opts=pulumi.ResourceOptions(depends_on=[infrastructure_alerts_topic_policy]),
     tags=tags,
 )
 

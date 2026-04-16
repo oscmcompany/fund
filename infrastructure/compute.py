@@ -239,21 +239,21 @@ aws.lb.ListenerRule(
 
 data_manager_log_group = aws.cloudwatch.LogGroup(
     "data_manager_logs",
-    name="/ecs/fund/data-manager-server",
+    name="/ecs/fund/applications-data-manager-server",
     retention_in_days=7,
     tags=tags,
 )
 
 portfolio_manager_log_group = aws.cloudwatch.LogGroup(
     "portfolio_manager_logs",
-    name="/ecs/fund/portfolio-manager-server",
+    name="/ecs/fund/applications-portfolio-manager-server",
     retention_in_days=7,
     tags=tags,
 )
 
 ensemble_manager_log_group = aws.cloudwatch.LogGroup(
     "ensemble_manager_logs",
-    name="/ecs/fund/ensemble-manager-server",
+    name="/ecs/fund/applications-ensemble-manager-server",
     retention_in_days=7,
     tags=tags,
 )
@@ -440,6 +440,10 @@ ensemble_manager_task_definition = aws.ecs.TaskDefinition(
                             "name": "DISABLE_DISK_CACHE",
                             "value": "1",
                         },
+                        {
+                            "name": "AWS_S3_MODEL_ARTIFACT_PATH",
+                            "value": "artifacts/tide/",
+                        },
                     ],
                     "secrets": [
                         {
@@ -559,6 +563,7 @@ ensemble_manager_service = aws.ecs.Service(
     task_definition=ensemble_manager_task_definition.arn,
     desired_count=1,
     launch_type="FARGATE",
+    health_check_grace_period_seconds=180,
     network_configuration=aws.ecs.ServiceNetworkConfigurationArgs(
         subnets=[private_subnet_1.id, private_subnet_2.id],
         security_groups=[ecs_security_group.id],

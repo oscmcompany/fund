@@ -1141,7 +1141,7 @@ requires-dist = [
     { name = "pip", specifier = ">=25.3,<26.0" },
     { name = "protobuf", specifier = ">=5.29.5,<6.0.0" },
     { name = "pulumi", specifier = ">=3.189.0" },
-    { name = "pulumi-aws", specifier = ">=7.4.0" },
+    { name = "pulumi-aws", specifier = ">=7.7.0" },
     { name = "pulumi-command", specifier = ">=1.1.0" },
     { name = "pulumi-docker", specifier = ">=4.10.0" },
     { name = "pulumi-tls", specifier = ">=5.2.1" },
