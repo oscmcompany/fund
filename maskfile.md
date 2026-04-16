@@ -472,16 +472,33 @@ echo "Rust packages checked successfully"
 
 #### format
 
-> Format Rust code
+> Check Rust code formatting
+
+<!-- markdownlint-disable MD036 MD032 MD007 -->
+**OPTIONS**
+* fix
+    * flags: --fix
+    * type: boolean
+    * desc: Apply formatting fixes instead of checking
+<!-- markdownlint-enable MD036 MD032 MD007 -->
 
 ```bash
 set -euo pipefail
 
-echo "Formatting Rust code"
+FIX="${fix:-"false"}"
+if [ -n "${fix+x}" ] && [ -z "$fix" ]; then
+    FIX="true"
+fi
 
-cargo fmt --all
-
-echo "Rust code formatted successfully"
+if [ "$FIX" == "true" ]; then
+    echo "Fixing Rust code formatting"
+    cargo fmt --all
+    echo "Rust code formatted successfully"
+else
+    echo "Checking Rust code formatting"
+    cargo fmt --all -- --check
+    echo "Rust code formatting check passed"
+fi
 ```
 
 #### lint
@@ -598,16 +615,33 @@ echo "Python dependencies installed successfully"
 
 #### format
 
-> Format Python code
+> Check Python code formatting
+
+<!-- markdownlint-disable MD036 MD032 MD007 -->
+**OPTIONS**
+* fix
+    * flags: --fix
+    * type: boolean
+    * desc: Apply formatting fixes instead of checking
+<!-- markdownlint-enable MD036 MD032 MD007 -->
 
 ```bash
 set -euo pipefail
 
-echo "Formatting Python code"
+FIX="${fix:-"false"}"
+if [ -n "${fix+x}" ] && [ -z "$fix" ]; then
+    FIX="true"
+fi
 
-ruff format
-
-echo "Python code formatted successfully"
+if [ "$FIX" == "true" ]; then
+    echo "Fixing Python code formatting"
+    ruff format
+    echo "Python code formatted successfully"
+else
+    echo "Checking Python code formatting"
+    ruff format --check
+    echo "Python code formatting check passed"
+fi
 ```
 
 #### dead-code
