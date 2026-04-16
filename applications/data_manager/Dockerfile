@@ -39,11 +39,13 @@ FROM chef AS builder
 
 ENV CARGO_BUILD_JOBS=1
 
+ENV CARGO_PROFILE_RELEASE_OPT_LEVEL=1
+
 COPY --from=planner /app/recipe.json recipe.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    CARGO_PROFILE_RELEASE_OPT_LEVEL=1 cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 

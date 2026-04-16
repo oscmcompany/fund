@@ -1,5 +1,6 @@
 import json
 
+import pulumi
 import pulumi_aws as aws
 from config import (
     account_id,
@@ -24,6 +25,34 @@ for notification_email_index, notification_email_address in enumerate(
         protocol="email",
         endpoint=notification_email_address,
     )
+
+infrastructure_alerts_topic_policy = aws.sns.TopicPolicy(
+    "infrastructure_alerts_topic_policy",
+    arn=infrastructure_alerts_topic.arn,
+    policy=aws.iam.get_policy_document_output(
+        statements=[
+            aws.iam.GetPolicyDocumentStatementArgs(
+                sid="AWSCostAnomalyDetectionSNSPublishingPermissions",
+                effect="Allow",
+                actions=["SNS:Publish"],
+                principals=[
+                    aws.iam.GetPolicyDocumentStatementPrincipalArgs(
+                        type="Service",
+                        identifiers=["costalerts.amazonaws.com"],
+                    )
+                ],
+                resources=[infrastructure_alerts_topic.arn],
+                conditions=[
+                    aws.iam.GetPolicyDocumentStatementConditionArgs(
+                        test="StringEquals",
+                        variable="aws:SourceAccount",
+                        values=[account_id],
+                    )
+                ],
+            )
+        ]
+    ).json,
+)
 
 cost_anomaly_monitor = aws.costexplorer.AnomalyMonitor(
     "cost_anomaly_monitor",
@@ -59,6 +88,7 @@ aws.costexplorer.AnomalySubscription(
             type="SNS",
         )
     ],
+    opts=pulumi.ResourceOptions(depends_on=[infrastructure_alerts_topic_policy]),
     tags=tags,
 )
 

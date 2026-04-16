@@ -5,7 +5,7 @@ description = "Infrastructure management with Pulumi"
 requires-python = "==3.12.10"
 dependencies = [
   "pulumi>=3.189.0",
-  "pulumi-aws>=7.4.0",
+  "pulumi-aws>=7.7.0",
   "pulumi-command>=1.1.0",
   "pulumi-docker>=4.10.0",
   "pulumi-tls>=5.2.1",
