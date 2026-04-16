@@ -1,7 +1,7 @@
 import polars as pl
 from portfolio_manager.report import (
     _SEPARATOR,
-    _W_TICKER,
+    _WIDTH_TICKER,
     format_beta_report,
     format_consolidation_report,
     format_pairs_report,
@@ -185,9 +185,9 @@ def test_format_pairs_report_header_aligns_with_separator() -> None:
 
 def test_format_pairs_report_column_widths_fit_headers() -> None:
     # "long_ticker" is 11 chars; column must be at least that wide
-    assert len("long_ticker") <= _W_TICKER
+    assert len("long_ticker") <= _WIDTH_TICKER
     # "short_ticker" is 12 chars
-    assert len("short_ticker") <= _W_TICKER
+    assert len("short_ticker") <= _WIDTH_TICKER
 
 
 # --- format_portfolio_report ---

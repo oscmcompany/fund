@@ -32,17 +32,17 @@ def classify_regime(
     if np.any(spy_close <= 0):
         return {"state": "trending", "confidence": 0.0}
 
-    returns = np.diff(np.log(spy_close))
+    log_returns = np.diff(np.log(spy_close))
 
     # Sparse data defaults to trending/0.0, halving exposure in the caller.
-    if len(returns) < _MINIMUM_RETURN_COUNT + 1:
+    if len(log_returns) < _MINIMUM_RETURN_COUNT + 1:
         return {"state": "trending", "confidence": 0.0}
 
     realized_volatility = float(
-        np.std(returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR)
+        np.std(log_returns, ddof=1) * np.sqrt(_TRADING_DAYS_PER_YEAR)
     )
 
-    autocorrelation = float(np.corrcoef(returns[:-1], returns[1:])[0, 1])
+    autocorrelation = float(np.corrcoef(log_returns[:-1], log_returns[1:])[0, 1])
 
     low_volatility = realized_volatility < REGIME_VOLATILITY_THRESHOLD
     mean_reverting_signal = autocorrelation < REGIME_AUTOCORRELATION_THRESHOLD

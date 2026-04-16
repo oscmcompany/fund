@@ -2,7 +2,6 @@ import os
 from datetime import UTC, datetime
 
 import httpx
-import numpy as np
 import polars as pl
 import structlog
 from fastapi import Response, status
@@ -12,45 +11,29 @@ from .alpaca_client import AlpacaClient
 from .beta import compute_market_betas
 from .consolidation import consolidate_predictions
 from .data_client import fetch_equity_details, fetch_historical_prices, fetch_spy_prices
-from .enums import PositionSide, TradeSide
-from .exceptions import (
-    AssetNotShortableError,
-    InsufficientBuyingPowerError,
-    InsufficientPairsError,
-)
+from .exceptions import InsufficientPairsError
 from .portfolio_schema import pairs_schema, portfolio_schema
-from .regime import classify_regime
-from .risk_management import (
-    Z_SCORE_HOLD_THRESHOLD,
-    Z_SCORE_STOP_LOSS,
-    size_pairs_with_volatility_parity,
+from .portfolio_state import (
+    DATA_MANAGER_BASE_URL,
+    evaluate_prior_pairs,
+    get_prior_portfolio,
+    save_portfolio,
 )
-from .statistical_arbitrage import (
-    CORRELATION_WINDOW_DAYS,
-    compute_spread_zscore,
-    select_pairs,
+from .regime import classify_regime
+from .risk_management import size_pairs_with_volatility_parity
+from .statistical_arbitrage import select_pairs
+from .trade_execution import (
+    execute_close_positions,
+    execute_open_positions,
+    get_positions,
 )
 
 logger = structlog.get_logger()
 
-DATA_MANAGER_BASE_URL = os.getenv(
-    "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
-)
 ENSEMBLE_MANAGER_BASE_URL = os.getenv(
     "FUND_ENSEMBLE_MANAGER_BASE_URL",
     "http://ensemble-manager:8080",
 )
-
-_MINIMUM_PAIR_PRICE_ROWS = 30
-
-_PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
-    "ticker": pl.String,
-    "timestamp": pl.Int64,
-    "side": pl.String,
-    "dollar_amount": pl.Float64,
-    "action": pl.String,
-    "pair_id": pl.String,
-}
 
 
 async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
@@ -93,8 +76,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        raw_predictions = await get_raw_predictions()
-        logger.info("Retrieved predictions", count=len(raw_predictions))
+        ensemble_predictions = await get_raw_predictions()
+        logger.info("Retrieved predictions", count=len(ensemble_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
         metrics.rebalance_errors_total.labels(stage="predictions").inc()
@@ -103,7 +86,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
     try:
         consolidated_signals = consolidate_predictions(
-            model_predictions={"tide": raw_predictions},
+            model_predictions={"tide": ensemble_predictions},
             historical_prices=historical_prices,
             equity_details=equity_details,
         )
@@ -242,189 +225,12 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    close_results = []
-    closed_count = 0
-    for close_position in close_positions:
-        try:
-            was_closed = alpaca_client.close_position(
-                ticker=close_position["ticker"],
-            )
-            if was_closed:
-                closed_count += 1
-                logger.info("Closed position", ticker=close_position["ticker"])
-                metrics.trades_submitted_total.labels(
-                    action="close", status="success"
-                ).inc()
-                close_results.append(
-                    {
-                        "ticker": close_position["ticker"],
-                        "action": "close",
-                        "status": "success",
-                    }
-                )
-            else:
-                logger.info(
-                    "Position already closed or did not exist",
-                    ticker=close_position["ticker"],
-                )
-                metrics.trades_submitted_total.labels(
-                    action="close", status="skipped"
-                ).inc()
-                close_results.append(
-                    {
-                        "ticker": close_position["ticker"],
-                        "action": "close",
-                        "status": "skipped",
-                        "reason": "position_not_found",
-                    }
-                )
-        except Exception as e:
-            logger.exception(
-                "Failed to close position",
-                ticker=close_position["ticker"],
-                error=str(e),
-            )
-            metrics.trades_submitted_total.labels(action="close", status="failed").inc()
-            close_results.append(
-                {
-                    "ticker": close_position["ticker"],
-                    "action": "close",
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-
-    open_results = []
-    opened_count = 0
-    remaining_buying_power = account.buying_power
-    skipped_insufficient_buying_power = 0
-    skipped_not_shortable = 0
-
-    for open_position in open_positions:
-        ticker = open_position["ticker"]
-        side = open_position["side"]
-        dollar_amount = open_position["dollar_amount"]
-
-        if dollar_amount > remaining_buying_power:
-            logger.warning(
-                "Skipping position due to insufficient buying power",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-                remaining_buying_power=remaining_buying_power,
-            )
-            skipped_insufficient_buying_power += 1
-            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "insufficient_buying_power",
-                }
-            )
-            continue
-
-        try:
-            alpaca_client.open_position(
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-            )
-            logger.info(
-                "Opened position",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-            )
-            opened_count += 1
-            metrics.trades_submitted_total.labels(action="open", status="success").inc()
-            metrics.trade_dollar_amount_total.labels(side=side.value).inc(dollar_amount)
-            # Refresh remaining buying power from the account after a successful order
-            try:
-                account = alpaca_client.get_account()
-                remaining_buying_power = account.buying_power
-            except Exception:
-                logger.exception(
-                    "Failed to refresh buying power from account, using estimate",
-                    ticker=ticker,
-                    deducting=dollar_amount,
-                )
-                remaining_buying_power -= dollar_amount
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "success",
-                }
-            )
-        except InsufficientBuyingPowerError as e:
-            logger.warning(
-                "Insufficient buying power for position",
-                ticker=ticker,
-                side=side,
-                dollar_amount=dollar_amount,
-                error=str(e),
-            )
-            skipped_insufficient_buying_power += 1
-            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "insufficient_buying_power",
-                }
-            )
-        except AssetNotShortableError as e:
-            logger.warning(
-                "Asset cannot be sold short",
-                ticker=ticker,
-                side=side,
-                error=str(e),
-            )
-            skipped_not_shortable += 1
-            metrics.trades_submitted_total.labels(action="open", status="skipped").inc()
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "skipped",
-                    "reason": "not_shortable",
-                }
-            )
-        except Exception as e:
-            logger.exception(
-                "Failed to open position",
-                ticker=ticker,
-                error=str(e),
-            )
-            metrics.trades_submitted_total.labels(action="open", status="failed").inc()
-            open_results.append(
-                {
-                    "ticker": ticker,
-                    "action": "open",
-                    "side": side,
-                    "dollar_amount": dollar_amount,
-                    "status": "failed",
-                    "error": str(e),
-                }
-            )
-
-    if skipped_insufficient_buying_power > 0 or skipped_not_shortable > 0:
-        logger.info(
-            "Some positions were skipped",
-            skipped_insufficient_buying_power=skipped_insufficient_buying_power,
-            skipped_not_shortable=skipped_not_shortable,
-        )
+    close_results, closed_count = execute_close_positions(
+        alpaca_client, close_positions
+    )
+    open_results, opened_count = execute_open_positions(
+        alpaca_client, open_positions, account.buying_power
+    )
 
     metrics.positions_opened_count.set(opened_count)
     metrics.positions_closed_count.set(closed_count)
@@ -460,148 +266,6 @@ async def get_raw_predictions() -> pl.DataFrame:
         return pl.DataFrame(response.json()["data"])
 
 
-async def get_prior_portfolio() -> pl.DataFrame:
-    empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(url=f"{DATA_MANAGER_BASE_URL}/portfolios")
-    response.raise_for_status()
-
-    response_text = response.text.strip()
-    if not response_text or response_text == "[]":
-        logger.info("Prior portfolio is empty")
-        return empty
-
-    try:
-        prior_portfolio_data = response.json()
-
-        if not prior_portfolio_data:
-            return empty
-
-        prior_portfolio = pl.DataFrame(
-            prior_portfolio_data, schema=_PRIOR_PORTFOLIO_SCHEMA
-        )
-
-        if prior_portfolio.is_empty():
-            return empty
-
-        logger.info("Retrieved prior portfolio", count=prior_portfolio.height)
-        return prior_portfolio  # noqa: TRY300
-
-    except (
-        ValueError,
-        pl.exceptions.PolarsError,
-    ) as e:
-        logger.exception("Failed to parse prior portfolio JSON", error=str(e))
-        raise
-
-
-def evaluate_prior_pairs(
-    prior_portfolio: pl.DataFrame,
-    historical_prices: pl.DataFrame,
-) -> set[str]:
-    held_tickers: set[str] = set()
-
-    if prior_portfolio.is_empty():
-        return held_tickers
-
-    pair_ids = prior_portfolio["pair_id"].unique(maintain_order=False).sort().to_list()
-
-    for pair_id_value in pair_ids:
-        pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id_value)
-
-        long_rows = pair_rows.filter(pl.col("side") == PositionSide.LONG.value)
-        short_rows = pair_rows.filter(pl.col("side") == PositionSide.SHORT.value)
-
-        if long_rows.is_empty() or short_rows.is_empty():
-            logger.warning(
-                "Malformed prior pair, closing normally", pair_id=pair_id_value
-            )
-            continue
-
-        long_ticker = long_rows["ticker"][0]
-        short_ticker = short_rows["ticker"][0]
-
-        pair_price_matrix = (
-            historical_prices.filter(
-                pl.col("ticker").is_in([long_ticker, short_ticker])
-            )
-            .pivot(
-                on="ticker",
-                index="timestamp",
-                values="close_price",
-                aggregate_function="last",
-            )
-            .sort("timestamp")
-            .drop_nulls()
-        )
-
-        if (
-            long_ticker not in pair_price_matrix.columns
-            or short_ticker not in pair_price_matrix.columns
-        ):
-            logger.warning(
-                "Missing price data for prior pair, closing normally",
-                pair_id=pair_id_value,
-            )
-            continue
-
-        pair_price_matrix = pair_price_matrix.tail(CORRELATION_WINDOW_DAYS)
-
-        if pair_price_matrix.height < _MINIMUM_PAIR_PRICE_ROWS:
-            logger.warning(
-                "Insufficient price history for prior pair, closing normally",
-                pair_id=pair_id_value,
-            )
-            continue
-
-        long_prices = pair_price_matrix[long_ticker].to_numpy()
-        short_prices = pair_price_matrix[short_ticker].to_numpy()
-
-        if np.any(long_prices <= 0) or np.any(short_prices <= 0):
-            logger.warning(
-                "Non-positive prices in prior pair, closing normally",
-                pair_id=pair_id_value,
-            )
-            continue
-
-        log_prices_long = np.log(long_prices)
-        log_prices_short = np.log(short_prices)
-
-        current_z, _ = compute_spread_zscore(log_prices_long, log_prices_short)
-
-        if np.isnan(current_z):
-            logger.warning(
-                "NaN z-score for prior pair, closing normally",
-                pair_id=pair_id_value,
-            )
-            continue
-
-        abs_z = abs(current_z)
-
-        if Z_SCORE_HOLD_THRESHOLD <= abs_z < Z_SCORE_STOP_LOSS:
-            held_tickers.add(long_ticker)
-            held_tickers.add(short_ticker)
-            logger.info(
-                "Holding prior pair, spread still mean-reverting",
-                pair_id=pair_id_value,
-                z_score=current_z,
-            )
-        elif abs_z < Z_SCORE_HOLD_THRESHOLD:
-            logger.info(
-                "Closing prior pair to realize profit, spread converged",
-                pair_id=pair_id_value,
-                z_score=current_z,
-            )
-        else:
-            logger.info(
-                "Closing prior pair on stop-loss, spread diverged",
-                pair_id=pair_id_value,
-                z_score=current_z,
-            )
-
-    return held_tickers
-
-
 def get_optimal_portfolio(
     candidate_pairs: pl.DataFrame,
     maximum_capital: float,
@@ -618,48 +282,3 @@ def get_optimal_portfolio(
     )
 
     return portfolio_schema.validate(optimal_portfolio)
-
-
-async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -> bool:
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-                json={
-                    "timestamp": current_timestamp.isoformat(),
-                    "data": portfolio.to_dicts(),
-                },
-            )
-        response.raise_for_status()
-        logger.info("Saved portfolio state", count=portfolio.height)
-        return True  # noqa: TRY300
-    except Exception as e:
-        logger.exception("Failed to save portfolio state", error=str(e))
-        return False
-
-
-def get_positions(
-    prior_portfolio_tickers: list[str],
-    held_tickers: set[str],
-    optimal_portfolio: pl.DataFrame,
-) -> tuple[list[dict], list[dict]]:
-    close_positions = [
-        {"ticker": ticker}
-        for ticker in prior_portfolio_tickers
-        if ticker not in held_tickers
-    ]
-
-    open_positions = [
-        {
-            "ticker": row["ticker"],
-            "side": (
-                TradeSide.BUY
-                if row["side"] == PositionSide.LONG.value
-                else TradeSide.SELL
-            ),
-            "dollar_amount": row["dollar_amount"],
-        }
-        for row in optimal_portfolio.iter_rows(named=True)
-    ]
-
-    return open_positions, close_positions
