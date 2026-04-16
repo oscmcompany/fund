@@ -7,11 +7,11 @@ from .statistical_arbitrage import CONFIDENCE_THRESHOLD
 _SEPARATOR = "-" * 62
 
 # Column widths for the pairs table — sized to fit both headers and data.
-_W_PAIR_ID = 24
-_W_TICKER = 12
-_W_Z_SCORE = 8
-_W_SIGNAL = 10
-_W_HEDGE = 8
+_WIDTH_PAIR_ID = 24
+_WIDTH_TICKER = 12
+_WIDTH_Z_SCORE = 8
+_WIDTH_SIGNAL = 10
+_WIDTH_HEDGE = 8
 
 
 def format_regime_report(regime: RegimeResult, exposure_scale: float) -> str:
@@ -65,8 +65,11 @@ def format_consolidation_report(
     high_confidence_count = signals.filter(
         pl.col("ensemble_confidence") >= CONFIDENCE_THRESHOLD
     ).height
-    alpha_min, alpha_max = alpha_values.min(), alpha_values.max()
-    conf_min, conf_max = confidence_values.min(), confidence_values.max()
+    alpha_minimum, alpha_maximum = alpha_values.min(), alpha_values.max()
+    confidence_minimum, confidence_maximum = (
+        confidence_values.min(),
+        confidence_values.max(),
+    )
 
     lines = [
         _SEPARATOR,
@@ -75,8 +78,9 @@ def format_consolidation_report(
         f"  Input tickers:            {input_ticker_count}",
         f"  Signals computed:         {signals.height}",
         f"  High confidence (>=0.5):  {high_confidence_count}",
-        f"  Alpha range:              [{alpha_min:.4f}, {alpha_max:.4f}]",
-        f"  Confidence range:         [{conf_min:.3f}, {conf_max:.3f}]",
+        f"  Alpha range:              [{alpha_minimum:.4f}, {alpha_maximum:.4f}]",
+        "  Confidence range:         "
+        f"[{confidence_minimum:.3f}, {confidence_maximum:.3f}]",
     ]
     return "\n".join(lines)
 
@@ -93,22 +97,24 @@ def format_pairs_report(candidate_pairs: pl.DataFrame) -> str:
     lines.append("")
 
     header = (
-        f"  {'pair_id':<{_W_PAIR_ID}} {'long_ticker':<{_W_TICKER}} "
-        f"{'short_ticker':<{_W_TICKER}} {'z_score':>{_W_Z_SCORE}} "
-        f"{'signal':>{_W_SIGNAL}} {'hedge':>{_W_HEDGE}}"
+        f"  {'pair_id':<{_WIDTH_PAIR_ID}} {'long_ticker':<{_WIDTH_TICKER}} "
+        f"{'short_ticker':<{_WIDTH_TICKER}} {'z_score':>{_WIDTH_Z_SCORE}} "
+        f"{'signal':>{_WIDTH_SIGNAL}} {'hedge':>{_WIDTH_HEDGE}}"
     )
     separator = (
-        f"  {'-' * _W_PAIR_ID} {'-' * _W_TICKER} {'-' * _W_TICKER} "
-        f"{'-' * _W_Z_SCORE} {'-' * _W_SIGNAL} {'-' * _W_HEDGE}"
+        f"  {'-' * _WIDTH_PAIR_ID} {'-' * _WIDTH_TICKER} {'-' * _WIDTH_TICKER} "
+        f"{'-' * _WIDTH_Z_SCORE} {'-' * _WIDTH_SIGNAL} {'-' * _WIDTH_HEDGE}"
     )
     lines += [header, separator]
 
     for row in candidate_pairs.iter_rows(named=True):
         lines.append(
-            f"  {row['pair_id']:<{_W_PAIR_ID}} {row['long_ticker']:<{_W_TICKER}} "
-            f"{row['short_ticker']:<{_W_TICKER}} {row['z_score']:>{_W_Z_SCORE}.3f} "
-            f"{row['signal_strength']:>{_W_SIGNAL}.4f} "
-            f"{row['hedge_ratio']:>{_W_HEDGE}.3f}"
+            f"  {row['pair_id']:<{_WIDTH_PAIR_ID}}"
+            f" {row['long_ticker']:<{_WIDTH_TICKER}}"
+            f" {row['short_ticker']:<{_WIDTH_TICKER}}"
+            f" {row['z_score']:>{_WIDTH_Z_SCORE}.3f}"
+            f" {row['signal_strength']:>{_WIDTH_SIGNAL}.4f}"
+            f" {row['hedge_ratio']:>{_WIDTH_HEDGE}.3f}"
         )
 
     return "\n".join(lines)
@@ -124,7 +130,9 @@ def format_portfolio_report(
     """Return a formatted string summarising position sizes and portfolio-level risk."""
     long_total = portfolio.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
     short_total = portfolio.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
-    imbalance_pct = abs(long_total - short_total) / max(long_total, short_total) * 100
+    imbalance_percent = (
+        abs(long_total - short_total) / max(long_total, short_total) * 100
+    )
     portfolio_beta = compute_portfolio_beta(portfolio, market_betas)
 
     lines = [
@@ -135,7 +143,7 @@ def format_portfolio_report(
         f"  Exposure scale:  {exposure_scale}x",
         f"  Long total:      ${long_total:,.2f}",
         f"  Short total:     ${short_total:,.2f}",
-        f"  Imbalance:       {imbalance_pct:.2f}%",
+        f"  Imbalance:       {imbalance_percent:.2f}%",
         f"  Portfolio beta:  {portfolio_beta:.4f}",
         "",
     ]
@@ -145,7 +153,7 @@ def format_portfolio_report(
         long_row = pair_rows.filter(pl.col("side") == "LONG").row(0, named=True)
         short_row = pair_rows.filter(pl.col("side") == "SHORT").row(0, named=True)
         lines.append(
-            f"  {pair_id:<{_W_PAIR_ID + 2}} "
+            f"  {pair_id:<{_WIDTH_PAIR_ID + 2}} "
             f"LONG  {long_row['ticker']:<8} ${long_row['dollar_amount']:>9,.2f}  "
             f"SHORT {short_row['ticker']:<8} ${short_row['dollar_amount']:>9,.2f}"
         )

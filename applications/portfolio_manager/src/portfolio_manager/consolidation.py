@@ -61,7 +61,7 @@ def consolidate_predictions(
             raise ValueError(message)
 
         latest_predictions = predictions_df.sort("timestamp").group_by("ticker").last()
-        signals = latest_predictions.with_columns(
+        model_signals = latest_predictions.with_columns(
             pl.col("quantile_50").alias("alpha"),
             (
                 1.0
@@ -74,7 +74,7 @@ def consolidate_predictions(
             ).alias("raw_confidence"),
         ).select(["ticker", "alpha", "raw_confidence"])
 
-        per_model_signals.append(signals)
+        per_model_signals.append(model_signals)
 
     blended = (
         pl.concat(per_model_signals)

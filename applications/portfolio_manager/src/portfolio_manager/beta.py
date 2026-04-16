@@ -19,28 +19,32 @@ def compute_market_betas(
     near 1.0 track the market closely, >1.0 amplify moves, and negative values
     indicate counter-cyclical or inverse behavior (e.g. gold miners).
     """
-    spy_close = (
+    spy_close_prices = (
         spy_prices.sort("timestamp").tail(window_days + 1)["close_price"].to_numpy()
     )
 
-    if len(spy_close) < _MINIMUM_RETURN_COUNT + 1 or np.any(spy_close <= 0):
+    if len(spy_close_prices) < _MINIMUM_RETURN_COUNT + 1 or np.any(
+        spy_close_prices <= 0
+    ):
         return pl.DataFrame(schema={"ticker": pl.String, "market_beta": pl.Float64})
 
-    spy_returns = np.diff(np.log(spy_close))
+    spy_returns = np.diff(np.log(spy_close_prices))
     tickers = historical_prices["ticker"].unique().to_list()
     results = []
 
     for ticker in tickers:
-        ticker_close = (
+        ticker_close_prices = (
             historical_prices.filter(pl.col("ticker") == ticker)
             .sort("timestamp")
             .tail(window_days + 1)["close_price"]
             .to_numpy()
         )
-        if len(ticker_close) < _MINIMUM_RETURN_COUNT or np.any(ticker_close <= 0):
+        if len(ticker_close_prices) < _MINIMUM_RETURN_COUNT or np.any(
+            ticker_close_prices <= 0
+        ):
             continue
 
-        ticker_returns = np.diff(np.log(ticker_close))
+        ticker_returns = np.diff(np.log(ticker_close_prices))
         count = min(len(spy_returns), len(ticker_returns))
         if count < _MINIMUM_RETURN_COUNT:
             continue
@@ -74,14 +78,14 @@ def compute_portfolio_beta(
         )
     )
 
-    total_gross = portfolio["dollar_amount"].sum()
-    if np.isclose(total_gross, 0.0):
+    total_gross_dollar_value = portfolio["dollar_amount"].sum()
+    if np.isclose(total_gross_dollar_value, 0.0):
         return 0.0
 
     net_beta = 0.0
     for row in portfolio.iter_rows(named=True):
         beta = beta_lookup.get(row["ticker"], 0.0)
         sign = 1.0 if row["side"] == "LONG" else -1.0
-        net_beta += sign * (row["dollar_amount"] / total_gross) * beta
+        net_beta += sign * (row["dollar_amount"] / total_gross_dollar_value) * beta
 
     return net_beta

@@ -59,8 +59,8 @@ def compute_spread_zscore(
 ) -> tuple[float, float]:
     slope: float = float(np.polyfit(log_prices_b, log_prices_a, 1)[0])
     spread = log_prices_a - slope * log_prices_b
-    current_z: float = float(scipy.stats.zscore(spread)[-1])
-    return current_z, slope
+    current_z_score: float = float(scipy.stats.zscore(spread)[-1])
+    return current_z_score, slope
 
 
 def _compute_log_returns(
@@ -102,16 +102,22 @@ def _build_candidate_pairs(
             log_prices_a = np.log(window[ticker_a].to_numpy())
             log_prices_b = np.log(window[ticker_b].to_numpy())
 
-            current_z, hedge_ratio = compute_spread_zscore(log_prices_a, log_prices_b)
+            current_z_score, hedge_ratio = compute_spread_zscore(
+                log_prices_a, log_prices_b
+            )
 
-            if np.isnan(current_z) or np.isnan(hedge_ratio) or np.isinf(hedge_ratio):
+            if (
+                np.isnan(current_z_score)
+                or np.isnan(hedge_ratio)
+                or np.isinf(hedge_ratio)
+            ):
                 continue
 
-            if abs(current_z) < Z_SCORE_ENTRY_THRESHOLD:
+            if abs(current_z_score) < Z_SCORE_ENTRY_THRESHOLD:
                 continue
 
             # z > 0: A is expensive → short A, long B
-            if current_z > 0:
+            if current_z_score > 0:
                 long_ticker, short_ticker = ticker_b, ticker_a
             else:
                 long_ticker, short_ticker = ticker_a, ticker_b
@@ -126,7 +132,7 @@ def _build_candidate_pairs(
                     "pair_id": f"{long_ticker}-{short_ticker}",
                     "long_ticker": long_ticker,
                     "short_ticker": short_ticker,
-                    "z_score": abs(current_z),
+                    "z_score": abs(current_z_score),
                     "hedge_ratio": hedge_ratio,
                     "signal_strength": signal_strength,
                     "long_realized_volatility": float(
@@ -135,7 +141,7 @@ def _build_candidate_pairs(
                     "short_realized_volatility": float(
                         signals_lookup[short_ticker]["realized_volatility"]
                     ),
-                    "_rank_score": abs(current_z) * signal_strength,
+                    "_rank_score": abs(current_z_score) * signal_strength,
                 }
             )
     return candidate_pairs
@@ -180,8 +186,8 @@ def select_pairs(
     if len(ticker_columns) < _MINIMUM_TICKER_COUNT:
         return empty_result
 
-    window = price_matrix.tail(CORRELATION_WINDOW_DAYS)
-    log_returns = _compute_log_returns(window, ticker_columns)
+    correlation_window = price_matrix.tail(CORRELATION_WINDOW_DAYS)
+    log_returns = _compute_log_returns(correlation_window, ticker_columns)
     valid_tickers = list(log_returns.keys())
 
     if len(valid_tickers) < _MINIMUM_TICKER_COUNT:
@@ -199,7 +205,7 @@ def select_pairs(
     }
 
     candidate_pairs = _build_candidate_pairs(
-        valid_tickers, correlation_matrix, window, signals_lookup
+        valid_tickers, correlation_matrix, correlation_window, signals_lookup
     )
 
     if not candidate_pairs:
