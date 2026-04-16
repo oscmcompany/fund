@@ -1,6 +1,7 @@
 import base64
 import json
 
+import pulumi
 import pulumi_aws as aws
 from config import tags
 from iam import execution_role, task_role
@@ -157,31 +158,35 @@ models_log_group = aws.cloudwatch.LogGroup(
 
 tide_trainer_task_definition = aws.ecs.TaskDefinition(
     "tide_trainer_task_definition",
-    family="fund-tide-trainer",
+    family="tide-runner",
     requires_compatibilities=["EC2"],
     network_mode="awsvpc",
     cpu="4096",
     memory="14336",
     execution_role_arn=execution_role.arn,
     task_role_arn=task_role.arn,
-    container_definitions=tide_runner_image_uri.apply(
-        lambda image_uri: json.dumps(
+    container_definitions=pulumi.Output.all(
+        models_log_group.name,
+        tide_runner_image_uri,
+    ).apply(
+        lambda args: json.dumps(
             [
                 {
                     "name": "prefect",
-                    "image": image_uri,
+                    "image": args[1],
                     "essential": True,
                     "resourceRequirements": [{"type": "GPU", "value": "1"}],
                     "logConfiguration": {
                         "logDriver": "awslogs",
                         "options": {
-                            "awslogs-group": "/ecs/fund/models",
+                            "awslogs-group": args[0],
                             "awslogs-region": "us-east-1",
                             "awslogs-stream-prefix": "tide",
                         },
                     },
                 }
-            ]
+            ],
+            sort_keys=True,
         )
     ),
     tags=tags,

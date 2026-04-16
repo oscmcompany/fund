@@ -1,6 +1,5 @@
 import json
 
-import pulumi
 import pulumi_aws as aws
 from config import (
     account_id,
@@ -54,15 +53,12 @@ aws.costexplorer.AnomalySubscription(
             match_options=["GREATER_THAN_OR_EQUAL"],
         )
     ),
-    subscribers=pulumi.Output.from_input(budget_alert_email_addresses).apply(
-        lambda emails: [
-            aws.costexplorer.AnomalySubscriptionSubscriberArgs(
-                address=email,
-                type="EMAIL",
-            )
-            for email in emails
-        ]
-    ),
+    subscribers=[
+        aws.costexplorer.AnomalySubscriptionSubscriberArgs(
+            address=infrastructure_alerts_topic.arn,
+            type="SNS",
+        )
+    ],
     tags=tags,
 )
 
