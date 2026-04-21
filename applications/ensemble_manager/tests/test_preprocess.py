@@ -1,5 +1,6 @@
 import polars as pl
-from ensemble_manager.preprocess import filter_equity_bars
+import pytest
+from ensemble_manager.preprocess import filter_equity_bars, filter_to_trained_tickers
 
 
 def test_filter_equity_bars_above_thresholds() -> None:
@@ -203,3 +204,70 @@ def test_filter_equity_bars_data_immutability() -> None:
     assert original_data["ticker"].to_list() == original_tickers
     assert original_data["close_price"].to_list() == original_close_prices
     assert original_data["volume"].to_list() == original_volumes
+
+
+def test_filter_to_trained_tickers_known_tickers_pass_through() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL", "MSFT", "MSFT"],
+            "close_price": [15.0, 20.0, 25.0, 30.0],
+        }
+    )
+    trained_tickers = {"AAPL", "MSFT", "GOOGL"}
+
+    result = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert result.height == 4  # noqa: PLR2004 all rows retained
+    assert set(result["ticker"].unique().to_list()) == {"AAPL", "MSFT"}
+
+
+def test_filter_to_trained_tickers_unknown_tickers_dropped() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL", "TSLA", "TSLA"],
+            "close_price": [15.0, 20.0, 25.0, 30.0],
+        }
+    )
+    trained_tickers = {"AAPL", "MSFT"}
+
+    result = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert result.height == 2  # noqa: PLR2004 only AAPL rows retained
+    assert result["ticker"].unique().to_list() == ["AAPL"]
+
+
+def test_filter_to_trained_tickers_warning_logged_when_dropping(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "TSLA"],
+            "close_price": [15.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL"}
+
+    with caplog.at_level("WARNING"):
+        filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert any(
+        "Dropping tickers not in trained set" in record.message
+        for record in caplog.records
+    )
+
+
+def test_filter_to_trained_tickers_no_warning_when_all_known(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "close_price": [15.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL", "MSFT"}
+
+    with caplog.at_level("WARNING"):
+        filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert not any("Dropping tickers" in record.message for record in caplog.records)

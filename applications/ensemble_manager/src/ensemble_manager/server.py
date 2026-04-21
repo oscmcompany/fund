@@ -39,7 +39,7 @@ from .metrics import (
     start_timer,
 )
 from .predictions_schema import predictions_schema
-from .preprocess import filter_equity_bars
+from .preprocess import filter_equity_bars, filter_to_trained_tickers
 
 sentry_sdk.init(
     dsn=os.environ.get("SENTRY_DSN"),
@@ -339,6 +339,9 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
     current_timestamp = datetime.now(tz=UTC)
 
     tide_data = Data.load(directory_path=request.app.state.model_directory)
+
+    trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
+    data = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
     tide_data.preprocess_and_set_data(data=data)
 

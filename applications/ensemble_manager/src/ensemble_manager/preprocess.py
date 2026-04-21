@@ -1,4 +1,23 @@
 import polars as pl
+import structlog
+
+logger = structlog.get_logger()
+
+
+def filter_to_trained_tickers(
+    data: pl.DataFrame,
+    trained_tickers: set[str],
+) -> pl.DataFrame:
+    input_tickers = set(data["ticker"].unique().to_list())
+    dropped_tickers = input_tickers - trained_tickers
+
+    if dropped_tickers:
+        logger.warning(
+            "Dropping tickers not in trained set",
+            dropped_count=len(dropped_tickers),
+        )
+
+    return data.filter(pl.col("ticker").is_in(trained_tickers))
 
 
 def filter_equity_bars(
