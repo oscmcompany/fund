@@ -24,6 +24,7 @@ def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
                 "dollar_amount": 1000.0,
                 "action": "OPEN_POSITION",
                 "pair_id": pair["pair_id"],
+                "entry_price": 100.0,
             }
         )
         rows.append(
@@ -34,6 +35,7 @@ def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
                 "dollar_amount": 1000.0,
                 "action": "OPEN_POSITION",
                 "pair_id": pair["pair_id"],
+                "entry_price": 100.0,
             }
         )
     return pl.DataFrame(rows, schema=_PRIOR_PORTFOLIO_SCHEMA)
@@ -169,6 +171,7 @@ def test_evaluate_prior_pairs_skips_malformed_pair_missing_long_leg() -> None:
             "dollar_amount": [1000.0],
             "action": ["OPEN_POSITION"],
             "pair_id": ["AAPL-MSFT"],
+            "entry_price": [100.0],
         },
         schema=_PRIOR_PORTFOLIO_SCHEMA,
     )

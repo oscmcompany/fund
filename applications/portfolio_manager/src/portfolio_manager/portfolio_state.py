@@ -1,5 +1,6 @@
+import io
 import os
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import numpy as np
@@ -25,6 +26,7 @@ _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
     "dollar_amount": pl.Float64,
     "action": pl.String,
     "pair_id": pl.String,
+    "entry_price": pl.Float64,
 }
 
 
@@ -79,6 +81,73 @@ async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -
     except Exception as e:
         logger.exception("Failed to save portfolio state", error=str(e))
         return False
+
+
+async def save_performance_snapshot(snapshot: dict) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
+                json={
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "data": snapshot,
+                },
+            )
+        response.raise_for_status()
+        logger.info("Saved performance snapshot")
+        return True  # noqa: TRY300
+    except Exception as e:
+        logger.exception("Failed to save performance snapshot", error=str(e))
+        return False
+
+
+async def save_closed_pair(record: dict) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url=f"{DATA_MANAGER_BASE_URL}/performance/closed-pairs",
+                json={
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "data": record,
+                },
+            )
+        response.raise_for_status()
+        logger.info("Saved closed pair record")
+        return True  # noqa: TRY300
+    except Exception as e:
+        logger.exception("Failed to save closed pair record", error=str(e))
+        return False
+
+
+async def get_last_portfolio_value() -> float | None:
+    try:
+        now = datetime.now(tz=UTC)
+        one_day_ago = now - timedelta(days=1)
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
+                params={
+                    "start_timestamp": one_day_ago.isoformat(),
+                    "end_timestamp": now.isoformat(),
+                },
+            )
+
+        if response.status_code == 404:  # noqa: PLR2004
+            return None
+
+        response.raise_for_status()
+
+        dataframe = pl.read_parquet(io.BytesIO(response.content))
+
+        if dataframe.height == 0:
+            return None
+
+        return float(dataframe["portfolio_value"][-1])
+
+    except Exception as e:
+        logger.exception("Failed to retrieve last portfolio value", error=str(e))
+        return None
 
 
 def evaluate_prior_pairs(

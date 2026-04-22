@@ -8,17 +8,19 @@ use data_manager::{
     },
     state::{MassiveSecrets, State},
     storage::{
-        date_to_int, escape_sql_ticker, format_s3_key, is_valid_ticker,
+        date_to_int, escape_sql_ticker, format_performance_s3_key, format_s3_key, is_valid_ticker,
         query_equity_bars_parquet_from_s3, query_portfolio_dataframe_from_s3,
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
         sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
         write_equity_details_dataframe_to_s3, write_portfolio_dataframe_to_s3,
-        write_predictions_dataframe_to_s3, PredictionQuery, DUCKDB_CONFIG_VALUE_MAX_LENGTH,
+        write_predictions_dataframe_to_s3, PredictionQuery, QueryCache,
+        DUCKDB_CONFIG_VALUE_MAX_LENGTH,
     },
 };
 use polars::prelude::*;
 use serial_test::serial;
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
 
 use common::{create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name};
 
@@ -72,6 +74,7 @@ async fn create_state(endpoint: &str) -> State {
         },
         s3_client,
         test_bucket_name(),
+        Arc::new(Mutex::new(QueryCache::new(300))),
     )
 }
 
@@ -513,4 +516,53 @@ async fn test_write_equity_details_dataframe_to_s3_success() {
         read_back.column("industry").unwrap().str().unwrap().get(0),
         Some("CONSUMER ELECTRONICS")
     );
+}
+
+#[test]
+fn test_format_performance_s3_key_live() {
+    let timestamp = fixed_date_time();
+    let key = format_performance_s3_key(&timestamp, "live");
+
+    assert_eq!(
+        key,
+        "performance/live/year=2025/month=01/day=01/data.parquet"
+    );
+}
+
+#[test]
+fn test_format_performance_s3_key_closed_pairs() {
+    let timestamp = fixed_date_time();
+    let key = format_performance_s3_key(&timestamp, "closed_pairs");
+
+    assert_eq!(
+        key,
+        "performance/closed_pairs/year=2025/month=01/day=01/data.parquet"
+    );
+}
+
+#[test]
+fn test_query_cache_get_miss() {
+    let cache = QueryCache::new(300);
+    assert!(cache.get("nonexistent_key").is_none());
+}
+
+#[test]
+fn test_query_cache_set_and_get() {
+    let mut cache = QueryCache::new(300);
+    let data = vec![1u8, 2, 3, 4];
+    cache.set("test_key".to_string(), data.clone());
+
+    let result = cache.get("test_key");
+    assert!(result.is_some());
+    assert_eq!(result.unwrap(), &data);
+}
+
+#[test]
+fn test_query_cache_expired() {
+    let mut cache = QueryCache::new(0);
+    let data = vec![1u8, 2, 3, 4];
+    cache.set("test_key".to_string(), data);
+
+    let result = cache.get("test_key");
+    assert!(result.is_none());
 }
