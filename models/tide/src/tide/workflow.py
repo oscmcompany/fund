@@ -19,11 +19,14 @@ import structlog  # noqa: E402
 from prefect import flow, task  # noqa: E402
 from prefect_aws.s3 import S3Bucket  # noqa: E402
 
+from tide.evaluate import DriftResult, check_drift, evaluate  # noqa: E402
 from tide.notifications import send_training_notification  # noqa: E402
 from tide.tasks import (  # noqa: E402
     MINIMUM_CLOSE_PRICE,
     MINIMUM_VOLUME,
+    fetch_prior_evaluations,
     prepare_training_data,
+    write_evaluation_results,
 )
 from tide.tracking import end_run, log_model_artifact, start_run  # noqa: E402
 
@@ -198,6 +201,107 @@ def train_tide_model(
     return f"s3://{artifacts_bucket}/{artifact_key}"
 
 
+@task(name="evaluate-tide-model")
+def evaluate_tide_model(
+    artifact_key: str,
+    training_data_key: str,
+    artifact_timestamp: str,
+) -> tuple[dict, DriftResult]:
+    """Download model artifact and training data, evaluate model, check for drift."""
+    from tide.data import Data  # noqa: PLC0415
+    from tide.model import Model  # noqa: PLC0415
+
+    try:
+        artifact_block = cast("S3Bucket", S3Bucket.load(ARTIFACT_BLOCK_NAME))
+    except ValueError as err:
+        message = (
+            f"Prefect S3Bucket block '{ARTIFACT_BLOCK_NAME}' not found. "
+            "Create it in Prefect Cloud or run 'prefect block register'. "
+            "Check that credentials are configured on the block."
+        )
+        raise ValueError(message) from err
+
+    s3_client = artifact_block.credentials.get_boto3_session().client("s3")
+    artifacts_bucket = artifact_block.bucket_name
+
+    resolved_training_data_key = training_data_key
+    bucket_prefix = f"s3://{artifacts_bucket}/"
+    if training_data_key.startswith(bucket_prefix):
+        resolved_training_data_key = training_data_key.removeprefix(bucket_prefix)
+
+    logger.info(
+        "Loading training data for evaluation",
+        artifacts_bucket=artifacts_bucket,
+        training_data_key=resolved_training_data_key,
+    )
+
+    response = s3_client.get_object(
+        Bucket=artifacts_bucket,
+        Key=resolved_training_data_key,
+    )
+    training_data = pl.read_parquet(response["Body"].read())
+
+    tide_data = Data()
+    tide_data.preprocess_and_set_data(training_data)
+    validation_dataset = tide_data.get_dataset("validate")
+
+    resolved_artifact_key = artifact_key
+    if artifact_key.startswith(bucket_prefix):
+        resolved_artifact_key = artifact_key.removeprefix(bucket_prefix)
+
+    logger.info(
+        "Downloading model artifact for evaluation",
+        artifacts_bucket=artifacts_bucket,
+        artifact_key=resolved_artifact_key,
+    )
+
+    artifact_response = s3_client.get_object(
+        Bucket=artifacts_bucket,
+        Key=resolved_artifact_key,
+    )
+    tar_bytes = artifact_response["Body"].read()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tar_buffer = io.BytesIO(tar_bytes)
+        with tarfile.open(fileobj=tar_buffer, mode="r:gz") as tar:
+            tar.extractall(path=tmpdir, filter="data")
+
+        tide_model = Model.load(directory_path=tmpdir)
+
+    logger.info("Running model evaluation")
+
+    evaluation_results = evaluate(tide_model, validation_dataset)
+
+    prior_evaluations = fetch_prior_evaluations(
+        s3_client=s3_client,
+        bucket_name=artifacts_bucket,
+        artifact_prefix="artifacts/tide/",
+        run_count=7,
+    )
+
+    drift_result = check_drift(
+        current_metrics=evaluation_results,
+        prior_evaluations=prior_evaluations,
+    )
+
+    write_evaluation_results(
+        s3_client=s3_client,
+        bucket_name=artifacts_bucket,
+        results=evaluation_results,
+        run_id=artifact_timestamp,
+    )
+
+    logger.info(
+        "Evaluation task complete",
+        drift_status=drift_result.status,
+        crps=evaluation_results["crps"],
+        directional_accuracy=evaluation_results["directional_accuracy"],
+        quantile_coverage=evaluation_results["quantile_coverage"],
+    )
+
+    return evaluation_results, drift_result
+
+
 @flow(  # type: ignore
     name="tide-training-pipeline",
     log_prints=True,
@@ -230,7 +334,11 @@ def training_pipeline(
         "stage_counts": stage_counts,
     }
 
-    return train_tide_model(training_key, training_summary, artifact_timestamp)
+    artifact_key = train_tide_model(training_key, training_summary, artifact_timestamp)
+
+    evaluate_tide_model(artifact_key, training_key, artifact_timestamp)
+
+    return artifact_key
 
 
 if __name__ == "__main__":
