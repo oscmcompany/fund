@@ -7,10 +7,10 @@ from portfolio_manager.performance import (
     build_closed_pair_record,
     build_performance_snapshot,
     compute_calmar_ratio,
-    compute_max_drawdown,
+    compute_maximum_drawdown,
     compute_period_return,
     compute_portfolio_value,
-    compute_realized_pnl,
+    compute_realized_profit_and_loss,
     compute_sharpe_ratio,
     compute_sortino_ratio,
     compute_spy_relative_return,
@@ -112,28 +112,32 @@ def test_compute_period_return_negative_return() -> None:
     assert result == pytest.approx(-0.1)
 
 
-# --- compute_realized_pnl ---
+# --- compute_realized_profit_and_loss ---
 
 
-def test_compute_realized_pnl_long_profit_price_went_up() -> None:
+def test_compute_realized_profit_and_loss_long_profit_price_went_up() -> None:
     closing_pair = _make_positions(["AAPL"], ["LONG"], [1000.0], [100.0])
     current_prices = _make_current_prices(["AAPL"], [110.0])
-    total_pnl, return_pct = compute_realized_pnl(closing_pair, current_prices)
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
     # pnl = 1000 * (110/100 - 1) = 100
     assert total_pnl == pytest.approx(100.0)
-    assert return_pct == pytest.approx(0.1)
+    assert return_percent == pytest.approx(0.1)
 
 
-def test_compute_realized_pnl_short_profit_price_went_down() -> None:
+def test_compute_realized_profit_and_loss_short_profit_price_went_down() -> None:
     closing_pair = _make_positions(["MSFT"], ["SHORT"], [1000.0], [100.0])
     current_prices = _make_current_prices(["MSFT"], [90.0])
-    total_pnl, return_pct = compute_realized_pnl(closing_pair, current_prices)
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
     # pnl = 1000 * (1 - 90/100) = 100
     assert total_pnl == pytest.approx(100.0)
-    assert return_pct == pytest.approx(0.1)
+    assert return_percent == pytest.approx(0.1)
 
 
-def test_compute_realized_pnl_mixed_pair() -> None:
+def test_compute_realized_profit_and_loss_mixed_pair() -> None:
     closing_pair = _make_positions(
         ["AAPL", "MSFT"],
         ["LONG", "SHORT"],
@@ -141,14 +145,16 @@ def test_compute_realized_pnl_mixed_pair() -> None:
         [100.0, 100.0],
     )
     current_prices = _make_current_prices(["AAPL", "MSFT"], [110.0, 110.0])
-    total_pnl, return_pct = compute_realized_pnl(closing_pair, current_prices)
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
     # AAPL long: 1000 * (110/100 - 1) = 100
     # MSFT short: 1000 * (1 - 110/100) = -100
     assert total_pnl == pytest.approx(0.0)
-    assert return_pct == pytest.approx(0.0)
+    assert return_percent == pytest.approx(0.0)
 
 
-def test_compute_realized_pnl_empty_closing_pair() -> None:
+def test_compute_realized_profit_and_loss_empty_closing_pair() -> None:
     closing_pair = pl.DataFrame(
         {"ticker": [], "side": [], "dollar_amount": [], "entry_price": []},
         schema={
@@ -159,9 +165,11 @@ def test_compute_realized_pnl_empty_closing_pair() -> None:
         },
     )
     current_prices = _make_current_prices(["AAPL"], [100.0])
-    total_pnl, return_pct = compute_realized_pnl(closing_pair, current_prices)
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
     assert total_pnl == 0.0
-    assert return_pct == 0.0
+    assert return_percent == 0.0
 
 
 # --- compute_sharpe_ratio ---
@@ -214,31 +222,29 @@ def test_compute_sortino_ratio_returns_none_when_no_downside_returns() -> None:
     assert compute_sortino_ratio(returns) is None
 
 
-# --- compute_max_drawdown ---
+# --- compute_maximum_drawdown ---
 
 
-def test_compute_max_drawdown_returns_none_for_fewer_than_2_values() -> None:
-    assert compute_max_drawdown([100.0]) is None
-    assert compute_max_drawdown([]) is None
+def test_compute_maximum_drawdown_returns_none_for_fewer_than_2_values() -> None:
+    assert compute_maximum_drawdown([100.0]) is None
+    assert compute_maximum_drawdown([]) is None
 
 
-def test_compute_max_drawdown_computes_known_drawdown() -> None:
+def test_compute_maximum_drawdown_computes_known_drawdown() -> None:
     # Peak = 100, then drops to 80 → drawdown = (100-80)/100 = 0.20
-    result = compute_max_drawdown([100.0, 80.0])
+    result = compute_maximum_drawdown([100.0, 80.0])
     assert result == pytest.approx(0.20)
 
 
-def test_compute_max_drawdown_returns_zero_for_monotonically_increasing_values() -> (
-    None
-):
-    result = compute_max_drawdown([100.0, 110.0, 120.0, 130.0])
+def test_compute_maximum_drawdown_returns_zero_when_values_increase() -> None:
+    result = compute_maximum_drawdown([100.0, 110.0, 120.0, 130.0])
     assert result == pytest.approx(0.0)
 
 
-def test_compute_max_drawdown_finds_maximum_among_multiple_drawdowns() -> None:
+def test_compute_maximum_drawdown_finds_maximum_among_multiple_drawdowns() -> None:
     # First drawdown: 100 → 90 = 10%
     # Second drawdown: 110 → 80 = ~27.3%
-    result = compute_max_drawdown([100.0, 90.0, 110.0, 80.0])
+    result = compute_maximum_drawdown([100.0, 90.0, 110.0, 80.0])
     expected = (110.0 - 80.0) / 110.0
     assert result == pytest.approx(expected)
 
@@ -308,7 +314,7 @@ def test_build_performance_snapshot_returns_dict_with_all_required_keys() -> Non
     assert "portfolio_value" in result
     assert "cash_balance" in result
     assert "spy_close" in result
-    assert "period_return_pct" in result
+    assert "period_return_percent" in result
     assert "open_pair_count" in result
 
 
@@ -339,7 +345,7 @@ def test_build_performance_snapshot_correct_values() -> None:
     assert result["portfolio_value"] == pytest.approx(100000.0)
     assert result["cash_balance"] == pytest.approx(5000.0)
     assert result["spy_close"] == pytest.approx(550.0)
-    assert result["period_return_pct"] == pytest.approx(0.02)
+    assert result["period_return_percent"] == pytest.approx(0.02)
     assert result["open_pair_count"] == _EXPECTED_OPEN_PAIR_COUNT
 
 
@@ -354,8 +360,8 @@ def test_build_closed_pair_record_returns_dict_with_all_required_keys() -> None:
         entry_timestamp=1735689600000,
         closed_timestamp=1735776000000,
         dollar_amount=2000.0,
-        realized_pnl=100.0,
-        return_pct=0.05,
+        realized_profit_and_loss=100.0,
+        return_percent=0.05,
     )
     assert "closed_timestamp" in result
     assert "pair_id" in result
@@ -363,8 +369,8 @@ def test_build_closed_pair_record_returns_dict_with_all_required_keys() -> None:
     assert "short_ticker" in result
     assert "entry_timestamp" in result
     assert "dollar_amount" in result
-    assert "realized_pnl" in result
-    assert "return_pct" in result
+    assert "realized_profit_and_loss" in result
+    assert "return_percent" in result
     assert "holding_days" in result
 
 
@@ -379,8 +385,8 @@ def test_build_closed_pair_record_holding_days_computed_correctly() -> None:
         entry_timestamp=entry_timestamp,
         closed_timestamp=closed_timestamp,
         dollar_amount=2000.0,
-        realized_pnl=100.0,
-        return_pct=0.05,
+        realized_profit_and_loss=100.0,
+        return_percent=0.05,
     )
     assert result["holding_days"] == _EXPECTED_HOLDING_DAYS
 
@@ -393,12 +399,12 @@ def test_build_closed_pair_record_correct_values() -> None:
         entry_timestamp=1735689600000,
         closed_timestamp=1735776000000,
         dollar_amount=2000.0,
-        realized_pnl=100.0,
-        return_pct=0.05,
+        realized_profit_and_loss=100.0,
+        return_percent=0.05,
     )
     assert result["pair_id"] == "AAPL-MSFT"
     assert result["long_ticker"] == "AAPL"
     assert result["short_ticker"] == "MSFT"
     assert result["dollar_amount"] == pytest.approx(2000.0)
-    assert result["realized_pnl"] == pytest.approx(100.0)
-    assert result["return_pct"] == pytest.approx(0.05)
+    assert result["realized_profit_and_loss"] == pytest.approx(100.0)
+    assert result["return_percent"] == pytest.approx(0.05)

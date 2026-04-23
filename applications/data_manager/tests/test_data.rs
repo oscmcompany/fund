@@ -695,7 +695,7 @@ fn test_create_performance_snapshot_dataframe_single_row() {
         portfolio_value: 100000.0,
         cash_balance: 25000.0,
         spy_close: 590.0,
-        period_return_pct: 0.05,
+        period_return_percent: 0.05,
         open_pair_count: 3,
     };
 
@@ -706,7 +706,7 @@ fn test_create_performance_snapshot_dataframe_single_row() {
     assert!(dataframe.column("portfolio_value").is_ok());
     assert!(dataframe.column("cash_balance").is_ok());
     assert!(dataframe.column("spy_close").is_ok());
-    assert!(dataframe.column("period_return_pct").is_ok());
+    assert!(dataframe.column("period_return_percent").is_ok());
     assert!(dataframe.column("open_pair_count").is_ok());
 
     let timestamp_value = dataframe.column("timestamp").unwrap().i64().unwrap().get(0);
@@ -734,8 +734,8 @@ fn test_create_closed_pair_dataframe_uppercase() {
         short_ticker: "msft".to_string(),
         entry_timestamp: 1735000000000,
         dollar_amount: 10000.0,
-        realized_pnl: 250.0,
-        return_pct: 0.025,
+        realized_profit_and_loss: 250.0,
+        return_percent: 0.025,
         holding_days: 5,
     };
 

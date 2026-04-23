@@ -1,5 +1,6 @@
 import math
 from datetime import datetime
+from typing import Any
 
 import polars as pl
 import structlog
@@ -45,7 +46,7 @@ def compute_period_return(current_value: float, previous_value: float) -> float:
     return (current_value - previous_value) / previous_value
 
 
-def compute_realized_pnl(
+def compute_realized_profit_and_loss(
     closing_pair: pl.DataFrame,
     current_prices: pl.DataFrame,
 ) -> tuple[float, float]:
@@ -109,7 +110,7 @@ def compute_sortino_ratio(returns: list[float]) -> float | None:
         return None
 
     downside_standard_deviation = math.sqrt(
-        sum(r**2 for r in downside_returns) / len(downside_returns)
+        sum(r**2 for r in downside_returns) / len(returns)
     )
 
     if downside_standard_deviation == 0:
@@ -118,7 +119,7 @@ def compute_sortino_ratio(returns: list[float]) -> float | None:
     return (mean_return / downside_standard_deviation) * math.sqrt(252)
 
 
-def compute_max_drawdown(portfolio_values: list[float]) -> float | None:
+def compute_maximum_drawdown(portfolio_values: list[float]) -> float | None:
     if len(portfolio_values) < 2:  # noqa: PLR2004
         return None
 
@@ -160,13 +161,13 @@ def build_performance_snapshot(  # noqa: PLR0913
     period_return: float,
     open_pair_count: int,
     timestamp: datetime,
-) -> dict:
+) -> dict[str, Any]:
     return {
         "timestamp": int(timestamp.timestamp() * 1000),
         "portfolio_value": portfolio_value,
         "cash_balance": cash,
         "spy_close": spy_close,
-        "period_return_pct": period_return,
+        "period_return_percent": period_return,
         "open_pair_count": open_pair_count,
     }
 
@@ -178,9 +179,9 @@ def build_closed_pair_record(  # noqa: PLR0913
     entry_timestamp: int,
     closed_timestamp: int,
     dollar_amount: float,
-    realized_pnl: float,
-    return_pct: float,
-) -> dict:
+    realized_profit_and_loss: float,
+    return_percent: float,
+) -> dict[str, Any]:
     holding_days = (closed_timestamp - entry_timestamp) // (1000 * 60 * 60 * 24)
     return {
         "closed_timestamp": closed_timestamp,
@@ -189,7 +190,7 @@ def build_closed_pair_record(  # noqa: PLR0913
         "short_ticker": short_ticker,
         "entry_timestamp": entry_timestamp,
         "dollar_amount": dollar_amount,
-        "realized_pnl": realized_pnl,
-        "return_pct": return_pct,
+        "realized_profit_and_loss": realized_profit_and_loss,
+        "return_percent": return_percent,
         "holding_days": holding_days,
     }

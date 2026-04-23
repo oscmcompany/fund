@@ -525,7 +525,7 @@ fn test_format_performance_s3_key_live() {
 
     assert_eq!(
         key,
-        "performance/live/year=2025/month=01/day=01/data.parquet"
+        "performance/live/year=2025/month=01/day=01/hour=00/minute=00/second=00/data.parquet"
     );
 }
 
@@ -536,7 +536,7 @@ fn test_format_performance_s3_key_closed_pairs() {
 
     assert_eq!(
         key,
-        "performance/closed_pairs/year=2025/month=01/day=01/data.parquet"
+        "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/data.parquet"
     );
 }
 

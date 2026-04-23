@@ -45,7 +45,9 @@ impl QueryCache {
     }
 
     pub fn set(&mut self, key: String, data: Vec<u8>) {
-        let expires_at = Instant::now() + self.ttl;
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.expires_at > now);
+        let expires_at = now + self.ttl;
         self.entries.insert(key, CacheEntry { data, expires_at });
     }
 }
@@ -157,7 +159,7 @@ pub async fn query_performance_snapshots_from_s3(
             portfolio_value,
             cash_balance,
             spy_close,
-            period_return_pct,
+            period_return_percent,
             open_pair_count
         FROM read_parquet('{}', hive_partitioning = true)
         WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
@@ -179,7 +181,7 @@ pub async fn query_performance_snapshots_from_s3(
                 portfolio_value: row.get(1)?,
                 cash_balance: row.get(2)?,
                 spy_close: row.get(3)?,
-                period_return_pct: row.get(4)?,
+                period_return_percent: row.get(4)?,
                 open_pair_count: row.get(5)?,
             })
         })?
@@ -295,8 +297,8 @@ pub async fn query_closed_pairs_from_s3(
             short_ticker,
             entry_timestamp,
             dollar_amount,
-            realized_pnl,
-            return_pct,
+            realized_profit_and_loss,
+            return_percent,
             holding_days
         FROM read_parquet('{}', hive_partitioning = true)
         WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
@@ -320,8 +322,8 @@ pub async fn query_closed_pairs_from_s3(
                 short_ticker: row.get(3)?,
                 entry_timestamp: row.get(4)?,
                 dollar_amount: row.get(5)?,
-                realized_pnl: row.get(6)?,
-                return_pct: row.get(7)?,
+                realized_profit_and_loss: row.get(6)?,
+                return_percent: row.get(7)?,
                 holding_days: row.get(8)?,
             })
         })?
@@ -417,10 +419,13 @@ pub fn format_performance_s3_key(timestamp: &DateTime<Utc>, performance_type: &s
     let year = timestamp.format("%Y");
     let month = timestamp.format("%m");
     let day = timestamp.format("%d");
+    let hour = timestamp.format("%H");
+    let minute = timestamp.format("%M");
+    let second = timestamp.format("%S");
 
     format!(
-        "performance/{}/year={}/month={}/day={}/data.parquet",
-        performance_type, year, month, day,
+        "performance/{}/year={}/month={}/day={}/hour={}/minute={}/second={}/data.parquet",
+        performance_type, year, month, day, hour, minute, second,
     )
 }
 

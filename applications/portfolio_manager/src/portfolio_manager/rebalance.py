@@ -17,7 +17,7 @@ from .performance import (
     build_performance_snapshot,
     compute_period_return,
     compute_portfolio_value,
-    compute_realized_pnl,
+    compute_realized_profit_and_loss,
 )
 from .portfolio_schema import pairs_schema, portfolio_schema
 from .portfolio_state import (
@@ -352,7 +352,9 @@ async def _record_performance(  # noqa: PLR0913
         if long_rows.is_empty() or short_rows.is_empty():
             continue
 
-        realized_pnl, return_pct = compute_realized_pnl(pair_rows, current_prices)
+        realized_profit_and_loss, return_percent = compute_realized_profit_and_loss(
+            pair_rows, current_prices
+        )
         dollar_amount = float(pair_rows["dollar_amount"].sum())
         long_ticker = long_rows["ticker"][0]
         short_ticker = short_rows["ticker"][0]
@@ -366,8 +368,8 @@ async def _record_performance(  # noqa: PLR0913
             entry_timestamp=entry_timestamp,
             closed_timestamp=closed_timestamp,
             dollar_amount=dollar_amount,
-            realized_pnl=realized_pnl,
-            return_pct=return_pct,
+            realized_profit_and_loss=realized_profit_and_loss,
+            return_percent=return_percent,
         )
         await save_closed_pair(record)
 
