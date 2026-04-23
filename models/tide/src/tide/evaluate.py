@@ -128,7 +128,7 @@ def check_drift(
     baseline_crps = float(
         np.mean([evaluation["crps"] for evaluation in prior_evaluations])
     )
-    degradation_limit = baseline_crps * (1.0 + degradation_threshold)
+    degradation_limit = max(baseline_crps, 1e-8) * (1.0 + degradation_threshold)
 
     if current_crps > degradation_limit:
         message = (
@@ -200,8 +200,8 @@ def evaluate(
 
     # predictions_array shape: [N, output_length, 3]
     # targets shape: [N, output_length, 1]
-    num_samples, output_length, _ = predictions_array.shape
-    total_steps = num_samples * output_length
+    samples_count, output_length, _ = predictions_array.shape
+    total_steps = samples_count * output_length
 
     predictions_flat = predictions_array.reshape(total_steps, 3)
     targets_flat = validation_dataset.targets.reshape(total_steps)

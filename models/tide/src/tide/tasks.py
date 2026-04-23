@@ -299,11 +299,15 @@ def fetch_prior_evaluations(
         run_count=run_count,
     )
 
+    all_file_objects = []
+    kwargs: dict = {"Bucket": bucket_name, "Prefix": artifact_prefix}
     try:
-        response = s3_client.list_objects_v2(
-            Bucket=bucket_name,
-            Prefix=artifact_prefix,
-        )
+        while True:
+            page = s3_client.list_objects_v2(**kwargs)
+            all_file_objects.extend(page.get("Contents", []))
+            if not page.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = page["NextContinuationToken"]
     except ClientError as error:
         logger.exception(
             "Failed to list prior evaluation objects",
@@ -315,7 +319,7 @@ def fetch_prior_evaluations(
 
     evaluation_objects = [
         file_object
-        for file_object in response.get("Contents", [])
+        for file_object in all_file_objects
         if file_object["Key"].endswith("/evaluation.json")
     ]
 
@@ -330,10 +334,10 @@ def fetch_prior_evaluations(
     evaluation_objects.sort(
         key=lambda file_object: file_object["LastModified"], reverse=True
     )
-    most_recent = evaluation_objects[:run_count]
+    most_recent_evaluation = evaluation_objects[:run_count]
 
     prior_evaluations = []
-    for file_object in most_recent:
+    for file_object in most_recent_evaluation:
         try:
             get_response = s3_client.get_object(
                 Bucket=bucket_name,
