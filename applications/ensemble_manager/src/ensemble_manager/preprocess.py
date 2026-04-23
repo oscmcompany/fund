@@ -15,6 +15,7 @@ def filter_to_trained_tickers(
         logger.warning(
             "Dropping tickers not in trained set",
             dropped_count=len(dropped_tickers),
+            dropped_tickers=sorted(dropped_tickers),
         )
 
     return data.filter(pl.col("ticker").is_in(trained_tickers))

@@ -343,7 +343,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
     data = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
-    tide_data.preprocess_and_set_data(data=data)
+    tide_data.apply_and_set_data(data=data)
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 

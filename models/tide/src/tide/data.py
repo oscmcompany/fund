@@ -349,6 +349,25 @@ class Data:
         self.scaler = cast("Scaler", scale_and_encode.scaler)
         self.mappings = cast("FeatureMappings", scale_and_encode.mappings)
 
+    def apply_and_set_data(self, data: pl.DataFrame) -> None:
+        pipeline = Pipeline(stages=[ValidateColumns(), EngineerFeatures(), CleanData()])
+        data = pipeline.run(data)
+
+        data = data.with_columns(
+            *[
+                (pl.col(col) - self.scaler.means[col])
+                / self.scaler.standard_deviations[col]
+                for col in self.continuous_columns
+            ]
+        )
+
+        for column, mapping in self.mappings.items():
+            data = data.with_columns(
+                pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
+            )
+
+        self.data = data
+
     def _get_training_and_validation_data(
         self,
         validation_split: float = 0.8,
