@@ -21,7 +21,7 @@ def filter_to_trained_tickers(
 
     return data.filter(
         pl.col("ticker").str.to_uppercase().is_in(normalized_trained_tickers)
-    )
+    ).with_columns(pl.col("ticker").str.to_uppercase())
 
 
 def filter_equity_bars(

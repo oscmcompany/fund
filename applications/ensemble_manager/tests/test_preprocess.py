@@ -282,7 +282,7 @@ def test_filter_to_trained_tickers_lowercase_input_passes_through() -> None:
     result = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
     assert result.height == 3  # noqa: PLR2004 all rows retained despite lowercase input
-    assert set(result["ticker"].unique().to_list()) == {"aapl", "msft"}
+    assert set(result["ticker"].unique().to_list()) == {"AAPL", "MSFT"}
 
 
 def test_filter_to_trained_tickers_mixed_case_warning_uses_normalized() -> None:
