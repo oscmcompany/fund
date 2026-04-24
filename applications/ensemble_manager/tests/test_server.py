@@ -1,7 +1,82 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
+import polars as pl
 from botocore.exceptions import ClientError
-from ensemble_manager.server import _resolve_artifact_key
+from ensemble_manager.server import _resolve_artifact_key, application
+from fastapi import status
+from fastapi.testclient import TestClient
+
+
+def test_create_predictions_some_tickers_dropped_continues() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL"],
+            "close_price": [15.0, 20.0],
+        }
+    )
+    mock_tide_data = MagicMock()
+    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
+
+    application.state.model_directory = "/fake/model/dir"
+
+    with (
+        patch("ensemble_manager.server.requests.get") as mock_requests_get,
+        patch("ensemble_manager.server.parse_responses") as mock_parse,
+        patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
+        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+    ):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_requests_get.return_value = mock_response
+        mock_parse.return_value = data
+        mock_data_load.return_value = mock_tide_data
+        mock_filter.return_value = data
+
+        mock_tide_data.get_dataset.return_value = MagicMock(__len__=lambda _: 0)
+
+        client = TestClient(application, raise_server_exceptions=False)
+        client.post("/predictions")
+
+    assert call(stage="ticker_filtering") not in mock_errors.labels.call_args_list
+
+
+def test_create_predictions_all_tickers_dropped_returns_500() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["TSLA", "TSLA"],
+            "close_price": [15.0, 20.0],
+        }
+    )
+    empty_data = pl.DataFrame({"ticker": pl.Series([], dtype=pl.Utf8)})
+    mock_tide_data = MagicMock()
+    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
+
+    application.state.model_directory = "/fake/model/dir"
+
+    with (
+        patch("ensemble_manager.server.requests.get") as mock_requests_get,
+        patch("ensemble_manager.server.parse_responses") as mock_parse,
+        patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
+        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+    ):
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_requests_get.return_value = mock_response
+        mock_parse.return_value = data
+        mock_data_load.return_value = mock_tide_data
+        mock_filter.return_value = empty_data
+
+        mock_errors_instance = MagicMock()
+        mock_errors.labels.return_value = mock_errors_instance
+
+        client = TestClient(application, raise_server_exceptions=False)
+        response = client.post("/predictions")
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    mock_errors.labels.assert_called_with(stage="ticker_filtering")
+    mock_errors_instance.inc.assert_called_once()
 
 
 def test_resolve_artifact_key_uses_latest_by_default() -> None:
