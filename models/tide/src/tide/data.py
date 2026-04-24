@@ -361,6 +361,15 @@ class Data:
             ]
         )
 
+        for col in self.continuous_columns:
+            nan_count = data.filter(pl.col(col).is_nan()).height
+            if nan_count > 0:
+                message = (
+                    f"NaN values after scaling column '{col}': "
+                    f"{nan_count}/{data.height} rows"
+                )
+                raise ValueError(message)
+
         for column, mapping in self.mappings.items():
             unknown_values = set(data[column].unique().to_list()) - set(mapping)
             if unknown_values:

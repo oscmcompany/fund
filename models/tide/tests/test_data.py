@@ -357,3 +357,23 @@ def test_apply_and_set_data_raises_on_unknown_category(
 
     with pytest.raises(ValueError, match="Unknown categories for column 'sector'"):
         data.apply_and_set_data(inference_raw)
+
+
+def test_apply_and_set_data_applies_mappings_and_scaler(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    training_raw = make_raw_data(tickers=["AAPL"], days=60)
+    data = Data()
+    data.preprocess_and_set_data(training_raw)
+
+    training_ticker_encoding = data.mappings["ticker"]["AAPL"]
+    training_scaler_means = data.scaler.means.clone()
+    training_scaler_stds = data.scaler.standard_deviations.clone()
+
+    inference_raw = make_raw_data(tickers=["AAPL"], days=10)
+    data.apply_and_set_data(inference_raw)
+
+    assert data.mappings["ticker"]["AAPL"] == training_ticker_encoding
+    assert data.scaler.means.equals(training_scaler_means)
+    assert data.scaler.standard_deviations.equals(training_scaler_stds)
+    assert not data.data.is_empty()

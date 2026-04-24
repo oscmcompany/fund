@@ -341,15 +341,26 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     tide_data = Data.load(directory_path=request.app.state.model_directory)
 
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
+    input_ticker_count = data.select(pl.col("ticker").n_unique()).item()
     data = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
     if data.is_empty():
         prediction_errors_total.labels(stage="ticker_filtering").inc()
-        logger.error("No trained tickers available for prediction")
+        logger.error(
+            "No input tickers matched trained set",
+            input_ticker_count=input_ticker_count,
+            trained_ticker_count=len(trained_tickers),
+        )
         observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    tide_data.apply_and_set_data(data=data)
+    try:
+        tide_data.apply_and_set_data(data=data)
+    except ValueError:
+        prediction_errors_total.labels(stage="apply_preprocessing").inc()
+        logger.exception("Failed to apply preprocessing to inference data")
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
