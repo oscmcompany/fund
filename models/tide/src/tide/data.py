@@ -362,6 +362,14 @@ class Data:
         )
 
         for column, mapping in self.mappings.items():
+            unknown_values = set(data[column].unique().to_list()) - set(mapping)
+            if unknown_values:
+                message = (
+                    f"Unknown categories for column '{column}': "
+                    f"{sorted(unknown_values)}"
+                )
+                raise ValueError(message)
+
             data = data.with_columns(
                 pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
             )

@@ -268,3 +268,40 @@ def test_filter_to_trained_tickers_no_warning_when_all_known() -> None:
         filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
     assert not any("Dropping tickers" in log["event"] for log in logs)
+
+
+def test_filter_to_trained_tickers_lowercase_input_passes_through() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["aapl", "aapl", "msft"],
+            "close_price": [15.0, 20.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL", "MSFT"}
+
+    result = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert result.height == 3  # noqa: PLR2004 all rows retained despite lowercase input
+    assert set(result["ticker"].unique().to_list()) == {"aapl", "msft"}
+
+
+def test_filter_to_trained_tickers_mixed_case_warning_uses_normalized() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["aapl", "tsla"],
+            "close_price": [15.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL"}
+
+    with capture_logs() as logs:
+        filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    warning_logs = [
+        log
+        for log in logs
+        if log["event"] == "Dropping tickers not in trained set"
+        and log.get("log_level") == "warning"
+    ]
+    assert len(warning_logs) == 1
+    assert "TSLA" in warning_logs[0]["dropped_tickers"]

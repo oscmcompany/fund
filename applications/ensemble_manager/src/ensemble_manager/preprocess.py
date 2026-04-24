@@ -8,8 +8,9 @@ def filter_to_trained_tickers(
     data: pl.DataFrame,
     trained_tickers: set[str],
 ) -> pl.DataFrame:
-    input_tickers = set(data["ticker"].unique().to_list())
-    dropped_tickers = input_tickers - trained_tickers
+    normalized_trained_tickers = {ticker.upper() for ticker in trained_tickers}
+    input_tickers = set(data["ticker"].str.to_uppercase().unique().to_list())
+    dropped_tickers = input_tickers - normalized_trained_tickers
 
     if dropped_tickers:
         logger.warning(
@@ -18,7 +19,9 @@ def filter_to_trained_tickers(
             dropped_tickers=sorted(dropped_tickers),
         )
 
-    return data.filter(pl.col("ticker").is_in(trained_tickers))
+    return data.filter(
+        pl.col("ticker").str.to_uppercase().is_in(normalized_trained_tickers)
+    )
 
 
 def filter_equity_bars(

@@ -342,3 +342,18 @@ def test_pipeline_honors_explicit_empty_stage_list(
     pipeline = Pipeline(stages=[])
     result = pipeline.run(data)
     assert result.equals(data)
+
+
+def test_apply_and_set_data_raises_on_unknown_category(
+    make_raw_data: Callable[..., pl.DataFrame],
+) -> None:
+    raw = make_raw_data(tickers=["AAPL"], days=60)
+    data = Data()
+    data.preprocess_and_set_data(raw)
+
+    inference_raw = make_raw_data(tickers=["AAPL"], days=10).with_columns(
+        pl.lit("NEW_SECTOR").alias("sector")
+    )
+
+    with pytest.raises(ValueError, match="Unknown categories for column 'sector'"):
+        data.apply_and_set_data(inference_raw)

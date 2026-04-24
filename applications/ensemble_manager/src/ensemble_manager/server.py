@@ -272,7 +272,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/model/predictions")
 @application.post("/predictions")
-def create_predictions(request: Request) -> Response:  # noqa: PLR0915
+def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     prediction_requests_total.inc()
     timer_start = start_timer()
     logger.info("Starting prediction generation process")
@@ -342,6 +342,12 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
     data = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    if data.is_empty():
+        prediction_errors_total.labels(stage="ticker_filtering").inc()
+        logger.error("No trained tickers available for prediction")
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     tide_data.apply_and_set_data(data=data)
 
