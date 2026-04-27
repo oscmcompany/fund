@@ -1,4 +1,5 @@
 import io
+import json
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -282,3 +283,103 @@ def prepare_training_data(  # noqa: PLR0913
     )
 
     return uri, stage_counts
+
+
+def fetch_prior_evaluations(
+    s3_client: "S3Client",
+    bucket_name: str,
+    artifact_prefix: str,
+    run_count: int,
+) -> list[dict[str, float]]:
+    """List evaluation JSON files under artifact_prefix and return the N most recent."""
+    logger.info(
+        "Fetching prior evaluations",
+        bucket=bucket_name,
+        prefix=artifact_prefix,
+        run_count=run_count,
+    )
+
+    all_file_objects = []
+    kwargs: dict[str, str] = {"Bucket": bucket_name, "Prefix": artifact_prefix}
+    try:
+        while True:
+            page = s3_client.list_objects_v2(**kwargs)
+            all_file_objects.extend(page.get("Contents", []))
+            if not page.get("IsTruncated"):
+                break
+            kwargs["ContinuationToken"] = page["NextContinuationToken"]
+    except ClientError as error:
+        logger.exception(
+            "Failed to list prior evaluation objects",
+            bucket=bucket_name,
+            prefix=artifact_prefix,
+            error=str(error),
+        )
+        return []
+
+    evaluation_objects = [
+        file_object
+        for file_object in all_file_objects
+        if file_object["Key"].endswith("/evaluation.json")
+    ]
+
+    if not evaluation_objects:
+        logger.info(
+            "No prior evaluations found",
+            bucket=bucket_name,
+            prefix=artifact_prefix,
+        )
+        return []
+
+    evaluation_objects.sort(
+        key=lambda file_object: file_object["LastModified"], reverse=True
+    )
+    most_recent_evaluation = evaluation_objects[:run_count]
+
+    prior_evaluations = []
+    for file_object in most_recent_evaluation:
+        try:
+            get_response = s3_client.get_object(
+                Bucket=bucket_name,
+                Key=file_object["Key"],
+            )
+            evaluation_data = json.loads(get_response["Body"].read())
+            prior_evaluations.append(evaluation_data)
+        except ClientError as error:
+            logger.exception(
+                "Failed to read evaluation file",
+                key=file_object["Key"],
+                error=str(error),
+            )
+
+    logger.info(
+        "Fetched prior evaluations",
+        count=len(prior_evaluations),
+    )
+
+    return prior_evaluations
+
+
+def write_evaluation_results(
+    s3_client: "S3Client",
+    bucket_name: str,
+    results: dict[str, float],
+    run_id: str,
+) -> None:
+    """Write evaluation results as JSON to artifacts/tide/{run_id}/evaluation.json."""
+    key = f"artifacts/tide/{run_id}/evaluation.json"
+
+    logger.info(
+        "Writing evaluation results",
+        bucket=bucket_name,
+        key=key,
+    )
+
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(results),
+        ContentType="application/json",
+    )
+
+    logger.info("Evaluation results written", key=key)

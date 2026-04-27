@@ -892,9 +892,11 @@ esac
 echo "Deployment complete: ${model_name}"
 ```
 
-### download (model_name)
+### download (model_name) [run_id]
 
 > Download model artifacts
+>
+> Optionally pass a run_id to skip interactive selection and download a specific run.
 
 ```bash
 set -euo pipefail
@@ -902,6 +904,7 @@ set -euo pipefail
 case "${model_name}" in
     tide)
         export APPLICATION_NAME="${model_name}"
+        export FUND_ARTIFACT_RUN_ID="${run_id:-}"
         uv run python -m tools.download_model_artifacts
         ;;
     *)
