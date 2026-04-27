@@ -290,7 +290,7 @@ def fetch_prior_evaluations(
     bucket_name: str,
     artifact_prefix: str,
     run_count: int,
-) -> list[dict]:
+) -> list[dict[str, float]]:
     """List evaluation JSON files under artifact_prefix and return the N most recent."""
     logger.info(
         "Fetching prior evaluations",
@@ -300,7 +300,7 @@ def fetch_prior_evaluations(
     )
 
     all_file_objects = []
-    kwargs: dict = {"Bucket": bucket_name, "Prefix": artifact_prefix}
+    kwargs: dict[str, str] = {"Bucket": bucket_name, "Prefix": artifact_prefix}
     try:
         while True:
             page = s3_client.list_objects_v2(**kwargs)
@@ -363,7 +363,7 @@ def fetch_prior_evaluations(
 def write_evaluation_results(
     s3_client: "S3Client",
     bucket_name: str,
-    results: dict,
+    results: dict[str, float],
     run_id: str,
 ) -> None:
     """Write evaluation results as JSON to artifacts/tide/{run_id}/evaluation.json."""

@@ -97,7 +97,7 @@ def compute_quantile_coverage(
 
 def check_drift(
     current_metrics: dict[str, float],
-    prior_evaluations: list[dict],
+    prior_evaluations: list[dict[str, float]],
     minimum_runs: int = 3,
     degradation_threshold: float = 0.20,
 ) -> DriftResult:
