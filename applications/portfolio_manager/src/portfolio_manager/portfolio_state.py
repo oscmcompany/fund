@@ -1,6 +1,7 @@
 import io
 import os
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import numpy as np
@@ -83,7 +84,7 @@ async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -
         return False
 
 
-async def save_performance_snapshot(snapshot: dict) -> bool:
+async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -101,7 +102,7 @@ async def save_performance_snapshot(snapshot: dict) -> bool:
         return False
 
 
-async def save_closed_pair(record: dict) -> bool:
+async def save_closed_pair(record: dict[str, Any]) -> bool:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
@@ -132,9 +133,6 @@ async def get_last_portfolio_value() -> float | None:
                     "end_timestamp": now.isoformat(),
                 },
             )
-
-        if response.status_code == 404:  # noqa: PLR2004
-            return None
 
         response.raise_for_status()
 

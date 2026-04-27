@@ -371,7 +371,9 @@ async def _record_performance(  # noqa: PLR0913
             realized_profit_and_loss=realized_profit_and_loss,
             return_percent=return_percent,
         )
-        await save_closed_pair(record)
+        pair_saved = await save_closed_pair(record)
+        if not pair_saved:
+            logger.warning("Failed to persist closed pair record", pair_id=pair_id)
 
     cash = float(account.cash_amount)
     portfolio_value = compute_portfolio_value(final_portfolio, current_prices, cash)
@@ -401,4 +403,6 @@ async def _record_performance(  # noqa: PLR0913
         open_pair_count=open_pair_count,
         timestamp=current_timestamp,
     )
-    await save_performance_snapshot(snapshot)
+    snapshot_saved = await save_performance_snapshot(snapshot)
+    if not snapshot_saved:
+        logger.warning("Failed to persist performance snapshot")
