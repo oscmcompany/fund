@@ -23,6 +23,7 @@ def test_create_predictions_some_tickers_dropped_continues() -> None:
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
         patch("ensemble_manager.server.parse_responses") as mock_parse,
         patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.Model.load"),
         patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
@@ -58,6 +59,7 @@ def test_create_predictions_all_tickers_dropped_returns_500() -> None:
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
         patch("ensemble_manager.server.parse_responses") as mock_parse,
         patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.Model.load"),
         patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
