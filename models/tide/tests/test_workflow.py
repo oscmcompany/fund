@@ -188,6 +188,7 @@ def test_prepare_data_raises_on_missing_blocks(
         )
 
 
+@patch("tide.workflow.evaluate_tide_model")
 @patch("tide.workflow.train_tide_model", return_value="s3://bucket/model")
 @patch("tide.workflow.prepare_data", return_value=("training/data.parquet", {}))
 @patch("tide.workflow.get_training_date_range")
@@ -195,6 +196,7 @@ def test_training_pipeline_threads_data_key(
     mock_date_range: MagicMock,
     mock_prepare: MagicMock,
     mock_train: MagicMock,
+    mock_evaluate: MagicMock,
 ) -> None:
     start_date = datetime(2024, 1, 1, tzinfo=UTC)
     end_date = datetime(2024, 1, 31, tzinfo=UTC)
@@ -207,6 +209,9 @@ def test_training_pipeline_threads_data_key(
     mock_date_range.assert_called_once_with(LOOKBACK_DAYS)
     mock_prepare.assert_called_once_with(start_date, end_date, ANY)
     mock_train.assert_called_once_with("training/data.parquet", ANY, ANY)
+    mock_evaluate.assert_called_once_with(
+        "s3://bucket/model", "training/data.parquet", ANY
+    )
     assert result == "s3://bucket/model"
 
 

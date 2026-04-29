@@ -349,6 +349,42 @@ class Data:
         self.scaler = cast("Scaler", scale_and_encode.scaler)
         self.mappings = cast("FeatureMappings", scale_and_encode.mappings)
 
+    def apply_and_set_data(self, data: pl.DataFrame) -> None:
+        pipeline = Pipeline(stages=[ValidateColumns(), EngineerFeatures(), CleanData()])
+        data = pipeline.run(data)
+
+        data = data.with_columns(
+            *[
+                (pl.col(col) - self.scaler.means[col])
+                / self.scaler.standard_deviations[col]
+                for col in self.continuous_columns
+            ]
+        )
+
+        for col in self.continuous_columns:
+            nan_count = data.filter(pl.col(col).is_nan()).height
+            if nan_count > 0:
+                message = (
+                    f"NaN values after scaling column '{col}': "
+                    f"{nan_count}/{data.height} rows"
+                )
+                raise ValueError(message)
+
+        for column, mapping in self.mappings.items():
+            unknown_values = set(data[column].unique().to_list()) - set(mapping)
+            if unknown_values:
+                message = (
+                    f"Unknown categories for column '{column}': "
+                    f"{sorted(unknown_values)}"
+                )
+                raise ValueError(message)
+
+            data = data.with_columns(
+                pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
+            )
+
+        self.data = data
+
     def _get_training_and_validation_data(
         self,
         validation_split: float = 0.8,

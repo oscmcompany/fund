@@ -39,7 +39,7 @@ from .metrics import (
     start_timer,
 )
 from .predictions_schema import predictions_schema
-from .preprocess import filter_equity_bars
+from .preprocess import filter_equity_bars, filter_to_trained_tickers
 
 sentry_sdk.init(
     dsn=os.environ.get("SENTRY_DSN"),
@@ -272,7 +272,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/model/predictions")
 @application.post("/predictions")
-def create_predictions(request: Request) -> Response:  # noqa: PLR0915
+def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     prediction_requests_total.inc()
     timer_start = start_timer()
     logger.info("Starting prediction generation process")
@@ -340,7 +340,27 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0915
 
     tide_data = Data.load(directory_path=request.app.state.model_directory)
 
-    tide_data.preprocess_and_set_data(data=data)
+    trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
+    input_ticker_count = data.select(pl.col("ticker").n_unique()).item()
+    data = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    if data.is_empty():
+        prediction_errors_total.labels(stage="ticker_filtering").inc()
+        logger.error(
+            "No input tickers matched trained set",
+            input_ticker_count=input_ticker_count,
+            trained_ticker_count=len(trained_tickers),
+        )
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        tide_data.apply_and_set_data(data=data)
+    except ValueError:
+        prediction_errors_total.labels(stage="apply_preprocessing").inc()
+        logger.exception("Failed to apply preprocessing to inference data")
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
