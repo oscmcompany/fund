@@ -299,15 +299,11 @@ def fetch_prior_evaluations(
         run_count=run_count,
     )
 
+    paginator = s3_client.get_paginator("list_objects_v2")
     all_file_objects = []
-    kwargs: dict[str, str] = {"Bucket": bucket_name, "Prefix": artifact_prefix}
     try:
-        while True:
-            page = s3_client.list_objects_v2(**kwargs)
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=artifact_prefix):
             all_file_objects.extend(page.get("Contents", []))
-            if not page.get("IsTruncated"):
-                break
-            kwargs["ContinuationToken"] = page["NextContinuationToken"]
     except ClientError as error:
         logger.exception(
             "Failed to list prior evaluation objects",
