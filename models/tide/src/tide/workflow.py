@@ -126,11 +126,11 @@ def train_tide_model(
         training_data_key=resolved_training_data_key,
     )
 
-    response = s3_client.get_object(
+    training_data_response = s3_client.get_object(
         Bucket=artifacts_bucket,
         Key=resolved_training_data_key,
     )
-    training_data = pl.read_parquet(response["Body"].read())
+    training_data = pl.read_parquet(training_data_response["Body"].read())
     logger.info("Training data loaded", rows=training_data.height)
 
     start_run(
@@ -235,11 +235,11 @@ def evaluate_tide_model(
         training_data_key=resolved_training_data_key,
     )
 
-    response = s3_client.get_object(
+    training_data_response = s3_client.get_object(
         Bucket=artifacts_bucket,
         Key=resolved_training_data_key,
     )
-    training_data = pl.read_parquet(response["Body"].read())
+    training_data = pl.read_parquet(training_data_response["Body"].read())
 
     tide_data = Data()
     tide_data.preprocess_and_set_data(training_data)
@@ -268,9 +268,9 @@ def evaluate_tide_model(
 
         tide_model = Model.load(directory_path=tmpdir)
 
-    logger.info("Running model evaluation")
+        logger.info("Running model evaluation")
 
-    evaluation_results = evaluate(tide_model, validation_dataset)
+        evaluation_results = evaluate(tide_model, validation_dataset)
 
     prior_evaluations = fetch_prior_evaluations(
         s3_client=s3_client,

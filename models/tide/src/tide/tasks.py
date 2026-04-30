@@ -290,7 +290,7 @@ def fetch_prior_evaluations(
     bucket_name: str,
     artifact_prefix: str,
     run_count: int,
-) -> list[dict]:
+) -> list[dict[str, float]]:
     """List evaluation JSON files under artifact_prefix and return the N most recent."""
     logger.info(
         "Fetching prior evaluations",
@@ -299,11 +299,11 @@ def fetch_prior_evaluations(
         run_count=run_count,
     )
 
+    paginator = s3_client.get_paginator("list_objects_v2")
+    all_file_objects = []
     try:
-        response = s3_client.list_objects_v2(
-            Bucket=bucket_name,
-            Prefix=artifact_prefix,
-        )
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=artifact_prefix):
+            all_file_objects.extend(page.get("Contents", []))
     except ClientError as error:
         logger.exception(
             "Failed to list prior evaluation objects",
@@ -315,7 +315,7 @@ def fetch_prior_evaluations(
 
     evaluation_objects = [
         file_object
-        for file_object in response.get("Contents", [])
+        for file_object in all_file_objects
         if file_object["Key"].endswith("/evaluation.json")
     ]
 
@@ -330,10 +330,10 @@ def fetch_prior_evaluations(
     evaluation_objects.sort(
         key=lambda file_object: file_object["LastModified"], reverse=True
     )
-    most_recent = evaluation_objects[:run_count]
+    most_recent_evaluation = evaluation_objects[:run_count]
 
     prior_evaluations = []
-    for file_object in most_recent:
+    for file_object in most_recent_evaluation:
         try:
             get_response = s3_client.get_object(
                 Bucket=bucket_name,
@@ -359,7 +359,7 @@ def fetch_prior_evaluations(
 def write_evaluation_results(
     s3_client: "S3Client",
     bucket_name: str,
-    results: dict,
+    results: dict[str, float],
     run_id: str,
 ) -> None:
     """Write evaluation results as JSON to artifacts/tide/{run_id}/evaluation.json."""

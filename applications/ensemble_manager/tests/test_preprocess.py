@@ -1,6 +1,6 @@
 import polars as pl
-import pytest
 from ensemble_manager.preprocess import filter_equity_bars, filter_to_trained_tickers
+from structlog.testing import capture_logs
 
 
 def test_filter_equity_bars_above_thresholds() -> None:
@@ -236,9 +236,7 @@ def test_filter_to_trained_tickers_unknown_tickers_dropped() -> None:
     assert result["ticker"].unique().to_list() == ["AAPL"]
 
 
-def test_filter_to_trained_tickers_warning_logged_when_dropping(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_filter_to_trained_tickers_warning_logged_when_dropping() -> None:
     data = pl.DataFrame(
         {
             "ticker": ["AAPL", "TSLA"],
@@ -247,18 +245,17 @@ def test_filter_to_trained_tickers_warning_logged_when_dropping(
     )
     trained_tickers = {"AAPL"}
 
-    with caplog.at_level("WARNING"):
+    with capture_logs() as logs:
         filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
     assert any(
-        "Dropping tickers not in trained set" in record.message
-        for record in caplog.records
+        log["event"] == "Dropping tickers not in trained set"
+        and log.get("log_level") == "warning"
+        for log in logs
     )
 
 
-def test_filter_to_trained_tickers_no_warning_when_all_known(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_filter_to_trained_tickers_no_warning_when_all_known() -> None:
     data = pl.DataFrame(
         {
             "ticker": ["AAPL", "MSFT"],
@@ -267,7 +264,44 @@ def test_filter_to_trained_tickers_no_warning_when_all_known(
     )
     trained_tickers = {"AAPL", "MSFT"}
 
-    with caplog.at_level("WARNING"):
+    with capture_logs() as logs:
         filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
 
-    assert not any("Dropping tickers" in record.message for record in caplog.records)
+    assert not any("Dropping tickers" in log["event"] for log in logs)
+
+
+def test_filter_to_trained_tickers_lowercase_input_passes_through() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["aapl", "aapl", "msft"],
+            "close_price": [15.0, 20.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL", "MSFT"}
+
+    result = filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    assert result.height == 3  # noqa: PLR2004 all rows retained despite lowercase input
+    assert set(result["ticker"].unique().to_list()) == {"AAPL", "MSFT"}
+
+
+def test_filter_to_trained_tickers_mixed_case_warning_uses_normalized() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["aapl", "tsla"],
+            "close_price": [15.0, 25.0],
+        }
+    )
+    trained_tickers = {"AAPL"}
+
+    with capture_logs() as logs:
+        filter_to_trained_tickers(data=data, trained_tickers=trained_tickers)
+
+    warning_logs = [
+        log
+        for log in logs
+        if log["event"] == "Dropping tickers not in trained set"
+        and log.get("log_level") == "warning"
+    ]
+    assert len(warning_logs) == 1
+    assert "TSLA" in warning_logs[0]["dropped_tickers"]
