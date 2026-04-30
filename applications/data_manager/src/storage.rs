@@ -674,20 +674,31 @@ pub async fn query_equity_bars_parquet_from_s3(
         }
     };
 
-    let cache_key = format!(
-        "equity_bars:{}:{}:{}",
-        state.bucket_name,
-        start_timestamp.timestamp(),
-        end_timestamp.timestamp(),
-    ) + &tickers
+    let ticker_key = tickers
         .as_ref()
-        .map(|ticker_list| ticker_list.join(","))
+        .map(|ticker_list| {
+            let mut normalized = ticker_list.clone();
+            normalized.sort();
+            normalized.dedup();
+            normalized.join(",")
+        })
         .unwrap_or_default();
 
+    let cache_key = format!(
+        "equity_bars:{}:{}:{}:{}",
+        state.bucket_name,
+        start_timestamp.timestamp_millis(),
+        end_timestamp.timestamp_millis(),
+        ticker_key,
+    );
+
     let cached = tokio::task::block_in_place(|| match state.cache.lock() {
-        Ok(mut cache) => Ok(cache.get(&cache_key)),
-        Err(_) => Err(Error::Other("Query cache lock poisoned".into())),
-    })?;
+        Ok(mut cache) => cache.get(&cache_key),
+        Err(_) => {
+            warn!("Query cache lock poisoned; treating as cache miss");
+            None
+        }
+    });
     if let Some(cached) = cached {
         info!("Cache hit for equity bars query");
         return Ok(cached);
@@ -963,7 +974,8 @@ pub async fn query_portfolio_dataframe_from_s3(
                     side,
                     dollar_amount,
                     action,
-                    pair_id
+                    pair_id,
+                    TRY_CAST(entry_price AS DOUBLE) AS entry_price
                 FROM '{}'
                 ORDER BY timestamp, ticker
                 ",
@@ -990,6 +1002,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                         dollar_amount,
                         action,
                         pair_id,
+                        TRY_CAST(entry_price AS DOUBLE) AS entry_price,
                         year,
                         month,
                         day
@@ -1005,7 +1018,8 @@ pub async fn query_portfolio_dataframe_from_s3(
                     side,
                     dollar_amount,
                     action,
-                    pair_id
+                    pair_id,
+                    entry_price
                 FROM partitioned_data
                 WHERE (year::int * 10000 + month::int * 100 + day::int) = (SELECT date_int FROM max_date)
                 ORDER BY timestamp, ticker
@@ -1044,6 +1058,7 @@ fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<P
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,
                 pair_id: row.get::<_, String>(5)?,
+                entry_price: row.get::<_, Option<f64>>(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()

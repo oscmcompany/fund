@@ -46,6 +46,22 @@ ENSEMBLE_MANAGER_BASE_URL = os.getenv(
 )
 
 
+def _prune_pairs_with_invalid_entry_price(portfolio: pl.DataFrame) -> pl.DataFrame:
+    invalid_pair_ids = (
+        portfolio.filter(
+            pl.col("entry_price").is_null() | (pl.col("entry_price") <= 0)
+        )["pair_id"]
+        .unique()
+        .to_list()
+    )
+    if invalid_pair_ids:
+        logger.warning(
+            "Dropped entire pairs with invalid entry price",
+            dropped_pair_count=len(invalid_pair_ids),
+        )
+    return portfolio.filter(~pl.col("pair_id").is_in(invalid_pair_ids))
+
+
 async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
     metrics.rebalance_requests_total.inc()
     start = metrics.start_timer()
@@ -222,19 +238,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     )
     optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
 
-    pairs_with_missing_price = (
-        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
-        .unique()
-        .to_list()
-    )
-    if pairs_with_missing_price:
-        logger.warning(
-            "Dropped entire pairs with missing entry price",
-            dropped_pair_count=len(pairs_with_missing_price),
-        )
-    optimal_portfolio = optimal_portfolio.filter(
-        ~pl.col("pair_id").is_in(pairs_with_missing_price)
-    )
+    optimal_portfolio = _prune_pairs_with_invalid_entry_price(optimal_portfolio)
 
     try:
         open_positions, close_positions = get_positions(

@@ -10,6 +10,7 @@ from portfolio_manager.portfolio_state import (
     evaluate_prior_pairs,
     get_prior_portfolio,
 )
+from portfolio_manager.rebalance import _prune_pairs_with_invalid_entry_price
 from portfolio_manager.trade_execution import get_positions
 
 
@@ -359,7 +360,7 @@ def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() ->
 
 
 def test_pair_filtering_drops_both_legs_when_one_leg_has_no_entry_price() -> None:
-    optimal_portfolio = pl.DataFrame(
+    portfolio = pl.DataFrame(
         {
             "ticker": ["AAPL", "MSFT", "NVDA", "AMD"],
             "pair_id": ["AAPL-MSFT", "AAPL-MSFT", "NVDA-AMD", "NVDA-AMD"],
@@ -368,14 +369,7 @@ def test_pair_filtering_drops_both_legs_when_one_leg_has_no_entry_price() -> Non
             "entry_price": [100.0, None, 200.0, 150.0],
         }
     )
-    pairs_with_missing_price = (
-        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
-        .unique()
-        .to_list()
-    )
-    filtered = optimal_portfolio.filter(
-        ~pl.col("pair_id").is_in(pairs_with_missing_price)
-    )
+    filtered = _prune_pairs_with_invalid_entry_price(portfolio)
     # AAPL-MSFT pair dropped entirely; only NVDA-AMD survives
     assert filtered.height == 2  # noqa: PLR2004
     assert "AAPL" not in filtered["ticker"].to_list()
@@ -385,7 +379,7 @@ def test_pair_filtering_drops_both_legs_when_one_leg_has_no_entry_price() -> Non
 
 
 def test_pair_filtering_retains_all_rows_when_no_prices_are_missing() -> None:
-    optimal_portfolio = pl.DataFrame(
+    portfolio = pl.DataFrame(
         {
             "ticker": ["AAPL", "MSFT"],
             "pair_id": ["AAPL-MSFT", "AAPL-MSFT"],
@@ -394,15 +388,29 @@ def test_pair_filtering_retains_all_rows_when_no_prices_are_missing() -> None:
             "entry_price": [100.0, 200.0],
         }
     )
-    pairs_with_missing_price = (
-        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
-        .unique()
-        .to_list()
-    )
-    filtered = optimal_portfolio.filter(
-        ~pl.col("pair_id").is_in(pairs_with_missing_price)
-    )
+    filtered = _prune_pairs_with_invalid_entry_price(portfolio)
     assert filtered.height == 2  # noqa: PLR2004
+
+
+def test_pair_filtering_drops_both_legs_when_one_leg_has_nonpositive_entry_price() -> (
+    None
+):
+    portfolio = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT", "NVDA", "AMD"],
+            "pair_id": ["AAPL-MSFT", "AAPL-MSFT", "NVDA-AMD", "NVDA-AMD"],
+            "side": ["LONG", "SHORT", "LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0, 1000.0, 1000.0],
+            "entry_price": [100.0, 0.0, 200.0, 150.0],
+        }
+    )
+    filtered = _prune_pairs_with_invalid_entry_price(portfolio)
+    # AAPL-MSFT pair dropped entirely due to zero entry_price; only NVDA-AMD survives
+    assert filtered.height == 2  # noqa: PLR2004
+    assert "AAPL" not in filtered["ticker"].to_list()
+    assert "MSFT" not in filtered["ticker"].to_list()
+    assert "NVDA" in filtered["ticker"].to_list()
+    assert "AMD" in filtered["ticker"].to_list()
 
 
 # --- get_positions ---

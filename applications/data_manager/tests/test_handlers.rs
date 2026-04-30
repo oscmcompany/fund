@@ -851,7 +851,15 @@ async fn test_performance_snapshot_save_and_query_round_trip() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!response.bytes().await.unwrap().is_empty());
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(
+        dataframe.column("timestamp").unwrap().i64().unwrap().get(0),
+        Some(1735689600000i64)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -868,7 +876,12 @@ async fn test_performance_snapshot_query_returns_empty_parquet_when_no_data() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!response.bytes().await.unwrap().is_empty());
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 0);
+    assert!(dataframe.column("timestamp").is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -913,8 +926,8 @@ async fn test_performance_snapshot_save_returns_internal_server_error_when_s3_fa
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     // Error body must not expose internal details
-    let body = response.text().await.unwrap();
-    assert!(!body.contains("S3") && !body.contains("aws") && !body.contains("bucket"));
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }
 
 // --- Closed pair handlers ---
@@ -958,7 +971,15 @@ async fn test_closed_pair_save_and_query_round_trip() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!response.bytes().await.unwrap().is_empty());
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(
+        dataframe.column("pair_id").unwrap().str().unwrap().get(0),
+        Some("AAPL-MSFT-001")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -975,7 +996,12 @@ async fn test_closed_pair_query_returns_empty_parquet_when_no_data() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!response.bytes().await.unwrap().is_empty());
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 0);
+    assert!(dataframe.column("closed_timestamp").is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1022,8 +1048,8 @@ async fn test_closed_pair_save_returns_internal_server_error_when_s3_fails() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = response.text().await.unwrap();
-    assert!(!body.contains("S3") && !body.contains("aws") && !body.contains("bucket"));
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

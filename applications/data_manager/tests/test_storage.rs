@@ -42,6 +42,7 @@ fn sample_portfolio() -> Portfolio {
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
         pair_id: "AAPL-MSFT".to_string(),
+        entry_price: Some(150.0),
     }
 }
 

@@ -45,6 +45,14 @@ pub async fn save_snapshot(
     AxumState(state): AxumState<State>,
     Json(payload): Json<SaveSnapshotPayload>,
 ) -> impl IntoResponse {
+    if payload.timestamp.timestamp_millis() != payload.data.timestamp {
+        return (
+            StatusCode::BAD_REQUEST,
+            "payload timestamp does not match data timestamp".to_string(),
+        )
+            .into_response();
+    }
+
     let dataframe = match create_performance_snapshot_dataframe(vec![payload.data]) {
         Ok(dataframe) => dataframe,
         Err(err) => {
@@ -137,6 +145,14 @@ pub async fn save_closed_pair(
     AxumState(state): AxumState<State>,
     Json(payload): Json<SaveClosedPairPayload>,
 ) -> impl IntoResponse {
+    if payload.timestamp.timestamp_millis() != payload.data.closed_timestamp {
+        return (
+            StatusCode::BAD_REQUEST,
+            "payload timestamp does not match data closed_timestamp".to_string(),
+        )
+            .into_response();
+    }
+
     let dataframe = match create_closed_pair_dataframe(vec![payload.data]) {
         Ok(dataframe) => dataframe,
         Err(err) => {
