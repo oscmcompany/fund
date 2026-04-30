@@ -226,11 +226,10 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         pl.col("entry_price").is_null()
     )["ticker"].to_list()
     if null_entry_tickers:
-        for ticker in null_entry_tickers:
-            logger.warning(
-                "Missing entry price after join, excluding ticker from portfolio",
-                ticker=ticker,
-            )
+        logger.warning(
+            "Missing entry prices after join, excluding tickers from portfolio",
+            tickers=null_entry_tickers,
+        )
         optimal_portfolio = optimal_portfolio.filter(
             pl.col("entry_price").is_not_null()
         )

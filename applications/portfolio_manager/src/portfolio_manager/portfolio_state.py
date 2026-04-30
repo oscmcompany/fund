@@ -49,13 +49,16 @@ async def get_prior_portfolio() -> pl.DataFrame:
             return empty
 
         # Build from data using only the columns present, then add missing ones
-        # for backward compatibility with pre-migration data lacking entry_price.
+        # in a single with_columns call for backward compatibility with
+        # pre-migration data lacking entry_price.
         prior_portfolio = pl.DataFrame(prior_portfolio_data)
-        for col, dtype in _PRIOR_PORTFOLIO_SCHEMA.items():
-            if col not in prior_portfolio.columns:
-                prior_portfolio = prior_portfolio.with_columns(
-                    pl.lit(None).cast(dtype).alias(col)
-                )
+        missing_columns = [
+            pl.lit(None).cast(dtype).alias(col)
+            for col, dtype in _PRIOR_PORTFOLIO_SCHEMA.items()
+            if col not in prior_portfolio.columns
+        ]
+        if missing_columns:
+            prior_portfolio = prior_portfolio.with_columns(missing_columns)
         prior_portfolio = prior_portfolio.select(list(_PRIOR_PORTFOLIO_SCHEMA.keys()))
 
         if prior_portfolio.is_empty():
