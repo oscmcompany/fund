@@ -372,7 +372,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
         observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    logger.info("Processing prediction dataset", num_samples=len(dataset))
+    logger.info("Processing prediction dataset", samples_count=len(dataset))
 
     batch = {
         "past_continuous_features": Tensor(dataset.past_continuous),

@@ -3,6 +3,7 @@ pub mod equity_bars;
 pub mod equity_details;
 pub mod errors;
 pub mod health;
+pub mod performance;
 pub mod portfolios;
 pub mod predictions;
 pub mod router;

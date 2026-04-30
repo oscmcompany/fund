@@ -3,9 +3,11 @@ mod common;
 use data_manager::{
     router::create_app_with_state,
     state::{MassiveSecrets, State},
+    storage::QueryCache,
 };
 use reqwest::StatusCode;
 use serial_test::serial;
+use std::sync::{Arc, Mutex};
 
 use common::{
     create_test_s3_client, setup_test_bucket, test_bucket_name, EnvironmentVariableGuard,
@@ -23,6 +25,7 @@ async fn create_state_for_endpoint(endpoint: &str, bucket_name: &str) -> State {
         },
         s3_client,
         bucket_name.to_string(),
+        Arc::new(Mutex::new(QueryCache::new(300))),
     )
 }
 

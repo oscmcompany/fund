@@ -2,8 +2,10 @@ mod common;
 
 use common::initialize_test_tracing;
 use data_manager::data::{
-    create_equity_bar_dataframe, create_equity_details_dataframe, create_portfolio_dataframe,
-    create_predictions_dataframe, EquityBar, Portfolio, Prediction,
+    create_closed_pair_dataframe, create_equity_bar_dataframe, create_equity_details_dataframe,
+    create_performance_snapshot_dataframe, create_portfolio_dataframe,
+    create_predictions_dataframe, ClosedPair, EquityBar, PerformanceSnapshot, Portfolio,
+    Prediction,
 };
 use polars::prelude::*;
 
@@ -683,4 +685,99 @@ fn test_parquet_empty_dataframe_roundtrip() {
 
     assert_eq!(deserialized_df.width(), 9);
     assert_eq!(deserialized_df.height(), 0);
+}
+
+#[test]
+fn test_create_performance_snapshot_dataframe_single_row() {
+    initialize_test_tracing();
+    let snapshot = PerformanceSnapshot {
+        timestamp: 1735689600000,
+        portfolio_value: 100000.0,
+        cash_balance: 25000.0,
+        spy_close: 590.0,
+        period_return_percent: 0.05,
+        open_pair_count: 3,
+    };
+
+    let dataframe = create_performance_snapshot_dataframe(vec![snapshot]).unwrap();
+
+    assert_eq!(dataframe.height(), 1);
+    assert!(dataframe.column("timestamp").is_ok());
+    assert!(dataframe.column("portfolio_value").is_ok());
+    assert!(dataframe.column("cash_balance").is_ok());
+    assert!(dataframe.column("spy_close").is_ok());
+    assert!(dataframe.column("period_return_percent").is_ok());
+    assert!(dataframe.column("open_pair_count").is_ok());
+
+    let timestamp_value = dataframe.column("timestamp").unwrap().i64().unwrap().get(0);
+    assert_eq!(timestamp_value, Some(1735689600000i64));
+}
+
+#[test]
+fn test_create_performance_snapshot_dataframe_empty() {
+    initialize_test_tracing();
+    let snapshots: Vec<PerformanceSnapshot> = vec![];
+
+    let dataframe = create_performance_snapshot_dataframe(snapshots).unwrap();
+
+    assert_eq!(dataframe.height(), 0);
+    assert_eq!(dataframe.width(), 6);
+}
+
+#[test]
+fn test_create_closed_pair_dataframe_uppercase() {
+    initialize_test_tracing();
+    let closed_pair = ClosedPair {
+        closed_timestamp: 1735689600000,
+        pair_id: "aapl-msft".to_string(),
+        long_ticker: "aapl".to_string(),
+        short_ticker: "msft".to_string(),
+        entry_timestamp: 1735000000000,
+        dollar_amount: 10000.0,
+        realized_profit_and_loss: 250.0,
+        return_percent: 0.025,
+        holding_days: 5,
+    };
+
+    let dataframe = create_closed_pair_dataframe(vec![closed_pair]).unwrap();
+
+    assert_eq!(dataframe.height(), 1);
+
+    let pair_id = dataframe
+        .column("pair_id")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(pair_id, "AAPL-MSFT");
+
+    let long_ticker = dataframe
+        .column("long_ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(long_ticker, "AAPL");
+
+    let short_ticker = dataframe
+        .column("short_ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(short_ticker, "MSFT");
+}
+
+#[test]
+fn test_create_closed_pair_dataframe_empty() {
+    initialize_test_tracing();
+    let closed_pairs: Vec<ClosedPair> = vec![];
+
+    let dataframe = create_closed_pair_dataframe(closed_pairs).unwrap();
+
+    assert_eq!(dataframe.height(), 0);
+    assert_eq!(dataframe.width(), 9);
 }

@@ -3,11 +3,13 @@ mod common;
 use data_manager::{
     router::create_app_with_state,
     state::{MassiveSecrets, State},
+    storage::QueryCache,
 };
 use mockito::{Matcher, Server};
 use polars::prelude::*;
 use reqwest::StatusCode;
 use serial_test::serial;
+use std::sync::{Arc, Mutex};
 
 use common::{
     create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name,
@@ -29,6 +31,7 @@ async fn spawn_app(
         },
         s3_client,
         test_bucket_name(),
+        Arc::new(Mutex::new(QueryCache::new(300))),
     );
     let app = create_app_with_state(state);
     (SpawnedAppServer::start(app).await, env_guard)
@@ -50,6 +53,7 @@ async fn spawn_app_with_unreachable_s3(
         },
         unreachable_s3_client,
         "test-bucket".to_string(),
+        Arc::new(Mutex::new(QueryCache::new(300))),
     );
     let app = create_app_with_state(state);
     (SpawnedAppServer::start(app).await, env_guard)

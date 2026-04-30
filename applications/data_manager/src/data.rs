@@ -171,6 +171,98 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
     Ok(portfolio_dataframe)
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct PerformanceSnapshot {
+    pub timestamp: i64,
+    pub portfolio_value: f64,
+    pub cash_balance: f64,
+    pub spy_close: f64,
+    pub period_return_percent: f64,
+    pub open_pair_count: i64,
+}
+
+pub fn create_performance_snapshot_dataframe(
+    rows: Vec<PerformanceSnapshot>,
+) -> Result<DataFrame, Error> {
+    debug!(
+        "Creating performance snapshot DataFrame from {} rows",
+        rows.len()
+    );
+
+    let dataframe = df!(
+        "timestamp" => rows.iter().map(|r| r.timestamp).collect::<Vec<i64>>(),
+        "portfolio_value" => rows.iter().map(|r| r.portfolio_value).collect::<Vec<f64>>(),
+        "cash_balance" => rows.iter().map(|r| r.cash_balance).collect::<Vec<f64>>(),
+        "spy_close" => rows.iter().map(|r| r.spy_close).collect::<Vec<f64>>(),
+        "period_return_percent" => rows.iter().map(|r| r.period_return_percent).collect::<Vec<f64>>(),
+        "open_pair_count" => rows.iter().map(|r| r.open_pair_count).collect::<Vec<i64>>(),
+    )
+    .map_err(|e| {
+        Error::Other(format!(
+            "Failed to create performance snapshot DataFrame: {}",
+            e
+        ))
+    })?;
+
+    info!(
+        "Created performance snapshot DataFrame: {} rows x {} columns",
+        dataframe.height(),
+        dataframe.width()
+    );
+
+    Ok(dataframe)
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClosedPair {
+    pub closed_timestamp: i64,
+    pub pair_id: String,
+    pub long_ticker: String,
+    pub short_ticker: String,
+    pub entry_timestamp: i64,
+    pub dollar_amount: f64,
+    pub realized_profit_and_loss: f64,
+    pub return_percent: f64,
+    pub holding_days: i64,
+}
+
+pub fn create_closed_pair_dataframe(rows: Vec<ClosedPair>) -> Result<DataFrame, Error> {
+    debug!("Creating closed pair DataFrame from {} rows", rows.len());
+
+    let dataframe = df!(
+        "closed_timestamp" => rows.iter().map(|r| r.closed_timestamp).collect::<Vec<i64>>(),
+        "pair_id" => rows.iter().map(|r| r.pair_id.as_str()).collect::<Vec<&str>>(),
+        "long_ticker" => rows.iter().map(|r| r.long_ticker.as_str()).collect::<Vec<&str>>(),
+        "short_ticker" => rows.iter().map(|r| r.short_ticker.as_str()).collect::<Vec<&str>>(),
+        "entry_timestamp" => rows.iter().map(|r| r.entry_timestamp).collect::<Vec<i64>>(),
+        "dollar_amount" => rows.iter().map(|r| r.dollar_amount).collect::<Vec<f64>>(),
+        "realized_profit_and_loss" => rows.iter().map(|r| r.realized_profit_and_loss).collect::<Vec<f64>>(),
+        "return_percent" => rows.iter().map(|r| r.return_percent).collect::<Vec<f64>>(),
+        "holding_days" => rows.iter().map(|r| r.holding_days).collect::<Vec<i64>>(),
+    )
+    .map_err(|e| Error::Other(format!("Failed to create closed pair DataFrame: {}", e)))?;
+
+    debug!("Normalizing pair_id, long_ticker, and short_ticker columns to uppercase");
+    let dataframe = dataframe
+        .lazy()
+        .with_columns([col("pair_id").str().to_uppercase().alias("pair_id")])
+        .with_columns([col("long_ticker").str().to_uppercase().alias("long_ticker")])
+        .with_columns([col("short_ticker")
+            .str()
+            .to_uppercase()
+            .alias("short_ticker")])
+        .collect()
+        .map_err(|e| Error::Other(format!("Failed to normalize string columns: {}", e)))?;
+
+    info!(
+        "Created closed pair DataFrame: {} rows x {} columns",
+        dataframe.height(),
+        dataframe.width()
+    );
+
+    Ok(dataframe)
+}
+
 pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame, Error> {
     debug!(
         "Creating equity details DataFrame from CSV ({} bytes)",

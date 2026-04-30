@@ -1,5 +1,7 @@
+use crate::storage::QueryCache;
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 #[derive(Clone)]
@@ -14,6 +16,7 @@ pub struct State {
     pub massive: MassiveSecrets,
     pub s3_client: S3Client,
     pub bucket_name: String,
+    pub cache: Arc<Mutex<QueryCache>>,
 }
 
 impl State {
@@ -48,6 +51,8 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
+        let cache = Arc::new(Mutex::new(QueryCache::new(300)));
+
         info!("Application state initialized successfully");
 
         Self {
@@ -58,6 +63,7 @@ impl State {
             },
             s3_client,
             bucket_name,
+            cache,
         }
     }
 
@@ -66,12 +72,14 @@ impl State {
         massive: MassiveSecrets,
         s3_client: S3Client,
         bucket_name: String,
+        cache: Arc<Mutex<QueryCache>>,
     ) -> Self {
         Self {
             http_client,
             massive,
             s3_client,
             bucket_name,
+            cache,
         }
     }
 }

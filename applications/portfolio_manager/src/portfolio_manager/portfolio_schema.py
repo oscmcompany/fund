@@ -172,6 +172,12 @@ portfolio_schema = pa.DataFrameSchema(
             required=False,
         ),
         "pair_id": pa.Column(dtype=str),
+        "entry_price": pa.Column(
+            dtype=float,
+            checks=[pa.Check.greater_than(0)],
+            required=False,
+            nullable=False,
+        ),
     },
     unique=["ticker"],
     coerce=True,

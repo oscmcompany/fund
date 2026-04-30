@@ -7,16 +7,26 @@ import structlog
 from fastapi import Response, status
 
 from . import metrics
-from .alpaca_client import AlpacaClient
+from .alpaca_client import AlpacaAccount, AlpacaClient
 from .beta import compute_market_betas
 from .consolidation import consolidate_predictions
 from .data_client import fetch_equity_details, fetch_historical_prices, fetch_spy_prices
 from .exceptions import InsufficientPairsError
+from .performance import (
+    build_closed_pair_record,
+    build_performance_snapshot,
+    compute_period_return,
+    compute_portfolio_value,
+    compute_realized_profit_and_loss,
+)
 from .portfolio_schema import pairs_schema, portfolio_schema
 from .portfolio_state import (
     DATA_MANAGER_BASE_URL,
     evaluate_prior_pairs,
+    get_last_portfolio_value,
     get_prior_portfolio,
+    save_closed_pair,
+    save_performance_snapshot,
     save_portfolio,
 )
 from .regime import classify_regime
@@ -205,6 +215,13 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    latest_prices = (
+        historical_prices.sort("timestamp", descending=True)
+        .group_by("ticker")
+        .agg(pl.col("close_price").first().alias("entry_price"))
+    )
+    optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
+
     try:
         open_positions, close_positions = get_positions(
             prior_portfolio_tickers=prior_portfolio_tickers,
@@ -238,6 +255,19 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
     save_succeeded = await save_portfolio(final_portfolio, current_timestamp)
+
+    try:
+        await _record_performance(
+            prior_portfolio=prior_portfolio,
+            held_tickers=held_tickers,
+            final_portfolio=final_portfolio,
+            historical_prices=historical_prices,
+            spy_prices=spy_prices,
+            account=account,
+            current_timestamp=current_timestamp,
+        )
+    except Exception as e:
+        logger.exception("Failed to record performance metrics", error=str(e))
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -282,3 +312,97 @@ def get_optimal_portfolio(
     )
 
     return portfolio_schema.validate(optimal_portfolio)
+
+
+async def _record_performance(  # noqa: PLR0913
+    prior_portfolio: pl.DataFrame,
+    held_tickers: set[str],
+    final_portfolio: pl.DataFrame,
+    historical_prices: pl.DataFrame,
+    spy_prices: pl.DataFrame,
+    account: AlpacaAccount,
+    current_timestamp: datetime,
+) -> None:
+    current_prices = (
+        historical_prices.sort("timestamp", descending=True)
+        .group_by("ticker")
+        .agg(pl.col("close_price").first())
+    )
+
+    closing_tickers = set(prior_portfolio["ticker"].to_list()) - held_tickers
+    closing_pair_ids = (
+        prior_portfolio.filter(pl.col("ticker").is_in(closing_tickers))["pair_id"]
+        .unique()
+        .to_list()
+    )
+
+    for pair_id in closing_pair_ids:
+        pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id)
+
+        if "entry_price" not in pair_rows.columns:
+            logger.warning(
+                "Prior pair missing entry_price, skipping pnl calculation",
+                pair_id=pair_id,
+            )
+            continue
+
+        long_rows = pair_rows.filter(pl.col("side") == "LONG")
+        short_rows = pair_rows.filter(pl.col("side") == "SHORT")
+
+        if long_rows.is_empty() or short_rows.is_empty():
+            continue
+
+        realized_profit_and_loss, return_percent = compute_realized_profit_and_loss(
+            pair_rows, current_prices
+        )
+        dollar_amount = float(pair_rows["dollar_amount"].sum())
+        long_ticker = long_rows["ticker"][0]
+        short_ticker = short_rows["ticker"][0]
+        entry_timestamp = int(pair_rows["timestamp"][0])
+        closed_timestamp = int(current_timestamp.timestamp() * 1000)
+
+        record = build_closed_pair_record(
+            pair_id=pair_id,
+            long_ticker=long_ticker,
+            short_ticker=short_ticker,
+            entry_timestamp=entry_timestamp,
+            closed_timestamp=closed_timestamp,
+            dollar_amount=dollar_amount,
+            realized_profit_and_loss=realized_profit_and_loss,
+            return_percent=return_percent,
+        )
+        pair_saved = await save_closed_pair(record)
+        if not pair_saved:
+            logger.warning("Failed to persist closed pair record", pair_id=pair_id)
+
+    cash = float(account.cash_amount)
+    portfolio_value = compute_portfolio_value(final_portfolio, current_prices, cash)
+    previous_value = await get_last_portfolio_value()
+    period_return = (
+        compute_period_return(portfolio_value, previous_value)
+        if previous_value is not None
+        else 0.0
+    )
+
+    spy_close = 0.0
+    if not spy_prices.is_empty():
+        latest_spy = spy_prices.sort("timestamp", descending=True).head(1)
+        spy_close = (
+            float(latest_spy["close_price"][0])
+            if latest_spy["close_price"][0] is not None
+            else 0.0
+        )
+
+    open_pair_count = len(final_portfolio["pair_id"].unique().to_list())
+
+    snapshot = build_performance_snapshot(
+        portfolio_value=portfolio_value,
+        cash=cash,
+        spy_close=spy_close,
+        period_return=period_return,
+        open_pair_count=open_pair_count,
+        timestamp=current_timestamp,
+    )
+    snapshot_saved = await save_performance_snapshot(snapshot)
+    if not snapshot_saved:
+        logger.warning("Failed to persist performance snapshot")
