@@ -355,6 +355,56 @@ def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() ->
     assert result.is_empty()
 
 
+# --- pair-level entry price filtering ---
+
+
+def test_pair_filtering_drops_both_legs_when_one_leg_has_no_entry_price() -> None:
+    optimal_portfolio = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT", "NVDA", "AMD"],
+            "pair_id": ["AAPL-MSFT", "AAPL-MSFT", "NVDA-AMD", "NVDA-AMD"],
+            "side": ["LONG", "SHORT", "LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0, 1000.0, 1000.0],
+            "entry_price": [100.0, None, 200.0, 150.0],
+        }
+    )
+    pairs_with_missing_price = (
+        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
+        .unique()
+        .to_list()
+    )
+    filtered = optimal_portfolio.filter(
+        ~pl.col("pair_id").is_in(pairs_with_missing_price)
+    )
+    # AAPL-MSFT pair dropped entirely; only NVDA-AMD survives
+    assert filtered.height == 2  # noqa: PLR2004
+    assert "AAPL" not in filtered["ticker"].to_list()
+    assert "MSFT" not in filtered["ticker"].to_list()
+    assert "NVDA" in filtered["ticker"].to_list()
+    assert "AMD" in filtered["ticker"].to_list()
+
+
+def test_pair_filtering_retains_all_rows_when_no_prices_are_missing() -> None:
+    optimal_portfolio = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "pair_id": ["AAPL-MSFT", "AAPL-MSFT"],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, 200.0],
+        }
+    )
+    pairs_with_missing_price = (
+        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
+        .unique()
+        .to_list()
+    )
+    filtered = optimal_portfolio.filter(
+        ~pl.col("pair_id").is_in(pairs_with_missing_price)
+    )
+    assert filtered.height == 2  # noqa: PLR2004
+
+
 # --- get_positions ---
 
 

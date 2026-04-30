@@ -160,6 +160,22 @@ async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fail
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn test_predictions_query_returns_bad_request_for_seconds_precision_timestamp() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    // Timestamp in seconds (not milliseconds) should be rejected as out of range
+    let encoded = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600}]");
+    let response = reqwest::Client::new()
+        .get(app.url(&format!("/predictions?tickers_and_timestamps={}", encoded)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_predictions_query_returns_bad_request_for_invalid_url_encoding() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
@@ -1008,4 +1024,34 @@ async fn test_closed_pair_save_returns_internal_server_error_when_s3_fails() {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = response.text().await.unwrap();
     assert!(!body.contains("S3") && !body.contains("aws") && !body.contains("bucket"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_query_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/snapshots?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_query_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/closed-pairs?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

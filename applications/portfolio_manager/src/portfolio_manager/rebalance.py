@@ -222,14 +222,19 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     )
     optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
 
-    pre_join_count = len(optimal_portfolio)
-    optimal_portfolio = optimal_portfolio.filter(pl.col("entry_price").is_not_null())
-    dropped_count = pre_join_count - len(optimal_portfolio)
-    if dropped_count > 0:
+    pairs_with_missing_price = (
+        optimal_portfolio.filter(pl.col("entry_price").is_null())["pair_id"]
+        .unique()
+        .to_list()
+    )
+    if pairs_with_missing_price:
         logger.warning(
-            "Dropped portfolio rows with missing entry price after latest price join",
-            dropped_count=dropped_count,
+            "Dropped entire pairs with missing entry price",
+            dropped_pair_count=len(pairs_with_missing_price),
         )
+    optimal_portfolio = optimal_portfolio.filter(
+        ~pl.col("pair_id").is_in(pairs_with_missing_price)
+    )
 
     try:
         open_positions, close_positions = get_positions(

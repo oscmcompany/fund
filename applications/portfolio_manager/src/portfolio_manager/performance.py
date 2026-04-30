@@ -28,7 +28,7 @@ def compute_portfolio_value(
 
         dollar_amount = row["dollar_amount"]
         entry_price = row["entry_price"]
-        if entry_price is None:
+        if entry_price is None or entry_price <= 0:
             logger.warning("No entry price for position, skipping", ticker=ticker)
             continue
         side = row["side"]
@@ -66,7 +66,7 @@ def compute_realized_profit_and_loss(
         close_price = row.get("close_price")
         dollar_amount = row["dollar_amount"]
         entry_price = row["entry_price"]
-        if entry_price is None:
+        if entry_price is None or entry_price <= 0:
             logger.warning(
                 "No entry price for closing position, skipping", ticker=ticker
             )
@@ -132,9 +132,11 @@ def compute_maximum_drawdown(portfolio_values: list[float]) -> float | None:
         return None
 
     peak = portfolio_values[0]
+    if peak <= 0:
+        return None
     maximum_drawdown = 0.0
 
-    for value in portfolio_values:
+    for value in portfolio_values[1:]:
         peak = max(peak, value)
         drawdown = (peak - value) / peak
         maximum_drawdown = max(maximum_drawdown, drawdown)

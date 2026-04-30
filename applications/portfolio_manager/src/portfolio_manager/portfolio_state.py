@@ -127,13 +127,13 @@ async def save_closed_pair(record: dict[str, Any]) -> bool:
 async def get_last_portfolio_value() -> float | None:
     try:
         now = datetime.now(tz=UTC)
-        one_day_ago = now - timedelta(days=1)
+        seven_days_ago = now - timedelta(days=7)
 
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
                 params={
-                    "start_timestamp": one_day_ago.isoformat(),
+                    "start_timestamp": seven_days_ago.isoformat(),
                     "end_timestamp": now.isoformat(),
                 },
             )

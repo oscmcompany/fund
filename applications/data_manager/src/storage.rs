@@ -684,10 +684,10 @@ pub async fn query_equity_bars_parquet_from_s3(
         .map(|ticker_list| ticker_list.join(","))
         .unwrap_or_default();
 
-    let cached = tokio::task::block_in_place(|| {
-        let mut cache = state.cache.lock().unwrap();
-        cache.get(&cache_key)
-    });
+    let cached = tokio::task::block_in_place(|| match state.cache.lock() {
+        Ok(mut cache) => Ok(cache.get(&cache_key)),
+        Err(_) => Err(Error::Other("Query cache lock poisoned".into())),
+    })?;
     if let Some(cached) = cached {
         info!("Cache hit for equity bars query");
         return Ok(cached);
@@ -807,9 +807,9 @@ pub async fn query_equity_bars_parquet_from_s3(
 
     info!("Query returned {} bytes of parquet data", buffer.len());
 
-    tokio::task::block_in_place(|| {
-        let mut cache = state.cache.lock().unwrap();
-        cache.set(cache_key, buffer.clone());
+    tokio::task::block_in_place(|| match state.cache.lock() {
+        Ok(mut cache) => cache.set(cache_key, buffer.clone()),
+        Err(_) => warn!("Query cache lock poisoned; skipping cache write"),
     });
 
     Ok(buffer)
