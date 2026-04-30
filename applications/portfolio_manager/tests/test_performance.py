@@ -87,6 +87,27 @@ def test_compute_portfolio_value_missing_ticker_in_prices_is_skipped() -> None:
     assert result == pytest.approx(1000.0)
 
 
+def test_compute_portfolio_value_null_entry_price_is_skipped() -> None:
+    positions = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "LONG"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, None],
+        },
+        schema={
+            "ticker": pl.String,
+            "side": pl.String,
+            "dollar_amount": pl.Float64,
+            "entry_price": pl.Float64,
+        },
+    )
+    current_prices = _make_current_prices(["AAPL", "MSFT"], [100.0, 120.0])
+    result = compute_portfolio_value(positions, current_prices, cash=0.0)
+    # Only AAPL counted: 1000 * (100/100) = 1000; MSFT skipped due to null entry_price
+    assert result == pytest.approx(1000.0)
+
+
 def test_compute_portfolio_value_includes_cash() -> None:
     positions = _make_positions(["AAPL"], ["LONG"], [1000.0], [100.0])
     current_prices = _make_current_prices(["AAPL"], [100.0])
@@ -118,22 +139,22 @@ def test_compute_period_return_negative_return() -> None:
 def test_compute_realized_profit_and_loss_long_profit_price_went_up() -> None:
     closing_pair = _make_positions(["AAPL"], ["LONG"], [1000.0], [100.0])
     current_prices = _make_current_prices(["AAPL"], [110.0])
-    total_pnl, return_percent = compute_realized_profit_and_loss(
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
         closing_pair, current_prices
     )
     # pnl = 1000 * (110/100 - 1) = 100
-    assert total_pnl == pytest.approx(100.0)
+    assert total_profit_and_loss == pytest.approx(100.0)
     assert return_percent == pytest.approx(0.1)
 
 
 def test_compute_realized_profit_and_loss_short_profit_price_went_down() -> None:
     closing_pair = _make_positions(["MSFT"], ["SHORT"], [1000.0], [100.0])
     current_prices = _make_current_prices(["MSFT"], [90.0])
-    total_pnl, return_percent = compute_realized_profit_and_loss(
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
         closing_pair, current_prices
     )
     # pnl = 1000 * (1 - 90/100) = 100
-    assert total_pnl == pytest.approx(100.0)
+    assert total_profit_and_loss == pytest.approx(100.0)
     assert return_percent == pytest.approx(0.1)
 
 
@@ -145,12 +166,12 @@ def test_compute_realized_profit_and_loss_mixed_pair() -> None:
         [100.0, 100.0],
     )
     current_prices = _make_current_prices(["AAPL", "MSFT"], [110.0, 110.0])
-    total_pnl, return_percent = compute_realized_profit_and_loss(
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
         closing_pair, current_prices
     )
     # AAPL long: 1000 * (110/100 - 1) = 100
     # MSFT short: 1000 * (1 - 110/100) = -100
-    assert total_pnl == pytest.approx(0.0)
+    assert total_profit_and_loss == pytest.approx(0.0)
     assert return_percent == pytest.approx(0.0)
 
 
@@ -165,11 +186,64 @@ def test_compute_realized_profit_and_loss_empty_closing_pair() -> None:
         },
     )
     current_prices = _make_current_prices(["AAPL"], [100.0])
-    total_pnl, return_percent = compute_realized_profit_and_loss(
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
         closing_pair, current_prices
     )
-    assert total_pnl == 0.0
+    assert total_profit_and_loss == 0.0
     assert return_percent == 0.0
+
+
+def test_compute_realized_profit_and_loss_null_entry_price_leg_is_skipped() -> None:
+    closing_pair = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, None],
+        },
+        schema={
+            "ticker": pl.String,
+            "side": pl.String,
+            "dollar_amount": pl.Float64,
+            "entry_price": pl.Float64,
+        },
+    )
+    current_prices = _make_current_prices(["AAPL", "MSFT"], [110.0, 90.0])
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
+    # Only AAPL counted (MSFT skipped due to null entry_price)
+    # AAPL long: 1000 * (110/100 - 1) = 100; invested = 1000
+    assert total_profit_and_loss == pytest.approx(100.0)
+    assert return_percent == pytest.approx(0.1)
+
+
+def test_compute_realized_profit_and_loss_skipped_leg_excluded_from_denominator() -> (
+    None
+):
+    # Leg with missing close_price should not inflate total_invested
+    closing_pair = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "LONG"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, 100.0],
+        },
+        schema={
+            "ticker": pl.String,
+            "side": pl.String,
+            "dollar_amount": pl.Float64,
+            "entry_price": pl.Float64,
+        },
+    )
+    # MSFT has no close_price → should be skipped entirely (incl. from total_invested)
+    current_prices = _make_current_prices(["AAPL"], [110.0])
+    total_profit_and_loss, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
+    # Only AAPL counted: pnl = 100, invested = 1000 → return = 10%
+    assert total_profit_and_loss == pytest.approx(100.0)
+    assert return_percent == pytest.approx(0.1)
 
 
 # --- compute_sharpe_ratio ---

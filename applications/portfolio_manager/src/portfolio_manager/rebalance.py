@@ -222,6 +222,19 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     )
     optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
 
+    null_entry_tickers = optimal_portfolio.filter(
+        pl.col("entry_price").is_null()
+    )["ticker"].to_list()
+    if null_entry_tickers:
+        for ticker in null_entry_tickers:
+            logger.warning(
+                "Missing entry price after join, excluding ticker from portfolio",
+                ticker=ticker,
+            )
+        optimal_portfolio = optimal_portfolio.filter(
+            pl.col("entry_price").is_not_null()
+        )
+
     try:
         open_positions, close_positions = get_positions(
             prior_portfolio_tickers=prior_portfolio_tickers,
@@ -339,7 +352,9 @@ async def _record_performance(  # noqa: PLR0913
     for pair_id in closing_pair_ids:
         pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id)
 
-        if "entry_price" not in pair_rows.columns:
+        if "entry_price" not in pair_rows.columns or pair_rows[
+            "entry_price"
+        ].is_null().any():
             logger.warning(
                 "Prior pair missing entry_price, skipping pnl calculation",
                 pair_id=pair_id,
@@ -371,7 +386,7 @@ async def _record_performance(  # noqa: PLR0913
             realized_profit_and_loss=realized_profit_and_loss,
             return_percent=return_percent,
         )
-        pair_saved = await save_closed_pair(record)
+        pair_saved = await save_closed_pair(record, current_timestamp)
         if not pair_saved:
             logger.warning("Failed to persist closed pair record", pair_id=pair_id)
 
@@ -403,6 +418,6 @@ async def _record_performance(  # noqa: PLR0913
         open_pair_count=open_pair_count,
         timestamp=current_timestamp,
     )
-    snapshot_saved = await save_performance_snapshot(snapshot)
+    snapshot_saved = await save_performance_snapshot(snapshot, current_timestamp)
     if not snapshot_saved:
         logger.warning("Failed to persist performance snapshot")

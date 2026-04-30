@@ -48,9 +48,15 @@ async def get_prior_portfolio() -> pl.DataFrame:
         if not prior_portfolio_data:
             return empty
 
-        prior_portfolio = pl.DataFrame(
-            prior_portfolio_data, schema=_PRIOR_PORTFOLIO_SCHEMA
-        )
+        # Build from data using only the columns present, then add missing ones
+        # for backward compatibility with pre-migration data lacking entry_price.
+        prior_portfolio = pl.DataFrame(prior_portfolio_data)
+        for col, dtype in _PRIOR_PORTFOLIO_SCHEMA.items():
+            if col not in prior_portfolio.columns:
+                prior_portfolio = prior_portfolio.with_columns(
+                    pl.lit(None).cast(dtype).alias(col)
+                )
+        prior_portfolio = prior_portfolio.select(list(_PRIOR_PORTFOLIO_SCHEMA.keys()))
 
         if prior_portfolio.is_empty():
             return empty
@@ -84,13 +90,15 @@ async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -
         return False
 
 
-async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
+async def save_performance_snapshot(
+    snapshot: dict[str, Any], current_timestamp: datetime
+) -> bool:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
                 json={
-                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "timestamp": current_timestamp.isoformat(),
                     "data": snapshot,
                 },
             )
@@ -102,13 +110,15 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
         return False
 
 
-async def save_closed_pair(record: dict[str, Any]) -> bool:
+async def save_closed_pair(
+    record: dict[str, Any], current_timestamp: datetime
+) -> bool:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/closed-pairs",
                 json={
-                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "timestamp": current_timestamp.isoformat(),
                     "data": record,
                 },
             )

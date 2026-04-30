@@ -13,6 +13,23 @@ def is_uppercase(data: PolarsData) -> pl.LazyFrame:
     )
 
 
+def check_open_positions_have_entry_price(data: PolarsData) -> bool:
+    frame = cast("pl.DataFrame", data.lazyframe.collect())
+    if "entry_price" not in frame.columns:
+        return True
+    missing = frame.filter(
+        (pl.col("action") == PositionAction.OPEN_POSITION.value)
+        & pl.col("entry_price").is_null()
+    )
+    if missing.height > 0:
+        message = (
+            f"OPEN_POSITION rows must have a non-null entry_price; "
+            f"found {missing.height} row(s) missing it"
+        )
+        raise ValueError(message)
+    return True
+
+
 def check_position_side_counts(
     data: PolarsData,
     total_positions_count: int = 20,  # 10 long and 10 short
@@ -189,6 +206,10 @@ portfolio_schema = pa.DataFrameSchema(
         pa.Check(
             check_fn=check_position_side_sums,
             error="Position side sums must be approximately equal",
+        ),
+        pa.Check(
+            check_fn=check_open_positions_have_entry_price,
+            error="OPEN_POSITION rows must have a non-null entry_price",
         ),
     ],
 )

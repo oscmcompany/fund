@@ -26,8 +26,12 @@ def compute_portfolio_value(
             logger.warning("No current price for position, skipping", ticker=ticker)
             continue
 
+        entry_price = row.get("entry_price")
+        if entry_price is None:
+            logger.warning("Missing entry price for position, skipping", ticker=ticker)
+            continue
+
         dollar_amount = row["dollar_amount"]
-        entry_price = row["entry_price"]
         side = row["side"]
 
         if side == "LONG":
@@ -55,17 +59,15 @@ def compute_realized_profit_and_loss(
 
     joined = closing_pair.join(current_prices, on="ticker", how="left")
 
-    total_pnl = 0.0
+    total_profit_and_loss = 0.0
     total_invested = 0.0
 
     for row in joined.iter_rows(named=True):
         ticker = row["ticker"]
         close_price = row.get("close_price")
+        entry_price = row.get("entry_price")
         dollar_amount = row["dollar_amount"]
-        entry_price = row["entry_price"]
         side = row["side"]
-
-        total_invested += dollar_amount
 
         if close_price is None:
             logger.warning(
@@ -73,16 +75,26 @@ def compute_realized_profit_and_loss(
             )
             continue
 
+        if entry_price is None:
+            logger.warning(
+                "Missing entry price for closing position, skipping pnl", ticker=ticker
+            )
+            continue
+
+        total_invested += dollar_amount
+
         if side == "LONG":
-            position_pnl = dollar_amount * (close_price / entry_price - 1.0)
+            position_profit_and_loss = dollar_amount * (close_price / entry_price - 1.0)
         else:
-            position_pnl = dollar_amount * (1.0 - close_price / entry_price)
+            position_profit_and_loss = dollar_amount * (1.0 - close_price / entry_price)
 
-        total_pnl += position_pnl
+        total_profit_and_loss += position_profit_and_loss
 
-    return_percent = total_pnl / total_invested if total_invested > 0 else 0.0
+    return_percent = (
+        total_profit_and_loss / total_invested if total_invested > 0 else 0.0
+    )
 
-    return (total_pnl, return_percent)
+    return (total_profit_and_loss, return_percent)
 
 
 def compute_sharpe_ratio(returns: list[float]) -> float | None:

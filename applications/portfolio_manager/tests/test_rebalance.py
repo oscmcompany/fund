@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -10,6 +11,7 @@ from portfolio_manager.portfolio_state import (
     evaluate_prior_pairs,
     get_prior_portfolio,
 )
+from portfolio_manager.rebalance import _record_performance
 from portfolio_manager.trade_execution import get_positions
 
 
@@ -307,6 +309,34 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     assert result["pair_id"][0] == "AAPL-MSFT"
 
 
+def test_get_prior_portfolio_fills_null_entry_price_for_pre_migration_data() -> None:
+    # Pre-migration data may not contain an entry_price field; the function
+    # should fill missing columns with null rather than raising an error.
+    data = [
+        {
+            "ticker": "AAPL",
+            "timestamp": 1735689600000,
+            "side": "LONG",
+            "dollar_amount": 1000.0,
+            "action": "OPEN_POSITION",
+            "pair_id": "AAPL-MSFT",
+            # entry_price intentionally absent
+        }
+    ]
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = json.dumps(data)
+    mock_response.json.return_value = data
+    mock_client = _make_mock_http_client(mock_response)
+    with patch(
+        "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
+    ):
+        result = asyncio.run(get_prior_portfolio())
+    assert result.height == 1
+    assert "entry_price" in result.columns
+    assert result["entry_price"][0] is None
+
+
 def test_get_prior_portfolio_raises_on_error_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
@@ -420,3 +450,191 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
     optimal = _make_optimal_portfolio()
     _, close_positions = get_positions(prior_tickers, held_tickers, optimal)
     assert len(close_positions) == expected_close_count
+
+
+# --- _record_performance ---
+
+
+def _make_account(
+    cash_amount: float = 10000.0, buying_power: float = 10000.0
+) -> MagicMock:
+    account = MagicMock()
+    account.cash_amount = cash_amount
+    account.buying_power = buying_power
+    return account
+
+
+def _make_spy_prices() -> pl.DataFrame:
+    return pl.DataFrame(
+        {"ticker": ["SPY"], "timestamp": [1735689600000.0], "close_price": [500.0]}
+    )
+
+
+def _record_performance_with_mocks(  # noqa: PLR0913
+    prior_portfolio: pl.DataFrame,
+    held_tickers: set[str],
+    final_portfolio: pl.DataFrame,
+    historical_prices: pl.DataFrame,
+    spy_prices: pl.DataFrame,
+    account: MagicMock,
+    current_timestamp: datetime,
+    last_portfolio_value: float | None = 100000.0,
+) -> None:
+    with (
+        patch(
+            "portfolio_manager.rebalance.save_closed_pair",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "portfolio_manager.rebalance.save_performance_snapshot",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "portfolio_manager.rebalance.get_last_portfolio_value",
+            new_callable=AsyncMock,
+            return_value=last_portfolio_value,
+        ),
+    ):
+        asyncio.run(
+            _record_performance(
+                prior_portfolio=prior_portfolio,
+                held_tickers=held_tickers,
+                final_portfolio=final_portfolio,
+                historical_prices=historical_prices,
+                spy_prices=spy_prices,
+                account=account,
+                current_timestamp=current_timestamp,
+            )
+        )
+
+
+def test_record_performance_skips_pair_with_null_entry_price() -> None:
+    # Closing pair has a null entry_price (from pre-migration data) - should be
+    # skipped with a warning rather than raising a TypeError.
+    prior = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "timestamp": [1735689600000, 1735689600000],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "action": ["OPEN_POSITION", "OPEN_POSITION"],
+            "pair_id": ["AAPL-MSFT", "AAPL-MSFT"],
+            "entry_price": [None, None],
+        },
+        schema=_PRIOR_PORTFOLIO_SCHEMA,
+    )
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    final_portfolio = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    # Must not raise
+    _record_performance_with_mocks(
+        prior_portfolio=prior,
+        held_tickers=set(),
+        final_portfolio=final_portfolio,
+        historical_prices=historical_prices,
+        spy_prices=_make_spy_prices(),
+        account=_make_account(),
+        current_timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_record_performance_skips_pair_with_missing_entry_price_column() -> None:
+    # Prior portfolio has no entry_price column at all (pre-migration state).
+    prior_no_entry = _make_prior_portfolio(
+        [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
+    ).drop("entry_price")
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    final_portfolio = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    # Must not raise
+    _record_performance_with_mocks(
+        prior_portfolio=prior_no_entry,
+        held_tickers=set(),
+        final_portfolio=final_portfolio,
+        historical_prices=historical_prices,
+        spy_prices=_make_spy_prices(),
+        account=_make_account(),
+        current_timestamp=datetime(2025, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_record_performance_uses_current_timestamp_for_closed_pair() -> None:
+    prior = _make_prior_portfolio(
+        [{"pair_id": "AAPL-MSFT", "long_ticker": "AAPL", "short_ticker": "MSFT"}]
+    )
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    final_portfolio = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    current_timestamp = datetime(2025, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    with (
+        patch(
+            "portfolio_manager.rebalance.save_closed_pair",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_save_pair,
+        patch(
+            "portfolio_manager.rebalance.save_performance_snapshot",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "portfolio_manager.rebalance.get_last_portfolio_value",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        asyncio.run(
+            _record_performance(
+                prior_portfolio=prior,
+                held_tickers=set(),
+                final_portfolio=final_portfolio,
+                historical_prices=historical_prices,
+                spy_prices=_make_spy_prices(),
+                account=_make_account(),
+                current_timestamp=current_timestamp,
+            )
+        )
+
+    mock_save_pair.assert_called_once()
+    _record, ts = mock_save_pair.call_args.args
+    assert ts == current_timestamp
+
+
+def test_record_performance_uses_current_timestamp_for_snapshot() -> None:
+    historical_prices = _make_historical_prices(["AAPL", "MSFT"])
+    prior = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    final_portfolio = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    current_timestamp = datetime(2025, 3, 15, 9, 30, 0, tzinfo=UTC)
+
+    with (
+        patch(
+            "portfolio_manager.rebalance.save_closed_pair",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "portfolio_manager.rebalance.save_performance_snapshot",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_save_snapshot,
+        patch(
+            "portfolio_manager.rebalance.get_last_portfolio_value",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        asyncio.run(
+            _record_performance(
+                prior_portfolio=prior,
+                held_tickers=set(),
+                final_portfolio=final_portfolio,
+                historical_prices=historical_prices,
+                spy_prices=_make_spy_prices(),
+                account=_make_account(),
+                current_timestamp=current_timestamp,
+            )
+        )
+
+    mock_save_snapshot.assert_called_once()
+    _snapshot, ts = mock_save_snapshot.call_args.args
+    assert ts == current_timestamp
