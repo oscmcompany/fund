@@ -11,6 +11,8 @@ pub enum Error {
     Credentials(#[from] CredentialsError),
     #[error("Polars error: {0}")]
     Polars(#[from] PolarsError),
+    #[error("No data found")]
+    NoData,
     #[error("Other error: {0}")]
     Other(String),
 }

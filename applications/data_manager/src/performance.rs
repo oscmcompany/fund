@@ -15,7 +15,6 @@ use axum::{
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use serde::Deserialize;
-use std::io::Cursor;
 use tracing::{info, warn};
 
 #[derive(Deserialize)]
@@ -52,7 +51,7 @@ pub async fn save_snapshot(
             warn!("Failed to create performance snapshot DataFrame: {}", err);
             return (
                 StatusCode::BAD_REQUEST,
-                format!("Invalid performance snapshot data: {}", err),
+                "Invalid performance snapshot data".to_string(),
             )
                 .into_response();
         }
@@ -77,7 +76,7 @@ pub async fn save_snapshot(
             warn!("Failed to upload performance snapshot to S3: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 upload failed: {}", err),
+                "Upload failed".to_string(),
             )
                 .into_response()
         }
@@ -88,6 +87,14 @@ pub async fn query_snapshots(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<SnapshotQueryParameters>,
 ) -> impl IntoResponse {
+    if parameters.start_timestamp > parameters.end_timestamp {
+        return (
+            StatusCode::BAD_REQUEST,
+            "start_timestamp must be less than or equal to end_timestamp".to_string(),
+        )
+            .into_response();
+    }
+
     info!("Fetching performance snapshots from S3");
 
     match query_performance_snapshots_from_s3(
@@ -103,53 +110,23 @@ pub async fn query_snapshots(
             parquet_bytes,
         )
             .into_response(),
-        Err(err) => {
-            let err_str = err.to_string();
-            if err_str.contains("No files found")
-                || err_str.contains("Could not find")
-                || err_str.contains("does not exist")
-                || err_str.contains("Invalid Input")
-            {
-                info!("No performance snapshot files in S3, returning empty parquet");
-                let mut empty_dataframe = match df!(
-                    "timestamp" => Vec::<i64>::new(),
-                    "portfolio_value" => Vec::<f64>::new(),
-                    "cash_balance" => Vec::<f64>::new(),
-                    "spy_close" => Vec::<f64>::new(),
-                    "period_return_percent" => Vec::<f64>::new(),
-                    "open_pair_count" => Vec::<i64>::new(),
-                ) {
-                    Ok(df) => df,
-                    Err(e) => {
-                        warn!("Failed to create empty snapshot DataFrame: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to create empty DataFrame: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                let mut buffer = Vec::new();
-                let cursor = Cursor::new(&mut buffer);
-                if let Err(e) = ParquetWriter::new(cursor).finish(&mut empty_dataframe) {
-                    warn!("Failed to write empty snapshot parquet: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to write parquet: {}", e),
-                    )
-                        .into_response();
-                }
-                return (
+        Err(crate::errors::Error::NoData) => {
+            info!("No performance snapshot files in S3, returning empty parquet");
+            match empty_performance_snapshot_parquet() {
+                Ok(buffer) => (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                     buffer,
                 )
-                    .into_response();
+                    .into_response(),
+                Err((status, msg)) => (status, msg).into_response(),
             }
+        }
+        Err(err) => {
             warn!("Failed to fetch performance snapshots from S3: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to fetch performance snapshots: {}", err),
+                "Internal server error".to_string(),
             )
                 .into_response()
         }
@@ -166,7 +143,7 @@ pub async fn save_closed_pair(
             warn!("Failed to create closed pair DataFrame: {}", err);
             return (
                 StatusCode::BAD_REQUEST,
-                format!("Invalid closed pair data: {}", err),
+                "Invalid closed pair data".to_string(),
             )
                 .into_response();
         }
@@ -188,7 +165,7 @@ pub async fn save_closed_pair(
             warn!("Failed to upload closed pair to S3: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("S3 upload failed: {}", err),
+                "Upload failed".to_string(),
             )
                 .into_response()
         }
@@ -199,6 +176,14 @@ pub async fn query_closed_pairs(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<ClosedPairQueryParameters>,
 ) -> impl IntoResponse {
+    if parameters.start_timestamp > parameters.end_timestamp {
+        return (
+            StatusCode::BAD_REQUEST,
+            "start_timestamp must be less than or equal to end_timestamp".to_string(),
+        )
+            .into_response();
+    }
+
     info!("Fetching closed pairs from S3");
 
     match query_closed_pairs_from_s3(
@@ -214,58 +199,88 @@ pub async fn query_closed_pairs(
             parquet_bytes,
         )
             .into_response(),
-        Err(err) => {
-            let err_str = err.to_string();
-            if err_str.contains("No files found")
-                || err_str.contains("Could not find")
-                || err_str.contains("does not exist")
-                || err_str.contains("Invalid Input")
-            {
-                info!("No closed pair files in S3, returning empty parquet");
-                let mut empty_dataframe = match df!(
-                    "closed_timestamp" => Vec::<i64>::new(),
-                    "pair_id" => Vec::<String>::new(),
-                    "long_ticker" => Vec::<String>::new(),
-                    "short_ticker" => Vec::<String>::new(),
-                    "entry_timestamp" => Vec::<i64>::new(),
-                    "dollar_amount" => Vec::<f64>::new(),
-                    "realized_profit_and_loss" => Vec::<f64>::new(),
-                    "return_percent" => Vec::<f64>::new(),
-                    "holding_days" => Vec::<i64>::new(),
-                ) {
-                    Ok(df) => df,
-                    Err(e) => {
-                        warn!("Failed to create empty closed pair DataFrame: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to create empty DataFrame: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-                let mut buffer = Vec::new();
-                let cursor = Cursor::new(&mut buffer);
-                if let Err(e) = ParquetWriter::new(cursor).finish(&mut empty_dataframe) {
-                    warn!("Failed to write empty closed pair parquet: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to write parquet: {}", e),
-                    )
-                        .into_response();
-                }
-                return (
+        Err(crate::errors::Error::NoData) => {
+            info!("No closed pair files in S3, returning empty parquet");
+            match empty_closed_pair_parquet() {
+                Ok(buffer) => (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                     buffer,
                 )
-                    .into_response();
+                    .into_response(),
+                Err((status, msg)) => (status, msg).into_response(),
             }
+        }
+        Err(err) => {
             warn!("Failed to fetch closed pairs from S3: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to fetch closed pairs: {}", err),
+                "Internal server error".to_string(),
             )
                 .into_response()
         }
     }
+}
+
+fn empty_performance_snapshot_parquet() -> Result<Vec<u8>, (StatusCode, String)> {
+    let mut dataframe = df!(
+        "timestamp" => Vec::<i64>::new(),
+        "portfolio_value" => Vec::<f64>::new(),
+        "cash_balance" => Vec::<f64>::new(),
+        "spy_close" => Vec::<f64>::new(),
+        "period_return_percent" => Vec::<f64>::new(),
+        "open_pair_count" => Vec::<i64>::new(),
+    )
+    .map_err(|e| {
+        warn!("Failed to create empty snapshot DataFrame: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
+        )
+    })?;
+    let mut buffer = Vec::new();
+    let cursor = std::io::Cursor::new(&mut buffer);
+    ParquetWriter::new(cursor)
+        .finish(&mut dataframe)
+        .map_err(|e| {
+            warn!("Failed to write empty snapshot parquet: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        })?;
+    Ok(buffer)
+}
+
+fn empty_closed_pair_parquet() -> Result<Vec<u8>, (StatusCode, String)> {
+    let mut dataframe = df!(
+        "closed_timestamp" => Vec::<i64>::new(),
+        "pair_id" => Vec::<String>::new(),
+        "long_ticker" => Vec::<String>::new(),
+        "short_ticker" => Vec::<String>::new(),
+        "entry_timestamp" => Vec::<i64>::new(),
+        "dollar_amount" => Vec::<f64>::new(),
+        "realized_profit_and_loss" => Vec::<f64>::new(),
+        "return_percent" => Vec::<f64>::new(),
+        "holding_days" => Vec::<i64>::new(),
+    )
+    .map_err(|e| {
+        warn!("Failed to create empty closed pair DataFrame: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error".to_string(),
+        )
+    })?;
+    let mut buffer = Vec::new();
+    let cursor = std::io::Cursor::new(&mut buffer);
+    ParquetWriter::new(cursor)
+        .finish(&mut dataframe)
+        .map_err(|e| {
+            warn!("Failed to write empty closed pair parquet: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        })?;
+    Ok(buffer)
 }

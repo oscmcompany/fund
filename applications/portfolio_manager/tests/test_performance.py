@@ -94,6 +94,21 @@ def test_compute_portfolio_value_includes_cash() -> None:
     assert result == pytest.approx(1250.0)
 
 
+def test_compute_portfolio_value_null_entry_price_is_skipped() -> None:
+    positions = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "LONG"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, None],
+        }
+    )
+    current_prices = _make_current_prices(["AAPL", "MSFT"], [120.0, 120.0])
+    result = compute_portfolio_value(positions, current_prices, cash=0.0)
+    # Only AAPL counted: 1000 * (120/100) = 1200
+    assert result == pytest.approx(1200.0)
+
+
 # --- compute_period_return ---
 
 
@@ -170,6 +185,43 @@ def test_compute_realized_profit_and_loss_empty_closing_pair() -> None:
     )
     assert total_pnl == 0.0
     assert return_percent == 0.0
+
+
+def test_compute_realized_profit_and_loss_null_entry_price_is_skipped() -> None:
+    closing_pair = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, None],
+        }
+    )
+    current_prices = _make_current_prices(["AAPL", "MSFT"], [110.0, 90.0])
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
+    # Only AAPL counted: pnl = 1000 * (110/100 - 1) = 100, invested = 1000
+    assert total_pnl == pytest.approx(100.0)
+    assert return_percent == pytest.approx(0.1)
+
+
+def test_compute_realized_pnl_null_close_price_excluded_from_denominator() -> None:
+    closing_pair = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "entry_price": [100.0, 100.0],
+        }
+    )
+    # MSFT has no current price — should be skipped and NOT counted in total_invested
+    current_prices = _make_current_prices(["AAPL"], [110.0])
+    total_pnl, return_percent = compute_realized_profit_and_loss(
+        closing_pair, current_prices
+    )
+    # Only AAPL: pnl = 100, invested = 1000 (MSFT excluded)
+    assert total_pnl == pytest.approx(100.0)
+    assert return_percent == pytest.approx(0.1)
 
 
 # --- compute_sharpe_ratio ---

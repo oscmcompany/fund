@@ -525,7 +525,7 @@ fn test_format_performance_s3_key_live() {
 
     assert_eq!(
         key,
-        "performance/live/year=2025/month=01/day=01/hour=00/minute=00/second=00/data.parquet"
+        "performance/live/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
     );
 }
 
@@ -536,13 +536,13 @@ fn test_format_performance_s3_key_closed_pairs() {
 
     assert_eq!(
         key,
-        "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/data.parquet"
+        "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
     );
 }
 
 #[test]
 fn test_query_cache_get_miss() {
-    let cache = QueryCache::new(300);
+    let mut cache = QueryCache::new(300);
     assert!(cache.get("nonexistent_key").is_none());
 }
 
@@ -554,7 +554,7 @@ fn test_query_cache_set_and_get() {
 
     let result = cache.get("test_key");
     assert!(result.is_some());
-    assert_eq!(result.unwrap(), &data);
+    assert_eq!(result.unwrap(), data);
 }
 
 #[test]

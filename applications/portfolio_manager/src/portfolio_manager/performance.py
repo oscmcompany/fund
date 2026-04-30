@@ -28,6 +28,9 @@ def compute_portfolio_value(
 
         dollar_amount = row["dollar_amount"]
         entry_price = row["entry_price"]
+        if entry_price is None:
+            logger.warning("No entry price for position, skipping", ticker=ticker)
+            continue
         side = row["side"]
 
         if side == "LONG":
@@ -63,15 +66,20 @@ def compute_realized_profit_and_loss(
         close_price = row.get("close_price")
         dollar_amount = row["dollar_amount"]
         entry_price = row["entry_price"]
+        if entry_price is None:
+            logger.warning(
+                "No entry price for closing position, skipping", ticker=ticker
+            )
+            continue
         side = row["side"]
-
-        total_invested += dollar_amount
 
         if close_price is None:
             logger.warning(
                 "No current price for closing position, skipping pnl", ticker=ticker
             )
             continue
+
+        total_invested += dollar_amount
 
         if side == "LONG":
             position_pnl = dollar_amount * (close_price / entry_price - 1.0)

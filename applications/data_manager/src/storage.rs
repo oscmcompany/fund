@@ -35,13 +35,16 @@ impl QueryCache {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&Vec<u8>> {
-        if let Some(entry) = self.entries.get(key) {
-            if entry.expires_at > Instant::now() {
-                return Some(&entry.data);
+    pub fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        match self.entries.get(key) {
+            Some(entry) if entry.expires_at > now => Some(entry.data.clone()),
+            Some(_) => {
+                self.entries.remove(key);
+                None
             }
+            None => None,
         }
-        None
     }
 
     pub fn set(&mut self, key: String, data: Vec<u8>) {
@@ -152,6 +155,9 @@ pub async fn query_performance_snapshots_from_s3(
         start_date_int, end_date_int
     );
 
+    let start_ms = start_timestamp.timestamp_millis();
+    let end_ms = end_timestamp.timestamp_millis();
+
     let query_sql = format!(
         "
         SELECT
@@ -163,15 +169,29 @@ pub async fn query_performance_snapshots_from_s3(
             open_pair_count
         FROM read_parquet('{}', hive_partitioning = true)
         WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
+        AND timestamp BETWEEN {} AND {}
         ORDER BY timestamp
         ",
-        s3_glob, start_date_int, end_date_int
+        s3_glob, start_date_int, end_date_int, start_ms, end_ms
     );
 
     debug!("Executing query SQL: {}", query_sql);
 
     info!("Preparing DuckDB statement");
-    let mut statement = connection.prepare(&query_sql)?;
+    let mut statement = match connection.prepare(&query_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No files found")
+                || msg.contains("Could not find")
+                || msg.contains("does not exist")
+                || msg.contains("Invalid Input")
+            {
+                return Err(Error::NoData);
+            }
+            return Err(Error::DuckDB(e));
+        }
+    };
 
     info!("Executing query and mapping results");
     let snapshots: Vec<PerformanceSnapshot> = statement
@@ -288,6 +308,9 @@ pub async fn query_closed_pairs_from_s3(
         start_date_int, end_date_int
     );
 
+    let start_ms = start_timestamp.timestamp_millis();
+    let end_ms = end_timestamp.timestamp_millis();
+
     let query_sql = format!(
         "
         SELECT
@@ -302,15 +325,29 @@ pub async fn query_closed_pairs_from_s3(
             holding_days
         FROM read_parquet('{}', hive_partitioning = true)
         WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
+        AND closed_timestamp BETWEEN {} AND {}
         ORDER BY closed_timestamp
         ",
-        s3_glob, start_date_int, end_date_int
+        s3_glob, start_date_int, end_date_int, start_ms, end_ms
     );
 
     debug!("Executing query SQL: {}", query_sql);
 
     info!("Preparing DuckDB statement");
-    let mut statement = connection.prepare(&query_sql)?;
+    let mut statement = match connection.prepare(&query_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No files found")
+                || msg.contains("Could not find")
+                || msg.contains("does not exist")
+                || msg.contains("Invalid Input")
+            {
+                return Err(Error::NoData);
+            }
+            return Err(Error::DuckDB(e));
+        }
+    };
 
     info!("Executing query and mapping results");
     let closed_pairs: Vec<ClosedPair> = statement
@@ -422,10 +459,11 @@ pub fn format_performance_s3_key(timestamp: &DateTime<Utc>, performance_type: &s
     let hour = timestamp.format("%H");
     let minute = timestamp.format("%M");
     let second = timestamp.format("%S");
+    let timestamp_millis = timestamp.timestamp_millis();
 
     format!(
-        "performance/{}/year={}/month={}/day={}/hour={}/minute={}/second={}/data.parquet",
-        performance_type, year, month, day, hour, minute, second,
+        "performance/{}/year={}/month={}/day={}/hour={}/minute={}/second={}/{}.parquet",
+        performance_type, year, month, day, hour, minute, second, timestamp_millis,
     )
 }
 
@@ -646,12 +684,13 @@ pub async fn query_equity_bars_parquet_from_s3(
         .map(|ticker_list| ticker_list.join(","))
         .unwrap_or_default();
 
-    {
-        let cache = state.cache.lock().unwrap();
-        if let Some(cached) = cache.get(&cache_key) {
-            info!("Cache hit for equity bars query");
-            return Ok(cached.clone());
-        }
+    let cached = tokio::task::block_in_place(|| {
+        let mut cache = state.cache.lock().unwrap();
+        cache.get(&cache_key)
+    });
+    if let Some(cached) = cached {
+        info!("Cache hit for equity bars query");
+        return Ok(cached);
     }
 
     let connection = create_duckdb_connection().await?;
@@ -768,10 +807,10 @@ pub async fn query_equity_bars_parquet_from_s3(
 
     info!("Query returned {} bytes of parquet data", buffer.len());
 
-    {
+    tokio::task::block_in_place(|| {
         let mut cache = state.cache.lock().unwrap();
         cache.set(cache_key, buffer.clone());
-    }
+    });
 
     Ok(buffer)
 }

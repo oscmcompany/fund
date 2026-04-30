@@ -222,6 +222,15 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     )
     optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
 
+    pre_join_count = len(optimal_portfolio)
+    optimal_portfolio = optimal_portfolio.filter(pl.col("entry_price").is_not_null())
+    dropped_count = pre_join_count - len(optimal_portfolio)
+    if dropped_count > 0:
+        logger.warning(
+            "Dropped portfolio rows with missing entry price after latest price join",
+            dropped_count=dropped_count,
+        )
+
     try:
         open_positions, close_positions = get_positions(
             prior_portfolio_tickers=prior_portfolio_tickers,
@@ -256,6 +265,9 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
     save_succeeded = await save_portfolio(final_portfolio, current_timestamp)
 
+    all_results = close_results + open_results
+    failed_trades = [r for r in all_results if r["status"] == "failed"]
+
     try:
         await _record_performance(
             prior_portfolio=prior_portfolio,
@@ -268,9 +280,6 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         )
     except Exception as e:
         logger.exception("Failed to record performance metrics", error=str(e))
-
-    all_results = close_results + open_results
-    failed_trades = [r for r in all_results if r["status"] == "failed"]
 
     logger.info(
         "Portfolio rebalance completed",
@@ -339,7 +348,10 @@ async def _record_performance(  # noqa: PLR0913
     for pair_id in closing_pair_ids:
         pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id)
 
-        if "entry_price" not in pair_rows.columns:
+        if (
+            "entry_price" not in pair_rows.columns
+            or pair_rows["entry_price"].is_null().any()
+        ):
             logger.warning(
                 "Prior pair missing entry_price, skipping pnl calculation",
                 pair_id=pair_id,

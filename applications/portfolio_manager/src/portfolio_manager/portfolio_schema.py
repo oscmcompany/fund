@@ -128,6 +128,25 @@ pairs_schema = pa.DataFrameSchema(
 )
 
 
+def check_open_positions_have_entry_price(data: PolarsData) -> bool:
+    schema_names = set(data.lazyframe.collect_schema().names())
+    if "action" not in schema_names or "entry_price" not in schema_names:
+        return True
+
+    invalid_count_dataframe = cast(
+        "pl.DataFrame",
+        data.lazyframe.select(
+            (
+                (pl.col("action") == PositionAction.OPEN_POSITION.value)
+                & (pl.col("entry_price").is_null() | (pl.col("entry_price") <= 0))
+            )
+            .sum()
+            .alias("invalid_count")
+        ).collect(),
+    )
+    return int(invalid_count_dataframe.get_column("invalid_count").item()) == 0
+
+
 portfolio_schema = pa.DataFrameSchema(
     {
         "ticker": pa.Column(
@@ -189,6 +208,10 @@ portfolio_schema = pa.DataFrameSchema(
         pa.Check(
             check_fn=check_position_side_sums,
             error="Position side sums must be approximately equal",
+        ),
+        pa.Check(
+            check_fn=check_open_positions_have_entry_price,
+            error="entry_price must be present and > 0 for OPEN_POSITION rows",
         ),
     ],
 )

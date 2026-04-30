@@ -90,7 +90,9 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
                 json={
-                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "timestamp": datetime.fromtimestamp(
+                        snapshot["timestamp"] / 1000, tz=UTC
+                    ).isoformat(),
                     "data": snapshot,
                 },
             )
@@ -108,7 +110,9 @@ async def save_closed_pair(record: dict[str, Any]) -> bool:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/closed-pairs",
                 json={
-                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "timestamp": datetime.fromtimestamp(
+                        record["closed_timestamp"] / 1000, tz=UTC
+                    ).isoformat(),
                     "data": record,
                 },
             )
