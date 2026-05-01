@@ -15,6 +15,7 @@ from storage import (
     tide_runner_image_uri,
     tide_runner_repository,
 )
+from redeployment import redeployment_lambda  # noqa: F401
 from training import models_cluster, tide_trainer_task_definition
 
 protocol = "https://" if acm_certificate_arn else "http://"
@@ -81,5 +82,6 @@ pulumi.export(
     "aws_iam_github_actions_oidc_provider_arn",
     github_actions_oidc_provider.arn,
 )
+pulumi.export("aws_lambda_redeployment_arn", redeployment_lambda.arn)
 pulumi.export("fund_base_url", fund_base_url)
 pulumi.export("readme", pulumi.Output.format(readme_content, fund_base_url))
