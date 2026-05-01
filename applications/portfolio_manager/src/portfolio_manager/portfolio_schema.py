@@ -195,7 +195,7 @@ portfolio_schema = pa.DataFrameSchema(
             dtype=float,
             checks=[pa.Check.greater_than(0)],
             required=False,
-            nullable=False,
+            nullable=True,
         ),
     },
     unique=["ticker"],
