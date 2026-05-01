@@ -379,3 +379,47 @@ def test_prepare_training_data_returns_stage_counts() -> None:
     assert stage_counts["filtered_tickers"] == 1
     assert stage_counts["consolidated_rows"] == 1
     assert stage_counts["consolidated_tickers"] == 1
+
+
+def test_prepare_training_data_deduplicates_ticker_timestamp() -> None:
+    duplicate_bars = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "AAPL"],
+            "timestamp": [
+                int(_TARGET_DATE.timestamp()) * 1000,
+                int(_TARGET_DATE.timestamp()) * 1000,
+            ],
+            "open_price": [148.0, 149.0],
+            "high_price": [152.0, 153.0],
+            "low_price": [147.0, 148.0],
+            "close_price": [150.0, 151.0],
+            "volume": [1_000_000, 2_000_000],
+            "volume_weighted_average_price": [151.0, 152.0],
+            "transactions": [5_000, 6_000],
+        }
+    )
+    parquet_bytes = _to_parquet_bytes(duplicate_bars)
+    csv_bytes = _to_csv_bytes(_SAMPLE_CATEGORIES)
+
+    mock_body_bars = MagicMock()
+    mock_body_bars.read.return_value = parquet_bytes
+    mock_body_categories = MagicMock()
+    mock_body_categories.read.return_value = csv_bytes
+
+    mock_s3_client = MagicMock()
+    mock_s3_client.get_object.side_effect = [
+        {"Body": mock_body_bars},
+        {"Body": mock_body_categories},
+    ]
+
+    with patch("tide.tasks.boto3.client", return_value=mock_s3_client):
+        uri, stage_counts = prepare_training_data(
+            data_bucket_name="test-data-bucket",
+            model_artifacts_bucket_name="test-artifacts-bucket",
+            start_date=_TARGET_DATE,
+            end_date=_TARGET_DATE,
+        )
+
+    assert uri.startswith("s3://test-artifacts-bucket/")
+    assert stage_counts["filtered_rows"] == 1
+    assert stage_counts["filtered_tickers"] == 1

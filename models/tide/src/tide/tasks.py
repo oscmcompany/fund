@@ -253,6 +253,8 @@ def prepare_training_data(  # noqa: PLR0913
 
     filtered_bars = filter_equity_bars(equity_bars)
 
+    filtered_bars = filtered_bars.unique(subset=["ticker", "timestamp"], keep="last")
+
     equity_bars_schema.validate(filtered_bars)
 
     filtered_rows = filtered_bars.height
