@@ -156,6 +156,22 @@ async fn test_predictions_save_returns_internal_server_error_when_s3_upload_fail
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
+async fn test_predictions_query_returns_bad_request_for_seconds_precision_timestamp() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    // Timestamp in seconds (not milliseconds) should be rejected as out of range
+    let encoded = urlencoding::encode("[{\"ticker\":\"AAPL\",\"timestamp\":1735689600}]");
+    let response = reqwest::Client::new()
+        .get(app.url(&format!("/predictions?tickers_and_timestamps={}", encoded)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
 async fn test_predictions_query_returns_bad_request_for_invalid_url_encoding() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
@@ -791,4 +807,277 @@ async fn test_equity_details_sync_returns_not_implemented() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+// --- Performance snapshot handlers ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_save_and_query_round_trip() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let client = reqwest::Client::new();
+
+    let save_payload = r#"{
+        "data": {
+            "timestamp": 1735689600000,
+            "portfolio_value": 100000.0,
+            "cash_balance": 5000.0,
+            "spy_close": 480.0,
+            "period_return_percent": 0.02,
+            "open_pair_count": 8
+        },
+        "timestamp": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let response = client
+        .post(app.url("/performance/snapshots"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client
+        .get(app.url(
+            "/performance/snapshots?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(
+        dataframe.column("timestamp").unwrap().i64().unwrap().get(0),
+        Some(1735689600000i64)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_query_returns_empty_parquet_when_no_data() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/snapshots?start_timestamp=2020-01-01T00:00:00Z&end_timestamp=2020-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 0);
+    assert!(dataframe.column("timestamp").is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_query_returns_bad_request_for_inverted_timestamps() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/snapshots?start_timestamp=2025-01-02T00:00:00Z&end_timestamp=2025-01-01T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_save_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let save_payload = r#"{
+        "data": {
+            "timestamp": 1735689600000,
+            "portfolio_value": 100000.0,
+            "cash_balance": 5000.0,
+            "spy_close": 480.0,
+            "period_return_percent": 0.02,
+            "open_pair_count": 8
+        },
+        "timestamp": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let response = reqwest::Client::new()
+        .post(app.url("/performance/snapshots"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // Error body must not expose internal details
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
+}
+
+// --- Closed pair handlers ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_save_and_query_round_trip() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+    let client = reqwest::Client::new();
+
+    let save_payload = r#"{
+        "data": {
+            "closed_timestamp": 1735689600000,
+            "pair_id": "AAPL-MSFT-001",
+            "long_ticker": "AAPL",
+            "short_ticker": "MSFT",
+            "entry_timestamp": 1735603200000,
+            "dollar_amount": 10000.0,
+            "realized_profit_and_loss": 250.0,
+            "return_percent": 0.025,
+            "holding_days": 1
+        },
+        "timestamp": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let response = client
+        .post(app.url("/performance/closed-pairs"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client
+        .get(app.url(
+            "/performance/closed-pairs?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(
+        dataframe.column("pair_id").unwrap().str().unwrap().get(0),
+        Some("AAPL-MSFT-001")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_query_returns_empty_parquet_when_no_data() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/closed-pairs?start_timestamp=2020-01-01T00:00:00Z&end_timestamp=2020-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let dataframe = ParquetReader::new(std::io::Cursor::new(body.to_vec()))
+        .finish()
+        .unwrap();
+    assert_eq!(dataframe.height(), 0);
+    assert!(dataframe.column("closed_timestamp").is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_query_returns_bad_request_for_inverted_timestamps() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/closed-pairs?start_timestamp=2025-01-02T00:00:00Z&end_timestamp=2025-01-01T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_save_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let save_payload = r#"{
+        "data": {
+            "closed_timestamp": 1735689600000,
+            "pair_id": "AAPL-MSFT-001",
+            "long_ticker": "AAPL",
+            "short_ticker": "MSFT",
+            "entry_timestamp": 1735603200000,
+            "dollar_amount": 10000.0,
+            "realized_profit_and_loss": 250.0,
+            "return_percent": 0.025,
+            "holding_days": 1
+        },
+        "timestamp": "2025-01-01T00:00:00Z"
+    }"#;
+
+    let response = reqwest::Client::new()
+        .post(app.url("/performance/closed-pairs"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(save_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_performance_snapshot_query_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/snapshots?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_closed_pair_query_returns_internal_server_error_when_s3_fails() {
+    let (app, _env_guard) = spawn_app_with_unreachable_s3("http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url(
+            "/performance/closed-pairs?start_timestamp=2025-01-01T00:00:00Z&end_timestamp=2025-01-02T00:00:00Z",
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }

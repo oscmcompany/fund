@@ -1,9 +1,4 @@
 ---
-pull:
-  - prefect.deployments.steps.git_clone:
-      repository: https://github.com/oscmcompany/fund.git
-      branch: master
-
 deployments:
   - name: tide-trainer-local
     entrypoint: models/tide/src/tide/workflow.py:training_pipeline

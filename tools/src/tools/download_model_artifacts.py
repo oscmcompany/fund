@@ -1,31 +1,23 @@
 import os
 import sys
 import tarfile
+from typing import TYPE_CHECKING
 
 import boto3
 import structlog
 
+if TYPE_CHECKING:
+    from mypy_boto3_s3 import S3Client
+
 logger = structlog.get_logger()
 
 
-def download_model_artifacts(  # noqa: C901, PLR0915
+def _resolve_artifact_run_id(
+    s3_client: "S3Client",
     application_name: str,
     artifacts_bucket: str,
     github_actions_check: bool,  # noqa: FBT001
-) -> None:
-    logger.info("Downloading model artifact", application_name=application_name)
-
-    try:
-        s3_client = boto3.client("s3")
-
-    except Exception as e:
-        logger.exception(
-            "Error creating S3 client",
-            error=f"{e}",
-            application_name=application_name,
-        )
-        raise RuntimeError from e
-
+) -> str:
     try:
         file_objects = s3_client.list_objects_v2(
             Bucket=artifacts_bucket,
@@ -40,7 +32,6 @@ def download_model_artifacts(  # noqa: C901, PLR0915
 
     for file_object in file_objects.get("Contents", []):
         file_object_name = file_object["Key"]
-
         file_object_name_parts = file_object_name.split("/")
 
         if len(file_object_name_parts) < 3:  # noqa: PLR2004
@@ -68,23 +59,55 @@ def download_model_artifacts(  # noqa: C901, PLR0915
             "GitHub Actions detected, selecting latest artifact",
             selected_option=selected_option,
         )
+        return selected_option
 
+    if not options:
+        logger.error("No artifacts found", application_name=application_name)
+        raise RuntimeError
+
+    logger.info("Available artifacts", options=options)
+    selected_option = input("Select an artifact to download: ")
+
+    if selected_option not in options:
+        logger.error(
+            "Invalid selection",
+            selected_option=selected_option,
+            valid_options=options,
+        )
+        raise RuntimeError
+
+    return selected_option
+
+
+def download_model_artifacts(
+    application_name: str,
+    artifacts_bucket: str,
+    github_actions_check: bool,  # noqa: FBT001
+    artifact_run_id: str | None = None,
+) -> None:
+    logger.info("Downloading model artifact", application_name=application_name)
+
+    try:
+        s3_client = boto3.client("s3")
+
+    except Exception as e:
+        logger.exception(
+            "Error creating S3 client",
+            error=f"{e}",
+            application_name=application_name,
+        )
+        raise RuntimeError from e
+
+    if artifact_run_id is not None:
+        logger.info(
+            "Using provided artifact run ID, skipping listing",
+            artifact_run_id=artifact_run_id,
+        )
+        selected_option = artifact_run_id
     else:
-        if not options:
-            logger.error("No artifacts found", application_name=application_name)
-            raise RuntimeError
-
-        logger.info("Available artifacts", options=options)
-
-        selected_option = input("Select an artifact to download: ")
-
-        if selected_option not in options:
-            logger.error(
-                "Invalid selection",
-                selected_option=selected_option,
-                valid_options=options,
-            )
-            raise RuntimeError
+        selected_option = _resolve_artifact_run_id(
+            s3_client, application_name, artifacts_bucket, github_actions_check
+        )
 
     logger.info("Selected artifact", selected_option=selected_option)
 
@@ -127,6 +150,7 @@ if __name__ == "__main__":
     application_name = os.getenv("APPLICATION_NAME", "")
     artifacts_bucket = os.getenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "")
     github_actions_check = os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+    artifact_run_id = os.getenv("FUND_ARTIFACT_RUN_ID") or None
 
     environment_variables = {
         "APPLICATION_NAME": application_name,
@@ -148,6 +172,7 @@ if __name__ == "__main__":
             application_name=application_name,
             artifacts_bucket=artifacts_bucket,
             github_actions_check=github_actions_check,
+            artifact_run_id=artifact_run_id,
         )
     except Exception as e:
         logger.exception("Failed to download model artifacts", error=f"{e}")

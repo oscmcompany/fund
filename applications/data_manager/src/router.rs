@@ -1,6 +1,7 @@
 use crate::equity_bars;
 use crate::equity_details;
 use crate::health;
+use crate::performance;
 use crate::portfolios;
 use crate::predictions;
 use crate::state::State;
@@ -27,6 +28,16 @@ pub fn create_app_with_state(state: State) -> Router {
         .route("/equity-bars", get(equity_bars::query))
         .route("/equity-details", get(equity_details::get))
         .route("/equity-details", post(equity_details::sync))
+        .route("/performance/snapshots", post(performance::save_snapshot))
+        .route("/performance/snapshots", get(performance::query_snapshots))
+        .route(
+            "/performance/closed-pairs",
+            post(performance::save_closed_pair),
+        )
+        .route(
+            "/performance/closed-pairs",
+            get(performance::query_closed_pairs),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(SentryHttpLayer::new().enable_transaction())
