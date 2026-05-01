@@ -448,7 +448,7 @@ github_actions_trainer_policy = aws.iam.Policy(
 github_actions_redeployment_policy = aws.iam.Policy(
     "github_actions_redeployment_policy",
     name="fund-github-actions-redeployment-policy",
-    description="Redeployment infrastructure permissions for GitHub Actions deployments.",
+    description="Redeployment infrastructure permissions for GitHub Actions.",
     policy=json.dumps(
         {
             "Version": "2012-10-17",
@@ -468,9 +468,10 @@ github_actions_redeployment_policy = aws.iam.Policy(
                     "Sid": "ManageLambdaFunctions",
                     "Effect": "Allow",
                     "Action": "lambda:*",
-                    "Resource": (
-                        f"arn:aws:lambda:{region}:{account_id}:function:fund-*"
-                    ),
+                    "Resource": [
+                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager",
+                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager:*",
+                    ],
                 },
                 {
                     "Sid": "ManageEventBridgeRules",
@@ -488,9 +489,7 @@ github_actions_redeployment_policy = aws.iam.Policy(
                         "events:TagResource",
                         "events:UntagResource",
                     ],
-                    "Resource": (
-                        f"arn:aws:events:{region}:{account_id}:rule/fund-*"
-                    ),
+                    "Resource": (f"arn:aws:events:{region}:{account_id}:rule/fund-*"),
                 },
                 {
                     "Sid": "ManageLambdaLogGroups",
@@ -525,8 +524,7 @@ github_actions_redeployment_policy = aws.iam.Policy(
                         "iam:UpdateAssumeRolePolicy",
                     ],
                     "Resource": (
-                        f"arn:aws:iam::{account_id}:role"
-                        "/fund-redeployment-lambda-role"
+                        f"arn:aws:iam::{account_id}:role/fund-redeployment-lambda-role"
                     ),
                     "Condition": {
                         "StringLikeIfExists": {
@@ -542,8 +540,7 @@ github_actions_redeployment_policy = aws.iam.Policy(
                         "iam:PutRolePolicy",
                     ],
                     "Resource": (
-                        f"arn:aws:iam::{account_id}:role"
-                        "/fund-redeployment-lambda-role"
+                        f"arn:aws:iam::{account_id}:role/fund-redeployment-lambda-role"
                     ),
                     "Condition": {
                         "StringEquals": {
