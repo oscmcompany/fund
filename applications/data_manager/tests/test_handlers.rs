@@ -31,7 +31,7 @@ async fn spawn_app(
         },
         s3_client,
         test_bucket_name(),
-        Arc::new(Mutex::new(QueryCache::new(300))),
+        Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
     );
     let app = create_app_with_state(state);
     (SpawnedAppServer::start(app).await, env_guard)
@@ -53,7 +53,7 @@ async fn spawn_app_with_unreachable_s3(
         },
         unreachable_s3_client,
         "test-bucket".to_string(),
-        Arc::new(Mutex::new(QueryCache::new(300))),
+        Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
     );
     let app = create_app_with_state(state);
     (SpawnedAppServer::start(app).await, env_guard)
@@ -1065,6 +1065,8 @@ async fn test_performance_snapshot_query_returns_internal_server_error_when_s3_f
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1080,4 +1082,6 @@ async fn test_closed_pair_query_returns_internal_server_error_when_s3_fails() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.unwrap().to_ascii_lowercase();
+    assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }

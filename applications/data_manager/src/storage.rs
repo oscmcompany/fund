@@ -20,38 +20,88 @@ use tracing::{debug, error, info, warn};
 pub struct CacheEntry {
     pub data: Vec<u8>,
     pub expires_at: Instant,
+    pub last_accessed: Instant,
 }
 
 pub struct QueryCache {
     entries: HashMap<String, CacheEntry>,
     ttl: Duration,
+    max_entries: usize,
+    max_bytes: usize,
+    current_size: usize,
 }
 
 impl QueryCache {
-    pub fn new(ttl_seconds: u64) -> Self {
+    pub fn new(ttl_seconds: u64, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
             ttl: Duration::from_secs(ttl_seconds),
+            max_entries,
+            max_bytes,
+            current_size: 0,
         }
     }
 
     pub fn get(&mut self, key: &str) -> Option<Vec<u8>> {
         let now = Instant::now();
-        match self.entries.get(key) {
-            Some(entry) if entry.expires_at > now => Some(entry.data.clone()),
-            Some(_) => {
-                self.entries.remove(key);
-                None
-            }
-            None => None,
+        let expired = match self.entries.get(key) {
+            Some(entry) => entry.expires_at <= now,
+            None => return None,
+        };
+        if expired {
+            let size = self.entries[key].data.len();
+            self.entries.remove(key);
+            self.current_size = self.current_size.saturating_sub(size);
+            return None;
         }
+        let entry = self.entries.get_mut(key).unwrap();
+        entry.last_accessed = now;
+        Some(entry.data.clone())
     }
 
     pub fn set(&mut self, key: String, data: Vec<u8>) {
         let now = Instant::now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
+        // TTL-based eviction
+        let mut removed_size: usize = 0;
+        self.entries.retain(|_, entry| {
+            if entry.expires_at > now {
+                true
+            } else {
+                removed_size += entry.data.len();
+                false
+            }
+        });
+        self.current_size = self.current_size.saturating_sub(removed_size);
+        // Remove existing entry for this key to avoid double-counting
+        if let Some(existing) = self.entries.remove(&key) {
+            self.current_size = self.current_size.saturating_sub(existing.data.len());
+        }
+        let incoming_size = data.len();
+        // LRU eviction to enforce budget
+        while (!self.entries.is_empty())
+            && (self.entries.len() >= self.max_entries
+                || self.current_size.saturating_add(incoming_size) > self.max_bytes)
+        {
+            let lru_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed)
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            let evicted_size = self.entries[&lru_key].data.len();
+            self.entries.remove(&lru_key);
+            self.current_size = self.current_size.saturating_sub(evicted_size);
+        }
         let expires_at = now + self.ttl;
-        self.entries.insert(key, CacheEntry { data, expires_at });
+        self.entries.insert(
+            key,
+            CacheEntry {
+                data,
+                expires_at,
+                last_accessed: now,
+            },
+        );
+        self.current_size += incoming_size;
     }
 }
 

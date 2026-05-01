@@ -51,7 +51,7 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
-        let cache = Arc::new(Mutex::new(QueryCache::new(300)));
+        let cache = Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024)));
 
         info!("Application state initialized successfully");
 

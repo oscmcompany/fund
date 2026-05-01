@@ -75,7 +75,7 @@ async fn create_state(endpoint: &str) -> State {
         },
         s3_client,
         test_bucket_name(),
-        Arc::new(Mutex::new(QueryCache::new(300))),
+        Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
     )
 }
 
@@ -543,13 +543,13 @@ fn test_format_performance_s3_key_closed_pairs() {
 
 #[test]
 fn test_query_cache_get_miss() {
-    let mut cache = QueryCache::new(300);
+    let mut cache = QueryCache::new(300, 1000, 100 * 1024 * 1024);
     assert!(cache.get("nonexistent_key").is_none());
 }
 
 #[test]
 fn test_query_cache_set_and_get() {
-    let mut cache = QueryCache::new(300);
+    let mut cache = QueryCache::new(300, 1000, 100 * 1024 * 1024);
     let data = vec![1u8, 2, 3, 4];
     cache.set("test_key".to_string(), data.clone());
 
@@ -560,7 +560,7 @@ fn test_query_cache_set_and_get() {
 
 #[test]
 fn test_query_cache_expired() {
-    let mut cache = QueryCache::new(0);
+    let mut cache = QueryCache::new(0, 1000, 100 * 1024 * 1024);
     let data = vec![1u8, 2, 3, 4];
     cache.set("test_key".to_string(), data);
 

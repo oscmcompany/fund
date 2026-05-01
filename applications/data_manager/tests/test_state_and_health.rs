@@ -25,7 +25,7 @@ async fn create_state_for_endpoint(endpoint: &str, bucket_name: &str) -> State {
         },
         s3_client,
         bucket_name.to_string(),
-        Arc::new(Mutex::new(QueryCache::new(300))),
+        Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
     )
 }
 
