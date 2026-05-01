@@ -1,6 +1,8 @@
 use crate::data::{
-    create_equity_bar_dataframe, create_equity_details_dataframe, create_portfolio_dataframe,
-    create_predictions_dataframe, EquityBar, Portfolio, Prediction,
+    create_closed_pair_dataframe, create_equity_bar_dataframe, create_equity_details_dataframe,
+    create_performance_snapshot_dataframe, create_portfolio_dataframe,
+    create_predictions_dataframe, ClosedPair, EquityBar, PerformanceSnapshot, Portfolio,
+    Prediction,
 };
 use crate::errors::Error;
 use crate::state::State;
@@ -38,6 +40,312 @@ pub async fn write_predictions_dataframe_to_s3(
     timestamp: &DateTime<Utc>,
 ) -> Result<String, Error> {
     write_dataframe_to_s3(state, dataframe, timestamp, "predictions".to_string()).await
+}
+
+pub async fn write_performance_snapshot_to_s3(
+    state: &State,
+    dataframe: &DataFrame,
+    timestamp: &DateTime<Utc>,
+) -> Result<String, Error> {
+    info!("Uploading performance snapshot DataFrame to S3 as parquet");
+
+    let key = format_performance_s3_key(timestamp, "live");
+
+    let mut buffer = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buffer);
+        let writer = ParquetWriter::new(cursor);
+        match writer.finish(&mut dataframe.clone()) {
+            Ok(_) => {
+                info!(
+                    "DataFrame successfully converted to parquet, size: {} bytes",
+                    buffer.len()
+                );
+            }
+            Err(err) => {
+                return Err(Error::Other(format!("Failed to write parquet: {}", err)));
+            }
+        }
+    }
+
+    let body = ByteStream::from(buffer);
+
+    match state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .body(body)
+        .content_type("application/octet-stream")
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Successfully uploaded parquet file to s3://{}/{}",
+                state.bucket_name, key
+            );
+            Ok(key)
+        }
+        Err(err) => Err(Error::Other(format!("Failed to upload to S3: {}", err))),
+    }
+}
+
+pub async fn query_performance_snapshots_from_s3(
+    state: &State,
+    start_timestamp: &DateTime<Utc>,
+    end_timestamp: &DateTime<Utc>,
+) -> Result<Vec<u8>, Error> {
+    info!(
+        "Querying performance snapshots from {} to {}, bucket: {}",
+        start_timestamp, end_timestamp, state.bucket_name
+    );
+
+    let connection = create_duckdb_connection().await?;
+
+    let s3_glob = format!("s3://{}/performance/live/**/*.parquet", state.bucket_name);
+
+    info!("Using S3 glob pattern: {}", s3_glob);
+
+    let start_date_int = date_to_int(start_timestamp)?;
+    let end_date_int = date_to_int(end_timestamp)?;
+
+    debug!(
+        "Date range filter: {} to {} (as integers)",
+        start_date_int, end_date_int
+    );
+
+    let start_ms = start_timestamp.timestamp_millis();
+    let end_ms = end_timestamp.timestamp_millis();
+
+    let query_sql = format!(
+        "
+        SELECT
+            timestamp,
+            portfolio_value,
+            cash_balance,
+            spy_close,
+            period_return_percent,
+            open_pair_count
+        FROM read_parquet('{}', hive_partitioning = true)
+        WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
+        AND timestamp BETWEEN {} AND {}
+        ORDER BY timestamp
+        ",
+        s3_glob, start_date_int, end_date_int, start_ms, end_ms
+    );
+
+    debug!("Executing query SQL: {}", query_sql);
+
+    info!("Preparing DuckDB statement");
+    let mut statement = match connection.prepare(&query_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No files found")
+                || msg.contains("Could not find")
+                || msg.contains("does not exist")
+                || msg.contains("Invalid Input Error: No files found")
+            {
+                return Err(Error::NoData);
+            }
+            return Err(Error::DuckDB(e));
+        }
+    };
+
+    info!("Executing query and mapping results");
+    let snapshots: Vec<PerformanceSnapshot> = statement
+        .query_map([], |row| {
+            Ok(PerformanceSnapshot {
+                timestamp: row.get(0)?,
+                portfolio_value: row.get(1)?,
+                cash_balance: row.get(2)?,
+                spy_close: row.get(3)?,
+                period_return_percent: row.get(4)?,
+                open_pair_count: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            warn!("Failed to map query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
+
+    info!(
+        "Query returned {} performance snapshot records",
+        snapshots.len()
+    );
+
+    let snapshots_dataframe = create_performance_snapshot_dataframe(snapshots)?;
+
+    let mut buffer = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buffer);
+        let writer = ParquetWriter::new(cursor);
+        writer
+            .finish(&mut snapshots_dataframe.clone())
+            .map_err(|e| Error::Other(format!("Failed to write parquet: {}", e)))?;
+    }
+
+    info!("Query returned {} bytes of parquet data", buffer.len());
+
+    Ok(buffer)
+}
+
+pub async fn write_closed_pair_to_s3(
+    state: &State,
+    dataframe: &DataFrame,
+    timestamp: &DateTime<Utc>,
+) -> Result<String, Error> {
+    info!("Uploading closed pair DataFrame to S3 as parquet");
+
+    let key = format_performance_s3_key(timestamp, "closed_pairs");
+
+    let mut buffer = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buffer);
+        let writer = ParquetWriter::new(cursor);
+        match writer.finish(&mut dataframe.clone()) {
+            Ok(_) => {
+                info!(
+                    "DataFrame successfully converted to parquet, size: {} bytes",
+                    buffer.len()
+                );
+            }
+            Err(err) => {
+                return Err(Error::Other(format!("Failed to write parquet: {}", err)));
+            }
+        }
+    }
+
+    let body = ByteStream::from(buffer);
+
+    match state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .body(body)
+        .content_type("application/octet-stream")
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(
+                "Successfully uploaded parquet file to s3://{}/{}",
+                state.bucket_name, key
+            );
+            Ok(key)
+        }
+        Err(err) => Err(Error::Other(format!("Failed to upload to S3: {}", err))),
+    }
+}
+
+pub async fn query_closed_pairs_from_s3(
+    state: &State,
+    start_timestamp: &DateTime<Utc>,
+    end_timestamp: &DateTime<Utc>,
+) -> Result<Vec<u8>, Error> {
+    info!(
+        "Querying closed pairs from {} to {}, bucket: {}",
+        start_timestamp, end_timestamp, state.bucket_name
+    );
+
+    let connection = create_duckdb_connection().await?;
+
+    let s3_glob = format!(
+        "s3://{}/performance/closed_pairs/**/*.parquet",
+        state.bucket_name
+    );
+
+    info!("Using S3 glob pattern: {}", s3_glob);
+
+    let start_date_int = date_to_int(start_timestamp)?;
+    let end_date_int = date_to_int(end_timestamp)?;
+
+    debug!(
+        "Date range filter: {} to {} (as integers)",
+        start_date_int, end_date_int
+    );
+
+    let start_ms = start_timestamp.timestamp_millis();
+    let end_ms = end_timestamp.timestamp_millis();
+
+    let query_sql = format!(
+        "
+        SELECT
+            closed_timestamp,
+            pair_id,
+            long_ticker,
+            short_ticker,
+            entry_timestamp,
+            dollar_amount,
+            realized_profit_and_loss,
+            return_percent,
+            holding_days
+        FROM read_parquet('{}', hive_partitioning = true)
+        WHERE (year::int * 10000 + month::int * 100 + day::int) BETWEEN {} AND {}
+        AND closed_timestamp BETWEEN {} AND {}
+        ORDER BY closed_timestamp
+        ",
+        s3_glob, start_date_int, end_date_int, start_ms, end_ms
+    );
+
+    debug!("Executing query SQL: {}", query_sql);
+
+    info!("Preparing DuckDB statement");
+    let mut statement = match connection.prepare(&query_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("No files found")
+                || msg.contains("Could not find")
+                || msg.contains("does not exist")
+                || msg.contains("Invalid Input Error: No files found")
+            {
+                return Err(Error::NoData);
+            }
+            return Err(Error::DuckDB(e));
+        }
+    };
+
+    info!("Executing query and mapping results");
+    let closed_pairs: Vec<ClosedPair> = statement
+        .query_map([], |row| {
+            Ok(ClosedPair {
+                closed_timestamp: row.get(0)?,
+                pair_id: row.get(1)?,
+                long_ticker: row.get(2)?,
+                short_ticker: row.get(3)?,
+                entry_timestamp: row.get(4)?,
+                dollar_amount: row.get(5)?,
+                realized_profit_and_loss: row.get(6)?,
+                return_percent: row.get(7)?,
+                holding_days: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            warn!("Failed to map query results: {}", e);
+            Error::Other(format!("Failed to map query results: {}", e))
+        })?;
+
+    info!("Query returned {} closed pair records", closed_pairs.len());
+
+    let closed_pairs_dataframe = create_closed_pair_dataframe(closed_pairs)?;
+
+    let mut buffer = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buffer);
+        let writer = ParquetWriter::new(cursor);
+        writer
+            .finish(&mut closed_pairs_dataframe.clone())
+            .map_err(|e| Error::Other(format!("Failed to write parquet: {}", e)))?;
+    }
+
+    info!("Query returned {} bytes of parquet data", buffer.len());
+
+    Ok(buffer)
 }
 
 pub async fn write_equity_details_dataframe_to_s3(
@@ -101,6 +409,21 @@ pub fn format_s3_key(timestamp: &DateTime<Utc>, dataframe_type: &str) -> String 
     format!(
         "equity/{}/daily/year={}/month={}/day={}/data.parquet",
         dataframe_type, year, month, day,
+    )
+}
+
+pub fn format_performance_s3_key(timestamp: &DateTime<Utc>, performance_type: &str) -> String {
+    let year = timestamp.format("%Y");
+    let month = timestamp.format("%m");
+    let day = timestamp.format("%d");
+    let hour = timestamp.format("%H");
+    let minute = timestamp.format("%M");
+    let second = timestamp.format("%S");
+    let timestamp_millis = timestamp.timestamp_millis();
+
+    format!(
+        "performance/{}/year={}/month={}/day={}/hour={}/minute={}/second={}/{}.parquet",
+        performance_type, year, month, day, hour, minute, second, timestamp_millis,
     )
 }
 
@@ -282,8 +605,6 @@ pub async fn query_equity_bars_parquet_from_s3(
     start_timestamp: Option<DateTime<Utc>>,
     end_timestamp: Option<DateTime<Utc>>,
 ) -> Result<Vec<u8>, Error> {
-    let connection = create_duckdb_connection().await?;
-
     let (start_timestamp, end_timestamp) = match (start_timestamp, end_timestamp) {
         (Some(start), Some(end)) => (start, end),
         (Some(start), None) => {
@@ -312,6 +633,8 @@ pub async fn query_equity_bars_parquet_from_s3(
             (start_date, end_date)
         }
     };
+
+    let connection = create_duckdb_connection().await?;
 
     info!(
         "Querying equity bars from {} to {}, bucket: {}",
@@ -576,7 +899,8 @@ pub async fn query_portfolio_dataframe_from_s3(
                     side,
                     dollar_amount,
                     action,
-                    pair_id
+                    pair_id,
+                    TRY_CAST(entry_price AS DOUBLE) AS entry_price
                 FROM '{}'
                 ORDER BY timestamp, ticker
                 ",
@@ -603,10 +927,11 @@ pub async fn query_portfolio_dataframe_from_s3(
                         dollar_amount,
                         action,
                         pair_id,
+                        TRY_CAST(entry_price AS DOUBLE) AS entry_price,
                         year,
                         month,
                         day
-                    FROM read_parquet('{}', hive_partitioning = true)
+                    FROM read_parquet('{}', hive_partitioning = true, union_by_name = true)
                 ),
                 max_date AS (
                     SELECT MAX(year::int * 10000 + month::int * 100 + day::int) as date_int
@@ -618,7 +943,8 @@ pub async fn query_portfolio_dataframe_from_s3(
                     side,
                     dollar_amount,
                     action,
-                    pair_id
+                    pair_id,
+                    entry_price
                 FROM partitioned_data
                 WHERE (year::int * 10000 + month::int * 100 + day::int) = (SELECT date_int FROM max_date)
                 ORDER BY timestamp, ticker
@@ -657,6 +983,7 @@ fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<P
                 dollar_amount: row.get::<_, f64>(3)?,
                 action: row.get::<_, String>(4)?,
                 pair_id: row.get::<_, String>(5)?,
+                entry_price: row.get::<_, Option<f64>>(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()

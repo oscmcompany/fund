@@ -8,7 +8,7 @@ use data_manager::{
     },
     state::{MassiveSecrets, State},
     storage::{
-        date_to_int, escape_sql_ticker, format_s3_key, is_valid_ticker,
+        date_to_int, escape_sql_ticker, format_performance_s3_key, format_s3_key, is_valid_ticker,
         query_equity_bars_parquet_from_s3, query_portfolio_dataframe_from_s3,
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
         sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
@@ -40,6 +40,7 @@ fn sample_portfolio() -> Portfolio {
         dollar_amount: 10_000.0,
         action: "BUY".to_string(),
         pair_id: "AAPL-MSFT".to_string(),
+        entry_price: Some(150.0),
     }
 }
 
@@ -512,5 +513,27 @@ async fn test_write_equity_details_dataframe_to_s3_success() {
     assert_eq!(
         read_back.column("industry").unwrap().str().unwrap().get(0),
         Some("CONSUMER ELECTRONICS")
+    );
+}
+
+#[test]
+fn test_format_performance_s3_key_live() {
+    let timestamp = fixed_date_time();
+    let key = format_performance_s3_key(&timestamp, "live");
+
+    assert_eq!(
+        key,
+        "performance/live/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
+    );
+}
+
+#[test]
+fn test_format_performance_s3_key_closed_pairs() {
+    let timestamp = fixed_date_time();
+    let key = format_performance_s3_key(&timestamp, "closed_pairs");
+
+    assert_eq!(
+        key,
+        "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
     );
 }
