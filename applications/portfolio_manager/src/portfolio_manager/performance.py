@@ -36,7 +36,7 @@ def compute_portfolio_value(
         if side == "LONG":
             position_value = dollar_amount * (close_price / entry_price)
         else:
-            position_value = max(0.0, dollar_amount * (2.0 - close_price / entry_price))
+            position_value = dollar_amount * (2.0 - close_price / entry_price)
 
         total_value += position_value
 

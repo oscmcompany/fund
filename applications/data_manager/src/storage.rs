@@ -12,102 +12,8 @@ use chrono::{DateTime, Utc};
 use duckdb::Connection;
 use polars::prelude::*;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::Cursor;
-use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-
-pub struct CacheEntry {
-    pub data: Vec<u8>,
-    pub expires_at: Instant,
-    pub last_accessed: Instant,
-}
-
-pub struct QueryCache {
-    entries: HashMap<String, CacheEntry>,
-    ttl: Duration,
-    max_entries: usize,
-    max_bytes: usize,
-    current_size: usize,
-}
-
-impl QueryCache {
-    pub fn new(ttl_seconds: u64, max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            ttl: Duration::from_secs(ttl_seconds),
-            max_entries,
-            max_bytes,
-            current_size: 0,
-        }
-    }
-
-    pub fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-        let now = Instant::now();
-        let expired = match self.entries.get(key) {
-            Some(entry) => entry.expires_at <= now,
-            None => return None,
-        };
-        if expired {
-            let size = self.entries[key].data.len();
-            self.entries.remove(key);
-            self.current_size = self.current_size.saturating_sub(size);
-            return None;
-        }
-        let entry = self.entries.get_mut(key).unwrap();
-        entry.last_accessed = now;
-        Some(entry.data.clone())
-    }
-
-    pub fn set(&mut self, key: String, data: Vec<u8>) {
-        let now = Instant::now();
-        // TTL-based eviction
-        let mut removed_size: usize = 0;
-        self.entries.retain(|_, entry| {
-            if entry.expires_at > now {
-                true
-            } else {
-                removed_size += entry.data.len();
-                false
-            }
-        });
-        self.current_size = self.current_size.saturating_sub(removed_size);
-        // Remove existing entry for this key to avoid double-counting
-        if let Some(existing) = self.entries.remove(&key) {
-            self.current_size = self.current_size.saturating_sub(existing.data.len());
-        }
-        let incoming_size = data.len();
-        // Skip caching if the entry alone exceeds the byte budget
-        if incoming_size > self.max_bytes {
-            return;
-        }
-        // LRU eviction to enforce budget
-        while (!self.entries.is_empty())
-            && (self.entries.len() >= self.max_entries
-                || self.current_size.saturating_add(incoming_size) > self.max_bytes)
-        {
-            let lru_key = self
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed)
-                .map(|(k, _)| k.clone())
-                .unwrap();
-            let evicted_size = self.entries[&lru_key].data.len();
-            self.entries.remove(&lru_key);
-            self.current_size = self.current_size.saturating_sub(evicted_size);
-        }
-        let expires_at = now + self.ttl;
-        self.entries.insert(
-            key,
-            CacheEntry {
-                data,
-                expires_at,
-                last_accessed: now,
-            },
-        );
-        self.current_size += incoming_size;
-    }
-}
 
 const EQUITY_DETAILS_KEY: &str = "equity/details/details.csv";
 pub const DUCKDB_CONFIG_VALUE_MAX_LENGTH: usize = 4096;
@@ -728,36 +634,6 @@ pub async fn query_equity_bars_parquet_from_s3(
         }
     };
 
-    let ticker_key = tickers
-        .as_ref()
-        .map(|ticker_list| {
-            let mut normalized = ticker_list.clone();
-            normalized.sort();
-            normalized.dedup();
-            normalized.join(",")
-        })
-        .unwrap_or_default();
-
-    let cache_key = format!(
-        "equity_bars:{}:{}:{}:{}",
-        state.bucket_name,
-        start_timestamp.timestamp_millis(),
-        end_timestamp.timestamp_millis(),
-        ticker_key,
-    );
-
-    let cached = tokio::task::block_in_place(|| match state.cache.lock() {
-        Ok(mut cache) => cache.get(&cache_key),
-        Err(_) => {
-            warn!("Query cache lock poisoned; treating as cache miss");
-            None
-        }
-    });
-    if let Some(cached) = cached {
-        info!("Cache hit for equity bars query");
-        return Ok(cached);
-    }
-
     let connection = create_duckdb_connection().await?;
 
     info!(
@@ -871,11 +747,6 @@ pub async fn query_equity_bars_parquet_from_s3(
     }
 
     info!("Query returned {} bytes of parquet data", buffer.len());
-
-    tokio::task::block_in_place(|| match state.cache.lock() {
-        Ok(mut cache) => cache.set(cache_key, buffer.clone()),
-        Err(_) => warn!("Query cache lock poisoned; skipping cache write"),
-    });
 
     Ok(buffer)
 }
@@ -1060,7 +931,7 @@ pub async fn query_portfolio_dataframe_from_s3(
                         year,
                         month,
                         day
-                    FROM read_parquet('{}', hive_partitioning = true)
+                    FROM read_parquet('{}', hive_partitioning = true, union_by_name = true)
                 ),
                 max_date AS (
                     SELECT MAX(year::int * 10000 + month::int * 100 + day::int) as date_int

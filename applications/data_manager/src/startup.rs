@@ -69,9 +69,7 @@ mod tests {
     use crate::{
         router::create_app_with_state,
         state::{MassiveSecrets, State},
-        storage::QueryCache,
     };
-    use std::sync::{Arc, Mutex};
 
     struct EnvironmentVariableGuard {
         name: String,
@@ -153,7 +151,6 @@ mod tests {
             },
             s3_client,
             "test-bucket".to_string(),
-            Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
         )
     }
 

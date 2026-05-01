@@ -13,14 +13,12 @@ use data_manager::{
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
         sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
         write_equity_details_dataframe_to_s3, write_portfolio_dataframe_to_s3,
-        write_predictions_dataframe_to_s3, PredictionQuery, QueryCache,
-        DUCKDB_CONFIG_VALUE_MAX_LENGTH,
+        write_predictions_dataframe_to_s3, PredictionQuery, DUCKDB_CONFIG_VALUE_MAX_LENGTH,
     },
 };
 use polars::prelude::*;
 use serial_test::serial;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
 
 use common::{create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name};
 
@@ -75,7 +73,6 @@ async fn create_state(endpoint: &str) -> State {
         },
         s3_client,
         test_bucket_name(),
-        Arc::new(Mutex::new(QueryCache::new(300, 1000, 100 * 1024 * 1024))),
     )
 }
 
@@ -539,31 +536,4 @@ fn test_format_performance_s3_key_closed_pairs() {
         key,
         "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
     );
-}
-
-#[test]
-fn test_query_cache_get_miss() {
-    let mut cache = QueryCache::new(300, 1000, 100 * 1024 * 1024);
-    assert!(cache.get("nonexistent_key").is_none());
-}
-
-#[test]
-fn test_query_cache_set_and_get() {
-    let mut cache = QueryCache::new(300, 1000, 100 * 1024 * 1024);
-    let data = vec![1u8, 2, 3, 4];
-    cache.set("test_key".to_string(), data.clone());
-
-    let result = cache.get("test_key");
-    assert!(result.is_some());
-    assert_eq!(result.unwrap(), data);
-}
-
-#[test]
-fn test_query_cache_expired() {
-    let mut cache = QueryCache::new(0, 1000, 100 * 1024 * 1024);
-    let data = vec![1u8, 2, 3, 4];
-    cache.set("test_key".to_string(), data);
-
-    let result = cache.get("test_key");
-    assert!(result.is_none());
 }
