@@ -285,6 +285,47 @@ in {
 
   # --- Local dev commands ---
 
+  # Register Prefect S3Bucket blocks on the local server
+  scripts.register-blocks.exec = ''
+    echo "Waiting for orchestrator..."
+    while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
+      sleep 2
+    done
+
+    export PREFECT_API_URL="http://localhost:4200/api"
+
+    echo "Reading bucket names from Pulumi stack outputs..."
+    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    DATA_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
+    ARTIFACTS_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
+
+    if [ -z "$DATA_BUCKET" ] || [ -z "$ARTIFACTS_BUCKET" ]; then
+      echo "Could not read bucket names from Pulumi. Using defaults."
+      DATA_BUCKET="fund-data-404221e2"
+      ARTIFACTS_BUCKET="fund-model-artifacts-404221e2"
+    fi
+
+    echo "  data bucket:      $DATA_BUCKET"
+    echo "  artifacts bucket:  $ARTIFACTS_BUCKET"
+
+    echo "Registering S3Bucket blocks on local Prefect server..."
+    uv run --package tide python -c "
+import sys
+from prefect_aws.s3 import S3Bucket
+from prefect_aws.credentials import AwsCredentials
+
+data_bucket = sys.argv[1]
+artifacts_bucket = sys.argv[2]
+
+creds = AwsCredentials()
+creds.save('aws-credentials', overwrite=True)
+
+S3Bucket(bucket_name=data_bucket, credentials=creds).save('data-bucket', overwrite=True)
+S3Bucket(bucket_name=artifacts_bucket, credentials=creds).save('artifact-bucket', overwrite=True)
+print('Blocks registered: data-bucket, artifact-bucket')
+" "$DATA_BUCKET" "$ARTIFACTS_BUCKET"
+  '';
+
   # Create work pool and register training deployment locally
   scripts.initialize-local-trainer.exec = ''
     echo "Waiting for orchestrator..."
@@ -292,12 +333,20 @@ in {
       sleep 2
     done
 
+    register-blocks
+
     echo "Creating fund-models-local work pool..."
     uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
       || echo "  already exists"
 
     echo "Registering local training deployment..."
     uv run prefect --no-prompt deploy --name tide-trainer-local
+
+    echo "Setting pull steps to local project root..."
+    DEPLOYMENT_ID=$(curl -sf http://localhost:4200/api/deployments/name/tide-training-pipeline/tide-trainer-local | jq -r '.id')
+    curl -sf -X PATCH "http://localhost:4200/api/deployments/$DEPLOYMENT_ID" \
+      -H 'Content-Type: application/json' \
+      -d "{\"pull_steps\": [{\"prefect.deployments.steps.set_working_directory\": {\"directory\": \"$DEVENV_ROOT\"}}]}"
 
     echo ""
     echo "Done. Visit http://localhost:4200 to see the orchestrator dashboard."
@@ -353,11 +402,20 @@ in {
         sleep 2
       done
 
-      # Create work pool and register deployment on first startup
-      PREFECT_API_URL="http://localhost:4200/api" \
-        uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null || true
-      PREFECT_API_URL="http://localhost:4200/api" \
-        uv run --package tide python -m tide.deploy 2>/dev/null || true
+      # Register S3 blocks, create work pool, and register deployment on first startup
+      export PREFECT_API_URL="http://localhost:4200/api"
+      register-blocks || true
+
+      uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null || true
+
+      uv run prefect --no-prompt deploy --name tide-trainer-local 2>/dev/null || true
+      DEPLOYMENT_ID=$(curl -sf http://localhost:4200/api/deployments/name/tide-training-pipeline/tide-trainer-local | jq -r '.id') || true
+      if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "null" ]; then
+        PROJECT_ROOT="''${DEVENV_ROOT:-$(pwd)}"
+        curl -sf -X PATCH "http://localhost:4200/api/deployments/$DEPLOYMENT_ID" \
+          -H 'Content-Type: application/json' \
+          -d "{\"pull_steps\": [{\"prefect.deployments.steps.set_working_directory\": {\"directory\": \"$PROJECT_ROOT\"}}]}" || true
+      fi
 
       cd tools
       exec uv run prefect worker start --pool fund-models-local --name worker-1
@@ -442,6 +500,7 @@ in {
     echo "    initialize-remote-trainer  Create work pool + register deployment (prod)"
     echo ""
     echo "  Local:"
+    echo "    register-blocks            Register S3 blocks on local Prefect server"
     echo "    initialize-local-trainer   Create work pool + register deployment (local)"
     echo "    cleanup-services  Kill stale local processes"
   '';
