@@ -236,3 +236,16 @@ def test_equity_details_schema_special_characters() -> None:
     validated_df = equity_details_schema.validate(data)
     assert validated_df["sector"][0] == "REAL-ESTATE"
     assert validated_df["industry"][0] == "RETAIL & WHOLESALE"
+
+
+def test_equity_details_schema_preferred_stock_ticker() -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": ["ABR^D", "ABR^E", "ACP^A"],
+            "sector": ["REAL-ESTATE", "REAL-ESTATE", "FINANCE"],
+            "industry": ["REITS", "REITS", "INVESTMENT TRUSTS"],
+        }
+    )
+
+    validated_df = equity_details_schema.validate(data)
+    assert list(validated_df["ticker"]) == ["ABR^D", "ABR^E", "ACP^A"]
