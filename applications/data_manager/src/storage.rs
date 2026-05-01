@@ -77,6 +77,10 @@ impl QueryCache {
             self.current_size = self.current_size.saturating_sub(existing.data.len());
         }
         let incoming_size = data.len();
+        // Skip caching if the entry alone exceeds the byte budget
+        if incoming_size > self.max_bytes {
+            return;
+        }
         // LRU eviction to enforce budget
         while (!self.entries.is_empty())
             && (self.entries.len() >= self.max_entries
@@ -235,7 +239,7 @@ pub async fn query_performance_snapshots_from_s3(
             if msg.contains("No files found")
                 || msg.contains("Could not find")
                 || msg.contains("does not exist")
-                || msg.contains("Invalid Input")
+                || msg.contains("Invalid Input Error: No files found")
             {
                 return Err(Error::NoData);
             }
@@ -391,7 +395,7 @@ pub async fn query_closed_pairs_from_s3(
             if msg.contains("No files found")
                 || msg.contains("Could not find")
                 || msg.contains("does not exist")
-                || msg.contains("Invalid Input")
+                || msg.contains("Invalid Input Error: No files found")
             {
                 return Err(Error::NoData);
             }

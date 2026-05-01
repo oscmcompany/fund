@@ -86,13 +86,16 @@ async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -
 
 async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
     try:
+        timestamp_millis = snapshot["timestamp"]
+        timestamp_seconds, timestamp_millis_remainder = divmod(timestamp_millis, 1000)
+        snapshot_timestamp = datetime.fromtimestamp(timestamp_seconds, tz=UTC).replace(
+            microsecond=timestamp_millis_remainder * 1000
+        )
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
                 json={
-                    "timestamp": datetime.fromtimestamp(
-                        snapshot["timestamp"] / 1000, tz=UTC
-                    ).isoformat(),
+                    "timestamp": snapshot_timestamp.isoformat(),
                     "data": snapshot,
                 },
             )
@@ -106,13 +109,18 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
 
 async def save_closed_pair(record: dict[str, Any]) -> bool:
     try:
+        closed_timestamp_millis = record["closed_timestamp"]
+        closed_timestamp_seconds, closed_millis_remainder = divmod(
+            closed_timestamp_millis, 1000
+        )
+        closed_timestamp = datetime.fromtimestamp(
+            closed_timestamp_seconds, tz=UTC
+        ).replace(microsecond=closed_millis_remainder * 1000)
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/performance/closed-pairs",
                 json={
-                    "timestamp": datetime.fromtimestamp(
-                        record["closed_timestamp"] / 1000, tz=UTC
-                    ).isoformat(),
+                    "timestamp": closed_timestamp.isoformat(),
                     "data": record,
                 },
             )

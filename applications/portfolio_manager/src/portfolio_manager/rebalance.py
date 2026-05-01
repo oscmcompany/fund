@@ -360,9 +360,10 @@ async def _record_performance(  # noqa: PLR0913
         if (
             "entry_price" not in pair_rows.columns
             or pair_rows["entry_price"].is_null().any()
+            or (pair_rows["entry_price"] <= 0).any()
         ):
             logger.warning(
-                "Prior pair missing entry_price, skipping pnl calculation",
+                "Prior pair missing or invalid entry_price, skipping pnl calculation",
                 pair_id=pair_id,
             )
             continue
@@ -373,12 +374,29 @@ async def _record_performance(  # noqa: PLR0913
         if long_rows.is_empty() or short_rows.is_empty():
             continue
 
+        long_ticker = long_rows["ticker"][0]
+        short_ticker = short_rows["ticker"][0]
+
+        expected_leg_count = 2
+        pair_current_prices = current_prices.filter(
+            pl.col("ticker").is_in([long_ticker, short_ticker])
+        )
+        if (
+            pair_current_prices.height != expected_leg_count
+            or pair_current_prices["close_price"].is_null().any()
+        ):
+            logger.warning(
+                "Missing current price for pair leg, skipping pnl calculation",
+                pair_id=pair_id,
+                long_ticker=long_ticker,
+                short_ticker=short_ticker,
+            )
+            continue
+
         realized_profit_and_loss, return_percent = compute_realized_profit_and_loss(
             pair_rows, current_prices
         )
         dollar_amount = float(pair_rows["dollar_amount"].sum())
-        long_ticker = long_rows["ticker"][0]
-        short_ticker = short_rows["ticker"][0]
         entry_timestamp = int(pair_rows["timestamp"][0])
         closed_timestamp = int(current_timestamp.timestamp() * 1000)
 
