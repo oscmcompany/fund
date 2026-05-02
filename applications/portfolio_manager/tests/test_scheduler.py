@@ -220,7 +220,7 @@ def test_already_rebalanced_today_returns_false_when_timestamp_field_is_missing(
 
 def _run_loop(
     mock_alpaca: MagicMock,
-    mock_sleep_side_effect: list,
+    mock_sleep_side_effect: list[BaseException | None],
     frozen_now: datetime,
     *,
     already_rebalanced: bool = False,
@@ -319,6 +319,182 @@ def test_rebalance_loop_skips_when_already_rebalanced_today() -> None:
         frozen_now=frozen_now,
         mock_sleep_side_effect=[asyncio.CancelledError()],
         already_rebalanced=True,
+        market_open=True,
+    )
+
+    mock_run_rebalance.assert_not_called()
+
+
+def test_rebalance_loop_skips_on_weekend_in_loop() -> None:
+    # Saturday 09:00 AM ET — catch_up=False (weekend), loop sleeps, in-loop weekend
+    # check skips, second sleep cancels.
+    frozen_now = _make_eastern_datetime(weekday_offset=5, hour=9).astimezone(UTC)
+    mock_alpaca = MagicMock()
+
+    mock_run_rebalance = _run_loop(
+        mock_alpaca=mock_alpaca,
+        frozen_now=frozen_now,
+        mock_sleep_side_effect=[None, asyncio.CancelledError()],
+        already_rebalanced=False,
+        market_open=True,
+    )
+
+    mock_run_rebalance.assert_not_called()
+
+
+def test_rebalance_loop_skips_when_already_rebalanced_in_loop() -> None:
+    # Monday 09:00 AM ET — before the 10:00 window so catch_up=False; after
+    # sleeping, the in-loop already-rebalanced check returns True → skip.
+    frozen_now = _make_eastern_datetime(weekday_offset=0, hour=9).astimezone(UTC)
+    mock_alpaca = MagicMock()
+
+    mock_run_rebalance = _run_loop(
+        mock_alpaca=mock_alpaca,
+        frozen_now=frozen_now,
+        mock_sleep_side_effect=[None, asyncio.CancelledError()],
+        already_rebalanced=True,
+        market_open=True,
+    )
+
+    mock_run_rebalance.assert_not_called()
+
+
+def test_rebalance_loop_skips_when_lock_is_held() -> None:
+    # Tuesday 10:05 AM ET — catch-up fires but the rebalance lock is already held.
+    frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
+        UTC
+    )
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock()
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        await lock.acquire()
+        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+
+    with (
+        patch("portfolio_manager.scheduler.datetime") as mock_dt,
+        patch(
+            "portfolio_manager.scheduler._already_rebalanced_today",
+            AsyncMock(return_value=False),
+        ),
+        patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+        patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
+    ):
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        asyncio.run(run())
+
+    mock_run_rebalance.assert_not_called()
+
+
+def test_rebalance_loop_handles_market_open_exception() -> None:
+    # Tuesday 10:05 AM ET — catch-up fires; is_market_open raises; sentry notified.
+    frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
+        UTC
+    )
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.side_effect = Exception("market check failed")
+    mock_run_rebalance = AsyncMock()
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+
+    with (
+        patch("portfolio_manager.scheduler.datetime") as mock_dt,
+        patch(
+            "portfolio_manager.scheduler._already_rebalanced_today",
+            AsyncMock(return_value=False),
+        ),
+        patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+        patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
+        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
+    ):
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        asyncio.run(run())
+
+    mock_run_rebalance.assert_not_called()
+    mock_sentry.capture_exception.assert_called_once()
+
+
+def test_rebalance_loop_handles_run_rebalance_exception() -> None:
+    # Tuesday 10:05 AM ET — catch-up fires; run_rebalance raises; sentry notified.
+    frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
+        UTC
+    )
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock(side_effect=Exception("rebalance failed"))
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+
+    with (
+        patch("portfolio_manager.scheduler.datetime") as mock_dt,
+        patch(
+            "portfolio_manager.scheduler._already_rebalanced_today",
+            AsyncMock(return_value=False),
+        ),
+        patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+        patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
+        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
+    ):
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        asyncio.run(run())
+
+    mock_run_rebalance.assert_called_once()
+    mock_sentry.capture_exception.assert_called_once()
+
+
+def test_rebalance_loop_logs_warning_on_non_200_response() -> None:
+    # Tuesday 10:05 AM ET — catch-up fires; run_rebalance returns non-200.
+    frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
+        UTC
+    )
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_response = MagicMock()
+    mock_response.status_code = 500
+    mock_run_rebalance = AsyncMock(return_value=mock_response)
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+
+    with (
+        patch("portfolio_manager.scheduler.datetime") as mock_dt,
+        patch(
+            "portfolio_manager.scheduler._already_rebalanced_today",
+            AsyncMock(return_value=False),
+        ),
+        patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+        patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
+        patch("portfolio_manager.scheduler.logger") as mock_logger,
+    ):
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        asyncio.run(run())
+
+    mock_run_rebalance.assert_called_once()
+    mock_logger.warning.assert_called_once()
+
+
+def test_rebalance_loop_retries_after_unexpected_error() -> None:
+    # Monday 09:00 AM ET — before window so catch_up=False; first sleep raises an
+    # unexpected error caught by the outer except, loop retries; second sleep cancels.
+    frozen_now = _make_eastern_datetime(weekday_offset=0, hour=9).astimezone(UTC)
+    mock_alpaca = MagicMock()
+
+    mock_run_rebalance = _run_loop(
+        mock_alpaca=mock_alpaca,
+        frozen_now=frozen_now,
+        mock_sleep_side_effect=[RuntimeError("unexpected"), asyncio.CancelledError()],
+        already_rebalanced=False,
         market_open=True,
     )
 
