@@ -155,10 +155,7 @@ pub async fn fetch_and_store(
     let text_content = response
         .error_for_status()
         .map_err(|err| {
-            warn!(
-                "API request failed with error status: {}",
-                err.without_url()
-            );
+            warn!("API request failed with status code: {:?}", err.status());
             "API request failed".to_string()
         })?
         .text()

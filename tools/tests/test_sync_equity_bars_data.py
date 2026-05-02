@@ -62,7 +62,7 @@ def test_sync_equity_bars_for_date_returns_status_and_body() -> None:
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
     assert call_kwargs.args[0] == "http://localhost:8080/equity-bars"
-    assert call_kwargs.kwargs["json"]["date"] == "2025-06-01T00:00:00Z"
+    assert call_kwargs.kwargs["json"]["date"] == "2025-06-01T16:00:00Z"
 
 
 def test_sync_equity_bars_data_single_date_makes_one_request() -> None:

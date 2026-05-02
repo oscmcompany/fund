@@ -48,7 +48,7 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
 
 def sync_equity_bars_for_date(base_url: str, date: datetime) -> tuple[int, str]:
     url = f"{base_url}/equity-bars"
-    date_string = date.strftime("%Y-%m-%dT00:00:00Z")
+    date_string = date.strftime("%Y-%m-%dT16:00:00Z")
 
     response = requests.post(
         url,
