@@ -32,8 +32,9 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
     except ValueError as e:
         raise RuntimeError from e
 
-    current_date = datetime.now(tz=UTC).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    today_eastern = datetime.now(tz=_EASTERN).date()
+    current_date = datetime(
+        today_eastern.year, today_eastern.month, today_eastern.day, tzinfo=UTC
     )
     maximum_lookback_days = 365 * 2  # two year limit
 
