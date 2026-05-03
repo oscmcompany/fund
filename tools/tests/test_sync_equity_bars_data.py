@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from tools.sync_equity_bars_data import (
     sync_equity_bars_data,
@@ -29,17 +30,21 @@ def test_validate_and_parse_dates_returns_datetime_tuple() -> None:
 
 
 def test_validate_and_parse_dates_clamps_to_current_day() -> None:
-    now = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    eastern = ZoneInfo("America/New_York")
+    today_eastern = datetime.now(tz=eastern).date()
     date_range_json = json.dumps(
         {
-            "start_date": now.strftime("%Y-%m-%d"),
-            "end_date": now.strftime("%Y-%m-%d"),
+            "start_date": today_eastern.strftime("%Y-%m-%d"),
+            "end_date": today_eastern.strftime("%Y-%m-%d"),
         }
     )
 
     _, end_date = validate_and_parse_dates(date_range_json)
 
-    assert end_date <= now
+    current_day_utc = datetime(
+        today_eastern.year, today_eastern.month, today_eastern.day, tzinfo=UTC
+    )
+    assert end_date <= current_day_utc
 
 
 def test_sync_equity_bars_for_date_returns_status_and_body() -> None:

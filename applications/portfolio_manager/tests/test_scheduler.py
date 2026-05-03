@@ -489,13 +489,31 @@ def test_rebalance_loop_retries_after_unexpected_error() -> None:
     # unexpected error caught by the outer except, loop retries; second sleep cancels.
     frozen_now = _make_eastern_datetime(weekday_offset=0, hour=9).astimezone(UTC)
     mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock()
 
-    mock_run_rebalance = _run_loop(
-        mock_alpaca=mock_alpaca,
-        frozen_now=frozen_now,
-        mock_sleep_side_effect=[RuntimeError("unexpected"), asyncio.CancelledError()],
-        already_rebalanced=False,
-        market_open=True,
-    )
+    async def run() -> None:
+        lock = asyncio.Lock()
+        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+
+    with (
+        patch("portfolio_manager.scheduler.datetime") as mock_dt,
+        patch(
+            "portfolio_manager.scheduler._already_rebalanced_today",
+            AsyncMock(return_value=False),
+        ),
+        patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+        patch(
+            "asyncio.sleep",
+            AsyncMock(
+                side_effect=[RuntimeError("unexpected"), asyncio.CancelledError()]
+            ),
+        ),
+        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
+    ):
+        mock_dt.now.return_value = frozen_now
+        mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
+        asyncio.run(run())
 
     mock_run_rebalance.assert_not_called()
+    mock_sentry.capture_exception.assert_called_once()
