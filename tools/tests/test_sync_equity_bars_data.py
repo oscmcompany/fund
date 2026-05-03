@@ -32,19 +32,20 @@ def test_validate_and_parse_dates_returns_datetime_tuple() -> None:
 def test_validate_and_parse_dates_clamps_to_current_day() -> None:
     eastern = ZoneInfo("America/New_York")
     today_eastern = datetime.now(tz=eastern).date()
+    tomorrow_eastern = today_eastern + timedelta(days=1)
     date_range_json = json.dumps(
         {
             "start_date": today_eastern.strftime("%Y-%m-%d"),
-            "end_date": today_eastern.strftime("%Y-%m-%d"),
+            "end_date": tomorrow_eastern.strftime("%Y-%m-%d"),
         }
     )
 
     _, end_date = validate_and_parse_dates(date_range_json)
 
-    current_day_utc = datetime(
+    expected_current_date = datetime(
         today_eastern.year, today_eastern.month, today_eastern.day, tzinfo=UTC
     )
-    assert end_date <= current_day_utc
+    assert end_date == expected_current_date
 
 
 def test_sync_equity_bars_for_date_returns_status_and_body() -> None:

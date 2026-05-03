@@ -63,20 +63,25 @@ def test_lifespan_initializes_client_and_scheduler() -> None:
     async def run() -> None:
         # Use an already-done future: cancel() is a no-op on done futures,
         # and await returns None without raising CancelledError.
-        future: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         future.set_result(None)
 
         with (
             patch.object(server_module, "ALPACA_API_KEY_ID", "test-key"),
             patch.object(server_module, "ALPACA_API_SECRET", "test-secret"),
-            patch("portfolio_manager.server.AlpacaClient", return_value=mock_alpaca),
+            patch(
+                "portfolio_manager.server.AlpacaClient", return_value=mock_alpaca
+            ) as mock_alpaca_client,
             patch(
                 "portfolio_manager.server.spawn_rebalance_scheduler",
                 AsyncMock(return_value=future),
-            ),
+            ) as mock_spawn_scheduler,
         ):
             async with _lifespan(mock_app):
                 pass
+
+        mock_alpaca_client.assert_called_once()
+        mock_spawn_scheduler.assert_awaited_once()
 
     asyncio.run(run())
 
@@ -105,8 +110,6 @@ def test_create_portfolio_calls_run_rebalance() -> None:
     application.state.alpaca_client = mock_alpaca
 
     async def run() -> Response:
-        # asyncio.wait_for(lock.acquire(), timeout=0) raises TimeoutError even for a
-        # free lock in Python 3.12 because the task hasn't run yet when timeout fires.
         # Patch wait_for to simulate a successful lock acquisition so we can verify
         # that run_rebalance is called and the lock is released in the finally block.
         with (
