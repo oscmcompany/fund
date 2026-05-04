@@ -44,6 +44,9 @@ jobs:
               - 'libraries/python/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
               - 'pyproject.toml'
               - 'uv.lock'
       - name: Configure AWS credentials
@@ -120,6 +123,9 @@ jobs:
               - 'libraries/python/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
               - 'pyproject.toml'
               - 'uv.lock'
       - name: Configure AWS credentials
