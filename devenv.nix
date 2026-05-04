@@ -33,6 +33,53 @@ in {
     nix.enable = true;
   };
 
+  git-hooks.hooks = {
+    python-install = {
+      enable = true;
+      name = "Install Python dependencies";
+      entry = "python-install";
+      files = "(pyproject\\.toml|uv\\.lock)$";
+      pass_filenames = false;
+      language = "system";
+    };
+    python-checks = {
+      enable = true;
+      name = "Check all Python code";
+      entry = "python-checks";
+      files = "(\\.py|pyproject\\.toml|uv\\.lock)$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
+    rust-checks = {
+      enable = true;
+      name = "Check all Rust code";
+      entry = "rust-checks";
+      files = "(\\.rs|Cargo\\.(toml|lock))$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
+    markdown-checks = {
+      enable = true;
+      name = "Check all Markdown code";
+      entry = "markdown-checks";
+      files = "\\.md$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
+    yaml-checks = {
+      enable = true;
+      name = "Check all YAML code";
+      entry = "yaml-checks";
+      files = "\\.(yaml|yml)$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
+  };
+
   env = {
     # AWS region
     AWS_REGION = awsRegion;
@@ -372,6 +419,141 @@ print('Blocks registered: data-bucket, artifact-bucket')
     fi
   '';
 
+  # --- Development check scripts ---
+
+  scripts.python-install.exec = ''
+    echo "Installing Python dependencies"
+    uv sync --all-packages --all-groups
+    echo "Python dependencies installed successfully"
+  '';
+
+  scripts.python-format.exec = ''
+    echo "Checking Python code formatting"
+    ruff format --check
+    echo "Python code formatting check passed"
+  '';
+
+  scripts.python-lint.exec = ''
+    echo "Running Python lint checks"
+    ruff check --output-format=github .
+    echo "Python linting completed successfully"
+  '';
+
+  scripts.python-type-check.exec = ''
+    echo "Running Python type checks"
+    uvx ty check
+    echo "Python type checks completed successfully"
+  '';
+
+  scripts.python-dead-code.exec = ''
+    echo "Running dead code analysis"
+    uvx vulture \
+      --min-confidence 80 \
+      --exclude '.flox,.venv,target' \
+      . tools/src/tools/vulture_whitelist.py
+    echo "Dead code check completed"
+  '';
+
+  scripts.python-complexity.exec = ''
+    echo "Running Python complexity analysis"
+    xenon --max-absolute D --max-modules D --max-average A \
+      --ignore '.flox,.venv,target' .
+    echo "Python complexity analysis completed successfully"
+  '';
+
+  scripts.python-test.exec = ''
+    echo "Running Python tests with coverage"
+    mkdir -p .coverage_output
+    uv run coverage run --parallel-mode -m pytest \
+      && uv run coverage combine \
+      && uv run coverage report \
+      && uv run coverage xml -o .coverage_output/python.xml
+    echo "Python tests completed successfully"
+  '';
+
+  scripts.python-checks.exec = ''
+    set -euo pipefail
+    echo "Running Python development checks"
+    python-format
+    python-lint
+    python-type-check
+    python-dead-code
+    python-complexity
+    python-test
+    echo "Python development checks completed successfully"
+  '';
+
+  scripts.rust-format.exec = ''
+    echo "Checking Rust code formatting"
+    cargo fmt --all -- --check
+    echo "Rust code formatting check passed"
+  '';
+
+  scripts.rust-check.exec = ''
+    echo "Check Rust packages"
+    cargo check --workspace
+    echo "Rust packages checked successfully"
+  '';
+
+  scripts.rust-lint.exec = ''
+    echo "Running Rust lint checks"
+    cargo clippy
+    echo "Rust linting completed successfully"
+  '';
+
+  scripts.rust-test.exec = ''
+    echo "Running Rust tests with coverage"
+    mkdir -p .coverage_output
+    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+      echo "cargo-llvm-cov not available - running tests without coverage"
+      cargo test --workspace --verbose
+    elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
+      echo "LLVM tools not available - running tests without coverage"
+      cargo test --workspace --verbose
+    else
+      export LLVM_COV=$(which llvm-cov)
+      export LLVM_PROFDATA=$(which llvm-profdata)
+      cargo llvm-cov --workspace --verbose \
+        --cobertura \
+        --output-path .coverage_output/rust.xml
+      echo "Rust tests with coverage completed successfully"
+    fi
+  '';
+
+  scripts.rust-checks.exec = ''
+    set -euo pipefail
+    echo "Running Rust development checks"
+    rust-format
+    rust-check
+    rust-lint
+    rust-test
+    echo "Rust development checks completed successfully"
+  '';
+
+  scripts.markdown-checks.exec = ''
+    echo "Running Markdown lint checks"
+    markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" \
+      --ignore "target" --ignore ".scratchpad"
+    echo "Markdown checks completed successfully"
+  '';
+
+  scripts.yaml-checks.exec = ''
+    echo "Running YAML lint checks"
+    yamllint .
+    echo "YAML checks completed successfully"
+  '';
+
+  scripts.bump-deps.exec = ''
+    echo "Bumping all dependencies..."
+    echo "=== Rust ==="
+    cargo update
+    echo "=== Python ==="
+    uv lock --upgrade
+    echo ""
+    echo "Dependencies bumped. Review changes:"
+    echo "  git diff Cargo.lock uv.lock"
+  '';
+
   tasks = {
     "models:tide:deploy".exec = ''
       uv run prefect --no-prompt deploy --all
@@ -498,6 +680,13 @@ print('Blocks registered: data-bucket, artifact-bucket')
     echo "    deploy <svc|all>  Build, push, and redeploy (ecr-push + ecs-deploy)"
     echo "    ecs-status        Show ECS service status"
     echo "    initialize-remote-trainer  Create work pool + register deployment (prod)"
+    echo ""
+    echo "  Development:"
+    echo "    python-checks     Run all Python checks"
+    echo "    rust-checks       Run all Rust checks"
+    echo "    markdown-checks   Run Markdown lint"
+    echo "    yaml-checks       Run YAML lint"
+    echo "    bump-deps         Update all dependency lockfiles"
     echo ""
     echo "  Local:"
     echo "    register-blocks            Register S3 blocks on local Prefect server"
