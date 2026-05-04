@@ -78,18 +78,10 @@ Flag any target with state other than `healthy`.
 
 ### 3. Direct health endpoint checks
 
-Hit the ALB health endpoints directly to verify application-level health:
-
-```bash
-curl -s -o /dev/null -w "%{http_code}" http://fund-alb-57175926.us-east-1.elb.amazonaws.com/data-manager/health
-curl -s -o /dev/null -w "%{http_code}" http://fund-alb-57175926.us-east-1.elb.amazonaws.com/portfolio-manager/health
-curl -s -o /dev/null -w "%{http_code}" http://fund-alb-57175926.us-east-1.elb.amazonaws.com/ensemble-manager/health
-```
-
-Run all three in parallel. Flag any non-200 response. If a health endpoint returns
-JSON with details, include relevant fields in the report. If endpoints are not
-routed at these paths, try `/health` on each service's listener rule path and
-note the actual paths for future skill updates.
+Health endpoints are exposed on each service at `/health` (port 8080) but are
+not routed through the ALB listener rules. Use the ALB target group health
+status from check 2 instead of direct curl. The target group health checks
+already hit `/health` on each registered target.
 
 ### 4. CloudWatch alarms
 
@@ -105,8 +97,17 @@ If no alarms are in ALARM state, report all clear. Otherwise flag each alarm.
 
 ### 5. Latest model artifact
 
+Discover the model artifacts bucket name dynamically:
+
 ```bash
-flox activate -- bash -c "aws s3 ls s3://fund-model-artifacts-404221e2/artifacts/tide/ \
+flox activate -- bash -c "aws s3api list-buckets --profile oscm --region us-east-1 \
+  --query 'Buckets[?starts_with(Name, \`fund-model-artifacts\`)].Name' --output text"
+```
+
+Then list recent artifacts:
+
+```bash
+flox activate -- bash -c "aws s3 ls s3://<MODEL_ARTIFACTS_BUCKET>/artifacts/tide/ \
   --profile oscm --region us-east-1 --recursive | sort | tail -3"
 ```
 
@@ -118,10 +119,18 @@ weekday-only training (Mon-Fri evenings ET):
 
 ### 6. S3 data freshness
 
-Check recent equity bar data to verify data-manager syncs are working:
+Check recent equity bar data to verify data-manager syncs are working.
+Discover the data bucket name dynamically:
 
 ```bash
-flox activate -- bash -c "aws s3 ls s3://fund-data-404221e2/equity_bars/ \
+flox activate -- bash -c "aws s3api list-buckets --profile oscm --region us-east-1 \
+  --query 'Buckets[?starts_with(Name, \`fund-data-\`)].Name' --output text"
+```
+
+Then list recent data:
+
+```bash
+flox activate -- bash -c "aws s3 ls s3://<DATA_BUCKET>/equity_bars/ \
   --profile oscm --region us-east-1 --recursive | sort | tail -5"
 ```
 
@@ -174,12 +183,9 @@ ECS: data-manager     OK        1/1 running, deployment COMPLETED
 ECS: portfolio-mgr    OK        1/1 running, deployment COMPLETED
 ECS: ensemble-mgr     OK        1/1 running, deployment COMPLETED
 ECS: stopped tasks    OK        No error-stopped tasks
-ALB: data-manager     OK        1 healthy target
-ALB: portfolio-mgr    OK        1 healthy target
-ALB: ensemble-mgr     OK        1 healthy target
-Health: data-manager  OK        /health returned 200
-Health: portfolio-mgr OK        /health returned 200
-Health: ensemble-mgr  OK        /health returned 200
+ALB: data-manager     OK        1 healthy target (/health 200)
+ALB: portfolio-mgr    OK        1 healthy target (/health 200)
+ALB: ensemble-mgr     OK        1 healthy target (/health 200)
 CloudWatch alarms     OK        No alarms firing
 Model artifacts       OK        Latest: 2026-04-29 22:30
 Data freshness        OK        Latest bars: 2026-04-29 18:05

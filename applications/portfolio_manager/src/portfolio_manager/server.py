@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 import sentry_sdk
 import structlog
+from alpaca.common.exceptions import APIError
 from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
@@ -96,8 +97,14 @@ def health_check() -> Response:
     checks: dict[str, str] = {}
     healthy = True
 
-    if hasattr(application.state, "alpaca_client"):
-        checks["alpaca_client"] = "ok"
+    alpaca_client = getattr(application.state, "alpaca_client", None)
+    if alpaca_client is not None:
+        try:
+            alpaca_client.get_account()
+            checks["alpaca_client"] = "ok"
+        except APIError:
+            checks["alpaca_client"] = "error"
+            healthy = False
     else:
         checks["alpaca_client"] = "error"
         healthy = False

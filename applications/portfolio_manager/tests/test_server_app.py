@@ -1,8 +1,10 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import portfolio_manager.server as server_module
 import pytest
+from alpaca.common.exceptions import APIError
 from fastapi import Response, status
 from portfolio_manager.server import (
     _lifespan,
@@ -13,10 +15,53 @@ from portfolio_manager.server import (
 )
 
 
-def test_health_check_returns_200() -> None:
+def test_health_check_returns_503_when_dependencies_missing() -> None:
+    if hasattr(application.state, "alpaca_client"):
+        del application.state.alpaca_client
+    if hasattr(application.state, "scheduler_task"):
+        del application.state.scheduler_task
+
+    response = health_check()
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    body = json.loads(bytes(response.body))
+    assert body["status"] == "degraded"
+    assert body["checks"]["alpaca_client"] == "error"
+    assert body["checks"]["scheduler"] == "error"
+
+
+def test_health_check_returns_200_when_healthy() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account = MagicMock()
+    application.state.alpaca_client = mock_alpaca
+    mock_scheduler = MagicMock()
+    mock_scheduler.done.return_value = False
+    application.state.scheduler_task = mock_scheduler
+
     response = health_check()
 
     assert response.status_code == status.HTTP_200_OK
+    body = json.loads(bytes(response.body))
+    assert body["status"] == "ok"
+    assert body["checks"]["alpaca_client"] == "ok"
+    assert body["checks"]["scheduler"] == "ok"
+
+
+def test_health_check_returns_503_when_alpaca_client_raises() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.side_effect = APIError("forbidden")
+    application.state.alpaca_client = mock_alpaca
+    mock_scheduler = MagicMock()
+    mock_scheduler.done.return_value = False
+    application.state.scheduler_task = mock_scheduler
+
+    response = health_check()
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    body = json.loads(bytes(response.body))
+    assert body["status"] == "degraded"
+    assert body["checks"]["alpaca_client"] == "error"
+    assert body["checks"]["scheduler"] == "ok"
 
 
 def test_metrics_endpoint_returns_response() -> None:

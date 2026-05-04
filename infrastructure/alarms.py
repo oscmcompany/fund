@@ -6,9 +6,9 @@ from redeployment import redeployment_lambda
 
 aws.cloudwatch.MetricAlarm(
     "alb_5xx_alarm",
-    name="fund-alb-target-5xx",
+    name="fund-alb-5xx",
     namespace="AWS/ApplicationELB",
-    metric_name="HTTPCode_Target_5XX_Count",
+    metric_name="HTTPCode_ELB_5XX_Count",
     dimensions={"LoadBalancer": alb.arn_suffix},
     statistic="Sum",
     period=300,
