@@ -1,5 +1,7 @@
 use axum::{extract::State as AxumState, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
+use std::time::Duration;
+use tokio::time::timeout;
 use tracing::debug;
 
 use crate::state::State;
@@ -7,13 +9,13 @@ use crate::state::State;
 pub async fn get_health(AxumState(state): AxumState<State>) -> impl IntoResponse {
     debug!("Health check endpoint called");
 
-    let s3_ok = state
-        .s3_client
-        .head_bucket()
-        .bucket(&state.bucket_name)
-        .send()
-        .await
-        .is_ok();
+    let s3_ok = timeout(
+        Duration::from_secs(3),
+        state.s3_client.head_bucket().bucket(&state.bucket_name).send(),
+    )
+    .await
+    .map(|result| result.is_ok())
+    .unwrap_or(false);
 
     if s3_ok {
         (
