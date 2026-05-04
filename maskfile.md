@@ -52,23 +52,25 @@ echo "Development environment setup completed successfully"
 
 > Manage Docker images for applications
 
-#### build-and-push (package_name) (stage_name)
+#### build (package_name) (stage_name)
 
-> Build and push Docker image directly to ECR (e.g. `portfolio-manager server`, `tide runner`)
+> Build Docker image, optionally pushing to ECR (e.g. `portfolio-manager server`, `tide runner`)
+
+<!-- markdownlint-disable MD036 MD032 MD007 -->
+**OPTIONS**
+* push
+    * flags: --push
+    * type: boolean
+    * desc: Push image to ECR after building
+<!-- markdownlint-enable MD036 MD032 MD007 -->
 
 ```bash
 set -euo pipefail
 
-echo "Building and pushing image"
-
-aws_account_id=$(aws sts get-caller-identity --query Account --output text)
-aws_region="${AWS_REGION:-}"
-if [ -z "$aws_region" ]; then
-    echo "AWS_REGION environment variable is not set"
-    exit 1
+PUSH="${push:-"false"}"
+if [ -n "${push+x}" ] && [ -z "$push" ]; then
+    PUSH="true"
 fi
-
-commit_hash=$(git rev-parse --short HEAD)
 
 if [ -f "models/${package_name}/Dockerfile" ]; then
     dockerfile="models/${package_name}/Dockerfile"
@@ -81,39 +83,6 @@ else
     namespace="applications"
 fi
 
-repository_name="fund/${namespace}-${package_name}-${stage_name}"
-image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
-
-echo "Logging into ECR"
-aws ecr get-login-password --region ${aws_region} | docker login \
-    --username AWS \
-    --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR (will build without cache)"
-
-echo "Checking if image for commit ${commit_hash} already exists in ECR"
-existing_image=$(aws ecr describe-images \
-    --repository-name "${repository_name}" \
-    --image-ids "imageTag=git-${commit_hash}" \
-    --query 'imageDetails[0].imageDigest' \
-    --output text 2>/dev/null || echo "NONE")
-if [ "$existing_image" != "NONE" ] && [ "$existing_image" != "None" ] && [ -n "$existing_image" ]; then
-    echo "Image for commit ${commit_hash} already exists in ECR, skipping build"
-    exit 0
-fi
-
-cache_reference="${image_reference}:buildcache"
-
-# Use GHA backend for caching when running in GitHub Actions
-if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    scope="${namespace}-${package_name}-${stage_name}"
-    echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
-    cache_from_arguments="--cache-from type=gha,scope=${scope} --cache-from type=registry,ref=${cache_reference}"
-    cache_to_arguments="--cache-to type=gha,scope=${scope},mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
-else
-    echo "Running locally - using registry cache only"
-    cache_from_arguments="--cache-from type=registry,ref=${cache_reference}"
-    cache_to_arguments="--cache-to type=registry,ref=${cache_reference},mode=max"
-fi
-
 echo "Setting up Docker Buildx"
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "Using buildx builder configured by docker/setup-buildx-action"
@@ -121,19 +90,84 @@ else
     docker buildx create --use --name fund-builder 2>/dev/null || docker buildx use fund-builder || (echo "Using default buildx builder" && docker buildx use default)
 fi
 
-echo "Building and pushing with caching (will continue if cache doesn't exist)"
-docker buildx build \
-    --platform linux/amd64 \
-    --target ${build_target} \
-    --file ${dockerfile} \
-    --tag ${image_reference}:latest \
-    --tag ${image_reference}:git-${commit_hash} \
-    ${cache_from_arguments} \
-    ${cache_to_arguments} \
-    --push \
-    .
+if [ "$PUSH" == "true" ]; then
+    echo "Building and pushing image"
 
-echo "Image built and pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
+    aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+    aws_region="${AWS_REGION:-}"
+    if [ -z "$aws_region" ]; then
+        echo "AWS_REGION environment variable is not set"
+        exit 1
+    fi
+
+    commit_hash=$(git rev-parse --short HEAD)
+
+    repository_name="fund/${namespace}-${package_name}-${stage_name}"
+    image_reference="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com/${repository_name}"
+
+    echo "Logging into ECR"
+    aws ecr get-login-password --region ${aws_region} | docker login \
+        --username AWS \
+        --password-stdin ${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com 2>/dev/null || echo "Could not authenticate to ECR (will build without cache)"
+
+    echo "Checking if image for commit ${commit_hash} already exists in ECR"
+    existing_image=$(aws ecr describe-images \
+        --repository-name "${repository_name}" \
+        --image-ids "imageTag=git-${commit_hash}" \
+        --query 'imageDetails[0].imageDigest' \
+        --output text 2>/dev/null || echo "NONE")
+    if [ "$existing_image" != "NONE" ] && [ "$existing_image" != "None" ] && [ -n "$existing_image" ]; then
+        echo "Image for commit ${commit_hash} already exists in ECR, skipping build"
+        exit 0
+    fi
+
+    cache_reference="${image_reference}:buildcache"
+
+    # Use GHA backend for caching when running in GitHub Actions
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        scope="${namespace}-${package_name}-${stage_name}"
+        echo "Running in GitHub Actions - using hybrid cache (gha + registry) with scope: ${scope}"
+        cache_from_arguments="--cache-from type=gha,scope=${scope} --cache-from type=registry,ref=${cache_reference}"
+        cache_to_arguments="--cache-to type=gha,scope=${scope},mode=max --cache-to type=registry,ref=${cache_reference},mode=max"
+    else
+        echo "Running locally - using registry cache only"
+        cache_from_arguments="--cache-from type=registry,ref=${cache_reference}"
+        cache_to_arguments="--cache-to type=registry,ref=${cache_reference},mode=max"
+    fi
+
+    docker buildx build \
+        --platform linux/amd64 \
+        --target ${build_target} \
+        --file ${dockerfile} \
+        --tag ${image_reference}:latest \
+        --tag ${image_reference}:git-${commit_hash} \
+        ${cache_from_arguments} \
+        ${cache_to_arguments} \
+        --push \
+        .
+
+    echo "Image built and pushed: ${package_name} ${stage_name} (commit: ${commit_hash})"
+else
+    echo "Checking image build"
+
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        scope="${namespace}-${package_name}-${stage_name}"
+        echo "Running in GitHub Actions - using GHA cache with scope: ${scope}"
+        cache_arguments="--cache-from type=gha,scope=${scope}"
+    else
+        echo "Running locally - no cache"
+        cache_arguments=""
+    fi
+
+    docker buildx build \
+        --platform linux/amd64 \
+        --target ${build_target} \
+        --file ${dockerfile} \
+        ${cache_arguments} \
+        .
+
+    echo "Image build check passed: ${package_name} ${stage_name}"
+fi
 ```
 
 ### stack
@@ -573,7 +607,7 @@ else
 fi
 ```
 
-#### all
+#### checks
 
 > Full Rust development checks
 
@@ -725,7 +759,7 @@ xenon --max-absolute D --max-modules D --max-average A --ignore '.flox,.venv,tar
 echo "Python complexity analysis completed successfully"
 ```
 
-#### all
+#### checks
 
 > Full Python development checks
 
@@ -733,8 +767,6 @@ echo "Python complexity analysis completed successfully"
 set -euo pipefail
 
 echo "Running Python development checks"
-
-mask development python install
 
 mask development python format
 
@@ -769,7 +801,7 @@ markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" --ignore "target" --ign
 echo "Markdown linting completed successfully"
 ```
 
-#### all
+#### checks
 
 > Full Markdown development checks
 
@@ -801,7 +833,7 @@ yamllint .
 echo "YAML linting completed successfully"
 ```
 
-#### all
+#### checks
 
 > Full YAML development checks
 
