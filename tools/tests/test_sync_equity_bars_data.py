@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 from tools.sync_equity_bars_data import (
     sync_equity_bars_data,
@@ -29,17 +30,22 @@ def test_validate_and_parse_dates_returns_datetime_tuple() -> None:
 
 
 def test_validate_and_parse_dates_clamps_to_current_day() -> None:
-    now = datetime.now(tz=UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    eastern = ZoneInfo("America/New_York")
+    today_eastern = datetime.now(tz=eastern).date()
+    tomorrow_eastern = today_eastern + timedelta(days=1)
     date_range_json = json.dumps(
         {
-            "start_date": now.strftime("%Y-%m-%d"),
-            "end_date": now.strftime("%Y-%m-%d"),
+            "start_date": today_eastern.strftime("%Y-%m-%d"),
+            "end_date": tomorrow_eastern.strftime("%Y-%m-%d"),
         }
     )
 
     _, end_date = validate_and_parse_dates(date_range_json)
 
-    assert end_date <= now
+    expected_current_date = datetime(
+        today_eastern.year, today_eastern.month, today_eastern.day, tzinfo=UTC
+    )
+    assert end_date == expected_current_date
 
 
 def test_sync_equity_bars_for_date_returns_status_and_body() -> None:
@@ -62,7 +68,28 @@ def test_sync_equity_bars_for_date_returns_status_and_body() -> None:
     mock_post.assert_called_once()
     call_kwargs = mock_post.call_args
     assert call_kwargs.args[0] == "http://localhost:8080/equity-bars"
-    assert call_kwargs.kwargs["json"]["date"] == "2025-06-01T00:00:00Z"
+    # June = EDT (UTC-4), so noon Eastern = 16:00 UTC
+    assert call_kwargs.kwargs["json"]["date"] == "2025-06-01T16:00:00Z"
+
+
+def test_sync_equity_bars_for_date_uses_correct_utc_offset_in_standard_time() -> None:
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = '{"synced": true}'
+
+    target_date = datetime(2025, 1, 15, tzinfo=UTC)
+
+    with patch(
+        "tools.sync_equity_bars_data.requests.post", return_value=mock_response
+    ) as mock_post:
+        sync_equity_bars_for_date(
+            base_url="http://localhost:8080",
+            date=target_date,
+        )
+
+    call_kwargs = mock_post.call_args
+    # January = EST (UTC-5), so noon Eastern = 17:00 UTC
+    assert call_kwargs.kwargs["json"]["date"] == "2025-01-15T17:00:00Z"
 
 
 def test_sync_equity_bars_data_single_date_makes_one_request() -> None:

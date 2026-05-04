@@ -42,8 +42,12 @@ jobs:
             service:
               - '${{ matrix.paths }}'
               - 'libraries/python/**'
+              - 'tools/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
               - 'pyproject.toml'
               - 'uv.lock'
       - name: Configure AWS credentials
@@ -62,7 +66,7 @@ jobs:
         if: steps.changes.outputs.service == 'true'
         uses: flox/activate-action@v1
         with:
-          command: mask infrastructure image build-and-push ${{ matrix.application }} ${{ matrix.stage }}
+          command: mask infrastructure image build ${{ matrix.application }} ${{ matrix.stage }} --push
   launch_infrastructure:
     name: Deploy with Pulumi
     needs: build_and_push_images
@@ -118,8 +122,12 @@ jobs:
             service:
               - '${{ matrix.paths }}'
               - 'libraries/python/**'
+              - 'tools/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
               - 'pyproject.toml'
               - 'uv.lock'
       - name: Configure AWS credentials

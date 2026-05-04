@@ -2,9 +2,12 @@ import json
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import structlog
+
+_EASTERN = ZoneInfo("America/New_York")
 
 logger = structlog.get_logger()
 
@@ -29,8 +32,9 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
     except ValueError as e:
         raise RuntimeError from e
 
-    current_date = datetime.now(tz=UTC).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    today_eastern = datetime.now(tz=_EASTERN).date()
+    current_date = datetime(
+        today_eastern.year, today_eastern.month, today_eastern.day, tzinfo=UTC
     )
     maximum_lookback_days = 365 * 2  # two year limit
 
@@ -48,7 +52,8 @@ def validate_and_parse_dates(date_range_json: str) -> tuple[datetime, datetime]:
 
 def sync_equity_bars_for_date(base_url: str, date: datetime) -> tuple[int, str]:
     url = f"{base_url}/equity-bars"
-    date_string = date.strftime("%Y-%m-%dT00:00:00Z")
+    eastern_noon = datetime(date.year, date.month, date.day, 12, 0, 0, tzinfo=_EASTERN)
+    date_string = eastern_noon.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     response = requests.post(
         url,

@@ -2,36 +2,38 @@
 repos:
   - repo: local
     hooks:
-      - id: python
+      - id: python-install
+        name: Install Python dependencies
+        entry: mask development python install
+        files: 'pyproject\.toml|uv\.lock'
+        pass_filenames: false
+        language: system
+      - id: python-checks
         name: Check all Python code
-        entry: mask development python all
+        entry: mask development python checks
+        files: '\.py$|pyproject\.toml|uv\.lock'
         pass_filenames: false
-        types:
-          - file
-          - python
         language: system
         fail_fast: true
-      - id: rust
+      - id: rust-checks
         name: Check all Rust code
-        entry: mask development rust all
+        entry: mask development rust checks
+        files: '\.rs$|Cargo\.(toml|lock)'
         pass_filenames: false
-        types:
-          - file
-          - rust
         language: system
         fail_fast: true
-      - id: markdown
+      - id: markdown-checks
         name: Check all Markdown code
-        entry: mask development markdown all
+        entry: mask development markdown checks
         pass_filenames: false
         types:
           - file
           - markdown
         language: system
         fail_fast: true
-      - id: yaml
+      - id: yaml-checks
         name: Check all YAML code
-        entry: mask development yaml all
+        entry: mask development yaml checks
         pass_filenames: false
         types:
           - file
