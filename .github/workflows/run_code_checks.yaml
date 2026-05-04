@@ -63,6 +63,7 @@ jobs:
               - 'applications/portfolio_manager/**'
               - 'applications/ensemble_manager/**'
               - 'libraries/python/**'
+              - 'tools/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'maskfile.md'
@@ -212,6 +213,7 @@ jobs:
             service:
               - '${{ matrix.paths }}'
               - 'libraries/python/**'
+              - 'tools/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'maskfile.md'
