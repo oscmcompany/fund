@@ -59,10 +59,8 @@ aws.iam.RolePolicy(
                             "logs:PutLogEvents",
                         ],
                         "Resource": [
-                            f"arn:aws:logs:{region}:{account_id}"
-                            ":log-group:/aws/lambda/fund-redeploy-ensemble-manager",
-                            f"arn:aws:logs:{region}:{account_id}"
-                            ":log-group:/aws/lambda/fund-redeploy-ensemble-manager:*",
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/fund-redeploy-ensemble-manager",
+                            f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/fund-redeploy-ensemble-manager:log-stream:*",
                         ],
                     },
                 ],
@@ -85,6 +83,7 @@ aws.cloudwatch.LogGroup(
 _handler_code = textwrap.dedent("""\
     import json
     import os
+    from typing import Any
 
     import boto3
 
@@ -95,7 +94,7 @@ _handler_code = textwrap.dedent("""\
     REQUIRED_PREFIX = "artifacts/tide/"
 
 
-    def handler(event, context):
+    def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         detail = event.get("detail", {})
         key = detail.get("object", {}).get("key", "")
 
@@ -145,7 +144,9 @@ model_artifact_uploaded_rule = aws.cloudwatch.EventRule(
                 "detail-type": ["Object Created"],
                 "detail": {
                     "bucket": {"name": [bucket_name]},
-                    "object": {"key": [{"suffix": "model.tar.gz"}]},
+                    "object": {
+                        "key": [{"prefix": "artifacts/tide/", "suffix": "model.tar.gz"}]
+                    },
                 },
             },
             sort_keys=True,
