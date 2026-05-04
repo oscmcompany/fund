@@ -445,6 +445,117 @@ github_actions_trainer_policy = aws.iam.Policy(
     tags=tags,
 )
 
+github_actions_redeployment_policy = aws.iam.Policy(
+    "github_actions_redeployment_policy",
+    name="fund-github-actions-redeployment-policy",
+    description="Redeployment infrastructure permissions for GitHub Actions.",
+    policy=json.dumps(
+        {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadLambdaAndEventBridgeMetadata",
+                    "Effect": "Allow",
+                    "Action": [
+                        "lambda:Get*",
+                        "lambda:List*",
+                        "events:Describe*",
+                        "events:List*",
+                    ],
+                    "Resource": "*",
+                },
+                {
+                    "Sid": "ManageLambdaFunctions",
+                    "Effect": "Allow",
+                    "Action": "lambda:*",
+                    "Resource": [
+                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager",
+                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager:*",
+                    ],
+                },
+                {
+                    "Sid": "ManageEventBridgeRules",
+                    "Effect": "Allow",
+                    "Action": [
+                        "events:DeleteRule",
+                        "events:DescribeRule",
+                        "events:DisableRule",
+                        "events:EnableRule",
+                        "events:ListTagsForResource",
+                        "events:ListTargetsByRule",
+                        "events:PutRule",
+                        "events:PutTargets",
+                        "events:RemoveTargets",
+                        "events:TagResource",
+                        "events:UntagResource",
+                    ],
+                    "Resource": (f"arn:aws:events:{region}:{account_id}:rule/fund-*"),
+                },
+                {
+                    "Sid": "ManageLambdaLogGroups",
+                    "Effect": "Allow",
+                    "Action": "logs:*",
+                    "Resource": [
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/fund-*",
+                        f"arn:aws:logs:{region}:{account_id}:log-group:/aws/lambda/fund-*:*",
+                    ],
+                },
+                {
+                    "Sid": "CreateRedeploymentRole",
+                    "Effect": "Allow",
+                    "Action": "iam:CreateRole",
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:RoleName": "fund-redeployment-lambda-role",
+                        }
+                    },
+                },
+                {
+                    "Sid": "ManageRedeploymentRole",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:AttachRolePolicy",
+                        "iam:DeleteRole",
+                        "iam:DetachRolePolicy",
+                        "iam:PassRole",
+                        "iam:TagRole",
+                        "iam:UntagRole",
+                        "iam:UpdateAssumeRolePolicy",
+                    ],
+                    "Resource": (
+                        f"arn:aws:iam::{account_id}:role/fund-redeployment-lambda-role"
+                    ),
+                    "Condition": {
+                        "StringLikeIfExists": {
+                            "iam:PassedToService": "lambda.amazonaws.com",
+                        },
+                    },
+                },
+                {
+                    "Sid": "ManageRedeploymentInlinePolicy",
+                    "Effect": "Allow",
+                    "Action": [
+                        "iam:DeleteRolePolicy",
+                        "iam:PutRolePolicy",
+                    ],
+                    "Resource": (
+                        f"arn:aws:iam::{account_id}:role/fund-redeployment-lambda-role"
+                    ),
+                    "Condition": {
+                        "StringEquals": {
+                            "iam:PolicyName": "fund-redeployment-lambda-policy",
+                        }
+                    },
+                },
+            ],
+        },
+        sort_keys=True,
+    ),
+    opts=pulumi.ResourceOptions(retain_on_delete=True),
+    tags=tags,
+)
+
 github_actions_infrastructure_role = aws.iam.Role(
     "github_actions_infrastructure_role",
     name=github_actions_role_name,
@@ -478,6 +589,7 @@ github_actions_infrastructure_role = aws.iam.Role(
     ),
     managed_policy_arns=[
         github_actions_infrastructure_policy.arn,
+        github_actions_redeployment_policy.arn,
         github_actions_trainer_policy.arn,
     ],
     opts=pulumi.ResourceOptions(retain_on_delete=True),

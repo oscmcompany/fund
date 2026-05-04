@@ -3,6 +3,7 @@ from compute import acm_certificate_arn, alb, cluster, service_discovery_namespa
 from config import account_id
 from iam import github_actions_infrastructure_role, github_actions_oidc_provider
 from networking import ecs_security_group, private_subnet_1, private_subnet_2, vpc
+from redeployment import redeployment_lambda
 from storage import (
     data_bucket,
     data_manager_image_uri,
@@ -81,5 +82,6 @@ pulumi.export(
     "aws_iam_github_actions_oidc_provider_arn",
     github_actions_oidc_provider.arn,
 )
+pulumi.export("aws_lambda_redeployment_arn", redeployment_lambda.arn)
 pulumi.export("fund_base_url", fund_base_url)
 pulumi.export("readme", pulumi.Output.format(readme_content, fund_base_url))
