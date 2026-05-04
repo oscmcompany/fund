@@ -42,7 +42,7 @@ for service_name, target_group in _unhealthy_host_targets.items():
         evaluation_periods=2,
         threshold=1,
         comparison_operator="GreaterThanOrEqualToThreshold",
-        treat_missing_data="breaching",
+        treat_missing_data="notBreaching",
         alarm_actions=[infrastructure_alerts_topic.arn],
         ok_actions=[infrastructure_alerts_topic.arn],
         tags=tags,
