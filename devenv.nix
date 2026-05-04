@@ -422,30 +422,35 @@ print('Blocks registered: data-bucket, artifact-bucket')
   # --- Development check scripts ---
 
   scripts.python-install.exec = ''
+    set -euo pipefail
     echo "Installing Python dependencies"
     uv sync --all-packages --all-groups
     echo "Python dependencies installed successfully"
   '';
 
   scripts.python-format.exec = ''
+    set -euo pipefail
     echo "Checking Python code formatting"
     ruff format --check
     echo "Python code formatting check passed"
   '';
 
   scripts.python-lint.exec = ''
+    set -euo pipefail
     echo "Running Python lint checks"
     ruff check --output-format=github .
     echo "Python linting completed successfully"
   '';
 
   scripts.python-type-check.exec = ''
+    set -euo pipefail
     echo "Running Python type checks"
     uvx ty check
     echo "Python type checks completed successfully"
   '';
 
   scripts.python-dead-code.exec = ''
+    set -euo pipefail
     echo "Running dead code analysis"
     uvx vulture \
       --min-confidence 80 \
@@ -455,6 +460,7 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.python-complexity.exec = ''
+    set -euo pipefail
     echo "Running Python complexity analysis"
     xenon --max-absolute D --max-modules D --max-average A \
       --ignore '.flox,.venv,target' .
@@ -462,6 +468,7 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.python-test.exec = ''
+    set -euo pipefail
     echo "Running Python tests with coverage"
     mkdir -p .coverage_output
     uv run coverage run --parallel-mode -m pytest \
@@ -484,25 +491,42 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.rust-format.exec = ''
+    set -euo pipefail
     echo "Checking Rust code formatting"
     cargo fmt --all -- --check
     echo "Rust code formatting check passed"
   '';
 
   scripts.rust-check.exec = ''
+    set -euo pipefail
     echo "Check Rust packages"
     cargo check --workspace
     echo "Rust packages checked successfully"
   '';
 
   scripts.rust-lint.exec = ''
+    set -euo pipefail
     echo "Running Rust lint checks"
     cargo clippy
     echo "Rust linting completed successfully"
   '';
 
   scripts.rust-test.exec = ''
+    set -euo pipefail
     echo "Running Rust tests with coverage"
+
+    if [[ "''${RUN_INTEGRATION_TESTS:-0}" == "1" ]]; then
+      if command -v docker >/dev/null 2>&1; then
+        if ! docker info >/dev/null 2>&1; then
+          echo "Error: Docker daemon is not running"
+          exit 1
+        fi
+      else
+        echo "Error: Docker is not installed"
+        exit 1
+      fi
+    fi
+
     mkdir -p .coverage_output
     if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
       echo "cargo-llvm-cov not available - running tests without coverage"
@@ -531,6 +555,7 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.markdown-checks.exec = ''
+    set -euo pipefail
     echo "Running Markdown lint checks"
     markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" \
       --ignore "target" --ignore ".scratchpad"
@@ -538,12 +563,14 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.yaml-checks.exec = ''
+    set -euo pipefail
     echo "Running YAML lint checks"
     yamllint .
     echo "YAML checks completed successfully"
   '';
 
   scripts.bump-deps.exec = ''
+    set -euo pipefail
     echo "Bumping all dependencies..."
     echo "=== Rust ==="
     cargo update
