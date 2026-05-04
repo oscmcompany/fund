@@ -62,7 +62,7 @@ if [[ -z "${CI}" ]]; then
 
   source .venv/bin/activate
 
-  mask development python install
+  uv sync --all-packages --all-groups
 fi
 '''
 
