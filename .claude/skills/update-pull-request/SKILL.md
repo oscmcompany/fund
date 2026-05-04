@@ -229,13 +229,13 @@ Follow these steps:
 ### 6. Verify Changes
 
 - After implementing each group's fixes, run verification checks locally:
-  - Run `mask development python checks` if any Python files were modified.
+  - Run `mask development python install` and then `mask development python checks` if any Python files, `pyproject.toml`, or `uv.lock` were modified.
   - Run `mask development rust checks` if any Rust files were modified.
   - **Note**: Local verification confirms fixes work in the development environment. Remote continuous integration will re-run after changes are pushed in the "Commit and Push Changes" step.
 - If checks fail, resolve issues and re-run until passing before moving to the next group.
 - Do not proceed to the next feedback group until current group's changes pass verification.
 - Repeat steps 4-6 for each feedback group until all have been addressed.
-- Always run final comprehensive verification using both `mask development python checks` and `mask development rust checks` before proceeding.
+- Always run final comprehensive verification using `mask development python install` + `mask development python checks`, and `mask development rust checks`, before proceeding.
 
 ### 7. Commit and Push Changes
 
