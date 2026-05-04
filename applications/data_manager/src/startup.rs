@@ -195,13 +195,20 @@ mod tests {
         let client = reqwest::Client::new();
         let health_url = format!("http://{}/health", address);
 
-        let mut healthy = false;
+        let mut responded = false;
         for _ in 0..20 {
             if let Ok(response) = client.get(&health_url).send().await {
-                if response.status() == StatusCode::OK {
-                    healthy = true;
-                    break;
-                }
+                let status = response.status();
+                assert!(
+                    status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+                    "Unexpected status code: {}",
+                    status
+                );
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert!(body.get("status").is_some());
+                assert!(body.get("checks").is_some());
+                responded = true;
+                break;
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -210,7 +217,7 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
 
-        assert!(healthy);
+        assert!(responded, "Health endpoint did not respond");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

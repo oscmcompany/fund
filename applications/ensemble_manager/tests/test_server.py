@@ -281,11 +281,30 @@ def test_create_predictions_apply_preprocessing_fails_returns_500() -> None:
     mock_errors_instance.inc.assert_called_once()
 
 
-def test_health_check_returns_200() -> None:
+def test_health_check_returns_503_when_model_not_loaded() -> None:
+    application.state.tide_model = None
+    application.state.model_directory = "/nonexistent"
     client = TestClient(application, raise_server_exceptions=False)
     with patch("ensemble_manager.server.Model.load"):
         response = client.get("/health")
-    assert response.status_code == status.HTTP_200_OK
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["checks"]["model"] == "error"
+
+
+def test_health_check_returns_200_when_model_loaded() -> None:
+    with tempfile.TemporaryDirectory() as model_dir:
+        application.state.tide_model = MagicMock()
+        application.state.model_directory = model_dir
+        client = TestClient(application, raise_server_exceptions=False)
+        with patch("ensemble_manager.server.Model.load"):
+            response = client.get("/health")
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["checks"]["model"] == "ok"
+        assert body["checks"]["model_directory"] == "ok"
 
 
 def test_metrics_endpoint_returns_200() -> None:

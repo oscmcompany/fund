@@ -1,8 +1,10 @@
+import alarms  # noqa: F401
 import pulumi
 from compute import acm_certificate_arn, alb, cluster, service_discovery_namespace
 from config import account_id
 from iam import github_actions_infrastructure_role, github_actions_oidc_provider
 from networking import ecs_security_group, private_subnet_1, private_subnet_2, vpc
+from redeployment import redeployment_lambda
 from storage import (
     data_bucket,
     data_manager_image_uri,
@@ -15,7 +17,6 @@ from storage import (
     tide_runner_image_uri,
     tide_runner_repository,
 )
-from redeployment import redeployment_lambda  # noqa: F401
 from training import models_cluster, tide_trainer_task_definition
 
 protocol = "https://" if acm_certificate_arn else "http://"

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from collections.abc import AsyncGenerator
@@ -87,7 +88,29 @@ application: FastAPI = FastAPI(lifespan=_lifespan)
 
 @application.get("/health")
 def health_check() -> Response:
-    return Response(status_code=status.HTTP_200_OK)
+    checks: dict[str, str] = {}
+    healthy = True
+
+    if hasattr(application.state, "alpaca_client"):
+        checks["alpaca_client"] = "ok"
+    else:
+        checks["alpaca_client"] = "error"
+        healthy = False
+
+    scheduler = getattr(application.state, "scheduler_task", None)
+    if scheduler and not scheduler.done():
+        checks["scheduler"] = "ok"
+    else:
+        checks["scheduler"] = "error"
+        healthy = False
+
+    status_code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    body = {"status": "ok" if healthy else "degraded", "checks": checks}
+    return Response(
+        content=json.dumps(body),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 @application.get("/metrics")
