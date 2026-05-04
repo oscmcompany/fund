@@ -20,6 +20,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       markdown: ${{ steps.filter.outputs.markdown }}
       yaml: ${{ steps.filter.outputs.yaml }}
+      container: ${{ steps.filter.outputs.container }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -53,6 +54,18 @@ jobs:
               - '.flox/**'
               - 'devenv.*'
               - '.github/**'
+            container:
+              - 'applications/data_manager/**'
+              - 'applications/portfolio_manager/**'
+              - 'applications/ensemble_manager/**'
+              - 'libraries/python/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'maskfile.md'
+              - '.flox/**'
+              - 'devenv.*'
+              - 'pyproject.toml'
+              - 'uv.lock'
   run_rust_code_checks:
     name: Run Rust code checks
     needs: detect_changes
@@ -167,6 +180,8 @@ jobs:
           command: mask development yaml checks
   run_docker_build_checks:
     name: Build check ${{ matrix.application }}-${{ matrix.stage }}
+    needs: detect_changes
+    if: needs.detect_changes.outputs.container == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:

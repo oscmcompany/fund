@@ -5,7 +5,7 @@ repos:
       - id: python-install
         name: Install Python dependencies
         entry: mask development python install
-        files: '\.py$|pyproject\.toml|uv\.lock'
+        files: 'pyproject\.toml|uv\.lock'
         pass_filenames: false
         language: system
       - id: python-checks
