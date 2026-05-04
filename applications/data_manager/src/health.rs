@@ -6,20 +6,31 @@ use tracing::debug;
 
 use crate::state::State;
 
+const S3_HEALTH_TTL_SECS: u64 = 60;
+
 pub async fn get_health(AxumState(state): AxumState<State>) -> impl IntoResponse {
     debug!("Health check endpoint called");
 
-    let s3_ok = timeout(
-        Duration::from_secs(3),
-        state
-            .s3_client
-            .head_bucket()
-            .bucket(&state.bucket_name)
-            .send(),
-    )
-    .await
-    .map(|result| result.is_ok())
-    .unwrap_or(false);
+    let s3_ok = if state.s3_ok_recently(S3_HEALTH_TTL_SECS) {
+        true
+    } else {
+        let ok = timeout(
+            Duration::from_secs(3),
+            state
+                .s3_client
+                .head_bucket()
+                .bucket(&state.bucket_name)
+                .send(),
+        )
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+
+        if ok {
+            state.mark_s3_ok();
+        }
+        ok
+    };
 
     if s3_ok {
         (
