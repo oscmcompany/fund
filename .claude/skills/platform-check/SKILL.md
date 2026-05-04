@@ -10,8 +10,8 @@ description: >
 # Platform Health Check
 
 Run a comprehensive health check of all fund platform components using the
-OSCM AWS account (`--profile oscm --region us-east-1`). Use `flox activate -- bash -c "..."`
-wrapper for commands with JMESPath queries.
+OSCM AWS account (`--profile oscm --region us-east-1`). All tools (`aws`,
+`curl`, `jq`, `prefect`) are available in the devenv shell.
 
 ## Check sequence
 
@@ -23,11 +23,11 @@ before reporting.
 ### 1. ECS services
 
 ```bash
-flox activate -- bash -c "aws ecs describe-services --profile oscm --region us-east-1 \
+aws ecs describe-services --profile oscm --region us-east-1 \
   --cluster fund-applications \
   --services fund-data-manager-server fund-portfolio-manager-server fund-ensemble-manager-server \
   --query 'services[*].{name:serviceName,status:status,running:runningCount,desired:desiredCount,deployment:deployments[0].rolloutState}' \
-  --output table"
+  --output table
 ```
 
 Flag any service where `running < desired` or `deployment != COMPLETED`.
@@ -37,19 +37,19 @@ Flag any service where `running < desired` or `deployment != COMPLETED`.
 Check for recently stopped tasks that could indicate crash-looping:
 
 ```bash
-flox activate -- bash -c "aws ecs list-tasks --profile oscm --region us-east-1 \
+aws ecs list-tasks --profile oscm --region us-east-1 \
   --cluster fund-applications --desired-status STOPPED \
-  --query 'taskArns' --output json"
+  --query 'taskArns' --output json
 ```
 
 If stopped tasks exist, describe them to get stop reasons:
 
 ```bash
-flox activate -- bash -c "aws ecs describe-tasks --profile oscm --region us-east-1 \
+aws ecs describe-tasks --profile oscm --region us-east-1 \
   --cluster fund-applications \
   --tasks <TASK_ARNS> \
   --query 'tasks[*].{task:taskArn,status:lastStatus,reason:stoppedReason,stopCode:stopCode,stopped:stoppedAt}' \
-  --output table"
+  --output table
 ```
 
 Flag any tasks that stopped due to errors (not routine deployments).
@@ -59,19 +59,19 @@ Flag any tasks that stopped due to errors (not routine deployments).
 Retrieve target group ARNs first, then check health for each:
 
 ```bash
-flox activate -- bash -c "aws elbv2 describe-target-groups --profile oscm --region us-east-1 \
+aws elbv2 describe-target-groups --profile oscm --region us-east-1 \
   --names fund-data-manager-server fund-portfolio-manager-server fund-ensemble-manager-server \
   --query 'TargetGroups[*].{name:TargetGroupName,arn:TargetGroupArn}' \
-  --output json"
+  --output json
 ```
 
 For each target group ARN (run all three health checks in parallel):
 
 ```bash
-flox activate -- bash -c "aws elbv2 describe-target-health --profile oscm --region us-east-1 \
+aws elbv2 describe-target-health --profile oscm --region us-east-1 \
   --target-group-arn <ARN> \
   --query 'TargetHealthDescriptions[*].{target:Target.Id,port:Target.Port,state:TargetHealth.State,reason:TargetHealth.Reason}' \
-  --output table"
+  --output table
 ```
 
 Flag any target with state other than `healthy`.
@@ -86,11 +86,11 @@ already hit `/health` on each registered target.
 ### 4. CloudWatch alarms
 
 ```bash
-flox activate -- bash -c "aws cloudwatch describe-alarms --profile oscm --region us-east-1 \
+aws cloudwatch describe-alarms --profile oscm --region us-east-1 \
   --state-value ALARM \
   --alarm-name-prefix fund- \
   --query 'MetricAlarms[*].{name:AlarmName,state:StateValue,reason:StateReason}' \
-  --output table"
+  --output table
 ```
 
 If no alarms are in ALARM state, report all clear. Otherwise flag each alarm.
@@ -100,15 +100,15 @@ If no alarms are in ALARM state, report all clear. Otherwise flag each alarm.
 Discover the model artifacts bucket name dynamically:
 
 ```bash
-flox activate -- bash -c "aws s3api list-buckets --profile oscm --region us-east-1 \
-  --query 'Buckets[?starts_with(Name, \`fund-model-artifacts\`)].Name' --output text"
+aws s3api list-buckets --profile oscm --region us-east-1 \
+  --query 'Buckets[?starts_with(Name, `fund-model-artifacts`)].Name' --output text
 ```
 
 Then list recent artifacts:
 
 ```bash
-flox activate -- bash -c "aws s3 ls s3://<MODEL_ARTIFACTS_BUCKET>/artifacts/tide/ \
-  --profile oscm --region us-east-1 --recursive | sort | tail -3"
+aws s3 ls s3://<MODEL_ARTIFACTS_BUCKET>/artifacts/tide/ \
+  --profile oscm --region us-east-1 --recursive | sort | tail -3
 ```
 
 Report the timestamp of the latest artifact. Staleness check accounts for
@@ -123,15 +123,15 @@ Check recent equity bar data to verify data-manager syncs are working.
 Discover the data bucket name dynamically:
 
 ```bash
-flox activate -- bash -c "aws s3api list-buckets --profile oscm --region us-east-1 \
-  --query 'Buckets[?starts_with(Name, \`fund-data-\`)].Name' --output text"
+aws s3api list-buckets --profile oscm --region us-east-1 \
+  --query 'Buckets[?starts_with(Name, `fund-data-`)].Name' --output text
 ```
 
 Then list recent data:
 
 ```bash
-flox activate -- bash -c "aws s3 ls s3://<DATA_BUCKET>/equity_bars/ \
-  --profile oscm --region us-east-1 --recursive | sort | tail -5"
+aws s3 ls s3://<DATA_BUCKET>/equity/bars/ \
+  --profile oscm --region us-east-1 --recursive | sort | tail -5
 ```
 
 Report the latest data timestamp. Apply the same weekday-aware staleness logic
@@ -140,12 +140,12 @@ as model artifacts (data syncs run 6 PM ET weekdays).
 ### 7. Redeployment Lambda recent activity
 
 ```bash
-flox activate -- bash -c "aws logs filter-log-events --profile oscm --region us-east-1 \
+aws logs filter-log-events --profile oscm --region us-east-1 \
   --log-group-name /aws/lambda/fund-redeploy-ensemble-manager \
-  --start-time \$(python3 -c 'import time; print(int((time.time() - 86400) * 1000))') \
+  --start-time $(python3 -c 'import time; print(int((time.time() - 86400) * 1000))') \
   --filter-pattern 'Forced new deployment' \
   --query 'events[*].{time:ingestionTime,message:message}' \
-  --output table"
+  --output table
 ```
 
 Report whether the Lambda triggered recently. No recent invocations is normal
@@ -159,15 +159,15 @@ the CLI starts a "temporary server", report DEGRADED with a note that the
 Prefect Cloud profile is not configured in this shell. To fix:
 
 ```bash
-flox activate -- prefect cloud login
+prefect cloud login
 # or
-flox activate -- prefect profile use cloud
+prefect profile use cloud
 ```
 
 When connected to Cloud, run:
 
 ```bash
-flox activate -- prefect flow-run ls --flow-name tide-trainer --limit 3
+prefect flow-run ls --flow-name tide-trainer --limit 3
 ```
 
 Report latest training run status. Flag if most recent run failed.
@@ -203,4 +203,4 @@ If any component is unhealthy, list specific remediation steps:
 - Health endpoint failures: "Check application logs in CloudWatch: `/ecs/fund-<service>`"
 - Model artifacts stale: "Check Prefect training runs and ECS `fund-models` cluster ASG scaling"
 - Data freshness stale: "Check data-manager logs and Massive API connectivity"
-- Prefect not connected: "Run `flox activate -- prefect cloud login` to configure Cloud profile"
+- Prefect not connected: "Run `prefect cloud login` to configure Cloud profile"
