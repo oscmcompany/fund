@@ -181,9 +181,6 @@ jobs:
           - application: ensemble-manager
             stage: server
             paths: applications/ensemble_manager/**
-          - application: tide
-            stage: runner
-            paths: models/**
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
