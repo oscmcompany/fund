@@ -14,7 +14,7 @@ config:
   fund:datamanagerSecretName:
     secure: AAABAH+qx0nGwnPg8Y3tU/ZHFqQggEn1WgFzLIS8KpidlGYX7oZ1Ly0rP1cQReaFhYqrYWKwn2OL2E6we92WQw==
   fund:datamanagerSecretValue:
-    secure: AAABAChRujETi2wJ+Tw2jj64uVvght6AMW5E+nuePkXqKXWyrMSVEIVQ5o9NRIHRRQ0wh1F3WzRW+BysSZhpdH/fULYOz9gtMmKlcG01uAApHdy8cWBk
+    secure: AAABAJCAGEb7AwasOAUxQefa2XKUZ3mni9GeJq9bxWFE9JJ2eHBFfADgJd4VlDTML7AjJjDi/XNciMEildMTRRZE5XYagY8LXpPx0gevLkwbOK/++Ts=
   fund:portfoliomanagerSecretName:
     secure: AAABAO85LMKlG40+NR/4KkfLOt7lj0MO6VaPCuLKEkonxNT2qBgQxmOODHnqRWfwjOz23F422ykryZqOwAvaiELoo0oy
   fund:portfoliomanagerSecretValue:

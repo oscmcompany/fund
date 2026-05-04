@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -16,6 +17,10 @@ from .metrics import (
 )
 from .rebalance import DATA_MANAGER_BASE_URL, run_rebalance
 from .scheduler import spawn_rebalance_scheduler
+
+logging.basicConfig(
+    level=logging.INFO, stream=sys.stdout, format="%(message)s", force=True
+)
 
 sentry_sdk.init(
     dsn=os.environ.get("SENTRY_DSN"),

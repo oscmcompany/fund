@@ -15,8 +15,8 @@ This is a collection of guidelines and references.
 - AWS is the target cloud provider
 - Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
 - Python servers primarily use [FastAPI](https://fastapi.tiangolo.com/)
-- Use `mask development python all` for comprehensive Python checks
-- Use `mask development rust all` for comprehensive Rust checks
+- Use `mask development python checks` for comprehensive Python checks
+- Use `mask development rust checks` for comprehensive Rust checks
 - Add in-line code comments only where necessary for clarity
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
