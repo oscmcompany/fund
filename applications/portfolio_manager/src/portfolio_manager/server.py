@@ -6,8 +6,10 @@ import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import requests
 import sentry_sdk
 import structlog
+from alpaca.common.exceptions import APIError
 from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
@@ -101,7 +103,7 @@ def health_check() -> Response:
         try:
             alpaca_client.get_account()
             checks["alpaca_client"] = "ok"
-        except Exception:
+        except (APIError, requests.RequestException, OSError):
             checks["alpaca_client"] = "error"
             healthy = False
     else:

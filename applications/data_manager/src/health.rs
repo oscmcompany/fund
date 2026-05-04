@@ -11,7 +11,11 @@ pub async fn get_health(AxumState(state): AxumState<State>) -> impl IntoResponse
 
     let s3_ok = timeout(
         Duration::from_secs(3),
-        state.s3_client.head_bucket().bucket(&state.bucket_name).send(),
+        state
+            .s3_client
+            .head_bucket()
+            .bucket(&state.bucket_name)
+            .send(),
     )
     .await
     .map(|result| result.is_ok())
