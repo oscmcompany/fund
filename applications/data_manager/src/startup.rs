@@ -199,14 +199,15 @@ mod tests {
         for _ in 0..20 {
             if let Ok(response) = client.get(&health_url).send().await {
                 let status = response.status();
-                assert!(
-                    status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
-                    "Unexpected status code: {}",
+                assert_eq!(
+                    status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Expected 503 with fake S3 endpoint, got {}",
                     status
                 );
                 let body: serde_json::Value = response.json().await.unwrap();
-                assert!(body.get("status").is_some());
-                assert!(body.get("checks").is_some());
+                assert_eq!(body["status"], "degraded");
+                assert_eq!(body["checks"]["s3"], "error");
                 responded = true;
                 break;
             }

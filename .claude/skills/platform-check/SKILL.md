@@ -176,7 +176,7 @@ Report latest training run status. Flag if most recent run failed.
 
 Present a summary table:
 
-```
+```text
 Component             Status    Details
 --------------------  --------  ----------------------------------------
 ECS: data-manager     OK        1/1 running, deployment COMPLETED

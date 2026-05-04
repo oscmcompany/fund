@@ -102,7 +102,7 @@ def health_check() -> Response:
         try:
             alpaca_client.get_account()
             checks["alpaca_client"] = "ok"
-        except APIError:
+        except (APIError, OSError):
             checks["alpaca_client"] = "error"
             healthy = False
     else:

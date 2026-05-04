@@ -15,53 +15,99 @@ from portfolio_manager.server import (
 )
 
 
+def _save_health_state() -> tuple[object, object]:
+    return (
+        getattr(application.state, "alpaca_client", None),
+        getattr(application.state, "scheduler_task", None),
+    )
+
+
+def _restore_health_state(saved: tuple[object, object]) -> None:
+    previous_client, previous_scheduler = saved
+    if previous_client is not None:
+        application.state.alpaca_client = previous_client
+    elif hasattr(application.state, "alpaca_client"):
+        del application.state.alpaca_client
+    if previous_scheduler is not None:
+        application.state.scheduler_task = previous_scheduler
+    elif hasattr(application.state, "scheduler_task"):
+        del application.state.scheduler_task
+
+
 def test_health_check_returns_503_when_dependencies_missing() -> None:
+    saved = _save_health_state()
     if hasattr(application.state, "alpaca_client"):
         del application.state.alpaca_client
     if hasattr(application.state, "scheduler_task"):
         del application.state.scheduler_task
+    try:
+        response = health_check()
 
-    response = health_check()
-
-    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-    body = json.loads(bytes(response.body))
-    assert body["status"] == "degraded"
-    assert body["checks"]["alpaca_client"] == "error"
-    assert body["checks"]["scheduler"] == "error"
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        body = json.loads(bytes(response.body))
+        assert body["status"] == "degraded"
+        assert body["checks"]["alpaca_client"] == "error"
+        assert body["checks"]["scheduler"] == "error"
+    finally:
+        _restore_health_state(saved)
 
 
 def test_health_check_returns_200_when_healthy() -> None:
+    saved = _save_health_state()
     mock_alpaca = MagicMock()
     mock_alpaca.get_account = MagicMock()
     application.state.alpaca_client = mock_alpaca
     mock_scheduler = MagicMock()
     mock_scheduler.done.return_value = False
     application.state.scheduler_task = mock_scheduler
+    try:
+        response = health_check()
 
-    response = health_check()
-
-    assert response.status_code == status.HTTP_200_OK
-    body = json.loads(bytes(response.body))
-    assert body["status"] == "ok"
-    assert body["checks"]["alpaca_client"] == "ok"
-    assert body["checks"]["scheduler"] == "ok"
+        assert response.status_code == status.HTTP_200_OK
+        body = json.loads(bytes(response.body))
+        assert body["status"] == "ok"
+        assert body["checks"]["alpaca_client"] == "ok"
+        assert body["checks"]["scheduler"] == "ok"
+    finally:
+        _restore_health_state(saved)
 
 
 def test_health_check_returns_503_when_alpaca_client_raises() -> None:
+    saved = _save_health_state()
     mock_alpaca = MagicMock()
     mock_alpaca.get_account.side_effect = APIError("forbidden")
     application.state.alpaca_client = mock_alpaca
     mock_scheduler = MagicMock()
     mock_scheduler.done.return_value = False
     application.state.scheduler_task = mock_scheduler
+    try:
+        response = health_check()
 
-    response = health_check()
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        body = json.loads(bytes(response.body))
+        assert body["status"] == "degraded"
+        assert body["checks"]["alpaca_client"] == "error"
+        assert body["checks"]["scheduler"] == "ok"
+    finally:
+        _restore_health_state(saved)
 
-    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
-    body = json.loads(bytes(response.body))
-    assert body["status"] == "degraded"
-    assert body["checks"]["alpaca_client"] == "error"
-    assert body["checks"]["scheduler"] == "ok"
+
+def test_health_check_returns_503_when_alpaca_network_error() -> None:
+    saved = _save_health_state()
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.side_effect = ConnectionError("connection refused")
+    application.state.alpaca_client = mock_alpaca
+    mock_scheduler = MagicMock()
+    mock_scheduler.done.return_value = False
+    application.state.scheduler_task = mock_scheduler
+    try:
+        response = health_check()
+
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        body = json.loads(bytes(response.body))
+        assert body["checks"]["alpaca_client"] == "error"
+    finally:
+        _restore_health_state(saved)
 
 
 def test_metrics_endpoint_returns_response() -> None:
