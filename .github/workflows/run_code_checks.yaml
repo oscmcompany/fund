@@ -194,6 +194,22 @@ jobs:
         run: nix profile add nixpkgs#devenv
       - name: Run YAML code checks
         run: devenv tasks run checks:yaml
+  run_nix_code_checks:
+    name: Run Nix code checks
+    needs: detect_changes
+    if: needs.detect_changes.outputs.nix == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+      - name: Run Nix code checks
+        run: devenv tasks run checks:nix
   run_docker_build_checks:
     name: Build check ${{ matrix.application }}-${{ matrix.stage }}
     needs: detect_changes
@@ -270,6 +286,7 @@ jobs:
       - run_python_code_checks
       - run_markdown_code_checks
       - run_yaml_code_checks
+      - run_nix_code_checks
       - run_docker_build_checks
       - finish_coverage_upload
     if: always()
@@ -283,6 +300,7 @@ jobs:
             [run_python_code_checks]="${{ needs.run_python_code_checks.result }}"
             [run_markdown_code_checks]="${{ needs.run_markdown_code_checks.result }}"
             [run_yaml_code_checks]="${{ needs.run_yaml_code_checks.result }}"
+            [run_nix_code_checks]="${{ needs.run_nix_code_checks.result }}"
             [run_docker_build_checks]="${{ needs.run_docker_build_checks.result }}"
             [finish_coverage_upload]="${{ needs.finish_coverage_upload.result }}"
           )

@@ -1,6 +1,10 @@
-{ pkgs, lib, config, inputs, ... }:
-
-let
+{
+  pkgs,
+  lib,
+  config,
+  inputs,
+  ...
+}: let
   awsRegion = "us-east-1";
 
   # ECS service definitions — maps service names to their Docker build context
@@ -23,7 +27,6 @@ let
   };
 
   deployableServices = builtins.attrNames ecsServices;
-
 in {
   dotenv.enable = true;
 
@@ -146,19 +149,19 @@ in {
     scrapeConfigs = [
       {
         job_name = "data-manager";
-        static_configs = [{ targets = [ "localhost:8080" ]; }];
+        static_configs = [{targets = ["localhost:8080"];}];
         metrics_path = "/metrics";
         scrape_interval = "15s";
       }
       {
         job_name = "ensemble-manager";
-        static_configs = [{ targets = [ "localhost:8082" ]; }];
+        static_configs = [{targets = ["localhost:8082"];}];
         metrics_path = "/metrics";
         scrape_interval = "15s";
       }
       {
         job_name = "portfolio-manager";
-        static_configs = [{ targets = [ "localhost:8081" ]; }];
+        static_configs = [{targets = ["localhost:8081"];}];
         metrics_path = "/metrics";
         scrape_interval = "15s";
       }
@@ -212,24 +215,27 @@ in {
     aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY"
 
     ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
-    push_${builtins.replaceStrings ["-"] ["_"] svc}() {
-      local repo="${def.ecrRepo}"
-      local image="$REGISTRY/$repo:latest"
-      local ctx_dir="$DEVENV_ROOT/${def.context}"
-      echo "=== Building ${svc} ==="
-      docker build -t "$image" -f "$DEVENV_ROOT/${def.dockerfile}" "$ctx_dir"
-      echo "=== Pushing ${svc} ==="
-      docker push "$image"
-      echo "OK: ${svc}"
-    }
-    '') ecsServices)}
+        push_${builtins.replaceStrings ["-"] ["_"] svc}() {
+          local repo="${def.ecrRepo}"
+          local image="$REGISTRY/$repo:latest"
+          local ctx_dir="$DEVENV_ROOT/${def.context}"
+          echo "=== Building ${svc} ==="
+          docker build -t "$image" -f "$DEVENV_ROOT/${def.dockerfile}" "$ctx_dir"
+          echo "=== Pushing ${svc} ==="
+          docker push "$image"
+          echo "OK: ${svc}"
+        }
+      '')
+      ecsServices)}
 
     case "$SERVICE" in
       ${lib.concatStringsSep "\n" (map (svc: ''
-      ${svc}) push_${builtins.replaceStrings ["-"] ["_"] svc} ;;'') deployableServices)}
+      ${svc}) push_${builtins.replaceStrings ["-"] ["_"] svc} ;;'')
+    deployableServices)}
       all)
         ${lib.concatStringsSep "\n        " (map (svc: ''
-        push_${builtins.replaceStrings ["-"] ["_"] svc}'') deployableServices)}
+      push_${builtins.replaceStrings ["-"] ["_"] svc}'')
+    deployableServices)}
         echo "All images pushed"
         ;;
       *) echo "Unknown service: $SERVICE"; exit 1 ;;
@@ -347,43 +353,43 @@ in {
 
   # Register Prefect S3Bucket blocks on the local server
   scripts.register-blocks.exec = ''
-    echo "Waiting for orchestrator..."
-    while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
-      sleep 2
-    done
+        echo "Waiting for orchestrator..."
+        while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
+          sleep 2
+        done
 
-    export PREFECT_API_URL="http://localhost:4200/api"
+        export PREFECT_API_URL="http://localhost:4200/api"
 
-    echo "Reading bucket names from Pulumi stack outputs..."
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
-    DATA_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
-    ARTIFACTS_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
+        echo "Reading bucket names from Pulumi stack outputs..."
+        unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+        DATA_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
+        ARTIFACTS_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
 
-    if [ -z "$DATA_BUCKET" ] || [ -z "$ARTIFACTS_BUCKET" ]; then
-      echo "Could not read bucket names from Pulumi. Using defaults."
-      DATA_BUCKET="fund-data-404221e2"
-      ARTIFACTS_BUCKET="fund-model-artifacts-404221e2"
-    fi
+        if [ -z "$DATA_BUCKET" ] || [ -z "$ARTIFACTS_BUCKET" ]; then
+          echo "Could not read bucket names from Pulumi. Using defaults."
+          DATA_BUCKET="fund-data-404221e2"
+          ARTIFACTS_BUCKET="fund-model-artifacts-404221e2"
+        fi
 
-    echo "  data bucket:      $DATA_BUCKET"
-    echo "  artifacts bucket:  $ARTIFACTS_BUCKET"
+        echo "  data bucket:      $DATA_BUCKET"
+        echo "  artifacts bucket:  $ARTIFACTS_BUCKET"
 
-    echo "Registering S3Bucket blocks on local Prefect server..."
-    uv run --package tide python -c "
-import sys
-from prefect_aws.s3 import S3Bucket
-from prefect_aws.credentials import AwsCredentials
+        echo "Registering S3Bucket blocks on local Prefect server..."
+        uv run --package tide python -c "
+    import sys
+    from prefect_aws.s3 import S3Bucket
+    from prefect_aws.credentials import AwsCredentials
 
-data_bucket = sys.argv[1]
-artifacts_bucket = sys.argv[2]
+    data_bucket = sys.argv[1]
+    artifacts_bucket = sys.argv[2]
 
-creds = AwsCredentials()
-creds.save('aws-credentials', overwrite=True)
+    creds = AwsCredentials()
+    creds.save('aws-credentials', overwrite=True)
 
-S3Bucket(bucket_name=data_bucket, credentials=creds).save('data-bucket', overwrite=True)
-S3Bucket(bucket_name=artifacts_bucket, credentials=creds).save('artifact-bucket', overwrite=True)
-print('Blocks registered: data-bucket, artifact-bucket')
-" "$DATA_BUCKET" "$ARTIFACTS_BUCKET"
+    S3Bucket(bucket_name=data_bucket, credentials=creds).save('data-bucket', overwrite=True)
+    S3Bucket(bucket_name=artifacts_bucket, credentials=creds).save('artifact-bucket', overwrite=True)
+    print('Blocks registered: data-bucket, artifact-bucket')
+    " "$DATA_BUCKET" "$ARTIFACTS_BUCKET"
   '';
 
   # Create work pool and register training deployment locally
@@ -564,14 +570,14 @@ print('Blocks registered: data-bucket, artifact-bucket')
   scripts.yaml-checks.exec = ''
     set -euo pipefail
     echo "Running YAML lint checks"
-    yamllint .
+    uvx yamllint .
     echo "YAML checks completed successfully"
   '';
 
   scripts.nix-lint.exec = ''
     set -euo pipefail
     echo "Linting Nix files"
-    alejandra --check .
+    alejandra --check --exclude ./.devenv --exclude ./.flox --exclude ./.venv --exclude ./target .
     echo "Nix lint check passed"
   '';
 
@@ -594,27 +600,27 @@ print('Blocks registered: data-bucket, artifact-bucket')
 
     "checks:python:format" = {
       exec = "python-format";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
     "checks:python:lint" = {
       exec = "python-lint";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
     "checks:python:type-check" = {
       exec = "python-type-check";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
     "checks:python:dead-code" = {
       exec = "python-dead-code";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
     "checks:python:complexity" = {
       exec = "python-complexity";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
     "checks:python:test" = {
       exec = "python-test";
-      after = [ "checks:python:install" ];
+      after = ["checks:python:install"];
     };
 
     # --- Rust checks (format parallel with check, lint+test after check) ---
@@ -624,11 +630,11 @@ print('Blocks registered: data-bucket, artifact-bucket')
 
     "checks:rust:lint" = {
       exec = "rust-lint";
-      after = [ "checks:rust:check" ];
+      after = ["checks:rust:check"];
     };
     "checks:rust:test" = {
       exec = "rust-test";
-      after = [ "checks:rust:check" ];
+      after = ["checks:rust:check"];
     };
 
     # --- Standalone checks ---
