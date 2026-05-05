@@ -7,16 +7,15 @@
 This is a collection of guidelines and references.
 
 - Rust and Python are the primary project languages
-- [Flox](https://flox.dev/) manages project environment and packages
-- [Mask](https://github.com/jacobdeichert/mask) is used for command management
+- [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
 - [Pulumi](https://www.pulumi.com/) manages cloud infrastructure via the Python SDK
 - Python code follows [uv](https://github.com/astral-sh/uv) workspace conventions
 - Rust code follows Cargo workspace conventions
 - AWS is the target cloud provider
 - Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
 - Python servers primarily use [FastAPI](https://fastapi.tiangolo.com/)
-- Use `mask development python checks` for comprehensive Python checks
-- Use `mask development rust checks` for comprehensive Rust checks
+- Use `devenv tasks run checks:python` for comprehensive Python checks
+- Use `devenv tasks run checks:rust` for comprehensive Rust checks
 - Add in-line code comments only where necessary for clarity
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
@@ -53,7 +52,7 @@ This is a collection of guidelines and references.
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
 - After user corrections, update `.claude/tasks/lessons.md` with timestamp to prevent repeating mistakes
-- Prove changes work before marking tasks complete - run `mask` checks, compare behavior, demonstrate correctness
+- Prove changes work before marking tasks complete - run `devenv tasks run` checks, compare behavior, demonstrate correctness
 - For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
 - Make every change as simple as possible and impact minimal code
 - Find root causes and avoid temporary fixes - maintain high standards

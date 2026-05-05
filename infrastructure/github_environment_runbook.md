@@ -9,7 +9,7 @@ Required environment secrets for operations with Pulumi:
 - `PULUMI_ACCESS_TOKEN`
 
 `AWS_IAM_INFRASTRUCTURE_ROLE_ARN` and `AWS_REGION` are set automatically when running
-`mask infrastructure stack up --bootstrap` from a local machine with `gh` authenticated.
+`devenv tasks run infra:up` from a local machine with `gh` authenticated.
 
 ## Update `PULUMI_ACCESS_TOKEN` from Pulumi account
 

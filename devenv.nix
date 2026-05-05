@@ -27,6 +27,55 @@
   };
 
   deployableServices = builtins.attrNames ecsServices;
+
+  # Per-service CD build tasks (build + push Docker images to ECR)
+  cdBuildTasks = lib.mapAttrs' (svc: def:
+    lib.nameValuePair "cd:build:${svc}" {
+      exec = ''
+        set -euo pipefail
+        unset AWS_ENDPOINT_URL
+
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        REGISTRY="$ACCOUNT_ID.dkr.ecr.${awsRegion}.amazonaws.com"
+        GIT_SHA=$(git rev-parse --short HEAD)
+        REPO="${def.ecrRepo}"
+        SHA_TAG="git-$GIT_SHA"
+
+        echo "Logging into ECR..."
+        aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY" 2>/dev/null \
+          || echo "Could not authenticate to ECR (will build without cache)"
+
+        if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$SHA_TAG" --region ${awsRegion} >/dev/null 2>&1; then
+          echo "=== Skipping ${svc} (tag $SHA_TAG already exists) ==="
+          exit 0
+        fi
+
+        CACHE_REF="$REGISTRY/$REPO:buildcache"
+        if [ -n "''${GITHUB_ACTIONS:-}" ]; then
+          SCOPE="${svc}"
+          echo "Using hybrid cache (gha + registry) with scope: $SCOPE"
+          CACHE_FROM="--cache-from type=gha,scope=$SCOPE --cache-from type=registry,ref=$CACHE_REF"
+          CACHE_TO="--cache-to type=gha,scope=$SCOPE,mode=max --cache-to type=registry,ref=$CACHE_REF,mode=max"
+        else
+          CACHE_FROM="--cache-from type=registry,ref=$CACHE_REF"
+          CACHE_TO="--cache-to type=registry,ref=$CACHE_REF,mode=max"
+        fi
+
+        echo "=== Building and pushing ${svc} ==="
+        docker buildx build \
+          --platform linux/amd64 \
+          --tag "$REGISTRY/$REPO:latest" \
+          --tag "$REGISTRY/$REPO:$SHA_TAG" \
+          $CACHE_FROM \
+          $CACHE_TO \
+          --file "$DEVENV_ROOT/${def.dockerfile}" \
+          --push \
+          "$DEVENV_ROOT/${def.context}"
+        echo "OK: ${svc}"
+      '';
+      after = ["cd:aws-check"];
+    })
+  ecsServices;
 in {
   dotenv.enable = true;
 
@@ -116,21 +165,23 @@ in {
   };
 
   packages = with pkgs; [
-    git
-    curl
-    jq
-    rustup
-    cargo-watch
+    alejandra
     awscli2
+    bacon
+    cargo-watch
+    curl
+    docker-client
+    duckdb
+    gh
+    git
+    jq
+    markdownlint-cli
     pulumiPackages.pulumi-language-python
     pulumi-bin
-    markdownlint-cli
+    ruff
+    rustup
     uv
     xenon
-    ruff
-    alejandra
-    duckdb
-    docker-client
   ];
 
   # PostgreSQL for orchestration server (local)
@@ -313,27 +364,16 @@ in {
     ecr-push "$SERVICE" && ecs-deploy "$SERVICE"
   '';
 
-  # CD pipeline: push images, update infra, deploy services
-  scripts.cd-deploy.exec = ''
+  # Verify AWS credentials are available
+  scripts.aws-check.exec = ''
     set -euo pipefail
     unset AWS_ENDPOINT_URL
-
     if ! aws sts get-caller-identity >/dev/null 2>&1; then
       echo "ERROR: No AWS credentials available"
       echo "CD deploy requires AWS credentials (OIDC in CI or configured profile locally)"
       exit 1
     fi
-
-    echo "=== Pushing images to ECR ==="
-    ecr-push all
-
-    echo "=== Updating infrastructure ==="
-    infra-up
-
-    echo "=== Deploying ECS services ==="
-    ecs-deploy all
-
-    echo "CD deploy completed successfully"
+    echo "AWS credentials verified"
   '';
 
   # Show ECS service status
@@ -521,7 +561,7 @@ in {
     echo "Running dead code analysis"
     uvx vulture \
       --min-confidence 80 \
-      --exclude '.flox,.venv,target' \
+      --exclude '.venv,target' \
       . tools/src/tools/vulture_whitelist.py
     echo "Dead code check completed"
   '';
@@ -530,7 +570,7 @@ in {
     set -euo pipefail
     echo "Running Python complexity analysis"
     xenon --max-absolute D --max-modules D --max-average A \
-      --ignore '.flox,.venv,target' .
+      --ignore '.venv,target' .
     echo "Python complexity analysis completed successfully"
   '';
 
@@ -610,7 +650,7 @@ in {
   scripts.markdown-checks.exec = ''
     set -euo pipefail
     echo "Running Markdown lint checks"
-    markdownlint "**/*.md" --ignore ".flox" --ignore ".venv" \
+    markdownlint "**/*.md" --ignore ".venv" \
       --ignore "target" --ignore ".scratchpad"
     echo "Markdown checks completed successfully"
   '';
@@ -625,7 +665,7 @@ in {
   scripts.nix-lint.exec = ''
     set -euo pipefail
     echo "Linting Nix files"
-    alejandra --check --exclude ./.devenv --exclude ./.flox --exclude ./.venv --exclude ./target .
+    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target .
     echo "Nix lint check passed"
   '';
 
@@ -660,94 +700,142 @@ in {
     echo "  git diff Cargo.lock uv.lock"
   '';
 
-  tasks = {
-    # --- Python checks (install first, then all others in parallel) ---
+  tasks =
+    {
+      # --- Python checks (install first, then all others in parallel) ---
 
-    "checks:python:install".exec = "python-install";
+      "checks:python:install".exec = "python-install";
 
-    "checks:python:format" = {
-      exec = "python-format";
-      after = ["checks:python:install"];
-    };
-    "checks:python:lint" = {
-      exec = "python-lint";
-      status = "python-install";
-    };
-    "checks:python:type-check" = {
-      exec = "python-type-check";
-      after = ["checks:python:lint"];
-    };
-    "checks:python:dead-code" = {
-      exec = "python-dead-code";
-      after = ["checks:python:type-check"];
-    };
-    "checks:python:complexity" = {
-      exec = "python-complexity";
-      after = ["checks:python:dead-code"];
-    };
-    "checks:python:test" = {
-      exec = "python-test";
-      after = ["checks:python:complexity"];
-    };
+      "checks:python:format" = {
+        exec = "python-format";
+        after = ["checks:python:install"];
+      };
+      "checks:python:lint" = {
+        exec = "python-lint";
+        status = "python-install";
+      };
+      "checks:python:type-check" = {
+        exec = "python-type-check";
+        after = ["checks:python:lint"];
+      };
+      "checks:python:dead-code" = {
+        exec = "python-dead-code";
+        after = ["checks:python:type-check"];
+      };
+      "checks:python:complexity" = {
+        exec = "python-complexity";
+        after = ["checks:python:dead-code"];
+      };
+      "checks:python:test" = {
+        exec = "python-test";
+        after = ["checks:python:complexity"];
+      };
 
-    # --- Rust checks (format parallel with check, lint+test after check) ---
+      # --- Rust checks (format parallel with check, lint+test after check) ---
 
-    "checks:rust:format".exec = "rust-format";
-    "checks:rust:check".exec = "rust-check";
+      "checks:rust:format".exec = "rust-format";
+      "checks:rust:check".exec = "rust-check";
 
-    "checks:rust:lint" = {
-      exec = "rust-lint";
-      after = ["checks:rust:check"];
-    };
-    "checks:rust:test" = {
-      exec = "rust-test";
-      after = ["checks:rust:check"];
-    };
+      "checks:rust:lint" = {
+        exec = "rust-lint";
+        after = ["checks:rust:check"];
+      };
+      "checks:rust:test" = {
+        exec = "rust-test";
+        after = ["checks:rust:check"];
+      };
 
-    # --- Standalone checks ---
+      # --- Standalone checks ---
 
-    "checks:markdown".exec = "markdown-checks";
-    "checks:yaml".exec = "yaml-checks";
-    "checks:nix".exec = "nix-lint";
+      "checks:markdown".exec = "markdown-checks";
+      "checks:yaml".exec = "yaml-checks";
+      "checks:nix".exec = "nix-lint";
 
-    # --- Model tasks ---
+      # --- Model tasks ---
 
-    "models:tide:deploy".exec = ''
-      uv run prefect --no-prompt deploy --all
-    '';
-    "models:tide:train".exec = ''
-      uv run prefect deployment run tide-training-pipeline/tide-trainer-remote
-    '';
-    "models:tide:train:local".exec = ''
-      uv run prefect deployment run tide-training-pipeline/tide-trainer-local
-    '';
-
-    "checks:docker".exec = "docker-build-check";
-
-    "checks:ci" = {
-      exec = ''
-        echo "All CI checks passed"
+      "models:tide:deploy".exec = ''
+        uv run prefect --no-prompt deploy --all
       '';
-      after = [
-        "checks:nix"
-        "checks:markdown"
-        "checks:yaml"
-        "checks:python:test"
-        "checks:rust:lint"
-        "checks:rust:test"
-        "checks:docker"
-      ];
-    };
-
-    "checks:cd:deploy".exec = "cd-deploy";
-
-    "checks:cd" = {
-      exec = ''
-        echo "CD pipeline completed"
+      "models:tide:train".exec = ''
+        uv run prefect deployment run tide-training-pipeline/tide-trainer-remote
       '';
-      after = ["checks:ci" "checks:cd:deploy"];
-    };
-  };
+      "models:tide:train:local".exec = ''
+        uv run prefect deployment run tide-training-pipeline/tide-trainer-local
+      '';
+
+      # --- Infrastructure tasks ---
+
+      "infra:down".exec = "infra-down";
+
+      "checks:docker".exec = "docker-build-check";
+
+      "checks:ci" = {
+        exec = ''
+          echo "All CI checks passed"
+        '';
+        after = [
+          "checks:nix"
+          "checks:markdown"
+          "checks:yaml"
+          "checks:python:test"
+          "checks:rust:lint"
+          "checks:rust:test"
+          "checks:docker"
+        ];
+      };
+
+      # --- CD deploy pipeline ---
+      # aws-check -> ecr-push (parallel) -> infra:up -> ecs-deploy (parallel) -> cd:deploy
+
+      "cd:aws-check".exec = "aws-check";
+
+      "infra:up" = {
+        exec = "infra-up";
+        after = map (svc: "cd:build:${svc}") deployableServices;
+      };
+
+      "cd:redeploy" = {
+        exec = ''
+          set -euo pipefail
+          unset AWS_ENDPOINT_URL
+          CLUSTER="fund-applications"
+          ${lib.concatStringsSep "\n" (map (svc: ''
+              ECS_NAME="fund-${svc}-server"
+              echo "=== Redeploying $ECS_NAME ==="
+              aws ecs update-service \
+                --cluster "$CLUSTER" \
+                --service "$ECS_NAME" \
+                --force-new-deployment \
+                --region ${awsRegion} \
+                --query 'service.serviceName' \
+                --output text
+            '')
+            deployableServices)}
+          echo "Waiting for all services to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "$CLUSTER" \
+            --services ${lib.concatStringsSep " " (map (svc: "fund-${svc}-server") deployableServices)} \
+            --region ${awsRegion}
+          echo "All services redeployed"
+        '';
+        after = ["infra:up"];
+      };
+
+      "checks:cd:deploy" = {
+        exec = ''
+          echo "CD deploy completed successfully"
+        '';
+        after = ["cd:redeploy"];
+      };
+
+      "checks:cd" = {
+        exec = ''
+          echo "CD pipeline completed"
+        '';
+        after = ["checks:ci" "checks:cd:deploy"];
+      };
+    }
+    // cdBuildTasks;
 
   # --- Local processes ---
 

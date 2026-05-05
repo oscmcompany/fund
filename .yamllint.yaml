@@ -3,7 +3,6 @@ extends: default
 ignore: |
   .venv/
   target/
-  .flox/
   .pre-commit-config.yaml
 rules:
   line-length:
