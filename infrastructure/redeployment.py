@@ -145,7 +145,7 @@ model_artifact_uploaded_rule = aws.cloudwatch.EventRule(
                 "detail": {
                     "bucket": {"name": [bucket_name]},
                     "object": {
-                        "key": [{"prefix": "artifacts/tide/"}]
+                        "key": [{"prefix": "artifacts/tide/", "suffix": "model.tar.gz"}]
                     },
                 },
             },
