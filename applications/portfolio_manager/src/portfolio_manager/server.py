@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -101,9 +102,11 @@ def health_check() -> Response:
     alpaca_client = getattr(application.state, "alpaca_client", None)
     if alpaca_client is not None:
         try:
-            alpaca_client.get_account()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(alpaca_client.get_account)
+                future.result(timeout=5)
             checks["alpaca_client"] = "ok"
-        except (APIError, requests.RequestException, OSError):
+        except (APIError, requests.RequestException, OSError, concurrent.futures.TimeoutError):
             checks["alpaca_client"] = "error"
             healthy = False
     else:

@@ -45,7 +45,6 @@ pkgconf.pkg-path = "pkgconf"
 direnv.pkg-path = "direnv"
 jq.pkg-path = "jq"
 markdownlint-cli.pkg-path = "markdownlint-cli"
-pre-commit.pkg-path = "pre-commit"
 xenon.pkg-path = "xenon"
 
 [hook]
@@ -63,11 +62,7 @@ if [[ -z "${CI}" ]]; then
 
   source .venv/bin/activate
 
-  if [[ ! -f .git/hooks/pre-commit ]]; then
-    pre-commit install
-  fi
-
-  mask development python install
+  uv sync --all-packages --all-groups
 fi
 '''
 

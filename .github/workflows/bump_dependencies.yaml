@@ -1,0 +1,44 @@
+---
+name: Bump dependencies
+run-name: Bump dependencies
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  bump:
+    name: Bump all dependency versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+      - name: Bump dependencies
+        run: devenv shell bump-deps
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet Cargo.lock uv.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create pull request
+        if: steps.changes.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automated-dependency-bump
+          delete-branch: true
+          title: "Bump dependency versions"
+          body: |
+            Automated daily dependency version bump.
+            Updates Cargo.lock and uv.lock to latest compatible versions.
+          commit-message: "Bump dependency versions"
+          labels: dependencies
