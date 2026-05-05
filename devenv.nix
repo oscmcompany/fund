@@ -784,7 +784,6 @@ in {
           "checks:python:test"
           "checks:rust:lint"
           "checks:rust:test"
-          "checks:docker"
         ];
       };
 

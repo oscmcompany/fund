@@ -30,17 +30,10 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-      - uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            extra-substituters = https://nixpkgs-unfree.cachix.org https://nix-community.cachix.org
-            extra-trusted-public-keys = nixpkgs-unfree.cachix.org-1:hqvoInulhbV4nJ9yJOEr+4wxhDV4xq2d1DK7S6Nj6rs=
-            extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs=
-      - uses: cachix/cachix-action@v16
-        with:
-          name: devenv
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: Install devenv
-        run: nix profile add nixpkgs#devenv
+        run: nix profile install nixpkgs#devenv
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
