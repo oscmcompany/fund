@@ -158,6 +158,9 @@ in {
     # Override in .envrc with the actual ALB URL: http://<alb-dns>:5000
     MLFLOW_TRACKING_URI = "";
 
+    # tinygrad CPU JIT requires clang (gcc rejects --target flag)
+    CC = "clang";
+
     # Development defaults
     ENVIRONMENT = "development";
     DISABLE_DISK_CACHE = "1";
@@ -167,6 +170,7 @@ in {
   packages = with pkgs; [
     alejandra
     awscli2
+    clang
     bacon
     cargo-watch
     curl
