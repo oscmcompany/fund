@@ -58,12 +58,11 @@ data_sync_metric_filter = aws.cloudwatch.LogMetricFilter(
     "data_sync_success_metric_filter",
     name="fund-data-sync-success",
     log_group_name=data_manager_log_group.name,
-    pattern='"Successfully uploaded DataFrame to S3"',
+    pattern='"Successfully uploaded DataFrame to S3" "equity/bars/daily/"',
     metric_transformation=aws.cloudwatch.LogMetricFilterMetricTransformationArgs(
         name="DataSyncSuccess",
         namespace="Fund/DataManager",
         value="1",
-        default_value="0",
     ),
 )
 

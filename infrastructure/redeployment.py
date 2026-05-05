@@ -92,6 +92,7 @@ _handler_code = textwrap.dedent("""\
     CLUSTER = os.environ["ECS_CLUSTER_NAME"]
     SERVICE = os.environ["ECS_SERVICE_NAME"]
     REQUIRED_PREFIX = "artifacts/tide/"
+    REQUIRED_SUFFIX = "model.tar.gz"
 
 
     def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -100,6 +101,10 @@ _handler_code = textwrap.dedent("""\
 
         if not key.startswith(REQUIRED_PREFIX):
             print(f"Skipping key outside required prefix: {key}")
+            return {"statusCode": 200, "body": "skipped"}
+
+        if not key.endswith(REQUIRED_SUFFIX):
+            print(f"Skipping non-model artifact: {key}")
             return {"statusCode": 200, "body": "skipped"}
 
         print(f"New model artifact detected: {key}")
