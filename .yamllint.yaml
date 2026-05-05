@@ -4,6 +4,7 @@ ignore: |
   .venv/
   target/
   .flox/
+  .pre-commit-config.yaml
 rules:
   line-length:
     max: 120
