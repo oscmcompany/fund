@@ -93,6 +93,9 @@ in {
   };
 
   env = {
+    # DuckDB library path for Rust linker
+    LIBRARY_PATH = "${pkgs.duckdb}/lib";
+
     # AWS region
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
@@ -123,8 +126,10 @@ in {
     pulumi-bin
     markdownlint-cli
     uv
+    xenon
     ruff
     alejandra
+    duckdb
   ];
 
   # PostgreSQL for orchestration server (local)
@@ -454,12 +459,14 @@ in {
     echo "Python code formatting check passed"
   '';
 
-  scripts.python-lint.exec = ''
-    set -euo pipefail
-    echo "Running Python lint checks"
-    ruff check --output-format=github .
-    echo "Python linting completed successfully"
-  '';
+  scripts.python-lint = {
+    description = "Running Python lint checks";
+    exec = ''
+      set -euo pipefail
+      ruff check --output-format=github .
+      echo "Python linting completed successfully"
+    '';
+  };
 
   scripts.python-type-check.exec = ''
     set -euo pipefail
@@ -488,12 +495,8 @@ in {
 
   scripts.python-test.exec = ''
     set -euo pipefail
-    echo "Running Python tests with coverage"
-    mkdir -p .coverage_output
-    uv run coverage run --parallel-mode -m pytest \
-      && uv run coverage combine \
-      && uv run coverage report \
-      && uv run coverage xml -o .coverage_output/python.xml
+    echo "Running Python tests"
+    uv run pytest --tb=short -q
     echo "Python tests completed successfully"
   '';
 
@@ -604,23 +607,23 @@ in {
     };
     "checks:python:lint" = {
       exec = "python-lint";
-      after = ["checks:python:install"];
+      status = "python-install";
     };
     "checks:python:type-check" = {
       exec = "python-type-check";
-      after = ["checks:python:install"];
+      after = ["checks:python:lint"];
     };
     "checks:python:dead-code" = {
       exec = "python-dead-code";
-      after = ["checks:python:install"];
+      after = ["checks:python:type-check"];
     };
     "checks:python:complexity" = {
       exec = "python-complexity";
-      after = ["checks:python:install"];
+      after = ["checks:python:dead-code"];
     };
     "checks:python:test" = {
       exec = "python-test";
-      after = ["checks:python:install"];
+      after = ["checks:python:complexity"];
     };
 
     # --- Rust checks (format parallel with check, lint+test after check) ---
@@ -654,6 +657,20 @@ in {
     "models:tide:train:local".exec = ''
       uv run prefect deployment run tide-training-pipeline/tide-trainer-local
     '';
+
+    "checks:ci" = {
+      exec = ''
+        echo "All CI/CD checks passed"
+      '';
+      after = [
+        "checks:nix"
+        "checks:markdown"
+        "checks:yaml"
+        "checks:python:test"
+        "checks:rust:lint"
+        "checks:rust:test"
+      ];
+    };
   };
 
   # --- Local processes ---
