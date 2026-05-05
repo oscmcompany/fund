@@ -22,6 +22,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
       - name: Cache Rust dependencies
