@@ -716,23 +716,23 @@ in {
       };
       "checks:python:lint" = {
         exec = "python-lint";
-        status = "python-install";
+        after = ["checks:python:install"];
       };
       "checks:python:type-check" = {
         exec = "python-type-check";
-        after = ["checks:python:lint"];
+        after = ["checks:python:install"];
       };
       "checks:python:dead-code" = {
         exec = "python-dead-code";
-        after = ["checks:python:type-check"];
+        after = ["checks:python:install"];
       };
       "checks:python:complexity" = {
         exec = "python-complexity";
-        after = ["checks:python:dead-code"];
+        after = ["checks:python:install"];
       };
       "checks:python:test" = {
         exec = "python-test";
-        after = ["checks:python:complexity"];
+        after = ["checks:python:install"];
       };
 
       # --- Rust checks (format parallel with check, lint+test after check) ---
@@ -781,7 +781,13 @@ in {
           "checks:nix"
           "checks:markdown"
           "checks:yaml"
+          "checks:python:format"
+          "checks:python:lint"
+          "checks:python:type-check"
+          "checks:python:dead-code"
+          "checks:python:complexity"
           "checks:python:test"
+          "checks:rust:format"
           "checks:rust:lint"
           "checks:rust:test"
         ];
