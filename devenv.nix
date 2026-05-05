@@ -527,31 +527,32 @@ in {
 
   scripts.rust-test.exec = ''
     set -euo pipefail
-    echo "Running Rust tests with coverage"
+    echo "Running Rust tests"
 
-    if [[ "''${RUN_INTEGRATION_TESTS:-0}" == "1" ]]; then
-      if command -v docker >/dev/null 2>&1; then
-        if ! docker info >/dev/null 2>&1; then
-          echo "Error: Docker daemon is not running"
-          exit 1
-        fi
-      else
-        echo "Error: Docker is not installed"
-        exit 1
-      fi
+    DOCKER_AVAILABLE=0
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+      DOCKER_AVAILABLE=1
+    fi
+
+    if [[ "$DOCKER_AVAILABLE" == "1" ]]; then
+      echo "Docker available - running all tests including integration"
+      TEST_ARGS="--workspace --verbose"
+    else
+      echo "Docker not available - skipping integration tests"
+      TEST_ARGS="--workspace --verbose --lib --bins"
     fi
 
     mkdir -p .coverage_output
     if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
       echo "cargo-llvm-cov not available - running tests without coverage"
-      cargo test --workspace --verbose
+      cargo test $TEST_ARGS
     elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
       echo "LLVM tools not available - running tests without coverage"
-      cargo test --workspace --verbose
+      cargo test $TEST_ARGS
     else
       export LLVM_COV=$(which llvm-cov)
       export LLVM_PROFDATA=$(which llvm-profdata)
-      cargo llvm-cov --workspace --verbose \
+      cargo llvm-cov $TEST_ARGS \
         --cobertura \
         --output-path .coverage_output/rust.xml
       echo "Rust tests with coverage completed successfully"
