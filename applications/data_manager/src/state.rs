@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
 use tracing::{debug, info};
@@ -14,6 +18,7 @@ pub struct State {
     pub massive: MassiveSecrets,
     pub s3_client: S3Client,
     pub bucket_name: String,
+    pub last_s3_ok_epoch: Arc<AtomicU64>,
 }
 
 impl State {
@@ -58,6 +63,7 @@ impl State {
             },
             s3_client,
             bucket_name,
+            last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -72,6 +78,27 @@ impl State {
             massive,
             s3_client,
             bucket_name,
+            last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn s3_ok_recently(&self, ttl_secs: u64) -> bool {
+        let last = self.last_s3_ok_epoch.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(last) < ttl_secs
+    }
+
+    pub fn mark_s3_ok(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_s3_ok_epoch.store(now, Ordering::Relaxed);
     }
 }

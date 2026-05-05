@@ -1,12 +1,15 @@
 import asyncio
+import json
 import logging
 import os
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+import requests
 import sentry_sdk
 import structlog
+from alpaca.common.exceptions import APIError
 from fastapi import FastAPI, Response, status
 from sentry_sdk.integrations.logging import LoggingIntegration
 
@@ -92,7 +95,35 @@ application: FastAPI = FastAPI(lifespan=_lifespan)
 
 @application.get("/health")
 def health_check() -> Response:
-    return Response(status_code=status.HTTP_200_OK)
+    checks: dict[str, str] = {}
+    healthy = True
+
+    alpaca_client = getattr(application.state, "alpaca_client", None)
+    if alpaca_client is not None:
+        try:
+            alpaca_client.get_account()
+            checks["alpaca_client"] = "ok"
+        except (APIError, requests.RequestException, OSError):
+            checks["alpaca_client"] = "error"
+            healthy = False
+    else:
+        checks["alpaca_client"] = "error"
+        healthy = False
+
+    scheduler = getattr(application.state, "scheduler_task", None)
+    if scheduler and not scheduler.done():
+        checks["scheduler"] = "ok"
+    else:
+        checks["scheduler"] = "error"
+        healthy = False
+
+    status_code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    body = {"status": "ok" if healthy else "degraded", "checks": checks}
+    return Response(
+        content=json.dumps(body),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 @application.get("/metrics")

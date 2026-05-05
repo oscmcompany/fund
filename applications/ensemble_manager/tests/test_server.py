@@ -281,11 +281,42 @@ def test_create_predictions_apply_preprocessing_fails_returns_500() -> None:
     mock_errors_instance.inc.assert_called_once()
 
 
-def test_health_check_returns_200() -> None:
-    client = TestClient(application, raise_server_exceptions=False)
-    with patch("ensemble_manager.server.Model.load"):
-        response = client.get("/health")
-    assert response.status_code == status.HTTP_200_OK
+def test_health_check_returns_503_when_model_not_loaded() -> None:
+    previous_model = getattr(application.state, "tide_model", None)
+    previous_directory = getattr(application.state, "model_directory", None)
+    application.state.tide_model = None
+    application.state.model_directory = "/nonexistent"
+    try:
+        client = TestClient(application, raise_server_exceptions=False)
+        with patch("ensemble_manager.server.Model.load"):
+            response = client.get("/health")
+        assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+        body = response.json()
+        assert body["status"] == "degraded"
+        assert body["checks"]["model"] == "error"
+    finally:
+        application.state.tide_model = previous_model
+        application.state.model_directory = previous_directory
+
+
+def test_health_check_returns_200_when_model_loaded() -> None:
+    previous_model = getattr(application.state, "tide_model", None)
+    previous_directory = getattr(application.state, "model_directory", None)
+    with tempfile.TemporaryDirectory() as model_dir:
+        application.state.tide_model = MagicMock()
+        application.state.model_directory = model_dir
+        try:
+            client = TestClient(application, raise_server_exceptions=False)
+            with patch("ensemble_manager.server.Model.load"):
+                response = client.get("/health")
+            assert response.status_code == status.HTTP_200_OK
+            body = response.json()
+            assert body["status"] == "ok"
+            assert body["checks"]["model"] == "ok"
+            assert body["checks"]["model_directory"] == "ok"
+        finally:
+            application.state.tide_model = previous_model
+            application.state.model_directory = previous_directory
 
 
 def test_metrics_endpoint_returns_200() -> None:

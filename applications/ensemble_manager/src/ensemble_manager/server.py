@@ -261,8 +261,31 @@ application = FastAPI(lifespan=lifespan)
 
 
 @application.get("/health")
-def health_check() -> Response:
-    return Response(status_code=status.HTTP_200_OK)
+def health_check(request: Request) -> Response:
+    checks: dict[str, str] = {}
+    healthy = True
+
+    model = getattr(request.app.state, "tide_model", None)
+    if model is not None:
+        checks["model"] = "ok"
+    else:
+        checks["model"] = "error"
+        healthy = False
+
+    model_dir = getattr(request.app.state, "model_directory", None)
+    if model_dir and Path(model_dir).exists():
+        checks["model_directory"] = "ok"
+    else:
+        checks["model_directory"] = "error"
+        healthy = False
+
+    status_code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    body = {"status": "ok" if healthy else "degraded", "checks": checks}
+    return Response(
+        content=json.dumps(body),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 @application.get("/metrics")

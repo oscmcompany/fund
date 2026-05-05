@@ -41,7 +41,7 @@ aws.iam.RolePolicy(
     "redeployment_lambda_policy",
     name="fund-redeployment-lambda-policy",
     role=redeployment_lambda_role.id,
-    policy=ensemble_manager_service.id.apply(
+    policy=ensemble_manager_service.arn.apply(
         lambda service_arn: json.dumps(
             {
                 "Version": "2012-10-17",

@@ -1,3 +1,4 @@
+import alarms  # noqa: F401
 import pulumi
 from compute import acm_certificate_arn, alb, cluster, service_discovery_namespace
 from config import account_id
