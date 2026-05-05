@@ -581,6 +581,7 @@ in {
   scripts.python-test.exec = ''
     set -euo pipefail
     echo "Running Python tests"
+    export CC=clang
     mkdir -p .coverage_output
     uv run coverage run -m pytest --tb=short -q
     uv run coverage combine 2>/dev/null || true
