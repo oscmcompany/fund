@@ -255,8 +255,20 @@ def test_equity_details_schema_slash_ticker() -> None:
     data = pl.DataFrame(
         {
             "ticker": ["AKO/A", "AKO/B", "BF/A", "BF/B", "BIO/B"],
-            "sector": ["CONSUMER STAPLES", "CONSUMER STAPLES", "CONSUMER STAPLES", "CONSUMER STAPLES", "HEALTHCARE"],
-            "industry": ["BEVERAGES", "BEVERAGES", "BEVERAGES", "BEVERAGES", "BIOTECHNOLOGY"],
+            "sector": [
+                "CONSUMER STAPLES",
+                "CONSUMER STAPLES",
+                "CONSUMER STAPLES",
+                "CONSUMER STAPLES",
+                "HEALTHCARE",
+            ],
+            "industry": [
+                "BEVERAGES",
+                "BEVERAGES",
+                "BEVERAGES",
+                "BEVERAGES",
+                "BIOTECHNOLOGY",
+            ],
         }
     )
 

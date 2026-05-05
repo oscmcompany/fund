@@ -54,7 +54,7 @@ for service_name, target_group in _unhealthy_host_targets.items():
         tags=tags,
     )
 
-data_sync_metric_filter = aws.cloudwatch.LogMetricFilter(
+aws.cloudwatch.LogMetricFilter(
     "data_sync_success_metric_filter",
     name="fund-data-sync-success",
     log_group_name=data_manager_log_group.name,
@@ -72,8 +72,9 @@ aws.cloudwatch.MetricAlarm(
     namespace="Fund/DataManager",
     metric_name="DataSyncSuccess",
     statistic="Sum",
-    period=86400,
-    evaluation_periods=1,
+    period=3600,
+    evaluation_periods=24,
+    datapoints_to_alarm=24,
     threshold=1,
     comparison_operator="LessThanThreshold",
     treat_missing_data="breaching",

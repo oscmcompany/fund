@@ -128,8 +128,12 @@ def format_portfolio_report(
     exposure_scale: float,
 ) -> str:
     """Return a formatted string summarising position sizes and portfolio-level risk."""
-    long_total = portfolio.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
-    short_total = portfolio.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
+    long_total = float(
+        portfolio.filter(pl.col("side") == "LONG")["dollar_amount"].sum()
+    )
+    short_total = float(
+        portfolio.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
+    )
     imbalance_percent = (
         abs(long_total - short_total) / max(long_total, short_total) * 100
     )

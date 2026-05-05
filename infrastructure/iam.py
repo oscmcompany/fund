@@ -448,7 +448,9 @@ github_actions_trainer_policy = aws.iam.Policy(
 github_actions_redeployment_policy = aws.iam.Policy(
     "github_actions_redeployment_policy",
     name="fund-github-actions-redeployment-policy",
-    description="Redeployment infrastructure permissions for GitHub Actions deployments.",
+    description=(
+        "Redeployment infrastructure permissions for GitHub Actions deployments."
+    ),
     policy=json.dumps(
         {
             "Version": "2012-10-17",
