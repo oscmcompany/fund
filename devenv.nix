@@ -179,35 +179,35 @@ in {
 
   # Bring up AWS infrastructure with Pulumi
   scripts.infra-up.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     cd "$DEVENV_ROOT/infrastructure"
     pulumi up --stack production --yes
   '';
 
   # Tear down AWS infrastructure with Pulumi
   scripts.infra-down.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     cd "$DEVENV_ROOT/infrastructure"
     pulumi down --stack production --yes
   '';
 
   # Show Pulumi stack outputs (ALB URL, ECR repos, bucket names, etc.)
   scripts.infra-outputs.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     cd "$DEVENV_ROOT/infrastructure"
     pulumi stack output --stack production --json
   '';
 
   # Get the ALB base URL from Pulumi outputs
   scripts.infra-url.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     cd "$DEVENV_ROOT/infrastructure"
     pulumi stack output --stack production aws_alb_url 2>/dev/null || echo "Not deployed yet"
   '';
 
   # Build and push a Docker image to ECR
   scripts.ecr-push.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     SERVICE="$1"
     if [ -z "$SERVICE" ]; then
       echo "Usage: ecr-push <${lib.concatStringsSep "|" deployableServices}|all>"
@@ -216,6 +216,7 @@ in {
 
     ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
     REGISTRY="$ACCOUNT_ID.dkr.ecr.${awsRegion}.amazonaws.com"
+    GIT_SHA=$(git rev-parse --short HEAD)
 
     echo "Logging into ECR..."
     aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY"
@@ -223,12 +224,23 @@ in {
     ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
         push_${builtins.replaceStrings ["-"] ["_"] svc}() {
           local repo="${def.ecrRepo}"
-          local image="$REGISTRY/$repo:latest"
+          local sha_tag="git-$GIT_SHA"
           local ctx_dir="$DEVENV_ROOT/${def.context}"
+
+          # Skip if this commit is already pushed
+          if aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$sha_tag" --region ${awsRegion} >/dev/null 2>&1; then
+            echo "=== Skipping ${svc} (tag $sha_tag already exists) ==="
+            return 0
+          fi
+
           echo "=== Building ${svc} ==="
-          docker build -t "$image" -f "$DEVENV_ROOT/${def.dockerfile}" "$ctx_dir"
-          echo "=== Pushing ${svc} ==="
-          docker push "$image"
+          docker buildx build \
+            --platform linux/amd64 \
+            --tag "$REGISTRY/$repo:latest" \
+            --tag "$REGISTRY/$repo:$sha_tag" \
+            --file "$DEVENV_ROOT/${def.dockerfile}" \
+            --push \
+            "$ctx_dir"
           echo "OK: ${svc}"
         }
       '')
@@ -250,7 +262,7 @@ in {
 
   # Force ECS services to redeploy with latest image
   scripts.ecs-deploy.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     SERVICE="$1"
     CLUSTER="fund-applications"
 
@@ -269,6 +281,11 @@ in {
         --region ${awsRegion} \
         --query 'service.serviceName' \
         --output text
+      echo "Waiting for $ecs_name to stabilize..."
+      aws ecs wait services-stable \
+        --cluster "$CLUSTER" \
+        --services "$ecs_name" \
+        --region ${awsRegion}
       echo "OK: $ecs_name"
     }
 
@@ -296,9 +313,32 @@ in {
     ecr-push "$SERVICE" && ecs-deploy "$SERVICE"
   '';
 
+  # CD pipeline: push images, update infra, deploy services
+  scripts.cd-deploy.exec = ''
+    set -euo pipefail
+    unset AWS_ENDPOINT_URL
+
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+      echo "ERROR: No AWS credentials available"
+      echo "CD deploy requires AWS credentials (OIDC in CI or configured profile locally)"
+      exit 1
+    fi
+
+    echo "=== Pushing images to ECR ==="
+    ecr-push all
+
+    echo "=== Updating infrastructure ==="
+    infra-up
+
+    echo "=== Deploying ECS services ==="
+    ecs-deploy all
+
+    echo "CD deploy completed successfully"
+  '';
+
   # Show ECS service status
   scripts.ecs-status.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     CLUSTER="fund-applications"
     echo "=== ECS Services ==="
     aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
@@ -315,7 +355,7 @@ in {
 
   # Pull secrets from AWS Secrets Manager into .envrc
   scripts.pull-secrets.exec = ''
-    unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+    unset AWS_ENDPOINT_URL
     ENVRC="$DEVENV_ROOT/.envrc"
     AWS_CMD="aws --region ${awsRegion}"
     export AWS_PROFILE=default
@@ -367,7 +407,7 @@ in {
         export PREFECT_API_URL="http://localhost:4200/api"
 
         echo "Reading bucket names from Pulumi stack outputs..."
-        unset AWS_ENDPOINT_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+        unset AWS_ENDPOINT_URL
         DATA_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
         ARTIFACTS_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
 
@@ -497,7 +537,10 @@ in {
   scripts.python-test.exec = ''
     set -euo pipefail
     echo "Running Python tests"
-    uv run pytest --tb=short -q
+    mkdir -p .coverage_output
+    uv run coverage run -m pytest --tb=short -q
+    uv run coverage combine 2>/dev/null || true
+    uv run coverage xml
     echo "Python tests completed successfully"
   '';
 
@@ -586,6 +629,25 @@ in {
     echo "Nix lint check passed"
   '';
 
+  scripts.docker-build-check.exec = ''
+    set -euo pipefail
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+      echo "Docker not available - skipping build checks"
+      exit 0
+    fi
+
+    echo "Running Docker build checks"
+    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
+        echo "=== Building ${svc} ==="
+        docker buildx build \
+          --platform linux/amd64 \
+          --file "$DEVENV_ROOT/${def.dockerfile}" \
+          "$DEVENV_ROOT/${def.context}"
+      '')
+      ecsServices)}
+    echo "Docker build checks passed"
+  '';
+
   scripts.bump-deps.exec = ''
     set -euo pipefail
     echo "Bumping all dependencies..."
@@ -660,9 +722,11 @@ in {
       uv run prefect deployment run tide-training-pipeline/tide-trainer-local
     '';
 
+    "checks:docker".exec = "docker-build-check";
+
     "checks:ci" = {
       exec = ''
-        echo "All CI/CD checks passed"
+        echo "All CI checks passed"
       '';
       after = [
         "checks:nix"
@@ -671,7 +735,17 @@ in {
         "checks:python:test"
         "checks:rust:lint"
         "checks:rust:test"
+        "checks:docker"
       ];
+    };
+
+    "checks:cd:deploy".exec = "cd-deploy";
+
+    "checks:cd" = {
+      exec = ''
+        echo "CD pipeline completed"
+      '';
+      after = ["checks:ci" "checks:cd:deploy"];
     };
   };
 
