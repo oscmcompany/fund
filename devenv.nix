@@ -130,6 +130,7 @@ in {
     ruff
     alejandra
     duckdb
+    docker-client
   ];
 
   # PostgreSQL for orchestration server (local)
