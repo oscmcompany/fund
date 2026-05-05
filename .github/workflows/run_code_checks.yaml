@@ -20,6 +20,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       markdown: ${{ steps.filter.outputs.markdown }}
       yaml: ${{ steps.filter.outputs.yaml }}
+      nix: ${{ steps.filter.outputs.nix }}
       container: ${{ steps.filter.outputs.container }}
     steps:
       - name: Checkout code
@@ -57,6 +58,11 @@ jobs:
               - 'maskfile.md'
               - '.flox/**'
               - 'devenv.*'
+              - '.github/**'
+            nix:
+              - '**/*.nix'
+              - 'flake.lock'
+              - '.flox/**'
               - '.github/**'
             container:
               - 'applications/data_manager/**'
@@ -113,7 +119,7 @@ jobs:
           shared-key: rust-continuous-integration
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Run Rust code checks
-        run: devenv shell rust-checks
+        run: devenv tasks run checks:rust
       - name: Check Rust coverage file exists
         run: |
           if [ ! -f .coverage_output/rust.xml ]; then
@@ -141,10 +147,8 @@ jobs:
           name: devenv
       - name: Install devenv
         run: nix profile add nixpkgs#devenv
-      - name: Install Python dependencies
-        run: devenv shell python-install
       - name: Run Python code checks
-        run: devenv shell python-checks
+        run: devenv tasks run checks:python
       - name: Check Python coverage file exists
         run: |
           if [ ! -f .coverage_output/python.xml ]; then
@@ -173,7 +177,7 @@ jobs:
       - name: Install devenv
         run: nix profile add nixpkgs#devenv
       - name: Run Markdown code checks
-        run: devenv shell markdown-checks
+        run: devenv tasks run checks:markdown
   run_yaml_code_checks:
     name: Run YAML code checks
     needs: detect_changes
@@ -189,7 +193,7 @@ jobs:
       - name: Install devenv
         run: nix profile add nixpkgs#devenv
       - name: Run YAML code checks
-        run: devenv shell yaml-checks
+        run: devenv tasks run checks:yaml
   run_docker_build_checks:
     name: Build check ${{ matrix.application }}-${{ matrix.stage }}
     needs: detect_changes

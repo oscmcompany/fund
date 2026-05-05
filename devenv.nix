@@ -78,6 +78,15 @@ in {
       language = "system";
       fail_fast = true;
     };
+    nix-lint = {
+      enable = true;
+      name = "Lint all Nix code";
+      entry = "nix-lint";
+      files = "\\.nix$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
   };
 
   env = {
@@ -111,6 +120,8 @@ in {
     pulumi-bin
     markdownlint-cli
     uv
+    ruff
+    alejandra
   ];
 
   # PostgreSQL for orchestration server (local)
@@ -481,15 +492,7 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.python-checks.exec = ''
-    set -euo pipefail
-    echo "Running Python development checks"
-    python-format
-    python-lint
-    python-type-check
-    python-dead-code
-    python-complexity
-    python-test
-    echo "Python development checks completed successfully"
+    devenv tasks run checks:python
   '';
 
   scripts.rust-format.exec = ''
@@ -547,13 +550,7 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   scripts.rust-checks.exec = ''
-    set -euo pipefail
-    echo "Running Rust development checks"
-    rust-format
-    rust-check
-    rust-lint
-    rust-test
-    echo "Rust development checks completed successfully"
+    devenv tasks run checks:rust
   '';
 
   scripts.markdown-checks.exec = ''
@@ -571,6 +568,13 @@ print('Blocks registered: data-bucket, artifact-bucket')
     echo "YAML checks completed successfully"
   '';
 
+  scripts.nix-lint.exec = ''
+    set -euo pipefail
+    echo "Linting Nix files"
+    alejandra --check .
+    echo "Nix lint check passed"
+  '';
+
   scripts.bump-deps.exec = ''
     set -euo pipefail
     echo "Bumping all dependencies..."
@@ -584,15 +588,66 @@ print('Blocks registered: data-bucket, artifact-bucket')
   '';
 
   tasks = {
+    # --- Python checks (install first, then all others in parallel) ---
+
+    "checks:python:install".exec = "python-install";
+
+    "checks:python:format" = {
+      exec = "python-format";
+      after = [ "checks:python:install" ];
+    };
+    "checks:python:lint" = {
+      exec = "python-lint";
+      after = [ "checks:python:install" ];
+    };
+    "checks:python:type-check" = {
+      exec = "python-type-check";
+      after = [ "checks:python:install" ];
+    };
+    "checks:python:dead-code" = {
+      exec = "python-dead-code";
+      after = [ "checks:python:install" ];
+    };
+    "checks:python:complexity" = {
+      exec = "python-complexity";
+      after = [ "checks:python:install" ];
+    };
+    "checks:python:test" = {
+      exec = "python-test";
+      after = [ "checks:python:install" ];
+    };
+
+    # --- Rust checks (format parallel with check, lint+test after check) ---
+
+    "checks:rust:format".exec = "rust-format";
+    "checks:rust:check".exec = "rust-check";
+
+    "checks:rust:lint" = {
+      exec = "rust-lint";
+      after = [ "checks:rust:check" ];
+    };
+    "checks:rust:test" = {
+      exec = "rust-test";
+      after = [ "checks:rust:check" ];
+    };
+
+    # --- Standalone checks ---
+
+    "checks:markdown".exec = "markdown-checks";
+    "checks:yaml".exec = "yaml-checks";
+    "checks:nix".exec = "nix-lint";
+
+    # --- Model tasks ---
+
     "models:tide:deploy".exec = ''
       uv run prefect --no-prompt deploy --all
-      '';
+    '';
     "models:tide:train".exec = ''
       uv run prefect deployment run tide-training-pipeline/tide-trainer-remote
-      '';
+    '';
     "models:tide:train:local".exec = ''
       uv run prefect deployment run tide-training-pipeline/tide-trainer-local
-      '';
+    '';
   };
 
   # --- Local processes ---
@@ -710,11 +765,15 @@ print('Blocks registered: data-bucket, artifact-bucket')
     echo "    ecs-status        Show ECS service status"
     echo "    initialize-remote-trainer  Create work pool + register deployment (prod)"
     echo ""
-    echo "  Development:"
-    echo "    python-checks     Run all Python checks"
-    echo "    rust-checks       Run all Rust checks"
-    echo "    markdown-checks   Run Markdown lint"
-    echo "    yaml-checks       Run YAML lint"
+    echo "  Checks (devenv tasks run):"
+    echo "    checks:python       All Python checks (parallel after install)"
+    echo "    checks:rust         All Rust checks (parallel after cargo check)"
+    echo "    checks:markdown     Markdown lint"
+    echo "    checks:yaml         YAML lint"
+    echo "    checks:nix          Nix lint (alejandra)"
+    echo "    Individual: checks:python:format, checks:rust:lint, etc."
+    echo ""
+    echo "  Utilities:"
     echo "    bump-deps         Update all dependency lockfiles"
     echo ""
     echo "  Local:"
