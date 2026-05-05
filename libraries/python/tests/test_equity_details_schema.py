@@ -274,3 +274,22 @@ def test_equity_details_schema_slash_ticker() -> None:
 
     validated_df = equity_details_schema.validate(data)
     assert list(validated_df["ticker"]) == ["AKO/A", "AKO/B", "BF/A", "BF/B", "BIO/B"]
+
+
+@pytest.mark.parametrize(
+    "invalid_ticker",
+    ["/AAPL", "AAPL/", "AKO//A", "ako/a", "bf/b"],
+)
+def test_equity_details_schema_rejects_invalid_slash_tickers(
+    invalid_ticker: str,
+) -> None:
+    data = pl.DataFrame(
+        {
+            "ticker": [invalid_ticker],
+            "sector": ["TECHNOLOGY"],
+            "industry": ["SOFTWARE"],
+        }
+    )
+
+    with pytest.raises(SchemaError):
+        equity_details_schema.validate(data)
