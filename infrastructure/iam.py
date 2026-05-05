@@ -448,7 +448,7 @@ github_actions_trainer_policy = aws.iam.Policy(
 github_actions_redeployment_policy = aws.iam.Policy(
     "github_actions_redeployment_policy",
     name="fund-github-actions-redeployment-policy",
-    description="Redeployment infrastructure permissions for GitHub Actions.",
+    description="Redeployment infrastructure permissions for GitHub Actions deployments.",
     policy=json.dumps(
         {
             "Version": "2012-10-17",
@@ -468,10 +468,7 @@ github_actions_redeployment_policy = aws.iam.Policy(
                     "Sid": "ManageLambdaFunctions",
                     "Effect": "Allow",
                     "Action": "lambda:*",
-                    "Resource": [
-                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager",
-                        f"arn:aws:lambda:{region}:{account_id}:function:fund-redeploy-ensemble-manager:*",
-                    ],
+                    "Resource": f"arn:aws:lambda:{region}:{account_id}:function:fund-*",
                 },
                 {
                     "Sid": "ManageEventBridgeRules",
