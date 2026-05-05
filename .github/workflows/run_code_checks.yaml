@@ -99,8 +99,12 @@ jobs:
           sudo mv /tmp/duckdb/*.h /usr/local/include/
           sudo ldconfig
           rm -rf /tmp/duckdb libduckdb-linux-amd64.zip
-      - name: Install Flox
-        uses: flox/install-flox-action@v2
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -109,9 +113,7 @@ jobs:
           shared-key: rust-continuous-integration
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Run Rust code checks
-        uses: flox/activate-action@v1
-        with:
-          command: mask development rust checks
+        run: devenv shell rust-checks
       - name: Check Rust coverage file exists
         run: |
           if [ ! -f .coverage_output/rust.xml ]; then
@@ -133,16 +135,16 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install Flox
-        uses: flox/install-flox-action@v2
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
       - name: Install Python dependencies
-        uses: flox/activate-action@v1
-        with:
-          command: mask development python install
+        run: devenv shell python-install
       - name: Run Python code checks
-        uses: flox/activate-action@v1
-        with:
-          command: mask development python checks
+        run: devenv shell python-checks
       - name: Check Python coverage file exists
         run: |
           if [ ! -f .coverage_output/python.xml ]; then
@@ -164,12 +166,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install Flox
-        uses: flox/install-flox-action@v2
-      - name: Run Markdown code checks
-        uses: flox/activate-action@v1
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
         with:
-          command: mask development markdown checks
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+      - name: Run Markdown code checks
+        run: devenv shell markdown-checks
   run_yaml_code_checks:
     name: Run YAML code checks
     needs: detect_changes
@@ -178,12 +182,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Install Flox
-        uses: flox/install-flox-action@v2
-      - name: Run YAML code checks
-        uses: flox/activate-action@v1
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
         with:
-          command: mask development yaml checks
+          name: devenv
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
+      - name: Run YAML code checks
+        run: devenv shell yaml-checks
   run_docker_build_checks:
     name: Build check ${{ matrix.application }}-${{ matrix.stage }}
     needs: detect_changes
