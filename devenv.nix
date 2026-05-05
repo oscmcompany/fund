@@ -100,15 +100,17 @@ in {
     BACKFILL_LOOKBACK_DAYS = "730";
   };
 
-  packages = [
-    pkgs.git
-    pkgs.curl
-    pkgs.jq
-    pkgs.rustup
-    pkgs.cargo-watch
-    pkgs.awscli2
-    pkgs.pulumiPackages.pulumi-language-python
-    pkgs.pulumi-bin
+  packages = with pkgs; [
+    git
+    curl
+    jq
+    rustup
+    cargo-watch
+    awscli2
+    pulumiPackages.pulumi-language-python
+    pulumi-bin
+    markdownlint-cli
+    uv
   ];
 
   # PostgreSQL for orchestration server (local)
