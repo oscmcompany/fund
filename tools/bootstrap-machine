@@ -121,7 +121,7 @@ if command -v secretspec &>/dev/null; then
   echo "secretspec is already installed, skipping"
 else
   echo "Installing secretspec..."
-  curl -sSL https://install.secretspec.dev | sh
+  nix profile install nixpkgs#secretspec
   echo "secretspec installed successfully"
 fi
 
