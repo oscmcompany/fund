@@ -66,3 +66,21 @@ This is a collection of guidelines and references.
 - When the user indicates pull request review bots have provided feedback, suggest running `/update-pull-request`
   with the pull request number
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash commands
+- Guard against division by zero when computing ratios or percentages from
+  DataFrame aggregations
+- When Polars `Series.sum()` is used on a potentially empty or all-null
+  series, handle the `None` return case
+- IAM policies must follow least-privilege: scope resource ARNs as narrowly
+  as possible (e.g., `fund-redeploy-*` not `fund-*`)
+- CloudWatch metric filter patterns should include enough context to uniquely
+  identify the log event (e.g., include S3 key path)
+- Comments describing AWS service behavior must be technically accurate;
+  verify claims about service capabilities
+- Infrastructure comments should explain the "why" of a design choice, not
+  make incorrect claims about service limitations
+- Pin GitHub Actions to version tags in deployment workflows; `@main` is
+  acceptable for CI but not for CD
+- `devenv tasks run` supports prefix group execution: `checks:python` runs
+  all `checks:python:*` subtasks
+- When writing CloudWatch alarms with `datapoints_to_alarm`, document the
+  intended detection semantics in a comment
