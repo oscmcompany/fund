@@ -101,8 +101,24 @@ step "Checking AWS CLI installation"
 if command -v aws &>/dev/null; then
   echo "AWS CLI is already installed, skipping"
 else
-  echo "Installing AWS CLI via Nix (required for secretspec)..."
-  nix profile install nixpkgs#awscli2
+  echo "Installing AWS CLI (required for secretspec)..."
+  case "$OS" in
+    Linux)
+      sudo apt-get update -qq && sudo apt-get install -y -qq awscli
+      ;;
+    Darwin)
+      if command -v brew &>/dev/null; then
+        brew install awscli
+      else
+        echo "Error: Homebrew not found. Install it from https://brew.sh"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Error: unsupported OS '$OS' for AWS CLI install"
+      exit 1
+      ;;
+  esac
   echo "AWS CLI installed successfully"
 fi
 
@@ -119,12 +135,10 @@ else
   echo "devenv uses secretspec with the awssm provider, so valid"
   echo "credentials are required before the environment can build."
   echo ""
-  echo "Open a new shell (so Nix paths are on PATH), then run:"
+  echo "Configure credentials with one of:"
   echo "  aws configure"
-  echo ""
-  echo "Or export credentials directly:"
-  echo "  export AWS_ACCESS_KEY_ID=..."
-  echo "  export AWS_SECRET_ACCESS_KEY=..."
+  echo "  aws configure sso"
+  echo "  export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
   echo ""
   echo "Then re-run: $(basename "$0")"
   exit 1
