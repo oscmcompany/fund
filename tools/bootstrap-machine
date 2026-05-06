@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PROD=false
+OS="$(uname -s)"
+
+usage() {
+  echo "Usage: $(basename "$0") [--prod]"
+  echo ""
+  echo "Bootstrap a fresh machine for the fund development environment."
+  echo ""
+  echo "Options:"
+  echo "  --prod    Configure production secrets from AWS Secrets Manager"
+  echo "  -h, --help  Show this help message"
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prod)
+      PROD=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Error: unknown option '$1'"
+      usage
+      ;;
+  esac
+done
+
+step() {
+  echo ""
+  echo "==> $1"
+}
+
+# --------------------------------------------------------------------------- #
+# 1. Install Nix via Determinate Systems installer
+# --------------------------------------------------------------------------- #
+step "Checking Nix installation"
+
+if command -v nix &>/dev/null; then
+  echo "Nix is already installed, skipping"
+else
+  echo "Installing Nix via Determinate Systems installer..."
+  curl --proto '=https' --tlsv1.2 -sSf -L \
+    https://install.determinate.systems/nix | sh -s -- install --no-confirm
+
+  # Source the Nix daemon profile so the current shell can use nix immediately
+  for profile in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh \
+                 /etc/profile.d/nix.sh; do
+    if [[ -f "$profile" ]]; then
+      # shellcheck disable=SC1090
+      . "$profile"
+      break
+    fi
+  done
+
+  if ! command -v nix &>/dev/null; then
+    echo "Error: nix not found on PATH after installation"
+    exit 1
+  fi
+  echo "Nix installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 2. Install devenv
+# --------------------------------------------------------------------------- #
+step "Checking devenv installation"
+
+if command -v devenv &>/dev/null; then
+  echo "devenv is already installed, skipping"
+else
+  echo "Installing devenv..."
+  nix profile install nixpkgs#devenv
+  echo "devenv installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 3. Build the devenv environment
+# --------------------------------------------------------------------------- #
+step "Building devenv environment"
+
+cd "$REPO_ROOT"
+echo "Running devenv shell to trigger Nix build (this may take a while)..."
+devenv shell -- echo "devenv environment built successfully"
+
+# --------------------------------------------------------------------------- #
+# 4. Prod mode: pull secrets from AWS Secrets Manager
+# --------------------------------------------------------------------------- #
+if [[ "$PROD" == true ]]; then
+  step "Configuring production environment"
+
+  if ! command -v aws &>/dev/null; then
+    echo "Error: aws CLI not found. Run this inside 'devenv shell' first."
+    exit 1
+  fi
+
+  echo "Verifying AWS credentials..."
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo ""
+    echo "AWS credentials are not configured or have expired."
+    echo "Configure credentials with one of:"
+    echo "  aws configure"
+    echo "  aws configure sso"
+    echo "  export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+    echo ""
+    echo "Then re-run: $(basename "$0") --prod"
+    exit 1
+  fi
+
+  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
+  echo "Authenticated as: $IDENTITY"
+
+  echo "Pulling secrets via devenv pull-secrets..."
+  devenv shell -- pull-secrets
+fi
+
+# --------------------------------------------------------------------------- #
+# Done
+# --------------------------------------------------------------------------- #
+step "Bootstrap complete"
+
+echo ""
+echo "Next steps:"
+echo "  cd $REPO_ROOT"
+echo "  devenv shell        # enter the development environment"
+echo "  devenv up           # start local services (postgres, prometheus, etc.)"
+if [[ "$PROD" != true ]]; then
+  echo ""
+  echo "For production secrets, re-run with:"
+  echo "  $(basename "$0") --prod"
+fi
