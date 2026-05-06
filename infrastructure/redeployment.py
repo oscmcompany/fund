@@ -138,7 +138,7 @@ redeployment_lambda = aws.lambda_.Function(
 
 # EventBridge rule: match S3 "Object Created" events under the artifacts/tide/
 # prefix in the model artifacts bucket. Suffix filtering (.tar.gz) is handled
-# by the Lambda handler since EventBridge only supports prefix matching.
+# by the Lambda handler to avoid unnecessary rule complexity.
 model_artifact_uploaded_rule = aws.cloudwatch.EventRule(
     "model_artifact_uploaded_rule",
     name="fund-model-artifact-uploaded",

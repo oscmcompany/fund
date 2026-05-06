@@ -134,8 +134,9 @@ def format_portfolio_report(
     short_total = float(
         portfolio.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
     )
+    max_side = max(long_total, short_total)
     imbalance_percent = (
-        abs(long_total - short_total) / max(long_total, short_total) * 100
+        abs(long_total - short_total) / max_side * 100 if max_side > 0 else 0.0
     )
     portfolio_beta = compute_portfolio_beta(portfolio, market_betas)
 
