@@ -40,8 +40,8 @@ devenv.nix
     └── scripts (train-local, deploy-training)
 
 AWS (retained services)
-├── S3: fund-data-404221e2 (equity bars, predictions, portfolios)
-├── S3: fund-model-artifacts-404221e2 (trained model weights)
+├── S3: fund-production-data (equity bars, predictions, portfolios)
+├── S3: fund-production-model-artifacts (trained model weights)
 └── Secrets Manager: secretspec/fund/production/* (via secretspec awssm)
 ```
 
@@ -116,8 +116,8 @@ curl localhost:8082/health  # ensemble-manager
 
 ```bash
 export FUND_ENVIRONMENT=production
-export AWS_S3_DATA_BUCKET_NAME=fund-data-404221e2
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME=fund-model-artifacts-404221e2
+export AWS_S3_DATA_BUCKET_NAME=fund-production-data
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME=fund-production-model-artifacts
 export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
 export MASSIVE_BASE_URL=https://api.massive.com
 ```

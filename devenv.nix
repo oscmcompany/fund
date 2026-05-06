@@ -95,14 +95,8 @@ in {
     FUND_PROFILE = fundProfile;
 
     # S3 bucket names derived from FUND_PROFILE
-    AWS_S3_DATA_BUCKET_NAME =
-      if isProd
-      then "fund-data-404221e2"
-      else "fund-${bucketSlug}-data";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME =
-      if isProd
-      then "fund-model-artifacts-404221e2"
-      else "fund-${bucketSlug}-model-artifacts";
+    AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";

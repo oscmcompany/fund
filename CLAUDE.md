@@ -76,3 +76,5 @@ This is a collection of guidelines and references.
   acceptable for CI but not for CD
 - `devenv tasks run` supports prefix group execution: `checks:python` runs
   all `checks:python:*` subtasks
+- Run git commands inside `devenv shell` so pre-commit hooks have access to
+  tools like `alejandra`, `ruff`, and `cargo fmt` (e.g., `devenv shell -- git commit ...`)
