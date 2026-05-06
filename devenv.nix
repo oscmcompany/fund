@@ -339,7 +339,7 @@ in {
     "models:tide:train".exec = ''
       set -euo pipefail
       echo "Running tide training pipeline"
-      secretspec run -- uv run python -m models.tide.train
+      secretspec run -- uv run python -m tide.workflow
     '';
 
     "checks:ci" = {
