@@ -13,6 +13,7 @@
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
   dotenv.enable = true;
+  dotenv.filename = ".envrc";
 
   languages = {
     rust.enable = true;
