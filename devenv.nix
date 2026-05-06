@@ -12,17 +12,17 @@
     data-manager = {
       dockerfile = "applications/data_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/data-manager-server";
+      ecrRepo = "fund/applications-data-manager-server";
     };
     ensemble-manager = {
       dockerfile = "applications/ensemble_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/ensemble-manager-server";
+      ecrRepo = "fund/applications-ensemble-manager-server";
     };
     portfolio-manager = {
       dockerfile = "applications/portfolio_manager/Dockerfile";
       context = ".";
-      ecrRepo = "fund/portfolio-manager-server";
+      ecrRepo = "fund/applications-portfolio-manager-server";
     };
   };
 
