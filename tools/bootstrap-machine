@@ -136,7 +136,10 @@ else
   echo "Installing AWS CLI (required for secretspec)..."
   case "$OS" in
     Linux)
-      sudo apt-get update -qq && sudo apt-get install -y -qq awscli
+      curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+      unzip -qo /tmp/awscliv2.zip -d /tmp
+      sudo /tmp/aws/install
+      rm -rf /tmp/awscliv2.zip /tmp/aws
       ;;
     Darwin)
       if command -v brew &>/dev/null; then
