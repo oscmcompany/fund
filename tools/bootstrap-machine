@@ -82,7 +82,42 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Build the devenv environment
+# 3. Install AWS CLI (needed before devenv shell for secretspec)
+# --------------------------------------------------------------------------- #
+step "Checking AWS CLI installation"
+
+if command -v aws &>/dev/null; then
+  echo "AWS CLI is already installed, skipping"
+else
+  echo "Installing AWS CLI via Nix (required for secretspec)..."
+  nix profile install nixpkgs#awscli2
+  echo "AWS CLI installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. Configure AWS credentials (required for secretspec provider)
+# --------------------------------------------------------------------------- #
+step "Checking AWS credentials"
+
+if aws sts get-caller-identity &>/dev/null; then
+  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
+  echo "Authenticated as: $IDENTITY"
+else
+  echo "AWS credentials are not configured."
+  echo "devenv uses secretspec with the awssm provider, so valid"
+  echo "credentials are required before the environment can build."
+  echo ""
+  echo "Configure credentials with one of:"
+  echo "  aws configure"
+  echo "  aws configure sso"
+  echo "  export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
+  echo ""
+  echo "Then re-run: $(basename "$0")"
+  exit 1
+fi
+
+# --------------------------------------------------------------------------- #
+# 5. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -91,31 +126,10 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 4. Prod mode: create .envrc and validate secrets
+# 6. Prod mode: create .envrc and validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
   step "Configuring production environment"
-
-  if ! command -v aws &>/dev/null; then
-    echo "Error: aws CLI not found. Run this inside 'devenv shell' first."
-    exit 1
-  fi
-
-  echo "Verifying AWS credentials..."
-  if ! aws sts get-caller-identity &>/dev/null; then
-    echo ""
-    echo "AWS credentials are not configured or have expired."
-    echo "Configure credentials with one of:"
-    echo "  aws configure"
-    echo "  aws configure sso"
-    echo "  export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
-    echo ""
-    echo "Then re-run: $(basename "$0") --prod"
-    exit 1
-  fi
-
-  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
-  echo "Authenticated as: $IDENTITY"
 
   ENVRC="$REPO_ROOT/.envrc"
   if [[ ! -f "$ENVRC" ]]; then
