@@ -379,12 +379,10 @@ in {
       data-manager.exec =
         if isProd
         then ''
-          cd applications/data_manager
-          exec secretspec run -- cargo run --release
+          exec secretspec run -- cargo run -p data_manager --release
         ''
         else ''
-          cd applications/data_manager
-          exec secretspec run -- cargo watch -x run
+          exec secretspec run -- cargo watch -x 'run -p data_manager'
         '';
 
       ensemble-manager.exec = let
@@ -398,12 +396,10 @@ in {
         if isProd
         then ''
           ${waitForDataManager}
-          cd applications/ensemble_manager
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
           ${waitForDataManager}
-          cd applications/ensemble_manager
           exec secretspec run -- ${uvicornCmd} --reload
         '';
 
@@ -421,12 +417,10 @@ in {
         if isProd
         then ''
           ${waitForDeps}
-          cd applications/portfolio_manager
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
           ${waitForDeps}
-          cd applications/portfolio_manager
           exec secretspec run -- ${uvicornCmd} --reload
         '';
 
