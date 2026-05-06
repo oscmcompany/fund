@@ -8,6 +8,7 @@
   awsRegion = "us-east-1";
 
   fundProfile = builtins.getEnv "FUND_PROFILE";
+  isProd = fundProfile == "production";
 
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
