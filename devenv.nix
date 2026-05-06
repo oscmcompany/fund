@@ -346,6 +346,7 @@ in {
     "models:tide:train" = {
       exec = ''
         set -euo pipefail
+        export CC=clang
         echo "Running tide training pipeline"
         secretspec run -- uv run python -m tide.workflow
       '';
