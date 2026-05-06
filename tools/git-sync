@@ -81,6 +81,16 @@ stop_devenv() {
 # Main loop
 # ------------------------------------------------------------------ #
 cd "$REPO_ROOT"
+
+# Source .envrc so FUND_PROFILE is set during Nix evaluation
+if [[ -f "$REPO_ROOT/.envrc" ]]; then
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.envrc"
+  log "Loaded .envrc (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
+else
+  log "WARNING: no .envrc found, FUND_PROFILE will be empty"
+fi
+
 log "git-sync starting in $REPO_ROOT"
 
 start_devenv
