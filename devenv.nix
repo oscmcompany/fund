@@ -378,8 +378,8 @@ in {
 
   profiles.apps.module = {
     env = {
-      FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
-      FUND_ENSEMBLEMANAGER_BASE_URL = "http://localhost:8082";
+      FUND_DATA_MANAGER_BASE_URL = "http://localhost:8080";
+      FUND_ENSEMBLE_MANAGER_BASE_URL = "http://localhost:8082";
       MASSIVE_BASE_URL = "";
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
