@@ -206,10 +206,13 @@ fi
 step "Bootstrap complete"
 
 echo ""
-echo "Next steps:"
+echo "Open a new shell to pick up Nix paths, then:"
 echo "  cd $REPO_ROOT"
 echo "  devenv shell        # enter the development environment"
 echo "  devenv --profile apps up  # start application services"
+echo ""
+echo "Or source Nix in this shell:"
+echo "  . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh"
 if [[ "$PROD" != true ]]; then
   echo ""
   echo "For production setup, re-run with:"
