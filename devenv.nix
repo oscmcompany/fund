@@ -474,6 +474,7 @@ in {
   };
 
   enterShell = ''
+    mkdir -p /var/log/fund 2>/dev/null || true
     echo "Fund development environment (profile: $FUND_PROFILE)"
     echo ""
     echo "  Buckets:"
