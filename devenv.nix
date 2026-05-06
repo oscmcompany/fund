@@ -7,15 +7,7 @@
 }: let
   awsRegion = "us-east-1";
 
-  isProd = builtins.getEnv "FUND_ENVIRONMENT" == "production";
-
-  fundProfileRaw = builtins.getEnv "FUND_PROFILE";
-  fundProfile =
-    if isProd
-    then "production"
-    else if fundProfileRaw == ""
-    then "dev/chris"
-    else fundProfileRaw;
+  fundProfile = builtins.getEnv "FUND_PROFILE";
 
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
