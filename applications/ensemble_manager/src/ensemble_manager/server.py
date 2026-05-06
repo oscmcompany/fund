@@ -13,13 +13,11 @@ from typing import TYPE_CHECKING, cast
 import boto3
 import polars as pl
 import requests
-import sentry_sdk
 import structlog
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from internal.timestamps import to_timestamp_milliseconds
-from sentry_sdk.integrations.logging import LoggingIntegration
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -41,23 +39,19 @@ from .metrics import (
 from .predictions_schema import predictions_schema
 from .preprocess import filter_equity_bars, filter_to_trained_tickers
 
-sentry_sdk.init(
-    dsn=os.environ.get("SENTRY_DSN"),
-    environment=os.environ.get("FUND_ENVIRONMENT", "development"),
-    traces_sample_rate=1.0,
-    profiles_sample_rate=1.0,
-    enable_tracing=True,
-    propagate_traces=True,
-    integrations=[
-        LoggingIntegration(
-            level=None,
-            event_level=logging.WARNING,
-        ),
-    ],
-)
+try:
+    _error_log_path = Path("/var/log/fund/ensemble-manager-errors.log")
+    _error_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _error_file_handler = logging.FileHandler(_error_log_path)
+    _error_file_handler.setLevel(logging.ERROR)
+    _error_file_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(_error_file_handler)
+except OSError:
+    pass
 
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
@@ -68,12 +62,15 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
+structlog.contextvars.bind_contextvars(
+    fund_profile=os.environ.get("FUND_PROFILE", "unknown")
+)
+
 logger = structlog.get_logger()
 
 DATA_MANAGER_BASE_URL = os.getenv(
     "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
-_environment = os.environ.get("FUND_ENVIRONMENT", "development")
 
 
 def find_latest_artifact_key(

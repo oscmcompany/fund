@@ -390,7 +390,7 @@ def test_rebalance_loop_skips_when_lock_is_held() -> None:
 
 
 def test_rebalance_loop_handles_market_open_exception() -> None:
-    # Tuesday 10:05 AM ET — catch-up fires; is_market_open raises; sentry notified.
+    # Tuesday 10:05 AM ET — catch-up fires; is_market_open raises; error logged.
     frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
         UTC
     )
@@ -410,18 +410,16 @@ def test_rebalance_loop_handles_market_open_exception() -> None:
         ),
         patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
         patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
-        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
     ):
         mock_dt.now.return_value = frozen_now
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         asyncio.run(run())
 
     mock_run_rebalance.assert_not_called()
-    mock_sentry.capture_exception.assert_called_once()
 
 
 def test_rebalance_loop_handles_run_rebalance_exception() -> None:
-    # Tuesday 10:05 AM ET — catch-up fires; run_rebalance raises; sentry notified.
+    # Tuesday 10:05 AM ET — catch-up fires; run_rebalance raises; error logged.
     frozen_now = _make_eastern_datetime(weekday_offset=1, hour=10, minute=5).astimezone(
         UTC
     )
@@ -441,14 +439,12 @@ def test_rebalance_loop_handles_run_rebalance_exception() -> None:
         ),
         patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
         patch("asyncio.sleep", AsyncMock(side_effect=[asyncio.CancelledError()])),
-        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
     ):
         mock_dt.now.return_value = frozen_now
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         asyncio.run(run())
 
     mock_run_rebalance.assert_called_once()
-    mock_sentry.capture_exception.assert_called_once()
 
 
 def test_rebalance_loop_logs_warning_on_non_200_response() -> None:
@@ -509,11 +505,9 @@ def test_rebalance_loop_retries_after_unexpected_error() -> None:
                 side_effect=[RuntimeError("unexpected"), asyncio.CancelledError()]
             ),
         ),
-        patch("portfolio_manager.scheduler.sentry_sdk") as mock_sentry,
     ):
         mock_dt.now.return_value = frozen_now
         mock_dt.fromtimestamp.side_effect = datetime.fromtimestamp
         asyncio.run(run())
 
     mock_run_rebalance.assert_not_called()
-    mock_sentry.capture_exception.assert_called_once()

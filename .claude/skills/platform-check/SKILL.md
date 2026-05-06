@@ -16,7 +16,6 @@ on a single VM via `devenv --profile apps up`. S3 buckets are checked via AWS CL
 ## Check sequence
 
 Run checks 1 through 4 in parallel. Collect all results before reporting.
-
 ### 1. Service health endpoints
 
 Check all three services in parallel:
@@ -71,15 +70,18 @@ aws s3 ls s3://<DATA_BUCKET>/equity/bars/ \
 Report the latest data timestamp. Apply the same weekday-aware staleness logic
 as model artifacts (data syncs run 6 PM ET weekdays).
 
-### 4. Sentry recent errors
+### 4. Error log files
 
-Check Sentry for recent errors (if Sentry CLI is available):
+Check recent error logs on disk:
 
 ```bash
-sentry-cli issues list --project fund --status unresolved --sort date | head -5
+ls -lt /var/log/fund/ 2>/dev/null | head -5
+tail -20 /var/log/fund/data-manager-errors.log 2>/dev/null
+tail -20 /var/log/fund/ensemble-manager-errors.log 2>/dev/null
+tail -20 /var/log/fund/portfolio-manager-errors.log 2>/dev/null
 ```
 
-If Sentry CLI is not available, note it as unchecked.
+Report any recent errors found or note if log files are empty/missing.
 
 ## Output format
 
@@ -93,7 +95,7 @@ portfolio-manager     OK        HTTP 200, status: ok
 ensemble-manager      OK        HTTP 200, model loaded
 Model artifacts       OK        Latest: 2026-04-29 22:30
 Data freshness        OK        Latest bars: 2026-04-29 18:05
-Sentry errors         OK        No unresolved errors
+Error logs            OK        No recent errors
 ```
 
 Use DEGRADED or ERROR for any failing checks and include the reason.
@@ -101,7 +103,7 @@ Use DEGRADED or ERROR for any failing checks and include the reason.
 If everything is healthy, conclude with: "All platform components are healthy."
 
 If any component is unhealthy, list specific remediation steps:
-- Service not responding: "Check `devenv up` process output and Sentry for stack traces"
+- Service not responding: "Check `devenv up` process output and error logs in `/var/log/fund/` for stack traces"
 - Model artifacts stale: "Check training pipeline and S3 artifact uploads"
 - Data freshness stale: "Check data-manager logs and Massive API connectivity"
 - Ensemble-manager model error: "Check model artifact download in logs, verify S3 bucket access"

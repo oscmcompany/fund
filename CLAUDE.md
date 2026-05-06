@@ -40,7 +40,7 @@ This is a collection of guidelines and references.
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
 - When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
-- When debugging or fixing bugs, check Sentry errors and structured logs to understand what happened
+- When debugging or fixing bugs, check structured logs and error log files in `/var/log/fund/` to understand what happened
 - After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
 - When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow commented instructions
 - Only use labels already available on the GitHub repository for issues and pull requests

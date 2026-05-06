@@ -195,7 +195,6 @@ if [[ "$PROD" == true ]]; then
     cat > "$ENVRC" << 'ENVRC_EOF'
 export FUND_PROFILE=production
 export SECRETSPEC_PROFILE="$FUND_PROFILE"
-export FUND_ENVIRONMENT=production
 export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
 export MASSIVE_BASE_URL=https://api.massive.com
 ENVRC_EOF
@@ -222,7 +221,14 @@ ENVRC_EOF
 fi
 
 # --------------------------------------------------------------------------- #
-# 7. Build the devenv environment
+# 7. Create log directory
+# --------------------------------------------------------------------------- #
+step "Creating log directory"
+mkdir -p /var/log/fund
+echo "Created /var/log/fund"
+
+# --------------------------------------------------------------------------- #
+# 8. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -231,7 +237,7 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 8. Prod mode: validate secrets
+# 9. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
   echo "Validating secrets via secretspec..."

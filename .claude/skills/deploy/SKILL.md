@@ -71,7 +71,6 @@ Required production secrets:
 - `ALPACA_API_KEY_ID` - Alpaca trading API key ID
 - `ALPACA_API_SECRET` - Alpaca trading API secret
 - `ALPACA_IS_PAPER` - Alpaca paper trading flag
-- `SENTRY_DSN` - Sentry error tracking DSN (optional)
 
 ## Deployment
 
@@ -91,7 +90,7 @@ devenv --profile ml shell       # ML training environment
 devenv --profile apps up          # start application services (secretspec injects secrets)
 ```
 
-Production mode is activated by setting `FUND_ENVIRONMENT=production` in `.envrc`.
+Production mode is activated by setting `FUND_PROFILE=production` in `.envrc`.
 This disables hot-reload, enables `cargo run --release`, and starts the
 artifact-watcher process.
 
@@ -115,9 +114,7 @@ curl localhost:8082/health  # ensemble-manager
 ## Environment Variables (Production .envrc)
 
 ```bash
-export FUND_ENVIRONMENT=production
-export AWS_S3_DATA_BUCKET_NAME=fund-production-data
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME=fund-production-model-artifacts
+export FUND_PROFILE=production
 export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
 export MASSIVE_BASE_URL=https://api.massive.com
 ```

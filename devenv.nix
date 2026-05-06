@@ -94,9 +94,6 @@ in {
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
 
-    # Development defaults
-    ENVIRONMENT = "development";
-
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
     SECRETSPEC_PROFILE = fundProfile;
