@@ -84,6 +84,9 @@ def find_latest_artifact_key(
     E.g., artifacts/tide/2026-03-19-21-28-12-557/
     Only considers folders that contain output/model.tar.gz.
     """
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
+
     logger.info("listing_artifact_folders", bucket=bucket, prefix=prefix)
 
     paginator = s3_client.get_paginator("list_objects_v2")

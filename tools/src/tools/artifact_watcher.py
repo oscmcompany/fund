@@ -26,6 +26,8 @@ def get_latest_artifact_key(
     prefix: str,
 ) -> str | None:
     """Find the latest model artifact key under a prefix."""
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
     s3_client = boto3.client("s3")
     paginator = s3_client.get_paginator("list_objects_v2")
     folders: list[str] = []
