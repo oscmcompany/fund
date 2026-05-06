@@ -324,6 +324,14 @@ in {
     "checks:yaml".exec = "yaml-checks";
     "checks:nix".exec = "nix-lint";
 
+    # --- Model training ---
+
+    "models:tide:train".exec = ''
+      set -euo pipefail
+      echo "Running tide training pipeline"
+      secretspec run -- uv run python -m models.tide.train
+    '';
+
     "checks:ci" = {
       exec = ''
         echo "All CI checks passed"
@@ -471,12 +479,13 @@ in {
     echo "    aws-buckets       List fund S3 buckets"
     echo "    aws-secrets       List fund secrets"
     echo ""
-    echo "  Checks (devenv tasks run):"
+    echo "  Tasks (devenv tasks run):"
     echo "    checks:python       All Python checks (parallel after install)"
     echo "    checks:rust         All Rust checks (parallel after cargo check)"
     echo "    checks:markdown     Markdown lint"
     echo "    checks:yaml         YAML lint"
     echo "    checks:nix          Nix lint (alejandra)"
+    echo "    models:tide:train   Train tide model and upload artifacts"
     echo ""
     echo "  Utilities:"
     echo "    bump-deps           Update all dependency lockfiles"
