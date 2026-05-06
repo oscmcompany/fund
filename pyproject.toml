@@ -9,7 +9,7 @@ members = [
 ]
 
 [dependency-groups]
-dev = ["coverage>=7.8.0", "pytest>=8.3.5", "behave>=1.2.6"]
+dev = ["coverage>=7.8.0", "pytest>=8.3.5"]
 
 [tool.pytest.ini_options]
 testpaths = [

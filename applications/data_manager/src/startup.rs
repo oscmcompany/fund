@@ -4,41 +4,39 @@ use crate::state::State;
 use axum::Router;
 use std::env;
 use tokio::net::TcpListener;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-pub fn initialize_sentry() -> sentry::ClientInitGuard {
-    sentry::init((
-        env::var("SENTRY_DSN").unwrap_or_default(), // Empty DSN disables Sentry; avoids blocking local startup
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            environment: Some(
-                env::var("FUND_ENVIRONMENT")
-                    .unwrap_or_else(|_| "development".to_string()) // Defaults to development so local runs don't require this
-                    .into(),
-            ),
-            traces_sample_rate: 1.0,
-            ..Default::default()
-        },
-    ))
-}
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 pub fn initialize_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
+
+    let log_dir = std::path::Path::new("/var/log/fund");
+    let file_layer = match std::fs::create_dir_all(log_dir) {
+        Ok(()) => {
+            let file_appender =
+                tracing_appender::rolling::daily("/var/log/fund", "data-manager-errors.log");
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(file_appender)
+                    .with_filter(tracing_subscriber::EnvFilter::new("warn")),
+            )
+        }
+        Err(error) => {
+            eprintln!("File logging disabled, cannot create {log_dir:?}: {error}");
+            None
+        }
+    };
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .with(tracing_subscriber::fmt::layer().json())
-        .with(
-            sentry::integrations::tracing::layer().event_filter(|metadata| {
-                use sentry::integrations::tracing::EventFilter;
-                match metadata.level() {
-                    &tracing::Level::ERROR | &tracing::Level::WARN => EventFilter::Event,
-                    _ => EventFilter::Breadcrumb,
-                }
-            }),
-        )
+        .with(tracing_subscriber::fmt::layer().json().with_target(true))
+        .with(file_layer)
         .try_init()?;
+
+    tracing::info!(fund_profile = %fund_profile, "Tracing initialized");
     Ok(())
 }
 
@@ -59,7 +57,7 @@ pub async fn run_server(bind_address: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_sentry, initialize_tracing, run_server, serve_app};
+    use super::{initialize_tracing, run_server, serve_app};
     use aws_credential_types::Credentials;
     use aws_sdk_s3::config::Region;
     use reqwest::StatusCode;
@@ -157,11 +155,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_initialize_observability_functions() {
-        let _environment_guard = EnvironmentVariableGuard::set("FUND_ENVIRONMENT", "test");
-        let _sentry_dsn_guard = EnvironmentVariableGuard::set("SENTRY_DSN", "");
         let _rust_log_guard =
             EnvironmentVariableGuard::set("RUST_LOG", "data_manager=debug,tower_http=debug");
-        let _sentry_guard = initialize_sentry();
         let _ = initialize_tracing();
         let _ = initialize_tracing();
     }
