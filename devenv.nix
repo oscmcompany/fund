@@ -81,12 +81,7 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # Service URLs (localhost)
-    FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
-    FUND_ENSEMBLEMANAGER_BASE_URL = "http://localhost:8082";
-
     # S3 bucket names (set in .envrc for prod)
-    MASSIVE_BASE_URL = "";
     AWS_S3_DATA_BUCKET_NAME = "";
     AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "";
 
@@ -95,8 +90,6 @@ in {
 
     # Development defaults
     ENVIRONMENT = "development";
-    DISABLE_DISK_CACHE = "1";
-    BACKFILL_LOOKBACK_DAYS = "730";
   };
 
   packages = with pkgs; [
@@ -116,17 +109,6 @@ in {
     uv
     xenon
   ];
-
-  scripts.cleanup-services.exec = ''
-    for PORT in 8080 8081 8082; do
-      PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
-      if [ -n "$PID" ]; then
-        echo "Killing stale process on port $PORT (PID $PID)"
-        kill $PID 2>/dev/null || true
-      fi
-    done
-    sleep 1
-  '';
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail
@@ -363,75 +345,120 @@ in {
     };
   };
 
-  # --- Local processes ---
+  # --- Profiles ---
 
-  processes = {
-    data-manager.exec =
-      if isProd
-      then ''
-        cd applications/data_manager
-        exec secretspec run -- cargo run --release
-      ''
-      else ''
-        cd applications/data_manager
-        exec secretspec run -- cargo watch -x run
-      '';
+  profiles.apps.module = {
+    env = {
+      FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
+      FUND_ENSEMBLEMANAGER_BASE_URL = "http://localhost:8082";
+      MASSIVE_BASE_URL = "";
+      DISABLE_DISK_CACHE = "1";
+      BACKFILL_LOOKBACK_DAYS = "730";
+    };
 
-    ensemble-manager.exec = let
-      waitForDataManager = ''
-        while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-          sleep 2
-        done
-      '';
-      uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
-    in
-      if isProd
-      then ''
-        ${waitForDataManager}
-        cd applications/ensemble_manager
-        exec secretspec run -- ${uvicornCmd}
-      ''
-      else ''
-        ${waitForDataManager}
-        cd applications/ensemble_manager
-        exec secretspec run -- ${uvicornCmd} --reload
-      '';
+    scripts.cleanup-services.exec = ''
+      for PORT in 8080 8081 8082; do
+        PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
+        if [ -n "$PID" ]; then
+          echo "Killing stale process on port $PORT (PID $PID)"
+          kill $PID 2>/dev/null || true
+        fi
+      done
+      sleep 1
+    '';
 
-    portfolio-manager.exec = let
-      waitForDeps = ''
-        while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-          sleep 2
-        done
+    processes = {
+      data-manager.exec =
+        if isProd
+        then ''
+          cd applications/data_manager
+          exec secretspec run -- cargo run --release
+        ''
+        else ''
+          cd applications/data_manager
+          exec secretspec run -- cargo watch -x run
+        '';
+
+      ensemble-manager.exec = let
+        waitForDataManager = ''
+          while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+            sleep 2
+          done
+        '';
+        uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
+      in
+        if isProd
+        then ''
+          ${waitForDataManager}
+          cd applications/ensemble_manager
+          exec secretspec run -- ${uvicornCmd}
+        ''
+        else ''
+          ${waitForDataManager}
+          cd applications/ensemble_manager
+          exec secretspec run -- ${uvicornCmd} --reload
+        '';
+
+      portfolio-manager.exec = let
+        waitForDeps = ''
+          while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+            sleep 2
+          done
+          while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
+            sleep 2
+          done
+        '';
+        uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
+      in
+        if isProd
+        then ''
+          ${waitForDeps}
+          cd applications/portfolio_manager
+          exec secretspec run -- ${uvicornCmd}
+        ''
+        else ''
+          ${waitForDeps}
+          cd applications/portfolio_manager
+          exec secretspec run -- ${uvicornCmd} --reload
+        '';
+
+      artifact-watcher.exec = ''
         while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
           sleep 2
         done
+        exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
       '';
-      uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
-    in
-      if isProd
-      then ''
-        ${waitForDeps}
-        cd applications/portfolio_manager
-        exec secretspec run -- ${uvicornCmd}
-      ''
-      else ''
-        ${waitForDeps}
-        cd applications/portfolio_manager
-        exec secretspec run -- ${uvicornCmd} --reload
-      '';
+    };
+  };
 
-    artifact-watcher.exec = ''
-      while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
-        sleep 2
-      done
-      exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
+  profiles.ml.module = {
+    env = {
+      FUND_LOOKBACK_DAYS = "";
+      MLFLOW_TRACKING_URI = "";
+      PREFECT_API_URL = "";
+    };
+
+    scripts.train-local.exec = ''
+      set -euo pipefail
+      echo "Running local training pipeline"
+      uv run python -m models.tide.train
+    '';
+
+    scripts.deploy-training.exec = ''
+      set -euo pipefail
+      echo "Registering Prefect deployment"
+      uv run python -m models.tide.deploy
     '';
   };
 
   enterShell = ''
     echo "Fund development environment"
     echo ""
-    echo "  Services (devenv up):"
+    echo "  Profiles:"
+    echo "    devenv --profile apps up      Start application services"
+    echo "    devenv --profile ml shell     ML training environment"
+    echo ""
+    echo "  Services (apps profile):"
     echo "    Data Manager:     localhost:8080"
     echo "    Portfolio Manager: localhost:8081"
     echo "    Ensemble Manager: localhost:8082"
@@ -453,7 +480,6 @@ in {
     echo ""
     echo "  Utilities:"
     echo "    bump-deps           Update all dependency lockfiles"
-    echo "    cleanup-services    Kill stale local processes"
   '';
 
   enterTest = ''

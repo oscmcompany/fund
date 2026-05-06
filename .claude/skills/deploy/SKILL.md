@@ -1,31 +1,43 @@
 ---
 name: deploy
 description: >
-  Set up and manage devenv services on exe.dev VM. Covers both local
-  development (devenv up) and production deployment via SSH. Secrets
-  are managed through secretspec with the awssm provider. Use when the
-  user wants to deploy services, manage the environment, start services,
-  check health, or set up local development. Triggers on requests like
-  "deploy", "set up production", "devenv up", "start services",
-  "deploy failed", "deploy errors", "fix deploy", "check health",
-  or environment setup involving devenv.
+  Set up and manage devenv services on exe.dev VM. Uses profiles to
+  separate app services from ML training. Secrets are managed through
+  secretspec with the awssm provider. Use when the user wants to deploy
+  services, manage the environment, start services, check health, or
+  set up local development. Triggers on requests like "deploy", "set up
+  production", "devenv up", "start services", "deploy failed", "deploy
+  errors", "fix deploy", "check health", or environment setup involving
+  devenv.
 ---
 
 # devenv + exe.dev Deployment
 
-`devenv.nix` drives both local development and production. All services
-run via `devenv up` on a single exe.dev VM. Secrets are injected via
-`secretspec run --`.
+`devenv.nix` drives both local development and production. Services run
+via `devenv --profile apps up` on a single exe.dev VM. ML training uses
+`devenv --profile ml shell`. Secrets are injected via `secretspec run --`.
 
 ## Architecture
 
 ```text
-devenv.nix (local development and production)
-├── processes.data-manager (Rust, port 8080)
-├── processes.ensemble-manager (Python/FastAPI, port 8082)
-├── processes.portfolio-manager (Python/FastAPI, port 8081)
-├── processes.artifact-watcher (production only, polls S3)
-└── env.* (localhost URLs, dev defaults)
+devenv.nix
+├── base (always active, no profile needed)
+│   ├── languages (Rust, Python, Nix)
+│   ├── packages (clang, uv, ruff, cargo-watch, etc.)
+│   ├── env (AWS_REGION, CC=clang, S3 bucket names, LIBRARY_PATH)
+│   ├── scripts (check scripts, aws utilities, bump-deps)
+│   ├── tasks (checks:python, checks:rust, checks:ci)
+│   └── git-hooks (all 6 hooks)
+├── profiles.apps (devenv --profile apps up)
+│   ├── processes.data-manager (Rust, port 8080)
+│   ├── processes.ensemble-manager (Python/FastAPI, port 8082)
+│   ├── processes.portfolio-manager (Python/FastAPI, port 8081)
+│   ├── processes.artifact-watcher (polls S3)
+│   ├── env (service URLs, MASSIVE_BASE_URL, DISABLE_DISK_CACHE, BACKFILL_LOOKBACK_DAYS)
+│   └── scripts.cleanup-services
+└── profiles.ml (devenv --profile ml shell)
+    ├── env (FUND_LOOKBACK_DAYS, MLFLOW_TRACKING_URI, PREFECT_API_URL)
+    └── scripts (train-local, deploy-training)
 
 AWS (retained services)
 ├── S3: fund-data-404221e2 (equity bars, predictions, portfolios)
@@ -66,8 +78,9 @@ Required production secrets:
 ### Local Development
 
 ```bash
-devenv shell   # enter the development environment
-devenv up      # start all services with hot-reload
+devenv shell                    # enter the development environment
+devenv --profile apps up        # start application services with hot-reload
+devenv --profile ml shell       # ML training environment
 ```
 
 ### Production (exe.dev VM)
@@ -75,7 +88,7 @@ devenv up      # start all services with hot-reload
 ```bash
 # On the VM:
 ./tools/bootstrap-machine --prod  # first-time setup
-devenv up                         # start all services (secretspec injects secrets)
+devenv --profile apps up          # start application services (secretspec injects secrets)
 ```
 
 Production mode is activated by setting `FUND_ENVIRONMENT=production` in `.envrc`.

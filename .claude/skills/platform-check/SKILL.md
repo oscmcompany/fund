@@ -10,7 +10,7 @@ description: >
 # Platform Health Check
 
 Run a comprehensive health check of all fund platform components. Services run
-on a single VM via `devenv up`. S3 buckets are checked via AWS CLI
+on a single VM via `devenv --profile apps up`. S3 buckets are checked via AWS CLI
 (`--profile oscm --region us-east-1`).
 
 ## Check sequence

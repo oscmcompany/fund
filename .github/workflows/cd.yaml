@@ -26,12 +26,12 @@ jobs:
 
       # SSH deploy to exe.dev VM
       # Manual deployment for now -- connect to the VM and run:
-      #   cd /path/to/fund && git pull && devenv up
+      #   cd /path/to/fund && git pull && devenv --profile apps up
       #
       # Future automation: use appleboy/ssh-action or similar to
       # SSH into the exe.dev VM, pull latest code, and restart services.
       - name: Deploy notification
         run: |
           echo "Merge to master detected."
-          echo "Deploy manually: SSH into exe.dev VM and run 'git pull && devenv up'"
+          echo "Deploy manually: SSH into exe.dev VM and run 'git pull && devenv --profile apps up'"
           echo "Commit: ${{ github.sha }}"

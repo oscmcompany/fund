@@ -8,7 +8,7 @@ This is a collection of guidelines and references.
 
 - Rust and Python are the primary project languages
 - [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
-- Services run on a single exe.dev VM via `devenv up` in both dev and production
+- Services run on a single exe.dev VM via `devenv --profile apps up` in both dev and production
 - Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider
 - Python code follows [uv](https://github.com/astral-sh/uv) workspace conventions
 - Rust code follows Cargo workspace conventions

@@ -27,11 +27,12 @@ On a fresh machine with the repo cloned, run the bootstrap script:
 Once bootstrapped:
 
 ```sh
-devenv shell  # enter the development environment
-devenv up     # start all services
+devenv shell                    # enter the development environment
+devenv --profile apps up        # start application services
+devenv --profile ml shell       # ML training environment
 ```
 
-Production runs on an exe.dev VM with `devenv up` and secretspec for secret injection.
+Production runs on an exe.dev VM with `devenv --profile apps up` and secretspec for secret injection.
 
 ### Principles
 
