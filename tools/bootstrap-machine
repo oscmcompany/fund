@@ -108,7 +108,7 @@ if command -v devenv &>/dev/null; then
   echo "devenv is already installed, skipping"
 else
   echo "Installing devenv..."
-  nix profile install nixpkgs#devenv
+  nix profile add nixpkgs#devenv
   echo "devenv installed successfully"
 fi
 
@@ -121,7 +121,7 @@ if command -v secretspec &>/dev/null; then
   echo "secretspec is already installed, skipping"
 else
   echo "Installing secretspec..."
-  nix profile install nixpkgs#secretspec
+  nix profile add nixpkgs#secretspec
   echo "secretspec installed successfully"
 fi
 
