@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
 
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
-    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
     model_directory = "."
 
     if bucket:
