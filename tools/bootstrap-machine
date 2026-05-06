@@ -194,6 +194,7 @@ if [[ "$PROD" == true ]]; then
     echo "Creating production .envrc..."
     cat > "$ENVRC" << 'ENVRC_EOF'
 export FUND_PROFILE=production
+export SECRETSPEC_PROFILE="$FUND_PROFILE"
 export FUND_ENVIRONMENT=production
 export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
 export MASSIVE_BASE_URL=https://api.massive.com
@@ -209,6 +210,7 @@ else
     echo "Creating development .envrc..."
     cat > "$ENVRC" << 'ENVRC_EOF'
 export FUND_PROFILE=dev/chris
+export SECRETSPEC_PROFILE="$FUND_PROFILE"
 ENVRC_EOF
     echo "Created $ENVRC"
   else
@@ -244,9 +246,14 @@ step "Bootstrap complete"
 echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
-echo "  devenv shell        # enter the development environment"
-echo "  devenv --profile apps up  # start application services"
-if [[ "$PROD" != true ]]; then
+if [[ "$PROD" == true ]]; then
+  echo "  nohup tools/git-sync > /var/log/git-sync.log 2>&1 &  # start git-sync supervisor"
+  echo ""
+  echo "git-sync will poll origin/master every 60 seconds and restart"
+  echo "devenv automatically when new commits arrive."
+else
+  echo "  devenv shell        # enter the development environment"
+  echo "  devenv --profile apps up  # start application services"
   echo ""
   echo "For production setup, re-run with:"
   echo "  $(basename "$0") --prod"

@@ -11,3 +11,4 @@ inputs:
 secretspec:
   enable: true
   provider: awssm
+  profile: dev/chris
