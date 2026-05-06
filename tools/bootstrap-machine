@@ -183,7 +183,44 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 6. Build the devenv environment
+# 6. Create .envrc with FUND_PROFILE
+# --------------------------------------------------------------------------- #
+ENVRC="$REPO_ROOT/.envrc"
+
+if [[ "$PROD" == true ]]; then
+  step "Configuring production environment"
+
+  if [[ ! -f "$ENVRC" ]]; then
+    echo "Creating production .envrc..."
+    cat > "$ENVRC" << 'ENVRC_EOF'
+export FUND_PROFILE=production
+export FUND_ENVIRONMENT=production
+export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+export MASSIVE_BASE_URL=https://api.massive.com
+ENVRC_EOF
+    echo "Created $ENVRC"
+  else
+    echo ".envrc already exists, skipping creation"
+  fi
+else
+  step "Configuring development environment"
+
+  if [[ ! -f "$ENVRC" ]]; then
+    echo "Creating development .envrc..."
+    cat > "$ENVRC" << 'ENVRC_EOF'
+export FUND_PROFILE=dev/chris
+ENVRC_EOF
+    echo "Created $ENVRC"
+  else
+    echo ".envrc already exists, skipping creation"
+  fi
+
+  step "Ensuring dev S3 buckets exist"
+  "$REPO_ROOT/tools/create-dev-buckets" "dev/chris"
+fi
+
+# --------------------------------------------------------------------------- #
+# 7. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -192,26 +229,9 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 7. Prod mode: create .envrc and validate secrets
+# 8. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
-  step "Configuring production environment"
-
-  ENVRC="$REPO_ROOT/.envrc"
-  if [[ ! -f "$ENVRC" ]]; then
-    echo "Creating production .envrc..."
-    cat > "$ENVRC" << 'ENVRC_EOF'
-export FUND_ENVIRONMENT=production
-export AWS_S3_DATA_BUCKET_NAME=fund-data-404221e2
-export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME=fund-model-artifacts-404221e2
-export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
-export MASSIVE_BASE_URL=https://api.massive.com
-ENVRC_EOF
-    echo "Created $ENVRC"
-  else
-    echo ".envrc already exists, skipping creation"
-  fi
-
   echo "Validating secrets via secretspec..."
   devenv shell -- secretspec check || echo "Run 'secretspec set <KEY>' to populate missing secrets"
 fi

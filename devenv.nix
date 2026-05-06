@@ -8,6 +8,16 @@
   awsRegion = "us-east-1";
 
   isProd = builtins.getEnv "FUND_ENVIRONMENT" == "production";
+
+  fundProfileRaw = builtins.getEnv "FUND_PROFILE";
+  fundProfile =
+    if isProd
+    then "production"
+    else if fundProfileRaw == ""
+    then "dev/chris"
+    else fundProfileRaw;
+
+  bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
   dotenv.enable = true;
 
@@ -81,9 +91,18 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # S3 bucket names (set in .envrc for prod)
-    AWS_S3_DATA_BUCKET_NAME = "";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "";
+    # Active profile
+    FUND_PROFILE = fundProfile;
+
+    # S3 bucket names derived from FUND_PROFILE
+    AWS_S3_DATA_BUCKET_NAME =
+      if isProd
+      then "fund-data-404221e2"
+      else "fund-${bucketSlug}-data";
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME =
+      if isProd
+      then "fund-model-artifacts-404221e2"
+      else "fund-${bucketSlug}-model-artifacts";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -93,10 +112,7 @@ in {
 
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
-    SECRETSPEC_PROFILE =
-      if isProd
-      then "production"
-      else "dev/chris";
+    SECRETSPEC_PROFILE = fundProfile;
   };
 
   packages = with pkgs; [
@@ -120,7 +136,10 @@ in {
   scripts.aws-buckets.exec = ''
     set -euo pipefail
     unset AWS_ENDPOINT_URL
-    echo "=== Fund S3 Buckets ==="
+    echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
+    echo "  Data:      $AWS_S3_DATA_BUCKET_NAME"
+    echo "  Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+    echo ""
     aws s3 ls | grep fund || echo "No fund buckets found"
   '';
 
@@ -461,7 +480,11 @@ in {
   };
 
   enterShell = ''
-    echo "Fund development environment"
+    echo "Fund development environment (profile: $FUND_PROFILE)"
+    echo ""
+    echo "  Buckets:"
+    echo "    Data:      $AWS_S3_DATA_BUCKET_NAME"
+    echo "    Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
     echo ""
     echo "  Profiles:"
     echo "    devenv --profile apps up      Start application services"
