@@ -17,13 +17,18 @@ Below are resources for the project and repository.
 
 ### Setup
 
-Run the commands below in the root directory.  
+On a fresh machine with the repo cloned, run the bootstrap script:
 
 ```sh
-brew install flox # see https://flox.dev/ for more information
-flox activate     # configure repository environment
-mask setup        # check for required tools
-mask --help       # list available Mask tasks
+./tools/bootstrap-machine         # install nix, devenv, and build the environment
+./tools/bootstrap-machine --prod  # also pull production secrets from AWS
+```
+
+Once bootstrapped:
+
+```sh
+devenv shell  # enter the development environment
+devenv up     # start local services (postgres, prometheus, prefect, etc.)
 ```
 
 ### Principles
