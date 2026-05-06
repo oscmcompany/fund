@@ -336,11 +336,20 @@ in {
 
     # --- Model training ---
 
-    "models:tide:train".exec = ''
+    "models:tide:register-blocks".exec = ''
       set -euo pipefail
-      echo "Running tide training pipeline"
-      secretspec run -- uv run python -m tide.workflow
+      echo "Registering Prefect S3 blocks"
+      secretspec run -- uv run python -m tide.register_blocks
     '';
+
+    "models:tide:train" = {
+      exec = ''
+        set -euo pipefail
+        echo "Running tide training pipeline"
+        secretspec run -- uv run python -m tide.workflow
+      '';
+      after = ["models:tide:register-blocks"];
+    };
 
     "checks:ci" = {
       exec = ''
