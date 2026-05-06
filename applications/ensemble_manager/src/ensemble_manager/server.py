@@ -74,7 +74,6 @@ DATA_MANAGER_BASE_URL = os.getenv(
     "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
 _environment = os.environ.get("FUND_ENVIRONMENT", "development")
-MODEL_VERSION_SSM_PARAMETER = f"/fund/{_environment}/ensemble-manager/model-version"
 
 
 def find_latest_artifact_key(
@@ -177,20 +176,11 @@ def _resolve_artifact_key(
     bucket: str,
     artifact_path: str,
 ) -> str:
-    """Resolve the model artifact S3 key using SSM Parameter Store."""
-    try:
-        ssm_client = boto3.client("ssm")
-        response = ssm_client.get_parameter(
-            Name=MODEL_VERSION_SSM_PARAMETER,
-            WithDecryption=True,
-        )
-        model_version = response["Parameter"]["Value"]
-    except ClientError:
-        logger.exception("SSM parameter not available, using default artifact path")
-        model_version = "latest"
+    """Resolve the model artifact S3 key."""
+    model_version = os.environ.get("MODEL_VERSION", "latest")
 
     if model_version != "latest":
-        logger.info("Using model version from SSM", model_version=model_version)
+        logger.info("Using model version from environment", model_version=model_version)
         if model_version.endswith(".tar.gz"):
             return model_version
         return f"{artifact_path.rstrip('/')}/{model_version}/output/model.tar.gz"

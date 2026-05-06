@@ -8,10 +8,12 @@ This is a collection of guidelines and references.
 
 - Rust and Python are the primary project languages
 - [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
-- [Pulumi](https://www.pulumi.com/) manages cloud infrastructure via the Python SDK
+- Services run on a single exe.dev VM via `devenv up` in both dev and production
+- Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider
 - Python code follows [uv](https://github.com/astral-sh/uv) workspace conventions
 - Rust code follows Cargo workspace conventions
-- AWS is the target cloud provider
+- AWS S3 is used for blob storage (data bucket and model artifacts bucket)
+- AWS Secrets Manager stores secrets in secretspec format (`secretspec/{project}/{profile}/{key}`)
 - Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
 - Python servers primarily use [FastAPI](https://fastapi.tiangolo.com/)
 - Use `devenv tasks run checks:python` for comprehensive Python checks
@@ -38,16 +40,16 @@ This is a collection of guidelines and references.
 - When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
 - When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
-- When debugging or fixing bugs, check Sentry errors, ECS logs, and Alpaca account status to understand what happened
+- When debugging or fixing bugs, check Sentry errors and structured logs to understand what happened
 - After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
 - When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow commented instructions
 - Only use labels already available on the GitHub repository for issues and pull requests
 - When naming branches, use an all-lowercase, hyphenated, and concise summary of the work being done
 - `tools/` folder contains development utilities and scripts
-- `applications/` folder contains deployable services and training workflows
+- `applications/` folder contains deployable services
 - `libraries/` folder contains shared code resources
-- `infrastructure/` folder contains Pulumi infrastructure as code
 - `models/` folder contains model definitions and training code
+- The artifact-watcher process polls S3 for new model artifacts and restarts ensemble-manager
 - See `README.md` "Principles" section for developer philosophy
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
@@ -70,17 +72,7 @@ This is a collection of guidelines and references.
   DataFrame aggregations
 - When Polars `Series.sum()` is used on a potentially empty or all-null
   series, handle the `None` return case
-- IAM policies must follow least-privilege: scope resource ARNs as narrowly
-  as possible (e.g., `fund-redeploy-*` not `fund-*`)
-- CloudWatch metric filter patterns should include enough context to uniquely
-  identify the log event (e.g., include S3 key path)
-- Comments describing AWS service behavior must be technically accurate;
-  verify claims about service capabilities
-- Infrastructure comments should explain the "why" of a design choice, not
-  make incorrect claims about service limitations
 - Pin GitHub Actions to version tags in deployment workflows; `@main` is
   acceptable for CI but not for CD
 - `devenv tasks run` supports prefix group execution: `checks:python` runs
   all `checks:python:*` subtasks
-- When writing CloudWatch alarms with `datapoints_to_alarm`, document the
-  intended detection semantics in a comment

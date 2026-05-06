@@ -1,7 +1,0 @@
----
-name: fund
-runtime:
-  name: python
-  options:
-    toolchain: uv
-description: OSCM application infrastructure

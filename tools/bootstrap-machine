@@ -13,7 +13,7 @@ usage() {
   echo "Bootstrap a fresh machine for the fund development environment."
   echo ""
   echo "Options:"
-  echo "  --prod    Configure production secrets from AWS Secrets Manager"
+  echo "  --prod    Configure production environment variables and validate secrets"
   echo "  -h, --help  Show this help message"
   exit 0
 }
@@ -91,7 +91,7 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 4. Prod mode: pull secrets from AWS Secrets Manager
+# 4. Prod mode: create .envrc and validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
   step "Configuring production environment"
@@ -117,8 +117,23 @@ if [[ "$PROD" == true ]]; then
   IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
   echo "Authenticated as: $IDENTITY"
 
-  echo "Pulling secrets via devenv pull-secrets..."
-  devenv shell -- pull-secrets
+  ENVRC="$REPO_ROOT/.envrc"
+  if [[ ! -f "$ENVRC" ]]; then
+    echo "Creating production .envrc..."
+    cat > "$ENVRC" << 'ENVRC_EOF'
+export FUND_ENVIRONMENT=production
+export AWS_S3_DATA_BUCKET_NAME=fund-data-404221e2
+export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME=fund-model-artifacts-404221e2
+export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+export MASSIVE_BASE_URL=https://api.massive.com
+ENVRC_EOF
+    echo "Created $ENVRC"
+  else
+    echo ".envrc already exists, skipping creation"
+  fi
+
+  echo "Validating secrets via secretspec..."
+  devenv shell -- secretspec check || echo "Run 'secretspec set <KEY>' to populate missing secrets"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -130,9 +145,9 @@ echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
 echo "  devenv shell        # enter the development environment"
-echo "  devenv up           # start local services (postgres, prometheus, etc.)"
+echo "  devenv up           # start all services"
 if [[ "$PROD" != true ]]; then
   echo ""
-  echo "For production secrets, re-run with:"
+  echo "For production setup, re-run with:"
   echo "  $(basename "$0") --prod"
 fi

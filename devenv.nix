@@ -7,75 +7,7 @@
 }: let
   awsRegion = "us-east-1";
 
-  # ECS service definitions — maps service names to their Docker build context
-  ecsServices = {
-    data-manager = {
-      dockerfile = "applications/data_manager/Dockerfile";
-      context = ".";
-      ecrRepo = "fund/applications-data-manager-server";
-    };
-    ensemble-manager = {
-      dockerfile = "applications/ensemble_manager/Dockerfile";
-      context = ".";
-      ecrRepo = "fund/applications-ensemble-manager-server";
-    };
-    portfolio-manager = {
-      dockerfile = "applications/portfolio_manager/Dockerfile";
-      context = ".";
-      ecrRepo = "fund/applications-portfolio-manager-server";
-    };
-  };
-
-  deployableServices = builtins.attrNames ecsServices;
-
-  # Per-service CD build tasks (build + push Docker images to ECR)
-  cdBuildTasks = lib.mapAttrs' (svc: def:
-    lib.nameValuePair "cd:build:${svc}" {
-      exec = ''
-        set -euo pipefail
-        unset AWS_ENDPOINT_URL
-
-        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        REGISTRY="$ACCOUNT_ID.dkr.ecr.${awsRegion}.amazonaws.com"
-        GIT_SHA=$(git rev-parse --short HEAD)
-        REPO="${def.ecrRepo}"
-        SHA_TAG="git-$GIT_SHA"
-
-        echo "Logging into ECR..."
-        aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY" 2>/dev/null \
-          || echo "Could not authenticate to ECR (will build without cache)"
-
-        if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$SHA_TAG" --region ${awsRegion} >/dev/null 2>&1; then
-          echo "=== Skipping ${svc} (tag $SHA_TAG already exists) ==="
-          exit 0
-        fi
-
-        CACHE_REF="$REGISTRY/$REPO:buildcache"
-        if [ -n "''${GITHUB_ACTIONS:-}" ]; then
-          SCOPE="${svc}"
-          echo "Using hybrid cache (gha + registry) with scope: $SCOPE"
-          CACHE_FROM="--cache-from type=gha,scope=$SCOPE --cache-from type=registry,ref=$CACHE_REF"
-          CACHE_TO="--cache-to type=gha,scope=$SCOPE,mode=max --cache-to type=registry,ref=$CACHE_REF,mode=max"
-        else
-          CACHE_FROM="--cache-from type=registry,ref=$CACHE_REF"
-          CACHE_TO="--cache-to type=registry,ref=$CACHE_REF,mode=max"
-        fi
-
-        echo "=== Building and pushing ${svc} ==="
-        docker buildx build \
-          --platform linux/amd64 \
-          --tag "$REGISTRY/$REPO:latest" \
-          --tag "$REGISTRY/$REPO:$SHA_TAG" \
-          $CACHE_FROM \
-          $CACHE_TO \
-          --file "$DEVENV_ROOT/${def.dockerfile}" \
-          --push \
-          "$DEVENV_ROOT/${def.context}"
-        echo "OK: ${svc}"
-      '';
-      after = ["cd:aws-check"];
-    })
-  ecsServices;
+  isProd = builtins.getEnv "FUND_ENVIRONMENT" == "production";
 in {
   dotenv.enable = true;
 
@@ -149,14 +81,14 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # Service URLs (localhost, not container names)
+    # Service URLs (localhost)
     FUND_DATAMANAGER_BASE_URL = "http://localhost:8080";
     FUND_ENSEMBLEMANAGER_BASE_URL = "http://localhost:8082";
-    PREFECT_API_URL = "http://localhost:4200/api";
 
-    # MLflow tracking (production ALB, set after pulumi-up)
-    # Override in .envrc with the actual ALB URL: http://<alb-dns>:5000
-    MLFLOW_TRACKING_URI = "";
+    # S3 bucket names (set in .envrc for prod)
+    MASSIVE_BASE_URL = "";
+    AWS_S3_DATA_BUCKET_NAME = "";
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -174,343 +106,19 @@ in {
     bacon
     cargo-watch
     curl
-    docker-client
     duckdb
     gh
     git
     jq
     markdownlint-cli
-    pulumiPackages.pulumi-language-python
-    pulumi-bin
     ruff
     rustup
     uv
     xenon
   ];
 
-  # PostgreSQL for orchestration server (local)
-  services.postgres = {
-    enable = true;
-    package = pkgs.postgresql_16;
-    listen_addresses = "127.0.0.1";
-    port = 5432;
-    initialDatabases = [
-      {
-        name = "prefect";
-        user = "prefect";
-        pass = "prefect";
-      }
-    ];
-  };
-
-  # Prometheus for local metrics scraping
-  services.prometheus = {
-    enable = true;
-    port = 9090;
-    scrapeConfigs = [
-      {
-        job_name = "data-manager";
-        static_configs = [{targets = ["localhost:8080"];}];
-        metrics_path = "/metrics";
-        scrape_interval = "15s";
-      }
-      {
-        job_name = "ensemble-manager";
-        static_configs = [{targets = ["localhost:8082"];}];
-        metrics_path = "/metrics";
-        scrape_interval = "15s";
-      }
-      {
-        job_name = "portfolio-manager";
-        static_configs = [{targets = ["localhost:8081"];}];
-        metrics_path = "/metrics";
-        scrape_interval = "15s";
-      }
-    ];
-  };
-
-  # --- AWS / Pulumi commands ---
-  # All infra scripts unset MinIO env vars so the real AWS credentials are used.
-
-  # Bring up AWS infrastructure with Pulumi
-  scripts.infra-up.exec = ''
-    unset AWS_ENDPOINT_URL
-    cd "$DEVENV_ROOT/infrastructure"
-    pulumi up --stack production --yes
-  '';
-
-  # Tear down AWS infrastructure with Pulumi
-  scripts.infra-down.exec = ''
-    unset AWS_ENDPOINT_URL
-    cd "$DEVENV_ROOT/infrastructure"
-    pulumi down --stack production --yes
-  '';
-
-  # Show Pulumi stack outputs (ALB URL, ECR repos, bucket names, etc.)
-  scripts.infra-outputs.exec = ''
-    unset AWS_ENDPOINT_URL
-    cd "$DEVENV_ROOT/infrastructure"
-    pulumi stack output --stack production --json
-  '';
-
-  # Get the ALB base URL from Pulumi outputs
-  scripts.infra-url.exec = ''
-    unset AWS_ENDPOINT_URL
-    cd "$DEVENV_ROOT/infrastructure"
-    pulumi stack output --stack production aws_alb_url 2>/dev/null || echo "Not deployed yet"
-  '';
-
-  # Build and push a Docker image to ECR
-  scripts.ecr-push.exec = ''
-    unset AWS_ENDPOINT_URL
-    SERVICE="$1"
-    if [ -z "$SERVICE" ]; then
-      echo "Usage: ecr-push <${lib.concatStringsSep "|" deployableServices}|all>"
-      exit 1
-    fi
-
-    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-    REGISTRY="$ACCOUNT_ID.dkr.ecr.${awsRegion}.amazonaws.com"
-    GIT_SHA=$(git rev-parse --short HEAD)
-
-    echo "Logging into ECR..."
-    aws ecr get-login-password --region ${awsRegion} | docker login --username AWS --password-stdin "$REGISTRY"
-
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
-        push_${builtins.replaceStrings ["-"] ["_"] svc}() {
-          local repo="${def.ecrRepo}"
-          local sha_tag="git-$GIT_SHA"
-          local ctx_dir="$DEVENV_ROOT/${def.context}"
-
-          # Skip if this commit is already pushed
-          if aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$sha_tag" --region ${awsRegion} >/dev/null 2>&1; then
-            echo "=== Skipping ${svc} (tag $sha_tag already exists) ==="
-            return 0
-          fi
-
-          echo "=== Building ${svc} ==="
-          docker buildx build \
-            --platform linux/amd64 \
-            --tag "$REGISTRY/$repo:latest" \
-            --tag "$REGISTRY/$repo:$sha_tag" \
-            --file "$DEVENV_ROOT/${def.dockerfile}" \
-            --push \
-            "$ctx_dir"
-          echo "OK: ${svc}"
-        }
-      '')
-      ecsServices)}
-
-    case "$SERVICE" in
-      ${lib.concatStringsSep "\n" (map (svc: ''
-      ${svc}) push_${builtins.replaceStrings ["-"] ["_"] svc} ;;'')
-    deployableServices)}
-      all)
-        ${lib.concatStringsSep "\n        " (map (svc: ''
-      push_${builtins.replaceStrings ["-"] ["_"] svc}'')
-    deployableServices)}
-        echo "All images pushed"
-        ;;
-      *) echo "Unknown service: $SERVICE"; exit 1 ;;
-    esac
-  '';
-
-  # Force ECS services to redeploy with latest image
-  scripts.ecs-deploy.exec = ''
-    unset AWS_ENDPOINT_URL
-    SERVICE="$1"
-    CLUSTER="fund-applications"
-
-    if [ -z "$SERVICE" ]; then
-      echo "Usage: ecs-deploy <${lib.concatStringsSep "|" deployableServices}|all>"
-      exit 1
-    fi
-
-    deploy_ecs_service() {
-      local ecs_name="$1"
-      echo "=== Redeploying $ecs_name ==="
-      aws ecs update-service \
-        --cluster "$CLUSTER" \
-        --service "$ecs_name" \
-        --force-new-deployment \
-        --region ${awsRegion} \
-        --query 'service.serviceName' \
-        --output text
-      echo "Waiting for $ecs_name to stabilize..."
-      aws ecs wait services-stable \
-        --cluster "$CLUSTER" \
-        --services "$ecs_name" \
-        --region ${awsRegion}
-      echo "OK: $ecs_name"
-    }
-
-    case "$SERVICE" in
-      data-manager) deploy_ecs_service "fund-data-manager-server" ;;
-      ensemble-manager) deploy_ecs_service "fund-ensemble-manager-server" ;;
-      portfolio-manager) deploy_ecs_service "fund-portfolio-manager-server" ;;
-      all)
-        for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server; do
-          deploy_ecs_service "$svc"
-        done
-        echo "All services redeployed"
-        ;;
-      *) echo "Unknown service: $SERVICE"; exit 1 ;;
-    esac
-  '';
-
-  # Build, push, and redeploy a service (combines ecr-push + ecs-deploy)
-  scripts.deploy.exec = ''
-    SERVICE="$1"
-    if [ -z "$SERVICE" ]; then
-      echo "Usage: deploy <${lib.concatStringsSep "|" deployableServices}|all>"
-      exit 1
-    fi
-    ecr-push "$SERVICE" && ecs-deploy "$SERVICE"
-  '';
-
-  # Verify AWS credentials are available
-  scripts.aws-check.exec = ''
-    set -euo pipefail
-    unset AWS_ENDPOINT_URL
-    if ! aws sts get-caller-identity >/dev/null 2>&1; then
-      echo "ERROR: No AWS credentials available"
-      echo "CD deploy requires AWS credentials (OIDC in CI or configured profile locally)"
-      exit 1
-    fi
-    echo "AWS credentials verified"
-  '';
-
-  # Show ECS service status
-  scripts.ecs-status.exec = ''
-    unset AWS_ENDPOINT_URL
-    CLUSTER="fund-applications"
-    echo "=== ECS Services ==="
-    aws ecs list-services --cluster "$CLUSTER" --region ${awsRegion} --query 'serviceArns[*]' --output table 2>/dev/null || echo "Cluster not found"
-    echo ""
-    for svc in fund-data-manager-server fund-ensemble-manager-server fund-portfolio-manager-server; do
-      STATUS=$(aws ecs describe-services --cluster "$CLUSTER" --services "$svc" --region ${awsRegion} --query 'services[0].{status:status,running:runningCount,desired:desiredCount}' --output text 2>/dev/null)
-      if [ -n "$STATUS" ]; then
-        echo "  $svc: $STATUS"
-      else
-        echo "  $svc: not found"
-      fi
-    done
-  '';
-
-  # Pull secrets from AWS Secrets Manager into .envrc
-  scripts.pull-secrets.exec = ''
-    unset AWS_ENDPOINT_URL
-    ENVRC="$DEVENV_ROOT/.envrc"
-    AWS_CMD="aws --region ${awsRegion}"
-    export AWS_PROFILE=default
-
-    echo "Fetching secrets from AWS Secrets Manager..."
-
-    for secret_id in fund/production/portfolio_manager fund/production/data_manager fund/production/shared; do
-      echo "  $secret_id"
-      json=$($AWS_CMD secretsmanager get-secret-value --secret-id "$secret_id" --query SecretString --output text)
-      for key in $(echo "$json" | jq -r 'keys[]'); do
-        val=$(echo "$json" | jq -r --arg k "$key" '.[$k]')
-        if grep -q "^export $key=" "$ENVRC" 2>/dev/null; then
-          echo "    $key (already set, skipping)"
-        else
-          echo "export $key=\"$val\"" >> "$ENVRC"
-          echo "    $key (added)"
-        fi
-      done
-    done
-
-    echo ""
-    echo "Done. Run 'direnv allow' to reload."
-  '';
-
-  # Create ECS work pool and register training deployment on Prefect Cloud
-  scripts.initialize-remote-trainer.exec = ''
-    unset PREFECT_API_URL
-
-    echo "Creating fund-models-remote work pool on Prefect Cloud..."
-    uv run --package tools prefect work-pool create "fund-models-remote" --type ecs 2>/dev/null \
-      || echo "  already exists"
-
-    echo "Registering training deployments..."
-    uv run prefect --no-prompt deploy --all
-
-    echo ""
-    echo "Done. Visit Prefect Cloud dashboard to view deployments."
-  '';
-
-  # --- Local dev commands ---
-
-  # Register Prefect S3Bucket blocks on the local server
-  scripts.register-blocks.exec = ''
-        echo "Waiting for orchestrator..."
-        while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
-          sleep 2
-        done
-
-        export PREFECT_API_URL="http://localhost:4200/api"
-
-        echo "Reading bucket names from Pulumi stack outputs..."
-        unset AWS_ENDPOINT_URL
-        DATA_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_data_bucket_name 2>/dev/null)
-        ARTIFACTS_BUCKET=$(cd "$DEVENV_ROOT/infrastructure" && pulumi stack output --stack production aws_s3_model_artifacts_bucket_name 2>/dev/null)
-
-        if [ -z "$DATA_BUCKET" ] || [ -z "$ARTIFACTS_BUCKET" ]; then
-          echo "Could not read bucket names from Pulumi. Using defaults."
-          DATA_BUCKET="fund-data-404221e2"
-          ARTIFACTS_BUCKET="fund-model-artifacts-404221e2"
-        fi
-
-        echo "  data bucket:      $DATA_BUCKET"
-        echo "  artifacts bucket:  $ARTIFACTS_BUCKET"
-
-        echo "Registering S3Bucket blocks on local Prefect server..."
-        uv run --package tide python -c "
-    import sys
-    from prefect_aws.s3 import S3Bucket
-    from prefect_aws.credentials import AwsCredentials
-
-    data_bucket = sys.argv[1]
-    artifacts_bucket = sys.argv[2]
-
-    creds = AwsCredentials()
-    creds.save('aws-credentials', overwrite=True)
-
-    S3Bucket(bucket_name=data_bucket, credentials=creds).save('data-bucket', overwrite=True)
-    S3Bucket(bucket_name=artifacts_bucket, credentials=creds).save('artifact-bucket', overwrite=True)
-    print('Blocks registered: data-bucket, artifact-bucket')
-    " "$DATA_BUCKET" "$ARTIFACTS_BUCKET"
-  '';
-
-  # Create work pool and register training deployment locally
-  scripts.initialize-local-trainer.exec = ''
-    echo "Waiting for orchestrator..."
-    while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
-      sleep 2
-    done
-
-    register-blocks
-
-    echo "Creating fund-models-local work pool..."
-    uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null \
-      || echo "  already exists"
-
-    echo "Registering local training deployment..."
-    uv run prefect --no-prompt deploy --name tide-trainer-local
-
-    echo "Setting pull steps to local project root..."
-    DEPLOYMENT_ID=$(curl -sf http://localhost:4200/api/deployments/name/tide-training-pipeline/tide-trainer-local | jq -r '.id')
-    curl -sf -X PATCH "http://localhost:4200/api/deployments/$DEPLOYMENT_ID" \
-      -H 'Content-Type: application/json' \
-      -d "{\"pull_steps\": [{\"prefect.deployments.steps.set_working_directory\": {\"directory\": \"$DEVENV_ROOT\"}}]}"
-
-    echo ""
-    echo "Done. Visit http://localhost:4200 to see the orchestrator dashboard."
-    echo "Run 'devenv up' to start workers that will pick up scheduled runs."
-  '';
-
   scripts.cleanup-services.exec = ''
-    for PORT in 4200 5432 8080 8081 8082 9090; do
+    for PORT in 8080 8081 8082; do
       PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
       if [ -n "$PID" ]; then
         echo "Killing stale process on port $PORT (PID $PID)"
@@ -518,14 +126,23 @@ in {
       fi
     done
     sleep 1
-    PID_FILE="$PGDATA/postmaster.pid"
-    if [ -f "$PID_FILE" ]; then
-      PID=$(head -1 "$PID_FILE")
-      if ! kill -0 "$PID" 2>/dev/null; then
-        echo "Removing stale postmaster.pid (PID $PID not running)"
-        rm -f "$PID_FILE"
-      fi
-    fi
+  '';
+
+  scripts.aws-buckets.exec = ''
+    set -euo pipefail
+    unset AWS_ENDPOINT_URL
+    echo "=== Fund S3 Buckets ==="
+    aws s3 ls | grep fund || echo "No fund buckets found"
+  '';
+
+  scripts.aws-secrets.exec = ''
+    set -euo pipefail
+    unset AWS_ENDPOINT_URL
+    echo "=== Fund Secrets ==="
+    aws secretsmanager list-secrets \
+      --region ${awsRegion} \
+      --query 'SecretList[?contains(Name, `fund`) || contains(Name, `secretspec`)].Name' \
+      --output table
   '';
 
   # --- Development check scripts ---
@@ -618,18 +235,7 @@ in {
     set -euo pipefail
     echo "Running Rust tests"
 
-    DOCKER_AVAILABLE=0
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-      DOCKER_AVAILABLE=1
-    fi
-
-    if [[ "$DOCKER_AVAILABLE" == "1" ]]; then
-      echo "Docker available - running all tests including integration"
-      TEST_ARGS="--workspace --verbose"
-    else
-      echo "Docker not available - skipping integration tests"
-      TEST_ARGS="--workspace --verbose --lib --bins"
-    fi
+    TEST_ARGS="--workspace --verbose --lib --bins"
 
     mkdir -p .coverage_output
     if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
@@ -674,25 +280,6 @@ in {
     echo "Nix lint check passed"
   '';
 
-  scripts.docker-build-check.exec = ''
-    set -euo pipefail
-    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-      echo "Docker not available - skipping build checks"
-      exit 0
-    fi
-
-    echo "Running Docker build checks"
-    ${lib.concatStringsSep "\n" (lib.mapAttrsToList (svc: def: ''
-        echo "=== Building ${svc} ==="
-        docker buildx build \
-          --platform linux/amd64 \
-          --file "$DEVENV_ROOT/${def.dockerfile}" \
-          "$DEVENV_ROOT/${def.context}"
-      '')
-      ecsServices)}
-    echo "Docker build checks passed"
-  '';
-
   scripts.bump-deps.exec = ''
     set -euo pipefail
     echo "Bumping all dependencies..."
@@ -705,262 +292,157 @@ in {
     echo "  git diff Cargo.lock uv.lock"
   '';
 
-  tasks =
-    {
-      # --- Python checks (install first, then all others in parallel) ---
+  tasks = {
+    # --- Python checks (install first, then all others in parallel) ---
 
-      "checks:python:install".exec = "python-install";
+    "checks:python:install".exec = "python-install";
 
-      "checks:python:format" = {
-        exec = "python-format";
-        after = ["checks:python:install"];
-      };
-      "checks:python:lint" = {
-        exec = "python-lint";
-        after = ["checks:python:install"];
-      };
-      "checks:python:type-check" = {
-        exec = "python-type-check";
-        after = ["checks:python:install"];
-      };
-      "checks:python:dead-code" = {
-        exec = "python-dead-code";
-        after = ["checks:python:install"];
-      };
-      "checks:python:complexity" = {
-        exec = "python-complexity";
-        after = ["checks:python:install"];
-      };
-      "checks:python:test" = {
-        exec = "python-test";
-        after = ["checks:python:install"];
-      };
+    "checks:python:format" = {
+      exec = "python-format";
+      after = ["checks:python:install"];
+    };
+    "checks:python:lint" = {
+      exec = "python-lint";
+      after = ["checks:python:install"];
+    };
+    "checks:python:type-check" = {
+      exec = "python-type-check";
+      after = ["checks:python:install"];
+    };
+    "checks:python:dead-code" = {
+      exec = "python-dead-code";
+      after = ["checks:python:install"];
+    };
+    "checks:python:complexity" = {
+      exec = "python-complexity";
+      after = ["checks:python:install"];
+    };
+    "checks:python:test" = {
+      exec = "python-test";
+      after = ["checks:python:install"];
+    };
 
-      # --- Rust checks (format parallel with check, lint+test after check) ---
+    # --- Rust checks (format parallel with check, lint+test after check) ---
 
-      "checks:rust:format".exec = "rust-format";
-      "checks:rust:check".exec = "rust-check";
+    "checks:rust:format".exec = "rust-format";
+    "checks:rust:check".exec = "rust-check";
 
-      "checks:rust:lint" = {
-        exec = "rust-lint";
-        after = ["checks:rust:check"];
-      };
-      "checks:rust:test" = {
-        exec = "rust-test";
-        after = ["checks:rust:check"];
-      };
+    "checks:rust:lint" = {
+      exec = "rust-lint";
+      after = ["checks:rust:check"];
+    };
+    "checks:rust:test" = {
+      exec = "rust-test";
+      after = ["checks:rust:check"];
+    };
 
-      # --- Standalone checks ---
+    # --- Standalone checks ---
 
-      "checks:markdown".exec = "markdown-checks";
-      "checks:yaml".exec = "yaml-checks";
-      "checks:nix".exec = "nix-lint";
+    "checks:markdown".exec = "markdown-checks";
+    "checks:yaml".exec = "yaml-checks";
+    "checks:nix".exec = "nix-lint";
 
-      # --- Model tasks ---
-
-      "models:tide:deploy".exec = ''
-        uv run prefect --no-prompt deploy --all
+    "checks:ci" = {
+      exec = ''
+        echo "All CI checks passed"
       '';
-      "models:tide:train".exec = ''
-        uv run prefect deployment run tide-training-pipeline/tide-trainer-remote
-      '';
-      "models:tide:train:local".exec = ''
-        uv run prefect deployment run tide-training-pipeline/tide-trainer-local
-      '';
-
-      # --- Infrastructure tasks ---
-
-      "infra:down".exec = "infra-down";
-
-      "checks:docker".exec = "docker-build-check";
-
-      "checks:ci" = {
-        exec = ''
-          echo "All CI checks passed"
-        '';
-        after = [
-          "checks:nix"
-          "checks:markdown"
-          "checks:yaml"
-          "checks:python:format"
-          "checks:python:lint"
-          "checks:python:type-check"
-          "checks:python:dead-code"
-          "checks:python:complexity"
-          "checks:python:test"
-          "checks:rust:format"
-          "checks:rust:lint"
-          "checks:rust:test"
-        ];
-      };
-
-      # --- CD deploy pipeline ---
-      # aws-check -> ecr-push (parallel) -> infra:up -> ecs-deploy (parallel) -> cd:deploy
-
-      "cd:aws-check".exec = "aws-check";
-
-      "infra:up" = {
-        exec = "infra-up";
-        after = map (svc: "cd:build:${svc}") deployableServices;
-      };
-
-      "cd:redeploy" = {
-        exec = ''
-          set -euo pipefail
-          unset AWS_ENDPOINT_URL
-          CLUSTER="fund-applications"
-          ${lib.concatStringsSep "\n" (map (svc: ''
-              ECS_NAME="fund-${svc}-server"
-              echo "=== Redeploying $ECS_NAME ==="
-              aws ecs update-service \
-                --cluster "$CLUSTER" \
-                --service "$ECS_NAME" \
-                --force-new-deployment \
-                --region ${awsRegion} \
-                --query 'service.serviceName' \
-                --output text
-            '')
-            deployableServices)}
-          echo "Waiting for all services to stabilize..."
-          aws ecs wait services-stable \
-            --cluster "$CLUSTER" \
-            --services ${lib.concatStringsSep " " (map (svc: "fund-${svc}-server") deployableServices)} \
-            --region ${awsRegion}
-          echo "All services redeployed"
-        '';
-        after = ["infra:up"];
-      };
-
-      "checks:cd:deploy" = {
-        exec = ''
-          echo "CD deploy completed successfully"
-        '';
-        after = ["cd:redeploy"];
-      };
-
-      "checks:cd" = {
-        exec = ''
-          echo "CD pipeline completed"
-        '';
-        after = ["checks:ci" "checks:cd:deploy"];
-      };
-    }
-    // cdBuildTasks;
+      after = [
+        "checks:nix"
+        "checks:markdown"
+        "checks:yaml"
+        "checks:python:format"
+        "checks:python:lint"
+        "checks:python:type-check"
+        "checks:python:dead-code"
+        "checks:python:complexity"
+        "checks:python:test"
+        "checks:rust:format"
+        "checks:rust:lint"
+        "checks:rust:test"
+      ];
+    };
+  };
 
   # --- Local processes ---
 
   processes = {
-    orchestrator.exec = ''
-      while ! pg_isready -h 127.0.0.1 -p 5432 -U prefect -q 2>/dev/null; do
-        sleep 1
-      done
-      export PREFECT_API_DATABASE_CONNECTION_URL="postgresql+asyncpg://prefect:prefect@127.0.0.1:5432/prefect"
-      export PREFECT_UI_API_URL="http://localhost:4200/api"
-      cd tools
-      exec uv run prefect server start --host 0.0.0.0
-    '';
+    data-manager.exec =
+      if isProd
+      then ''
+        cd applications/data_manager
+        exec secretspec run -- cargo run --release
+      ''
+      else ''
+        cd applications/data_manager
+        exec secretspec run -- cargo watch -x run
+      '';
 
-    training-worker-1.exec = ''
-      while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
-        sleep 2
-      done
+    ensemble-manager.exec = let
+      waitForDataManager = ''
+        while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+          sleep 2
+        done
+      '';
+      uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
+    in
+      if isProd
+      then ''
+        ${waitForDataManager}
+        cd applications/ensemble_manager
+        exec secretspec run -- ${uvicornCmd}
+      ''
+      else ''
+        ${waitForDataManager}
+        cd applications/ensemble_manager
+        exec secretspec run -- ${uvicornCmd} --reload
+      '';
 
-      # Register S3 blocks, create work pool, and register deployment on first startup
-      export PREFECT_API_URL="http://localhost:4200/api"
-      register-blocks || true
+    portfolio-manager.exec = let
+      waitForDeps = ''
+        while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+          sleep 2
+        done
+        while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
+          sleep 2
+        done
+      '';
+      uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
+    in
+      if isProd
+      then ''
+        ${waitForDeps}
+        cd applications/portfolio_manager
+        exec secretspec run -- ${uvicornCmd}
+      ''
+      else ''
+        ${waitForDeps}
+        cd applications/portfolio_manager
+        exec secretspec run -- ${uvicornCmd} --reload
+      '';
 
-      uv run --package tools prefect work-pool create "fund-models-local" --type process 2>/dev/null || true
-
-      uv run prefect --no-prompt deploy --name tide-trainer-local 2>/dev/null || true
-      DEPLOYMENT_ID=$(curl -sf http://localhost:4200/api/deployments/name/tide-training-pipeline/tide-trainer-local | jq -r '.id') || true
-      if [ -n "$DEPLOYMENT_ID" ] && [ "$DEPLOYMENT_ID" != "null" ]; then
-        PROJECT_ROOT="''${DEVENV_ROOT:-$(pwd)}"
-        curl -sf -X PATCH "http://localhost:4200/api/deployments/$DEPLOYMENT_ID" \
-          -H 'Content-Type: application/json' \
-          -d "{\"pull_steps\": [{\"prefect.deployments.steps.set_working_directory\": {\"directory\": \"$PROJECT_ROOT\"}}]}" || true
-      fi
-
-      cd tools
-      exec uv run prefect worker start --pool fund-models-local --name worker-1
-    '';
-
-    training-worker-2.exec = ''
-      while ! curl -sf http://localhost:4200/api/health > /dev/null 2>&1; do
-        sleep 2
-      done
-      sleep 3
-      cd tools
-      exec uv run prefect worker start --pool fund-models-local --name worker-2
-    '';
-
-    data-manager.exec = ''
-      cd applications/data_manager
-      exec cargo watch -x run
-    '';
-
-    ensemble-manager.exec = ''
-      while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-        sleep 2
-      done
-      cd applications/ensemble_manager
-      exec uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082 --reload
-    '';
-
-    portfolio-manager.exec = ''
-      while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-        sleep 2
-      done
+    artifact-watcher.exec = ''
       while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
         sleep 2
       done
-      cd applications/portfolio_manager
-      exec uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081 --reload
-    '';
-
-    ready.exec = ''
-      while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-        sleep 2
-      done
-      echo ""
-      echo "========================================"
-      echo "  Fund development environment ready"
-      echo "========================================"
-      echo ""
-      echo "  PostgreSQL:       localhost:5432"
-      echo "  Prometheus:       localhost:9090"
-      echo "  Orchestrator UI:  localhost:4200"
-      echo "  Data Manager:     localhost:8080"
-      echo "  Ensemble Manager: localhost:8082"
-      echo "  Portfolio Manager: localhost:8081"
-      echo ""
-
-      # Stay alive so devenv doesn't restart this process
-      while true; do sleep 3600; done
+      exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
     '';
   };
 
   enterShell = ''
     echo "Fund development environment"
     echo ""
-    echo "  Local (devenv up):"
-    echo "    PostgreSQL:       localhost:5432"
-    echo "    Prometheus:       localhost:9090"
-    echo "    Orchestrator UI:  localhost:4200"
+    echo "  Services (devenv up):"
     echo "    Data Manager:     localhost:8080"
-    echo "    Ensemble Manager: localhost:8082"
     echo "    Portfolio Manager: localhost:8081"
+    echo "    Ensemble Manager: localhost:8082"
     echo ""
-    echo "  AWS (Pulumi):"
-    echo "    infra-up          Create all AWS infrastructure"
-    echo "    infra-down        Tear down all AWS infrastructure"
-    echo "    infra-outputs     Show Pulumi stack outputs"
-    echo "    infra-url         Show ALB base URL"
-    echo "    pull-secrets      AWS Secrets Manager -> .envrc"
-    echo "    ecr-push <svc>   Build and push Docker image to ECR"
-    echo "    ecs-deploy <svc>  Force ECS service redeployment"
-    echo "    deploy <svc|all>  Build, push, and redeploy (ecr-push + ecs-deploy)"
-    echo "    ecs-status        Show ECS service status"
-    echo "    initialize-remote-trainer  Create work pool + register deployment (prod)"
+    echo "  Secrets (secretspec):"
+    echo "    secretspec check          Validate production secrets"
+    echo "    secretspec set <KEY>      Set a secret value"
+    echo ""
+    echo "  AWS:"
+    echo "    aws-buckets       List fund S3 buckets"
+    echo "    aws-secrets       List fund secrets"
     echo ""
     echo "  Checks (devenv tasks run):"
     echo "    checks:python       All Python checks (parallel after install)"
@@ -968,15 +450,10 @@ in {
     echo "    checks:markdown     Markdown lint"
     echo "    checks:yaml         YAML lint"
     echo "    checks:nix          Nix lint (alejandra)"
-    echo "    Individual: checks:python:format, checks:rust:lint, etc."
     echo ""
     echo "  Utilities:"
-    echo "    bump-deps         Update all dependency lockfiles"
-    echo ""
-    echo "  Local:"
-    echo "    register-blocks            Register S3 blocks on local Prefect server"
-    echo "    initialize-local-trainer   Create work pool + register deployment (local)"
-    echo "    cleanup-services  Kill stale local processes"
+    echo "    bump-deps           Update all dependency lockfiles"
+    echo "    cleanup-services    Kill stale local processes"
   '';
 
   enterTest = ''

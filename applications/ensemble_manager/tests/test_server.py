@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -94,22 +95,13 @@ def test_create_predictions_all_tickers_dropped_returns_500() -> None:
 
 def test_resolve_artifact_key_uses_latest_by_default() -> None:
     mock_s3 = MagicMock()
-    mock_ssm = MagicMock()
-    mock_ssm.get_parameter.side_effect = ClientError(
-        error_response={
-            "Error": {
-                "Code": "ParameterNotFound",
-                "Message": "Parameter not found",
-            }
-        },
-        operation_name="GetParameter",
-    )
 
     with (
-        patch("ensemble_manager.server.boto3") as mock_boto3,
+        patch.dict("os.environ", {}, clear=False),
         patch("ensemble_manager.server.find_latest_artifact_key") as mock_find,
     ):
-        mock_boto3.client.return_value = mock_ssm
+        if "MODEL_VERSION" in os.environ:
+            del os.environ["MODEL_VERSION"]
         mock_find.return_value = "artifacts/model-2026/output/model.tar.gz"
         result = _resolve_artifact_key(
             s3_client=mock_s3,
@@ -121,15 +113,13 @@ def test_resolve_artifact_key_uses_latest_by_default() -> None:
     mock_find.assert_called_once()
 
 
-def test_resolve_artifact_key_uses_ssm_version() -> None:
+def test_resolve_artifact_key_uses_env_version() -> None:
     mock_s3 = MagicMock()
-    mock_ssm = MagicMock()
-    mock_ssm.get_parameter.return_value = {
-        "Parameter": {"Value": "equitypricemodel-trainer-2026-01-15"}
-    }
 
-    with patch("ensemble_manager.server.boto3") as mock_boto3:
-        mock_boto3.client.return_value = mock_ssm
+    with patch.dict(
+        "os.environ",
+        {"MODEL_VERSION": "equitypricemodel-trainer-2026-01-15"},
+    ):
         result = _resolve_artifact_key(
             s3_client=mock_s3,
             bucket="test-bucket",
@@ -140,15 +130,13 @@ def test_resolve_artifact_key_uses_ssm_version() -> None:
     assert result == expected
 
 
-def test_resolve_artifact_key_ssm_tar_gz_value() -> None:
+def test_resolve_artifact_key_env_tar_gz_value() -> None:
     mock_s3 = MagicMock()
-    mock_ssm = MagicMock()
-    mock_ssm.get_parameter.return_value = {
-        "Parameter": {"Value": "custom/path/model.tar.gz"}
-    }
 
-    with patch("ensemble_manager.server.boto3") as mock_boto3:
-        mock_boto3.client.return_value = mock_ssm
+    with patch.dict(
+        "os.environ",
+        {"MODEL_VERSION": "custom/path/model.tar.gz"},
+    ):
         result = _resolve_artifact_key(
             s3_client=mock_s3,
             bucket="test-bucket",
@@ -160,11 +148,8 @@ def test_resolve_artifact_key_ssm_tar_gz_value() -> None:
 
 def test_resolve_artifact_key_explicit_tar_gz_path() -> None:
     mock_s3 = MagicMock()
-    mock_ssm = MagicMock()
-    mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "latest"}}
 
-    with patch("ensemble_manager.server.boto3") as mock_boto3:
-        mock_boto3.client.return_value = mock_ssm
+    with patch.dict("os.environ", {"MODEL_VERSION": "latest"}):
         result = _resolve_artifact_key(
             s3_client=mock_s3,
             bucket="test-bucket",
