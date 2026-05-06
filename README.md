@@ -17,13 +17,18 @@ Below are resources for the project and repository.
 
 ### Setup
 
-Run the commands below in the root directory.  
+On a fresh machine with the repo cloned, run the bootstrap script:
 
 ```sh
-# Install devenv — see https://devenv.sh/getting-started/
-devenv shell      # enter development environment
-devenv up         # start local services
-devenv tasks list # list available tasks
+./tools/bootstrap-machine         # install nix, devenv, and build the environment
+./tools/bootstrap-machine --prod  # also pull production secrets from AWS
+```
+
+Once bootstrapped:
+
+```sh
+devenv shell  # enter the development environment
+devenv up     # start local services (postgres, prometheus, prefect, etc.)
 ```
 
 ### Principles
