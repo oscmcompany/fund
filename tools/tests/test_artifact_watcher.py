@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +9,7 @@ from tools.artifact_watcher import (
 )
 
 
-def test_get_latest_artifact_key_returns_latest(tmp_path: Path) -> None:
+def test_get_latest_artifact_key_returns_latest() -> None:
     mock_s3 = MagicMock()
     mock_paginator = MagicMock()
     mock_paginator.paginate.return_value = [

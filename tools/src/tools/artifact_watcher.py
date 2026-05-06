@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import boto3
+import botocore.exceptions
 import structlog
 
 logger = structlog.get_logger()
@@ -43,7 +44,8 @@ def get_latest_artifact_key(
         artifact_key = f"{folder}output/model.tar.gz"
         try:
             s3_client.head_object(Bucket=bucket, Key=artifact_key)
-        except Exception:
+        except botocore.exceptions.ClientError:
+            logger.debug("Artifact not found", key=artifact_key)
             continue
         else:
             return artifact_key
@@ -55,7 +57,7 @@ def read_last_key() -> str | None:
     """Read the last known artifact key from the state file."""
     if STATE_FILE.exists():
         content = STATE_FILE.read_text().strip()
-        return content if content else None
+        return content or None
     return None
 
 
@@ -67,8 +69,8 @@ def write_last_key(key: str) -> None:
 def restart_ensemble_manager() -> None:
     """Send SIGTERM to ensemble-manager process listening on port 8082."""
     try:
-        result = subprocess.run(  # noqa: S603, S607
-            ["lsof", "-ti", "tcp:8082"],
+        result = subprocess.run(
+            ["/usr/bin/lsof", "-ti", "tcp:8082"],
             capture_output=True,
             text=True,
             check=False,
@@ -120,9 +122,9 @@ def run() -> None:
                     previous_key=last_key,
                     new_key=current_key,
                 )
+                restart_ensemble_manager()
                 write_last_key(current_key)
                 last_key = current_key
-                restart_ensemble_manager()
         except Exception:
             logger.exception("Error during artifact poll")
 
