@@ -585,7 +585,7 @@ in {
     mkdir -p .coverage_output
     uv run coverage run -m pytest --tb=short -q
     uv run coverage combine 2>/dev/null || true
-    uv run coverage xml
+    uv run coverage xml -o .coverage_output/python.xml
     echo "Python tests completed successfully"
   '';
 
