@@ -30,8 +30,8 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: DeterminateSystems/nix-installer-action@v16.0.0
+      - uses: DeterminateSystems/magic-nix-cache-action@v7.0.0
         with:
           use-flakehub: false
       - name: Install devenv
