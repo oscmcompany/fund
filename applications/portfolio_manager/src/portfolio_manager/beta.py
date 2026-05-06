@@ -78,7 +78,8 @@ def compute_portfolio_beta(
         )
     )
 
-    total_gross_dollar_value = portfolio["dollar_amount"].sum()
+    raw_sum = portfolio["dollar_amount"].sum()
+    total_gross_dollar_value = float(raw_sum) if raw_sum is not None else 0.0
     if np.isclose(total_gross_dollar_value, 0.0):
         return 0.0
 

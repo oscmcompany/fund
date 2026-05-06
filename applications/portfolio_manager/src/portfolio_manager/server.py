@@ -106,7 +106,12 @@ def health_check() -> Response:
                 future = executor.submit(alpaca_client.get_account)
                 future.result(timeout=5)
             checks["alpaca_client"] = "ok"
-        except (APIError, requests.RequestException, OSError, concurrent.futures.TimeoutError):
+        except (
+            APIError,
+            requests.RequestException,
+            OSError,
+            concurrent.futures.TimeoutError,
+        ):
             checks["alpaca_client"] = "error"
             healthy = False
     else:
