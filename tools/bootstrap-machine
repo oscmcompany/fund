@@ -113,7 +113,20 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Install AWS CLI (needed before devenv shell for secretspec)
+# 3. Install secretspec (secrets management for devenv services)
+# --------------------------------------------------------------------------- #
+step "Checking secretspec installation"
+
+if command -v secretspec &>/dev/null; then
+  echo "secretspec is already installed, skipping"
+else
+  echo "Installing secretspec..."
+  curl -sSL https://install.secretspec.dev | sh
+  echo "secretspec installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. Install AWS CLI (needed before devenv shell for secretspec)
 # --------------------------------------------------------------------------- #
 step "Checking AWS CLI installation"
 
@@ -142,7 +155,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 4. Configure AWS credentials (required for secretspec provider)
+# 5. Configure AWS credentials (required for secretspec provider)
 # --------------------------------------------------------------------------- #
 step "Checking AWS credentials"
 
@@ -167,7 +180,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. Build the devenv environment
+# 6. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -176,7 +189,7 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 6. Prod mode: create .envrc and validate secrets
+# 7. Prod mode: create .envrc and validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
   step "Configuring production environment"
