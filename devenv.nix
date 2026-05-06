@@ -90,6 +90,13 @@ in {
 
     # Development defaults
     ENVIRONMENT = "development";
+
+    # Secretspec CLI configuration
+    SECRETSPEC_PROVIDER = "awssm";
+    SECRETSPEC_PROFILE =
+      if isProd
+      then "production"
+      else "dev/chris";
   };
 
   packages = with pkgs; [
