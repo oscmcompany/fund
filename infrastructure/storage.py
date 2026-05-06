@@ -116,7 +116,7 @@ aws.s3.BucketVersioning(
 # ECR Repositories - these must exist before images can be pushed
 # force_delete allows repositories containing images to be deleted on stack teardown.
 # If image rebuild and push times become prohibitive on daily down/up cycles, switch to
-# retain_on_delete=True and add pulumi import statements to the maskfile up command.
+# retain_on_delete=True and add pulumi import statements to the infra-up script.
 data_manager_repository = aws.ecr.Repository(
     "data_manager_repository",
     name="fund/applications-data-manager-server",

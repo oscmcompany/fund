@@ -3,7 +3,7 @@
 > The open source capital management company  
 
 <!-- markdownlint-disable-next-line MD013 -->
-[![Code checks](https://github.com/oscmcompany/fund/actions/workflows/run_code_checks.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/run_code_checks.yaml) [![Test coverage](https://coveralls.io/repos/github/oscmcompany/fund/badge.svg?branch=master)](https://coveralls.io/github/oscmcompany/fund?branch=master)
+[![Code checks](https://github.com/oscmcompany/fund/actions/workflows/ci.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/ci.yaml) [![Test coverage](https://coveralls.io/repos/github/oscmcompany/fund/badge.svg?branch=master)](https://coveralls.io/github/oscmcompany/fund?branch=master)
 
 ## About
 
@@ -20,10 +20,10 @@ Below are resources for the project and repository.
 Run the commands below in the root directory.  
 
 ```sh
-brew install flox # see https://flox.dev/ for more information
-flox activate     # configure repository environment
-mask setup        # check for required tools
-mask --help       # list available Mask tasks
+# Install devenv — see https://devenv.sh/getting-started/
+devenv shell      # enter development environment
+devenv up         # start local services
+devenv tasks list # list available tasks
 ```
 
 ### Principles

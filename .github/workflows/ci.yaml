@@ -1,0 +1,66 @@
+---
+name: Continuous Integration
+run-name: Continuous Integration
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  ci:
+    name: CI checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-flakehub: false
+      - name: Install devenv
+        run: nix profile install nixpkgs#devenv
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-on-failure: false
+          shared-key: rust-continuous-integration
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ hashFiles('**/pyproject.toml', 'uv.lock') }}
+          restore-keys: uv-
+      - name: Run all CI checks
+        run: devenv tasks run --mode before checks:ci
+      - name: Upload Rust coverage to Coveralls
+        if: hashFiles('.coverage_output/rust.xml') != ''
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          flag-name: rust
+          file: .coverage_output/rust.xml
+          parallel: true
+      - name: Upload Python coverage to Coveralls
+        if: hashFiles('.coverage_output/python.xml') != ''
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          flag-name: python
+          file: .coverage_output/python.xml
+          parallel: true
+      - name: Finalize coverage upload
+        if: hashFiles('.coverage_output/rust.xml') != '' || hashFiles('.coverage_output/python.xml') != ''
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parallel-finished: true
+          carryforward: rust,python

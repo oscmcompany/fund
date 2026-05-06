@@ -195,7 +195,7 @@ Follow these steps:
   - `check_failures.json`: Check name, conclusion, details URL
   - `pr_review_comments_raw.json`: Full flat array of all review comments including replies (use for full context if needed)
 
-- Note that check-runs and workflow runs are distinct; to fetch logs, obtain the workflow run ID from `check_runs_raw.json` and use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs`. If logs are inaccessible via API, run `mask development python checks` or `mask development rust checks` locally to replicate the errors.
+- Note that check-runs and workflow runs are distinct; to fetch logs, obtain the workflow run ID from `check_runs_raw.json` and use `gh api repos/${OWNER}/${REPO}/actions/runs/{run_id}/logs`. If logs are inaccessible via API, run `devenv tasks run checks:python` or `devenv tasks run checks:rust` locally to replicate the errors.
 - Group all feedback (check failures, review threads, outdated threads, PR-level comments) using judgement: by file, by theme, by type of change, or whatever makes most sense for the specific pull request; ensure each group maintains the full metadata for all items it contains.
 - Analyze dependencies between feedback groups to determine which are independent (can be worked in parallel) and which are interdependent (must be handled sequentially).
 - For each piece of feedback, evaluate whether to address it (make code changes) or reject it (explain why the feedback doesn't apply); provide clear reasoning for each decision.
@@ -229,13 +229,13 @@ Follow these steps:
 ### 6. Verify Changes
 
 - After implementing each group's fixes, run verification checks locally:
-  - Run `mask development python install` and then `mask development python checks` if any Python files, `pyproject.toml`, or `uv.lock` were modified.
-  - Run `mask development rust checks` if any Rust files were modified.
+  - Run `devenv tasks run checks:python` if any Python files, `pyproject.toml`, or `uv.lock` were modified.
+  - Run `devenv tasks run checks:rust` if any Rust files were modified.
   - **Note**: Local verification confirms fixes work in the development environment. Remote continuous integration will re-run after changes are pushed in the "Commit and Push Changes" step.
 - If checks fail, resolve issues and re-run until passing before moving to the next group.
 - Do not proceed to the next feedback group until current group's changes pass verification.
 - Repeat steps 4-6 for each feedback group until all have been addressed.
-- Always run final comprehensive verification using `mask development python install` + `mask development python checks`, and `mask development rust checks`, before proceeding.
+- Always run final comprehensive verification using `devenv tasks run checks:python` and `devenv tasks run checks:rust` before proceeding.
 
 ### 7. Commit and Push Changes
 

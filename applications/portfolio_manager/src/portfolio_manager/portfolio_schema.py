@@ -121,7 +121,7 @@ pairs_schema = pa.DataFrameSchema(
     coerce=True,
     checks=[
         pa.Check(
-            check_fn=lambda df: check_pair_tickers_different(df),
+            check_fn=check_pair_tickers_different,
             error="Long and short tickers must be different for every pair",
         ),
     ],

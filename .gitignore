@@ -1,7 +1,4 @@
 .DS_Store
-.flox/cache/
-.flox/log/
-.flox/run/
 .env
 .ruff_cache/
 .pytest_cache/
