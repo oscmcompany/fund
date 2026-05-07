@@ -453,6 +453,25 @@ class Data:
         elif data_type == "predict":
             self.batch_data = self._get_prediction_data(input_length + output_length)
 
+        logger.info(
+            "Batch data prepared",
+            data_type=data_type,
+            batch_rows=self.batch_data.height,
+            batch_tickers=self.batch_data["ticker"].n_unique(),
+            input_length=input_length,
+            output_length=output_length,
+        )
+
+        if self.batch_data.is_empty():
+            logger.error("Batch data is empty after preparation")
+            return TrainingDataset(
+                past_continuous=np.empty((0,)),
+                past_categorical=np.empty((0,)),
+                future_categorical=np.empty((0,)),
+                static_categorical=np.empty((0,)),
+                targets=None,
+            )
+
         minimum_date: date = self.batch_data.select(
             self.batch_data["date"].min()
         ).item()
@@ -509,6 +528,12 @@ class Data:
             num_windows = num_rows - input_length - output_length + 1
 
             if num_windows <= 0:
+                logger.debug(
+                    "Skipping ticker with insufficient rows",
+                    ticker=ticker_df["ticker"][0],
+                    num_rows=num_rows,
+                    required=input_length + output_length,
+                )
                 continue
 
             window_indices = (
