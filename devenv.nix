@@ -422,13 +422,24 @@ in {
       sleep 1
     '';
 
-    processes = {
+    processes = let
+      killPort = port: ''
+        STALE_PID=$(lsof -ti tcp:${port} 2>/dev/null || true)
+        if [ -n "$STALE_PID" ]; then
+          echo "Killing stale process on port ${port} (PID $STALE_PID)"
+          kill $STALE_PID 2>/dev/null || true
+          sleep 1
+        fi
+      '';
+    in {
       data-manager.exec =
         if isProd
         then ''
+          ${killPort "8080"}
           exec secretspec run -- cargo run -p data_manager --release
         ''
         else ''
+          ${killPort "8080"}
           exec secretspec run -- cargo watch -x 'run -p data_manager'
         '';
 
@@ -443,11 +454,13 @@ in {
         if isProd
         then ''
           ${waitForDataManager}
+          ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
           ${waitForDataManager}
+          ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd} --reload
         '';
@@ -466,10 +479,12 @@ in {
         if isProd
         then ''
           ${waitForDeps}
+          ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
           ${waitForDeps}
+          ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
         '';
 
