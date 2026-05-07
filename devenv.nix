@@ -285,6 +285,29 @@ in {
     echo "  git diff Cargo.lock uv.lock"
   '';
 
+  scripts.backfill-bars.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-bars"
+      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+      exit 1
+    fi
+
+    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
+
+    echo "Waiting for data-manager to be healthy..."
+    while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+      sleep 2
+    done
+    echo "Data-manager is healthy"
+
+    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
+    secretspec run -- uv run --package tools python -m tools.sync_equity_bars_data \
+      http://localhost:8080 \
+      "{\"start_date\": \"$BACKFILL_START_DATE\", \"end_date\": \"$END_DATE\"}"
+  '';
+
   tasks = {
     # --- Python checks (install first, then all others in parallel) ---
 
@@ -352,6 +375,10 @@ in {
       '';
       after = ["models:tide:register-blocks"];
     };
+
+    # --- Data tasks ---
+
+    "data:backfill-bars".exec = "backfill-bars";
 
     "checks:ci" = {
       exec = ''
@@ -505,6 +532,7 @@ in {
     echo "    checks:markdown     Markdown lint"
     echo "    checks:yaml         YAML lint"
     echo "    checks:nix          Nix lint (alejandra)"
+    echo "    data:backfill-bars  Backfill historical equity bar data"
     echo "    models:tide:train   Train tide model and upload artifacts"
     echo ""
     echo "  Utilities:"
