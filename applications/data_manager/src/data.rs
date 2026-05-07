@@ -44,10 +44,15 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<D
     )
     .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 
-    debug!("Normalizing ticker column to uppercase");
+    debug!("Normalizing ticker column: trimming whitespace and converting to uppercase");
     let equity_bars_dataframe = equity_bars_dataframe
         .lazy()
-        .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
+        .with_columns([col("ticker")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("ticker")])
         .collect()
         .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
@@ -86,10 +91,15 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
     )
     .map_err(|e| Error::Other(format!("Failed to create predictions DataFrame: {}", e)))?;
 
-    debug!("Normalizing ticker column to uppercase");
+    debug!("Normalizing ticker column: trimming whitespace and converting to uppercase");
     let unfiltered_prediction_dataframe = prediction_dataframe
         .lazy()
-        .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
+        .with_columns([col("ticker")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("ticker")])
         .collect()
         .map_err(|e| Error::Other(format!("Failed to normalize ticker column: {}", e)))?;
 
@@ -156,10 +166,15 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
         "entry_price" => portfolio_rows.iter().map(|p| p.entry_price).collect::<Vec<Option<f64>>>(),
     )?;
 
-    debug!("Normalizing ticker, side, and action columns to uppercase");
+    debug!("Normalizing ticker, side, and action columns: trimming whitespace and converting to uppercase");
     let portfolio_dataframe = portfolio_dataframe
         .lazy()
-        .with_columns([col("ticker").str().to_uppercase().alias("ticker")])
+        .with_columns([col("ticker")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("ticker")])
         .with_columns([col("side").str().to_uppercase().alias("side")])
         .with_columns([col("action").str().to_uppercase().alias("action")])
         .collect()?;
@@ -244,12 +259,19 @@ pub fn create_closed_pair_dataframe(rows: Vec<ClosedPair>) -> Result<DataFrame, 
     )
     .map_err(|e| Error::Other(format!("Failed to create closed pair DataFrame: {}", e)))?;
 
-    debug!("Normalizing pair_id, long_ticker, and short_ticker columns to uppercase");
+    debug!("Normalizing pair_id, long_ticker, and short_ticker columns: trimming whitespace and converting to uppercase");
     let dataframe = dataframe
         .lazy()
         .with_columns([col("pair_id").str().to_uppercase().alias("pair_id")])
-        .with_columns([col("long_ticker").str().to_uppercase().alias("long_ticker")])
+        .with_columns([col("long_ticker")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("long_ticker")])
         .with_columns([col("short_ticker")
+            .str()
+            .strip_chars(lit(NULL))
             .str()
             .to_uppercase()
             .alias("short_ticker")])
@@ -304,17 +326,26 @@ pub fn create_equity_details_dataframe(csv_content: String) -> Result<DataFrame,
     debug!("All required columns present, selecting subset");
     dataframe = dataframe.select(required_columns)?;
 
-    debug!("Normalizing ticker, sector, and industry columns to uppercase and filling nulls");
+    debug!("Normalizing ticker, sector, and industry columns: trimming whitespace, converting to uppercase, and filling nulls");
     let equity_details_dataframe = dataframe
         .lazy()
         .with_columns([
-            col("ticker").str().to_uppercase().alias("ticker"),
+            col("ticker")
+                .str()
+                .strip_chars(lit(NULL))
+                .str()
+                .to_uppercase()
+                .alias("ticker"),
             col("sector")
+                .str()
+                .strip_chars(lit(NULL))
                 .str()
                 .to_uppercase()
                 .fill_null(lit("NOT AVAILABLE"))
                 .alias("sector"),
             col("industry")
+                .str()
+                .strip_chars(lit(NULL))
                 .str()
                 .to_uppercase()
                 .fill_null(lit("NOT AVAILABLE"))

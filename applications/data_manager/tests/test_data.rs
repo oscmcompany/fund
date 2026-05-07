@@ -120,6 +120,27 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
 }
 
 #[test]
+fn test_create_equity_bar_dataframe_whitespace_trimming() {
+    initialize_test_tracing();
+    let bars = vec![EquityBar {
+        ticker: "  ECC           ".to_string(),
+        timestamp: 1234567890000,
+        open_price: Some(10.0),
+        high_price: Some(11.0),
+        low_price: Some(9.0),
+        close_price: Some(10.5),
+        volume: Some(100000),
+        volume_weighted_average_price: Some(10.2),
+        transactions: Some(500),
+    }];
+
+    let df = create_equity_bar_dataframe(bars).unwrap();
+
+    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(ticker, "ECC");
+}
+
+#[test]
 fn test_create_equity_bar_dataframe_mixed_case_tickers() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar(), sample_equity_bar_lowercase()];
@@ -448,6 +469,30 @@ fn test_create_equity_details_dataframe_valid_csv() {
 }
 
 #[test]
+fn test_create_equity_details_dataframe_whitespace_trimming() {
+    initialize_test_tracing();
+    let csv_content =
+        "ticker,sector,industry\nECC           ,  Technology  ,  Consumer Electronics  \n";
+
+    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+
+    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(ticker, "ECC");
+
+    let sector = df.column("sector").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(sector, "TECHNOLOGY");
+
+    let industry = df
+        .column("industry")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(industry, "CONSUMER ELECTRONICS");
+}
+
+#[test]
 fn test_create_equity_details_dataframe_uppercase_normalization() {
     initialize_test_tracing();
     let csv_content = "ticker,sector,industry\naapl,technology,consumer electronics\n";
@@ -757,6 +802,42 @@ fn test_create_closed_pair_dataframe_uppercase() {
         .get(0)
         .unwrap();
     assert_eq!(pair_id, "AAPL-MSFT");
+
+    let long_ticker = dataframe
+        .column("long_ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(long_ticker, "AAPL");
+
+    let short_ticker = dataframe
+        .column("short_ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(short_ticker, "MSFT");
+}
+
+#[test]
+fn test_create_closed_pair_dataframe_whitespace_trimming() {
+    initialize_test_tracing();
+    let closed_pair = ClosedPair {
+        closed_timestamp: 1735689600000,
+        pair_id: "AAPL-MSFT".to_string(),
+        long_ticker: "  AAPL  ".to_string(),
+        short_ticker: "MSFT   ".to_string(),
+        entry_timestamp: 1735000000000,
+        dollar_amount: 10000.0,
+        realized_profit_and_loss: 250.0,
+        return_percent: 0.025,
+        holding_days: 5,
+    };
+
+    let dataframe = create_closed_pair_dataframe(vec![closed_pair]).unwrap();
 
     let long_ticker = dataframe
         .column("long_ticker")
