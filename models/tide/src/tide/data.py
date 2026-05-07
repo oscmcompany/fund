@@ -385,6 +385,11 @@ class Data:
             )
 
         self.data = data
+        logger.info(
+            "Preprocessing complete",
+            remaining_rows=data.height,
+            remaining_tickers=data["ticker"].n_unique(),
+        )
 
     def _get_training_and_validation_data(
         self,
