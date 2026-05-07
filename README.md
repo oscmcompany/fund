@@ -32,7 +32,7 @@ devenv --profile apps up        # start application services
 devenv --profile ml shell       # ML training environment
 ```
 
-Production runs on an exe.dev VM with `devenv --profile apps up` and secretspec for secret injection.
+Production runs on a VM with `devenv --profile apps up` and secretspec for secret injection.
 
 ### Principles
 

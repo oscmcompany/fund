@@ -443,10 +443,12 @@ in {
         if isProd
         then ''
           ${waitForDataManager}
+          export CC=clang
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
           ${waitForDataManager}
+          export CC=clang
           exec secretspec run -- ${uvicornCmd} --reload
         '';
 
