@@ -23,7 +23,7 @@ polars = { version = "0.51.0", features = [
   "serde",
   "strings",
 ] }
-reqwest = { version = "0.13", features = ["query"] }
+reqwest = { version = "0.13", features = ["query", "rustls-tls"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 urlencoding = "2.1.3"
