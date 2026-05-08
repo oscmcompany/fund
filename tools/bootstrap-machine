@@ -5,16 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROD=false
+NONINTERACTIVE=false
 OS="$(uname -s)"
 
 usage() {
-  echo "Usage: $(basename "$0") [--prod]"
+  echo "Usage: $(basename "$0") [--prod] [--noninteractive]"
   echo ""
   echo "Bootstrap a fresh machine for the fund development environment."
   echo ""
   echo "Options:"
-  echo "  --prod    Configure production environment variables and validate secrets"
-  echo "  -h, --help  Show this help message"
+  echo "  --prod              Configure production environment variables and validate secrets"
+  echo "  --noninteractive    Skip the final exec \$SHELL (for use from automation)"
+  echo "  -h, --help          Show this help message"
   exit 0
 }
 
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prod)
       PROD=true
+      shift
+      ;;
+    --noninteractive)
+      NONINTERACTIVE=true
       shift
       ;;
     -h|--help)
@@ -266,4 +272,6 @@ else
 fi
 
 # Replace current shell so Nix paths are on PATH
-exec "$SHELL" -l
+if [[ "$NONINTERACTIVE" == false ]]; then
+  exec "$SHELL" -l
+fi
