@@ -291,7 +291,7 @@ phase_bootstrap() {
     echo "Starting GitHub device flow authentication..."
     echo "A code will appear below. Open https://github.com/login/device in your browser and enter it."
     echo ""
-    remote_tty "gh auth login --hostname github.com --git-protocol https --web"
+    remote_long_tty "gh auth login --hostname github.com --git-protocol https --web"
 
     # Verify
     if ! remote "gh auth status" &>/dev/null; then
