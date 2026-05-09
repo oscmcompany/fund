@@ -108,8 +108,10 @@ phase_collect() {
   [[ -z "$AWS_SECRET_KEY" ]] && fail "AWS Secret Access Key is required"
 
   # VM name
+  local slug
+  slug="$(head -c 4 /dev/urandom | xxd -p)"
   echo ""
-  VM_NAME="$(prompt "VM name" "fund")"
+  VM_NAME="$(prompt "VM name" "oscm-fund-$slug")"
 
   # Mode
   echo ""
@@ -331,12 +333,12 @@ phase_bootstrap() {
     echo "Created dev/$DEV_NAME .envrc"
   fi
 
-  # --- 3e: Copy local bootstrap-machine to VM ---
-  step "Syncing bootstrap-machine to VM"
-  scp -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "$SCRIPT_DIR/bootstrap-machine" "$VM_NAME.exe.xyz:~/fund/tools/bootstrap-machine"
-  remote "chmod +x ~/fund/tools/bootstrap-machine"
-  echo "Copied local bootstrap-machine to VM"
+  # --- 3e: Sync local tools/ to VM ---
+  step "Syncing tools/ to VM"
+  scp -r -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+    "$SCRIPT_DIR/"* "$VM_NAME.exe.xyz:~/fund/tools/"
+  remote "chmod +x ~/fund/tools/bootstrap-machine ~/fund/tools/create-dev-buckets ~/fund/tools/git-sync"
+  echo "Copied local tools/ to VM"
 
   # --- 3f: Run bootstrap-machine ---
   step "Running bootstrap-machine on VM (this will take a while)"
