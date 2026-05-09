@@ -3,6 +3,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from tide.register_blocks import register_blocks
 
+EXPECTED_BUCKET_COUNT = 2
+
 
 @patch("tide.register_blocks.S3Bucket")
 @patch("tide.register_blocks.AwsCredentials")
@@ -24,12 +26,12 @@ def test_register_blocks_creates_both_buckets(
     register_blocks()
 
     mock_credentials_cls.assert_called_once_with(region_name="us-west-2")
-    assert mock_s3_bucket_cls.call_count == 2
+    assert mock_s3_bucket_cls.call_count == EXPECTED_BUCKET_COUNT
     mock_s3_bucket_cls.assert_any_call(bucket_name="my-data", credentials=mock_creds)
     mock_s3_bucket_cls.assert_any_call(
         bucket_name="my-artifacts", credentials=mock_creds
     )
-    assert mock_block.save.call_count == 2
+    assert mock_block.save.call_count == EXPECTED_BUCKET_COUNT
     mock_block.save.assert_any_call("data-bucket", overwrite=True)
     mock_block.save.assert_any_call("artifact-bucket", overwrite=True)
 
