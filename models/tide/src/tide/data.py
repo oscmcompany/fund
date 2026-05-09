@@ -376,7 +376,7 @@ class Data:
                 logger.warning(
                     "Filtering rows with unknown categories",
                     column=column,
-                    unknown_values=sorted(unknown_values),
+                    unknown_values=sorted(v for v in unknown_values if v is not None),
                 )
                 data = data.filter(pl.col(column).is_in(list(mapping)))
 
@@ -462,14 +462,21 @@ class Data:
             output_length=output_length,
         )
 
+        has_targets = data_type in {"train", "validate"}
+        n_cont = len(self.continuous_columns)
+        n_cat = len(self.categorical_columns)
+        n_static = len(self.static_categorical_columns)
+
         if self.batch_data.is_empty():
             logger.error("Batch data is empty after preparation")
             return TrainingDataset(
-                past_continuous=np.empty((0,)),
-                past_categorical=np.empty((0,)),
-                future_categorical=np.empty((0,)),
-                static_categorical=np.empty((0,)),
-                targets=None,
+                past_continuous=np.zeros((0, input_length, n_cont), dtype=np.float32),
+                past_categorical=np.zeros((0, input_length, n_cat), dtype=np.int32),
+                future_categorical=np.zeros((0, output_length, n_cat), dtype=np.int32),
+                static_categorical=np.zeros((0, 1, n_static), dtype=np.int32),
+                targets=None
+                if not has_targets
+                else np.zeros((0, output_length, 1), dtype=np.float32),
             )
 
         minimum_date: date = self.batch_data.select(
@@ -493,7 +500,6 @@ class Data:
         all_future_categorical: list[np.ndarray] = []
         all_static_categorical: list[np.ndarray] = []
         all_targets: list[np.ndarray] = []
-        has_targets = data_type in {"train", "validate"}
 
         logger.info("Partitioning data by ticker")
         ticker_groups = self.batch_data.sort("time_idx").partition_by(
@@ -560,10 +566,6 @@ class Data:
         logger.info(
             "Sample collection complete", total_samples=len(all_past_continuous)
         )
-
-        n_cont = len(self.continuous_columns)
-        n_cat = len(self.categorical_columns)
-        n_static = len(self.static_categorical_columns)
 
         if not all_past_continuous:
             return TrainingDataset(

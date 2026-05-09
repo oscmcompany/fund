@@ -10,7 +10,8 @@ from portfolio_manager.portfolio_state import (
     evaluate_prior_pairs,
     get_prior_portfolio,
 )
-from portfolio_manager.rebalance import _prune_pairs_with_invalid_entry_price
+from fastapi import status
+from portfolio_manager.rebalance import _prune_pairs_with_invalid_entry_price, run_rebalance
 from portfolio_manager.trade_execution import get_positions
 
 
@@ -478,3 +479,43 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
     optimal = _make_optimal_portfolio()
     _, close_positions = get_positions(prior_tickers, held_tickers, optimal)
     assert len(close_positions) == expected_close_count
+
+
+# --- run_rebalance: empty predictions ---
+
+
+@patch("portfolio_manager.rebalance.consolidate_predictions")
+@patch(
+    "portfolio_manager.rebalance.get_raw_predictions",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
+@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_equity_details",
+    return_value=pl.DataFrame(),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_historical_prices",
+    return_value=pl.DataFrame(),
+)
+def test_run_rebalance_empty_predictions_returns_200(
+    _mock_hist: MagicMock,
+    _mock_equity: MagicMock,
+    _mock_spy: MagicMock,
+    _mock_predictions: AsyncMock,
+    mock_consolidate: MagicMock,
+) -> None:
+    mock_account = MagicMock()
+    mock_account.cash_amount = 10000.0
+    mock_account.buying_power = 10000.0
+
+    mock_client = MagicMock()
+    mock_client.get_account.return_value = mock_account
+
+    response = asyncio.get_event_loop().run_until_complete(
+        run_rebalance(mock_client)
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    mock_consolidate.assert_not_called()

@@ -7,8 +7,12 @@
 }: let
   awsRegion = "us-east-1";
 
-  fundProfile = builtins.getEnv "FUND_PROFILE";
-  isProd = fundProfile == "production";
+  rawFundProfile = builtins.getEnv "FUND_PROFILE";
+  fundProfile =
+    if rawFundProfile == ""
+    then builtins.throw "FUND_PROFILE is not set. Export it (e.g. 'dev/chris' or 'production') before running devenv."
+    else rawFundProfile;
+  isDeployed = builtins.elem fundProfile ["production" "paper"];
 
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
@@ -298,7 +302,14 @@ in {
     END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
 
     echo "Waiting for data-manager to be healthy..."
+    attempt=0
+    max_attempts=30
     while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
+        exit 1
+      fi
       sleep 2
     done
     echo "Data-manager is healthy"
@@ -434,7 +445,7 @@ in {
       '';
     in {
       data-manager.exec =
-        if isProd
+        if isDeployed
         then ''
           ${killPort "8080"}
           exec secretspec run -- cargo run -p data_manager --release
@@ -446,13 +457,20 @@ in {
 
       ensemble-manager.exec = let
         waitForDataManager = ''
+          attempt=0
+          max_attempts=90
           while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
+              exit 1
+            fi
             sleep 2
           done
         '';
         uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
       in
-        if isProd
+        if isDeployed
         then ''
           ${waitForDataManager}
           ${killPort "8082"}
@@ -468,16 +486,23 @@ in {
 
       portfolio-manager.exec = let
         waitForDeps = ''
-          while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-            sleep 2
-          done
-          while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
-            sleep 2
+          attempt=0
+          max_attempts=90
+          for endpoint in http://localhost:8080/health http://localhost:8082/health; do
+            attempt=0
+            while ! curl -sf "$endpoint" > /dev/null 2>&1; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Dependency $endpoint did not become healthy after $((max_attempts * 2)) seconds"
+                exit 1
+              fi
+              sleep 2
+            done
           done
         '';
         uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
       in
-        if isProd
+        if isDeployed
         then ''
           ${waitForDeps}
           ${killPort "8081"}
@@ -490,7 +515,14 @@ in {
         '';
 
       artifact-watcher.exec = ''
+        attempt=0
+        max_attempts=90
         while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
+          attempt=$((attempt + 1))
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "ensemble-manager did not become healthy after $((max_attempts * 2)) seconds"
+            exit 1
+          fi
           sleep 2
         done
         exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
@@ -507,14 +539,15 @@ in {
 
     scripts.train-local.exec = ''
       set -euo pipefail
+      export CC=clang
       echo "Running local training pipeline"
-      uv run python -m models.tide.train
+      uv run python -m tide.workflow
     '';
 
     scripts.deploy-training.exec = ''
       set -euo pipefail
       echo "Registering Prefect deployment"
-      uv run python -m models.tide.deploy
+      uv run python -m tide.deploy
     '';
   };
 

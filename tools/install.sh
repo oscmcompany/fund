@@ -209,7 +209,7 @@ phase_create_vm() {
 
   if [[ "$vm_exists" == false ]]; then
     echo "Creating VM '$VM_NAME'..."
-    ssh exe.dev new --name="$VM_NAME" || true
+    ssh exe.dev new --name="$VM_NAME"
     echo "VM creation initiated"
   fi
 
@@ -274,6 +274,8 @@ phase_bootstrap() {
   printf '[default]\nregion = %s\noutput = json\n' \
     "$AWS_REGION" \
     | remote "cat > ~/.aws/config"
+
+  remote "chmod 600 ~/.aws/credentials ~/.aws/config"
 
   # Verify -- aws CLI may not be installed yet on a fresh VM, so only
   # check if the files were written. bootstrap-machine will install the
@@ -358,13 +360,6 @@ phase_bootstrap() {
     || fail "bootstrap-machine failed"
 
   echo "Bootstrap complete"
-
-  # --- 3f: Prod-only: start git-sync ---
-  if [[ "$MODE" == "prod" ]]; then
-    step "Starting git-sync on VM"
-    remote "cd ~/fund && nohup tools/git-sync > /var/log/git-sync.log 2>&1 &"
-    echo "git-sync started in background"
-  fi
 }
 
 # --------------------------------------------------------------------------- #
@@ -389,6 +384,14 @@ phase_dropin() {
 
   if [[ $reboot_elapsed -ge $reboot_timeout ]]; then
     fail "Timed out waiting for VM to come back after reboot (${reboot_timeout}s)"
+  fi
+
+  # --- Prod-only: start git-sync after reboot ---
+  if [[ "$MODE" == "prod" ]]; then
+    step "Starting git-sync on VM"
+    remote "mkdir -p ~/logs"
+    remote "cd ~/fund && nohup tools/git-sync > ~/logs/git-sync.log 2>&1 &"
+    echo "git-sync started in background"
   fi
 
   step "Setup complete"

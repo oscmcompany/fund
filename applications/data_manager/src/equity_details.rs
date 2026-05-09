@@ -14,7 +14,7 @@ pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
 
     match read_equity_details_csv_from_s3(&state).await {
         Ok(csv_content) => {
-            let dataframe = match create_equity_details_dataframe(csv_content) {
+            let mut dataframe = match create_equity_details_dataframe(csv_content) {
                 Ok(df) => df,
                 Err(err) => {
                     warn!("Failed to parse equity details CSV: {}", err);
@@ -27,7 +27,7 @@ pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
             };
 
             let mut buffer = Vec::new();
-            if let Err(err) = CsvWriter::new(&mut buffer).finish(&mut dataframe.clone()) {
+            if let Err(err) = CsvWriter::new(&mut buffer).finish(&mut dataframe) {
                 warn!("Failed to serialize equity details DataFrame: {}", err);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -36,7 +36,17 @@ pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
                     .into_response();
             }
 
-            let csv_output = String::from_utf8_lossy(&buffer).to_string();
+            let csv_output = match String::from_utf8(buffer) {
+                Ok(s) => s,
+                Err(err) => {
+                    warn!("Equity details CSV output is not valid UTF-8: {}", err);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to serialize equity details: invalid UTF-8",
+                    )
+                        .into_response();
+                }
+            };
             let mut response = csv_output.into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
