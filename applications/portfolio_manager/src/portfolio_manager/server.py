@@ -140,11 +140,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/portfolio")
 async def create_portfolio() -> Response:
-    try:
-        await asyncio.wait_for(_rebalance_lock.acquire(), timeout=0)
-    except TimeoutError:
+    if _rebalance_lock.locked():
         return Response(status_code=status.HTTP_409_CONFLICT)
-    try:
+    async with _rebalance_lock:
         return await run_rebalance(application.state.alpaca_client)
-    finally:
-        _rebalance_lock.release()

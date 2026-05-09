@@ -179,10 +179,9 @@ def test_lifespan_initializes_client_and_scheduler() -> None:
 
 def test_create_portfolio_returns_conflict_when_lock_held() -> None:
     async def run() -> Response:
-        with patch(
-            "portfolio_manager.server.asyncio.wait_for",
-            AsyncMock(side_effect=TimeoutError),
-        ):
+        lock = asyncio.Lock()
+        await lock.acquire()
+        with patch("portfolio_manager.server._rebalance_lock", lock):
             return await create_portfolio()
 
     response = asyncio.run(run())
@@ -195,20 +194,13 @@ def test_create_portfolio_calls_run_rebalance() -> None:
     mock_response = MagicMock(spec=Response)
     mock_response.status_code = status.HTTP_200_OK
     mock_run = AsyncMock(return_value=mock_response)
-    mock_lock = MagicMock()
-    mock_lock.release = MagicMock()
 
     application.state.alpaca_client = mock_alpaca
 
     async def run() -> Response:
-        # Patch wait_for to simulate a successful lock acquisition so we can verify
-        # that run_rebalance is called and the lock is released in the finally block.
+        lock = asyncio.Lock()
         with (
-            patch(
-                "portfolio_manager.server.asyncio.wait_for",
-                AsyncMock(return_value=True),
-            ),
-            patch("portfolio_manager.server._rebalance_lock", mock_lock),
+            patch("portfolio_manager.server._rebalance_lock", lock),
             patch("portfolio_manager.server.run_rebalance", mock_run),
         ):
             return await create_portfolio()
@@ -217,4 +209,3 @@ def test_create_portfolio_calls_run_rebalance() -> None:
 
     assert response.status_code == status.HTTP_200_OK
     mock_run.assert_called_once_with(mock_alpaca)
-    mock_lock.release.assert_called_once()
