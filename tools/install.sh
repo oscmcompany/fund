@@ -16,6 +16,7 @@ AWS_ACCESS_KEY=""
 AWS_SECRET_KEY=""
 AWS_REGION=""
 VM_TAGS=()
+VM_BRANCH=""
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -154,6 +155,10 @@ phase_collect() {
     done
   fi
 
+  # Branch
+  echo ""
+  VM_BRANCH="$(prompt "Branch" "master")"
+
   # Summary
   echo ""
   echo "--- Configuration Summary ---"
@@ -168,6 +173,7 @@ phase_collect() {
   else
     echo "  Profile:    production"
   fi
+  echo "  Branch:     $VM_BRANCH"
   echo "  Tags:       ${VM_TAGS[*]}"
   echo "-----------------------------"
   echo ""
@@ -306,8 +312,8 @@ phase_bootstrap() {
   step "Cloning repository on VM"
 
   if remote "test -d ~/fund/.git" 2>/dev/null; then
-    echo "Repository already cloned, pulling latest..."
-    remote "cd ~/fund && git pull"
+    echo "Repository already cloned, fetching latest..."
+    remote "cd ~/fund && git fetch --all"
   else
     echo "Cloning oscmcompany/fund..."
     remote "gh repo clone oscmcompany/fund ~/fund"
@@ -317,7 +323,13 @@ phase_bootstrap() {
   if ! remote "test -d ~/fund/.git" 2>/dev/null; then
     fail "Repository clone verification failed"
   fi
-  echo "Repository ready"
+
+  # Checkout branch
+  if [[ "$VM_BRANCH" != "master" ]]; then
+    echo "Checking out branch $VM_BRANCH..."
+    remote "cd ~/fund && git checkout $VM_BRANCH"
+  fi
+  echo "Repository ready (branch: $VM_BRANCH)"
 
   # --- 3d: Create .envrc ---
   step "Creating .envrc on VM"
@@ -333,14 +345,7 @@ phase_bootstrap() {
     echo "Created dev/$DEV_NAME .envrc"
   fi
 
-  # --- 3e: Sync local tools/ to VM ---
-  step "Syncing tools/ to VM"
-  scp -r -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-    "$SCRIPT_DIR/"* "$VM_NAME.exe.xyz:~/fund/tools/"
-  remote "chmod +x ~/fund/tools/bootstrap-machine ~/fund/tools/create-dev-buckets ~/fund/tools/git-sync"
-  echo "Copied local tools/ to VM"
-
-  # --- 3f: Run bootstrap-machine ---
+  # --- 3e: Run bootstrap-machine ---
   step "Running bootstrap-machine on VM (this will take a while)"
 
   local bootstrap_args="--noninteractive"
