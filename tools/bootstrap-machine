@@ -119,7 +119,52 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Install secretspec (secrets management for devenv services)
+# 3. Install direnv (auto-loads .envrc via devenv integration)
+# --------------------------------------------------------------------------- #
+step "Checking direnv installation"
+
+if command -v direnv &>/dev/null; then
+  echo "direnv is already installed, skipping"
+else
+  echo "Installing direnv..."
+  nix profile add nixpkgs#direnv
+  echo "direnv installed successfully"
+fi
+
+# Hook direnv into the shell
+SHELL_NAME="$(basename "$SHELL")"
+case "$SHELL_NAME" in
+  bash)
+    SHELL_RC="$HOME/.bashrc"
+    HOOK='eval "$(direnv hook bash)"'
+    ;;
+  zsh)
+    SHELL_RC="$HOME/.zshrc"
+    HOOK='eval "$(direnv hook zsh)"'
+    ;;
+  *)
+    SHELL_RC=""
+    HOOK=""
+    echo "Warning: unsupported shell '$SHELL_NAME' for direnv hook, add manually"
+    ;;
+esac
+
+if [[ -n "$SHELL_RC" ]]; then
+  if ! grep -qF 'direnv hook' "$SHELL_RC" 2>/dev/null; then
+    echo "$HOOK" >> "$SHELL_RC"
+    echo "Added direnv hook to $SHELL_RC"
+  else
+    echo "direnv hook already in $SHELL_RC"
+  fi
+fi
+
+# Allow .envrc in the repo so direnv loads it automatically
+if [[ -f "$REPO_ROOT/.envrc" ]]; then
+  direnv allow "$REPO_ROOT" 2>/dev/null || true
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. Install secretspec (secrets management for devenv services)
 # --------------------------------------------------------------------------- #
 step "Checking secretspec installation"
 
@@ -132,7 +177,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 4. Install AWS CLI (needed before devenv shell for secretspec)
+# 5. Install AWS CLI (needed before devenv shell for secretspec)
 # --------------------------------------------------------------------------- #
 step "Checking AWS CLI installation"
 
@@ -164,7 +209,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. Configure AWS credentials (required for secretspec provider)
+# 6. Configure AWS credentials (required for secretspec provider)
 # --------------------------------------------------------------------------- #
 step "Checking AWS credentials"
 
@@ -189,7 +234,7 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 6. Create .envrc with FUND_PROFILE
+# 7. Create .envrc with FUND_PROFILE
 # --------------------------------------------------------------------------- #
 ENVRC="$REPO_ROOT/.envrc"
 
@@ -223,18 +268,21 @@ ENVRC_EOF
   fi
 
   step "Ensuring dev S3 buckets exist"
-  "$REPO_ROOT/tools/create-dev-buckets" "dev/chris"
+  # shellcheck disable=SC1090
+  source "$ENVRC"
+  "$REPO_ROOT/tools/create-dev-buckets" "${FUND_PROFILE:-dev/chris}"
 fi
 
 # --------------------------------------------------------------------------- #
-# 7. Create log directory
+# 8. Create log directory
 # --------------------------------------------------------------------------- #
 step "Creating log directory"
-mkdir -p /var/log/fund
+sudo mkdir -p /var/log/fund
+sudo chown "$(whoami)" /var/log/fund
 echo "Created /var/log/fund"
 
 # --------------------------------------------------------------------------- #
-# 8. Build the devenv environment
+# 9. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -243,7 +291,7 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 9. Prod mode: validate secrets
+# 10. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
   echo "Validating secrets via secretspec..."

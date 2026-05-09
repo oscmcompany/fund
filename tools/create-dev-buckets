@@ -14,7 +14,7 @@ ARTIFACTS_BUCKET="fund-${SLUG}-model-artifacts"
 
 create_bucket() {
   local bucket="$1"
-  if aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+  if aws s3api head-bucket --bucket "$bucket" &>/dev/null; then
     echo "Bucket $bucket already exists, skipping"
   else
     echo "Creating bucket $bucket"
