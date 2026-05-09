@@ -125,7 +125,8 @@ in {
     echo "  Data:      $AWS_S3_DATA_BUCKET_NAME"
     echo "  Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
     echo ""
-    aws s3 ls | grep fund || echo "No fund buckets found"
+    buckets=$(aws s3 ls)
+    printf '%s\n' "$buckets" | grep fund || echo "No fund buckets found"
   '';
 
   scripts.aws-secrets.exec = ''
@@ -269,7 +270,7 @@ in {
   scripts.nix-lint.exec = ''
     set -euo pipefail
     echo "Linting Nix files"
-    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target .
+    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target --exclude ./models/tide/.devenv .
     echo "Nix lint check passed"
   '';
 

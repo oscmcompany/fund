@@ -245,6 +245,23 @@ fn test_create_predictions_dataframe_uppercase_normalization() {
 }
 
 #[test]
+fn test_create_predictions_dataframe_whitespace_trimming() {
+    initialize_test_tracing();
+    let predictions = vec![Prediction {
+        ticker: "  AAPL  ".to_string(),
+        timestamp: 1234567890000,
+        quantile_10: 95.0,
+        quantile_50: 100.0,
+        quantile_90: 105.0,
+    }];
+
+    let df = create_predictions_dataframe(predictions).unwrap();
+
+    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(ticker, "AAPL");
+}
+
+#[test]
 fn test_create_predictions_dataframe_deduplication() {
     initialize_test_tracing();
     let predictions = vec![
@@ -380,6 +397,31 @@ fn test_create_portfolio_dataframe_uppercase_normalization() {
 
     let action = df.column("action").unwrap().str().unwrap().get(0).unwrap();
     assert_eq!(action, "SELL");
+}
+
+#[test]
+fn test_create_portfolio_dataframe_whitespace_trimming() {
+    initialize_test_tracing();
+    let portfolios = vec![Portfolio {
+        ticker: "  AAPL  ".to_string(),
+        timestamp: 1234567890000,
+        side: "  long  ".to_string(),
+        dollar_amount: 10000.0,
+        action: "  buy  ".to_string(),
+        pair_id: "  AAPL-GOOGL  ".to_string(),
+        entry_price: Some(150.0),
+    }];
+
+    let df = create_portfolio_dataframe(portfolios).unwrap();
+
+    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(ticker, "AAPL");
+
+    let side = df.column("side").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(side, "LONG");
+
+    let action = df.column("action").unwrap().str().unwrap().get(0).unwrap();
+    assert_eq!(action, "BUY");
 }
 
 #[test]

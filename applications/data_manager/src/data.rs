@@ -175,8 +175,18 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
             .str()
             .to_uppercase()
             .alias("ticker")])
-        .with_columns([col("side").str().to_uppercase().alias("side")])
-        .with_columns([col("action").str().to_uppercase().alias("action")])
+        .with_columns([col("side")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("side")])
+        .with_columns([col("action")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("action")])
         .collect()?;
 
     info!(
@@ -262,7 +272,12 @@ pub fn create_closed_pair_dataframe(rows: Vec<ClosedPair>) -> Result<DataFrame, 
     debug!("Normalizing pair_id, long_ticker, and short_ticker columns: trimming whitespace and converting to uppercase");
     let dataframe = dataframe
         .lazy()
-        .with_columns([col("pair_id").str().to_uppercase().alias("pair_id")])
+        .with_columns([col("pair_id")
+            .str()
+            .strip_chars(lit(NULL))
+            .str()
+            .to_uppercase()
+            .alias("pair_id")])
         .with_columns([col("long_ticker")
             .str()
             .strip_chars(lit(NULL))

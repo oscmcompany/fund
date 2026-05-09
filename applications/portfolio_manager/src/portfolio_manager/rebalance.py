@@ -311,7 +311,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
 
 async def get_raw_predictions() -> pl.DataFrame:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
             url=f"{ENSEMBLE_MANAGER_BASE_URL}/predictions",
         )

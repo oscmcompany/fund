@@ -1,10 +1,14 @@
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
+
+import botocore.exceptions
+import pytest
 
 from tools.artifact_watcher import (
     get_latest_artifact_key,
     read_last_key,
     restart_ensemble_manager,
+    run,
     write_last_key,
 )
 
@@ -79,3 +83,173 @@ def test_restart_ensemble_manager_no_process() -> None:
         with patch("tools.artifact_watcher.os.kill") as mock_kill:
             restart_ensemble_manager()
             mock_kill.assert_not_called()
+
+
+def test_get_latest_artifact_key_skips_client_error_folders() -> None:
+    mock_s3 = MagicMock()
+    mock_paginator = MagicMock()
+    mock_paginator.paginate.return_value = [
+        {
+            "CommonPrefixes": [
+                {"Prefix": "artifacts/tide/2026-01-01/"},
+                {"Prefix": "artifacts/tide/2026-02-01/"},
+            ]
+        }
+    ]
+    mock_s3.get_paginator.return_value = mock_paginator
+    error_response = {"Error": {"Code": "404", "Message": "Not Found"}}
+    mock_s3.head_object.side_effect = [
+        botocore.exceptions.ClientError(error_response, "HeadObject"),
+        {},
+    ]
+
+    with patch("tools.artifact_watcher.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        result = get_latest_artifact_key(
+            bucket="test-bucket",
+            prefix="artifacts/tide/",
+        )
+
+    assert result == "artifacts/tide/2026-01-01/output/model.tar.gz"
+
+
+def test_get_latest_artifact_key_all_folders_error() -> None:
+    mock_s3 = MagicMock()
+    mock_paginator = MagicMock()
+    mock_paginator.paginate.return_value = [
+        {"CommonPrefixes": [{"Prefix": "artifacts/tide/2026-01-01/"}]}
+    ]
+    mock_s3.get_paginator.return_value = mock_paginator
+    error_response = {"Error": {"Code": "404", "Message": "Not Found"}}
+    mock_s3.head_object.side_effect = botocore.exceptions.ClientError(
+        error_response, "HeadObject"
+    )
+
+    with patch("tools.artifact_watcher.boto3") as mock_boto3:
+        mock_boto3.client.return_value = mock_s3
+        result = get_latest_artifact_key(
+            bucket="test-bucket",
+            prefix="artifacts/tide/",
+        )
+
+    assert result is None
+
+
+def test_run_exits_when_bucket_not_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", raising=False)
+
+    run()
+
+
+@patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
+@patch("tools.artifact_watcher.get_latest_artifact_key", return_value=None)
+@patch("tools.artifact_watcher.read_last_key", return_value=None)
+def test_run_no_artifacts_found(
+    mock_read: MagicMock,
+    mock_get: MagicMock,
+    mock_sleep: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
+
+    with pytest.raises(StopIteration):
+        run()
+
+    mock_get.assert_called_once()
+
+
+@patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
+@patch("tools.artifact_watcher.write_last_key")
+@patch(
+    "tools.artifact_watcher.get_latest_artifact_key",
+    return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
+)
+@patch("tools.artifact_watcher.read_last_key", return_value=None)
+def test_run_initial_artifact_detected(
+    mock_read: MagicMock,
+    mock_get: MagicMock,
+    mock_write: MagicMock,
+    mock_sleep: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
+
+    with pytest.raises(StopIteration):
+        run()
+
+    mock_write.assert_called_once_with(
+        "artifacts/tide/2026-01-01/output/model.tar.gz"
+    )
+
+
+@patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
+@patch("tools.artifact_watcher.restart_ensemble_manager")
+@patch("tools.artifact_watcher.write_last_key")
+@patch(
+    "tools.artifact_watcher.get_latest_artifact_key",
+    return_value="artifacts/tide/2026-02-01/output/model.tar.gz",
+)
+@patch(
+    "tools.artifact_watcher.read_last_key",
+    return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
+)
+def test_run_new_artifact_triggers_restart(
+    mock_read: MagicMock,
+    mock_get: MagicMock,
+    mock_write: MagicMock,
+    mock_restart: MagicMock,
+    mock_sleep: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
+
+    with pytest.raises(StopIteration):
+        run()
+
+    mock_restart.assert_called_once()
+    mock_write.assert_called_once_with(
+        "artifacts/tide/2026-02-01/output/model.tar.gz"
+    )
+
+
+@patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
+@patch("tools.artifact_watcher.write_last_key")
+@patch(
+    "tools.artifact_watcher.get_latest_artifact_key",
+    return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
+)
+@patch(
+    "tools.artifact_watcher.read_last_key",
+    return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
+)
+def test_run_same_artifact_no_action(
+    mock_read: MagicMock,
+    mock_get: MagicMock,
+    mock_write: MagicMock,
+    mock_sleep: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
+
+    with pytest.raises(StopIteration):
+        run()
+
+    mock_write.assert_not_called()
+
+
+@patch("tools.artifact_watcher.time.sleep", side_effect=[None, StopIteration])
+@patch(
+    "tools.artifact_watcher.get_latest_artifact_key",
+    side_effect=RuntimeError("S3 error"),
+)
+@patch("tools.artifact_watcher.read_last_key", return_value=None)
+def test_run_handles_exception_in_poll(
+    mock_read: MagicMock,
+    mock_get: MagicMock,
+    mock_sleep: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
+
+    with pytest.raises(StopIteration):
+        run()
