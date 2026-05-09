@@ -10,7 +10,7 @@
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
   fundProfile =
     if rawFundProfile == ""
-    then builtins.throw "FUND_PROFILE is not set. Export it (e.g. 'dev/chris' or 'production') before running devenv."
+    then "development"
     else rawFundProfile;
   isDeployed = builtins.elem fundProfile ["production" "paper"];
 
