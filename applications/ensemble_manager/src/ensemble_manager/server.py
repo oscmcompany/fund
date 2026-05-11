@@ -497,7 +497,9 @@ def parse_responses(
 
     equity_details_data = pl.read_csv(io.BytesIO(equity_details_response.content))
     equity_details_data = equity_details_data.with_columns(
-        pl.col(col).str.strip_chars() for col in equity_details_data.columns if equity_details_data[col].dtype == pl.String
+        pl.col(col).str.strip_chars()
+        for col in equity_details_data.columns
+        if equity_details_data[col].dtype == pl.String
     )
 
     equity_details_validated = equity_details_schema.validate(equity_details_data)

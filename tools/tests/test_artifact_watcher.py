@@ -1,10 +1,9 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import botocore.exceptions
 import pytest
-
 from tools.artifact_watcher import (
     get_latest_artifact_key,
     read_last_key,
@@ -13,9 +12,10 @@ from tools.artifact_watcher import (
     write_last_key,
 )
 
-CLIENT_ERROR_RESPONSE: dict[str, Any] = {
-    "Error": {"Code": "404", "Message": "Not Found"},
-}
+CLIENT_ERROR_RESPONSE = cast(
+    "Any",
+    {"Error": {"Code": "404", "Message": "Not Found"}},
+)
 
 
 def test_get_latest_artifact_key_returns_latest() -> None:
@@ -103,9 +103,7 @@ def test_get_latest_artifact_key_skips_client_error_folders() -> None:
     ]
     mock_s3.get_paginator.return_value = mock_paginator
     mock_s3.head_object.side_effect = [
-        botocore.exceptions.ClientError(
-            CLIENT_ERROR_RESPONSE, "HeadObject"
-        ),
+        botocore.exceptions.ClientError(CLIENT_ERROR_RESPONSE, "HeadObject"),
         {},
     ]
 
@@ -143,9 +141,7 @@ def test_get_latest_artifact_key_all_folders_error() -> None:
 def test_run_exits_when_bucket_not_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(
-        "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", raising=False
-    )
+    monkeypatch.delenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", raising=False)
     run()
 
 
@@ -156,9 +152,9 @@ def test_run_exits_when_bucket_not_set(
 )
 @patch("tools.artifact_watcher.read_last_key", return_value=None)
 def test_run_no_artifacts_found(
-    _mock_read: MagicMock,
+    _mock_read: MagicMock,  # noqa: PT019
     mock_get: MagicMock,
-    _mock_sleep: MagicMock,
+    _mock_sleep: MagicMock,  # noqa: PT019
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
@@ -177,10 +173,10 @@ def test_run_no_artifacts_found(
 )
 @patch("tools.artifact_watcher.read_last_key", return_value=None)
 def test_run_initial_artifact_detected(
-    _mock_read: MagicMock,
-    _mock_get: MagicMock,
+    _mock_read: MagicMock,  # noqa: PT019
+    _mock_get: MagicMock,  # noqa: PT019
     mock_write: MagicMock,
-    _mock_sleep: MagicMock,
+    _mock_sleep: MagicMock,  # noqa: PT019
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
@@ -188,9 +184,7 @@ def test_run_initial_artifact_detected(
     with pytest.raises(StopIteration):
         run()
 
-    mock_write.assert_called_once_with(
-        "artifacts/tide/2026-01-01/output/model.tar.gz"
-    )
+    mock_write.assert_called_once_with("artifacts/tide/2026-01-01/output/model.tar.gz")
 
 
 @patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
@@ -204,12 +198,12 @@ def test_run_initial_artifact_detected(
     "tools.artifact_watcher.read_last_key",
     return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
 )
-def test_run_new_artifact_triggers_restart(  # noqa: PLR0913
-    _mock_read: MagicMock,
-    _mock_get: MagicMock,
+def test_run_new_artifact_triggers_restart(
+    _mock_read: MagicMock,  # noqa: PT019
+    _mock_get: MagicMock,  # noqa: PT019
     mock_write: MagicMock,
     mock_restart: MagicMock,
-    _mock_sleep: MagicMock,
+    _mock_sleep: MagicMock,  # noqa: PT019
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
@@ -218,9 +212,7 @@ def test_run_new_artifact_triggers_restart(  # noqa: PLR0913
         run()
 
     mock_restart.assert_called_once()
-    mock_write.assert_called_once_with(
-        "artifacts/tide/2026-02-01/output/model.tar.gz"
-    )
+    mock_write.assert_called_once_with("artifacts/tide/2026-02-01/output/model.tar.gz")
 
 
 @patch("tools.artifact_watcher.time.sleep", side_effect=StopIteration)
@@ -234,10 +226,10 @@ def test_run_new_artifact_triggers_restart(  # noqa: PLR0913
     return_value="artifacts/tide/2026-01-01/output/model.tar.gz",
 )
 def test_run_same_artifact_no_action(
-    _mock_read: MagicMock,
-    _mock_get: MagicMock,
+    _mock_read: MagicMock,  # noqa: PT019
+    _mock_get: MagicMock,  # noqa: PT019
     mock_write: MagicMock,
-    _mock_sleep: MagicMock,
+    _mock_sleep: MagicMock,  # noqa: PT019
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")
@@ -258,9 +250,9 @@ def test_run_same_artifact_no_action(
 )
 @patch("tools.artifact_watcher.read_last_key", return_value=None)
 def test_run_handles_exception_in_poll(
-    _mock_read: MagicMock,
-    _mock_get: MagicMock,
-    _mock_sleep: MagicMock,
+    _mock_read: MagicMock,  # noqa: PT019
+    _mock_get: MagicMock,  # noqa: PT019
+    _mock_sleep: MagicMock,  # noqa: PT019
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME", "test-bucket")

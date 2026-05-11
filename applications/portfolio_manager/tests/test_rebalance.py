@@ -5,13 +5,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import polars as pl
 import pytest
+from fastapi import status
 from portfolio_manager.portfolio_state import (
     _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
     get_prior_portfolio,
 )
-from fastapi import status
-from portfolio_manager.rebalance import _prune_pairs_with_invalid_entry_price, run_rebalance
+from portfolio_manager.rebalance import (
+    _prune_pairs_with_invalid_entry_price,
+    run_rebalance,
+)
 from portfolio_manager.trade_execution import get_positions
 
 
@@ -500,10 +503,10 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
     return_value=pl.DataFrame(),
 )
 def test_run_rebalance_empty_predictions_returns_200(
-    _mock_hist: MagicMock,
-    _mock_equity: MagicMock,
-    _mock_spy: MagicMock,
-    _mock_predictions: AsyncMock,
+    _mock_hist: MagicMock,  # noqa: PT019
+    _mock_equity: MagicMock,  # noqa: PT019
+    _mock_spy: MagicMock,  # noqa: PT019
+    _mock_predictions: AsyncMock,  # noqa: PT019
     mock_consolidate: MagicMock,
 ) -> None:
     mock_account = MagicMock()
@@ -513,9 +516,7 @@ def test_run_rebalance_empty_predictions_returns_200(
     mock_client = MagicMock()
     mock_client.get_account.return_value = mock_account
 
-    response = asyncio.get_event_loop().run_until_complete(
-        run_rebalance(mock_client)
-    )
+    response = asyncio.run(run_rebalance(mock_client))
 
     assert response.status_code == status.HTTP_200_OK
     mock_consolidate.assert_not_called()

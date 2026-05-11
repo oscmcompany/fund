@@ -431,7 +431,7 @@ class Data:
             "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
 
-    def get_dataset(  # noqa: C901
+    def get_dataset(  # noqa: C901, PLR0915
         self,
         data_type: str = "train",
         validation_split: float = 0.8,
