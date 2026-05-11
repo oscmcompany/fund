@@ -6,13 +6,12 @@ import os
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import requests
-import sentry_sdk
 import structlog
 from alpaca.common.exceptions import APIError
 from fastapi import FastAPI, Response, status
-from sentry_sdk.integrations.logging import LoggingIntegration
 
 from .alpaca_client import AlpacaClient
 from .metrics import (
@@ -25,23 +24,19 @@ logging.basicConfig(
     level=logging.INFO, stream=sys.stdout, format="%(message)s", force=True
 )
 
-sentry_sdk.init(
-    dsn=os.environ.get("SENTRY_DSN"),
-    environment=os.environ.get("FUND_ENVIRONMENT", "development"),
-    traces_sample_rate=1.0,
-    profiles_sample_rate=1.0,
-    enable_tracing=True,
-    propagate_traces=True,
-    integrations=[
-        LoggingIntegration(
-            level=None,
-            event_level=logging.WARNING,
-        ),
-    ],
-)
+try:
+    _error_log_path = Path("/var/log/fund/portfolio-manager-errors.log")
+    _error_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _error_file_handler = logging.FileHandler(_error_log_path)
+    _error_file_handler.setLevel(logging.ERROR)
+    _error_file_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(_error_file_handler)
+except OSError:
+    pass
 
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
@@ -50,6 +45,10 @@ structlog.configure(
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
     cache_logger_on_first_use=True,
+)
+
+structlog.contextvars.bind_contextvars(
+    fund_profile=os.environ.get("FUND_PROFILE", "unknown")
 )
 
 logger = structlog.get_logger()
@@ -141,11 +140,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/portfolio")
 async def create_portfolio() -> Response:
-    try:
-        await asyncio.wait_for(_rebalance_lock.acquire(), timeout=0)
-    except TimeoutError:
+    if _rebalance_lock.locked():
         return Response(status_code=status.HTTP_409_CONFLICT)
-    try:
+    async with _rebalance_lock:
         return await run_rebalance(application.state.alpaca_client)
-    finally:
-        _rebalance_lock.release()

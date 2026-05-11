@@ -7,3 +7,8 @@ inputs:
         follows: nixpkgs
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
+
+secretspec:
+  enable: true
+  provider: awssm
+  profile: dev/chris

@@ -373,17 +373,23 @@ class Data:
         for column, mapping in self.mappings.items():
             unknown_values = set(data[column].unique().to_list()) - set(mapping)
             if unknown_values:
-                message = (
-                    f"Unknown categories for column '{column}': "
-                    f"{sorted(unknown_values)}"
+                logger.warning(
+                    "Filtering rows with unknown categories",
+                    column=column,
+                    unknown_values=sorted(v for v in unknown_values if v is not None),
                 )
-                raise ValueError(message)
+                data = data.filter(pl.col(column).is_in(list(mapping)))
 
             data = data.with_columns(
                 pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
             )
 
         self.data = data
+        logger.info(
+            "Preprocessing complete",
+            remaining_rows=data.height,
+            remaining_tickers=data["ticker"].n_unique(),
+        )
 
     def _get_training_and_validation_data(
         self,
@@ -425,7 +431,7 @@ class Data:
             "static_continuous_features": 0,  # not using static_continuous_features for now  # noqa: E501
         }
 
-    def get_dataset(  # noqa: C901
+    def get_dataset(  # noqa: C901, PLR0915
         self,
         data_type: str = "train",
         validation_split: float = 0.8,
@@ -446,6 +452,32 @@ class Data:
             )
         elif data_type == "predict":
             self.batch_data = self._get_prediction_data(input_length + output_length)
+
+        logger.info(
+            "Batch data prepared",
+            data_type=data_type,
+            batch_rows=self.batch_data.height,
+            batch_tickers=self.batch_data["ticker"].n_unique(),
+            input_length=input_length,
+            output_length=output_length,
+        )
+
+        has_targets = data_type in {"train", "validate"}
+        n_cont = len(self.continuous_columns)
+        n_cat = len(self.categorical_columns)
+        n_static = len(self.static_categorical_columns)
+
+        if self.batch_data.is_empty():
+            logger.error("Batch data is empty after preparation")
+            return TrainingDataset(
+                past_continuous=np.zeros((0, input_length, n_cont), dtype=np.float32),
+                past_categorical=np.zeros((0, input_length, n_cat), dtype=np.int32),
+                future_categorical=np.zeros((0, output_length, n_cat), dtype=np.int32),
+                static_categorical=np.zeros((0, 1, n_static), dtype=np.int32),
+                targets=None
+                if not has_targets
+                else np.zeros((0, output_length, 1), dtype=np.float32),
+            )
 
         minimum_date: date = self.batch_data.select(
             self.batch_data["date"].min()
@@ -468,7 +500,6 @@ class Data:
         all_future_categorical: list[np.ndarray] = []
         all_static_categorical: list[np.ndarray] = []
         all_targets: list[np.ndarray] = []
-        has_targets = data_type in {"train", "validate"}
 
         logger.info("Partitioning data by ticker")
         ticker_groups = self.batch_data.sort("time_idx").partition_by(
@@ -503,6 +534,12 @@ class Data:
             num_windows = num_rows - input_length - output_length + 1
 
             if num_windows <= 0:
+                logger.debug(
+                    "Skipping ticker with insufficient rows",
+                    ticker=ticker_df["ticker"][0],
+                    num_rows=num_rows,
+                    required=input_length + output_length,
+                )
                 continue
 
             window_indices = (
@@ -529,10 +566,6 @@ class Data:
         logger.info(
             "Sample collection complete", total_samples=len(all_past_continuous)
         )
-
-        n_cont = len(self.continuous_columns)
-        n_cat = len(self.categorical_columns)
-        n_static = len(self.static_categorical_columns)
 
         if not all_past_continuous:
             return TrainingDataset(

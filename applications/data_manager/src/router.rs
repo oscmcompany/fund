@@ -9,7 +9,6 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sentry_tower::SentryHttpLayer;
 use tower_http::trace::TraceLayer;
 
 pub async fn create_app() -> Router {
@@ -40,5 +39,4 @@ pub fn create_app_with_state(state: State) -> Router {
         )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
-        .layer(SentryHttpLayer::new().enable_transaction())
 }

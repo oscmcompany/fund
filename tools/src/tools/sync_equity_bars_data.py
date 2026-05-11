@@ -1,6 +1,5 @@
 import json
 import sys
-import time
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -111,10 +110,6 @@ def sync_equity_bars_data(
             logger.exception("HTTP request failed", error=f"{e}")
 
         current_date += timedelta(days=1)
-
-        if current_date <= end_date:
-            logger.info("Waiting 15 seconds before next request")
-            time.sleep(15)
 
     logger.info("All dates processed", total_requests=request_count)
 

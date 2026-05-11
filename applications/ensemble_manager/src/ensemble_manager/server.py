@@ -13,13 +13,11 @@ from typing import TYPE_CHECKING, cast
 import boto3
 import polars as pl
 import requests
-import sentry_sdk
 import structlog
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
 from internal.equity_bars_schema import equity_bars_schema
 from internal.timestamps import to_timestamp_milliseconds
-from sentry_sdk.integrations.logging import LoggingIntegration
 
 if TYPE_CHECKING:
     from mypy_boto3_s3 import S3Client
@@ -41,23 +39,19 @@ from .metrics import (
 from .predictions_schema import predictions_schema
 from .preprocess import filter_equity_bars, filter_to_trained_tickers
 
-sentry_sdk.init(
-    dsn=os.environ.get("SENTRY_DSN"),
-    environment=os.environ.get("FUND_ENVIRONMENT", "development"),
-    traces_sample_rate=1.0,
-    profiles_sample_rate=1.0,
-    enable_tracing=True,
-    propagate_traces=True,
-    integrations=[
-        LoggingIntegration(
-            level=None,
-            event_level=logging.WARNING,
-        ),
-    ],
-)
+try:
+    _error_log_path = Path("/var/log/fund/ensemble-manager-errors.log")
+    _error_log_path.parent.mkdir(parents=True, exist_ok=True)
+    _error_file_handler = logging.FileHandler(_error_log_path)
+    _error_file_handler.setLevel(logging.ERROR)
+    _error_file_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(_error_file_handler)
+except OSError:
+    pass
 
 structlog.configure(
     processors=[
+        structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.processors.JSONRenderer(),
@@ -68,13 +62,15 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 
+structlog.contextvars.bind_contextvars(
+    fund_profile=os.environ.get("FUND_PROFILE", "unknown")
+)
+
 logger = structlog.get_logger()
 
 DATA_MANAGER_BASE_URL = os.getenv(
     "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
-_environment = os.environ.get("FUND_ENVIRONMENT", "development")
-MODEL_VERSION_SSM_PARAMETER = f"/fund/{_environment}/ensemble-manager/model-version"
 
 
 def find_latest_artifact_key(
@@ -88,6 +84,9 @@ def find_latest_artifact_key(
     E.g., artifacts/tide/2026-03-19-21-28-12-557/
     Only considers folders that contain output/model.tar.gz.
     """
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
+
     logger.info("listing_artifact_folders", bucket=bucket, prefix=prefix)
 
     paginator = s3_client.get_paginator("list_objects_v2")
@@ -177,20 +176,11 @@ def _resolve_artifact_key(
     bucket: str,
     artifact_path: str,
 ) -> str:
-    """Resolve the model artifact S3 key using SSM Parameter Store."""
-    try:
-        ssm_client = boto3.client("ssm")
-        response = ssm_client.get_parameter(
-            Name=MODEL_VERSION_SSM_PARAMETER,
-            WithDecryption=True,
-        )
-        model_version = response["Parameter"]["Value"]
-    except ClientError:
-        logger.exception("SSM parameter not available, using default artifact path")
-        model_version = "latest"
+    """Resolve the model artifact S3 key."""
+    model_version = os.environ.get("MODEL_VERSION", "latest")
 
     if model_version != "latest":
-        logger.info("Using model version from SSM", model_version=model_version)
+        logger.info("Using model version from environment", model_version=model_version)
         if model_version.endswith(".tar.gz"):
             return model_version
         return f"{artifact_path.rstrip('/')}/{model_version}/output/model.tar.gz"
@@ -217,7 +207,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
 
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
-    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
     model_directory = "."
 
     if bucket:
@@ -506,6 +496,11 @@ def parse_responses(
     filtered_tickers = equity_bars_data["ticker"].n_unique()
 
     equity_details_data = pl.read_csv(io.BytesIO(equity_details_response.content))
+    equity_details_data = equity_details_data.with_columns(
+        pl.col(col).str.strip_chars()
+        for col in equity_details_data.columns
+        if equity_details_data[col].dtype == pl.String
+    )
 
     equity_details_validated = equity_details_schema.validate(equity_details_data)
     equity_details_data = cast(

@@ -40,7 +40,7 @@ jobs:
           key: uv-${{ hashFiles('**/pyproject.toml', 'uv.lock') }}
           restore-keys: uv-
       - name: Run all CI checks
-        run: devenv tasks run --mode before checks:ci
+        run: devenv --secretspec-provider env --secretspec-profile development tasks run --mode before checks:ci
       - name: Upload Rust coverage to Coveralls
         if: hashFiles('.coverage_output/rust.xml') != ''
         uses: coverallsapp/github-action@v2

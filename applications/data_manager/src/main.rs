@@ -1,7 +1,6 @@
-use data_manager::startup::{initialize_sentry, initialize_tracing, run_server};
+use data_manager::startup::{initialize_tracing, run_server};
 
 async fn run_with_bind_address(bind_address: &str) -> i32 {
-    let _sentry_guard = initialize_sentry();
     initialize_tracing().expect("Failed to initialize tracing");
 
     handle_server_result(run_server(bind_address).await)
@@ -52,8 +51,6 @@ mod tests {
             std::env::set_var("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
-            std::env::set_var("SENTRY_DSN", "");
-            std::env::set_var("FUND_ENVIRONMENT", "test");
             std::env::set_var("RUST_LOG", "data_manager=debug,tower_http=debug");
         }
 
@@ -65,8 +62,6 @@ mod tests {
             std::env::remove_var("AWS_S3_DATA_BUCKET_NAME");
             std::env::remove_var("MASSIVE_BASE_URL");
             std::env::remove_var("MASSIVE_API_KEY");
-            std::env::remove_var("SENTRY_DSN");
-            std::env::remove_var("FUND_ENVIRONMENT");
             std::env::remove_var("RUST_LOG");
         }
     }

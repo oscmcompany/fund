@@ -110,6 +110,11 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    if ensemble_predictions.is_empty():
+        logger.warning("No predictions returned, skipping rebalance")
+        metrics.observe_duration(start)
+        return Response(status_code=status.HTTP_200_OK)
+
     try:
         consolidated_signals = consolidate_predictions(
             model_predictions={"tide": ensemble_predictions},
@@ -306,7 +311,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
 
 async def get_raw_predictions() -> pl.DataFrame:
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         response = await client.post(
             url=f"{ENSEMBLE_MANAGER_BASE_URL}/predictions",
         )

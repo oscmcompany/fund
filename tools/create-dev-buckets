@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE="${1:-}"
+if [[ -z "$PROFILE" ]]; then
+  echo "Usage: $(basename "$0") <profile>"
+  echo "  e.g. $(basename "$0") dev/chris"
+  exit 1
+fi
+
+SLUG="${PROFILE//\//-}"
+DATA_BUCKET="fund-${SLUG}-data"
+ARTIFACTS_BUCKET="fund-${SLUG}-model-artifacts"
+
+create_bucket() {
+  local bucket="$1"
+  if aws s3api head-bucket --bucket "$bucket" &>/dev/null; then
+    echo "Bucket $bucket already exists, skipping"
+  else
+    echo "Creating bucket $bucket"
+    aws s3api create-bucket --bucket "$bucket" --region us-east-1
+  fi
+}
+
+create_bucket "$DATA_BUCKET"
+create_bucket "$ARTIFACTS_BUCKET"
+
+echo "Dev buckets ready for profile $PROFILE"

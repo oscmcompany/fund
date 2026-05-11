@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
-import sentry_sdk
 import structlog
 from fastapi import status
 
@@ -115,7 +114,6 @@ async def _rebalance_loop(  # noqa: C901
                 market_open = alpaca_client.is_market_open()
             except Exception as error:
                 logger.exception("Failed to check market open status", error=str(error))
-                sentry_sdk.capture_exception(error)
                 continue
 
             if not market_open:
@@ -143,7 +141,6 @@ async def _rebalance_loop(  # noqa: C901
                 logger.exception(
                     "Scheduled portfolio rebalance failed", error=str(error)
                 )
-                sentry_sdk.capture_exception(error)
         except asyncio.CancelledError:
             logger.info("Rebalance scheduler cancelled")
             return
@@ -152,4 +149,3 @@ async def _rebalance_loop(  # noqa: C901
                 "Unexpected error in rebalance loop, retrying next cycle",
                 error=str(error),
             )
-            sentry_sdk.capture_exception(error)

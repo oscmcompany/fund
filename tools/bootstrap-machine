@@ -5,16 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROD=false
+NONINTERACTIVE=false
 OS="$(uname -s)"
 
 usage() {
-  echo "Usage: $(basename "$0") [--prod]"
+  echo "Usage: $(basename "$0") [--prod] [--noninteractive]"
   echo ""
   echo "Bootstrap a fresh machine for the fund development environment."
   echo ""
   echo "Options:"
-  echo "  --prod    Configure production secrets from AWS Secrets Manager"
-  echo "  -h, --help  Show this help message"
+  echo "  --prod              Configure production environment variables and validate secrets"
+  echo "  --noninteractive    Skip the final exec \$SHELL (for use from automation)"
+  echo "  -h, --help          Show this help message"
   exit 0
 }
 
@@ -22,6 +24,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --prod)
       PROD=true
+      shift
+      ;;
+    --noninteractive)
+      NONINTERACTIVE=true
       shift
       ;;
     -h|--help)
@@ -39,13 +45,41 @@ step() {
   echo "==> $1"
 }
 
+ensure_nix_trusted_user() {
+  local nix_conf="/etc/nix/nix.conf"
+  local user
+  user="$(whoami)"
+  if [[ -f "$nix_conf" ]] && ! grep -qE "^trusted-users\s*=.*\b${user}\b" "$nix_conf"; then
+    echo "Adding $user to Nix trusted-users..."
+    if grep -qE "^trusted-users\s*=" "$nix_conf"; then
+      sudo sed -i "s/^trusted-users\s*=.*/& $user/" "$nix_conf"
+    else
+      echo "trusted-users = root $user" | sudo tee -a "$nix_conf" >/dev/null
+    fi
+    sudo systemctl restart nix-daemon 2>/dev/null || true
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Ensure Nix paths are available in this shell session
+# --------------------------------------------------------------------------- #
+for profile in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh \
+               /etc/profile.d/nix.sh; do
+  if [[ -f "$profile" ]]; then
+    # shellcheck disable=SC1090
+    . "$profile"
+    break
+  fi
+done
+
 # --------------------------------------------------------------------------- #
 # 1. Install Nix via Determinate Systems installer
 # --------------------------------------------------------------------------- #
 step "Checking Nix installation"
 
 if command -v nix &>/dev/null; then
-  echo "Nix is already installed, skipping"
+  echo "Nix is already installed"
+  ensure_nix_trusted_user
 else
   echo "Installing Nix via Determinate Systems installer..."
   curl --proto '=https' --tlsv1.2 -sSf -L \
@@ -65,6 +99,9 @@ else
     echo "Error: nix not found on PATH after installation"
     exit 1
   fi
+
+  ensure_nix_trusted_user
+
   echo "Nix installed successfully"
 fi
 
@@ -77,12 +114,175 @@ if command -v devenv &>/dev/null; then
   echo "devenv is already installed, skipping"
 else
   echo "Installing devenv..."
-  nix profile install nixpkgs#devenv
+  nix profile add nixpkgs#devenv
   echo "devenv installed successfully"
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Build the devenv environment
+# 3. Install direnv (auto-loads .envrc via devenv integration)
+# --------------------------------------------------------------------------- #
+step "Checking direnv installation"
+
+if command -v direnv &>/dev/null; then
+  echo "direnv is already installed, skipping"
+else
+  echo "Installing direnv..."
+  nix profile add nixpkgs#direnv
+  echo "direnv installed successfully"
+fi
+
+# Hook direnv into the shell
+SHELL_NAME="$(basename "$SHELL")"
+case "$SHELL_NAME" in
+  bash)
+    SHELL_RC="$HOME/.bashrc"
+    HOOK='eval "$(direnv hook bash)"'
+    ;;
+  zsh)
+    SHELL_RC="$HOME/.zshrc"
+    HOOK='eval "$(direnv hook zsh)"'
+    ;;
+  *)
+    SHELL_RC=""
+    HOOK=""
+    echo "Warning: unsupported shell '$SHELL_NAME' for direnv hook, add manually"
+    ;;
+esac
+
+if [[ -n "$SHELL_RC" ]]; then
+  if ! grep -qF 'direnv hook' "$SHELL_RC" 2>/dev/null; then
+    echo "$HOOK" >> "$SHELL_RC"
+    echo "Added direnv hook to $SHELL_RC"
+  else
+    echo "direnv hook already in $SHELL_RC"
+  fi
+fi
+
+# Allow .envrc in the repo so direnv loads it automatically
+if [[ -f "$REPO_ROOT/.envrc" ]]; then
+  direnv allow "$REPO_ROOT" 2>/dev/null || true
+fi
+
+# --------------------------------------------------------------------------- #
+# 4. Install secretspec (secrets management for devenv services)
+# --------------------------------------------------------------------------- #
+step "Checking secretspec installation"
+
+if command -v secretspec &>/dev/null; then
+  echo "secretspec is already installed, skipping"
+else
+  echo "Installing secretspec..."
+  nix profile add nixpkgs#secretspec
+  echo "secretspec installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 5. Install AWS CLI (needed before devenv shell for secretspec)
+# --------------------------------------------------------------------------- #
+step "Checking AWS CLI installation"
+
+if command -v aws &>/dev/null; then
+  echo "AWS CLI is already installed, skipping"
+else
+  echo "Installing AWS CLI (required for secretspec)..."
+  case "$OS" in
+    Linux)
+      curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+      unzip -qo /tmp/awscliv2.zip -d /tmp
+      sudo /tmp/aws/install
+      rm -rf /tmp/awscliv2.zip /tmp/aws
+      ;;
+    Darwin)
+      if command -v brew &>/dev/null; then
+        brew install awscli
+      else
+        echo "Error: Homebrew not found. Install it from https://brew.sh"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Error: unsupported OS '$OS' for AWS CLI install"
+      exit 1
+      ;;
+  esac
+  echo "AWS CLI installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 6. Configure AWS credentials (required for secretspec provider)
+# --------------------------------------------------------------------------- #
+step "Checking AWS credentials"
+
+if aws sts get-caller-identity &>/dev/null; then
+  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
+  echo "Authenticated as: $IDENTITY"
+else
+  echo "AWS credentials are not configured."
+  echo "devenv uses secretspec with the awssm provider, so valid"
+  echo "credentials are required before the environment can build."
+  echo ""
+  aws configure
+  echo ""
+
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "Error: AWS credentials still not valid after configuration."
+    echo "Re-run: $(basename "$0")"
+    exit 1
+  fi
+  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
+  echo "Authenticated as: $IDENTITY"
+fi
+
+# --------------------------------------------------------------------------- #
+# 7. Create .envrc with FUND_PROFILE
+# --------------------------------------------------------------------------- #
+ENVRC="$REPO_ROOT/.envrc"
+
+if [[ "$PROD" == true ]]; then
+  step "Configuring production environment"
+
+  if [[ ! -f "$ENVRC" ]]; then
+    echo "Creating production .envrc..."
+    cat > "$ENVRC" << 'ENVRC_EOF'
+export FUND_PROFILE=production
+export SECRETSPEC_PROFILE="$FUND_PROFILE"
+export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+export MASSIVE_BASE_URL=https://api.massive.com
+ENVRC_EOF
+    echo "Created $ENVRC"
+  else
+    echo ".envrc already exists, skipping creation"
+  fi
+else
+  step "Configuring development environment"
+
+  if [[ ! -f "$ENVRC" ]]; then
+    echo "Creating development .envrc..."
+    cat > "$ENVRC" << 'ENVRC_EOF'
+export FUND_PROFILE=dev/chris
+export SECRETSPEC_PROFILE="$FUND_PROFILE"
+ENVRC_EOF
+    echo "Created $ENVRC"
+  else
+    echo ".envrc already exists, skipping creation"
+  fi
+
+  step "Ensuring dev S3 buckets exist"
+  # shellcheck disable=SC1090
+  source "$ENVRC"
+  "$REPO_ROOT/tools/create-dev-buckets" "${FUND_PROFILE:-dev/chris}"
+fi
+
+# --------------------------------------------------------------------------- #
+# 8. Create log directory
+# --------------------------------------------------------------------------- #
+step "Creating log directory"
+sudo mkdir -p /var/log/fund
+sudo chown "$(whoami)" /var/log/fund
+echo "Created /var/log/fund"
+
+# --------------------------------------------------------------------------- #
+# 9. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
 
@@ -91,34 +291,11 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 4. Prod mode: pull secrets from AWS Secrets Manager
+# 10. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
 if [[ "$PROD" == true ]]; then
-  step "Configuring production environment"
-
-  if ! command -v aws &>/dev/null; then
-    echo "Error: aws CLI not found. Run this inside 'devenv shell' first."
-    exit 1
-  fi
-
-  echo "Verifying AWS credentials..."
-  if ! aws sts get-caller-identity &>/dev/null; then
-    echo ""
-    echo "AWS credentials are not configured or have expired."
-    echo "Configure credentials with one of:"
-    echo "  aws configure"
-    echo "  aws configure sso"
-    echo "  export AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY"
-    echo ""
-    echo "Then re-run: $(basename "$0") --prod"
-    exit 1
-  fi
-
-  IDENTITY=$(aws sts get-caller-identity --output text --query 'Arn')
-  echo "Authenticated as: $IDENTITY"
-
-  echo "Pulling secrets via devenv pull-secrets..."
-  devenv shell -- pull-secrets
+  echo "Validating secrets via secretspec..."
+  devenv shell -- secretspec check || echo "Run 'secretspec set <KEY>' to populate missing secrets"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -129,10 +306,20 @@ step "Bootstrap complete"
 echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
-echo "  devenv shell        # enter the development environment"
-echo "  devenv up           # start local services (postgres, prometheus, etc.)"
-if [[ "$PROD" != true ]]; then
+if [[ "$PROD" == true ]]; then
+  echo "  nohup tools/git-sync > /var/log/git-sync.log 2>&1 &  # start git-sync supervisor"
   echo ""
-  echo "For production secrets, re-run with:"
+  echo "git-sync will poll origin/master every 60 seconds and restart"
+  echo "devenv automatically when new commits arrive."
+else
+  echo "  devenv shell        # enter the development environment"
+  echo "  devenv --profile apps up  # start application services"
+  echo ""
+  echo "For production setup, re-run with:"
   echo "  $(basename "$0") --prod"
+fi
+
+# Replace current shell so Nix paths are on PATH
+if [[ "$NONINTERACTIVE" == false ]]; then
+  exec "$SHELL" -l
 fi

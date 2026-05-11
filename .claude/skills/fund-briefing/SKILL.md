@@ -68,54 +68,21 @@ APCA-API-SECRET-KEY: <ALPACA_SECRET>
 
 ## Phase 2, Group A: Platform health checks
 
-Run all of these in parallel. These are the same checks from the platform-check
-skill, inlined here to avoid skill-in-skill invocation.
+Run all of these in parallel.
 
-### A1. ECS services
+### A1. Service health endpoints
 
-```bash
-aws ecs describe-services --profile oscm --region us-east-1 \
-  --cluster fund-applications \
-  --services fund-data-manager-server fund-portfolio-manager-server fund-ensemble-manager-server \
-  --query 'services[*].{name:serviceName,status:status,running:runningCount,desired:desiredCount,deployment:deployments[0].rolloutState}' \
-  --output json
-```
-
-Flag any service where `running < desired` or `deployment != COMPLETED`.
-
-### A2. ALB target group health
-
-First get ARNs:
+Check all three services in parallel:
 
 ```bash
-aws elbv2 describe-target-groups --profile oscm --region us-east-1 \
-  --names fund-data-manager-server fund-portfolio-manager-server fund-ensemble-manager-server \
-  --query 'TargetGroups[*].{name:TargetGroupName,arn:TargetGroupArn}' \
-  --output json
+curl -sf http://localhost:8080/health | jq .
+curl -sf http://localhost:8081/health | jq .
+curl -sf http://localhost:8082/health | jq .
 ```
 
-Then for each ARN (run in parallel):
+Flag any service that doesn't return HTTP 200 with `"status": "ok"`.
 
-```bash
-aws elbv2 describe-target-health --profile oscm --region us-east-1 \
-  --target-group-arn <ARN> \
-  --query 'TargetHealthDescriptions[*].{target:Target.Id,state:TargetHealth.State}' \
-  --output json
-```
-
-Flag any target with state other than `healthy`.
-
-### A3. CloudWatch alarms
-
-```bash
-aws cloudwatch describe-alarms --profile oscm --region us-east-1 \
-  --state-value ALARM \
-  --alarm-name-prefix fund- \
-  --query 'MetricAlarms[*].{name:AlarmName,state:StateValue,reason:StateReason}' \
-  --output json
-```
-
-### A4. Model artifact freshness
+### A2. Model artifact freshness
 
 Discover bucket:
 
@@ -136,7 +103,7 @@ Weekday-aware staleness:
 - Tue-Fri: flag if older than ~1.5 days.
 - Sat-Sun: allow since Friday night.
 
-### A5. S3 data freshness
+### A3. S3 data freshness
 
 Discover bucket:
 
@@ -251,11 +218,9 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 
   Component             Status    Details
   --------------------  --------  ----------------------------------------
-  ECS: data-manager     OK        1/1 running, deployment COMPLETED
-  ECS: portfolio-mgr    OK        1/1 running, deployment COMPLETED
-  ECS: ensemble-mgr     OK        1/1 running, deployment COMPLETED
-  ALB targets           OK        All 3 target groups healthy
-  CloudWatch alarms     OK        No alarms firing
+  data-manager          OK        HTTP 200, status: ok
+  portfolio-manager     OK        HTTP 200, status: ok
+  ensemble-manager      OK        HTTP 200, model loaded
   Model artifacts       OK        Latest: <timestamp>
   Data freshness        OK        Latest bars: <timestamp>
 
