@@ -460,19 +460,15 @@ def test_get_account_retries_on_transient_error(
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
-@patch("portfolio_manager.alpaca_client.time.sleep")
-@patch("tenacity.nap.time.sleep")
-def test_open_position_retries_on_transient_error(
-    mock_tenacity_sleep: MagicMock,
-    mock_rate_limit_sleep: MagicMock,
-) -> None:
+def test_open_position_does_not_retry_on_transient_error() -> None:
     client, mock_trading = _make_client()
     transient_error = _FakeAPIError("service unavailable", status_code=503)
-    mock_trading.submit_order.side_effect = [transient_error, None]
+    mock_trading.submit_order.side_effect = transient_error
 
-    client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+    with pytest.raises(_FakeAPIError, match="service unavailable"):
+        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
 
-    assert mock_trading.submit_order.call_count == 2
+    assert mock_trading.submit_order.call_count == 1
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)

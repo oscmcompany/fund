@@ -112,7 +112,6 @@ class AlpacaClient:
             buying_power=float(cast("str", account.buying_power)),
         )
 
-    @_alpaca_retry
     def open_position(
         self,
         ticker: str,

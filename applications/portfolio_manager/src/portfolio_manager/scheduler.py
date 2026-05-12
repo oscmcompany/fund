@@ -93,10 +93,13 @@ async def spawn_status_logger(
 
 
 async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
+    loop = asyncio.get_running_loop()
     while True:
         try:
-            account = alpaca_client.get_account()
-            positions = alpaca_client.get_open_positions()
+            account = await loop.run_in_executor(None, alpaca_client.get_account)
+            positions = await loop.run_in_executor(
+                None, alpaca_client.get_open_positions
+            )
             logger.info(
                 "Account status",
                 cash_amount=account.cash_amount,
