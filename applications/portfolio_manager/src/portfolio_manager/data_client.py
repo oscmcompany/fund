@@ -32,8 +32,10 @@ def fetch_historical_prices(
         raise PriceDataUnavailableError(message) from error
 
     dataframe = pl.read_parquet(io.BytesIO(response.content))
-    return dataframe.select(["ticker", "timestamp", "close_price"]).drop_nulls(
-        subset=["close_price"]
+    return (
+        dataframe.select(["ticker", "timestamp", "close_price"])
+        .unique(subset=["ticker", "timestamp"], keep="last")
+        .drop_nulls(subset=["close_price"])
     )
 
 
@@ -81,6 +83,8 @@ def fetch_spy_prices(
         raise PriceDataUnavailableError(message) from error
 
     dataframe = pl.read_parquet(io.BytesIO(response.content))
-    return dataframe.select(["ticker", "timestamp", "close_price"]).drop_nulls(
-        subset=["close_price"]
+    return (
+        dataframe.select(["ticker", "timestamp", "close_price"])
+        .unique(subset=["ticker", "timestamp"], keep="last")
+        .drop_nulls(subset=["close_price"])
     )
