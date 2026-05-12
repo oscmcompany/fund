@@ -377,7 +377,10 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
-    dataset = tide_data.get_dataset(data_type="predict")
+    model = request.app.state.tide_model
+    dataset = tide_data.get_dataset(
+        data_type="predict", output_length=model.output_length
+    )
 
     if len(dataset) == 0:
         prediction_errors_total.labels(stage="batch_creation").inc()
@@ -394,7 +397,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
         "static_categorical_features": Tensor(dataset.static_categorical),
     }
 
-    raw_predictions = request.app.state.tide_model.predict(inputs=batch)
+    raw_predictions = model.predict(inputs=batch)
     predictions = tide_data.postprocess_predictions(
         input_batch=batch,
         predictions=raw_predictions,
@@ -405,7 +408,9 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
         total_predictions=predictions.height,
     )
 
-    processed_prediction_timestamp = current_timestamp + timedelta(days=6)
+    processed_prediction_timestamp = current_timestamp + timedelta(
+        days=model.output_length - 1
+    )
     processed_predictions = predictions.filter(
         pl.col("timestamp")
         == to_timestamp_milliseconds(

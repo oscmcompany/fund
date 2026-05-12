@@ -1651,6 +1651,7 @@ dependencies = [
     { name = "requests" },
     { name = "scipy" },
     { name = "structlog" },
+    { name = "tenacity" },
     { name = "uvicorn" },
 ]
 
@@ -1666,6 +1667,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.5" },
     { name = "scipy", specifier = ">=1.17.1" },
     { name = "structlog", specifier = ">=25.5.0" },
+    { name = "tenacity", specifier = ">=9.0" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
 

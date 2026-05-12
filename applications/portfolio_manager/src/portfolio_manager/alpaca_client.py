@@ -1,5 +1,5 @@
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import structlog
 from alpaca.common.exceptions import APIError
@@ -10,6 +10,7 @@ from alpaca.trading import (
     ClosePositionRequest,
     GetAssetsRequest,
     OrderRequest,
+    Position,
     TradeAccount,
     TradingClient,
 )
@@ -20,11 +21,49 @@ from alpaca.trading.enums import (
     OrderType,
     TimeInForce,
 )
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+if TYPE_CHECKING:
+    from tenacity import RetryCallState
 
 from .enums import TradeSide
 from .exceptions import AssetNotShortableError, InsufficientBuyingPowerError
 
 logger = structlog.get_logger(__name__)
+
+_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def _is_transient_error(error: BaseException) -> bool:
+    status_code = getattr(error, "status_code", None)
+    if status_code in _TRANSIENT_STATUS_CODES:
+        return True
+    return isinstance(error, OSError)
+
+
+def _log_retry(retry_state: "RetryCallState") -> None:
+    outcome = retry_state.outcome
+    error = outcome.exception() if outcome is not None else None
+    logger.warning(
+        "Retrying Alpaca API call",
+        attempt=retry_state.attempt_number,
+        wait_seconds=getattr(retry_state.next_action, "sleep", None),
+        error=str(error),
+    )
+
+
+_alpaca_retry = retry(
+    retry=retry_if_exception(_is_transient_error),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    before_sleep=_log_retry,
+    reraise=True,
+)
 
 
 class AlpacaAccount:
@@ -59,19 +98,21 @@ class AlpacaClient:
 
         self.is_paper = is_paper
 
+    @_alpaca_retry
     def is_market_open(self) -> bool:
         clock: Clock = cast("Clock", self.trading_client.get_clock())
         time.sleep(self.rate_limit_sleep)
         return bool(clock.is_open)
 
+    @_alpaca_retry
     def get_account(self) -> AlpacaAccount:
         account: TradeAccount = cast("TradeAccount", self.trading_client.get_account())
 
         time.sleep(self.rate_limit_sleep)
 
         return AlpacaAccount(
-            cash_amount=float(cast("str", account.cash)),
-            buying_power=float(cast("str", account.buying_power)),
+            cash_amount=float(str(account.cash)),
+            buying_power=float(str(account.buying_power)),
         )
 
     def open_position(
@@ -93,7 +134,7 @@ class AlpacaClient:
             self.trading_client.submit_order(
                 order_data=OrderRequest(
                     symbol=ticker.upper(),
-                    notional=dollar_amount,
+                    notional=round(dollar_amount, 2),
                     side=OrderSide(side.value.lower()),
                     type=OrderType.MARKET,
                     time_in_force=TimeInForce.DAY,
@@ -106,7 +147,11 @@ class AlpacaClient:
                 message = f"Insufficient buying power for {ticker}: {e}"
                 raise InsufficientBuyingPowerError(message) from e
             # Handle non-shortable assets
-            if "cannot be sold short" in error_str or "not shortable" in error_str:
+            if (
+                "cannot be sold short" in error_str
+                or "not shortable" in error_str
+                or "not allowed to short" in error_str
+            ):
                 message = f"Asset {ticker} cannot be sold short: {e}"
                 raise AssetNotShortableError(message) from e
             # Re-raise other API errors
@@ -114,6 +159,7 @@ class AlpacaClient:
 
         time.sleep(self.rate_limit_sleep)
 
+    @_alpaca_retry
     def get_shortable_tickers(self, tickers: list[str]) -> set[str]:
         all_assets: list[Asset] = cast(
             "list[Asset]",
@@ -132,6 +178,25 @@ class AlpacaClient:
             if asset.symbol in ticker_set and asset.shortable and asset.easy_to_borrow
         }
 
+    @_alpaca_retry
+    def get_open_positions(self) -> list[dict[str, object]]:
+        positions: list[Position] = cast(
+            "list[Position]",
+            self.trading_client.get_all_positions(),
+        )
+        time.sleep(self.rate_limit_sleep)
+        return [
+            {
+                "ticker": str(position.symbol),
+                "side": str(position.side),
+                "quantity": float(str(position.qty)),
+                "market_value": float(str(position.market_value)),
+                "unrealized_profit_and_loss": float(str(position.unrealized_pl)),
+            }
+            for position in positions
+        ]
+
+    @_alpaca_retry
     def close_position(
         self,
         ticker: str,
