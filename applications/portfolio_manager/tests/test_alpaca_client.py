@@ -190,6 +190,19 @@ def test_open_position_raises_asset_not_shortable_error_on_not_shortable_keyword
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
+def test_open_position_raises_asset_not_shortable_error_on_not_allowed_to_short() -> (
+    None
+):
+    client, mock_trading = _make_client()
+    mock_trading.submit_order.side_effect = _FakeAPIError(
+        "account is not allowed to short"
+    )
+
+    with pytest.raises(AssetNotShortableError):
+        client.open_position(ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0)
+
+
+@patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
 def test_open_position_reraises_other_api_errors() -> None:
     client, mock_trading = _make_client()
     mock_trading.submit_order.side_effect = _FakeAPIError("some unhandled error")

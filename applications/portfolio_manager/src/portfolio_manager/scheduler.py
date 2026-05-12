@@ -54,7 +54,7 @@ async def _already_rebalanced_today(data_manager_base_url: str) -> bool:
             timestamp_value = row.get("timestamp")
             if timestamp_value is not None:
                 row_date = datetime.fromtimestamp(
-                    float(timestamp_value), tz=_EASTERN
+                    float(timestamp_value) / 1000, tz=_EASTERN
                 ).date()
                 if row_date == today:
                     return True

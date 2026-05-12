@@ -145,7 +145,7 @@ class AlpacaClient:
                 message = f"Insufficient buying power for {ticker}: {e}"
                 raise InsufficientBuyingPowerError(message) from e
             # Handle non-shortable assets
-            if "cannot be sold short" in error_str or "not shortable" in error_str:
+            if "cannot be sold short" in error_str or "not shortable" in error_str or "not allowed to short" in error_str:
                 message = f"Asset {ticker} cannot be sold short: {e}"
                 raise AssetNotShortableError(message) from e
             # Re-raise other API errors

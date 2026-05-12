@@ -100,7 +100,7 @@ def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
 
 def test_already_rebalanced_today_returns_true_when_todays_portfolio_exists() -> None:
     frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
-    data = [{"ticker": "AAPL", "timestamp": frozen_now.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(frozen_now.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
@@ -122,7 +122,7 @@ def test_already_rebalanced_today_returns_false_when_portfolio_is_from_yesterday
 ):
     frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
     yesterday = frozen_now - timedelta(days=1)
-    data = [{"ticker": "AAPL", "timestamp": yesterday.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(yesterday.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
@@ -143,7 +143,7 @@ def test_already_rebalanced_today_handles_eastern_utc_day_boundary() -> None:
     # Timestamp recorded at Monday 20:30 ET (= Tuesday 00:30 UTC).
     # "now" is also Monday 20:30 ET — should detect already rebalanced for that ET day.
     monday_eastern = datetime(2026, 3, 23, 20, 30, 0, tzinfo=_EASTERN)
-    data = [{"ticker": "AAPL", "timestamp": monday_eastern.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(monday_eastern.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
