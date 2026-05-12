@@ -80,6 +80,39 @@ async def spawn_rebalance_scheduler(
     return task
 
 
+_STATUS_LOG_INTERVAL_SECONDS = 60
+
+
+async def spawn_status_logger(
+    alpaca_client: AlpacaClient,
+) -> asyncio.Task:
+    task = asyncio.create_task(_status_logger_loop(alpaca_client))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
+    while True:
+        try:
+            account = alpaca_client.get_account()
+            positions = alpaca_client.get_open_positions()
+            logger.info(
+                "Account status",
+                cash_amount=account.cash_amount,
+                buying_power=account.buying_power,
+                position_count=len(positions),
+                positions=positions,
+            )
+            await asyncio.sleep(_STATUS_LOG_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("Status logger cancelled")
+            return
+        except Exception as error:
+            logger.exception("Status logger error", error=str(error))
+            await asyncio.sleep(_STATUS_LOG_INTERVAL_SECONDS)
+
+
 async def _rebalance_loop(  # noqa: C901
     alpaca_client: AlpacaClient,
     data_manager_base_url: str,

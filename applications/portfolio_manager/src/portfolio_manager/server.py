@@ -18,7 +18,7 @@ from .metrics import (
     get_metrics,
 )
 from .rebalance import DATA_MANAGER_BASE_URL, run_rebalance
-from .scheduler import spawn_rebalance_scheduler
+from .scheduler import spawn_rebalance_scheduler, spawn_status_logger
 
 logging.basicConfig(
     level=logging.INFO, stream=sys.stdout, format="%(message)s", force=True
@@ -85,8 +85,14 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         rebalance_lock=_rebalance_lock,
     )
     logger.info("Portfolio rebalance scheduler started")
+    _app.state.status_logger_task = await spawn_status_logger(
+        alpaca_client=_app.state.alpaca_client,
+    )
+    logger.info("Account status logger started")
     yield
+    _app.state.status_logger_task.cancel()
     _app.state.scheduler_task.cancel()
+    await _app.state.status_logger_task
     await _app.state.scheduler_task
 
 
