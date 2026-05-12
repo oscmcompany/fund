@@ -313,7 +313,8 @@ def test_get_open_positions_returns_position_dicts(mock_sleep: MagicMock) -> Non
 
     result = client.get_open_positions()
 
-    assert len(result) == 2
+    expected_positions = 2
+    assert len(result) == expected_positions
     assert result[0] == {
         "ticker": "AAPL",
         "side": "long",
@@ -455,8 +456,12 @@ def test_get_account_retries_on_transient_error(
 
     result = client.get_account()
 
-    assert result.cash_amount == 5000.0
-    assert mock_trading.get_account.call_count == 2
+    expected_cash = 5000.0
+    expected_attempts = 2
+    assert result.cash_amount == expected_cash
+    assert mock_trading.get_account.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -484,8 +489,11 @@ def test_close_position_retries_on_transient_error(
 
     result = client.close_position(ticker="AAPL")
 
+    expected_attempts = 2
     assert result is True
-    assert mock_trading.close_position.call_count == 2
+    assert mock_trading.close_position.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
@@ -503,3 +511,5 @@ def test_get_account_raises_after_retries_exhausted(
 
     expected_attempts = 3
     assert mock_trading.get_account.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called

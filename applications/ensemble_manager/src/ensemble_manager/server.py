@@ -378,7 +378,9 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
     model = request.app.state.tide_model
-    dataset = tide_data.get_dataset(data_type="predict", output_length=model.output_length)
+    dataset = tide_data.get_dataset(
+        data_type="predict", output_length=model.output_length
+    )
 
     if len(dataset) == 0:
         prediction_errors_total.labels(stage="batch_creation").inc()

@@ -3,12 +3,6 @@ from typing import TYPE_CHECKING, cast
 
 import structlog
 from alpaca.common.exceptions import APIError
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
 from alpaca.data import StockHistoricalDataClient
 from alpaca.trading import (
     Asset,
@@ -16,6 +10,7 @@ from alpaca.trading import (
     ClosePositionRequest,
     GetAssetsRequest,
     OrderRequest,
+    Position,
     TradeAccount,
     TradingClient,
 )
@@ -25,6 +20,12 @@ from alpaca.trading.enums import (
     OrderSide,
     OrderType,
     TimeInForce,
+)
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
 )
 
 if TYPE_CHECKING:
@@ -46,11 +47,13 @@ def _is_transient_error(error: BaseException) -> bool:
 
 
 def _log_retry(retry_state: "RetryCallState") -> None:
+    outcome = retry_state.outcome
+    error = outcome.exception() if outcome is not None else None
     logger.warning(
         "Retrying Alpaca API call",
         attempt=retry_state.attempt_number,
         wait_seconds=getattr(retry_state.next_action, "sleep", None),
-        error=str(retry_state.outcome.exception()),
+        error=str(error),
     )
 
 
@@ -108,8 +111,8 @@ class AlpacaClient:
         time.sleep(self.rate_limit_sleep)
 
         return AlpacaAccount(
-            cash_amount=float(cast("str", account.cash)),
-            buying_power=float(cast("str", account.buying_power)),
+            cash_amount=float(str(account.cash)),
+            buying_power=float(str(account.buying_power)),
         )
 
     def open_position(
@@ -144,7 +147,11 @@ class AlpacaClient:
                 message = f"Insufficient buying power for {ticker}: {e}"
                 raise InsufficientBuyingPowerError(message) from e
             # Handle non-shortable assets
-            if "cannot be sold short" in error_str or "not shortable" in error_str or "not allowed to short" in error_str:
+            if (
+                "cannot be sold short" in error_str
+                or "not shortable" in error_str
+                or "not allowed to short" in error_str
+            ):
                 message = f"Asset {ticker} cannot be sold short: {e}"
                 raise AssetNotShortableError(message) from e
             # Re-raise other API errors
@@ -173,15 +180,18 @@ class AlpacaClient:
 
     @_alpaca_retry
     def get_open_positions(self) -> list[dict[str, object]]:
-        positions = self.trading_client.get_all_positions()
+        positions: list[Position] = cast(
+            "list[Position]",
+            self.trading_client.get_all_positions(),
+        )
         time.sleep(self.rate_limit_sleep)
         return [
             {
                 "ticker": str(position.symbol),
                 "side": str(position.side),
-                "quantity": float(cast("str", position.qty)),
-                "market_value": float(cast("str", position.market_value)),
-                "unrealized_profit_and_loss": float(cast("str", position.unrealized_pl)),
+                "quantity": float(str(position.qty)),
+                "market_value": float(str(position.market_value)),
+                "unrealized_profit_and_loss": float(str(position.unrealized_pl)),
             }
             for position in positions
         ]
