@@ -93,7 +93,7 @@ class AlpacaClient:
             self.trading_client.submit_order(
                 order_data=OrderRequest(
                     symbol=ticker.upper(),
-                    notional=dollar_amount,
+                    notional=round(dollar_amount, 2),
                     side=OrderSide(side.value.lower()),
                     type=OrderType.MARKET,
                     time_in_force=TimeInForce.DAY,
