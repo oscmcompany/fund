@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -16,6 +18,7 @@ import requests
 import structlog
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
+from internal.database import close_pool, get_pool
 from internal.equity_bars_schema import equity_bars_schema
 from internal.timestamps import to_timestamp_milliseconds
 
@@ -202,6 +205,126 @@ def cleanup_model_directory(model_directory: str) -> None:
         shutil.rmtree(model_directory, ignore_errors=True)
 
 
+async def _sync_run_metadata(
+    s3_client: "S3Client",
+    bucket: str,
+    artifact_key: str,
+) -> None:
+    """Fetch run_metadata.json from S3 and insert into model_runs table."""
+    artifact_folder = str(Path(artifact_key).parent.parent)
+    metadata_key = f"{artifact_folder}/run_metadata.json"
+
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=metadata_key)
+        metadata = json.loads(response["Body"].read())
+    except ClientError:
+        logger.debug("No run_metadata.json found", metadata_key=metadata_key)
+        return
+    except (json.JSONDecodeError, KeyError):
+        logger.warning("Invalid run_metadata.json", metadata_key=metadata_key)
+        return
+
+    run_id = metadata.get("artifact_timestamp", "")
+    if not run_id:
+        return
+
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            await connection.execute(
+                """INSERT INTO model_runs (
+                       run_id, artifact_key, training_data_key,
+                       start_date, end_date, lookback_days,
+                       status, stage_counts, completed_at
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                   ON CONFLICT (run_id) DO UPDATE SET
+                       artifact_key = EXCLUDED.artifact_key,
+                       status = EXCLUDED.status,
+                       completed_at = EXCLUDED.completed_at""",
+                (
+                    run_id,
+                    artifact_key,
+                    metadata.get("training_data_key"),
+                    metadata.get("start_date"),
+                    metadata.get("end_date"),
+                    metadata.get("lookback_days"),
+                    "completed",
+                    json.dumps(metadata.get("stage_counts")),
+                ),
+            )
+        logger.info("Synced model run metadata", run_id=run_id)
+    except Exception:
+        logger.exception("Failed to sync run metadata to PostgreSQL")
+
+
+async def _artifact_polling_task(app: FastAPI) -> None:
+    """Background task that polls S3 for new model artifacts."""
+    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
+
+    if not bucket:
+        logger.info("Artifact polling disabled, no bucket configured")
+        return
+
+    s3_client = boto3.client("s3")
+    poll_interval = 60
+
+    while True:
+        await asyncio.sleep(poll_interval)
+
+        try:
+            latest_key = find_latest_artifact_key(
+                s3_client=s3_client,
+                bucket=bucket,
+                prefix=artifact_path,
+            )
+        except ValueError:
+            logger.debug("No artifacts found during polling")
+            continue
+
+        current_key = getattr(app.state, "current_artifact_key", None)
+        if latest_key == current_key:
+            continue
+
+        logger.info(
+            "New artifact detected",
+            current_key=current_key,
+            new_key=latest_key,
+        )
+
+        new_directory = tempfile.mkdtemp(prefix="model_artifacts_")
+        try:
+            download_and_extract_artifacts(
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_key=latest_key,
+                extract_path=Path(new_directory),
+            )
+
+            new_model = Model.load(directory_path=new_directory)
+
+            old_directory = getattr(app.state, "model_directory", None)
+            app.state.tide_model = new_model
+            app.state.model_directory = new_directory
+            app.state.current_artifact_key = latest_key
+            model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
+
+            logger.info("Hot-swapped model", artifact_key=latest_key)
+
+            if old_directory and old_directory != ".":
+                cleanup_model_directory(old_directory)
+
+            await _sync_run_metadata(
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_key=latest_key,
+            )
+
+        except Exception:
+            logger.exception("Failed to hot-swap model artifact")
+            cleanup_model_directory(new_directory)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
@@ -233,8 +356,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Failed to download artifacts")
             raise
 
+        app.state.current_artifact_key = artifact_key
         logger.info("Loading model", directory=model_directory)
     else:
+        app.state.current_artifact_key = None
         logger.info("Loading model from local", directory=model_directory)
 
     app.state.model_directory = model_directory
@@ -242,9 +367,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
     logger.info("model_loaded_successfully")
 
-    yield
+    polling_task = asyncio.create_task(_artifact_polling_task(app))
 
-    cleanup_model_directory(app.state.model_directory)
+    try:
+        yield
+    finally:
+        polling_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await polling_task
+        await close_pool()
+        cleanup_model_directory(app.state.model_directory)
 
 
 application = FastAPI(lifespan=lifespan)

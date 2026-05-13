@@ -1,3 +1,5 @@
+use crate::data::EquityBar;
+use crate::db;
 use crate::state::State;
 use crate::storage::{query_equity_bars_parquet_from_s3, write_equity_bars_dataframe_to_s3};
 use axum::{
@@ -289,7 +291,116 @@ pub async fn fetch_and_store(
         })?;
 
     info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
+
+    if let Some(pool) = &state.pool {
+        let equity_bars: Vec<EquityBar> = bars
+            .iter()
+            .map(|b| EquityBar {
+                ticker: b.ticker.clone(),
+                timestamp: b.t as i64,
+                open_price: b.o,
+                high_price: b.h,
+                low_price: b.l,
+                close_price: b.c,
+                volume: b.v.and_then(|v| {
+                    if v.is_finite() && v >= 0.0 {
+                        let rounded = v.round();
+                        if rounded <= i64::MAX as f64 {
+                            Some(rounded as i64)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }),
+                volume_weighted_average_price: b.vw,
+                transactions: b.n,
+            })
+            .collect();
+
+        if let Err(error) = db::insert_equity_bars(pool, &equity_bars).await {
+            warn!("Failed to write equity bars to PostgreSQL: {}", error);
+        }
+    }
+
     Ok(Some(s3_key))
+}
+
+#[derive(Deserialize)]
+pub struct RecentQueryParameters {
+    tickers: Option<String>,
+    days: Option<i32>,
+}
+
+pub async fn query_recent(
+    AxumState(state): AxumState<State>,
+    Query(parameters): Query<RecentQueryParameters>,
+) -> impl IntoResponse {
+    let pool = match &state.pool {
+        Some(pool) => pool,
+        None => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL not available").into_response();
+        }
+    };
+
+    let days_back = parameters.days.unwrap_or(10);
+    let tickers: Option<Vec<String>> = parameters.tickers.as_ref().map(|tickers_str| {
+        tickers_str
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .collect()
+    });
+
+    match db::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
+        Ok(bars) => {
+            let dataframe = crate::data::create_equity_bar_dataframe(bars);
+            match dataframe {
+                Ok(dataframe) => {
+                    let mut buffer = Vec::new();
+                    if let Err(error) =
+                        ParquetWriter::new(&mut buffer).finish(&mut dataframe.clone())
+                    {
+                        warn!("Failed to serialize parquet: {}", error);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to serialize response",
+                        )
+                            .into_response();
+                    }
+                    let mut response = Response::new(Body::from(buffer));
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        "application/octet-stream".parse().unwrap(),
+                    );
+                    response.headers_mut().insert(
+                        "Content-Disposition",
+                        "attachment; filename=\"equity_data.parquet\""
+                            .parse()
+                            .unwrap(),
+                    );
+                    *response.status_mut() = StatusCode::OK;
+                    response
+                }
+                Err(error) => {
+                    warn!("Failed to create DataFrame from cache: {}", error);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Query failed: {}", error),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(error) => {
+            warn!("Failed to query PostgreSQL cache: {}", error);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Cache query failed: {}", error),
+            )
+                .into_response()
+        }
+    }
 }
 
 pub async fn sync(

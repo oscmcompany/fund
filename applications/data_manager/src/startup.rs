@@ -141,6 +141,7 @@ mod tests {
 
         let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
+        // PgPool is None in tests that don't need PostgreSQL
         State::new(
             reqwest::Client::new(),
             MassiveSecrets {

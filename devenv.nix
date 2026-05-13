@@ -96,12 +96,33 @@ in {
     AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
     AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
 
+    # PostgreSQL
+    DATABASE_URL = "postgresql://localhost:5432/fund";
+
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
 
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
     SECRETSPEC_PROFILE = fundProfile;
+  };
+
+  services.postgres = {
+    enable = true;
+    package = pkgs.postgresql_16;
+    port = 5432;
+    listen_addresses = "127.0.0.1";
+    initialDatabases = [
+      {
+        name = "fund";
+        schema = ./schema.sql;
+      }
+    ];
+    extensions = extensions: [extensions.pg_cron];
+    settings = {
+      shared_preload_libraries = "pg_cron";
+      "cron.database_name" = "fund";
+    };
   };
 
   packages = with pkgs; [
@@ -116,6 +137,7 @@ in {
     git
     jq
     markdownlint-cli
+    postgresql_16
     ruff
     rustup
     uv
@@ -421,6 +443,7 @@ in {
       FUND_ENSEMBLE_MANAGER_BASE_URL = "http://localhost:8082";
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
+      DATABASE_URL = "postgresql://localhost:5432/fund";
     };
 
     scripts.cleanup-services.exec = ''
@@ -513,20 +536,6 @@ in {
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
         '';
-
-      artifact-watcher.exec = ''
-        attempt=0
-        max_attempts=90
-        while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
-          attempt=$((attempt + 1))
-          if [ "$attempt" -ge "$max_attempts" ]; then
-            echo "ensemble-manager did not become healthy after $((max_attempts * 2)) seconds"
-            exit 1
-          fi
-          sleep 2
-        done
-        exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
-      '';
     };
   };
 
@@ -567,6 +576,7 @@ in {
     echo "    Data Manager:     localhost:8080"
     echo "    Portfolio Manager: localhost:8081"
     echo "    Ensemble Manager: localhost:8082"
+    echo "    PostgreSQL:       localhost:5432/fund"
     echo ""
     echo "  Secrets (secretspec):"
     echo "    secretspec check          Validate production secrets"
