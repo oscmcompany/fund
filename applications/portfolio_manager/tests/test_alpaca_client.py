@@ -3,7 +3,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.trading.requests import GetAssetsRequest
-from portfolio_manager.alpaca_client import AlpacaAccount, AlpacaClient
+from portfolio_manager.alpaca_client import (
+    AlpacaAccount,
+    AlpacaClient,
+    _is_transient_error,
+)
 from portfolio_manager.enums import TradeSide
 from portfolio_manager.exceptions import (
     AssetNotShortableError,
@@ -186,6 +190,19 @@ def test_open_position_raises_asset_not_shortable_error_on_not_shortable_keyword
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
+def test_open_position_raises_asset_not_shortable_error_on_not_allowed_to_short() -> (
+    None
+):
+    client, mock_trading = _make_client()
+    mock_trading.submit_order.side_effect = _FakeAPIError(
+        "account is not allowed to short"
+    )
+
+    with pytest.raises(AssetNotShortableError):
+        client.open_position(ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0)
+
+
+@patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
 def test_open_position_reraises_other_api_errors() -> None:
     client, mock_trading = _make_client()
     mock_trading.submit_order.side_effect = _FakeAPIError("some unhandled error")
@@ -270,6 +287,64 @@ def test_close_position_reraises_other_api_errors() -> None:
         client.close_position(ticker="AAPL")
 
 
+def _make_mock_position(
+    symbol: str,
+    side: str,
+    qty: str,
+    market_value: str,
+    unrealized_pl: str,
+) -> MagicMock:
+    position = MagicMock()
+    position.symbol = symbol
+    position.side = side
+    position.qty = qty
+    position.market_value = market_value
+    position.unrealized_pl = unrealized_pl
+    return position
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_open_positions_returns_position_dicts(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+    mock_trading.get_all_positions.return_value = [
+        _make_mock_position("AAPL", "long", "10.0", "1500.00", "50.00"),
+        _make_mock_position("MSFT", "short", "5.0", "2000.00", "-30.00"),
+    ]
+
+    result = client.get_open_positions()
+
+    expected_positions = 2
+    assert len(result) == expected_positions
+    assert result[0] == {
+        "ticker": "AAPL",
+        "side": "long",
+        "quantity": 10.0,
+        "market_value": 1500.0,
+        "unrealized_profit_and_loss": 50.0,
+    }
+    assert result[1] == {
+        "ticker": "MSFT",
+        "side": "short",
+        "quantity": 5.0,
+        "market_value": 2000.0,
+        "unrealized_profit_and_loss": -30.0,
+    }
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_open_positions_returns_empty_list_when_no_positions(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_trading.get_all_positions.return_value = []
+
+    result = client.get_open_positions()
+
+    assert result == []
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
 def test_get_shortable_tickers_excludes_non_shortable() -> None:
     client, mock_trading = _make_client()
     mock_trading.get_all_assets.return_value = [
@@ -333,3 +408,108 @@ def test_get_shortable_tickers_does_not_pass_attributes_to_api() -> None:
         status=AssetStatus.ACTIVE,
     )
     mock_trading.get_all_assets.assert_called_once_with(expected_request)
+
+
+# --- _is_transient_error predicate tests ---
+
+
+def test_is_transient_error_returns_true_for_429() -> None:
+    error = _FakeAPIError("rate limited", status_code=429)
+    assert _is_transient_error(error) is True
+
+
+def test_is_transient_error_returns_true_for_500() -> None:
+    error = _FakeAPIError("internal server error", status_code=500)
+    assert _is_transient_error(error) is True
+
+
+def test_is_transient_error_returns_true_for_os_error() -> None:
+    error = OSError("connection reset")
+    assert _is_transient_error(error) is True
+
+
+def test_is_transient_error_returns_false_for_permanent_api_error() -> None:
+    error = _FakeAPIError("bad request", status_code=400)
+    assert _is_transient_error(error) is False
+
+
+def test_is_transient_error_returns_false_for_non_api_error() -> None:
+    error = ValueError("invalid value")
+    assert _is_transient_error(error) is False
+
+
+# --- Retry behavior tests ---
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+@patch("tenacity.nap.time.sleep")
+def test_get_account_retries_on_transient_error(
+    mock_tenacity_sleep: MagicMock,
+    mock_rate_limit_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    transient_error = _FakeAPIError("server error", status_code=500)
+    mock_account = MagicMock()
+    mock_account.cash = "5000.00"
+    mock_account.buying_power = "10000.00"
+    mock_trading.get_account.side_effect = [transient_error, mock_account]
+
+    result = client.get_account()
+
+    expected_cash = 5000.0
+    expected_attempts = 2
+    assert result.cash_amount == expected_cash
+    assert mock_trading.get_account.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
+
+
+@patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
+def test_open_position_does_not_retry_on_transient_error() -> None:
+    client, mock_trading = _make_client()
+    transient_error = _FakeAPIError("service unavailable", status_code=503)
+    mock_trading.submit_order.side_effect = transient_error
+
+    with pytest.raises(_FakeAPIError, match="service unavailable"):
+        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+
+    assert mock_trading.submit_order.call_count == 1
+
+
+@patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
+@patch("portfolio_manager.alpaca_client.time.sleep")
+@patch("tenacity.nap.time.sleep")
+def test_close_position_retries_on_transient_error(
+    mock_tenacity_sleep: MagicMock,
+    mock_rate_limit_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    transient_error = _FakeAPIError("bad gateway", status_code=502)
+    mock_trading.close_position.side_effect = [transient_error, None]
+
+    result = client.close_position(ticker="AAPL")
+
+    expected_attempts = 2
+    assert result is True
+    assert mock_trading.close_position.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+@patch("tenacity.nap.time.sleep")
+def test_get_account_raises_after_retries_exhausted(
+    mock_tenacity_sleep: MagicMock,
+    mock_rate_limit_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    transient_error = _FakeAPIError("server error", status_code=500)
+    mock_trading.get_account.side_effect = transient_error
+
+    with pytest.raises(_FakeAPIError, match="server error"):
+        client.get_account()
+
+    expected_attempts = 3
+    assert mock_trading.get_account.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
