@@ -66,10 +66,29 @@ def _make_optimal_portfolio() -> pl.DataFrame:
             "ticker": ["NVDA", "AMD"],
             "timestamp": [1735689600000, 1735689600000],
             "side": ["LONG", "SHORT"],
-            "dollar_amount": [1000.0, 1000.0],
+            "dollar_amount": [
+                990.0,
+                990.0,
+            ],  # long matched to short's whole-share amount
             "action": ["OPEN_POSITION", "OPEN_POSITION"],
             "pair_id": ["NVDA-AMD", "NVDA-AMD"],
-        }
+            "entry_price": [100.0, 99.0],
+            # quantity: null for LONG, whole-share count for SHORT (int(990/99)=10)
+            "quantity": [None, 10],
+            # notional: dollar amount for LONG, null for SHORT
+            "notional": [990.0, None],
+        },
+        schema={
+            "ticker": pl.Utf8,
+            "timestamp": pl.Int64,
+            "side": pl.Utf8,
+            "dollar_amount": pl.Float64,
+            "action": pl.Utf8,
+            "pair_id": pl.Utf8,
+            "entry_price": pl.Float64,
+            "quantity": pl.Int64,
+            "notional": pl.Float64,
+        },
     )
 
 
@@ -463,6 +482,16 @@ def test_get_positions_returns_correct_open_positions() -> None:
     tickers = [p["ticker"] for p in open_positions]
     assert "NVDA" in tickers
     assert "AMD" in tickers
+    # entry_price, quantity, and notional must flow through for order submission
+    for position in open_positions:
+        assert "entry_price" in position
+        assert position["entry_price"] is not None
+    nvda = next(p for p in open_positions if p["ticker"] == "NVDA")
+    amd = next(p for p in open_positions if p["ticker"] == "AMD")
+    assert nvda["quantity"] is None
+    assert nvda["notional"] == pytest.approx(990.0)
+    assert amd["quantity"] == 10  # noqa: PLR2004
+    assert amd["notional"] is None
 
 
 @pytest.mark.parametrize(
@@ -512,6 +541,7 @@ def test_run_rebalance_empty_predictions_returns_200(
     mock_account = MagicMock()
     mock_account.cash_amount = 10000.0
     mock_account.buying_power = 10000.0
+    mock_account.equity = 10000.0
 
     mock_client = MagicMock()
     mock_client.get_account.return_value = mock_account

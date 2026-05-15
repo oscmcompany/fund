@@ -150,21 +150,22 @@ def test_portfolio_schema_unbalanced_sides_fails() -> None:
         portfolio_schema.validate(data)
 
 
-def test_portfolio_schema_imbalanced_dollar_amounts_fails() -> None:
+def test_portfolio_schema_accepts_imbalanced_dollar_amounts() -> None:
+    # Short legs are whole-share adjusted so their dollar amounts may differ from
+    # the long notional amounts. The schema no longer rejects this imbalance.
     data = pl.DataFrame(
         {
             "ticker": _TICKERS,
             "timestamp": [datetime(2025, 1, 1, 0, 0, 0, 0, tzinfo=UTC).timestamp()]
             * 20,
             "side": (["LONG"] * 10) + (["SHORT"] * 10),
-            "dollar_amount": ([2000.0] * 10)
-            + ([500.0] * 10),  # Very imbalanced amounts
+            "dollar_amount": ([2000.0] * 10) + ([500.0] * 10),
             "pair_id": _PAIR_IDS,
         }
     )
 
-    with pytest.raises(SchemaError, match="long and short dollar amount sums"):
-        portfolio_schema.validate(data)
+    validated = portfolio_schema.validate(data)
+    assert validated is not None
 
 
 def test_portfolio_schema_duplicate_tickers_fails() -> None:

@@ -32,9 +32,11 @@ class AlpacaAccount:
         self,
         cash_amount: float,
         buying_power: float,
+        equity: float,
     ) -> None:
         self.cash_amount = cash_amount
         self.buying_power = buying_power
+        self.equity = equity
 
 
 class AlpacaClient:
@@ -72,6 +74,7 @@ class AlpacaClient:
         return AlpacaAccount(
             cash_amount=float(cast("str", account.cash)),
             buying_power=float(cast("str", account.buying_power)),
+            equity=float(cast("str", account.equity)),
         )
 
     def open_position(
@@ -79,9 +82,9 @@ class AlpacaClient:
         ticker: str,
         side: TradeSide,
         dollar_amount: float,
+        entry_price: float,
+        quantity: int | None = None,
     ) -> None:
-        # Use notional (dollar amount) for order submission
-        # This allows Alpaca to handle fractional shares automatically
         if dollar_amount <= 0:
             message = (
                 f"Cannot open position for {ticker}: "
@@ -89,27 +92,47 @@ class AlpacaClient:
             )
             raise ValueError(message)
 
-        try:
-            self.trading_client.submit_order(
-                order_data=OrderRequest(
-                    symbol=ticker.upper(),
-                    notional=dollar_amount,
-                    side=OrderSide(side.value.lower()),
-                    type=OrderType.MARKET,
-                    time_in_force=TimeInForce.DAY,
-                ),
+        if side == TradeSide.SELL:
+            # Alpaca does not support fractional short sells; whole shares only.
+            # Use the pre-computed quantity when available to avoid recomputation.
+            qty = quantity if quantity is not None else int(dollar_amount / entry_price)
+            if qty == 0:
+                message = (
+                    f"Cannot short {ticker}: dollar_amount {dollar_amount} "
+                    f"is less than one share at entry_price {entry_price}"
+                )
+                raise ValueError(message)
+            order_request = OrderRequest(
+                symbol=ticker.upper(),
+                qty=qty,
+                side=OrderSide.SELL,
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce.DAY,
             )
+        else:
+            # Long buys use notional so Alpaca handles fractional shares automatically.
+            order_request = OrderRequest(
+                symbol=ticker.upper(),
+                notional=round(dollar_amount, 2),
+                side=OrderSide.BUY,
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce.DAY,
+            )
+
+        try:
+            self.trading_client.submit_order(order_data=order_request)
         except APIError as e:
             error_str = str(e).lower()
-            # Handle insufficient buying power
             if "insufficient buying power" in error_str or "buying_power" in error_str:
                 message = f"Insufficient buying power for {ticker}: {e}"
                 raise InsufficientBuyingPowerError(message) from e
-            # Handle non-shortable assets
-            if "cannot be sold short" in error_str or "not shortable" in error_str:
+            if (
+                "cannot be sold short" in error_str
+                or "not shortable" in error_str
+                or "not allowed to short" in error_str
+            ):
                 message = f"Asset {ticker} cannot be sold short: {e}"
                 raise AssetNotShortableError(message) from e
-            # Re-raise other API errors
             raise
 
         time.sleep(self.rate_limit_sleep)
@@ -131,6 +154,25 @@ class AlpacaClient:
             for asset in all_assets
             if asset.symbol in ticker_set and asset.shortable and asset.easy_to_borrow
         }
+
+    def get_open_positions(self) -> list[dict[str, object]]:
+        positions = cast(
+            "list[object]",
+            self.trading_client.get_all_positions(),
+        )
+        time.sleep(self.rate_limit_sleep)
+        return [
+            {
+                "ticker": str(getattr(position, "symbol", "")),
+                "side": str(getattr(position, "side", "")),
+                "quantity": float(str(getattr(position, "qty", "0"))),
+                "market_value": float(str(getattr(position, "market_value", "0"))),
+                "unrealized_profit_and_loss": float(
+                    str(getattr(position, "unrealized_pl", "0"))
+                ),
+            }
+            for position in positions
+        ]
 
     def close_position(
         self,

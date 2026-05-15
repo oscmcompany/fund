@@ -3,6 +3,7 @@ import structlog
 
 from . import metrics
 from .alpaca_client import AlpacaClient
+from .configuration import Configuration
 from .enums import PositionSide, TradeSide
 from .exceptions import AssetNotShortableError, InsufficientBuyingPowerError
 
@@ -29,6 +30,9 @@ def get_positions(
                 else TradeSide.SELL
             ),
             "dollar_amount": row["dollar_amount"],
+            "entry_price": row["entry_price"],
+            "quantity": row.get("quantity"),
+            "notional": row.get("notional"),
         }
         for row in optimal_portfolio.iter_rows(named=True)
     ]
@@ -96,10 +100,12 @@ def execute_close_positions(
     return close_results, closed_count
 
 
-def execute_open_positions(
+def execute_open_positions(  # noqa: C901, PLR0915
     alpaca_client: AlpacaClient,
     open_positions: list[dict],
     initial_buying_power: float,
+    account_equity: float,
+    configuration: Configuration,
 ) -> tuple[list[dict], int]:
     open_results = []
     opened_count = 0
@@ -107,17 +113,104 @@ def execute_open_positions(
     skipped_insufficient_buying_power = 0
     skipped_not_shortable = 0
 
-    for open_position in open_positions:
+    # Submit all long (BUY) positions before short (SELL) positions so that long
+    # legs are established first and buying power is accurately reflected when
+    # evaluating each short leg.
+    sorted_positions = sorted(
+        open_positions,
+        key=lambda position: 0 if position["side"] == TradeSide.BUY else 1,
+    )
+
+    for open_position in sorted_positions:
         ticker = open_position["ticker"]
         side = open_position["side"]
         dollar_amount = open_position["dollar_amount"]
+        entry_price = open_position["entry_price"]
 
-        if dollar_amount > remaining_buying_power:
+        if side == TradeSide.SELL:
+            # Check minimum account equity required for short selling.
+            if account_equity < configuration.minimum_short_equity:
+                logger.warning(
+                    "Skipping short position due to insufficient account equity",
+                    ticker=ticker,
+                    account_equity=account_equity,
+                    minimum_short_equity=configuration.minimum_short_equity,
+                )
+                skipped_insufficient_buying_power += 1
+                metrics.trades_submitted_total.labels(
+                    action="open", status="skipped"
+                ).inc()
+                open_results.append(
+                    {
+                        "ticker": ticker,
+                        "action": "open",
+                        "side": side,
+                        "dollar_amount": dollar_amount,
+                        "status": "skipped",
+                        "reason": "insufficient_equity_for_short",
+                    }
+                )
+                continue
+
+            pre_computed_qty = open_position.get("quantity")
+            short_qty = (
+                pre_computed_qty
+                if pre_computed_qty is not None
+                else int(dollar_amount / entry_price)
+            )
+            if short_qty == 0:
+                logger.warning(
+                    "Skipping short position with zero quantity",
+                    ticker=ticker,
+                    dollar_amount=dollar_amount,
+                    entry_price=entry_price,
+                )
+                skipped_insufficient_buying_power += 1
+                metrics.trades_submitted_total.labels(
+                    action="open", status="skipped"
+                ).inc()
+                open_results.append(
+                    {
+                        "ticker": ticker,
+                        "action": "open",
+                        "side": side,
+                        "dollar_amount": dollar_amount,
+                        "status": "skipped",
+                        "reason": "zero_short_quantity",
+                    }
+                )
+                continue
+
+            # Alpaca reserves ask * 1.03 * qty against buying power for short
+            # market orders.
+            buying_power_cost = (
+                short_qty * entry_price * configuration.short_buying_power_buffer
+            )
+
+            if configuration.hold_overnight:
+                # Overnight maintenance margin: 30% for stocks >= $5, 100% for < $5.
+                margin_rate = (
+                    configuration.overnight_margin_rate_low_price
+                    if entry_price < configuration.low_price_threshold
+                    else configuration.overnight_margin_rate_standard
+                )
+                overnight_margin_reserve = short_qty * entry_price * margin_rate
+                logger.info(
+                    "Overnight margin reserve for short position",
+                    ticker=ticker,
+                    short_qty=short_qty,
+                    overnight_margin_reserve=overnight_margin_reserve,
+                    margin_rate=margin_rate,
+                )
+        else:
+            buying_power_cost = dollar_amount
+
+        if buying_power_cost > remaining_buying_power:
             logger.warning(
                 "Skipping position due to insufficient buying power",
                 ticker=ticker,
                 side=side,
-                dollar_amount=dollar_amount,
+                buying_power_cost=buying_power_cost,
                 remaining_buying_power=remaining_buying_power,
             )
             skipped_insufficient_buying_power += 1
@@ -139,6 +232,8 @@ def execute_open_positions(
                 ticker=ticker,
                 side=side,
                 dollar_amount=dollar_amount,
+                entry_price=entry_price,
+                quantity=open_position.get("quantity"),
             )
             logger.info(
                 "Opened position",
@@ -149,7 +244,7 @@ def execute_open_positions(
             opened_count += 1
             metrics.trades_submitted_total.labels(action="open", status="success").inc()
             metrics.trade_dollar_amount_total.labels(side=side.value).inc(dollar_amount)
-            # Refresh remaining buying power from the account after a successful order
+            # Refresh remaining buying power from the account after a successful order.
             try:
                 account = alpaca_client.get_account()
                 remaining_buying_power = account.buying_power
@@ -157,9 +252,9 @@ def execute_open_positions(
                 logger.exception(
                     "Failed to refresh buying power from account, using estimate",
                     ticker=ticker,
-                    deducting=dollar_amount,
+                    deducting=buying_power_cost,
                 )
-                remaining_buying_power -= dollar_amount
+                remaining_buying_power -= buying_power_cost
             open_results.append(
                 {
                     "ticker": ticker,
