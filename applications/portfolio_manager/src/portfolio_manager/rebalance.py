@@ -221,9 +221,12 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     entry_prices_map: dict[str, float] = {
         row["ticker"]: row["entry_price"]
         for row in (
-            historical_prices.sort("timestamp", descending=True)
-            .group_by("ticker")
-            .agg(pl.col("close_price").first().alias("entry_price"))
+            historical_prices.group_by("ticker").agg(
+                pl.col("close_price")
+                .sort_by("timestamp", descending=True)
+                .first()
+                .alias("entry_price")
+            )
         ).iter_rows(named=True)
         if row["entry_price"] is not None and row["entry_price"] > 0
     }

@@ -165,7 +165,7 @@ def test_portfolio_schema_accepts_imbalanced_dollar_amounts() -> None:
     )
 
     validated = portfolio_schema.validate(data)
-    assert validated is not None
+    assert validated.shape == (20, 5)
 
 
 def test_portfolio_schema_duplicate_tickers_fails() -> None:

@@ -195,6 +195,7 @@ def execute_open_positions(  # noqa: C901, PLR0915
                     else configuration.overnight_margin_rate_standard
                 )
                 overnight_margin_reserve = short_qty * entry_price * margin_rate
+                buying_power_cost += overnight_margin_reserve
                 logger.info(
                     "Overnight margin reserve for short position",
                     ticker=ticker,

@@ -92,6 +92,13 @@ class AlpacaClient:
             )
             raise ValueError(message)
 
+        if entry_price <= 0:
+            message = (
+                f"Cannot open position for {ticker}: "
+                f"entry_price must be positive, got {entry_price}"
+            )
+            raise ValueError(message)
+
         if side == TradeSide.SELL:
             # Alpaca does not support fractional short sells; whole shares only.
             # Use the pre-computed quantity when available to avoid recomputation.

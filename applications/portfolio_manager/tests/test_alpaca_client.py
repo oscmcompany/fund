@@ -213,6 +213,51 @@ def test_open_position_raises_value_error_for_negative_amount() -> None:
         )
 
 
+def test_open_position_raises_value_error_for_zero_entry_price() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="entry_price must be positive"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=100.0, entry_price=0.0
+        )
+
+
+def test_open_position_raises_value_error_for_negative_entry_price() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="entry_price must be positive"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=100.0, entry_price=-50.0
+        )
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_open_positions_returns_position_list(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+    expected_quantity = 10.0
+    expected_market_value = 1500.0
+    expected_unrealized_profit_and_loss = 50.0
+    mock_position = MagicMock()
+    mock_position.symbol = "AAPL"
+    mock_position.side = "long"
+    mock_position.qty = str(int(expected_quantity))
+    mock_position.market_value = str(expected_market_value)
+    mock_position.unrealized_pl = str(expected_unrealized_profit_and_loss)
+    mock_trading.get_all_positions.return_value = [mock_position]
+
+    result = client.get_open_positions()
+
+    assert len(result) == 1
+    assert result[0]["ticker"] == "AAPL"
+    assert result[0]["side"] == "long"
+    assert result[0]["quantity"] == expected_quantity
+    assert result[0]["market_value"] == expected_market_value
+    assert result[0]["unrealized_profit_and_loss"] == (
+        expected_unrealized_profit_and_loss
+    )
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
 def test_open_position_raises_insufficient_buying_power_error() -> None:
     client, mock_trading = _make_client()
