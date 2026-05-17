@@ -312,8 +312,20 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     metrics.positions_closed_count.set(closed_count)
 
     opened_tickers = {r["ticker"] for r in open_results if r["status"] == "success"}
+    # Only persist pairs where all legs opened successfully to avoid unbalanced exposure
+    successful_pair_ids = set(
+        optimal_portfolio.filter(pl.col("ticker").is_in(opened_tickers))
+        .group_by("pair_id")
+        .agg(pl.len().alias("opened_legs"))
+        .join(
+            optimal_portfolio.group_by("pair_id").agg(pl.len().alias("total_legs")),
+            on="pair_id",
+        )
+        .filter(pl.col("opened_legs") == pl.col("total_legs"))["pair_id"]
+        .to_list()
+    )
     successful_open_rows = optimal_portfolio.filter(
-        pl.col("ticker").is_in(opened_tickers)
+        pl.col("pair_id").is_in(successful_pair_ids)
     )
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([successful_open_rows, held_rows])

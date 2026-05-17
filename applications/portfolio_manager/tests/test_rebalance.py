@@ -825,8 +825,125 @@ def test_run_rebalance_saves_only_opened_rows(
 
     saved_df = mock_save.call_args[0][0]
     saved_tickers = saved_df["ticker"].to_list()
-    assert "NVDA" in saved_tickers
+    assert "NVDA" not in saved_tickers
     assert "AMD" not in saved_tickers
+
+
+@patch("portfolio_manager.rebalance.execute_open_positions")
+@patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
+@patch(
+    "portfolio_manager.rebalance.save_portfolio",
+    new_callable=AsyncMock,
+    return_value=True,
+)
+@patch("portfolio_manager.rebalance.get_optimal_portfolio")
+@patch(
+    "portfolio_manager.rebalance.classify_regime",
+    return_value={"state": "mean_reversion", "confidence": 0.8},
+)
+@patch(
+    "portfolio_manager.rebalance.compute_market_betas",
+    return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"], "market_beta": [1.0, 1.0]}),
+)
+@patch("portfolio_manager.rebalance.pairs_schema")
+@patch(
+    "portfolio_manager.rebalance.select_pairs",
+    return_value=pl.DataFrame(
+        {
+            "pair_id": ["NVDA-AMD"],
+            "long_ticker": ["NVDA"],
+            "short_ticker": ["AMD"],
+            "z_score": [2.5],
+            "hedge_ratio": [1.0],
+            "signal_strength": [0.1],
+            "long_realized_volatility": [0.02],
+            "short_realized_volatility": [0.02],
+        }
+    ),
+)
+@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch(
+    "portfolio_manager.rebalance.consolidate_predictions",
+    return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
+)
+@patch(
+    "portfolio_manager.rebalance.get_raw_predictions",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+)
+@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_equity_details",
+    return_value=pl.DataFrame(),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_historical_prices",
+    return_value=pl.DataFrame(
+        schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
+    ),
+)
+def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
+    _mock_hist: MagicMock,  # noqa: PT019
+    _mock_equity: MagicMock,  # noqa: PT019
+    _mock_spy: MagicMock,  # noqa: PT019
+    _mock_predictions: AsyncMock,  # noqa: PT019
+    _mock_consolidate: MagicMock,  # noqa: PT019
+    mock_prior_portfolio: AsyncMock,
+    _mock_select: MagicMock,  # noqa: PT019
+    mock_pairs_schema: MagicMock,
+    _mock_betas: MagicMock,  # noqa: PT019
+    _mock_regime: MagicMock,  # noqa: PT019
+    mock_optimal_portfolio: MagicMock,
+    mock_save: AsyncMock,
+    _mock_record: AsyncMock,  # noqa: PT019
+    mock_execute_open: MagicMock,
+) -> None:
+    optimal = _make_optimal_portfolio()
+    mock_optimal_portfolio.return_value = optimal
+    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_prior_portfolio.return_value = pl.DataFrame(
+        schema={
+            **_PRIOR_PORTFOLIO_SCHEMA,
+            "quantity": pl.Int64,
+            "notional": pl.Float64,
+        }
+    )
+    # Both legs succeed — the full pair should be saved.
+    mock_execute_open.return_value = (
+        [
+            {
+                "ticker": "NVDA",
+                "action": "open",
+                "side": "BUY",
+                "dollar_amount": 990.0,
+                "status": "success",
+            },
+            {
+                "ticker": "AMD",
+                "action": "open",
+                "side": "SELL",
+                "dollar_amount": 990.0,
+                "status": "success",
+            },
+        ],
+        2,
+    )
+
+    mock_account = MagicMock()
+    mock_account.cash_amount = 10000.0
+    mock_account.buying_power = 10000.0
+    mock_account.equity = 50000.0
+
+    mock_client = MagicMock()
+    mock_client.get_account.return_value = mock_account
+    mock_client.get_shortable_tickers.return_value = ["NVDA", "AMD"]
+
+    asyncio.run(run_rebalance(mock_client))
+
+    saved_df = mock_save.call_args[0][0]
+    saved_tickers = saved_df["ticker"].to_list()
+    assert "NVDA" in saved_tickers
+    assert "AMD" in saved_tickers
 
 
 # --- run_rebalance: empty predictions ---
