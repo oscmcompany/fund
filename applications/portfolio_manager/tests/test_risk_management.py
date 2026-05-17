@@ -143,8 +143,8 @@ def test_size_pairs_with_volatility_parity_raises_insufficient_pairs_error() -> 
 
 
 def test_size_pairs_with_volatility_parity_raises_when_short_price_too_high() -> None:
-    # maximum_per_pair_dollar = (10000/2.03) * 1.0 * 2.0 / 10 ≈ 985.2
-    # With price=1001, int(985.2/1001) = 0, so all pairs are infeasible.
+    # maximum_per_pair_dollar = (10000/2.33) * 1.0 * 2.0 / 10 ≈ 858.4
+    # With price=1001, int(858.4/1001) = 0, so all pairs are infeasible.
     pairs = _make_candidate_pairs()
     with pytest.raises(InsufficientPairsError):
         size_pairs_with_volatility_parity(
@@ -177,9 +177,9 @@ def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts(
     pairs = _make_candidate_pairs()
     market_betas = _make_neutral_market_betas()
     entry_prices = _make_entry_prices(price=10.0)
-    # maximum_capital=2030 gives per-pair = 2030/2.03/10 = 100.0 exactly at price=10,
+    # maximum_capital=2330 gives per-pair = 2330/2.33/10 = 100.0 exactly at price=10,
     # so exposure_scale=0.5 halves to 50.0 without any whole-share rounding loss.
-    maximum_capital = 2030.0
+    maximum_capital = 2330.0
 
     full_result = size_pairs_with_volatility_parity(
         pairs,
@@ -274,6 +274,40 @@ def test_size_pairs_with_volatility_parity_output_includes_entry_price() -> None
     assert result["entry_price"].is_null().sum() == 0
     for price in result["entry_price"].to_list():
         assert price == pytest.approx(10.0)
+
+
+def test_size_pairs_with_volatility_parity_hold_overnight_reduces_dollar_amounts() -> (
+    None
+):
+    pairs = _make_candidate_pairs()
+    market_betas = _make_neutral_market_betas()
+    entry_prices = _make_entry_prices(price=10.0)
+    maximum_capital = 10000.0
+
+    overnight_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=maximum_capital,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        entry_prices=entry_prices,
+        hold_overnight=True,
+        overnight_margin_rate_standard=0.30,
+    )
+    intraday_result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=maximum_capital,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        entry_prices=entry_prices,
+        hold_overnight=False,
+        overnight_margin_rate_standard=0.30,
+    )
+
+    overnight_total = overnight_result["dollar_amount"].sum()
+    intraday_total = intraday_result["dollar_amount"].sum()
+    assert overnight_total is not None
+    assert intraday_total is not None
+    assert float(overnight_total) < float(intraday_total)
 
 
 def test_size_pairs_with_volatility_parity_output_includes_quantity_and_notional() -> (

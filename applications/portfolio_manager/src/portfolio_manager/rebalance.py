@@ -240,6 +240,8 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
             entry_prices=entry_prices_map,
             exposure_scale=exposure_scale,
             short_buying_power_buffer=configuration.short_buying_power_buffer,
+            hold_overnight=configuration.hold_overnight,
+            overnight_margin_rate_standard=configuration.overnight_margin_rate_standard,
         )
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
     except InsufficientPairsError as e:
@@ -350,6 +352,8 @@ def get_optimal_portfolio(  # noqa: PLR0913
     entry_prices: dict[str, float],
     exposure_scale: float,
     short_buying_power_buffer: float,
+    hold_overnight: bool,  # noqa: FBT001
+    overnight_margin_rate_standard: float,
 ) -> pl.DataFrame:
     optimal_portfolio = size_pairs_with_volatility_parity(
         candidate_pairs=candidate_pairs,
@@ -359,6 +363,8 @@ def get_optimal_portfolio(  # noqa: PLR0913
         entry_prices=entry_prices,
         exposure_scale=exposure_scale,
         short_buying_power_buffer=short_buying_power_buffer,
+        hold_overnight=hold_overnight,
+        overnight_margin_rate_standard=overnight_margin_rate_standard,
     )
 
     return portfolio_schema.validate(optimal_portfolio)
