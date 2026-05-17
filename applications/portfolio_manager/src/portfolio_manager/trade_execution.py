@@ -111,6 +111,8 @@ def execute_open_positions(  # noqa: C901, PLR0915
     opened_count = 0
     remaining_buying_power = initial_buying_power
     skipped_insufficient_buying_power = 0
+    skipped_insufficient_equity = 0
+    skipped_zero_quantity = 0
     skipped_not_shortable = 0
 
     # Submit all long (BUY) positions before short (SELL) positions so that long
@@ -136,7 +138,7 @@ def execute_open_positions(  # noqa: C901, PLR0915
                     account_equity=account_equity,
                     minimum_short_equity=configuration.minimum_short_equity,
                 )
-                skipped_insufficient_buying_power += 1
+                skipped_insufficient_equity += 1
                 metrics.trades_submitted_total.labels(
                     action="open", status="skipped"
                 ).inc()
@@ -165,7 +167,7 @@ def execute_open_positions(  # noqa: C901, PLR0915
                     dollar_amount=dollar_amount,
                     entry_price=entry_price,
                 )
-                skipped_insufficient_buying_power += 1
+                skipped_zero_quantity += 1
                 metrics.trades_submitted_total.labels(
                     action="open", status="skipped"
                 ).inc()
@@ -322,10 +324,18 @@ def execute_open_positions(  # noqa: C901, PLR0915
                 }
             )
 
-    if skipped_insufficient_buying_power > 0 or skipped_not_shortable > 0:
+    any_skipped = (
+        skipped_insufficient_buying_power > 0
+        or skipped_insufficient_equity > 0
+        or skipped_zero_quantity > 0
+        or skipped_not_shortable > 0
+    )
+    if any_skipped:
         logger.info(
             "Some positions were skipped",
             skipped_insufficient_buying_power=skipped_insufficient_buying_power,
+            skipped_insufficient_equity=skipped_insufficient_equity,
+            skipped_zero_quantity=skipped_zero_quantity,
             skipped_not_shortable=skipped_not_shortable,
         )
 

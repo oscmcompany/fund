@@ -73,6 +73,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     short_buying_power_buffer: float = 1.03,
     hold_overnight: bool = True,  # noqa: FBT001, FBT002
     overnight_margin_rate_standard: float = 0.30,
+    overnight_margin_rate_low_price: float = 1.00,
 ) -> pl.DataFrame:
     """Size pairs so each contributes equal risk, then optimize for beta neutrality.
 
@@ -95,7 +96,18 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     # discarding pairs that the optimizer might assign a higher-than-equal weight.
     # Denominator accounts for the short buying power buffer and, when holding
     # overnight, the maintenance margin so the capital budget matches execution.
-    overnight_margin_rate = overnight_margin_rate_standard if hold_overnight else 0.0
+    # When holding overnight, the more conservative (higher) of the two margin rates
+    # is used so that low-priced shorts are not oversized relative to the buying
+    # power cost that execute_open_positions will charge at execution time.
+    # REQUIRED_PAIRS (the target pair count) is used as the divisor rather than
+    # feasible_pairs.height so the bound is stable before filtering; pairs whose
+    # short price exceeds this upper bound cannot be afforded at any weight the
+    # optimizer assigns within BETA_WEIGHT_UPPER_BOUND of an equal allocation.
+    overnight_margin_rate = 0.0
+    if hold_overnight:
+        overnight_margin_rate = max(
+            overnight_margin_rate_standard, overnight_margin_rate_low_price
+        )
     capital_divisor = 1.0 + short_buying_power_buffer + overnight_margin_rate
     maximum_per_pair_dollar = (
         (maximum_capital / capital_divisor)

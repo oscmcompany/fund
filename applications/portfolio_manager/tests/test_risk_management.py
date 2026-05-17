@@ -177,9 +177,10 @@ def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts(
     pairs = _make_candidate_pairs()
     market_betas = _make_neutral_market_betas()
     entry_prices = _make_entry_prices(price=10.0)
-    # maximum_capital=2330 gives per-pair = 2330/2.33/10 = 100.0 exactly at price=10,
-    # so exposure_scale=0.5 halves to 50.0 without any whole-share rounding loss.
-    maximum_capital = 2330.0
+    # maximum_capital=3030 gives per-pair = 3030/3.03/10 = 100.0 exactly at price=10
+    # (capital_divisor = 1 + 1.03 + max(0.30, 1.00) = 3.03), so exposure_scale=0.5
+    # halves to 50.0 without any whole-share rounding loss.
+    maximum_capital = 3030.0
 
     full_result = size_pairs_with_volatility_parity(
         pairs,
@@ -199,7 +200,7 @@ def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts(
     )
 
     # Both long and short legs are whole-share adjusted and balanced to each other;
-    # with price=10 and maximum_capital=2030 the halving is exact for both.
+    # with price=10 and maximum_capital=3030 the halving is exact for both.
     full_long = (
         full_result.filter(pl.col("side") == "LONG")
         .sort("ticker")["dollar_amount"]
@@ -210,7 +211,7 @@ def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts(
         .sort("ticker")["dollar_amount"]
         .to_list()
     )
-    for full, half in zip(full_long, half_long, strict=False):
+    for full, half in zip(full_long, half_long, strict=True):
         assert half == pytest.approx(full * 0.5)
 
     full_short = (
@@ -223,7 +224,7 @@ def test_size_pairs_with_volatility_parity_exposure_scale_halves_dollar_amounts(
         .sort("ticker")["dollar_amount"]
         .to_list()
     )
-    for full, half in zip(full_short, half_short, strict=False):
+    for full, half in zip(full_short, half_short, strict=True):
         assert half == pytest.approx(full * 0.5)
 
 
@@ -331,3 +332,34 @@ def test_size_pairs_with_volatility_parity_output_includes_quantity_and_notional
     long_rows = result.filter(pl.col("side") == "LONG")
     assert long_rows["quantity"].is_null().sum() == long_rows.height
     assert long_rows["notional"].is_null().sum() == 0
+
+
+def test_size_pairs_with_volatility_parity_uses_conservative_overnight_margin() -> None:
+    # When hold_overnight=True and the low-price margin rate exceeds the standard rate,
+    # sizing must use the higher rate so low-priced shorts are not oversized
+    # versus the buying power cost charged at execution time.
+    pairs = _make_candidate_pairs()
+    market_betas = _make_neutral_market_betas()
+    entry_prices = _make_entry_prices(price=10.0)
+    maximum_capital = 3030.0
+    standard_rate = 0.30
+    low_price_rate = 1.00
+
+    result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=maximum_capital,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        entry_prices=entry_prices,
+        hold_overnight=True,
+        overnight_margin_rate_standard=standard_rate,
+        overnight_margin_rate_low_price=low_price_rate,
+    )
+
+    # capital_divisor = 1.0 + 1.03 + max(0.30, 1.00) = 3.03
+    # short total = maximum_capital / 3.03 ≈ 1000
+    # Without the fix, capital_divisor would be 2.33 and short total ≈ 1300.
+    short_total = result.filter(pl.col("side") == "SHORT")["dollar_amount"].sum()
+    assert short_total is not None
+    expected = maximum_capital / (1.0 + 1.03 + low_price_rate)
+    assert short_total == pytest.approx(expected, rel=0.05)
