@@ -292,11 +292,14 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     )
     try:
         account = alpaca_client.get_account()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "Failed to refresh account after closing positions, using prior snapshot",
+    except Exception as e:
+        logger.exception(
+            "Failed to refresh account after closing positions, aborting open phase",
             error=str(e),
         )
+        metrics.rebalance_errors_total.labels(stage="account_refresh").inc()
+        metrics.observe_duration(start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     open_results, opened_count = execute_open_positions(
         alpaca_client,
         open_positions,
@@ -308,8 +311,12 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     metrics.positions_opened_count.set(opened_count)
     metrics.positions_closed_count.set(closed_count)
 
+    opened_tickers = {r["ticker"] for r in open_results if r["status"] == "succeeded"}
+    successful_open_rows = optimal_portfolio.filter(
+        pl.col("ticker").is_in(opened_tickers)
+    )
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
-    final_portfolio = pl.concat([optimal_portfolio, held_rows])
+    final_portfolio = pl.concat([successful_open_rows, held_rows])
     save_succeeded = await save_portfolio(final_portfolio, current_timestamp)
 
     all_results = close_results + open_results

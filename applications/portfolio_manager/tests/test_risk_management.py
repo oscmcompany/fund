@@ -142,6 +142,27 @@ def test_size_pairs_with_volatility_parity_raises_insufficient_pairs_error() -> 
         )
 
 
+def test_size_pairs_with_volatility_parity_raises_when_partial_zero_qty() -> None:
+    # pair 0 has very low volatility → gets ~100% of capital, non-zero qty.
+    # pairs 1-9 have very high volatility → get almost nothing, zero qty.
+    # After the zero-qty filter, 1 pair remains (0 < 1 < REQUIRED_PAIRS=10);
+    # should raise InsufficientPairsError rather than returning a truncated DataFrame.
+    # maximum_per_pair_dollar = (100/1.0)*1.0*2.0/10 = 20; price=10 passes pre-filter.
+    low_vol = 0.001
+    high_vol = 1000.0
+    long_vols = [low_vol] + [high_vol] * 9
+    short_vols = [low_vol] + [high_vol] * 9
+    pairs = _make_candidate_pairs(long_vols=long_vols, short_vols=short_vols)
+    with pytest.raises(InsufficientPairsError):
+        size_pairs_with_volatility_parity(
+            pairs,
+            maximum_capital=100.0,
+            current_timestamp=_CURRENT_TIMESTAMP,
+            market_betas=_make_neutral_market_betas(),
+            entry_prices=_make_entry_prices(price=10.0),
+        )
+
+
 def test_size_pairs_with_volatility_parity_raises_when_short_price_too_high() -> None:
     # maximum_per_pair_dollar = (10000/2.33) * 1.0 * 2.0 / 10 ≈ 858.4
     # With price=1001, int(858.4/1001) = 0, so all pairs are infeasible.

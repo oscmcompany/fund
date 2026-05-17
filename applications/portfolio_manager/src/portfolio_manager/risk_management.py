@@ -207,6 +207,13 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
         )
         pairs = pairs.filter(pl.col("_short_qty") > 0)
 
+    if 0 < pairs.height < REQUIRED_PAIRS:
+        message = (
+            f"Only {pairs.height} viable pairs remain after zero-quantity filter, "
+            f"need at least {REQUIRED_PAIRS}."
+        )
+        raise InsufficientPairsError(message)
+
     if pairs.height == 0:
         message = "No viable pairs remain after whole-share short constraint."
         raise InsufficientPairsError(message)
