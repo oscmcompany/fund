@@ -14,6 +14,7 @@ from alpaca.common.exceptions import APIError
 from fastapi import FastAPI, Response, status
 
 from .alpaca_client import AlpacaClient
+from .configuration import Configuration
 from .metrics import (
     get_metrics,
 )
@@ -76,11 +77,17 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         api_secret=ALPACA_API_SECRET,
         is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
     )
+    _app.state.configuration = Configuration(
+        hold_overnight=os.getenv("FUND_HOLD_OVERNIGHT", "true").lower() == "true",
+    )
     logger.info(
-        "Portfolio manager initialized", is_paper=_app.state.alpaca_client.is_paper
+        "Portfolio manager initialized",
+        is_paper=_app.state.alpaca_client.is_paper,
+        hold_overnight=_app.state.configuration.hold_overnight,
     )
     _app.state.scheduler_task = await spawn_rebalance_scheduler(
         alpaca_client=_app.state.alpaca_client,
+        configuration=_app.state.configuration,
         data_manager_base_url=DATA_MANAGER_BASE_URL,
         rebalance_lock=_rebalance_lock,
     )
@@ -143,4 +150,7 @@ async def create_portfolio() -> Response:
     if _rebalance_lock.locked():
         return Response(status_code=status.HTTP_409_CONFLICT)
     async with _rebalance_lock:
-        return await run_rebalance(application.state.alpaca_client)
+        return await run_rebalance(
+            application.state.alpaca_client,
+            application.state.configuration,
+        )

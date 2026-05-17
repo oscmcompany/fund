@@ -1,5 +1,4 @@
 .DS_Store
-.env
 .ruff_cache/
 .pytest_cache/
 .venv/
@@ -19,5 +18,4 @@ data/
 **/*.json
 .claude/tasks/
 .scratchpad/
-
 .devenv

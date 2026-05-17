@@ -7,7 +7,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  statuses: write
 
 jobs:
   ci:
@@ -41,26 +40,3 @@ jobs:
           restore-keys: uv-
       - name: Run all CI checks
         run: devenv --secretspec-provider env --secretspec-profile development tasks run --mode before checks:ci
-      - name: Upload Rust coverage to Coveralls
-        if: hashFiles('.coverage_output/rust.xml') != ''
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          flag-name: rust
-          file: .coverage_output/rust.xml
-          parallel: true
-      - name: Upload Python coverage to Coveralls
-        if: hashFiles('.coverage_output/python.xml') != ''
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          flag-name: python
-          file: .coverage_output/python.xml
-          parallel: true
-      - name: Finalize coverage upload
-        if: hashFiles('.coverage_output/rust.xml') != '' || hashFiles('.coverage_output/python.xml') != ''
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          parallel-finished: true
-          carryforward: rust,python
