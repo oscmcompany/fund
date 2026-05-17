@@ -18,6 +18,7 @@ from alpaca.trading.enums import (
     AssetStatus,
     OrderSide,
     OrderType,
+    PositionIntent,
     TimeInForce,
 )
 
@@ -115,6 +116,7 @@ class AlpacaClient:
                 side=OrderSide.SELL,
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,
+                position_intent=PositionIntent.SELL_TO_OPEN,
             )
         else:
             # Long buys use notional so Alpaca handles fractional shares automatically.
@@ -124,6 +126,7 @@ class AlpacaClient:
                 side=OrderSide.BUY,
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,
+                position_intent=PositionIntent.BUY_TO_OPEN,
             )
 
         try:

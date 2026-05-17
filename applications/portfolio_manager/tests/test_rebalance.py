@@ -513,6 +513,105 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
     assert len(close_positions) == expected_close_count
 
 
+# --- run_rebalance: account refresh after close ---
+
+
+@patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
+@patch(
+    "portfolio_manager.rebalance.save_portfolio",
+    new_callable=AsyncMock,
+    return_value=True,
+)
+@patch("portfolio_manager.rebalance.get_optimal_portfolio")
+@patch(
+    "portfolio_manager.rebalance.classify_regime",
+    return_value={"state": "mean_reversion", "confidence": 0.8},
+)
+@patch(
+    "portfolio_manager.rebalance.compute_market_betas",
+    return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"], "market_beta": [1.0, 1.0]}),
+)
+@patch("portfolio_manager.rebalance.pairs_schema")
+@patch(
+    "portfolio_manager.rebalance.select_pairs",
+    return_value=pl.DataFrame(
+        {
+            "pair_id": ["NVDA-AMD"],
+            "long_ticker": ["NVDA"],
+            "short_ticker": ["AMD"],
+            "z_score": [2.5],
+            "hedge_ratio": [1.0],
+            "signal_strength": [0.1],
+            "long_realized_volatility": [0.02],
+            "short_realized_volatility": [0.02],
+        }
+    ),
+)
+@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch(
+    "portfolio_manager.rebalance.consolidate_predictions",
+    return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
+)
+@patch(
+    "portfolio_manager.rebalance.get_raw_predictions",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+)
+@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_equity_details",
+    return_value=pl.DataFrame(),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_historical_prices",
+    return_value=pl.DataFrame(
+        schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
+    ),
+)
+def test_run_rebalance_refreshes_account_after_closing_positions(
+    _mock_hist: MagicMock,  # noqa: PT019
+    _mock_equity: MagicMock,  # noqa: PT019
+    _mock_spy: MagicMock,  # noqa: PT019
+    _mock_predictions: AsyncMock,  # noqa: PT019
+    _mock_consolidate: MagicMock,  # noqa: PT019
+    mock_prior_portfolio: AsyncMock,
+    _mock_select: MagicMock,  # noqa: PT019
+    mock_pairs_schema: MagicMock,
+    _mock_betas: MagicMock,  # noqa: PT019
+    _mock_regime: MagicMock,  # noqa: PT019
+    mock_optimal_portfolio: MagicMock,
+    _mock_save: AsyncMock,  # noqa: PT019
+    _mock_record: AsyncMock,  # noqa: PT019
+) -> None:
+    optimal = _make_optimal_portfolio()
+    mock_optimal_portfolio.return_value = optimal
+    mock_pairs_schema.validate.side_effect = lambda df: df
+    # Use the full portfolio schema (including quantity/notional) so that pl.concat
+    # in run_rebalance does not fail on schema mismatch.
+    mock_prior_portfolio.return_value = pl.DataFrame(
+        schema={
+            **_PRIOR_PORTFOLIO_SCHEMA,
+            "quantity": pl.Int64,
+            "notional": pl.Float64,
+        }
+    )
+
+    mock_account = MagicMock()
+    mock_account.cash_amount = 10000.0
+    mock_account.buying_power = 10000.0
+    mock_account.equity = 50000.0
+
+    mock_client = MagicMock()
+    mock_client.get_account.return_value = mock_account
+    mock_client.get_shortable_tickers.return_value = ["NVDA", "AMD"]
+
+    asyncio.run(run_rebalance(mock_client))
+
+    # get_account is called at the start and again after close positions
+    minimum_account_calls = 2
+    assert mock_client.get_account.call_count >= minimum_account_calls
+
+
 # --- run_rebalance: empty predictions ---
 
 

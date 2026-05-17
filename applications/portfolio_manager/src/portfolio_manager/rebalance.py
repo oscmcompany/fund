@@ -290,6 +290,13 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     close_results, closed_count = execute_close_positions(
         alpaca_client, close_positions
     )
+    try:
+        account = alpaca_client.get_account()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Failed to refresh account after closing positions, using prior snapshot",
+            error=str(e),
+        )
     open_results, opened_count = execute_open_positions(
         alpaca_client,
         open_positions,

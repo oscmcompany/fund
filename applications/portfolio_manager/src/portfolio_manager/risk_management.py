@@ -115,17 +115,25 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
         * BETA_WEIGHT_UPPER_BOUND
         / REQUIRED_PAIRS
     )
+    long_prices = [
+        entry_prices.get(ticker, 0.0)
+        for ticker in candidate_pairs["long_ticker"].to_list()
+    ]
     short_prices = [
         entry_prices.get(ticker, 0.0)
         for ticker in candidate_pairs["short_ticker"].to_list()
     ]
     feasible_pairs = (
-        candidate_pairs.with_columns(pl.Series("_short_entry_price", short_prices))
+        candidate_pairs.with_columns(
+            pl.Series("_long_entry_price", long_prices),
+            pl.Series("_short_entry_price", short_prices),
+        )
         .filter(
-            (pl.col("_short_entry_price") > 0)
+            (pl.col("_long_entry_price") > 0)
+            & (pl.col("_short_entry_price") > 0)
             & (pl.col("_short_entry_price") <= maximum_per_pair_dollar)
         )
-        .drop("_short_entry_price")
+        .drop("_long_entry_price", "_short_entry_price")
     )
 
     if feasible_pairs.height < REQUIRED_PAIRS:

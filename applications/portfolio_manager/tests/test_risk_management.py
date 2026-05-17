@@ -334,6 +334,31 @@ def test_size_pairs_with_volatility_parity_output_includes_quantity_and_notional
     assert long_rows["notional"].is_null().sum() == 0
 
 
+def test_size_pairs_with_volatility_parity_filters_pairs_missing_long_entry_price() -> (
+    None
+):
+    # 11 candidate pairs; pair 10's long ticker is absent from entry_prices.
+    # The prefilter must remove it so sizing completes cleanly with 10 pairs
+    # and no long position carries entry_price=0.
+    pairs = _make_candidate_pairs(count=11)
+    market_betas = _make_neutral_market_betas(count=11)
+    entry_prices = _make_entry_prices(count=10)  # pair 10's long ticker omitted
+
+    result = size_pairs_with_volatility_parity(
+        pairs,
+        maximum_capital=10000.0,
+        current_timestamp=_CURRENT_TIMESTAMP,
+        market_betas=market_betas,
+        entry_prices=entry_prices,
+    )
+
+    long_rows = result.filter(pl.col("side") == "LONG")
+    assert long_rows.height == REQUIRED_PAIRS
+    for price in long_rows["entry_price"].to_list():
+        assert price is not None
+        assert price > 0
+
+
 def test_size_pairs_with_volatility_parity_uses_conservative_overnight_margin() -> None:
     # When hold_overnight=True and the low-price margin rate exceeds the standard rate,
     # sizing must use the higher rate so low-priced shorts are not oversized

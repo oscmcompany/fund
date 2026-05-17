@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, PositionIntent
 from alpaca.trading.requests import GetAssetsRequest
 from portfolio_manager.alpaca_client import AlpacaAccount, AlpacaClient
 from portfolio_manager.enums import TradeSide
@@ -182,6 +182,42 @@ def test_open_position_sell_uses_qty_not_notional(mock_sleep: MagicMock) -> None
     assert order_request.side == OrderSide.SELL
     assert order_request.qty == _EXPECTED_SELL_QTY
     assert not hasattr(order_request, "notional") or order_request.notional is None
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_buy_includes_position_intent_buy_to_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.position_intent == PositionIntent.BUY_TO_OPEN
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_sell_includes_position_intent_sell_to_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL",
+        side=TradeSide.SELL,
+        dollar_amount=500.0,
+        entry_price=50.0,
+        quantity=10,
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.position_intent == PositionIntent.SELL_TO_OPEN
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 
 
