@@ -798,7 +798,7 @@ def test_run_rebalance_saves_only_opened_rows(
                 "action": "open",
                 "side": "BUY",
                 "dollar_amount": 990.0,
-                "status": "succeeded",
+                "status": "success",
             },
             {
                 "ticker": "AMD",

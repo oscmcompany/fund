@@ -311,7 +311,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     metrics.positions_opened_count.set(opened_count)
     metrics.positions_closed_count.set(closed_count)
 
-    opened_tickers = {r["ticker"] for r in open_results if r["status"] == "succeeded"}
+    opened_tickers = {r["ticker"] for r in open_results if r["status"] == "success"}
     successful_open_rows = optimal_portfolio.filter(
         pl.col("ticker").is_in(opened_tickers)
     )
