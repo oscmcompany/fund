@@ -5,7 +5,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
-pub async fn insert_equity_prices(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
+pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
     if bars.is_empty() {
         return Ok(0);
     }
@@ -39,7 +39,7 @@ pub async fn insert_equity_prices(pool: &PgPool, bars: &[EquityBar]) -> Result<u
 
     for chunk in valid_bars.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO equity_prices (time, symbol, open, high, low, close, volume) ",
+            "INSERT INTO equity_bars (time, symbol, open, high, low, close, volume) ",
         );
 
         query_builder.push_values(chunk, |mut builder, bar| {
@@ -67,17 +67,17 @@ pub async fn insert_equity_prices(pool: &PgPool, bars: &[EquityBar]) -> Result<u
         rows_affected += result.rows_affected();
     }
 
-    info!("Inserted {} equity prices into PostgreSQL", rows_affected);
+    info!("Inserted {} equity bars into PostgreSQL", rows_affected);
     Ok(rows_affected)
 }
 
-pub async fn query_recent_equity_prices(
+pub async fn query_recent_equity_bars(
     pool: &PgPool,
     tickers: Option<&[String]>,
     days_back: i32,
 ) -> Result<Vec<EquityBar>, sqlx::Error> {
     debug!(
-        "Querying recent equity prices, days_back: {}, tickers: {:?}",
+        "Querying recent equity bars, days_back: {}, tickers: {:?}",
         days_back, tickers
     );
 
@@ -85,7 +85,7 @@ pub async fn query_recent_equity_prices(
         Some(ticker_list) if !ticker_list.is_empty() => {
             sqlx::query(
                 r#"SELECT symbol, time, open, high, low, close, volume
-                   FROM equity_prices
+                   FROM equity_bars
                    WHERE time >= now() - make_interval(days => $1)
                      AND symbol = ANY($2)
                    ORDER BY symbol, time"#,
@@ -98,7 +98,7 @@ pub async fn query_recent_equity_prices(
         _ => {
             sqlx::query(
                 r#"SELECT symbol, time, open, high, low, close, volume
-                   FROM equity_prices
+                   FROM equity_bars
                    WHERE time >= now() - make_interval(days => $1)
                    ORDER BY symbol, time"#,
             )
@@ -109,7 +109,7 @@ pub async fn query_recent_equity_prices(
     };
 
     let bars: Vec<EquityBar> = rows.iter().map(equity_bar_from_row).collect();
-    info!("Queried {} equity prices from PostgreSQL", bars.len());
+    info!("Queried {} equity bars from PostgreSQL", bars.len());
     Ok(bars)
 }
 
@@ -233,7 +233,7 @@ mod tests {
             // (which returns before touching the database)
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
-            let result = insert_equity_prices(&pool, &[]).await;
+            let result = insert_equity_bars(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
         });

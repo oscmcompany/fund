@@ -4,9 +4,9 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- equity_prices: daily OHLCV bars (TimescaleDB hypertable)
+-- equity_bars: daily OHLCV bars (TimescaleDB hypertable)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
-CREATE TABLE IF NOT EXISTS equity_prices (
+CREATE TABLE IF NOT EXISTS equity_bars (
     time    TIMESTAMPTZ      NOT NULL,
     symbol  TEXT             NOT NULL,
     open    DOUBLE PRECISION NOT NULL,
@@ -15,8 +15,8 @@ CREATE TABLE IF NOT EXISTS equity_prices (
     close   DOUBLE PRECISION NOT NULL,
     volume  BIGINT           NOT NULL
 );
-SELECT create_hypertable('equity_prices', by_range('time'), if_not_exists => TRUE);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_prices_symbol_time ON equity_prices (symbol, time DESC);
+SELECT create_hypertable('equity_bars', by_range('time'), if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_time ON equity_bars (symbol, time DESC);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
@@ -130,5 +130,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Nightly equity prices sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
-SELECT cron.schedule('equity-prices-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-prices-sync')$$);
+-- Nightly equity bars sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
+SELECT cron.schedule('equity-bars-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bars-sync')$$);
