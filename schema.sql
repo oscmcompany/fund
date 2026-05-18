@@ -1,25 +1,92 @@
 -- Fund platform PostgreSQL schema
--- Hot cache, model metadata, and job scheduling
+-- TimescaleDB operational data layer
 
--- equity_bars: Hot cache for recent equity bar data (TTL-managed, last 10 days)
-CREATE TABLE IF NOT EXISTS equity_bars (
-    ticker                        TEXT             NOT NULL,
-    timestamp                     BIGINT           NOT NULL,
-    open_price                    DOUBLE PRECISION,
-    high_price                    DOUBLE PRECISION,
-    low_price                     DOUBLE PRECISION,
-    close_price                   DOUBLE PRECISION,
-    volume                        BIGINT,
-    volume_weighted_average_price DOUBLE PRECISION,
-    transactions                  BIGINT,
-    inserted_at                   TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    PRIMARY KEY (ticker, timestamp)
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- equity_prices: daily OHLCV bars (TimescaleDB hypertable)
+-- Source: Massive API (historical), Alpaca REST (EOD backfill)
+CREATE TABLE IF NOT EXISTS equity_prices (
+    time    TIMESTAMPTZ      NOT NULL,
+    symbol  TEXT             NOT NULL,
+    open    DOUBLE PRECISION NOT NULL,
+    high    DOUBLE PRECISION NOT NULL,
+    low     DOUBLE PRECISION NOT NULL,
+    close   DOUBLE PRECISION NOT NULL,
+    volume  BIGINT           NOT NULL
+);
+SELECT create_hypertable('equity_prices', by_range('time'), if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_prices_symbol_time ON equity_prices (symbol, time DESC);
+
+-- equity_quotes: intraday bid/ask rolling 24-hour buffer
+-- Exported to S3 Parquet daily then purged; future use: replay simulation
+CREATE TABLE IF NOT EXISTS equity_quotes (
+    time        TIMESTAMPTZ NOT NULL,
+    symbol      TEXT        NOT NULL,
+    bid_price   NUMERIC     NOT NULL,
+    ask_price   NUMERIC     NOT NULL,
+    bid_size    INTEGER     NOT NULL,
+    ask_size    INTEGER     NOT NULL
+);
+SELECT create_hypertable('equity_quotes', by_range('time'), if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_equity_quotes_symbol_time ON equity_quotes (symbol, time DESC);
+SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+
+-- equity_orders: orders submitted to Alpaca, linked to allocations
+CREATE TABLE IF NOT EXISTS equity_orders (
+    id               UUID        PRIMARY KEY,
+    allocation_id    UUID        NOT NULL,
+    submitted_at     TIMESTAMPTZ NOT NULL,
+    symbol           TEXT        NOT NULL,
+    side             TEXT        NOT NULL,
+    quantity         NUMERIC     NOT NULL,
+    order_type       TEXT        NOT NULL,
+    limit_price      NUMERIC,
+    alpaca_order_id  TEXT        NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp);
-CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_at);
+-- equity_allocations: model output (intended target weights) at generation time
+CREATE TABLE IF NOT EXISTS equity_allocations (
+    id               UUID        PRIMARY KEY,
+    rebalance_id     UUID        NOT NULL,
+    generated_at     TIMESTAMPTZ NOT NULL,
+    model_run_id     UUID        NOT NULL,
+    symbol           TEXT        NOT NULL,
+    target_weight    NUMERIC     NOT NULL,
+    reference_price  NUMERIC     NOT NULL
+);
 
--- model_runs: Training metadata for model artifacts and evaluation metrics
+-- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
+CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
+    id              UUID        PRIMARY KEY,
+    triggered_at    TIMESTAMPTZ NOT NULL,
+    trigger_reason  TEXT        NOT NULL,
+    model_run_id    UUID        NOT NULL,
+    completed_at    TIMESTAMPTZ,
+    status          TEXT        NOT NULL
+);
+
+-- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
+CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
+    snapshot_date        DATE    NOT NULL PRIMARY KEY,
+    nav                  NUMERIC NOT NULL,
+    gross_return         NUMERIC NOT NULL,
+    net_return           NUMERIC NOT NULL,
+    total_slippage_cost  NUMERIC NOT NULL
+);
+
+-- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
+CREATE TABLE IF NOT EXISTS equity_trades (
+    time          TIMESTAMPTZ NOT NULL,
+    symbol        TEXT        NOT NULL,
+    order_id      UUID        NOT NULL,
+    quantity      NUMERIC     NOT NULL,
+    price         NUMERIC     NOT NULL,
+    side          TEXT        NOT NULL,
+    slippage_bps  NUMERIC
+);
+
+-- model_runs: training metadata for model artifacts and evaluation metrics
 CREATE TABLE IF NOT EXISTS model_runs (
     run_id               TEXT PRIMARY KEY,
     model_name           TEXT NOT NULL DEFAULT 'tide',
@@ -41,7 +108,7 @@ CREATE TABLE IF NOT EXISTS model_runs (
 CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status);
 CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC);
 
--- scheduled_jobs: Job queue for pg_cron + LISTEN/NOTIFY
+-- scheduled_jobs: job queue for pg_cron + LISTEN/NOTIFY
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
     id           BIGSERIAL    PRIMARY KEY,
     job_name     TEXT         NOT NULL,
@@ -55,9 +122,6 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
 CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_pending
     ON scheduled_jobs (job_name, status) WHERE status = 'pending';
 
--- pg_cron extension for scheduled jobs
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-
 -- Notify function: insert row then send NOTIFY on channel "jobs"
 CREATE OR REPLACE FUNCTION schedule_job(name TEXT) RETURNS void AS $$
 BEGIN
@@ -66,8 +130,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Nightly equity bar sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
-SELECT cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
-
--- TTL cleanup: delete equity bars older than 10 days, daily at 3:00 AM UTC
-SELECT cron.schedule('equity-bars-ttl', '0 3 * * *', $$DELETE FROM equity_bars WHERE inserted_at < now() - interval '10 days'$$);
+-- Nightly equity prices sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
+SELECT cron.schedule('equity-prices-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-prices-sync')$$);

@@ -1,72 +1,94 @@
 use crate::data::EquityBar;
+use chrono::DateTime;
+use chrono::Utc;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
-pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
+pub async fn insert_equity_prices(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
     if bars.is_empty() {
+        return Ok(0);
+    }
+
+    // Filter to bars that have all required non-null fields and a valid timestamp.
+    let valid_bars: Vec<&EquityBar> = bars
+        .iter()
+        .filter(|bar| {
+            bar.open_price.is_some()
+                && bar.high_price.is_some()
+                && bar.low_price.is_some()
+                && bar.close_price.is_some()
+                && bar.volume.is_some()
+                && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
+        })
+        .collect();
+
+    let skipped = bars.len() - valid_bars.len();
+    if skipped > 0 {
+        warn!(
+            "Skipping {} bars with null OHLCV or invalid timestamp",
+            skipped
+        );
+    }
+
+    if valid_bars.is_empty() {
         return Ok(0);
     }
 
     let mut rows_affected: u64 = 0;
 
-    for chunk in bars.chunks(1000) {
+    for chunk in valid_bars.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO equity_bars (ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions) ",
+            "INSERT INTO equity_prices (time, symbol, open, high, low, close, volume) ",
         );
 
         query_builder.push_values(chunk, |mut builder, bar| {
+            let time = DateTime::<Utc>::from_timestamp_millis(bar.timestamp).unwrap();
             builder
+                .push_bind(time)
                 .push_bind(&bar.ticker)
-                .push_bind(bar.timestamp)
-                .push_bind(bar.open_price)
-                .push_bind(bar.high_price)
-                .push_bind(bar.low_price)
-                .push_bind(bar.close_price)
-                .push_bind(bar.volume)
-                .push_bind(bar.volume_weighted_average_price)
-                .push_bind(bar.transactions.map(|t| t as i64));
+                .push_bind(bar.open_price.unwrap())
+                .push_bind(bar.high_price.unwrap())
+                .push_bind(bar.low_price.unwrap())
+                .push_bind(bar.close_price.unwrap())
+                .push_bind(bar.volume.unwrap());
         });
 
         query_builder.push(
-            " ON CONFLICT (ticker, timestamp) DO UPDATE SET \
-             open_price = EXCLUDED.open_price, \
-             high_price = EXCLUDED.high_price, \
-             low_price = EXCLUDED.low_price, \
-             close_price = EXCLUDED.close_price, \
-             volume = EXCLUDED.volume, \
-             volume_weighted_average_price = EXCLUDED.volume_weighted_average_price, \
-             transactions = EXCLUDED.transactions, \
-             inserted_at = now()",
+            " ON CONFLICT (symbol, time) DO UPDATE SET \
+             open = EXCLUDED.open, \
+             high = EXCLUDED.high, \
+             low = EXCLUDED.low, \
+             close = EXCLUDED.close, \
+             volume = EXCLUDED.volume",
         );
 
         let result = query_builder.build().execute(pool).await?;
         rows_affected += result.rows_affected();
     }
 
-    info!("Inserted {} equity bars into PostgreSQL", rows_affected);
+    info!("Inserted {} equity prices into PostgreSQL", rows_affected);
     Ok(rows_affected)
 }
 
-pub async fn query_recent_equity_bars(
+pub async fn query_recent_equity_prices(
     pool: &PgPool,
     tickers: Option<&[String]>,
     days_back: i32,
 ) -> Result<Vec<EquityBar>, sqlx::Error> {
     debug!(
-        "Querying recent equity bars, days_back: {}, tickers: {:?}",
+        "Querying recent equity prices, days_back: {}, tickers: {:?}",
         days_back, tickers
     );
 
     let rows: Vec<PgRow> = match tickers {
         Some(ticker_list) if !ticker_list.is_empty() => {
             sqlx::query(
-                r#"SELECT ticker, timestamp, open_price, high_price, low_price,
-                          close_price, volume, volume_weighted_average_price, transactions
-                   FROM equity_bars
-                   WHERE inserted_at >= now() - make_interval(days => $1)
-                     AND ticker = ANY($2)
-                   ORDER BY ticker, timestamp"#,
+                r#"SELECT symbol, time, open, high, low, close, volume
+                   FROM equity_prices
+                   WHERE time >= now() - make_interval(days => $1)
+                     AND symbol = ANY($2)
+                   ORDER BY symbol, time"#,
             )
             .bind(days_back)
             .bind(ticker_list)
@@ -75,11 +97,10 @@ pub async fn query_recent_equity_bars(
         }
         _ => {
             sqlx::query(
-                r#"SELECT ticker, timestamp, open_price, high_price, low_price,
-                          close_price, volume, volume_weighted_average_price, transactions
-                   FROM equity_bars
-                   WHERE inserted_at >= now() - make_interval(days => $1)
-                   ORDER BY ticker, timestamp"#,
+                r#"SELECT symbol, time, open, high, low, close, volume
+                   FROM equity_prices
+                   WHERE time >= now() - make_interval(days => $1)
+                   ORDER BY symbol, time"#,
             )
             .bind(days_back)
             .fetch_all(pool)
@@ -88,22 +109,22 @@ pub async fn query_recent_equity_bars(
     };
 
     let bars: Vec<EquityBar> = rows.iter().map(equity_bar_from_row).collect();
-    info!("Queried {} equity bars from PostgreSQL", bars.len());
+    info!("Queried {} equity prices from PostgreSQL", bars.len());
     Ok(bars)
 }
 
 fn equity_bar_from_row(row: &PgRow) -> EquityBar {
-    let transactions: Option<i64> = row.get("transactions");
+    let time: DateTime<Utc> = row.get("time");
     EquityBar {
-        ticker: row.get("ticker"),
-        timestamp: row.get("timestamp"),
-        open_price: row.get("open_price"),
-        high_price: row.get("high_price"),
-        low_price: row.get("low_price"),
-        close_price: row.get("close_price"),
-        volume: row.get("volume"),
-        volume_weighted_average_price: row.get("volume_weighted_average_price"),
-        transactions: transactions.map(|t| t as u64),
+        ticker: row.get("symbol"),
+        timestamp: time.timestamp_millis(),
+        open_price: Some(row.get::<f64, _>("open")),
+        high_price: Some(row.get::<f64, _>("high")),
+        low_price: Some(row.get::<f64, _>("low")),
+        close_price: Some(row.get::<f64, _>("close")),
+        volume: Some(row.get("volume")),
+        volume_weighted_average_price: None,
+        transactions: None,
     }
 }
 
@@ -212,9 +233,36 @@ mod tests {
             // (which returns before touching the database)
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
-            let result = insert_equity_bars(&pool, &[]).await;
+            let result = insert_equity_prices(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
         });
+    }
+
+    #[test]
+    fn test_bars_with_null_ohlcv_are_filtered() {
+        let bars_with_nulls = vec![EquityBar {
+            ticker: "AAPL".to_string(),
+            timestamp: 1700000000000,
+            open_price: None,
+            high_price: None,
+            low_price: None,
+            close_price: None,
+            volume: None,
+            volume_weighted_average_price: None,
+            transactions: None,
+        }];
+        let valid_bars: Vec<&EquityBar> = bars_with_nulls
+            .iter()
+            .filter(|bar| {
+                bar.open_price.is_some()
+                    && bar.high_price.is_some()
+                    && bar.low_price.is_some()
+                    && bar.close_price.is_some()
+                    && bar.volume.is_some()
+                    && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
+            })
+            .collect();
+        assert_eq!(valid_bars.len(), 0);
     }
 }

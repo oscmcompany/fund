@@ -140,16 +140,16 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         let notification = listener.recv().await?;
         let payload = notification.payload();
 
-        if payload != "equity-bar-sync" {
+        if payload != "equity-prices-sync" {
             continue;
         }
 
-        info!("Received NOTIFY for equity-bar-sync");
+        info!("Received NOTIFY for equity-prices-sync");
 
-        let job_id = match db::claim_pending_job(pool, "equity-bar-sync").await {
+        let job_id = match db::claim_pending_job(pool, "equity-prices-sync").await {
             Ok(Some(id)) => id,
             Ok(None) => {
-                info!("No pending equity-bar-sync job to claim");
+                info!("No pending equity-prices-sync job to claim");
                 continue;
             }
             Err(error) => {

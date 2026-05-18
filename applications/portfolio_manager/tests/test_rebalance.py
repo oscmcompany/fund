@@ -7,9 +7,9 @@ import polars as pl
 import pytest
 from fastapi import status
 from portfolio_manager.portfolio_state import (
-    _PRIOR_PORTFOLIO_SCHEMA,
+    _PRIOR_ALLOCATION_SCHEMA,
     evaluate_prior_pairs,
-    get_prior_portfolio,
+    get_prior_allocation,
 )
 from portfolio_manager.rebalance import (
     _prune_pairs_with_invalid_entry_price,
@@ -43,7 +43,7 @@ def _make_prior_portfolio(pairs: list[dict]) -> pl.DataFrame:
                 "entry_price": 100.0,
             }
         )
-    return pl.DataFrame(rows, schema=_PRIOR_PORTFOLIO_SCHEMA)
+    return pl.DataFrame(rows, schema=_PRIOR_ALLOCATION_SCHEMA)
 
 
 def _make_historical_prices(tickers: list[str], n_rows: int = 65) -> pl.DataFrame:
@@ -77,7 +77,7 @@ def _make_optimal_portfolio() -> pl.DataFrame:
 
 
 def test_evaluate_prior_pairs_returns_empty_set_for_empty_portfolio() -> None:
-    empty_portfolio = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+    empty_portfolio = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     result = evaluate_prior_pairs(empty_portfolio, historical_prices)
     assert result == set()
@@ -178,7 +178,7 @@ def test_evaluate_prior_pairs_skips_malformed_pair_missing_long_leg() -> None:
             "pair_id": ["AAPL-MSFT"],
             "entry_price": [100.0],
         },
-        schema=_PRIOR_PORTFOLIO_SCHEMA,
+        schema=_PRIOR_ALLOCATION_SCHEMA,
     )
     historical_prices = _make_historical_prices(["AAPL", "MSFT"])
     result = evaluate_prior_pairs(prior, historical_prices)
@@ -263,7 +263,7 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
     assert result == {"AAPL", "MSFT"}
 
 
-# --- get_prior_portfolio ---
+# --- get_prior_allocation ---
 
 
 def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
@@ -274,7 +274,7 @@ def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
     return mock_client
 
 
-def test_get_prior_portfolio_returns_empty_dataframe_on_empty_array_response() -> None:
+def test_get_prior_allocation_returns_empty_dataframe_on_empty_array_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "[]"
@@ -282,12 +282,12 @@ def test_get_prior_portfolio_returns_empty_dataframe_on_empty_array_response() -
     with patch(
         "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
     ):
-        result = asyncio.run(get_prior_portfolio())
+        result = asyncio.run(get_prior_allocation())
     assert result.is_empty()
     assert "pair_id" in result.columns
 
 
-def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None:
+def test_get_prior_allocation_returns_dataframe_with_pair_id_on_success() -> None:
     data = [
         {
             "ticker": "AAPL",
@@ -306,13 +306,13 @@ def test_get_prior_portfolio_returns_dataframe_with_pair_id_on_success() -> None
     with patch(
         "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
     ):
-        result = asyncio.run(get_prior_portfolio())
+        result = asyncio.run(get_prior_allocation())
     assert result.height == 1
     assert "pair_id" in result.columns
     assert result["pair_id"][0] == "AAPL-MSFT"
 
 
-def test_get_prior_portfolio_raises_on_error_response() -> None:
+def test_get_prior_allocation_raises_on_error_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 500
     mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
@@ -328,10 +328,10 @@ def test_get_prior_portfolio_raises_on_error_response() -> None:
         ),
         pytest.raises(httpx.HTTPStatusError),
     ):
-        asyncio.run(get_prior_portfolio())
+        asyncio.run(get_prior_allocation())
 
 
-def test_get_prior_portfolio_raises_on_parse_error() -> None:
+def test_get_prior_allocation_raises_on_parse_error() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.raise_for_status.return_value = None
@@ -345,10 +345,10 @@ def test_get_prior_portfolio_raises_on_parse_error() -> None:
         ),
         pytest.raises(ValueError, match="invalid json"),
     ):
-        asyncio.run(get_prior_portfolio())
+        asyncio.run(get_prior_allocation())
 
 
-def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() -> None:
+def test_get_prior_allocation_returns_empty_dataframe_on_whitespace_response() -> None:
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.text = "  "
@@ -356,7 +356,7 @@ def test_get_prior_portfolio_returns_empty_dataframe_on_whitespace_response() ->
     with patch(
         "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
     ):
-        result = asyncio.run(get_prior_portfolio())
+        result = asyncio.run(get_prior_allocation())
     assert result.is_empty()
 
 

@@ -109,7 +109,10 @@ in {
 
   services.postgres = {
     enable = true;
-    package = pkgs.postgresql_16;
+    package = pkgs.postgresql_16.withPackages (p: [
+      p.timescaledb
+      p.pg_cron
+    ]);
     port = 5432;
     listen_addresses = "127.0.0.1";
     initialDatabases = [
@@ -118,9 +121,8 @@ in {
         schema = ./schema.sql;
       }
     ];
-    extensions = extensions: [extensions.pg_cron];
     settings = {
-      shared_preload_libraries = "pg_cron";
+      shared_preload_libraries = "timescaledb,pg_cron";
       "cron.database_name" = "fund";
     };
   };
@@ -143,6 +145,16 @@ in {
     uv
     xenon
   ];
+
+  scripts.db-seed.exec = ''
+    set -euo pipefail
+    echo "Downloading latest database snapshot..."
+    aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
+    gunzip /tmp/fund-latest.dump.gz
+    pg_restore --host 127.0.0.1 --port 5432 --username fund \
+      --dbname fund --clean --if-exists /tmp/fund-latest.dump
+    echo "Database seeded"
+  '';
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail

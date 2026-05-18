@@ -1,7 +1,7 @@
 use crate::data::{
-    create_closed_pair_dataframe, create_equity_bar_dataframe, create_equity_details_dataframe,
-    create_performance_snapshot_dataframe, create_portfolio_dataframe,
-    create_predictions_dataframe, ClosedPair, EquityBar, PerformanceSnapshot, Portfolio,
+    create_allocation_dataframe, create_closed_pair_dataframe, create_equity_bar_dataframe,
+    create_equity_details_dataframe, create_performance_snapshot_dataframe,
+    create_predictions_dataframe, Allocation, ClosedPair, EquityBar, PerformanceSnapshot,
     Prediction,
 };
 use crate::errors::Error;
@@ -26,7 +26,7 @@ pub async fn write_equity_bars_dataframe_to_s3(
     write_dataframe_to_s3(state, dataframe, timestamp, "bars".to_string()).await
 }
 
-pub async fn write_portfolio_dataframe_to_s3(
+pub async fn write_allocation_dataframe_to_s3(
     state: &State,
     dataframe: &DataFrame,
     timestamp: &DateTime<Utc>,
@@ -867,7 +867,7 @@ pub async fn query_predictions_dataframe_from_s3(
     Ok(predictions_dataframe)
 }
 
-pub async fn query_portfolio_dataframe_from_s3(
+pub async fn query_allocation_dataframe_from_s3(
     state: &State,
     timestamp: Option<DateTime<Utc>>,
 ) -> Result<DataFrame, Error> {
@@ -954,29 +954,32 @@ pub async fn query_portfolio_dataframe_from_s3(
         }
     };
 
-    let portfolios = execute_portfolio_query(&connection, &query)?;
+    let allocations = execute_allocation_query(&connection, &query)?;
 
-    info!("Query returned {} portfolio records", portfolios.len());
+    info!("Query returned {} allocation records", allocations.len());
 
-    debug!("Creating portfolio DataFrame");
-    let portfolio_dataframe = create_portfolio_dataframe(portfolios)?;
+    debug!("Creating allocation DataFrame");
+    let allocation_dataframe = create_allocation_dataframe(allocations)?;
 
     info!(
-        "Portfolio DataFrame created with {} rows",
-        portfolio_dataframe.height()
+        "Allocation DataFrame created with {} rows",
+        allocation_dataframe.height()
     );
 
-    Ok(portfolio_dataframe)
+    Ok(allocation_dataframe)
 }
 
-fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<Portfolio>, Error> {
-    debug!("Executing portfolio query: {}", query);
+fn execute_allocation_query(
+    connection: &Connection,
+    query: &str,
+) -> Result<Vec<Allocation>, Error> {
+    debug!("Executing allocation query: {}", query);
 
     let mut statement = connection.prepare(query)?;
 
-    let portfolios: Vec<Portfolio> = statement
+    let allocations: Vec<Allocation> = statement
         .query_map([], |row| {
-            Ok(Portfolio {
+            Ok(Allocation {
                 ticker: row.get::<_, String>(0)?,
                 timestamp: row.get::<_, i64>(1)?,
                 side: row.get::<_, String>(2)?,
@@ -988,11 +991,11 @@ fn execute_portfolio_query(connection: &Connection, query: &str) -> Result<Vec<P
         })?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
-            warn!("Failed to map portfolio query results: {}", e);
+            warn!("Failed to map allocation query results: {}", e);
             Error::Other(format!("Failed to map query results: {}", e))
         })?;
 
-    Ok(portfolios)
+    Ok(allocations)
 }
 
 pub async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Error> {

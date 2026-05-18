@@ -24,10 +24,10 @@ from .portfolio_state import (
     DATA_MANAGER_BASE_URL,
     evaluate_prior_pairs,
     get_last_portfolio_value,
-    get_prior_portfolio,
+    get_prior_allocation,
+    save_allocation,
     save_closed_pair,
     save_performance_snapshot,
-    save_portfolio,
 )
 from .regime import classify_regime
 from .risk_management import size_pairs_with_volatility_parity
@@ -129,11 +129,11 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_portfolio = await get_prior_portfolio()
+        prior_portfolio = await get_prior_allocation()
         prior_portfolio_tickers = prior_portfolio["ticker"].unique().to_list()
-        logger.info("Retrieved prior portfolio", count=len(prior_portfolio_tickers))
+        logger.info("Retrieved prior allocation", count=len(prior_portfolio_tickers))
     except Exception as e:
-        logger.exception("Failed to retrieve prior portfolio", error=str(e))
+        logger.exception("Failed to retrieve prior allocation", error=str(e))
         metrics.rebalance_errors_total.labels(stage="prior_portfolio").inc()
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -277,7 +277,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
     held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
     final_portfolio = pl.concat([optimal_portfolio, held_rows])
-    save_succeeded = await save_portfolio(final_portfolio, current_timestamp)
+    save_succeeded = await save_allocation(final_portfolio, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
