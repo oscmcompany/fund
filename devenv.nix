@@ -155,6 +155,7 @@ in {
     rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
     pg_restore --host 127.0.0.1 --port 5432 \
+      --no-owner --no-acl \
       --dbname fund --clean --if-exists /tmp/fund-latest.dump
     echo "Database seeded"
   '';
