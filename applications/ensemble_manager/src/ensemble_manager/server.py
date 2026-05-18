@@ -215,8 +215,11 @@ async def _sync_run_metadata(
     metadata_key = f"{artifact_folder}/run_metadata.json"
 
     try:
-        response = s3_client.get_object(Bucket=bucket, Key=metadata_key)
-        metadata = json.loads(response["Body"].read())
+        response = await asyncio.to_thread(
+            s3_client.get_object, Bucket=bucket, Key=metadata_key
+        )
+        body = await asyncio.to_thread(response["Body"].read)
+        metadata = json.loads(body)
     except ClientError:
         logger.debug("No run_metadata.json found", metadata_key=metadata_key)
         return
@@ -240,7 +243,9 @@ async def _sync_run_metadata(
                    ON CONFLICT (run_id) DO UPDATE SET
                        artifact_key = EXCLUDED.artifact_key,
                        status = EXCLUDED.status,
-                       completed_at = EXCLUDED.completed_at""",
+                       completed_at = COALESCE(
+                           model_runs.completed_at, EXCLUDED.completed_at
+                       )""",
                 (
                     run_id,
                     artifact_key,
@@ -281,7 +286,8 @@ async def _artifact_polling_task(app: FastAPI) -> None:
         await asyncio.sleep(poll_interval)
 
         try:
-            latest_key = _resolve_artifact_key(
+            latest_key = await asyncio.to_thread(
+                _resolve_artifact_key,
                 s3_client=s3_client,
                 bucket=bucket,
                 artifact_path=artifact_path,
@@ -305,14 +311,17 @@ async def _artifact_polling_task(app: FastAPI) -> None:
 
         new_directory = tempfile.mkdtemp(prefix="model_artifacts_")
         try:
-            download_and_extract_artifacts(
+            await asyncio.to_thread(
+                download_and_extract_artifacts,
                 s3_client=s3_client,
                 bucket=bucket,
                 artifact_key=latest_key,
                 extract_path=Path(new_directory),
             )
 
-            new_model = Model.load(directory_path=new_directory)
+            new_model = await asyncio.to_thread(
+                Model.load, directory_path=new_directory
+            )
 
             with app.state.model_swap_lock:
                 old_directory = getattr(app.state, "model_directory", None)

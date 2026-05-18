@@ -559,6 +559,9 @@ def test_status_logger_loop_logs_account_status() -> None:
         cash_amount=10000.0,
         buying_power=20000.0,
         position_count=1,
+    )
+    mock_logger.debug.assert_any_call(
+        "Account positions",
         positions=mock_alpaca.get_open_positions.return_value,
     )
 
@@ -589,8 +592,8 @@ def test_status_logger_loop_handles_exception_without_crashing() -> None:
         cash_amount=5000.0,
         buying_power=10000.0,
         position_count=0,
-        positions=[],
     )
+    mock_logger.debug.assert_any_call("Account positions", positions=[])
 
 
 def test_status_logger_loop_exits_on_cancellation() -> None:

@@ -105,8 +105,8 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
                 cash_amount=account.cash_amount,
                 buying_power=account.buying_power,
                 position_count=len(positions),
-                positions=positions,
             )
+            logger.debug("Account positions", positions=positions)
             await asyncio.sleep(_STATUS_LOG_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             logger.info("Status logger cancelled")
