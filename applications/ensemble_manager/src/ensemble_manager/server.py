@@ -236,7 +236,7 @@ async def _sync_run_metadata(
                        run_id, artifact_key, training_data_key,
                        start_date, end_date, lookback_days,
                        status, stage_counts, completed_at
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, now())
                    ON CONFLICT (run_id) DO UPDATE SET
                        artifact_key = EXCLUDED.artifact_key,
                        status = EXCLUDED.status,

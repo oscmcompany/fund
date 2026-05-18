@@ -154,7 +154,7 @@ in {
     aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
     rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
-    pg_restore --host 127.0.0.1 --port 5432 --username fund \
+    pg_restore --host 127.0.0.1 --port 5432 \
       --dbname fund --clean --if-exists /tmp/fund-latest.dump
     echo "Database seeded"
   '';

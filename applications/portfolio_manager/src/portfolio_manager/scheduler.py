@@ -113,7 +113,11 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
             return
         except Exception as error:
             logger.exception("Status logger error", error=str(error))
-            await asyncio.sleep(_STATUS_LOG_INTERVAL_SECONDS)
+            try:
+                await asyncio.sleep(_STATUS_LOG_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                logger.info("Status logger cancelled")
+                return
 
 
 async def _rebalance_loop(  # noqa: C901
