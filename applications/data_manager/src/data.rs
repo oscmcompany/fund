@@ -138,10 +138,10 @@ pub fn create_predictions_dataframe(prediction_rows: Vec<Prediction>) -> Result<
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct Portfolio {
+pub struct Allocation {
     pub ticker: String,
-    /// Unix timestamp in milliseconds. Records when the portfolio allocation
-    /// was computed. See EquityBar.timestamp for the rationale.
+    /// Unix timestamp in milliseconds. Records when the allocation was
+    /// computed. See EquityBar.timestamp for the rationale.
     pub timestamp: i64,
     pub side: String,
     pub dollar_amount: f64,
@@ -150,24 +150,24 @@ pub struct Portfolio {
     pub entry_price: Option<f64>,
 }
 
-pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<DataFrame, Error> {
+pub fn create_allocation_dataframe(allocation_rows: Vec<Allocation>) -> Result<DataFrame, Error> {
     debug!(
-        "Creating portfolio DataFrame from {} rows",
-        portfolio_rows.len()
+        "Creating allocation DataFrame from {} rows",
+        allocation_rows.len()
     );
 
-    let portfolio_dataframe = df!(
-        "ticker" => portfolio_rows.iter().map(|p| p.ticker.as_str()).collect::<Vec<&str>>(),
-        "timestamp" => portfolio_rows.iter().map(|p| p.timestamp).collect::<Vec<i64>>(),
-        "side" => portfolio_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
-        "dollar_amount" => portfolio_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
-        "action" => portfolio_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
-        "pair_id" => portfolio_rows.iter().map(|p| p.pair_id.as_str()).collect::<Vec<&str>>(),
-        "entry_price" => portfolio_rows.iter().map(|p| p.entry_price).collect::<Vec<Option<f64>>>(),
+    let allocation_dataframe = df!(
+        "ticker" => allocation_rows.iter().map(|p| p.ticker.as_str()).collect::<Vec<&str>>(),
+        "timestamp" => allocation_rows.iter().map(|p| p.timestamp).collect::<Vec<i64>>(),
+        "side" => allocation_rows.iter().map(|p| p.side.as_str()).collect::<Vec<&str>>(),
+        "dollar_amount" => allocation_rows.iter().map(|p| p.dollar_amount).collect::<Vec<f64>>(),
+        "action" => allocation_rows.iter().map(|p| p.action.as_str()).collect::<Vec<&str>>(),
+        "pair_id" => allocation_rows.iter().map(|p| p.pair_id.as_str()).collect::<Vec<&str>>(),
+        "entry_price" => allocation_rows.iter().map(|p| p.entry_price).collect::<Vec<Option<f64>>>(),
     )?;
 
     debug!("Normalizing ticker, side, and action columns: trimming whitespace and converting to uppercase");
-    let portfolio_dataframe = portfolio_dataframe
+    let allocation_dataframe = allocation_dataframe
         .lazy()
         .with_columns([col("ticker")
             .str()
@@ -190,12 +190,12 @@ pub fn create_portfolio_dataframe(portfolio_rows: Vec<Portfolio>) -> Result<Data
         .collect()?;
 
     info!(
-        "Created portfolio DataFrame: {} rows x {} columns",
-        portfolio_dataframe.height(),
-        portfolio_dataframe.width()
+        "Created allocation DataFrame: {} rows x {} columns",
+        allocation_dataframe.height(),
+        allocation_dataframe.width()
     );
 
-    Ok(portfolio_dataframe)
+    Ok(allocation_dataframe)
 }
 
 #[derive(Debug, Deserialize, Clone)]

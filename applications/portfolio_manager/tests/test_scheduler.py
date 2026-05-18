@@ -3,10 +3,12 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from portfolio_manager.alpaca_client import AlpacaAccount
 from portfolio_manager.scheduler import (
     _already_rebalanced_today,
     _rebalance_loop,
     _seconds_until_next_rebalance,
+    _status_logger_loop,
 )
 
 _EASTERN = ZoneInfo("America/New_York")
@@ -98,7 +100,7 @@ def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
 
 def test_already_rebalanced_today_returns_true_when_todays_portfolio_exists() -> None:
     frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
-    data = [{"ticker": "AAPL", "timestamp": frozen_now.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(frozen_now.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
@@ -120,7 +122,7 @@ def test_already_rebalanced_today_returns_false_when_portfolio_is_from_yesterday
 ):
     frozen_now = datetime(2026, 3, 23, 10, 30, 0, tzinfo=_EASTERN)
     yesterday = frozen_now - timedelta(days=1)
-    data = [{"ticker": "AAPL", "timestamp": yesterday.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(yesterday.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
@@ -141,7 +143,7 @@ def test_already_rebalanced_today_handles_eastern_utc_day_boundary() -> None:
     # Timestamp recorded at Monday 20:30 ET (= Tuesday 00:30 UTC).
     # "now" is also Monday 20:30 ET — should detect already rebalanced for that ET day.
     monday_eastern = datetime(2026, 3, 23, 20, 30, 0, tzinfo=_EASTERN)
-    data = [{"ticker": "AAPL", "timestamp": monday_eastern.timestamp()}]
+    data = [{"ticker": "AAPL", "timestamp": int(monday_eastern.timestamp() * 1000)}]
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = data
@@ -511,3 +513,102 @@ def test_rebalance_loop_retries_after_unexpected_error() -> None:
         asyncio.run(run())
 
     mock_run_rebalance.assert_not_called()
+
+
+# --- _status_logger_loop ---
+
+
+def _make_mock_alpaca_for_status(
+    positions: list[dict[str, object]] | None = None,
+) -> MagicMock:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.return_value = AlpacaAccount(
+        cash_amount=10000.0, buying_power=20000.0
+    )
+    mock_alpaca.get_open_positions.return_value = positions or []
+    return mock_alpaca
+
+
+def test_status_logger_loop_logs_account_status() -> None:
+    mock_alpaca = _make_mock_alpaca_for_status(
+        positions=[
+            {
+                "ticker": "AAPL",
+                "side": "long",
+                "quantity": 10.0,
+                "market_value": 1500.0,
+                "unrealized_profit_and_loss": 50.0,
+            }
+        ]
+    )
+
+    async def run() -> None:
+        await _status_logger_loop(mock_alpaca)
+
+    with (
+        patch(
+            "asyncio.sleep",
+            AsyncMock(side_effect=[asyncio.CancelledError()]),
+        ),
+        patch("portfolio_manager.scheduler.logger") as mock_logger,
+    ):
+        asyncio.run(run())
+
+    mock_logger.info.assert_any_call(
+        "Account status",
+        cash_amount=10000.0,
+        buying_power=20000.0,
+        position_count=1,
+    )
+    mock_logger.debug.assert_any_call(
+        "Account positions",
+        positions=mock_alpaca.get_open_positions.return_value,
+    )
+
+
+def test_status_logger_loop_handles_exception_without_crashing() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.side_effect = [
+        Exception("api error"),
+        AlpacaAccount(cash_amount=5000.0, buying_power=10000.0),
+    ]
+    mock_alpaca.get_open_positions.return_value = []
+
+    async def run() -> None:
+        await _status_logger_loop(mock_alpaca)
+
+    with (
+        patch(
+            "asyncio.sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError()]),
+        ),
+        patch("portfolio_manager.scheduler.logger") as mock_logger,
+    ):
+        asyncio.run(run())
+
+    mock_logger.exception.assert_called_once()
+    mock_logger.info.assert_any_call(
+        "Account status",
+        cash_amount=5000.0,
+        buying_power=10000.0,
+        position_count=0,
+    )
+    mock_logger.debug.assert_any_call("Account positions", positions=[])
+
+
+def test_status_logger_loop_exits_on_cancellation() -> None:
+    mock_alpaca = _make_mock_alpaca_for_status()
+
+    async def run() -> None:
+        await _status_logger_loop(mock_alpaca)
+
+    with (
+        patch(
+            "asyncio.sleep",
+            AsyncMock(side_effect=[asyncio.CancelledError()]),
+        ),
+        patch("portfolio_manager.scheduler.logger") as mock_logger,
+    ):
+        asyncio.run(run())
+
+    mock_logger.info.assert_any_call("Status logger cancelled")

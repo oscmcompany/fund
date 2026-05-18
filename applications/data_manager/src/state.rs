@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
+use sqlx::PgPool;
 use tracing::{debug, info};
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub struct State {
     pub s3_client: S3Client,
     pub bucket_name: String,
     pub last_s3_ok_epoch: Arc<AtomicU64>,
+    pub pool: Option<PgPool>,
 }
 
 impl State {
@@ -53,6 +55,21 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
+        let pool = match std::env::var("DATABASE_URL") {
+            Ok(database_url) => {
+                debug!("Connecting to PostgreSQL");
+                let pool = PgPool::connect(&database_url)
+                    .await
+                    .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL: {error}"));
+                info!("Connected to PostgreSQL");
+                Some(pool)
+            }
+            Err(_) => {
+                info!("DATABASE_URL not set, PostgreSQL disabled");
+                None
+            }
+        };
+
         info!("Application state initialized successfully");
 
         Self {
@@ -64,6 +81,7 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
+            pool,
         }
     }
 
@@ -79,6 +97,7 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
+            pool: None,
         }
     }
 

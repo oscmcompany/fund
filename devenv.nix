@@ -96,12 +96,37 @@ in {
     AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
     AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
 
+    # PostgreSQL
+    DATABASE_URL = "postgresql://localhost:5432/fund";
+
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
 
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
     SECRETSPEC_PROFILE = fundProfile;
+  };
+
+  services.postgres = {
+    enable = true;
+    package = pkgs.postgresql_16.withPackages (p: [
+      (p.timescaledb.overrideAttrs (old: {
+        meta = old.meta // {license = lib.licenses.tsl // {free = true;};};
+      }))
+      p.pg_cron
+    ]);
+    port = 5432;
+    listen_addresses = "127.0.0.1";
+    initialDatabases = [
+      {
+        name = "fund";
+        schema = ./schema.sql;
+      }
+    ];
+    settings = {
+      shared_preload_libraries = "timescaledb,pg_cron";
+      "cron.database_name" = "fund";
+    };
   };
 
   packages = with pkgs; [
@@ -116,11 +141,24 @@ in {
     git
     jq
     markdownlint-cli
+    postgresql_16
     ruff
     rustup
     uv
     xenon
   ];
+
+  scripts.db-seed.exec = ''
+    set -euo pipefail
+    echo "Downloading latest database snapshot..."
+    aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
+    rm -f /tmp/fund-latest.dump
+    gunzip /tmp/fund-latest.dump.gz
+    pg_restore --host 127.0.0.1 --port 5432 \
+      --no-owner --no-acl \
+      --dbname fund --clean --if-exists /tmp/fund-latest.dump
+    echo "Database seeded"
+  '';
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail
@@ -421,6 +459,7 @@ in {
       FUND_ENSEMBLE_MANAGER_BASE_URL = "http://localhost:8082";
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
+      DATABASE_URL = "postgresql://localhost:5432/fund";
     };
 
     scripts.cleanup-services.exec = ''
@@ -513,20 +552,6 @@ in {
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
         '';
-
-      artifact-watcher.exec = ''
-        attempt=0
-        max_attempts=90
-        while ! curl -sf http://localhost:8082/health > /dev/null 2>&1; do
-          attempt=$((attempt + 1))
-          if [ "$attempt" -ge "$max_attempts" ]; then
-            echo "ensemble-manager did not become healthy after $((max_attempts * 2)) seconds"
-            exit 1
-          fi
-          sleep 2
-        done
-        exec secretspec run -- uv run --package tools python -m tools.artifact_watcher
-      '';
     };
   };
 
@@ -567,6 +592,7 @@ in {
     echo "    Data Manager:     localhost:8080"
     echo "    Portfolio Manager: localhost:8081"
     echo "    Ensemble Manager: localhost:8082"
+    echo "    PostgreSQL:       localhost:5432/fund"
     echo ""
     echo "  Secrets (secretspec):"
     echo "    secretspec check          Validate production secrets"

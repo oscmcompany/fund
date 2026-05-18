@@ -52,6 +52,7 @@ mod tests {
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
             std::env::set_var("RUST_LOG", "data_manager=debug,tower_http=debug");
+            std::env::remove_var("DATABASE_URL");
         }
 
         let exit_code = run_with_bind_address("invalid-address").await;

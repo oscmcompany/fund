@@ -25,6 +25,7 @@ pub fn create_app_with_state(state: State) -> Router {
         .route("/portfolios", get(portfolios::get))
         .route("/equity-bars", post(equity_bars::sync))
         .route("/equity-bars", get(equity_bars::query))
+        .route("/equity-bars/recent", get(equity_bars::query_recent))
         .route("/equity-details", get(equity_details::get))
         .route("/equity-details", post(equity_details::sync))
         .route("/performance/snapshots", post(performance::save_snapshot))

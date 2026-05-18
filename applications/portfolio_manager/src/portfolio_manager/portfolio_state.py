@@ -20,7 +20,7 @@ DATA_MANAGER_BASE_URL = os.getenv(
 
 _MINIMUM_PAIR_PRICE_ROWS = 30
 
-_PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
+_PRIOR_ALLOCATION_SCHEMA: dict[str, type] = {
     "ticker": pl.String,
     "timestamp": pl.Int64,
     "side": pl.String,
@@ -31,56 +31,58 @@ _PRIOR_PORTFOLIO_SCHEMA: dict[str, type] = {
 }
 
 
-async def get_prior_portfolio() -> pl.DataFrame:
-    empty = pl.DataFrame(schema=_PRIOR_PORTFOLIO_SCHEMA)
+async def get_prior_allocation() -> pl.DataFrame:
+    empty = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.get(url=f"{DATA_MANAGER_BASE_URL}/portfolios")
     response.raise_for_status()
 
     response_text = response.text.strip()
     if not response_text or response_text == "[]":
-        logger.info("Prior portfolio is empty")
+        logger.info("Prior allocation is empty")
         return empty
 
     try:
-        prior_portfolio_data = response.json()
+        prior_allocation_data = response.json()
 
-        if not prior_portfolio_data:
+        if not prior_allocation_data:
             return empty
 
-        prior_portfolio = pl.DataFrame(
-            prior_portfolio_data, schema=_PRIOR_PORTFOLIO_SCHEMA
+        prior_allocation = pl.DataFrame(
+            prior_allocation_data, schema=_PRIOR_ALLOCATION_SCHEMA
         )
 
-        if prior_portfolio.is_empty():
+        if prior_allocation.is_empty():
             return empty
 
-        logger.info("Retrieved prior portfolio", count=prior_portfolio.height)
-        return prior_portfolio  # noqa: TRY300
+        logger.info("Retrieved prior allocation", count=prior_allocation.height)
+        return prior_allocation  # noqa: TRY300
 
     except (
         ValueError,
         pl.exceptions.PolarsError,
     ) as e:
-        logger.exception("Failed to parse prior portfolio JSON", error=str(e))
+        logger.exception("Failed to parse prior allocation JSON", error=str(e))
         raise
 
 
-async def save_portfolio(portfolio: pl.DataFrame, current_timestamp: datetime) -> bool:
+async def save_allocation(
+    allocation: pl.DataFrame, current_timestamp: datetime
+) -> bool:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url=f"{DATA_MANAGER_BASE_URL}/portfolios",
                 json={
                     "timestamp": current_timestamp.isoformat(),
-                    "data": portfolio.to_dicts(),
+                    "data": allocation.to_dicts(),
                 },
             )
         response.raise_for_status()
-        logger.info("Saved portfolio state", count=portfolio.height)
+        logger.info("Saved allocation state", count=allocation.height)
         return True  # noqa: TRY300
     except Exception as e:
-        logger.exception("Failed to save portfolio state", error=str(e))
+        logger.exception("Failed to save allocation state", error=str(e))
         return False
 
 
