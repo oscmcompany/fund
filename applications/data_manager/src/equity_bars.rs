@@ -340,17 +340,17 @@ pub async fn query_recent(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<RecentQueryParameters>,
 ) -> impl IntoResponse {
+    let days_back = parameters.days.unwrap_or(10);
+    if !(1..=30).contains(&days_back) {
+        return (StatusCode::BAD_REQUEST, "days must be between 1 and 30").into_response();
+    }
+
     let pool = match &state.pool {
         Some(pool) => pool,
         None => {
             return (StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL not available").into_response();
         }
     };
-
-    let days_back = parameters.days.unwrap_or(10);
-    if !(1..=30).contains(&days_back) {
-        return (StatusCode::BAD_REQUEST, "days must be between 1 and 30").into_response();
-    }
     let tickers: Option<Vec<String>> = parameters.tickers.as_ref().and_then(|tickers_str| {
         let parsed: Vec<String> = tickers_str
             .split(',')

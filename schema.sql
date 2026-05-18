@@ -139,7 +139,7 @@ BEGIN
         PERFORM cron.schedule(
             'equity-bars-sync',
             '0 5 * * 1-5',
-            $$SELECT schedule_job('equity-bars-sync')$$
+            $cmd$SELECT schedule_job('equity-bars-sync')$cmd$
         );
     END IF;
 END
