@@ -110,7 +110,9 @@ in {
   services.postgres = {
     enable = true;
     package = pkgs.postgresql_16.withPackages (p: [
-      p.timescaledb
+      (p.timescaledb.overrideAttrs (old: {
+        meta = old.meta // {license = lib.licenses.tsl // {free = true;};};
+      }))
       p.pg_cron
     ]);
     port = 5432;
