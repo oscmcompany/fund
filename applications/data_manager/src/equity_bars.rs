@@ -273,25 +273,6 @@ pub async fn fetch_and_store(
     );
     debug!("DataFrame schema: {:?}", data.schema());
 
-    info!("Uploading DataFrame to S3");
-    let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
-        .await
-        .map_err(|err| {
-            warn!(
-                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
-                err,
-                data.height(),
-                data.width(),
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            );
-            format!(
-                "Failed to upload equity bars to storage for date {}",
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            )
-        })?;
-
-    info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
-
     if let Some(pool) = &state.pool {
         let equity_bars: Vec<EquityBar> = bars
             .iter()
@@ -327,6 +308,25 @@ pub async fn fetch_and_store(
             })?;
     }
 
+    info!("Uploading DataFrame to S3");
+    let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
+        .await
+        .map_err(|err| {
+            warn!(
+                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
+                err,
+                data.height(),
+                data.width(),
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
+            );
+            format!(
+                "Failed to upload equity bars to storage for date {}",
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
+            )
+        })?;
+
+    info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
+
     Ok(Some(s3_key))
 }
 
@@ -351,11 +351,18 @@ pub async fn query_recent(
     if !(1..=30).contains(&days_back) {
         return (StatusCode::BAD_REQUEST, "days must be between 1 and 30").into_response();
     }
-    let tickers: Option<Vec<String>> = parameters.tickers.as_ref().map(|tickers_str| {
-        tickers_str
+    let tickers: Option<Vec<String>> = parameters.tickers.as_ref().and_then(|tickers_str| {
+        let parsed: Vec<String> = tickers_str
             .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .collect()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_uppercase())
+            .collect();
+        if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed)
+        }
     });
 
     match db::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {

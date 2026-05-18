@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
     id               UUID        PRIMARY KEY,
     rebalance_id     UUID        NOT NULL,
     generated_at     TIMESTAMPTZ NOT NULL,
-    model_run_id     UUID        NOT NULL,
+    model_run_id     TEXT        NOT NULL,
     symbol           TEXT        NOT NULL,
     target_weight    NUMERIC     NOT NULL,
     reference_price  NUMERIC     NOT NULL
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
     id              UUID        PRIMARY KEY,
     triggered_at    TIMESTAMPTZ NOT NULL,
     trigger_reason  TEXT        NOT NULL,
-    model_run_id    UUID        NOT NULL,
+    model_run_id    TEXT        NOT NULL,
     completed_at    TIMESTAMPTZ,
     status          TEXT        NOT NULL
 );

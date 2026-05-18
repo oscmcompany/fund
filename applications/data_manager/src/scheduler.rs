@@ -139,19 +139,36 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     info!("LISTEN handler connected, listening on channel 'jobs'");
 
     loop {
+        match db::claim_pending_job(pool, "equity-bars-sync").await {
+            Ok(Some(job_id)) => {
+                info!("Draining pending equity-bars-sync job on reconnect");
+                run_equity_bar_sync(state).await;
+                if let Err(error) = db::complete_job(pool, job_id, "drained on reconnect").await {
+                    warn!("Failed to complete drained job {}: {}", job_id, error);
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                warn!("Failed to drain pending jobs: {}", error);
+                break;
+            }
+        }
+    }
+
+    loop {
         let notification = listener.recv().await?;
         let payload = notification.payload();
 
-        if payload != "equity-prices-sync" {
+        if payload != "equity-bars-sync" {
             continue;
         }
 
-        info!("Received NOTIFY for equity-prices-sync");
+        info!("Received NOTIFY for equity-bars-sync");
 
-        let job_id = match db::claim_pending_job(pool, "equity-prices-sync").await {
+        let job_id = match db::claim_pending_job(pool, "equity-bars-sync").await {
             Ok(Some(id)) => id,
             Ok(None) => {
-                info!("No pending equity-prices-sync job to claim");
+                info!("No pending equity-bars-sync job to claim");
                 continue;
             }
             Err(error) => {

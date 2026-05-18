@@ -94,6 +94,7 @@ pub async fn query_recent_equity_bars(
             .fetch_all(pool)
             .await?
         }
+        Some(_) => return Ok(Vec::new()),
         _ => {
             sqlx::query(
                 r#"SELECT symbol, time, open, high, low, close, volume

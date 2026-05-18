@@ -30,10 +30,11 @@ async def get_pool() -> AsyncConnectionPool:
         async with _pool_lock:
             if _pool is None:
                 database_url = _get_database_url()
-                _pool = AsyncConnectionPool(
+                pool = AsyncConnectionPool(
                     conninfo=database_url, min_size=1, max_size=5, open=False
                 )
-                await _pool.open()
+                await pool.open()
+                _pool = pool
                 logger.info("Async connection pool opened")
     return _pool
 
