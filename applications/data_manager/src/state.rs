@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -58,16 +58,11 @@ impl State {
         let pool = match std::env::var("DATABASE_URL") {
             Ok(database_url) => {
                 debug!("Connecting to PostgreSQL");
-                match PgPool::connect(&database_url).await {
-                    Ok(pool) => {
-                        info!("Connected to PostgreSQL");
-                        Some(pool)
-                    }
-                    Err(error) => {
-                        warn!("Failed to connect to PostgreSQL: {}", error);
-                        None
-                    }
-                }
+                let pool = PgPool::connect(&database_url)
+                    .await
+                    .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL: {error}"));
+                info!("Connected to PostgreSQL");
+                Some(pool)
             }
             Err(_) => {
                 info!("DATABASE_URL not set, PostgreSQL disabled");

@@ -56,7 +56,9 @@ fn sync_date_for(now: DateTime<Utc>) -> NaiveDate {
 
 pub fn spawn_sync_scheduler(state: State) {
     let listen_state = state.clone();
-    tokio::spawn(sync_loop(state));
+    if state.pool.is_none() {
+        tokio::spawn(sync_loop(state));
+    }
     tokio::spawn(listen_loop(listen_state));
 }
 
@@ -162,7 +164,9 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         let now_eastern = now_utc.with_timezone(&Eastern);
         if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
             info!("Weekend detected, skipping scheduled sync");
-            let _ = db::complete_job(pool, job_id, "skipped: weekend").await;
+            if let Err(error) = db::complete_job(pool, job_id, "skipped: weekend").await {
+                warn!("Failed to complete job {}: {}", job_id, error);
+            }
             continue;
         }
 
@@ -176,15 +180,23 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         match fetch_and_store(state, &sync_utc).await {
             Ok(Some(s3_key)) => {
                 info!("LISTEN-triggered sync completed, s3_key: {}", s3_key);
-                let _ = db::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await;
+                if let Err(error) =
+                    db::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
+                {
+                    warn!("Failed to complete job {}: {}", job_id, error);
+                }
             }
             Ok(None) => {
                 info!("No data available for LISTEN-triggered sync");
-                let _ = db::complete_job(pool, job_id, "no data available").await;
+                if let Err(error) = db::complete_job(pool, job_id, "no data available").await {
+                    warn!("Failed to complete job {}: {}", job_id, error);
+                }
             }
             Err(err) => {
                 error!("LISTEN-triggered sync failed: {}", err);
-                let _ = db::fail_job(pool, job_id, &err).await;
+                if let Err(error) = db::fail_job(pool, job_id, &err.to_string()).await {
+                    warn!("Failed to fail job {}: {}", job_id, error);
+                }
             }
         }
     }

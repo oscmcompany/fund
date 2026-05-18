@@ -5,23 +5,22 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 use tracing::{debug, info, warn};
 
+fn is_valid_equity_bar(bar: &EquityBar) -> bool {
+    bar.open_price.is_some()
+        && bar.high_price.is_some()
+        && bar.low_price.is_some()
+        && bar.close_price.is_some()
+        && bar.volume.is_some()
+        && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
+}
+
 pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
     if bars.is_empty() {
         return Ok(0);
     }
 
     // Filter to bars that have all required non-null fields and a valid timestamp.
-    let valid_bars: Vec<&EquityBar> = bars
-        .iter()
-        .filter(|bar| {
-            bar.open_price.is_some()
-                && bar.high_price.is_some()
-                && bar.low_price.is_some()
-                && bar.close_price.is_some()
-                && bar.volume.is_some()
-                && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
-        })
-        .collect();
+    let valid_bars: Vec<&EquityBar> = bars.iter().filter(|bar| is_valid_equity_bar(bar)).collect();
 
     let skipped = bars.len() - valid_bars.len();
     if skipped > 0 {
@@ -252,17 +251,6 @@ mod tests {
             volume_weighted_average_price: None,
             transactions: None,
         }];
-        let valid_bars: Vec<&EquityBar> = bars_with_nulls
-            .iter()
-            .filter(|bar| {
-                bar.open_price.is_some()
-                    && bar.high_price.is_some()
-                    && bar.low_price.is_some()
-                    && bar.close_price.is_some()
-                    && bar.volume.is_some()
-                    && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
-            })
-            .collect();
-        assert_eq!(valid_bars.len(), 0);
+        assert!(!is_valid_equity_bar(&bars_with_nulls[0]));
     }
 }

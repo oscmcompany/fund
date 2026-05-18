@@ -129,21 +129,21 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_portfolio = await get_prior_allocation()
-        prior_portfolio_tickers = prior_portfolio["ticker"].unique().to_list()
-        logger.info("Retrieved prior allocation", count=len(prior_portfolio_tickers))
+        prior_allocation = await get_prior_allocation()
+        prior_allocation_tickers = prior_allocation["ticker"].unique().to_list()
+        logger.info("Retrieved prior allocation", count=len(prior_allocation_tickers))
     except Exception as e:
         logger.exception("Failed to retrieve prior allocation", error=str(e))
-        metrics.rebalance_errors_total.labels(stage="prior_portfolio").inc()
+        metrics.rebalance_errors_total.labels(stage="prior_allocation").inc()
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        held_tickers = evaluate_prior_pairs(prior_portfolio, historical_prices)
+        held_tickers = evaluate_prior_pairs(prior_allocation, historical_prices)
         logger.info(
             "Evaluated prior pairs",
             held_count=len(held_tickers),
-            closing_count=len(prior_portfolio_tickers) - len(held_tickers),
+            closing_count=len(prior_allocation_tickers) - len(held_tickers),
         )
     except Exception as e:
         logger.exception("Failed to evaluate prior pairs", error=str(e))
@@ -152,7 +152,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
-        ~pl.col("ticker").is_in(prior_portfolio_tickers)
+        ~pl.col("ticker").is_in(prior_allocation_tickers)
     )
 
     try:
@@ -247,7 +247,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
 
     try:
         open_positions, close_positions = get_positions(
-            prior_portfolio_tickers=prior_portfolio_tickers,
+            prior_allocation_tickers=prior_allocation_tickers,
             held_tickers=held_tickers,
             optimal_portfolio=optimal_portfolio,
         )
@@ -275,18 +275,18 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     metrics.positions_opened_count.set(opened_count)
     metrics.positions_closed_count.set(closed_count)
 
-    held_rows = prior_portfolio.filter(pl.col("ticker").is_in(held_tickers))
-    final_portfolio = pl.concat([optimal_portfolio, held_rows])
-    save_succeeded = await save_allocation(final_portfolio, current_timestamp)
+    held_rows = prior_allocation.filter(pl.col("ticker").is_in(held_tickers))
+    final_allocation = pl.concat([optimal_portfolio, held_rows])
+    save_succeeded = await save_allocation(final_allocation, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
 
     try:
         await _record_performance(
-            prior_portfolio=prior_portfolio,
+            prior_allocation=prior_allocation,
             held_tickers=held_tickers,
-            final_portfolio=final_portfolio,
+            final_allocation=final_allocation,
             historical_prices=historical_prices,
             spy_prices=spy_prices,
             account=account,
@@ -338,9 +338,9 @@ def get_optimal_portfolio(
 
 
 async def _record_performance(  # noqa: PLR0913
-    prior_portfolio: pl.DataFrame,
+    prior_allocation: pl.DataFrame,
     held_tickers: set[str],
-    final_portfolio: pl.DataFrame,
+    final_allocation: pl.DataFrame,
     historical_prices: pl.DataFrame,
     spy_prices: pl.DataFrame,
     account: AlpacaAccount,
@@ -352,15 +352,15 @@ async def _record_performance(  # noqa: PLR0913
         .agg(pl.col("close_price").first())
     )
 
-    closing_tickers = set(prior_portfolio["ticker"].to_list()) - held_tickers
+    closing_tickers = set(prior_allocation["ticker"].to_list()) - held_tickers
     closing_pair_ids = (
-        prior_portfolio.filter(pl.col("ticker").is_in(closing_tickers))["pair_id"]
+        prior_allocation.filter(pl.col("ticker").is_in(closing_tickers))["pair_id"]
         .unique()
         .to_list()
     )
 
     for pair_id in closing_pair_ids:
-        pair_rows = prior_portfolio.filter(pl.col("pair_id") == pair_id)
+        pair_rows = prior_allocation.filter(pl.col("pair_id") == pair_id)
 
         if (
             "entry_price" not in pair_rows.columns
@@ -420,7 +420,7 @@ async def _record_performance(  # noqa: PLR0913
             logger.warning("Failed to persist closed pair record", pair_id=pair_id)
 
     cash = float(account.cash_amount)
-    portfolio_value = compute_portfolio_value(final_portfolio, current_prices, cash)
+    portfolio_value = compute_portfolio_value(final_allocation, current_prices, cash)
     previous_value = await get_last_portfolio_value()
     period_return = (
         compute_period_return(portfolio_value, previous_value)
@@ -437,7 +437,7 @@ async def _record_performance(  # noqa: PLR0913
             else 0.0
         )
 
-    open_pair_count = len(final_portfolio["pair_id"].unique().to_list())
+    open_pair_count = len(final_allocation["pair_id"].unique().to_list())
 
     snapshot = build_performance_snapshot(
         portfolio_value=portfolio_value,

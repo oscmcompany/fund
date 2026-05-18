@@ -1,11 +1,11 @@
 import asyncio
-import contextlib
 import io
 import json
 import logging
 import os
 import tarfile
 import tempfile
+import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -257,6 +257,14 @@ async def _sync_run_metadata(
         logger.exception("Failed to sync run metadata to PostgreSQL")
 
 
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def _delayed_cleanup(directory: str) -> None:
+    await asyncio.sleep(5)
+    cleanup_model_directory(directory)
+
+
 async def _artifact_polling_task(app: FastAPI) -> None:
     """Background task that polls S3 for new model artifacts."""
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
@@ -273,13 +281,16 @@ async def _artifact_polling_task(app: FastAPI) -> None:
         await asyncio.sleep(poll_interval)
 
         try:
-            latest_key = find_latest_artifact_key(
+            latest_key = _resolve_artifact_key(
                 s3_client=s3_client,
                 bucket=bucket,
-                prefix=artifact_path,
+                artifact_path=artifact_path,
             )
         except ValueError:
             logger.debug("No artifacts found during polling")
+            continue
+        except Exception:
+            logger.exception("Artifact polling failed")
             continue
 
         current_key = getattr(app.state, "current_artifact_key", None)
@@ -303,16 +314,19 @@ async def _artifact_polling_task(app: FastAPI) -> None:
 
             new_model = Model.load(directory_path=new_directory)
 
-            old_directory = getattr(app.state, "model_directory", None)
-            app.state.tide_model = new_model
-            app.state.model_directory = new_directory
-            app.state.current_artifact_key = latest_key
-            model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
+            with app.state.model_swap_lock:
+                old_directory = getattr(app.state, "model_directory", None)
+                app.state.tide_model = new_model
+                app.state.model_directory = new_directory
+                app.state.current_artifact_key = latest_key
+                model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
 
             logger.info("Hot-swapped model", artifact_key=latest_key)
 
             if old_directory and old_directory != ".":
-                cleanup_model_directory(old_directory)
+                cleanup_task = asyncio.create_task(_delayed_cleanup(old_directory))
+                _background_tasks.add(cleanup_task)
+                cleanup_task.add_done_callback(_background_tasks.discard)
 
             await _sync_run_metadata(
                 s3_client=s3_client,
@@ -357,6 +371,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             raise
 
         app.state.current_artifact_key = artifact_key
+        await _sync_run_metadata(
+            s3_client=s3_client,
+            bucket=bucket,
+            artifact_key=artifact_key,
+        )
         logger.info("Loading model", directory=model_directory)
     else:
         app.state.current_artifact_key = None
@@ -373,13 +392,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         yield
     finally:
         polling_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await polling_task
+        await asyncio.gather(polling_task, return_exceptions=True)
         await close_pool()
         cleanup_model_directory(app.state.model_directory)
 
 
 application = FastAPI(lifespan=lifespan)
+application.state.model_swap_lock = threading.Lock()
+application.state.tide_model = None
+application.state.model_directory = "."
+application.state.current_artifact_key = None
 
 
 @application.get("/health")
@@ -483,7 +505,10 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
 
     current_timestamp = datetime.now(tz=UTC)
 
-    tide_data = Data.load(directory_path=request.app.state.model_directory)
+    with request.app.state.model_swap_lock:
+        tide_model = request.app.state.tide_model
+        model_directory = request.app.state.model_directory
+    tide_data = Data.load(directory_path=model_directory)
 
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
     input_ticker_count = data.select(pl.col("ticker").n_unique()).item()
@@ -509,7 +534,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
-    model = request.app.state.tide_model
+    model = tide_model
     dataset = tide_data.get_dataset(
         data_type="predict", output_length=model.output_length
     )

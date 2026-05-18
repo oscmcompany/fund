@@ -319,9 +319,12 @@ pub async fn fetch_and_store(
             })
             .collect();
 
-        if let Err(error) = db::insert_equity_bars(pool, &equity_bars).await {
-            warn!("Failed to write equity bars to PostgreSQL: {}", error);
-        }
+        db::insert_equity_bars(pool, &equity_bars)
+            .await
+            .map_err(|error| {
+                warn!("Failed to write equity bars to PostgreSQL: {}", error);
+                error.to_string()
+            })?;
     }
 
     Ok(Some(s3_key))
@@ -345,6 +348,9 @@ pub async fn query_recent(
     };
 
     let days_back = parameters.days.unwrap_or(10);
+    if !(1..=30).contains(&days_back) {
+        return (StatusCode::BAD_REQUEST, "days must be between 1 and 30").into_response();
+    }
     let tickers: Option<Vec<String>> = parameters.tickers.as_ref().map(|tickers_str| {
         tickers_str
             .split(',')

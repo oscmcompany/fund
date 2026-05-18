@@ -150,6 +150,7 @@ in {
     set -euo pipefail
     echo "Downloading latest database snapshot..."
     aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
+    rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
     pg_restore --host 127.0.0.1 --port 5432 --username fund \
       --dbname fund --clean --if-exists /tmp/fund-latest.dump
