@@ -23,15 +23,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_timestamp ON equity_bar
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
 CREATE TABLE IF NOT EXISTS equity_quotes (
-    time        TIMESTAMPTZ NOT NULL,
+    timestamp   TIMESTAMPTZ NOT NULL,
     symbol      TEXT        NOT NULL,
     bid_price   NUMERIC     NOT NULL,
     ask_price   NUMERIC     NOT NULL,
     bid_size    INTEGER     NOT NULL,
     ask_size    INTEGER     NOT NULL
 );
-SELECT create_hypertable('equity_quotes', by_range('time'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_quotes_symbol_time ON equity_quotes (symbol, time DESC);
+SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
+CREATE INDEX IF NOT EXISTS idx_equity_quotes_symbol_timestamp ON equity_quotes (symbol, timestamp DESC);
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
 
 -- equity_orders: orders submitted to Alpaca, linked to allocations
@@ -70,16 +70,17 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
 
 -- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
-    snapshot_date        DATE    NOT NULL PRIMARY KEY,
-    net_asset_value      NUMERIC NOT NULL,
-    gross_return         NUMERIC NOT NULL,
-    net_return           NUMERIC NOT NULL,
-    total_slippage_cost  NUMERIC NOT NULL
+    snapshot_date        DATE        NOT NULL PRIMARY KEY,
+    net_asset_value      NUMERIC     NOT NULL,
+    gross_return         NUMERIC     NOT NULL,
+    net_return           NUMERIC     NOT NULL,
+    total_slippage_cost  NUMERIC     NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
-    time                    TIMESTAMPTZ NOT NULL,
+    timestamp               TIMESTAMPTZ NOT NULL,
     symbol                  TEXT        NOT NULL,
     order_id                UUID        NOT NULL,
     quantity                NUMERIC     NOT NULL,
