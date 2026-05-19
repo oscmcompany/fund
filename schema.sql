@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS model_runs (
     end_date             DATE,
     lookback_days        INTEGER,
     status               TEXT NOT NULL DEFAULT 'started',
-    crps                 DOUBLE PRECISION,
+    continuous_ranked_probability_score DOUBLE PRECISION,
     directional_accuracy DOUBLE PRECISION,
     quantile_coverage    DOUBLE PRECISION,
     drift_status         TEXT,

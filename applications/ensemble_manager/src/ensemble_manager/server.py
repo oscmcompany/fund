@@ -245,13 +245,13 @@ async def _sync_run_metadata(
         return
 
     evaluation_key = f"{artifact_folder}/evaluation.json"
-    crps: float | None = None
+    continuous_ranked_probability_score: float | None = None
     directional_accuracy: float | None = None
     quantile_coverage: float | None = None
     try:
         evaluation_response = s3_client.get_object(Bucket=bucket, Key=evaluation_key)
         evaluation = json.loads(evaluation_response["Body"].read())
-        crps = evaluation.get("crps")
+        continuous_ranked_probability_score = evaluation.get("crps")
         directional_accuracy = evaluation.get("directional_accuracy")
         quantile_coverage = evaluation.get("quantile_coverage")
     except ClientError as error:
@@ -271,7 +271,7 @@ async def _sync_run_metadata(
                        run_id, artifact_key, training_data_key,
                        start_date, end_date, lookback_days,
                        status, stage_counts, completed_at,
-                       crps, directional_accuracy, quantile_coverage
+                       continuous_ranked_probability_score, directional_accuracy, quantile_coverage
                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
                    ON CONFLICT (run_id) DO UPDATE SET
                        artifact_key = EXCLUDED.artifact_key,
@@ -282,7 +282,7 @@ async def _sync_run_metadata(
                        status = EXCLUDED.status,
                        stage_counts = EXCLUDED.stage_counts,
                        completed_at = EXCLUDED.completed_at,
-                       crps = EXCLUDED.crps,
+                       continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score,
                        directional_accuracy = EXCLUDED.directional_accuracy,
                        quantile_coverage = EXCLUDED.quantile_coverage""",
                 (
@@ -294,7 +294,7 @@ async def _sync_run_metadata(
                     metadata.get("lookback_days"),
                     "completed",
                     json.dumps(metadata.get("stage_counts")),
-                    crps,
+                    continuous_ranked_probability_score,
                     directional_accuracy,
                     quantile_coverage,
                 ),
