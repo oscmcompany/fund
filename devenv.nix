@@ -130,12 +130,14 @@ in {
     awscli2
     clang
     bacon
+    cargo-llvm-cov
     cargo-watch
     curl
     duckdb
     gh
     git
     jq
+    llvmPackages.llvm
     markdownlint-cli
     postgresql_16
     ruff
@@ -223,6 +225,7 @@ in {
     uv run coverage run -m pytest --tb=short -q
     uv run coverage combine 2>/dev/null || true
     uv run coverage xml -o .coverage_output/python.xml
+    uv run coverage report --fail-under=80
     echo "Python tests completed successfully"
   '';
 
@@ -252,26 +255,28 @@ in {
   '';
 
   scripts.rust-test.exec = ''
-    set -euo pipefail
-    echo "Running Rust tests"
+        set -euo pipefail
+        echo "Running Rust tests"
 
-    TEST_ARGS="--workspace --verbose --lib --bins"
+        TEST_ARGS="--workspace --verbose --lib --bins"
 
-    mkdir -p .coverage_output
-    if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-      echo "cargo-llvm-cov not available - running tests without coverage"
-      cargo test $TEST_ARGS
-    elif ! command -v llvm-cov >/dev/null 2>&1 || ! command -v llvm-profdata >/dev/null 2>&1; then
-      echo "LLVM tools not available - running tests without coverage"
-      cargo test $TEST_ARGS
-    else
-      export LLVM_COV=$(which llvm-cov)
-      export LLVM_PROFDATA=$(which llvm-profdata)
-      cargo llvm-cov $TEST_ARGS \
-        --cobertura \
-        --output-path .coverage_output/rust.xml
-      echo "Rust tests with coverage completed successfully"
-    fi
+        mkdir -p .coverage_output
+        export LLVM_COV=$(which llvm-cov)
+        export LLVM_PROFDATA=$(which llvm-profdata)
+        cargo llvm-cov $TEST_ARGS \
+          --cobertura \
+          --output-path .coverage_output/rust.xml
+        python3 -c "
+    import xml.etree.ElementTree as ET, sys
+    root = ET.parse('.coverage_output/rust.xml').getroot()
+    rate = float(root.get('line-rate', 0)) * 100
+    threshold = 10
+    print(f'Rust line coverage: {rate:.1f}%')
+    if rate < threshold:
+        print(f'Coverage failure: {rate:.1f}% is below threshold of {threshold}%')
+        sys.exit(1)
+    "
+        echo "Rust tests with coverage completed successfully"
   '';
 
   scripts.rust-checks.exec = ''
