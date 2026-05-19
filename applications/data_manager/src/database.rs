@@ -11,22 +11,41 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     let mut rows_affected: u64 = 0;
 
     for chunk in bars.chunks(1000) {
+        let transaction_values: Vec<Option<i64>> = chunk
+            .iter()
+            .map(|bar| match bar.transactions {
+                Some(transactions) => i64::try_from(transactions).map(Some).map_err(|_| {
+                    sqlx::Error::Protocol(
+                        format!(
+                            "transactions value {} for {} at {} exceeds BIGINT",
+                            transactions, bar.ticker, bar.timestamp
+                        )
+                        .into(),
+                    )
+                }),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<Option<i64>>, sqlx::Error>>()?;
+
         let mut query_builder = sqlx::QueryBuilder::new(
             "INSERT INTO equity_bars (ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions) ",
         );
 
-        query_builder.push_values(chunk, |mut builder, bar| {
-            builder
-                .push_bind(&bar.ticker)
-                .push_bind(bar.timestamp)
-                .push_bind(bar.open_price)
-                .push_bind(bar.high_price)
-                .push_bind(bar.low_price)
-                .push_bind(bar.close_price)
-                .push_bind(bar.volume)
-                .push_bind(bar.volume_weighted_average_price)
-                .push_bind(bar.transactions.map(|t| t as i64));
-        });
+        query_builder.push_values(
+            chunk.iter().zip(transaction_values.iter()),
+            |mut builder, (bar, transactions)| {
+                builder
+                    .push_bind(&bar.ticker)
+                    .push_bind(bar.timestamp)
+                    .push_bind(bar.open_price)
+                    .push_bind(bar.high_price)
+                    .push_bind(bar.low_price)
+                    .push_bind(bar.close_price)
+                    .push_bind(bar.volume)
+                    .push_bind(bar.volume_weighted_average_price)
+                    .push_bind(*transactions);
+            },
+        );
 
         query_builder.push(
             " ON CONFLICT (ticker, timestamp) DO UPDATE SET \

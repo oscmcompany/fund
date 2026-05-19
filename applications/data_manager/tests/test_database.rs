@@ -39,13 +39,22 @@ async fn get_pg_pool() -> PgPool {
         .await
         .expect("Failed to start PostgreSQL container — is Docker running?");
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
 
-    let pool = PgPool::connect(&url).await.unwrap();
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let pool = loop {
+        match PgPool::connect(&url).await {
+            Ok(pool) => break pool,
+            Err(error) => {
+                if tokio::time::Instant::now() >= connect_deadline {
+                    panic!("Failed to connect to PostgreSQL within timeout: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    };
 
     let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
     sqlx::raw_sql(&filtered_schema)
@@ -117,6 +126,30 @@ async fn test_insert_and_query_equity_bars() {
     assert_eq!(aapl.close_price, Some(153.0));
     assert_eq!(aapl.volume, Some(1_000_000));
     assert_eq!(aapl.transactions, Some(50_000));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_insert_equity_bars_rejects_transactions_overflow() {
+    let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
+
+    let bar = EquityBar {
+        ticker: "AAPL".to_string(),
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        open_price: Some(150.0),
+        high_price: Some(155.0),
+        low_price: Some(149.0),
+        close_price: Some(153.0),
+        volume: Some(1_000_000),
+        volume_weighted_average_price: Some(152.0),
+        transactions: Some(u64::MAX),
+    };
+
+    let error = insert_equity_bars(&pool, &[bar]).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("transactions value 18446744073709551615"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

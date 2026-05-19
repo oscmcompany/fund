@@ -358,9 +358,8 @@ pub async fn query_recent(
             match dataframe {
                 Ok(dataframe) => {
                     let mut buffer = Vec::new();
-                    if let Err(error) =
-                        ParquetWriter::new(&mut buffer).finish(&mut dataframe.clone())
-                    {
+                    let mut dataframe = dataframe;
+                    if let Err(error) = ParquetWriter::new(&mut buffer).finish(&mut dataframe) {
                         warn!("Failed to serialize parquet: {}", error);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
