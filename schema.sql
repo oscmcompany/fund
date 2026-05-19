@@ -7,13 +7,15 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 -- equity_bars: daily OHLCV bars (TimescaleDB hypertable)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
 CREATE TABLE IF NOT EXISTS equity_bars (
-    time    TIMESTAMPTZ      NOT NULL,
-    symbol  TEXT             NOT NULL,
-    open    DOUBLE PRECISION NOT NULL,
-    high    DOUBLE PRECISION NOT NULL,
-    low     DOUBLE PRECISION NOT NULL,
-    close   DOUBLE PRECISION NOT NULL,
-    volume  BIGINT           NOT NULL
+    time                          TIMESTAMPTZ      NOT NULL,
+    symbol                        TEXT             NOT NULL,
+    open_price                    DOUBLE PRECISION NOT NULL,
+    high_price                    DOUBLE PRECISION NOT NULL,
+    low_price                     DOUBLE PRECISION NOT NULL,
+    close_price                   DOUBLE PRECISION NOT NULL,
+    volume                        BIGINT           NOT NULL,
+    volume_weighted_average_price DOUBLE PRECISION,
+    transactions                  BIGINT
 );
 SELECT create_hypertable('equity_bars', by_range('time'), if_not_exists => TRUE);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_time ON equity_bars (symbol, time DESC);
@@ -50,7 +52,7 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
     id               UUID        PRIMARY KEY,
     rebalance_id     UUID        NOT NULL,
     generated_at     TIMESTAMPTZ NOT NULL,
-    model_run_id     TEXT        NOT NULL,
+    model_run_id     TEXT        NOT NULL, -- set by the training pipeline; references model_runs.run_id
     symbol           TEXT        NOT NULL,
     target_weight    NUMERIC     NOT NULL,
     reference_price  NUMERIC     NOT NULL
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
     id              UUID        PRIMARY KEY,
     triggered_at    TIMESTAMPTZ NOT NULL,
     trigger_reason  TEXT        NOT NULL,
-    model_run_id    TEXT        NOT NULL,
+    model_run_id    TEXT        NOT NULL, -- set by the training pipeline; references model_runs.run_id
     completed_at    TIMESTAMPTZ,
     status          TEXT        NOT NULL
 );
@@ -69,7 +71,7 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
 -- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
     snapshot_date        DATE    NOT NULL PRIMARY KEY,
-    nav                  NUMERIC NOT NULL,
+    net_asset_value      NUMERIC NOT NULL,
     gross_return         NUMERIC NOT NULL,
     net_return           NUMERIC NOT NULL,
     total_slippage_cost  NUMERIC NOT NULL
@@ -77,13 +79,13 @@ CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
-    time          TIMESTAMPTZ NOT NULL,
-    symbol        TEXT        NOT NULL,
-    order_id      UUID        NOT NULL,
-    quantity      NUMERIC     NOT NULL,
-    price         NUMERIC     NOT NULL,
-    side          TEXT        NOT NULL,
-    slippage_bps  NUMERIC
+    time                    TIMESTAMPTZ NOT NULL,
+    symbol                  TEXT        NOT NULL,
+    order_id                UUID        NOT NULL,
+    quantity                NUMERIC     NOT NULL,
+    price                   NUMERIC     NOT NULL,
+    side                    TEXT        NOT NULL,
+    slippage_basis_points   NUMERIC
 );
 
 -- model_runs: training metadata for model artifacts and evaluation metrics

@@ -396,7 +396,7 @@ pub async fn query_recent(
                     response
                 }
                 Err(error) => {
-                    warn!("Failed to create DataFrame from cache: {}", error);
+                    warn!("Failed to create DataFrame from database: {}", error);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Query failed: {}", error),
@@ -406,10 +406,10 @@ pub async fn query_recent(
             }
         }
         Err(error) => {
-            warn!("Failed to query PostgreSQL cache: {}", error);
+            warn!("Failed to query PostgreSQL database: {}", error);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cache query failed: {}", error),
+                format!("Database query failed: {}", error),
             )
                 .into_response()
         }

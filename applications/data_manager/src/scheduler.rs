@@ -56,6 +56,9 @@ fn sync_date_for(now: DateTime<Utc>) -> NaiveDate {
 
 pub fn spawn_sync_scheduler(state: State) {
     let listen_state = state.clone();
+    // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
+    // unavailable (e.g., local development without a database). In production the
+    // pg_cron + LISTEN/NOTIFY path (listen_loop) is the sole trigger mechanism.
     if state.pool.is_none() {
         tokio::spawn(sync_loop(state));
     }
