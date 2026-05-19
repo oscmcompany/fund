@@ -144,5 +144,5 @@ BEGIN
             $cmd$SELECT schedule_job('equity-bars-sync')$cmd$
         );
     END IF;
-END
+END;
 $$;
