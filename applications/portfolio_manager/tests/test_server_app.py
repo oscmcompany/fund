@@ -168,12 +168,17 @@ def test_lifespan_initializes_client_and_scheduler() -> None:
                 "portfolio_manager.server.spawn_rebalance_scheduler",
                 AsyncMock(return_value=future),
             ) as mock_spawn_scheduler,
+            patch(
+                "portfolio_manager.server.spawn_status_logger",
+                AsyncMock(return_value=future),
+            ) as mock_spawn_status_logger,
         ):
             async with _lifespan(mock_app):
                 pass
 
         mock_alpaca_client.assert_called_once()
         mock_spawn_scheduler.assert_awaited_once()
+        mock_spawn_status_logger.assert_awaited_once()
 
     asyncio.run(run())
 

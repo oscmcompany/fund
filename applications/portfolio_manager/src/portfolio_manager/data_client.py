@@ -3,8 +3,11 @@ from datetime import datetime, timedelta
 
 import polars as pl
 import requests
+import structlog
 
 from .exceptions import PriceDataUnavailableError
+
+logger = structlog.get_logger(__name__)
 
 
 def fetch_historical_prices(
@@ -32,9 +35,18 @@ def fetch_historical_prices(
         raise PriceDataUnavailableError(message) from error
 
     dataframe = pl.read_parquet(io.BytesIO(response.content))
-    return dataframe.select(["ticker", "timestamp", "close_price"]).drop_nulls(
-        subset=["close_price"]
+    selected = dataframe.select(["ticker", "timestamp", "close_price"])
+    cleaned = selected.drop_nulls(subset=["close_price"])
+    deduped = cleaned.sort("timestamp").unique(
+        subset=["ticker", "timestamp"], keep="last", maintain_order=True
     )
+    duplicates_removed = cleaned.height - deduped.height
+    if duplicates_removed > 0:
+        logger.warning(
+            "Removed duplicate ticker-timestamp rows from historical prices",
+            duplicates_removed=duplicates_removed,
+        )
+    return deduped
 
 
 def fetch_equity_details(datamanager_base_url: str) -> pl.DataFrame:
@@ -81,6 +93,15 @@ def fetch_spy_prices(
         raise PriceDataUnavailableError(message) from error
 
     dataframe = pl.read_parquet(io.BytesIO(response.content))
-    return dataframe.select(["ticker", "timestamp", "close_price"]).drop_nulls(
-        subset=["close_price"]
+    selected = dataframe.select(["ticker", "timestamp", "close_price"])
+    cleaned = selected.drop_nulls(subset=["close_price"])
+    deduped = cleaned.sort("timestamp").unique(
+        subset=["ticker", "timestamp"], keep="last", maintain_order=True
     )
+    duplicates_removed = cleaned.height - deduped.height
+    if duplicates_removed > 0:
+        logger.warning(
+            "Removed duplicate ticker-timestamp rows from SPY prices",
+            duplicates_removed=duplicates_removed,
+        )
+    return deduped
