@@ -7,6 +7,7 @@ import structlog
 from fastapi import status
 
 from .alpaca_client import AlpacaClient
+from .configuration import Configuration
 from .rebalance import run_rebalance
 
 logger = structlog.get_logger()
@@ -69,11 +70,14 @@ async def _already_rebalanced_today(data_manager_base_url: str) -> bool:
 
 async def spawn_rebalance_scheduler(
     alpaca_client: AlpacaClient,
+    configuration: Configuration,
     data_manager_base_url: str,
     rebalance_lock: asyncio.Lock,
 ) -> asyncio.Task:
     task = asyncio.create_task(
-        _rebalance_loop(alpaca_client, data_manager_base_url, rebalance_lock)
+        _rebalance_loop(
+            alpaca_client, configuration, data_manager_base_url, rebalance_lock
+        )
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -118,6 +122,7 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
 
 async def _rebalance_loop(  # noqa: C901
     alpaca_client: AlpacaClient,
+    configuration: Configuration,
     data_manager_base_url: str,
     rebalance_lock: asyncio.Lock,
 ) -> None:
@@ -167,7 +172,7 @@ async def _rebalance_loop(  # noqa: C901
             logger.info("Starting scheduled portfolio rebalance")
             try:
                 async with rebalance_lock:
-                    response = await run_rebalance(alpaca_client)
+                    response = await run_rebalance(alpaca_client, configuration)
                 if response.status_code != status.HTTP_200_OK:
                     logger.warning(
                         "Scheduled rebalance completed with non-200 status",

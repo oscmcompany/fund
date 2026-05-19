@@ -197,6 +197,19 @@ portfolio_schema = pa.DataFrameSchema(
             required=False,
             nullable=True,
         ),
+        # quantity is non-null only for SHORT legs (whole-share count for Alpaca SELL).
+        "quantity": pa.Column(
+            dtype=pl.Int64,
+            required=False,
+            nullable=True,
+        ),
+        # notional is non-null only for LONG legs (dollar amount for Alpaca BUY).
+        "notional": pa.Column(
+            dtype=float,
+            checks=[pa.Check.greater_than(0)],
+            required=False,
+            nullable=True,
+        ),
     },
     unique=["ticker"],
     coerce=True,
@@ -205,10 +218,9 @@ portfolio_schema = pa.DataFrameSchema(
             check_fn=check_position_side_counts,
             error="Each side must have expected position counts",
         ),
-        pa.Check(
-            check_fn=check_position_side_sums,
-            error="Position side sums must be approximately equal",
-        ),
+        # check_position_side_sums is intentionally omitted: short legs are
+        # constrained to whole shares, so their actual dollar amounts may differ
+        # from the long notional amounts by up to one share price per pair.
         pa.Check(
             check_fn=check_open_positions_have_entry_price,
             error="entry_price must be present and > 0 for OPEN_POSITION rows",

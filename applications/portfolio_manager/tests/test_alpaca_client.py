@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-from alpaca.trading.enums import AssetClass, AssetStatus
+from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, PositionIntent
 from alpaca.trading.requests import GetAssetsRequest
 from portfolio_manager.alpaca_client import (
     AlpacaAccount,
@@ -55,6 +55,7 @@ def _make_mock_asset(
 
 EXPECTED_CASH = 1000.0
 EXPECTED_BUYING_POWER = 2000.0
+EXPECTED_EQUITY = 3000.0
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
@@ -89,11 +90,14 @@ def test_is_market_open_returns_false_when_market_is_closed(
 
 def test_alpaca_account_stores_values() -> None:
     account = AlpacaAccount(
-        cash_amount=EXPECTED_CASH, buying_power=EXPECTED_BUYING_POWER
+        cash_amount=EXPECTED_CASH,
+        buying_power=EXPECTED_BUYING_POWER,
+        equity=EXPECTED_EQUITY,
     )
 
     assert account.cash_amount == EXPECTED_CASH
     assert account.buying_power == EXPECTED_BUYING_POWER
+    assert account.equity == EXPECTED_EQUITY
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
@@ -102,14 +106,17 @@ def test_get_account_returns_account(mock_sleep: MagicMock) -> None:
     mock_account = MagicMock()
     expected_cash_amount = 5000.0
     expected_account_buying_power = 10000.0
+    expected_account_equity = 15000.0
     mock_account.cash = "5000.00"
     mock_account.buying_power = "10000.00"
+    mock_account.equity = "15000.00"
     mock_trading.get_account.return_value = mock_account
 
     result = client.get_account()
 
     assert result.cash_amount == expected_cash_amount
     assert result.buying_power == expected_account_buying_power
+    assert result.equity == expected_account_equity
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 
 
@@ -117,9 +124,33 @@ def test_get_account_returns_account(mock_sleep: MagicMock) -> None:
 def test_open_position_buy_submits_order(mock_sleep: MagicMock) -> None:
     client, mock_trading = _make_client()
 
-    client.open_position(ticker="aapl", side=TradeSide.BUY, dollar_amount=500.0)
+    client.open_position(
+        ticker="aapl", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+    )
 
     mock_trading.submit_order.assert_called_once()
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+_EXPECTED_BUY_NOTIONAL = 500.0
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_buy_uses_notional(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL",
+        side=TradeSide.BUY,
+        dollar_amount=_EXPECTED_BUY_NOTIONAL,
+        entry_price=50.0,
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.side == OrderSide.BUY
+    assert order_request.notional == _EXPECTED_BUY_NOTIONAL
+    assert not hasattr(order_request, "qty") or order_request.qty is None
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 
 
@@ -127,24 +158,144 @@ def test_open_position_buy_submits_order(mock_sleep: MagicMock) -> None:
 def test_open_position_sell_submits_order(mock_sleep: MagicMock) -> None:
     client, mock_trading = _make_client()
 
-    client.open_position(ticker="aapl", side=TradeSide.SELL, dollar_amount=500.0)
+    client.open_position(
+        ticker="aapl", side=TradeSide.SELL, dollar_amount=500.0, entry_price=50.0
+    )
 
     mock_trading.submit_order.assert_called_once()
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+_EXPECTED_SELL_QTY = 10  # int(500.0 / 50.0)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_sell_uses_qty_not_notional(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL",
+        side=TradeSide.SELL,
+        dollar_amount=500.0,
+        entry_price=50.0,
+        quantity=_EXPECTED_SELL_QTY,
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.side == OrderSide.SELL
+    assert order_request.qty == _EXPECTED_SELL_QTY
+    assert not hasattr(order_request, "notional") or order_request.notional is None
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_buy_includes_position_intent_buy_to_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.position_intent == PositionIntent.BUY_TO_OPEN
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_sell_includes_position_intent_sell_to_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+
+    client.open_position(
+        ticker="AAPL",
+        side=TradeSide.SELL,
+        dollar_amount=500.0,
+        entry_price=50.0,
+        quantity=10,
+    )
+
+    submitted = mock_trading.submit_order.call_args
+    order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
+    assert order_request.position_intent == PositionIntent.SELL_TO_OPEN
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+def test_open_position_sell_raises_value_error_for_zero_qty() -> None:
+    client, _ = _make_client()
+
+    # dollar_amount < entry_price means qty would be 0
+    with pytest.raises(ValueError, match="less than one share"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=10.0, entry_price=100.0
+        )
 
 
 def test_open_position_raises_value_error_for_zero_amount() -> None:
     client, _ = _make_client()
 
     with pytest.raises(ValueError, match="non-positive dollar_amount"):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=0.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=0.0, entry_price=50.0
+        )
 
 
 def test_open_position_raises_value_error_for_negative_amount() -> None:
     client, _ = _make_client()
 
     with pytest.raises(ValueError, match="non-positive dollar_amount"):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=-100.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=-100.0, entry_price=50.0
+        )
+
+
+def test_open_position_raises_value_error_for_zero_entry_price() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="entry_price must be positive"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=100.0, entry_price=0.0
+        )
+
+
+def test_open_position_raises_value_error_for_negative_entry_price() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="entry_price must be positive"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=100.0, entry_price=-50.0
+        )
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_open_positions_returns_position_list(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+    expected_quantity = 10.0
+    expected_market_value = 1500.0
+    expected_unrealized_profit_and_loss = 50.0
+    mock_position = MagicMock()
+    mock_position.symbol = "AAPL"
+    mock_position.side = "long"
+    mock_position.qty = str(int(expected_quantity))
+    mock_position.market_value = str(expected_market_value)
+    mock_position.unrealized_pl = str(expected_unrealized_profit_and_loss)
+    mock_trading.get_all_positions.return_value = [mock_position]
+
+    result = client.get_open_positions()
+
+    assert len(result) == 1
+    assert result[0]["ticker"] == "AAPL"
+    assert result[0]["side"] == "long"
+    assert result[0]["quantity"] == expected_quantity
+    assert result[0]["market_value"] == expected_market_value
+    assert result[0]["unrealized_profit_and_loss"] == (
+        expected_unrealized_profit_and_loss
+    )
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -153,7 +304,9 @@ def test_open_position_raises_insufficient_buying_power_error() -> None:
     mock_trading.submit_order.side_effect = _FakeAPIError("insufficient buying power")
 
     with pytest.raises(InsufficientBuyingPowerError):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -164,7 +317,9 @@ def test_open_position_raises_insufficient_buying_power_error_on_buying_power_ke
     mock_trading.submit_order.side_effect = _FakeAPIError("buying_power exceeded")
 
     with pytest.raises(InsufficientBuyingPowerError):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -175,7 +330,9 @@ def test_open_position_raises_asset_not_shortable_error_on_cannot_be_sold_short(
     mock_trading.submit_order.side_effect = _FakeAPIError("cannot be sold short")
 
     with pytest.raises(AssetNotShortableError):
-        client.open_position(ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -186,7 +343,9 @@ def test_open_position_raises_asset_not_shortable_error_on_not_shortable_keyword
     mock_trading.submit_order.side_effect = _FakeAPIError("asset not shortable")
 
     with pytest.raises(AssetNotShortableError):
-        client.open_position(ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -199,7 +358,9 @@ def test_open_position_raises_asset_not_shortable_error_on_not_allowed_to_short(
     )
 
     with pytest.raises(AssetNotShortableError):
-        client.open_position(ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.SELL, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.APIError", _FakeAPIError)
@@ -208,7 +369,9 @@ def test_open_position_reraises_other_api_errors() -> None:
     mock_trading.submit_order.side_effect = _FakeAPIError("some unhandled error")
 
     with pytest.raises(_FakeAPIError):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
@@ -471,7 +634,9 @@ def test_open_position_does_not_retry_on_transient_error() -> None:
     mock_trading.submit_order.side_effect = transient_error
 
     with pytest.raises(_FakeAPIError, match="service unavailable"):
-        client.open_position(ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0)
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
 
     assert mock_trading.submit_order.call_count == 1
 
