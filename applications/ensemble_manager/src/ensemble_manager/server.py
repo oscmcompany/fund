@@ -220,8 +220,16 @@ async def _sync_run_metadata(
         )
         body = await asyncio.to_thread(response["Body"].read)
         metadata = json.loads(body)
-    except ClientError:
-        logger.debug("No run_metadata.json found", metadata_key=metadata_key)
+    except ClientError as error:
+        code = error.response["Error"]["Code"]
+        if code == "NoSuchKey":
+            logger.debug("No run_metadata.json found", metadata_key=metadata_key)
+        else:
+            logger.exception(
+                "S3 error fetching run_metadata.json",
+                metadata_key=metadata_key,
+                error_code=code,
+            )
         return
     except (json.JSONDecodeError, KeyError):
         logger.warning("Invalid run_metadata.json", metadata_key=metadata_key)

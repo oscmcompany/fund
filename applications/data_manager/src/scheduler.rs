@@ -138,6 +138,23 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     listener.listen("jobs").await?;
     info!("LISTEN handler connected, listening on channel 'jobs'");
 
+    match db::requeue_stale_claimed_jobs(
+        pool,
+        "equity-bars-sync",
+        std::time::Duration::from_secs(2 * 3600),
+    )
+    .await
+    {
+        Ok(count) if count > 0 => {
+            info!(
+                "Requeued {} stale claimed job(s) for equity-bars-sync",
+                count
+            )
+        }
+        Ok(_) => {}
+        Err(error) => warn!("Failed to requeue stale claimed jobs: {}", error),
+    }
+
     loop {
         match db::claim_pending_job(pool, "equity-bars-sync").await {
             Ok(Some(job_id)) => {
