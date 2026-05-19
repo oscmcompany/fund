@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
+from portfolio_manager.configuration import Configuration
 from portfolio_manager.scheduler import (
     _already_rebalanced_today,
     _rebalance_loop,
@@ -235,7 +236,9 @@ def _run_loop(
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -371,7 +374,9 @@ def test_rebalance_loop_skips_when_lock_is_held() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         await lock.acquire()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -400,7 +405,9 @@ def test_rebalance_loop_handles_market_open_exception() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -429,7 +436,9 @@ def test_rebalance_loop_handles_run_rebalance_exception() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -460,7 +469,9 @@ def test_rebalance_loop_logs_warning_on_non_200_response() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -490,7 +501,9 @@ def test_rebalance_loop_retries_after_unexpected_error() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,

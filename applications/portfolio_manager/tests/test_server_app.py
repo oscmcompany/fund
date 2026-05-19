@@ -6,6 +6,7 @@ import portfolio_manager.server as server_module
 import pytest
 from alpaca.common.exceptions import APIError
 from fastapi import Response, status
+from portfolio_manager.configuration import Configuration
 from portfolio_manager.server import (
     _lifespan,
     application,
@@ -195,7 +196,9 @@ def test_create_portfolio_calls_run_rebalance() -> None:
     mock_response.status_code = status.HTTP_200_OK
     mock_run = AsyncMock(return_value=mock_response)
 
+    mock_configuration = Configuration()
     application.state.alpaca_client = mock_alpaca
+    application.state.configuration = mock_configuration
 
     async def run() -> Response:
         lock = asyncio.Lock()
@@ -208,4 +211,4 @@ def test_create_portfolio_calls_run_rebalance() -> None:
     response = asyncio.run(run())
 
     assert response.status_code == status.HTTP_200_OK
-    mock_run.assert_called_once_with(mock_alpaca)
+    mock_run.assert_called_once_with(mock_alpaca, mock_configuration)
