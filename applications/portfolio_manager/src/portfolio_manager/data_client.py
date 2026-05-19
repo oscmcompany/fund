@@ -37,7 +37,9 @@ def fetch_historical_prices(
     dataframe = pl.read_parquet(io.BytesIO(response.content))
     selected = dataframe.select(["ticker", "timestamp", "close_price"])
     cleaned = selected.drop_nulls(subset=["close_price"])
-    deduped = cleaned.unique(subset=["ticker", "timestamp"], keep="last")
+    deduped = cleaned.sort("timestamp").unique(
+        subset=["ticker", "timestamp"], keep="last", maintain_order=True
+    )
     duplicates_removed = cleaned.height - deduped.height
     if duplicates_removed > 0:
         logger.warning(
@@ -93,7 +95,9 @@ def fetch_spy_prices(
     dataframe = pl.read_parquet(io.BytesIO(response.content))
     selected = dataframe.select(["ticker", "timestamp", "close_price"])
     cleaned = selected.drop_nulls(subset=["close_price"])
-    deduped = cleaned.unique(subset=["ticker", "timestamp"], keep="last")
+    deduped = cleaned.sort("timestamp").unique(
+        subset=["ticker", "timestamp"], keep="last", maintain_order=True
+    )
     duplicates_removed = cleaned.height - deduped.height
     if duplicates_removed > 0:
         logger.warning(

@@ -62,31 +62,89 @@ def _apply_beta_neutral_weights(
     return volatility_parity_weights
 
 
-def size_pairs_with_volatility_parity(
+def size_pairs_with_volatility_parity(  # noqa: PLR0913
     candidate_pairs: pl.DataFrame,
     maximum_capital: float,
     current_timestamp: datetime,
     market_betas: pl.DataFrame,
+    entry_prices: dict[str, float],
     exposure_scale: float = 1.0,
+    # Defaults mirror Configuration fields.
+    short_buying_power_buffer: float = 1.03,
+    hold_overnight: bool = True,  # noqa: FBT001, FBT002
+    overnight_margin_rate_standard: float = 0.30,
+    overnight_margin_rate_low_price: float = 1.00,
 ) -> pl.DataFrame:
     """Size pairs so each contributes equal risk, then optimize for beta neutrality.
 
     Pairs with lower realized spread volatility receive more capital so that every
     pair contributes the same risk to the portfolio (volatility parity). A SLSQP
     optimizer then nudges the weights to drive net portfolio beta toward zero.
-    Each pair is dollar-neutral: the same dollar amount is allocated to both legs.
+    Each pair is dollar-neutral: the short leg is floored to whole shares (Alpaca
+    does not support fractional short sells), and the long notional is matched to
+    the short's whole-share-adjusted amount so each pair is exactly balanced.
+    The capital split accounts for Alpaca's short buying power reservation
+    (ask * short_buying_power_buffer * qty) and, when hold_overnight=True, the
+    overnight maintenance margin reserve, so the total buying power consumed
+    equals maximum_capital.
     The exposure_scale parameter is a regime-driven multiplier (1.0x for
     mean_reversion, 0.5x for trending) applied before the final dollar amounts.
     """
-    if candidate_pairs.height < REQUIRED_PAIRS:
+    # Pre-filter: remove pairs whose short leg cannot fill at least 1 whole share
+    # at the maximum possible per-pair allocation the optimizer can assign.
+    # Upper bound uses BETA_WEIGHT_UPPER_BOUND to stay conservative without
+    # discarding pairs that the optimizer might assign a higher-than-equal weight.
+    # Denominator accounts for the short buying power buffer and, when holding
+    # overnight, the maintenance margin so the capital budget matches execution.
+    # When holding overnight, the more conservative (higher) of the two margin rates
+    # is used so that low-priced shorts are not oversized relative to the buying
+    # power cost that execute_open_positions will charge at execution time.
+    # REQUIRED_PAIRS (the target pair count) is used as the divisor rather than
+    # feasible_pairs.height so the bound is stable before filtering; pairs whose
+    # short price exceeds this upper bound cannot be afforded at any weight the
+    # optimizer assigns within BETA_WEIGHT_UPPER_BOUND of an equal allocation.
+    overnight_margin_rate = 0.0
+    if hold_overnight:
+        overnight_margin_rate = max(
+            overnight_margin_rate_standard, overnight_margin_rate_low_price
+        )
+    capital_divisor = 1.0 + short_buying_power_buffer + overnight_margin_rate
+    maximum_per_pair_dollar = (
+        (maximum_capital / capital_divisor)
+        * exposure_scale
+        * BETA_WEIGHT_UPPER_BOUND
+        / REQUIRED_PAIRS
+    )
+    long_prices = [
+        entry_prices.get(ticker, 0.0)
+        for ticker in candidate_pairs["long_ticker"].to_list()
+    ]
+    short_prices = [
+        entry_prices.get(ticker, 0.0)
+        for ticker in candidate_pairs["short_ticker"].to_list()
+    ]
+    feasible_pairs = (
+        candidate_pairs.with_columns(
+            pl.Series("_long_entry_price", long_prices),
+            pl.Series("_short_entry_price", short_prices),
+        )
+        .filter(
+            (pl.col("_long_entry_price") > 0)
+            & (pl.col("_short_entry_price") > 0)
+            & (pl.col("_short_entry_price") <= maximum_per_pair_dollar)
+        )
+        .drop("_long_entry_price", "_short_entry_price")
+    )
+
+    if feasible_pairs.height < REQUIRED_PAIRS:
         message = (
-            f"Only {candidate_pairs.height} pairs available, "
-            f"need at least {REQUIRED_PAIRS}."
+            f"Only {feasible_pairs.height} pairs available after whole-share short "
+            f"constraint filter, need at least {REQUIRED_PAIRS}."
         )
         raise InsufficientPairsError(message)
 
     pairs = (
-        candidate_pairs.head(REQUIRED_PAIRS)
+        feasible_pairs.head(REQUIRED_PAIRS)
         .with_columns(
             (
                 (
@@ -116,8 +174,49 @@ def size_pairs_with_volatility_parity(
     else:
         adjusted_weights = adjusted_weights / adjusted_weights.sum()
 
-    dollar_amounts = adjusted_weights * (maximum_capital / 2.0) * exposure_scale
+    dollar_amounts = (
+        adjusted_weights * (maximum_capital / capital_divisor) * exposure_scale
+    )
     pairs = pairs.with_columns(pl.Series("dollar_amount", dollar_amounts))
+
+    # Apply whole-share constraint to short legs: floor to the nearest whole share.
+    # Long legs retain the full notional amount (fractional shares are supported).
+    short_prices_for_pairs = [
+        entry_prices.get(ticker, 0.0) for ticker in pairs["short_ticker"].to_list()
+    ]
+    pairs = (
+        pairs.with_columns(pl.Series("_short_entry_price", short_prices_for_pairs))
+        .with_columns(
+            (pl.col("dollar_amount") / pl.col("_short_entry_price"))
+            .cast(pl.Int64)
+            .alias("_short_qty")
+        )
+        .with_columns(
+            (
+                pl.col("_short_qty").cast(pl.Float64) * pl.col("_short_entry_price")
+            ).alias("_short_dollar_amount")
+        )
+    )
+
+    # Drop any pairs where the optimizer assigned too little capital for even 1 share.
+    zero_qty_count = int(pairs.filter(pl.col("_short_qty") == 0).height)
+    if zero_qty_count > 0:
+        logger.warning(
+            "Dropped pairs with zero short quantity after optimization",
+            count=zero_qty_count,
+        )
+        pairs = pairs.filter(pl.col("_short_qty") > 0)
+
+    if 0 < pairs.height < REQUIRED_PAIRS:
+        message = (
+            f"Only {pairs.height} viable pairs remain after zero-quantity filter, "
+            f"need at least {REQUIRED_PAIRS}."
+        )
+        raise InsufficientPairsError(message)
+
+    if pairs.height == 0:
+        message = "No viable pairs remain after whole-share short constraint."
+        raise InsufficientPairsError(message)
 
     logger.info(
         "Sized pairs with volatility parity",
@@ -127,22 +226,38 @@ def size_pairs_with_volatility_parity(
     )
 
     timestamp_val = to_timestamp_milliseconds(current_timestamp)
+
+    long_entry_prices = [
+        entry_prices.get(ticker, 0.0) for ticker in pairs["long_ticker"].to_list()
+    ]
+    # Long notional is matched to the short's whole-share-adjusted dollar amount so
+    # each pair is exactly dollar-neutral. quantity is null for long legs because
+    # Alpaca BUY orders use notional (fractional shares are supported).
     long_positions = pairs.select(
         pl.col("long_ticker").alias("ticker"),
         pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.LONG.value).alias("side"),
-        pl.col("dollar_amount"),
+        pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
         pl.col("pair_id"),
+    ).with_columns(
+        pl.Series("entry_price", long_entry_prices),
+        pl.lit(None).cast(pl.Int64).alias("quantity"),
+        pl.col("dollar_amount").alias("notional"),
     )
 
+    # Short legs carry the pre-computed whole-share quantity. notional is null because
+    # Alpaca SELL orders must use qty (fractional short sells are not supported).
     short_positions = pairs.select(
         pl.col("short_ticker").alias("ticker"),
         pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.SHORT.value).alias("side"),
-        pl.col("dollar_amount"),
+        pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
         pl.col("pair_id"),
+        pl.col("_short_entry_price").alias("entry_price"),
+        pl.col("_short_qty").alias("quantity"),
+        pl.lit(None).cast(pl.Float64).alias("notional"),
     )
 
     return pl.concat([long_positions, short_positions]).sort(["ticker", "side"])

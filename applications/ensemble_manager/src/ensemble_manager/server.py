@@ -75,6 +75,9 @@ DATA_MANAGER_BASE_URL = os.getenv(
     "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
 
+_swap_lock = threading.Lock()
+_CLEANUP_DELAY_SECONDS = 120
+
 
 def find_latest_artifact_key(
     s3_client: "S3Client",
@@ -110,9 +113,12 @@ def find_latest_artifact_key(
         artifact_key = str(Path(folder) / "output" / "model.tar.gz")
         try:
             s3_client.head_object(Bucket=bucket, Key=artifact_key)
-        except ClientError:
-            logger.debug("artifact_not_found_in_folder", folder=folder)
-            continue
+        except ClientError as error:
+            error_code = error.response.get("Error", {}).get("Code", "")
+            if error_code in ("404", "NoSuchKey"):
+                logger.debug("artifact_not_found_in_folder", folder=folder)
+                continue
+            raise
         else:
             logger.info(
                 "found_latest_artifact",
@@ -461,6 +467,11 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     timer_start = start_timer()
     logger.info("Starting prediction generation process")
 
+    with request.app.state.model_swap_lock:
+        tide_model = request.app.state.tide_model
+        model_directory = request.app.state.model_directory
+    tide_data = Data.load(directory_path=model_directory)
+
     end_date = datetime.now(tz=UTC)
     start_date = end_date - timedelta(
         days=70
@@ -521,11 +532,6 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     current_timestamp = datetime.now(tz=UTC)
-
-    with request.app.state.model_swap_lock:
-        tide_model = request.app.state.tide_model
-        model_directory = request.app.state.model_directory
-    tide_data = Data.load(directory_path=model_directory)
 
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
     input_ticker_count = data.select(pl.col("ticker").n_unique()).item()

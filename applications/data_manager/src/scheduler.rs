@@ -1,4 +1,4 @@
-use crate::db;
+use crate::database;
 use crate::equity_bars::fetch_and_store;
 use crate::state::State;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -138,7 +138,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     listener.listen("jobs").await?;
     info!("LISTEN handler connected, listening on channel 'jobs'");
 
-    match db::requeue_stale_claimed_jobs(
+    match database::requeue_stale_claimed_jobs(
         pool,
         "equity-bars-sync",
         std::time::Duration::from_secs(2 * 3600),
@@ -156,27 +156,27 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     }
 
     loop {
-        match db::claim_pending_job(pool, "equity-bars-sync").await {
+        match database::claim_pending_job(pool, "equity-bars-sync").await {
             Ok(Some(job_id)) => {
                 info!("Draining pending equity-bars-sync job on reconnect");
                 match run_equity_bar_sync(state).await {
                     Ok(Some(s3_key)) => {
                         if let Err(error) =
-                            db::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
+                            database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
                         {
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
                     }
                     Ok(None) => {
                         if let Err(error) =
-                            db::complete_job(pool, job_id, "no data available").await
+                            database::complete_job(pool, job_id, "no data available").await
                         {
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
                     }
                     Err(err) => {
                         error!("Drained equity-bars-sync job failed: {}", err);
-                        if let Err(error) = db::fail_job(pool, job_id, &err).await {
+                        if let Err(error) = database::fail_job(pool, job_id, &err).await {
                             warn!("Failed to fail drained job {}: {}", job_id, error);
                         }
                     }
@@ -200,7 +200,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
 
         info!("Received NOTIFY for equity-bars-sync");
 
-        let job_id = match db::claim_pending_job(pool, "equity-bars-sync").await {
+        let job_id = match database::claim_pending_job(pool, "equity-bars-sync").await {
             Ok(Some(id)) => id,
             Ok(None) => {
                 info!("No pending equity-bars-sync job to claim");
@@ -216,7 +216,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         let now_eastern = now_utc.with_timezone(&Eastern);
         if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
             info!("Weekend detected, skipping scheduled sync");
-            if let Err(error) = db::complete_job(pool, job_id, "skipped: weekend").await {
+            if let Err(error) = database::complete_job(pool, job_id, "skipped: weekend").await {
                 warn!("Failed to complete job {}: {}", job_id, error);
             }
             continue;
@@ -233,20 +233,20 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             Ok(Some(s3_key)) => {
                 info!("LISTEN-triggered sync completed, s3_key: {}", s3_key);
                 if let Err(error) =
-                    db::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
+                    database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
                 {
                     warn!("Failed to complete job {}: {}", job_id, error);
                 }
             }
             Ok(None) => {
                 info!("No data available for LISTEN-triggered sync");
-                if let Err(error) = db::complete_job(pool, job_id, "no data available").await {
+                if let Err(error) = database::complete_job(pool, job_id, "no data available").await {
                     warn!("Failed to complete job {}: {}", job_id, error);
                 }
             }
             Err(err) => {
                 error!("LISTEN-triggered sync failed: {}", err);
-                if let Err(error) = db::fail_job(pool, job_id, &err.to_string()).await {
+                if let Err(error) = database::fail_job(pool, job_id, &err.to_string()).await {
                     warn!("Failed to fail job {}: {}", job_id, error);
                 }
             }
