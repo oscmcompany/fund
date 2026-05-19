@@ -38,7 +38,7 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
 
     for chunk in valid_bars.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO equity_bars (time, symbol, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions) ",
+            "INSERT INTO equity_bars (timestamp, symbol, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions) ",
         );
 
         query_builder.push_values(chunk, |mut builder, bar| {
@@ -56,7 +56,7 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
         });
 
         query_builder.push(
-            " ON CONFLICT (symbol, time) DO UPDATE SET \
+            " ON CONFLICT (symbol, timestamp) DO UPDATE SET \
              open_price = EXCLUDED.open_price, \
              high_price = EXCLUDED.high_price, \
              low_price = EXCLUDED.low_price, \
@@ -87,11 +87,11 @@ pub async fn query_recent_equity_bars(
     let rows: Vec<PgRow> = match tickers {
         Some(ticker_list) if !ticker_list.is_empty() => {
             sqlx::query(
-                r#"SELECT symbol, time, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
+                r#"SELECT symbol, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
                    FROM equity_bars
-                   WHERE time >= now() - make_interval(days => $1)
+                   WHERE timestamp >= now() - make_interval(days => $1)
                      AND symbol = ANY($2)
-                   ORDER BY symbol, time"#,
+                   ORDER BY symbol, timestamp"#,
             )
             .bind(days_back)
             .bind(ticker_list)
@@ -101,10 +101,10 @@ pub async fn query_recent_equity_bars(
         Some(_) => return Ok(Vec::new()),
         _ => {
             sqlx::query(
-                r#"SELECT symbol, time, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
+                r#"SELECT symbol, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
                    FROM equity_bars
-                   WHERE time >= now() - make_interval(days => $1)
-                   ORDER BY symbol, time"#,
+                   WHERE timestamp >= now() - make_interval(days => $1)
+                   ORDER BY symbol, timestamp"#,
             )
             .bind(days_back)
             .fetch_all(pool)
@@ -118,10 +118,10 @@ pub async fn query_recent_equity_bars(
 }
 
 fn equity_bar_from_row(row: &PgRow) -> EquityBar {
-    let time: DateTime<Utc> = row.get("time");
+    let timestamp: DateTime<Utc> = row.get("timestamp");
     EquityBar {
         ticker: row.get("symbol"),
-        timestamp: time.timestamp_millis(),
+        timestamp: timestamp.timestamp_millis(),
         open_price: Some(row.get::<f64, _>("open_price")),
         high_price: Some(row.get::<f64, _>("high_price")),
         low_price: Some(row.get::<f64, _>("low_price")),

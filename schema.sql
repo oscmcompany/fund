@@ -7,7 +7,7 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 -- equity_bars: daily OHLCV bars (TimescaleDB hypertable)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
 CREATE TABLE IF NOT EXISTS equity_bars (
-    time                          TIMESTAMPTZ      NOT NULL,
+    timestamp                     TIMESTAMPTZ      NOT NULL,
     symbol                        TEXT             NOT NULL,
     open_price                    DOUBLE PRECISION NOT NULL,
     high_price                    DOUBLE PRECISION NOT NULL,
@@ -17,8 +17,8 @@ CREATE TABLE IF NOT EXISTS equity_bars (
     volume_weighted_average_price DOUBLE PRECISION,
     transactions                  BIGINT
 );
-SELECT create_hypertable('equity_bars', by_range('time'), if_not_exists => TRUE);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_time ON equity_bars (symbol, time DESC);
+SELECT create_hypertable('equity_bars', by_range('timestamp'), if_not_exists => TRUE);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_timestamp ON equity_bars (symbol, timestamp DESC);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
