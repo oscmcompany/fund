@@ -1,4 +1,6 @@
+import asyncio
 import io
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -8,13 +10,16 @@ import polars as pl
 import pytest
 from botocore.exceptions import ClientError
 from ensemble_manager.server import (
+    _artifact_polling_task,
     _resolve_artifact_key,
+    _sync_run_metadata,
     application,
     cleanup_model_directory,
+    download_and_extract_artifacts,
     find_latest_artifact_key,
     parse_responses,
 )
-from fastapi import status
+from fastapi import FastAPI, status
 from fastapi.testclient import TestClient
 
 
@@ -29,6 +34,7 @@ def test_create_predictions_some_tickers_dropped_continues() -> None:
     mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
 
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -66,6 +72,7 @@ def test_create_predictions_all_tickers_dropped_returns_500() -> None:
     mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
 
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -161,6 +168,7 @@ def test_resolve_artifact_key_explicit_tar_gz_path() -> None:
 
 def test_create_predictions_fetch_equity_bars_fails_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -180,6 +188,7 @@ def test_create_predictions_fetch_equity_bars_fails_returns_500() -> None:
 
 def test_create_predictions_fetch_equity_details_fails_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -205,6 +214,7 @@ def test_create_predictions_fetch_equity_details_fails_returns_500() -> None:
 
 def test_create_predictions_parse_responses_fails_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -239,6 +249,7 @@ def test_create_predictions_apply_preprocessing_fails_returns_500() -> None:
     mock_tide_data.apply_and_set_data.side_effect = ValueError("unknown category")
 
     application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
 
     with (
         patch("ensemble_manager.server.requests.get") as mock_requests_get,
@@ -420,3 +431,267 @@ def test_parse_responses_returns_consolidated_dataframe() -> None:
     assert "sector" in result.columns
     assert "industry" in result.columns
     assert set(result["ticker"].to_list()).issubset({"AAPL", "MSFT"})
+
+
+# --- Artifact polling and hot-swap tests ---
+
+_SWAP_ITERATIONS = 2
+
+
+def _make_cancel_sleep(max_iterations: int = 1):  # noqa: ANN202
+    iteration = {"count": 0}
+
+    async def controlled_sleep(_seconds: float) -> None:
+        iteration["count"] += 1
+        if iteration["count"] > max_iterations:
+            raise asyncio.CancelledError
+
+    return controlled_sleep
+
+
+def test_artifact_polling_detects_new_key_and_swaps() -> None:
+    async def _run() -> None:
+        app = MagicMock(spec=FastAPI)
+        app.state = MagicMock()
+        app.state.current_artifact_key = "old/output/model.tar.gz"
+        app.state.model_directory = "/old/dir"
+
+        mock_model = MagicMock()
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+            ),
+            patch("ensemble_manager.server.boto3.client"),
+            patch(
+                "ensemble_manager.server.asyncio.sleep",
+                side_effect=_make_cancel_sleep(_SWAP_ITERATIONS),
+            ),
+            patch(
+                "ensemble_manager.server.asyncio.to_thread"
+            ) as mock_to_thread,
+            patch("ensemble_manager.server.cleanup_model_directory"),
+            patch("ensemble_manager.server._sync_run_metadata"),
+            patch("ensemble_manager.server.model_load_timestamp"),
+        ):
+
+            async def _fake(
+                func: object, *_a: object, **_kw: object
+            ) -> object:
+                if func is find_latest_artifact_key:
+                    return "new/output/model.tar.gz"
+                return mock_model
+
+            mock_to_thread.side_effect = _fake
+
+            with pytest.raises(asyncio.CancelledError):
+                await _artifact_polling_task(app)
+
+        assert app.state.tide_model == mock_model
+        assert app.state.current_artifact_key == "new/output/model.tar.gz"
+
+    asyncio.run(_run())
+
+
+def test_artifact_polling_same_key_no_swap() -> None:
+    async def _run() -> None:
+        app = MagicMock(spec=FastAPI)
+        app.state = MagicMock()
+        app.state.current_artifact_key = "current/output/model.tar.gz"
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+            ),
+            patch("ensemble_manager.server.boto3.client"),
+            patch(
+                "ensemble_manager.server.asyncio.sleep",
+                side_effect=_make_cancel_sleep(),
+            ),
+            patch(
+                "ensemble_manager.server.asyncio.to_thread"
+            ) as mock_to_thread,
+        ):
+
+            async def _fake(
+                _func: object, *_a: object, **_kw: object
+            ) -> str:
+                return "current/output/model.tar.gz"
+
+            mock_to_thread.side_effect = _fake
+
+            with pytest.raises(asyncio.CancelledError):
+                await _artifact_polling_task(app)
+
+        assert (
+            app.state.current_artifact_key == "current/output/model.tar.gz"
+        )
+
+    asyncio.run(_run())
+
+
+def test_artifact_polling_download_failure_cleans_up() -> None:
+    async def _run() -> None:
+        app = MagicMock(spec=FastAPI)
+        app.state = MagicMock()
+        app.state.current_artifact_key = "old/output/model.tar.gz"
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+            ),
+            patch("ensemble_manager.server.boto3.client"),
+            patch(
+                "ensemble_manager.server.asyncio.sleep",
+                side_effect=_make_cancel_sleep(),
+            ),
+            patch(
+                "ensemble_manager.server.asyncio.to_thread"
+            ) as mock_to_thread,
+            patch(
+                "ensemble_manager.server.cleanup_model_directory"
+            ) as mock_cleanup,
+        ):
+
+            async def _fake(
+                func: object, *_a: object, **_kw: object
+            ) -> object:
+                if func is find_latest_artifact_key:
+                    return "new/output/model.tar.gz"
+                if func is download_and_extract_artifacts:
+                    message = "S3 download failed"
+                    raise ConnectionError(message)
+                return None
+
+            mock_to_thread.side_effect = _fake
+
+            with pytest.raises(asyncio.CancelledError):
+                await _artifact_polling_task(app)
+
+        assert app.state.current_artifact_key == "old/output/model.tar.gz"
+        mock_cleanup.assert_called()
+
+    asyncio.run(_run())
+
+
+def test_artifact_polling_transient_s3_error_continues() -> None:
+    async def _run() -> None:
+        app = MagicMock(spec=FastAPI)
+        app.state = MagicMock()
+        app.state.current_artifact_key = "old/output/model.tar.gz"
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+            ),
+            patch("ensemble_manager.server.boto3.client"),
+            patch(
+                "ensemble_manager.server.asyncio.sleep",
+                side_effect=_make_cancel_sleep(),
+            ),
+            patch(
+                "ensemble_manager.server.asyncio.to_thread"
+            ) as mock_to_thread,
+        ):
+
+            async def _fake(
+                _func: object, *_a: object, **_kw: object
+            ) -> None:
+                raise ClientError(
+                    error_response={
+                        "Error": {"Code": "503", "Message": "Slow Down"}
+                    },
+                    operation_name="ListObjectsV2",
+                )
+
+            mock_to_thread.side_effect = _fake
+
+            with pytest.raises(asyncio.CancelledError):
+                await _artifact_polling_task(app)
+
+        assert app.state.current_artifact_key == "old/output/model.tar.gz"
+
+    asyncio.run(_run())
+
+
+def test_artifact_polling_no_bucket_returns_immediately() -> None:
+    async def _run() -> None:
+        app = MagicMock(spec=FastAPI)
+
+        with patch.dict("os.environ", {}, clear=False):
+            if "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME" in os.environ:
+                del os.environ["AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"]
+            await _artifact_polling_task(app)
+
+    asyncio.run(_run())
+
+
+def test_sync_run_metadata_skips_without_database_url() -> None:
+    async def _run() -> None:
+        mock_s3 = MagicMock()
+        with patch.dict("os.environ", {}, clear=False):
+            if "DATABASE_URL" in os.environ:
+                del os.environ["DATABASE_URL"]
+            await _sync_run_metadata(
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                artifact_key="artifacts/2026/output/model.tar.gz",
+            )
+
+        mock_s3.get_object.assert_not_called()
+
+    asyncio.run(_run())
+
+
+def test_sync_run_metadata_handles_missing_metadata_json() -> None:
+    async def _run() -> None:
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = ClientError(
+            error_response={
+                "Error": {"Code": "404", "Message": "Not Found"}
+            },
+            operation_name="GetObject",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"DATABASE_URL": "postgresql://localhost/test"},
+        ):
+            await _sync_run_metadata(
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                artifact_key="artifacts/2026/output/model.tar.gz",
+            )
+
+    asyncio.run(_run())
+
+
+def test_sync_run_metadata_handles_empty_run_id() -> None:
+    async def _run() -> None:
+        mock_s3 = MagicMock()
+        mock_body = MagicMock()
+        mock_body.read.return_value = json.dumps(
+            {"some_key": "value"}
+        ).encode()
+        mock_s3.get_object.return_value = {"Body": mock_body}
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"DATABASE_URL": "postgresql://localhost/test"},
+            ),
+            patch("ensemble_manager.server.get_pool") as mock_pool,
+        ):
+            await _sync_run_metadata(
+                s3_client=mock_s3,
+                bucket="test-bucket",
+                artifact_key="artifacts/2026/output/model.tar.gz",
+            )
+
+        mock_pool.assert_not_called()
+
+    asyncio.run(_run())

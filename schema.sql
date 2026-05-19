@@ -21,7 +21,8 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_
 
 -- model_runs: Training metadata for model artifacts and evaluation metrics
 CREATE TABLE IF NOT EXISTS model_runs (
-    run_id               TEXT PRIMARY KEY,
+    id                   BIGSERIAL PRIMARY KEY,
+    run_id               TEXT NOT NULL UNIQUE,
     model_name           TEXT NOT NULL DEFAULT 'tide',
     artifact_key         TEXT,
     training_data_key    TEXT,
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     scheduled_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
     claimed_at   TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
-    status       TEXT         NOT NULL DEFAULT 'pending',
+    status       TEXT         NOT NULL DEFAULT 'pending'
+                              CHECK (status IN ('pending', 'claimed', 'completed', 'failed')),
     result       TEXT
 );
 
@@ -70,4 +72,4 @@ $$ LANGUAGE plpgsql;
 SELECT cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
 
 -- TTL cleanup: delete equity bars older than 10 days, daily at 3:00 AM UTC
-SELECT cron.schedule('equity-bars-ttl', '0 3 * * *', $$DELETE FROM equity_bars WHERE inserted_at < now() - interval '10 days'$$);
+SELECT cron.schedule('equity-bars-ttl', '0 3 * * *', $$DELETE FROM equity_bars WHERE timestamp < (EXTRACT(EPOCH FROM now() - interval '10 days') * 1000)::BIGINT$$);

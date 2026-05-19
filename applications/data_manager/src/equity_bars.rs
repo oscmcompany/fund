@@ -1,5 +1,5 @@
 use crate::data::EquityBar;
-use crate::db;
+use crate::database;
 use crate::state::State;
 use crate::storage::{query_equity_bars_parquet_from_s3, write_equity_bars_dataframe_to_s3};
 use axum::{
@@ -319,7 +319,7 @@ pub async fn fetch_and_store(
             })
             .collect();
 
-        if let Err(error) = db::insert_equity_bars(pool, &equity_bars).await {
+        if let Err(error) = database::insert_equity_bars(pool, &equity_bars).await {
             warn!("Failed to write equity bars to PostgreSQL: {}", error);
         }
     }
@@ -352,7 +352,7 @@ pub async fn query_recent(
             .collect()
     });
 
-    match db::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
+    match database::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
         Ok(bars) => {
             let dataframe = crate::data::create_equity_bar_dataframe(bars);
             match dataframe {

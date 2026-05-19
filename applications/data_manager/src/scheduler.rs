@@ -1,4 +1,4 @@
-use crate::db;
+use crate::database;
 use crate::equity_bars::fetch_and_store;
 use crate::state::State;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -60,12 +60,12 @@ pub fn spawn_sync_scheduler(state: State) {
     tokio::spawn(listen_loop(listen_state));
 }
 
-async fn run_equity_bar_sync(state: &State) {
+async fn run_equity_bar_sync(state: &State) -> bool {
     let now_utc = Utc::now();
     let now_eastern = now_utc.with_timezone(&Eastern);
     if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
         info!("Weekend detected, skipping equity bar sync");
-        return;
+        return false;
     }
 
     let sync_date = sync_date_for(now_utc);
@@ -83,18 +83,23 @@ async fn run_equity_bar_sync(state: &State) {
     match fetch_and_store(state, &sync_utc).await {
         Ok(Some(s3_key)) => {
             info!("Equity bar sync completed, s3_key: {}", s3_key);
+            true
         }
         Ok(None) => {
             info!(
                 "No equity bar data available for sync date {}",
                 sync_date.format("%Y-%m-%d")
             );
+            false
         }
         Err(err) => {
             error!("Equity bar sync failed: {}", err);
+            false
         }
     }
 }
+
+const SYNC_DEDUP_TTL_SECS: u64 = 300;
 
 async fn sync_loop(state: State) {
     loop {
@@ -105,7 +110,14 @@ async fn sync_loop(state: State) {
         );
         sleep(wait_duration).await;
 
-        run_equity_bar_sync(&state).await;
+        if state.synced_recently(SYNC_DEDUP_TTL_SECS) {
+            info!("Skipping sync loop run, synced recently");
+            continue;
+        }
+
+        if run_equity_bar_sync(&state).await {
+            state.mark_synced();
+        }
     }
 }
 
@@ -131,60 +143,75 @@ async fn listen_loop(state: State) {
     }
 }
 
+async fn process_equity_bar_sync_job(state: &State, pool: &sqlx::PgPool, job_id: i64) {
+    let now_utc = Utc::now();
+    let now_eastern = now_utc.with_timezone(&Eastern);
+    if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
+        info!("Weekend detected, skipping scheduled sync");
+        let _ = database::complete_job(pool, job_id, "skipped: weekend").await;
+        return;
+    }
+
+    let sync_date = sync_date_for(now_utc);
+    let sync_noon_eastern = Eastern
+        .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .unwrap();
+    let sync_utc = sync_noon_eastern.with_timezone(&Utc);
+
+    match fetch_and_store(state, &sync_utc).await {
+        Ok(Some(s3_key)) => {
+            info!("LISTEN-triggered sync completed, s3_key: {}", s3_key);
+            let _ = database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await;
+            state.mark_synced();
+        }
+        Ok(None) => {
+            info!("No data available for LISTEN-triggered sync");
+            let _ = database::complete_job(pool, job_id, "no data available").await;
+        }
+        Err(err) => {
+            error!("LISTEN-triggered sync failed: {}", err);
+            let _ = database::fail_job(pool, job_id, &err).await;
+        }
+    }
+}
+
+async fn drain_pending_jobs(state: &State, pool: &sqlx::PgPool) {
+    loop {
+        match database::claim_pending_job(pool, "equity-bar-sync").await {
+            Ok(Some(job_id)) => {
+                info!("Draining pending job {}", job_id);
+                process_equity_bar_sync_job(state, pool, job_id).await;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                warn!("Failed to claim job during drain: {}", error);
+                break;
+            }
+        }
+    }
+}
+
 async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("jobs").await?;
     info!("LISTEN handler connected, listening on channel 'jobs'");
 
     loop {
-        let notification = listener.recv().await?;
-        let payload = notification.payload();
-
-        if payload != "equity-bar-sync" {
-            continue;
-        }
-
-        info!("Received NOTIFY for equity-bar-sync");
-
-        let job_id = match db::claim_pending_job(pool, "equity-bar-sync").await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                info!("No pending equity-bar-sync job to claim");
-                continue;
+        match tokio::time::timeout(Duration::from_secs(30), listener.recv()).await {
+            Ok(Ok(notification)) => {
+                let payload = notification.payload();
+                if payload != "equity-bar-sync" {
+                    continue;
+                }
+                info!("Received NOTIFY for equity-bar-sync");
+                drain_pending_jobs(state, pool).await;
             }
-            Err(error) => {
-                warn!("Failed to claim job: {}", error);
-                continue;
+            Ok(Err(error)) => {
+                return Err(error);
             }
-        };
-
-        let now_utc = Utc::now();
-        let now_eastern = now_utc.with_timezone(&Eastern);
-        if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
-            info!("Weekend detected, skipping scheduled sync");
-            let _ = db::complete_job(pool, job_id, "skipped: weekend").await;
-            continue;
-        }
-
-        let sync_date = sync_date_for(now_utc);
-        let sync_noon_eastern = Eastern
-            .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
-            .earliest()
-            .unwrap();
-        let sync_utc = sync_noon_eastern.with_timezone(&Utc);
-
-        match fetch_and_store(state, &sync_utc).await {
-            Ok(Some(s3_key)) => {
-                info!("LISTEN-triggered sync completed, s3_key: {}", s3_key);
-                let _ = db::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await;
-            }
-            Ok(None) => {
-                info!("No data available for LISTEN-triggered sync");
-                let _ = db::complete_job(pool, job_id, "no data available").await;
-            }
-            Err(err) => {
-                error!("LISTEN-triggered sync failed: {}", err);
-                let _ = db::fail_job(pool, job_id, &err).await;
+            Err(_timeout) => {
+                drain_pending_jobs(state, pool).await;
             }
         }
     }

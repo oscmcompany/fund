@@ -64,7 +64,7 @@ pub async fn query_recent_equity_bars(
                 r#"SELECT ticker, timestamp, open_price, high_price, low_price,
                           close_price, volume, volume_weighted_average_price, transactions
                    FROM equity_bars
-                   WHERE inserted_at >= now() - make_interval(days => $1)
+                   WHERE timestamp >= (EXTRACT(EPOCH FROM now() - make_interval(days => $1)) * 1000)::BIGINT
                      AND ticker = ANY($2)
                    ORDER BY ticker, timestamp"#,
             )
@@ -78,7 +78,7 @@ pub async fn query_recent_equity_bars(
                 r#"SELECT ticker, timestamp, open_price, high_price, low_price,
                           close_price, volume, volume_weighted_average_price, transactions
                    FROM equity_bars
-                   WHERE inserted_at >= now() - make_interval(days => $1)
+                   WHERE timestamp >= (EXTRACT(EPOCH FROM now() - make_interval(days => $1)) * 1000)::BIGINT
                    ORDER BY ticker, timestamp"#,
             )
             .bind(days_back)
@@ -113,7 +113,7 @@ pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i
            SET claimed_at = now(), status = 'claimed'
            WHERE id = (
                SELECT id FROM scheduled_jobs
-               WHERE job_name = $1 AND status = 'pending'
+               WHERE job_name = $1 AND status = 'pending' AND scheduled_at <= now()
                ORDER BY scheduled_at
                LIMIT 1
                FOR UPDATE SKIP LOCKED
