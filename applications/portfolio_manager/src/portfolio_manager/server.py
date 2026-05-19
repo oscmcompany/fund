@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import requests
@@ -99,8 +99,10 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     _app.state.status_logger_task.cancel()
     _app.state.scheduler_task.cancel()
-    await _app.state.status_logger_task
-    await _app.state.scheduler_task
+    with suppress(asyncio.CancelledError):
+        await _app.state.status_logger_task
+    with suppress(asyncio.CancelledError):
+        await _app.state.scheduler_task
 
 
 application: FastAPI = FastAPI(lifespan=_lifespan)

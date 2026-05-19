@@ -1,9 +1,12 @@
+import asyncio
+import contextlib
 import io
 import json
 import logging
 import os
 import tarfile
 import tempfile
+import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -16,6 +19,7 @@ import requests
 import structlog
 from botocore.exceptions import ClientError
 from fastapi import FastAPI, Request, Response, status
+from internal.database import close_pool, get_pool
 from internal.equity_bars_schema import equity_bars_schema
 from internal.timestamps import to_timestamp_milliseconds
 
@@ -72,6 +76,9 @@ DATA_MANAGER_BASE_URL = os.getenv(
     "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
 )
 
+_swap_lock = threading.Lock()
+_CLEANUP_DELAY_SECONDS = 120
+
 
 def find_latest_artifact_key(
     s3_client: "S3Client",
@@ -107,9 +114,12 @@ def find_latest_artifact_key(
         artifact_key = str(Path(folder) / "output" / "model.tar.gz")
         try:
             s3_client.head_object(Bucket=bucket, Key=artifact_key)
-        except ClientError:
-            logger.debug("artifact_not_found_in_folder", folder=folder)
-            continue
+        except ClientError as error:
+            error_code = error.response.get("Error", {}).get("Code", "")
+            if error_code in ("404", "NoSuchKey"):
+                logger.debug("artifact_not_found_in_folder", folder=folder)
+                continue
+            raise
         else:
             logger.info(
                 "found_latest_artifact",
@@ -202,6 +212,178 @@ def cleanup_model_directory(model_directory: str) -> None:
         shutil.rmtree(model_directory, ignore_errors=True)
 
 
+async def _sync_run_metadata(
+    s3_client: "S3Client",
+    bucket: str,
+    artifact_key: str,
+) -> None:
+    """Fetch run_metadata.json and evaluation.json from S3.
+
+    Inserts or updates the corresponding row in the model_runs table.
+    """
+    if not os.environ.get("DATABASE_URL"):
+        return
+
+    artifact_folder = str(Path(artifact_key).parent.parent)
+    metadata_key = f"{artifact_folder}/run_metadata.json"
+
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=metadata_key)
+        metadata = json.loads(response["Body"].read())
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code in ("404", "NoSuchKey"):
+            logger.debug("No run_metadata.json found", metadata_key=metadata_key)
+            return
+        raise
+    except (json.JSONDecodeError, KeyError):
+        logger.warning("Invalid run_metadata.json", metadata_key=metadata_key)
+        return
+
+    run_id = metadata.get("artifact_timestamp", "")
+    if not run_id:
+        return
+
+    evaluation_key = f"{artifact_folder}/evaluation.json"
+    continuous_ranked_probability_score: float | None = None
+    directional_accuracy: float | None = None
+    quantile_coverage: float | None = None
+    try:
+        evaluation_response = s3_client.get_object(Bucket=bucket, Key=evaluation_key)
+        evaluation = json.loads(evaluation_response["Body"].read())
+        continuous_ranked_probability_score = evaluation.get("crps")
+        directional_accuracy = evaluation.get("directional_accuracy")
+        quantile_coverage = evaluation.get("quantile_coverage")
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code", "")
+        if error_code in ("404", "NoSuchKey"):
+            logger.debug("No evaluation.json found", evaluation_key=evaluation_key)
+        else:
+            raise
+    except (json.JSONDecodeError, KeyError):
+        logger.warning("Invalid evaluation.json", evaluation_key=evaluation_key)
+
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            await connection.execute(
+                """INSERT INTO model_runs (
+                       run_id, artifact_key, training_data_key,
+                       start_date, end_date, lookback_days,
+                       status, stage_counts, completed_at,
+                       continuous_ranked_probability_score, directional_accuracy, quantile_coverage
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
+                   ON CONFLICT (run_id) DO UPDATE SET
+                       artifact_key = EXCLUDED.artifact_key,
+                       training_data_key = EXCLUDED.training_data_key,
+                       start_date = EXCLUDED.start_date,
+                       end_date = EXCLUDED.end_date,
+                       lookback_days = EXCLUDED.lookback_days,
+                       status = EXCLUDED.status,
+                       stage_counts = EXCLUDED.stage_counts,
+                       completed_at = EXCLUDED.completed_at,
+                       continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score,
+                       directional_accuracy = EXCLUDED.directional_accuracy,
+                       quantile_coverage = EXCLUDED.quantile_coverage""",
+                (
+                    run_id,
+                    artifact_key,
+                    metadata.get("training_data_key"),
+                    metadata.get("start_date"),
+                    metadata.get("end_date"),
+                    metadata.get("lookback_days"),
+                    "completed",
+                    json.dumps(metadata.get("stage_counts")),
+                    continuous_ranked_probability_score,
+                    directional_accuracy,
+                    quantile_coverage,
+                ),
+            )
+        logger.info("Synced model run metadata", run_id=run_id)
+    except Exception:
+        logger.exception("Failed to sync run metadata to PostgreSQL")
+
+
+async def _artifact_polling_task(app: FastAPI) -> None:
+    """Background task that polls S3 for new model artifacts."""
+    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
+
+    if not bucket:
+        logger.info("Artifact polling disabled, no bucket configured")
+        return
+
+    s3_client = boto3.client("s3")
+    poll_interval = 60
+
+    while True:
+        await asyncio.sleep(poll_interval)
+
+        try:
+            latest_key = await asyncio.to_thread(
+                find_latest_artifact_key,
+                s3_client=s3_client,
+                bucket=bucket,
+                prefix=artifact_path,
+            )
+        except ValueError:
+            logger.debug("No artifacts found during polling")
+            continue
+        except Exception:
+            logger.exception("Transient error during artifact polling")
+            continue
+
+        current_key = getattr(app.state, "current_artifact_key", None)
+        if latest_key == current_key:
+            continue
+
+        logger.info(
+            "New artifact detected",
+            current_key=current_key,
+            new_key=latest_key,
+        )
+
+        new_directory = tempfile.mkdtemp(prefix="model_artifacts_")
+        try:
+            await asyncio.to_thread(
+                download_and_extract_artifacts,
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_key=latest_key,
+                extract_path=Path(new_directory),
+            )
+
+            new_model = await asyncio.to_thread(
+                Model.load, directory_path=new_directory
+            )
+        except Exception:
+            logger.exception("Failed to download or load model artifact")
+            cleanup_model_directory(new_directory)
+            continue
+
+        with _swap_lock:
+            old_directory = getattr(app.state, "model_directory", None)
+            app.state.tide_model = new_model
+            app.state.model_directory = new_directory
+            app.state.current_artifact_key = latest_key
+
+        model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
+        logger.info("Hot-swapped model", artifact_key=latest_key)
+
+        if old_directory and old_directory != ".":
+            await asyncio.sleep(_CLEANUP_DELAY_SECONDS)
+            cleanup_model_directory(old_directory)
+
+        try:
+            await _sync_run_metadata(
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_key=latest_key,
+            )
+        except Exception:
+            logger.exception("Failed to sync run metadata after hot-swap")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Load model artifacts from S3 at startup."""
@@ -233,8 +415,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.exception("Failed to download artifacts")
             raise
 
+        app.state.current_artifact_key = artifact_key
         logger.info("Loading model", directory=model_directory)
     else:
+        app.state.current_artifact_key = None
         logger.info("Loading model from local", directory=model_directory)
 
     app.state.model_directory = model_directory
@@ -242,9 +426,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
     logger.info("model_loaded_successfully")
 
-    yield
+    if app.state.current_artifact_key and bucket:
+        try:
+            await _sync_run_metadata(
+                s3_client=s3_client,
+                bucket=bucket,
+                artifact_key=app.state.current_artifact_key,
+            )
+        except Exception:
+            logger.exception("Failed to sync run metadata at startup")
 
-    cleanup_model_directory(app.state.model_directory)
+    polling_task = asyncio.create_task(_artifact_polling_task(app))
+
+    try:
+        yield
+    finally:
+        polling_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await polling_task
+        await close_pool()
+        cleanup_model_directory(app.state.model_directory)
 
 
 application = FastAPI(lifespan=lifespan)
@@ -289,6 +490,10 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
     prediction_requests_total.inc()
     timer_start = start_timer()
     logger.info("Starting prediction generation process")
+
+    with _swap_lock:
+        local_model_directory = request.app.state.model_directory
+        local_tide_model = request.app.state.tide_model
 
     end_date = datetime.now(tz=UTC)
     start_date = end_date - timedelta(
@@ -351,7 +556,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
 
     current_timestamp = datetime.now(tz=UTC)
 
-    tide_data = Data.load(directory_path=request.app.state.model_directory)
+    tide_data = Data.load(directory_path=local_model_directory)
 
     trained_tickers = cast("set[str]", set(tide_data.mappings["ticker"].keys()))
     input_ticker_count = data.select(pl.col("ticker").n_unique()).item()
@@ -377,7 +582,7 @@ def create_predictions(request: Request) -> Response:  # noqa: PLR0911, PLR0915
 
     from tinygrad.tensor import Tensor  # noqa: PLC0415
 
-    model = request.app.state.tide_model
+    model = local_tide_model
     dataset = tide_data.get_dataset(
         data_type="predict", output_length=model.output_length
     )
