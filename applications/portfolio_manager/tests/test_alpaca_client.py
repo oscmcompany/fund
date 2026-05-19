@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from alpaca.trading.enums import AssetClass, AssetStatus, OrderSide, PositionIntent
@@ -615,6 +615,7 @@ def test_get_account_retries_on_transient_error(
     mock_account = MagicMock()
     mock_account.cash = "5000.00"
     mock_account.buying_power = "10000.00"
+    mock_account.equity = "15000.00"
     mock_trading.get_account.side_effect = [transient_error, mock_account]
 
     result = client.get_account()
@@ -677,4 +678,4 @@ def test_get_account_raises_after_retries_exhausted(
     expected_attempts = 3
     assert mock_trading.get_account.call_count == expected_attempts
     assert mock_tenacity_sleep is not None
-    assert mock_rate_limit_sleep.called
+    assert call(client.rate_limit_sleep) not in mock_rate_limit_sleep.call_args_list
