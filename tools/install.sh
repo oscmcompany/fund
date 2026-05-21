@@ -286,31 +286,7 @@ phase_bootstrap() {
     fail "Failed to write AWS credentials on VM"
   fi
 
-  # --- 3b: GitHub auth ---
-  step "Authenticating GitHub on VM"
-
-  # Install gh if missing
-  if ! remote "command -v gh" &>/dev/null; then
-    echo "Installing GitHub CLI on VM..."
-    remote "sudo apt-get update -qq && sudo apt-get install -y -qq gh" >/dev/null
-  fi
-
-  if remote "gh auth status" &>/dev/null; then
-    echo "GitHub CLI already authenticated"
-  else
-    echo "Starting GitHub device flow authentication..."
-    echo "A code will appear below. Open https://github.com/login/device in your browser and enter it."
-    echo ""
-    remote_long_tty "gh auth login --hostname github.com --git-protocol https --web"
-
-    # Verify
-    if ! remote "gh auth status" &>/dev/null; then
-      fail "GitHub authentication failed"
-    fi
-    echo "GitHub authentication successful"
-  fi
-
-  # --- 3c: Clone repo ---
+  # --- 3b: Clone repo ---
   step "Cloning repository on VM"
 
   if remote "test -d ~/fund/.git" 2>/dev/null; then
@@ -318,7 +294,7 @@ phase_bootstrap() {
     remote "cd ~/fund && git fetch --all"
   else
     echo "Cloning oscmcompany/fund..."
-    remote "gh repo clone oscmcompany/fund ~/fund"
+    remote "git clone https://github.com/oscmcompany/fund.git ~/fund"
   fi
 
   # Verify
