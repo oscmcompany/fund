@@ -382,6 +382,15 @@ phase_dropin() {
     echo "git-sync started in background"
   fi
 
+  # --- Share VM with team ---
+  step "Sharing VM with team"
+  ssh exe.dev share add "$VM_NAME" team 2>/dev/null \
+    && echo "Shared $VM_NAME with team" \
+    || echo "Warning: could not share VM with team (share manually with: ssh exe.dev share add $VM_NAME team)"
+  ssh exe.dev share access allow "$VM_NAME" 2>/dev/null \
+    && echo "Enabled team SSH access" \
+    || echo "Warning: could not enable team access (run: ssh exe.dev share access allow $VM_NAME)"
+
   step "Setup complete"
 
   echo ""
@@ -395,16 +404,21 @@ phase_dropin() {
   fi
   echo "  Tags:     ${VM_TAGS[*]}"
   echo ""
-  local nix_source='for p in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh /etc/profile.d/nix.sh; do [ -f "$p" ] && . "$p" && break; done'
-  local drop_cmd="cd ~/fund && $nix_source && devenv shell"
-
-  echo "  SSH:    ssh $VM_NAME.exe.xyz"
-  echo "  Devenv: ssh -t $VM_NAME.exe.xyz \"$drop_cmd\""
+  echo "Next steps:"
+  echo "  ssh $VM_NAME.exe.xyz"
+  echo "  cd ~/fund"
+  if [[ "$MODE" == "prod" ]]; then
+    echo "  # environment auto-activates via devenv hook"
+    echo "  devenv --profile apps up    # services are already running via git-sync"
+  else
+    echo "  # environment auto-activates via devenv hook"
+    echo "  devenv --profile apps up    # start application services"
+  fi
   echo "-----------------"
   echo ""
 
   if confirm "Drop into VM now?"; then
-    exec ssh -t "$VM_NAME.exe.xyz" "$drop_cmd"
+    exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
   fi
 }
 
