@@ -19,12 +19,16 @@ usage() {
   echo "  --prod              Configure production environment and validate secrets"
   echo "  --noninteractive    Skip the final exec \$SHELL (for use from automation)"
   echo "  -h, --help          Show this help message"
-  exit 0
+  exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --profile requires a value"
+        usage 1
+      fi
       PROFILE="$2"
       shift 2
       ;;
@@ -41,14 +45,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Error: unknown option '$1'"
-      usage
+      usage 1
       ;;
   esac
 done
 
 if [[ -z "$PROFILE" ]]; then
   echo "Error: --profile is required (e.g., --profile dev/chris or --profile production)"
-  usage
+  usage 1
 fi
 
 step() {
@@ -127,6 +131,15 @@ else
   echo "Installing devenv..."
   nix profile add nixpkgs#devenv
   echo "devenv installed successfully"
+fi
+
+# --------------------------------------------------------------------------- #
+# 2b. Install tmux (required for production service sessions)
+# --------------------------------------------------------------------------- #
+if ! command -v tmux &>/dev/null; then
+  echo "Installing tmux..."
+  sudo apt-get install -y -qq tmux 2>/dev/null || nix profile add nixpkgs#tmux
+  echo "tmux installed"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -230,10 +243,15 @@ EOF
 
   echo "Created $DOTENV"
 else
+  existing_profile=$(grep -E '^FUND_PROFILE=' "$DOTENV" | cut -d= -f2-)
+  if [[ -n "$existing_profile" && "$existing_profile" != "$PROFILE" ]]; then
+    echo "WARNING: .env has FUND_PROFILE=$existing_profile but --profile is $PROFILE"
+    echo "  To update, delete .env and re-run, or edit it manually"
+  fi
   echo ".env already exists, skipping creation"
 fi
 
-if [[ "$PROD" != true ]]; then
+if [[ "$PROD" != true && "$PROFILE" != "production" && "$PROFILE" != "paper" ]]; then
   step "Ensuring dev S3 buckets exist"
   set -a
   # shellcheck disable=SC1090
@@ -243,7 +261,11 @@ if [[ "$PROD" != true ]]; then
 fi
 
 # Patch devenv.yaml secretspec profile to match this environment
-sed -i "s|profile: .*|profile: $PROFILE|" "$REPO_ROOT/devenv.yaml"
+if [[ "$OS" == "Darwin" ]]; then
+  sed -i '' "s|profile: .*|profile: $PROFILE|" "$REPO_ROOT/devenv.yaml"
+else
+  sed -i "s|profile: .*|profile: $PROFILE|" "$REPO_ROOT/devenv.yaml"
+fi
 
 cd "$REPO_ROOT"
 devenv allow
@@ -282,10 +304,8 @@ echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
 if [[ "$PROD" == true ]]; then
-  echo "  nohup tools/git-sync > /var/log/git-sync.log 2>&1 &  # start git-sync supervisor"
-  echo ""
-  echo "git-sync will poll origin/master every 60 seconds and restart"
-  echo "devenv automatically when new commits arrive."
+  echo "  tmux new-session -d -s fund 'devenv --profile apps up'"
+  echo "  tmux attach -t fund        # attach to services session"
 else
   echo "  devenv shell        # enter the development environment"
   echo "  devenv --profile apps up  # start application services"

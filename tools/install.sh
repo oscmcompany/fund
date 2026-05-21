@@ -374,12 +374,11 @@ phase_dropin() {
     fail "Timed out waiting for VM to come back after reboot (${reboot_timeout}s)"
   fi
 
-  # --- Prod-only: start git-sync after reboot ---
+  # --- Prod-only: start services in tmux session ---
   if [[ "$MODE" == "prod" ]]; then
-    step "Starting git-sync on VM"
-    remote "mkdir -p ~/logs"
-    remote "cd ~/fund && nohup tools/git-sync > ~/logs/git-sync.log 2>&1 &"
-    echo "git-sync started in background"
+    step "Starting services in tmux session"
+    remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'devenv --profile apps up'"
+    echo "Services started in tmux session 'fund'"
   fi
 
   # --- Share VM with team ---
@@ -398,7 +397,7 @@ phase_dropin() {
   echo "  VM:       $VM_NAME.exe.xyz"
   if [[ "$MODE" == "prod" ]]; then
     echo "  Profile:  production"
-    echo "  git-sync: running"
+    echo "  Services: running in tmux session 'fund'"
   else
     echo "  Profile:  dev/$DEV_NAME"
   fi
@@ -406,19 +405,21 @@ phase_dropin() {
   echo ""
   echo "Next steps:"
   echo "  ssh $VM_NAME.exe.xyz"
-  echo "  cd ~/fund"
   if [[ "$MODE" == "prod" ]]; then
-    echo "  # environment auto-activates via devenv hook"
-    echo "  devenv --profile apps up    # services are already running via git-sync"
+    echo "  tmux attach -t fund        # attach to services session"
   else
-    echo "  # environment auto-activates via devenv hook"
+    echo "  cd ~/fund"
     echo "  devenv --profile apps up    # start application services"
   fi
   echo "-----------------"
   echo ""
 
   if confirm "Drop into VM now?"; then
-    exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
+    if [[ "$MODE" == "prod" ]]; then
+      exec ssh -t "$VM_NAME.exe.xyz" "tmux attach -t fund"
+    else
+      exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
+    fi
   fi
 }
 
