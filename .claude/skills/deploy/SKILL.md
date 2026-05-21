@@ -90,7 +90,7 @@ devenv --profile ml shell       # ML training environment
 devenv --profile apps up          # start application services (secretspec injects secrets)
 ```
 
-Production mode is activated by setting `FUND_PROFILE=production` in `.envrc`.
+Production mode is activated by setting `FUND_PROFILE=production` in `.env`.
 This disables hot-reload, enables `cargo run --release`, and starts the
 artifact-watcher process.
 
@@ -111,12 +111,12 @@ curl localhost:8081/health  # portfolio-manager
 curl localhost:8082/health  # ensemble-manager
 ```
 
-## Environment Variables (Production .envrc)
+## Environment Variables (Production .env)
 
 ```bash
-export FUND_PROFILE=production
-export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
-export MASSIVE_BASE_URL=https://api.massive.com
+FUND_PROFILE=production
+AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+MASSIVE_BASE_URL=https://api.massive.com
 ```
 
 ## Common Issues

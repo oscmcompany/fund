@@ -1,10 +1,4 @@
-{
-  pkgs,
-  lib,
-  config,
-  inputs,
-  ...
-}: let
+{pkgs, ...}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -17,7 +11,6 @@
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
   dotenv.enable = true;
-  dotenv.filename = ".envrc";
 
   languages = {
     rust.enable = true;

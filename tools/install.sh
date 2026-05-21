@@ -333,26 +333,14 @@ phase_bootstrap() {
   fi
   echo "Repository ready (branch: $VM_BRANCH)"
 
-  # --- 3d: Create .envrc ---
-  step "Creating .envrc on VM"
-
-  if [[ "$MODE" == "prod" ]]; then
-    printf 'export FUND_PROFILE=production\nexport SECRETSPEC_PROFILE="$FUND_PROFILE"\nexport AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/\nexport MASSIVE_BASE_URL=https://api.massive.com\n' \
-      | remote "cat > ~/fund/.envrc"
-    echo "Created production .envrc"
-  else
-    printf 'export FUND_PROFILE=dev/%s\nexport SECRETSPEC_PROFILE="$FUND_PROFILE"\n' \
-      "$DEV_NAME" \
-      | remote "cat > ~/fund/.envrc"
-    echo "Created dev/$DEV_NAME .envrc"
-  fi
-
-  # --- 3e: Run bootstrap-machine ---
+  # --- 3d: Run bootstrap-machine ---
   step "Running bootstrap-machine on VM (this will take a while)"
 
   local bootstrap_args="--noninteractive"
   if [[ "$MODE" == "prod" ]]; then
-    bootstrap_args="--prod $bootstrap_args"
+    bootstrap_args="--profile production --prod $bootstrap_args"
+  else
+    bootstrap_args="--profile dev/$DEV_NAME $bootstrap_args"
   fi
 
   # shellcheck disable=SC2086
