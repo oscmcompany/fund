@@ -271,8 +271,11 @@ async def _sync_run_metadata(
                        run_id, artifact_key, training_data_key,
                        start_date, end_date, lookback_days,
                        status, stage_counts, completed_at,
-                       continuous_ranked_probability_score, directional_accuracy, quantile_coverage
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
+                       continuous_ranked_probability_score,
+                       directional_accuracy, quantile_coverage
+                   ) VALUES (
+                       %s, %s, %s, %s, %s, %s, %s, %s,
+                       now(), %s, %s, %s)
                    ON CONFLICT (run_id) DO UPDATE SET
                        artifact_key = EXCLUDED.artifact_key,
                        training_data_key = EXCLUDED.training_data_key,
@@ -282,7 +285,8 @@ async def _sync_run_metadata(
                        status = EXCLUDED.status,
                        stage_counts = EXCLUDED.stage_counts,
                        completed_at = EXCLUDED.completed_at,
-                       continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score,
+                       continuous_ranked_probability_score
+                           = EXCLUDED.continuous_ranked_probability_score,
                        directional_accuracy = EXCLUDED.directional_accuracy,
                        quantile_coverage = EXCLUDED.quantile_coverage""",
                 (

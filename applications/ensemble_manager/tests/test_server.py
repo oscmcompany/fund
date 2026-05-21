@@ -468,17 +468,13 @@ def test_artifact_polling_detects_new_key_and_swaps() -> None:
                 "ensemble_manager.server.asyncio.sleep",
                 side_effect=_make_cancel_sleep(_SWAP_ITERATIONS),
             ),
-            patch(
-                "ensemble_manager.server.asyncio.to_thread"
-            ) as mock_to_thread,
+            patch("ensemble_manager.server.asyncio.to_thread") as mock_to_thread,
             patch("ensemble_manager.server.cleanup_model_directory"),
             patch("ensemble_manager.server._sync_run_metadata"),
             patch("ensemble_manager.server.model_load_timestamp"),
         ):
 
-            async def _fake(
-                func: object, *_a: object, **_kw: object
-            ) -> object:
+            async def _fake(func: object, *_a: object, **_kw: object) -> object:
                 if func is find_latest_artifact_key:
                     return "new/output/model.tar.gz"
                 return mock_model
@@ -510,14 +506,10 @@ def test_artifact_polling_same_key_no_swap() -> None:
                 "ensemble_manager.server.asyncio.sleep",
                 side_effect=_make_cancel_sleep(),
             ),
-            patch(
-                "ensemble_manager.server.asyncio.to_thread"
-            ) as mock_to_thread,
+            patch("ensemble_manager.server.asyncio.to_thread") as mock_to_thread,
         ):
 
-            async def _fake(
-                _func: object, *_a: object, **_kw: object
-            ) -> str:
+            async def _fake(_func: object, *_a: object, **_kw: object) -> str:
                 return "current/output/model.tar.gz"
 
             mock_to_thread.side_effect = _fake
@@ -525,9 +517,7 @@ def test_artifact_polling_same_key_no_swap() -> None:
             with pytest.raises(asyncio.CancelledError):
                 await _artifact_polling_task(app)
 
-        assert (
-            app.state.current_artifact_key == "current/output/model.tar.gz"
-        )
+        assert app.state.current_artifact_key == "current/output/model.tar.gz"
 
     asyncio.run(_run())
 
@@ -548,17 +538,11 @@ def test_artifact_polling_download_failure_cleans_up() -> None:
                 "ensemble_manager.server.asyncio.sleep",
                 side_effect=_make_cancel_sleep(),
             ),
-            patch(
-                "ensemble_manager.server.asyncio.to_thread"
-            ) as mock_to_thread,
-            patch(
-                "ensemble_manager.server.cleanup_model_directory"
-            ) as mock_cleanup,
+            patch("ensemble_manager.server.asyncio.to_thread") as mock_to_thread,
+            patch("ensemble_manager.server.cleanup_model_directory") as mock_cleanup,
         ):
 
-            async def _fake(
-                func: object, *_a: object, **_kw: object
-            ) -> object:
+            async def _fake(func: object, *_a: object, **_kw: object) -> object:
                 if func is find_latest_artifact_key:
                     return "new/output/model.tar.gz"
                 if func is download_and_extract_artifacts:
@@ -593,18 +577,12 @@ def test_artifact_polling_transient_s3_error_continues() -> None:
                 "ensemble_manager.server.asyncio.sleep",
                 side_effect=_make_cancel_sleep(),
             ),
-            patch(
-                "ensemble_manager.server.asyncio.to_thread"
-            ) as mock_to_thread,
+            patch("ensemble_manager.server.asyncio.to_thread") as mock_to_thread,
         ):
 
-            async def _fake(
-                _func: object, *_a: object, **_kw: object
-            ) -> None:
+            async def _fake(_func: object, *_a: object, **_kw: object) -> None:
                 raise ClientError(
-                    error_response={
-                        "Error": {"Code": "503", "Message": "Slow Down"}
-                    },
+                    error_response={"Error": {"Code": "503", "Message": "Slow Down"}},
                     operation_name="ListObjectsV2",
                 )
 
@@ -651,9 +629,7 @@ def test_sync_run_metadata_handles_missing_metadata_json() -> None:
     async def _run() -> None:
         mock_s3 = MagicMock()
         mock_s3.get_object.side_effect = ClientError(
-            error_response={
-                "Error": {"Code": "404", "Message": "Not Found"}
-            },
+            error_response={"Error": {"Code": "404", "Message": "Not Found"}},
             operation_name="GetObject",
         )
 
@@ -674,9 +650,7 @@ def test_sync_run_metadata_handles_empty_run_id() -> None:
     async def _run() -> None:
         mock_s3 = MagicMock()
         mock_body = MagicMock()
-        mock_body.read.return_value = json.dumps(
-            {"some_key": "value"}
-        ).encode()
+        mock_body.read.return_value = json.dumps({"some_key": "value"}).encode()
         mock_s3.get_object.return_value = {"Body": mock_body}
 
         with (
