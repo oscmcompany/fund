@@ -139,6 +139,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Remove legacy TTL job: timestamp column is now TIMESTAMPTZ; retention handled by TimescaleDB policy.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-ttl') THEN
+        PERFORM cron.unschedule('equity-bars-ttl');
+    END IF;
+END;
+$do$;
+
 -- Nightly equity bar sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
 DO $do$
 BEGIN
