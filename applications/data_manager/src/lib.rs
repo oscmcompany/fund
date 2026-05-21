@@ -1,5 +1,5 @@
 pub mod data;
-pub mod db;
+pub mod database;
 pub mod equity_bars;
 pub mod equity_details;
 pub mod errors;

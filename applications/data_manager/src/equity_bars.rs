@@ -1,5 +1,5 @@
 use crate::data::EquityBar;
-use crate::db;
+use crate::database;
 use crate::state::State;
 use crate::storage::{query_equity_bars_parquet_from_s3, write_equity_bars_dataframe_to_s3};
 use axum::{
@@ -273,6 +273,25 @@ pub async fn fetch_and_store(
     );
     debug!("DataFrame schema: {:?}", data.schema());
 
+    info!("Uploading DataFrame to S3");
+    let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
+        .await
+        .map_err(|err| {
+            warn!(
+                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
+                err,
+                data.height(),
+                data.width(),
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
+            );
+            format!(
+                "Failed to upload equity bars to storage for date {}",
+                date.with_timezone(&Eastern).format("%Y-%m-%d")
+            )
+        })?;
+
+    info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
+
     if let Some(pool) = &state.pool {
         let equity_bars: Vec<EquityBar> = bars
             .iter()
@@ -300,32 +319,10 @@ pub async fn fetch_and_store(
             })
             .collect();
 
-        db::insert_equity_bars(pool, &equity_bars)
-            .await
-            .map_err(|error| {
-                warn!("Failed to write equity bars to PostgreSQL: {}", error);
-                error.to_string()
-            })?;
+        if let Err(error) = database::insert_equity_bars(pool, &equity_bars).await {
+            warn!("Failed to write equity bars to PostgreSQL: {}", error);
+        }
     }
-
-    info!("Uploading DataFrame to S3");
-    let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
-        .await
-        .map_err(|err| {
-            warn!(
-                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
-                err,
-                data.height(),
-                data.width(),
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            );
-            format!(
-                "Failed to upload equity bars to storage for date {}",
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            )
-        })?;
-
-    info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
 
     Ok(Some(s3_key))
 }
@@ -351,6 +348,7 @@ pub async fn query_recent(
             return (StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL not available").into_response();
         }
     };
+
     let tickers: Option<Vec<String>> = parameters.tickers.as_ref().and_then(|tickers_str| {
         let parsed: Vec<String> = tickers_str
             .split(',')
@@ -365,15 +363,14 @@ pub async fn query_recent(
         }
     });
 
-    match db::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
+    match database::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
         Ok(bars) => {
             let dataframe = crate::data::create_equity_bar_dataframe(bars);
             match dataframe {
                 Ok(dataframe) => {
                     let mut buffer = Vec::new();
-                    if let Err(error) =
-                        ParquetWriter::new(&mut buffer).finish(&mut dataframe.clone())
-                    {
+                    let mut dataframe = dataframe;
+                    if let Err(error) = ParquetWriter::new(&mut buffer).finish(&mut dataframe) {
                         warn!("Failed to serialize parquet: {}", error);
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -396,7 +393,7 @@ pub async fn query_recent(
                     response
                 }
                 Err(error) => {
-                    warn!("Failed to create DataFrame from database: {}", error);
+                    warn!("Failed to create DataFrame from cache: {}", error);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Query failed: {}", error),
@@ -406,10 +403,10 @@ pub async fn query_recent(
             }
         }
         Err(error) => {
-            warn!("Failed to query PostgreSQL database: {}", error);
+            warn!("Failed to query PostgreSQL cache: {}", error);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database query failed: {}", error),
+                format!("Cache query failed: {}", error),
             )
                 .into_response()
         }

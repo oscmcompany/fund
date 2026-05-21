@@ -109,6 +109,11 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
         return False
 
 
+_PRIOR_PORTFOLIO_SCHEMA = _PRIOR_ALLOCATION_SCHEMA
+get_prior_portfolio = get_prior_allocation
+save_portfolio = save_allocation
+
+
 async def save_closed_pair(record: dict[str, Any]) -> bool:
     try:
         closed_timestamp_millis = record["closed_timestamp"]

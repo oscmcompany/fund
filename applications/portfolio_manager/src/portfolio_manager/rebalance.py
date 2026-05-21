@@ -9,6 +9,7 @@ from fastapi import Response, status
 from . import metrics
 from .alpaca_client import AlpacaAccount, AlpacaClient
 from .beta import compute_market_betas
+from .configuration import Configuration
 from .consolidation import consolidate_predictions
 from .data_client import fetch_equity_details, fetch_historical_prices, fetch_spy_prices
 from .exceptions import InsufficientPairsError
@@ -24,10 +25,10 @@ from .portfolio_state import (
     DATA_MANAGER_BASE_URL,
     evaluate_prior_pairs,
     get_last_portfolio_value,
-    get_prior_allocation,
-    save_allocation,
+    get_prior_portfolio,
     save_closed_pair,
     save_performance_snapshot,
+    save_portfolio,
 )
 from .regime import classify_regime
 from .risk_management import size_pairs_with_volatility_parity
@@ -62,7 +63,12 @@ def _prune_pairs_with_invalid_entry_price(portfolio: pl.DataFrame) -> pl.DataFra
     return portfolio.filter(~pl.col("pair_id").is_in(invalid_pair_ids))
 
 
-async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR0911, PLR0912, PLR0915, C901
+async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
+    alpaca_client: AlpacaClient,
+    configuration: Configuration | None = None,
+) -> Response:
+    if configuration is None:
+        configuration = Configuration()
     metrics.rebalance_requests_total.inc()
     start = metrics.start_timer()
     current_timestamp = datetime.now(tz=UTC)
@@ -74,6 +80,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
             "Retrieved account",
             cash_amount=account.cash_amount,
             buying_power=account.buying_power,
+            equity=account.equity,
         )
         metrics.account_cash.set(float(account.cash_amount))
         metrics.account_buying_power.set(float(account.buying_power))
@@ -129,7 +136,7 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_allocation = await get_prior_allocation()
+        prior_allocation = await get_prior_portfolio()
         prior_allocation_tickers = prior_allocation["ticker"].unique().to_list()
         logger.info("Retrieved prior allocation", count=len(prior_allocation_tickers))
     except Exception as e:
@@ -209,13 +216,33 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    # Build entry prices before portfolio sizing so risk management can enforce
+    # the whole-share constraint on short legs.
+    entry_prices_map: dict[str, float] = {
+        row["ticker"]: row["entry_price"]
+        for row in (
+            historical_prices.group_by("ticker").agg(
+                pl.col("close_price")
+                .sort_by("timestamp", descending=True)
+                .first()
+                .alias("entry_price")
+            )
+        ).iter_rows(named=True)
+        if row["entry_price"] is not None and row["entry_price"] > 0
+    }
+
     try:
         optimal_portfolio = get_optimal_portfolio(
             candidate_pairs=candidate_pairs,
             maximum_capital=float(account.cash_amount),
             current_timestamp=current_timestamp,
             market_betas=market_betas,
+            entry_prices=entry_prices_map,
             exposure_scale=exposure_scale,
+            short_buying_power_buffer=configuration.short_buying_power_buffer,
+            hold_overnight=configuration.hold_overnight,
+            overnight_margin_rate_standard=configuration.overnight_margin_rate_standard,
+            overnight_margin_rate_low_price=configuration.overnight_margin_rate_low_price,
         )
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
     except InsufficientPairsError as e:
@@ -236,13 +263,8 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    latest_prices = (
-        historical_prices.sort("timestamp", descending=True)
-        .group_by("ticker")
-        .agg(pl.col("close_price").first().alias("entry_price"))
-    )
-    optimal_portfolio = optimal_portfolio.join(latest_prices, on="ticker", how="left")
-
+    # entry_price is embedded in optimal_portfolio by size_pairs_with_volatility_parity;
+    # prune any pairs that still have missing or invalid entry prices as a safety guard.
     optimal_portfolio = _prune_pairs_with_invalid_entry_price(optimal_portfolio)
 
     try:
@@ -268,16 +290,46 @@ async def run_rebalance(alpaca_client: AlpacaClient) -> Response:  # noqa: PLR09
     close_results, closed_count = execute_close_positions(
         alpaca_client, close_positions
     )
+    try:
+        account = alpaca_client.get_account()
+    except Exception as e:
+        logger.exception(
+            "Failed to refresh account after closing positions, aborting open phase",
+            error=str(e),
+        )
+        metrics.rebalance_errors_total.labels(stage="account_refresh").inc()
+        metrics.observe_duration(start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     open_results, opened_count = execute_open_positions(
-        alpaca_client, open_positions, account.buying_power
+        alpaca_client,
+        open_positions,
+        account.buying_power,
+        account.equity,
+        configuration,
     )
 
     metrics.positions_opened_count.set(opened_count)
     metrics.positions_closed_count.set(closed_count)
 
+    opened_tickers = {r["ticker"] for r in open_results if r["status"] == "success"}
+    # Only persist pairs where all legs opened successfully to avoid unbalanced exposure
+    successful_pair_ids = set(
+        optimal_portfolio.filter(pl.col("ticker").is_in(opened_tickers))
+        .group_by("pair_id")
+        .agg(pl.len().alias("opened_legs"))
+        .join(
+            optimal_portfolio.group_by("pair_id").agg(pl.len().alias("total_legs")),
+            on="pair_id",
+        )
+        .filter(pl.col("opened_legs") == pl.col("total_legs"))["pair_id"]
+        .to_list()
+    )
+    successful_open_rows = optimal_portfolio.filter(
+        pl.col("pair_id").is_in(successful_pair_ids)
+    )
     held_rows = prior_allocation.filter(pl.col("ticker").is_in(held_tickers))
-    final_allocation = pl.concat([optimal_portfolio, held_rows])
-    save_succeeded = await save_allocation(final_allocation, current_timestamp)
+    final_allocation = pl.concat([successful_open_rows, held_rows])
+    save_succeeded = await save_portfolio(final_allocation, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -319,19 +371,29 @@ async def get_raw_predictions() -> pl.DataFrame:
         return pl.DataFrame(response.json()["data"])
 
 
-def get_optimal_portfolio(
+def get_optimal_portfolio(  # noqa: PLR0913
     candidate_pairs: pl.DataFrame,
     maximum_capital: float,
     current_timestamp: datetime,
     market_betas: pl.DataFrame,
+    entry_prices: dict[str, float],
     exposure_scale: float,
+    short_buying_power_buffer: float,
+    hold_overnight: bool,  # noqa: FBT001
+    overnight_margin_rate_standard: float,
+    overnight_margin_rate_low_price: float,
 ) -> pl.DataFrame:
     optimal_portfolio = size_pairs_with_volatility_parity(
         candidate_pairs=candidate_pairs,
         maximum_capital=maximum_capital,
         current_timestamp=current_timestamp,
         market_betas=market_betas,
+        entry_prices=entry_prices,
         exposure_scale=exposure_scale,
+        short_buying_power_buffer=short_buying_power_buffer,
+        hold_overnight=hold_overnight,
+        overnight_margin_rate_standard=overnight_margin_rate_standard,
+        overnight_margin_rate_low_price=overnight_margin_rate_low_price,
     )
 
     return portfolio_schema.validate(optimal_portfolio)

@@ -1,24 +1,28 @@
 -- Fund platform PostgreSQL schema
--- TimescaleDB operational data layer
+-- TimescaleDB operational data layer, model metadata, and job scheduling
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- equity_bars: daily OHLCV bars (TimescaleDB hypertable)
+-- equity_bars: Hot cache for recent equity bar data (TTL-managed, last 10 days)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
 CREATE TABLE IF NOT EXISTS equity_bars (
+    ticker                        TEXT             NOT NULL,
     timestamp                     TIMESTAMPTZ      NOT NULL,
-    symbol                        TEXT             NOT NULL,
-    open_price                    DOUBLE PRECISION NOT NULL,
-    high_price                    DOUBLE PRECISION NOT NULL,
-    low_price                     DOUBLE PRECISION NOT NULL,
-    close_price                   DOUBLE PRECISION NOT NULL,
-    volume                        BIGINT           NOT NULL,
+    open_price                    DOUBLE PRECISION,
+    high_price                    DOUBLE PRECISION,
+    low_price                     DOUBLE PRECISION,
+    close_price                   DOUBLE PRECISION,
+    volume                        BIGINT,
     volume_weighted_average_price DOUBLE PRECISION,
-    transactions                  BIGINT
+    transactions                  BIGINT,
+    inserted_at                   TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    PRIMARY KEY (ticker, timestamp)
 );
+
 SELECT create_hypertable('equity_bars', by_range('timestamp'), if_not_exists => TRUE);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_equity_bars_symbol_timestamp ON equity_bars (symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_at);
+SELECT add_retention_policy('equity_bars', INTERVAL '10 days', if_not_exists => TRUE);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
@@ -89,36 +93,38 @@ CREATE TABLE IF NOT EXISTS equity_trades (
     slippage_basis_points   NUMERIC
 );
 
--- model_runs: training metadata for model artifacts and evaluation metrics
+-- model_runs: Training metadata for model artifacts and evaluation metrics
 CREATE TABLE IF NOT EXISTS model_runs (
-    run_id               TEXT PRIMARY KEY,
-    model_name           TEXT NOT NULL DEFAULT 'tide',
-    artifact_key         TEXT,
-    training_data_key    TEXT,
-    start_date           DATE,
-    end_date             DATE,
-    lookback_days        INTEGER,
-    status               TEXT NOT NULL DEFAULT 'started',
-    crps                 DOUBLE PRECISION,
-    directional_accuracy DOUBLE PRECISION,
-    quantile_coverage    DOUBLE PRECISION,
-    drift_status         TEXT,
-    stage_counts         JSONB,
-    started_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at         TIMESTAMPTZ
+    id                                  BIGSERIAL PRIMARY KEY,
+    run_id                              TEXT NOT NULL UNIQUE,
+    model_name                          TEXT NOT NULL DEFAULT 'tide',
+    artifact_key                        TEXT,
+    training_data_key                   TEXT,
+    start_date                          DATE,
+    end_date                            DATE,
+    lookback_days                       INTEGER,
+    status                              TEXT NOT NULL DEFAULT 'started',
+    continuous_ranked_probability_score DOUBLE PRECISION,
+    directional_accuracy                DOUBLE PRECISION,
+    quantile_coverage                   DOUBLE PRECISION,
+    drift_status                        TEXT,
+    stage_counts                        JSONB,
+    started_at                          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at                        TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status);
 CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC);
 
--- scheduled_jobs: job queue for pg_cron + LISTEN/NOTIFY
+-- scheduled_jobs: Job queue for pg_cron + LISTEN/NOTIFY
 CREATE TABLE IF NOT EXISTS scheduled_jobs (
     id           BIGSERIAL    PRIMARY KEY,
     job_name     TEXT         NOT NULL,
     scheduled_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
     claimed_at   TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
-    status       TEXT         NOT NULL DEFAULT 'pending',
+    status       TEXT         NOT NULL DEFAULT 'pending'
+                              CHECK (status IN ('pending', 'claimed', 'completed', 'failed')),
     result       TEXT
 );
 
@@ -133,17 +139,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Nightly equity bars sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-sync'
-    ) THEN
-        PERFORM cron.schedule(
-            'equity-bars-sync',
-            '0 5 * * 1-5',
-            $cmd$SELECT schedule_job('equity-bars-sync')$cmd$
-        );
-    END IF;
-END;
-$$;
+-- Nightly equity bar sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
+SELECT cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);

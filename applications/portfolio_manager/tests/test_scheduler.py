@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 from portfolio_manager.alpaca_client import AlpacaAccount
+from portfolio_manager.configuration import Configuration
 from portfolio_manager.scheduler import (
     _already_rebalanced_today,
     _rebalance_loop,
@@ -237,7 +238,9 @@ def _run_loop(
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -373,7 +376,9 @@ def test_rebalance_loop_skips_when_lock_is_held() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         await lock.acquire()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -402,7 +407,9 @@ def test_rebalance_loop_handles_market_open_exception() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -431,7 +438,9 @@ def test_rebalance_loop_handles_run_rebalance_exception() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -462,7 +471,9 @@ def test_rebalance_loop_logs_warning_on_non_200_response() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -492,7 +503,9 @@ def test_rebalance_loop_retries_after_unexpected_error() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await _rebalance_loop(mock_alpaca, "http://data-manager:8080", lock)
+        await _rebalance_loop(
+            mock_alpaca, Configuration(), "http://data-manager:8080", lock
+        )
 
     with (
         patch("portfolio_manager.scheduler.datetime") as mock_dt,
@@ -523,7 +536,7 @@ def _make_mock_alpaca_for_status(
 ) -> MagicMock:
     mock_alpaca = MagicMock()
     mock_alpaca.get_account.return_value = AlpacaAccount(
-        cash_amount=10000.0, buying_power=20000.0
+        cash_amount=10000.0, buying_power=20000.0, equity=30000.0
     )
     mock_alpaca.get_open_positions.return_value = positions or []
     return mock_alpaca
@@ -570,7 +583,7 @@ def test_status_logger_loop_handles_exception_without_crashing() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.get_account.side_effect = [
         Exception("api error"),
-        AlpacaAccount(cash_amount=5000.0, buying_power=10000.0),
+        AlpacaAccount(cash_amount=5000.0, buying_power=10000.0, equity=15000.0),
     ]
     mock_alpaca.get_open_positions.return_value = []
 

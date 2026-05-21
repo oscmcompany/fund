@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
 use sqlx::PgPool;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -20,7 +20,9 @@ pub struct State {
     pub s3_client: S3Client,
     pub bucket_name: String,
     pub last_s3_ok_epoch: Arc<AtomicU64>,
+    pub last_sync_epoch: Arc<AtomicU64>,
     pub pool: Option<PgPool>,
+    pub database_url_configured: bool,
 }
 
 impl State {
@@ -55,18 +57,23 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
-        let pool = match std::env::var("DATABASE_URL") {
+        let (pool, database_url_configured) = match std::env::var("DATABASE_URL") {
             Ok(database_url) => {
                 debug!("Connecting to PostgreSQL");
-                let pool = PgPool::connect(&database_url)
-                    .await
-                    .unwrap_or_else(|error| panic!("Failed to connect to PostgreSQL: {error}"));
-                info!("Connected to PostgreSQL");
-                Some(pool)
+                match PgPool::connect(&database_url).await {
+                    Ok(pool) => {
+                        info!("Connected to PostgreSQL");
+                        (Some(pool), true)
+                    }
+                    Err(error) => {
+                        warn!("Failed to connect to PostgreSQL: {}", error);
+                        (None, true)
+                    }
+                }
             }
             Err(_) => {
                 info!("DATABASE_URL not set, PostgreSQL disabled");
-                None
+                (None, false)
             }
         };
 
@@ -81,7 +88,9 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
+            last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool,
+            database_url_configured,
         }
     }
 
@@ -97,7 +106,9 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
+            last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool: None,
+            database_url_configured: false,
         }
     }
 
@@ -119,5 +130,25 @@ impl State {
             .unwrap_or_default()
             .as_secs();
         self.last_s3_ok_epoch.store(now, Ordering::Relaxed);
+    }
+
+    pub fn synced_recently(&self, ttl_secs: u64) -> bool {
+        let last = self.last_sync_epoch.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(last) < ttl_secs
+    }
+
+    pub fn mark_synced(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_sync_epoch.store(now, Ordering::Relaxed);
     }
 }

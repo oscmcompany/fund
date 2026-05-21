@@ -10,7 +10,7 @@ from psycopg_pool import AsyncConnectionPool
 logger = structlog.get_logger()
 
 _pool: AsyncConnectionPool | None = None
-_pool_lock = asyncio.Lock()
+_pool_lock: asyncio.Lock = asyncio.Lock()
 
 
 def _get_database_url() -> str:
@@ -24,16 +24,18 @@ def _get_database_url() -> str:
 async def get_pool() -> AsyncConnectionPool:
     """Return a lazily-initialized async connection pool."""
     global _pool  # noqa: PLW0603
-    if _pool is None:
-        async with _pool_lock:
-            if _pool is None:
-                database_url = _get_database_url()
-                pool = AsyncConnectionPool(
-                    conninfo=database_url, min_size=1, max_size=5, open=False
-                )
-                await pool.open()
-                _pool = pool
-                logger.info("Async connection pool opened")
+    if _pool is not None:
+        return _pool
+    async with _pool_lock:
+        if _pool is not None:
+            return _pool
+        database_url = _get_database_url()
+        pool = AsyncConnectionPool(
+            conninfo=database_url, min_size=1, max_size=5, open=False
+        )
+        await pool.open()
+        _pool = pool
+        logger.info("Async connection pool opened")
     return _pool
 
 

@@ -32,15 +32,30 @@ pub async fn get_health(AxumState(state): AxumState<State>) -> impl IntoResponse
         ok
     };
 
-    if s3_ok {
-        (
-            StatusCode::OK,
-            Json(json!({"status": "ok", "checks": {"s3": "ok"}})),
-        )
+    let postgres_status = if state.pool.is_some() {
+        "ok"
+    } else if state.database_url_configured {
+        "error"
     } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "degraded", "checks": {"s3": "error"}})),
-        )
-    }
+        "disabled"
+    };
+
+    let degraded = !s3_ok || postgres_status == "error";
+    let overall_status = if degraded { "degraded" } else { "ok" };
+    let status_code = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+
+    (
+        status_code,
+        Json(json!({
+            "status": overall_status,
+            "checks": {
+                "s3": if s3_ok { "ok" } else { "error" },
+                "postgres": postgres_status,
+            }
+        })),
+    )
 }

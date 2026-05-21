@@ -2,9 +2,6 @@
 
 > The open source capital management company
 
-<!-- markdownlint-disable-next-line MD013 -->
-[![Code checks](https://github.com/oscmcompany/fund/actions/workflows/ci.yaml/badge.svg)](https://github.com/oscmcompany/fund/actions/workflows/ci.yaml) [![Test coverage](https://coveralls.io/repos/github/oscmcompany/fund/badge.svg?branch=master)](https://coveralls.io/github/oscmcompany/fund?branch=master)
-
 ## About
 
 The **fund** repository holds the resources for the Open Source Capital Management platform.
