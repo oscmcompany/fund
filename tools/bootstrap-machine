@@ -311,7 +311,7 @@ else
   echo "  devenv --profile apps up  # start application services"
   echo ""
   echo "For production setup, re-run with:"
-  echo "  $(basename "$0") --prod"
+  echo "  $(basename "$0") --profile production --prod"
 fi
 
 # Replace current shell so Nix paths are on PATH
