@@ -109,7 +109,6 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
         return False
 
 
-_PRIOR_PORTFOLIO_SCHEMA = _PRIOR_ALLOCATION_SCHEMA
 get_prior_portfolio = get_prior_allocation
 save_portfolio = save_allocation
 

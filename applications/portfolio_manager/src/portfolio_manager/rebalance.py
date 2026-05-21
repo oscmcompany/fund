@@ -25,10 +25,10 @@ from .portfolio_state import (
     DATA_MANAGER_BASE_URL,
     evaluate_prior_pairs,
     get_last_portfolio_value,
-    get_prior_portfolio,
+    get_prior_allocation,
+    save_allocation,
     save_closed_pair,
     save_performance_snapshot,
-    save_portfolio,
 )
 from .regime import classify_regime
 from .risk_management import size_pairs_with_volatility_parity
@@ -136,7 +136,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        prior_allocation = await get_prior_portfolio()
+        prior_allocation = await get_prior_allocation()
         prior_allocation_tickers = prior_allocation["ticker"].unique().to_list()
         logger.info("Retrieved prior allocation", count=len(prior_allocation_tickers))
     except Exception as e:
@@ -329,7 +329,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     )
     held_rows = prior_allocation.filter(pl.col("ticker").is_in(held_tickers))
     final_allocation = pl.concat([successful_open_rows, held_rows])
-    save_succeeded = await save_portfolio(final_allocation, current_timestamp)
+    save_succeeded = await save_allocation(final_allocation, current_timestamp)
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]

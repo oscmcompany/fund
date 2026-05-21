@@ -140,4 +140,10 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Nightly equity bar sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
-SELECT cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
+        PERFORM cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
+    END IF;
+END;
+$do$;

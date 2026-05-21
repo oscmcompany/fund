@@ -8,7 +8,6 @@ import pytest
 from fastapi import status
 from portfolio_manager.portfolio_state import (
     _PRIOR_ALLOCATION_SCHEMA,
-    _PRIOR_PORTFOLIO_SCHEMA,
     evaluate_prior_pairs,
     get_prior_allocation,
 )
@@ -523,7 +522,7 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
 )
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_portfolio",
+    "portfolio_manager.rebalance.save_allocation",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -552,7 +551,7 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
         }
     ),
 )
-@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch("portfolio_manager.rebalance.get_prior_allocation", new_callable=AsyncMock)
 @patch(
     "portfolio_manager.rebalance.consolidate_predictions",
     return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
@@ -596,7 +595,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
     # in run_rebalance does not fail on schema mismatch.
     mock_prior_portfolio.return_value = pl.DataFrame(
         schema={
-            **_PRIOR_PORTFOLIO_SCHEMA,
+            **_PRIOR_ALLOCATION_SCHEMA,
             "quantity": pl.Int64,
             "notional": pl.Float64,
         }
@@ -620,7 +619,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
 
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_portfolio",
+    "portfolio_manager.rebalance.save_allocation",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -649,7 +648,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
         }
     ),
 )
-@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch("portfolio_manager.rebalance.get_prior_allocation", new_callable=AsyncMock)
 @patch(
     "portfolio_manager.rebalance.consolidate_predictions",
     return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
@@ -690,7 +689,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
     mock_pairs_schema.validate.side_effect = lambda df: df
     mock_prior_portfolio.return_value = pl.DataFrame(
         schema={
-            **_PRIOR_PORTFOLIO_SCHEMA,
+            **_PRIOR_ALLOCATION_SCHEMA,
             "quantity": pl.Int64,
             "notional": pl.Float64,
         }
@@ -715,7 +714,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_portfolio",
+    "portfolio_manager.rebalance.save_allocation",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -744,7 +743,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
         }
     ),
 )
-@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch("portfolio_manager.rebalance.get_prior_allocation", new_callable=AsyncMock)
 @patch(
     "portfolio_manager.rebalance.consolidate_predictions",
     return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
@@ -786,7 +785,7 @@ def test_run_rebalance_saves_only_opened_rows(
     mock_pairs_schema.validate.side_effect = lambda df: df
     mock_prior_portfolio.return_value = pl.DataFrame(
         schema={
-            **_PRIOR_PORTFOLIO_SCHEMA,
+            **_PRIOR_ALLOCATION_SCHEMA,
             "quantity": pl.Int64,
             "notional": pl.Float64,
         }
@@ -833,7 +832,7 @@ def test_run_rebalance_saves_only_opened_rows(
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_portfolio",
+    "portfolio_manager.rebalance.save_allocation",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -862,7 +861,7 @@ def test_run_rebalance_saves_only_opened_rows(
         }
     ),
 )
-@patch("portfolio_manager.rebalance.get_prior_portfolio", new_callable=AsyncMock)
+@patch("portfolio_manager.rebalance.get_prior_allocation", new_callable=AsyncMock)
 @patch(
     "portfolio_manager.rebalance.consolidate_predictions",
     return_value=pl.DataFrame({"ticker": ["NVDA", "AMD"]}),
@@ -904,7 +903,7 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
     mock_pairs_schema.validate.side_effect = lambda df: df
     mock_prior_portfolio.return_value = pl.DataFrame(
         schema={
-            **_PRIOR_PORTFOLIO_SCHEMA,
+            **_PRIOR_ALLOCATION_SCHEMA,
             "quantity": pl.Int64,
             "notional": pl.Float64,
         }

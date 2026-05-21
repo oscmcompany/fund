@@ -142,11 +142,11 @@ fn equity_bar_from_row(row: &PgRow) -> EquityBar {
     EquityBar {
         ticker: row.get("ticker"),
         timestamp: timestamp.timestamp_millis(),
-        open_price: Some(row.get::<f64, _>("open_price")),
-        high_price: Some(row.get::<f64, _>("high_price")),
-        low_price: Some(row.get::<f64, _>("low_price")),
-        close_price: Some(row.get::<f64, _>("close_price")),
-        volume: Some(row.get("volume")),
+        open_price: row.get::<Option<f64>, _>("open_price"),
+        high_price: row.get::<Option<f64>, _>("high_price"),
+        low_price: row.get::<Option<f64>, _>("low_price"),
+        close_price: row.get::<Option<f64>, _>("close_price"),
+        volume: row.get::<Option<i64>, _>("volume"),
         volume_weighted_average_price: row.get("volume_weighted_average_price"),
         transactions: transactions.map(|t| t as u64),
     }
