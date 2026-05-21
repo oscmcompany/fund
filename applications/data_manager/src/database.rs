@@ -146,7 +146,7 @@ fn equity_bar_from_row(row: &PgRow) -> EquityBar {
         high_price: row.get::<Option<f64>, _>("high_price"),
         low_price: row.get::<Option<f64>, _>("low_price"),
         close_price: row.get::<Option<f64>, _>("close_price"),
-        volume: row.get::<Option<f64>, _>("volume").map(|f| f as i64),
+        volume: row.get::<Option<i64>, _>("volume"),
         volume_weighted_average_price: row.get("volume_weighted_average_price"),
         transactions: transactions.map(|t| t as u64),
     }
