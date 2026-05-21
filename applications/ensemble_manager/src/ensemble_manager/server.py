@@ -271,7 +271,8 @@ async def _sync_run_metadata(
                        run_id, artifact_key, training_data_key,
                        start_date, end_date, lookback_days,
                        status, stage_counts, completed_at,
-                       continuous_ranked_probability_score, directional_accuracy, quantile_coverage
+                       continuous_ranked_probability_score,
+                       directional_accuracy, quantile_coverage
                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s, %s)
                    ON CONFLICT (run_id) DO UPDATE SET
                        artifact_key = EXCLUDED.artifact_key,
@@ -282,7 +283,8 @@ async def _sync_run_metadata(
                        status = EXCLUDED.status,
                        stage_counts = EXCLUDED.stage_counts,
                        completed_at = EXCLUDED.completed_at,
-                       continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score,
+                       continuous_ranked_probability_score
+                           = EXCLUDED.continuous_ranked_probability_score,
                        directional_accuracy = EXCLUDED.directional_accuracy,
                        quantile_coverage = EXCLUDED.quantile_coverage""",
                 (
@@ -321,10 +323,10 @@ async def _artifact_polling_task(app: FastAPI) -> None:
 
         try:
             latest_key = await asyncio.to_thread(
-                find_latest_artifact_key,
+                _resolve_artifact_key,
                 s3_client=s3_client,
                 bucket=bucket,
-                prefix=artifact_path,
+                artifact_path=artifact_path,
             )
         except ValueError:
             logger.debug("No artifacts found during polling")
@@ -391,6 +393,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
     artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
     model_directory = "."
+    s3_client: S3Client | None = None
 
     if bucket:
         s3_client = boto3.client("s3")
@@ -426,7 +429,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     model_load_timestamp.set(datetime.now(tz=UTC).timestamp())
     logger.info("model_loaded_successfully")
 
-    if app.state.current_artifact_key and bucket:
+    if app.state.current_artifact_key and bucket and s3_client is not None:
         try:
             await _sync_run_metadata(
                 s3_client=s3_client,
@@ -449,6 +452,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 
 application = FastAPI(lifespan=lifespan)
+application.state.tide_model = None
+application.state.model_directory = "."
+application.state.current_artifact_key = None
 
 
 @application.get("/health")

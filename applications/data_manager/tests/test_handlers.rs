@@ -1065,6 +1065,50 @@ async fn test_performance_snapshot_query_returns_internal_server_error_when_s3_f
     assert!(!body.contains("s3") && !body.contains("aws") && !body.contains("bucket"));
 }
 
+// --- equity-bars/recent handler ---
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_equity_bars_recent_returns_service_unavailable_when_pool_not_configured() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url("/equity-bars/recent"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_equity_bars_recent_returns_bad_request_for_days_below_minimum() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url("/equity-bars/recent?days=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn test_equity_bars_recent_returns_bad_request_for_days_above_maximum() {
+    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (app, _env_guard) = spawn_app(&endpoint, "http://127.0.0.1:1".to_string()).await;
+
+    let response = reqwest::Client::new()
+        .get(app.url("/equity-bars/recent?days=31"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_closed_pair_query_returns_internal_server_error_when_s3_fails() {

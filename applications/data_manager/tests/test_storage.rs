@@ -3,16 +3,16 @@ mod common;
 use chrono::{TimeZone, Utc};
 use data_manager::{
     data::{
-        create_equity_bar_dataframe, create_portfolio_dataframe, create_predictions_dataframe,
-        EquityBar, Portfolio, Prediction,
+        create_allocation_dataframe, create_equity_bar_dataframe, create_predictions_dataframe,
+        Allocation, EquityBar, Prediction,
     },
     state::{MassiveSecrets, State},
     storage::{
         date_to_int, escape_sql_ticker, format_performance_s3_key, format_s3_key, is_valid_ticker,
-        query_equity_bars_parquet_from_s3, query_portfolio_dataframe_from_s3,
+        query_allocation_dataframe_from_s3, query_equity_bars_parquet_from_s3,
         query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
-        sanitize_duckdb_config_value, write_equity_bars_dataframe_to_s3,
-        write_equity_details_dataframe_to_s3, write_portfolio_dataframe_to_s3,
+        sanitize_duckdb_config_value, write_allocation_dataframe_to_s3,
+        write_equity_bars_dataframe_to_s3, write_equity_details_dataframe_to_s3,
         write_predictions_dataframe_to_s3, PredictionQuery, DUCKDB_CONFIG_VALUE_MAX_LENGTH,
     },
 };
@@ -32,8 +32,8 @@ fn sample_prediction() -> Prediction {
     }
 }
 
-fn sample_portfolio() -> Portfolio {
-    Portfolio {
+fn sample_allocation() -> Allocation {
+    Allocation {
         ticker: "AAPL".to_string(),
         timestamp: 1_735_689_600_000,
         side: "LONG".to_string(),
@@ -191,17 +191,17 @@ async fn test_query_predictions_errors_when_query_positions_are_empty() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_write_and_query_portfolio_round_trip() {
+async fn test_write_and_query_allocation_round_trip() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
-    let portfolio_dataframe = create_portfolio_dataframe(vec![sample_portfolio()]).unwrap();
-    write_portfolio_dataframe_to_s3(&state, &portfolio_dataframe, &timestamp)
+    let allocation_dataframe = create_allocation_dataframe(vec![sample_allocation()]).unwrap();
+    write_allocation_dataframe_to_s3(&state, &allocation_dataframe, &timestamp)
         .await
         .unwrap();
 
-    let query_results = query_portfolio_dataframe_from_s3(&state, Some(timestamp))
+    let query_results = query_allocation_dataframe_from_s3(&state, Some(timestamp))
         .await
         .unwrap();
 
@@ -228,33 +228,33 @@ async fn test_write_and_query_portfolio_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_query_portfolio_without_timestamp_uses_latest_partition() {
+async fn test_query_allocation_without_timestamp_uses_latest_partition() {
     let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
     let old_timestamp = Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap();
     let new_timestamp = fixed_date_time();
 
-    let old_portfolio = Portfolio {
+    let old_allocation = Allocation {
         ticker: "OLD".to_string(),
-        ..sample_portfolio()
+        ..sample_allocation()
     };
-    let new_portfolio = Portfolio {
+    let new_allocation = Allocation {
         ticker: "NEW".to_string(),
-        ..sample_portfolio()
+        ..sample_allocation()
     };
 
-    let old_dataframe = create_portfolio_dataframe(vec![old_portfolio]).unwrap();
-    let new_dataframe = create_portfolio_dataframe(vec![new_portfolio]).unwrap();
+    let old_dataframe = create_allocation_dataframe(vec![old_allocation]).unwrap();
+    let new_dataframe = create_allocation_dataframe(vec![new_allocation]).unwrap();
 
-    write_portfolio_dataframe_to_s3(&state, &old_dataframe, &old_timestamp)
+    write_allocation_dataframe_to_s3(&state, &old_dataframe, &old_timestamp)
         .await
         .unwrap();
-    write_portfolio_dataframe_to_s3(&state, &new_dataframe, &new_timestamp)
+    write_allocation_dataframe_to_s3(&state, &new_dataframe, &new_timestamp)
         .await
         .unwrap();
 
-    let query_results = query_portfolio_dataframe_from_s3(&state, None)
+    let query_results = query_allocation_dataframe_from_s3(&state, None)
         .await
         .unwrap();
 
