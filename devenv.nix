@@ -110,6 +110,10 @@ in {
   services.postgres = {
     enable = true;
     package = pkgs.postgresql_16.withPackages (p: [
+      # overrideAttrs is required here: p.timescaledb comes from the PostgreSQL
+      # extension package set inside withPackages, which does not inherit top-level
+      # nixpkgs.config.allowUnfree. This is the standard pattern for enabling
+      # TimescaleDB (TSL-licensed) via withPackages in devenv.
       (p.timescaledb.overrideAttrs (old: {
         meta = old.meta // {license = lib.licenses.tsl // {free = true;};};
       }))

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS equity_bars (
 
 SELECT create_hypertable('equity_bars', by_range('timestamp'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_at);
+CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '10 days', if_not_exists => TRUE);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
