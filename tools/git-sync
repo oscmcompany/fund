@@ -82,15 +82,13 @@ stop_devenv() {
 # ------------------------------------------------------------------ #
 cd "$REPO_ROOT"
 
-# Source .env so FUND_PROFILE is set during Nix evaluation
-if [[ -f "$REPO_ROOT/.env" ]]; then
-  set -a
+# Source .envrc so FUND_PROFILE is set during Nix evaluation
+if [[ -f "$REPO_ROOT/.envrc" ]]; then
   # shellcheck disable=SC1091
-  source "$REPO_ROOT/.env"
-  set +a
-  log "Loaded .env (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
+  source "$REPO_ROOT/.envrc"
+  log "Loaded .envrc (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
 else
-  log "WARNING: no .env found, FUND_PROFILE will be empty"
+  log "WARNING: no .envrc found, FUND_PROFILE will be empty"
 fi
 
 log "git-sync starting in $REPO_ROOT"
@@ -123,10 +121,6 @@ while true; do
     log "Resetting to origin/master"
     git reset --hard origin/master
     log "Now at $(git rev-parse --short HEAD)"
-    # Patch devenv.yaml secretspec profile to match this environment
-    if [[ -n "${FUND_PROFILE:-}" ]]; then
-      sed -i "s|profile: .*|profile: $FUND_PROFILE|" "$REPO_ROOT/devenv.yaml"
-    fi
     start_devenv
   fi
 done
