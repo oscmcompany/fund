@@ -28,14 +28,14 @@ SELECT add_retention_policy('equity_bars', INTERVAL '10 days', if_not_exists => 
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
-    symbol      TEXT        NOT NULL,
+    ticker      TEXT        NOT NULL,
     bid_price   NUMERIC     NOT NULL,
     ask_price   NUMERIC     NOT NULL,
     bid_size    INTEGER     NOT NULL,
     ask_size    INTEGER     NOT NULL
 );
 SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_quotes_symbol_timestamp ON equity_quotes (symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC);
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
 
 -- equity_orders: orders submitted to Alpaca, linked to allocations
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     id               UUID        PRIMARY KEY,
     allocation_id    UUID        NOT NULL,
     submitted_at     TIMESTAMPTZ NOT NULL,
-    symbol           TEXT        NOT NULL,
+    ticker           TEXT        NOT NULL,
     side             TEXT        NOT NULL,
     quantity         NUMERIC     NOT NULL,
     order_type       TEXT        NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
     rebalance_id     UUID        NOT NULL,
     generated_at     TIMESTAMPTZ NOT NULL,
     model_run_id     TEXT        NOT NULL, -- set by the training pipeline; references model_runs.run_id
-    symbol           TEXT        NOT NULL,
+    ticker           TEXT        NOT NULL,
     target_weight    NUMERIC     NOT NULL,
     reference_price  NUMERIC     NOT NULL
 );
@@ -85,7 +85,7 @@ CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
     timestamp               TIMESTAMPTZ NOT NULL,
-    symbol                  TEXT        NOT NULL,
+    ticker                  TEXT        NOT NULL,
     order_id                UUID        NOT NULL,
     quantity                NUMERIC     NOT NULL,
     price                   NUMERIC     NOT NULL,
