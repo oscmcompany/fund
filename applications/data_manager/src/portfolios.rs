@@ -67,14 +67,14 @@ pub async fn get(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<QueryParameters>,
 ) -> impl IntoResponse {
-    info!("Fetching portfolio from S3");
+    info!("Fetching allocation from S3");
 
     let timestamp: Option<DateTime<Utc>> = parameters.timestamp;
 
     match query_allocation_dataframe_from_s3(&state, timestamp).await {
         Ok(dataframe) => {
             if dataframe.height() == 0 {
-                info!("No portfolio data found, returning empty array");
+                info!("No allocation data found, returning empty array");
                 return (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -93,7 +93,7 @@ pub async fn get(
                     let json_bytes = buffer.into_inner();
                     let json_string = String::from_utf8_lossy(&json_bytes).to_string();
                     info!(
-                        "Returning portfolio as JSON with {} rows",
+                        "Returning allocation as JSON with {} rows",
                         dataframe.height()
                     );
                     (

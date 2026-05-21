@@ -68,12 +68,6 @@ pub fn spawn_sync_scheduler(state: State) {
 
 async fn run_equity_bar_sync(state: &State) -> Result<Option<String>, String> {
     let now_utc = Utc::now();
-    let now_eastern = now_utc.with_timezone(&Eastern);
-    if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
-        info!("Weekend detected, skipping equity bar sync");
-        return Ok(None);
-    }
-
     let sync_date = sync_date_for(now_utc);
     let sync_noon_eastern = Eastern
         .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
@@ -222,15 +216,6 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         };
 
         let now_utc = Utc::now();
-        let now_eastern = now_utc.with_timezone(&Eastern);
-        if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
-            info!("Weekend detected, skipping scheduled sync");
-            if let Err(error) = database::complete_job(pool, job_id, "skipped: weekend").await {
-                warn!("Failed to complete job {}: {}", job_id, error);
-            }
-            continue;
-        }
-
         let sync_date = sync_date_for(now_utc);
         let sync_noon_eastern = Eastern
             .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
