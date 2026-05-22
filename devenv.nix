@@ -142,7 +142,6 @@ in {
     duckdb
     gh
     git
-    gobang
     rainfrog
     jq
     llvmPackages.llvm
