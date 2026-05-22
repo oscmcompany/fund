@@ -19,3 +19,4 @@ data/
 .claude/tasks/
 .scratchpad/
 .devenv
+.env
