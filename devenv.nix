@@ -10,6 +10,7 @@
 
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
+  cachix.enable = false;
   dotenv.enable = true;
 
   languages = {
