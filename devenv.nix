@@ -1,10 +1,4 @@
-{
-  pkgs,
-  lib,
-  config,
-  inputs,
-  ...
-}: let
+{pkgs, ...}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -17,7 +11,6 @@
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
   dotenv.enable = true;
-  dotenv.filename = ".envrc";
 
   languages = {
     rust.enable = true;
@@ -397,18 +390,21 @@ in {
       after = ["checks:python:install"];
     };
 
-    # --- Rust checks (format parallel with check, lint+test after check) ---
+    # --- Rust checks (sequential to reuse compilation artifacts) ---
 
     "checks:rust:format".exec = "rust-format";
-    "checks:rust:check".exec = "rust-check";
 
+    "checks:rust:check" = {
+      exec = "rust-check";
+      after = ["checks:rust:format"];
+    };
     "checks:rust:lint" = {
       exec = "rust-lint";
       after = ["checks:rust:check"];
     };
     "checks:rust:test" = {
       exec = "rust-test";
-      after = ["checks:rust:check"];
+      after = ["checks:rust:lint"];
     };
 
     # --- Standalone checks ---
