@@ -6,22 +6,32 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PROD=false
 NONINTERACTIVE=false
+PROFILE=""
 OS="$(uname -s)"
 
 usage() {
-  echo "Usage: $(basename "$0") [--prod] [--noninteractive]"
+  echo "Usage: $(basename "$0") --profile <name> [--prod] [--noninteractive]"
   echo ""
   echo "Bootstrap a fresh machine for the fund development environment."
   echo ""
   echo "Options:"
-  echo "  --prod              Configure production environment variables and validate secrets"
+  echo "  --profile <name>    Fund profile (e.g., dev/chris, production) [required]"
+  echo "  --prod              Configure production environment and validate secrets"
   echo "  --noninteractive    Skip the final exec \$SHELL (for use from automation)"
   echo "  -h, --help          Show this help message"
-  exit 0
+  exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --profile)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: --profile requires a value"
+        usage 1
+      fi
+      PROFILE="$2"
+      shift 2
+      ;;
     --prod)
       PROD=true
       shift
@@ -35,10 +45,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Error: unknown option '$1'"
-      usage
+      usage 1
       ;;
   esac
 done
+
+if [[ -z "$PROFILE" ]]; then
+  echo "Error: --profile is required (e.g., --profile dev/chris or --profile production)"
+  usage 1
+fi
 
 step() {
   echo ""
@@ -138,48 +153,24 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Install direnv (auto-loads .envrc via devenv integration)
+# 2b. Install tmux (required for production service sessions)
 # --------------------------------------------------------------------------- #
-step "Checking direnv installation"
+if ! command -v tmux &>/dev/null; then
+  echo "Installing tmux..."
+  sudo apt-get install -y -qq tmux 2>/dev/null || nix profile add nixpkgs#tmux
+  echo "tmux installed"
+fi
 
-if command -v direnv &>/dev/null; then
-  echo "direnv is already installed, skipping"
+# --------------------------------------------------------------------------- #
+# 3. Configure devenv shell hook (auto-activates environment on cd)
+# --------------------------------------------------------------------------- #
+step "Configuring devenv shell hook"
+
+if ! grep -qF 'devenv hook' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'eval "$(devenv hook bash)"' >> "$HOME/.bashrc"
+  echo "Added devenv hook to ~/.bashrc"
 else
-  echo "Installing direnv..."
-  nix profile add nixpkgs#direnv
-  echo "direnv installed successfully"
-fi
-
-# Hook direnv into the shell
-SHELL_NAME="$(basename "$SHELL")"
-case "$SHELL_NAME" in
-  bash)
-    SHELL_RC="$HOME/.bashrc"
-    HOOK='eval "$(direnv hook bash)"'
-    ;;
-  zsh)
-    SHELL_RC="$HOME/.zshrc"
-    HOOK='eval "$(direnv hook zsh)"'
-    ;;
-  *)
-    SHELL_RC=""
-    HOOK=""
-    echo "Warning: unsupported shell '$SHELL_NAME' for direnv hook, add manually"
-    ;;
-esac
-
-if [[ -n "$SHELL_RC" ]]; then
-  if ! grep -qF 'direnv hook' "$SHELL_RC" 2>/dev/null; then
-    echo "$HOOK" >> "$SHELL_RC"
-    echo "Added direnv hook to $SHELL_RC"
-  else
-    echo "direnv hook already in $SHELL_RC"
-  fi
-fi
-
-# Allow .envrc in the repo so direnv loads it automatically
-if [[ -f "$REPO_ROOT/.envrc" ]]; then
-  direnv allow "$REPO_ROOT" 2>/dev/null || true
+  echo "devenv hook already in ~/.bashrc"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -253,44 +244,50 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# 7. Create .envrc with FUND_PROFILE
+# 7. Generate .env from .env.example
 # --------------------------------------------------------------------------- #
-ENVRC="$REPO_ROOT/.envrc"
+DOTENV="$REPO_ROOT/.env"
 
-if [[ "$PROD" == true ]]; then
-  step "Configuring production environment"
+if [[ ! -f "$DOTENV" ]]; then
+  step "Creating .env (profile: $PROFILE)"
+  sed "s|dev/yourname|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
 
-  if [[ ! -f "$ENVRC" ]]; then
-    echo "Creating production .envrc..."
-    cat > "$ENVRC" << 'ENVRC_EOF'
-export FUND_PROFILE=production
-export SECRETSPEC_PROFILE="$FUND_PROFILE"
-export AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
-export MASSIVE_BASE_URL=https://api.massive.com
-ENVRC_EOF
-    echo "Created $ENVRC"
-  else
-    echo ".envrc already exists, skipping creation"
+  # Production needs extra vars
+  if [[ "$PROD" == true ]]; then
+    cat >> "$DOTENV" << 'EOF'
+AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+MASSIVE_BASE_URL=https://api.massive.com
+EOF
   fi
+
+  echo "Created $DOTENV"
 else
-  step "Configuring development environment"
-
-  if [[ ! -f "$ENVRC" ]]; then
-    echo "Creating development .envrc..."
-    cat > "$ENVRC" << 'ENVRC_EOF'
-export FUND_PROFILE=dev/chris
-export SECRETSPEC_PROFILE="$FUND_PROFILE"
-ENVRC_EOF
-    echo "Created $ENVRC"
-  else
-    echo ".envrc already exists, skipping creation"
+  existing_profile=$(grep -E '^FUND_PROFILE=' "$DOTENV" | cut -d= -f2-)
+  if [[ -n "$existing_profile" && "$existing_profile" != "$PROFILE" ]]; then
+    echo "WARNING: .env has FUND_PROFILE=$existing_profile but --profile is $PROFILE"
+    echo "  To update, delete .env and re-run, or edit it manually"
   fi
-
-  step "Ensuring dev S3 buckets exist"
-  # shellcheck disable=SC1090
-  source "$ENVRC"
-  "$REPO_ROOT/tools/create-dev-buckets" "${FUND_PROFILE:-dev/chris}"
+  echo ".env already exists, skipping creation"
 fi
+
+if [[ "$PROD" != true && "$PROFILE" != "production" && "$PROFILE" != "paper" ]]; then
+  step "Ensuring dev S3 buckets exist"
+  set -a
+  # shellcheck disable=SC1090
+  source "$DOTENV"
+  set +a
+  "$REPO_ROOT/tools/create-dev-buckets" "${FUND_PROFILE:-$PROFILE}"
+fi
+
+# Patch devenv.yaml secretspec profile to match this environment
+if [[ "$OS" == "Darwin" ]]; then
+  sed -i '' "s|profile: .*|profile: $PROFILE|" "$REPO_ROOT/devenv.yaml"
+else
+  sed -i "s|profile: .*|profile: $PROFILE|" "$REPO_ROOT/devenv.yaml"
+fi
+
+cd "$REPO_ROOT"
+devenv allow
 
 # --------------------------------------------------------------------------- #
 # 8. Create log directory
@@ -326,16 +323,14 @@ echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
 if [[ "$PROD" == true ]]; then
-  echo "  nohup tools/git-sync > /var/log/git-sync.log 2>&1 &  # start git-sync supervisor"
-  echo ""
-  echo "git-sync will poll origin/master every 60 seconds and restart"
-  echo "devenv automatically when new commits arrive."
+  echo "  tmux new-session -d -s fund 'devenv --profile apps up'"
+  echo "  tmux attach -t fund        # attach to services session"
 else
   echo "  devenv shell        # enter the development environment"
   echo "  devenv --profile apps up  # start application services"
   echo ""
   echo "For production setup, re-run with:"
-  echo "  $(basename "$0") --prod"
+  echo "  $(basename "$0") --profile production --prod"
 fi
 
 # Replace current shell so Nix paths are on PATH

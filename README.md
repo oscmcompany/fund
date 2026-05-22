@@ -17,14 +17,38 @@ Below are resources for the project and repository.
 On a fresh machine with the repo cloned, run the bootstrap script:
 
 ```sh
-./tools/bootstrap-machine         # install nix, devenv, and build the environment
-./tools/bootstrap-machine --prod  # also configure production env vars and validate secrets
+./tools/bootstrap-machine --profile dev/yourname
+./tools/bootstrap-machine --profile production --prod  # production with secret validation
+```
+
+Add the devenv shell hook to auto-activate the environment on `cd`:
+
+```sh
+# zsh (~/.zshrc)
+eval "$(devenv hook zsh)"
+
+# bash (~/.bashrc)
+eval "$(devenv hook bash)"
+
+# fish (~/.config/fish/config.fish)
+devenv hook fish | source
+
+# nushell (config.nu)
+devenv hook nu | save --force ~/.cache/devenv/hook.nu
+source ~/.cache/devenv/hook.nu
+```
+
+Then trust the project directory:
+
+```sh
+devenv allow
 ```
 
 Once bootstrapped:
 
 ```sh
-devenv shell                    # enter the development environment
+# Environment auto-activates on cd with devenv hook configured
+devenv shell                    # or: enter manually without hook
 devenv --profile apps up        # start application services
 devenv --profile ml shell       # ML training environment
 ```
