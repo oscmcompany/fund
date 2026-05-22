@@ -1,4 +1,8 @@
-{pkgs, lib, ...}: let
+{
+  pkgs,
+  lib,
+  ...
+}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -138,6 +142,8 @@ in {
     duckdb
     gh
     git
+    gobang
+    rainfrog
     jq
     llvmPackages.llvm
     markdownlint-cli
