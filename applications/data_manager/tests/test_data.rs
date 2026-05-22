@@ -2,9 +2,9 @@ mod common;
 
 use common::initialize_test_tracing;
 use data_manager::data::{
-    create_closed_pair_dataframe, create_equity_bar_dataframe, create_equity_details_dataframe,
-    create_performance_snapshot_dataframe, create_portfolio_dataframe,
-    create_predictions_dataframe, ClosedPair, EquityBar, PerformanceSnapshot, Portfolio,
+    create_allocation_dataframe, create_closed_pair_dataframe, create_equity_bar_dataframe,
+    create_equity_details_dataframe, create_performance_snapshot_dataframe,
+    create_predictions_dataframe, Allocation, ClosedPair, EquityBar, PerformanceSnapshot,
     Prediction,
 };
 use polars::prelude::*;
@@ -62,8 +62,8 @@ fn sample_prediction_with_timestamp(timestamp: i64) -> Prediction {
 }
 
 #[allow(dead_code)]
-fn sample_portfolio() -> Portfolio {
-    Portfolio {
+fn sample_allocation() -> Allocation {
+    Allocation {
         ticker: "AAPL".to_string(),
         timestamp: 1234567890000,
         side: "long".to_string(),
@@ -75,8 +75,8 @@ fn sample_portfolio() -> Portfolio {
 }
 
 #[allow(dead_code)]
-fn sample_portfolio_lowercase() -> Portfolio {
-    Portfolio {
+fn sample_allocation_lowercase() -> Allocation {
+    Allocation {
         ticker: "aapl".to_string(),
         timestamp: 1234567890000,
         side: "short".to_string(),
@@ -365,11 +365,11 @@ fn test_create_predictions_dataframe_multiple_different_tickers() {
 }
 
 #[test]
-fn test_create_portfolio_dataframe_valid_data() {
+fn test_create_allocation_dataframe_valid_data() {
     initialize_test_tracing();
-    let portfolios = vec![sample_portfolio()];
+    let allocations = vec![sample_allocation()];
 
-    let df = create_portfolio_dataframe(portfolios).unwrap();
+    let df = create_allocation_dataframe(allocations).unwrap();
 
     assert_eq!(df.height(), 1);
     assert_eq!(df.width(), 7);
@@ -383,11 +383,11 @@ fn test_create_portfolio_dataframe_valid_data() {
 }
 
 #[test]
-fn test_create_portfolio_dataframe_uppercase_normalization() {
+fn test_create_allocation_dataframe_uppercase_normalization() {
     initialize_test_tracing();
-    let portfolios = vec![sample_portfolio_lowercase()];
+    let allocations = vec![sample_allocation_lowercase()];
 
-    let df = create_portfolio_dataframe(portfolios).unwrap();
+    let df = create_allocation_dataframe(allocations).unwrap();
 
     let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
     assert_eq!(ticker, "AAPL");
@@ -400,9 +400,9 @@ fn test_create_portfolio_dataframe_uppercase_normalization() {
 }
 
 #[test]
-fn test_create_portfolio_dataframe_whitespace_trimming() {
+fn test_create_allocation_dataframe_whitespace_trimming() {
     initialize_test_tracing();
-    let portfolios = vec![Portfolio {
+    let allocations = vec![Allocation {
         ticker: "  AAPL  ".to_string(),
         timestamp: 1234567890000,
         side: "  long  ".to_string(),
@@ -412,7 +412,7 @@ fn test_create_portfolio_dataframe_whitespace_trimming() {
         entry_price: Some(150.0),
     }];
 
-    let df = create_portfolio_dataframe(portfolios).unwrap();
+    let df = create_allocation_dataframe(allocations).unwrap();
 
     let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
     assert_eq!(ticker, "AAPL");
@@ -425,10 +425,10 @@ fn test_create_portfolio_dataframe_whitespace_trimming() {
 }
 
 #[test]
-fn test_create_portfolio_dataframe_mixed_case() {
+fn test_create_allocation_dataframe_mixed_case() {
     initialize_test_tracing();
-    let portfolios = vec![
-        Portfolio {
+    let allocations = vec![
+        Allocation {
             ticker: "aapl".to_string(),
             timestamp: 1234567890000,
             side: "long".to_string(),
@@ -437,7 +437,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
             pair_id: "AAPL-GOOGL".to_string(),
             entry_price: Some(150.0),
         },
-        Portfolio {
+        Allocation {
             ticker: "GOOGL".to_string(),
             timestamp: 1234567890000,
             side: "SHORT".to_string(),
@@ -448,7 +448,7 @@ fn test_create_portfolio_dataframe_mixed_case() {
         },
     ];
 
-    let df = create_portfolio_dataframe(portfolios).unwrap();
+    let df = create_allocation_dataframe(allocations).unwrap();
 
     assert_eq!(df.height(), 2);
 
@@ -484,11 +484,11 @@ fn test_create_portfolio_dataframe_mixed_case() {
 }
 
 #[test]
-fn test_create_portfolio_dataframe_empty_vec() {
+fn test_create_allocation_dataframe_empty_vec() {
     initialize_test_tracing();
-    let portfolios: Vec<Portfolio> = vec![];
+    let allocations: Vec<Allocation> = vec![];
 
-    let df = create_portfolio_dataframe(portfolios).unwrap();
+    let df = create_allocation_dataframe(allocations).unwrap();
 
     assert_eq!(df.height(), 0);
     assert_eq!(df.width(), 7);
@@ -727,12 +727,12 @@ fn test_predictions_dataframe_parquet_roundtrip() {
 }
 
 #[test]
-fn test_portfolio_dataframe_parquet_roundtrip() {
+fn test_allocation_dataframe_parquet_roundtrip() {
     initialize_test_tracing();
     use std::io::Cursor;
 
-    let original_portfolios = vec![sample_portfolio()];
-    let original_df = create_portfolio_dataframe(original_portfolios.clone()).unwrap();
+    let original_allocations = vec![sample_allocation()];
+    let original_df = create_allocation_dataframe(original_allocations.clone()).unwrap();
 
     let mut buffer = Vec::new();
     ParquetWriter::new(&mut buffer)

@@ -102,7 +102,16 @@ in {
 
   services.postgres = {
     enable = true;
-    package = pkgs.postgresql_16;
+    package = pkgs.postgresql_16.withPackages (p: [
+      # overrideAttrs is required here: p.timescaledb comes from the PostgreSQL
+      # extension package set inside withPackages, which does not inherit top-level
+      # nixpkgs.config.allowUnfree. This is the standard pattern for enabling
+      # TimescaleDB (TSL-licensed) via withPackages in devenv.
+      (p.timescaledb.overrideAttrs (old: {
+        meta = old.meta // {license = lib.licenses.tsl // {free = true;};};
+      }))
+      p.pg_cron
+    ]);
     port = 5432;
     listen_addresses = "127.0.0.1";
     initialDatabases = [
@@ -111,9 +120,8 @@ in {
         schema = ./schema.sql;
       }
     ];
-    extensions = extensions: [extensions.pg_cron];
     settings = {
-      shared_preload_libraries = "pg_cron";
+      shared_preload_libraries = "timescaledb,pg_cron";
       "cron.database_name" = "fund";
     };
   };
@@ -138,6 +146,18 @@ in {
     uv
     xenon
   ];
+
+  scripts.db-seed.exec = ''
+    set -euo pipefail
+    echo "Downloading latest database snapshot..."
+    aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
+    rm -f /tmp/fund-latest.dump
+    gunzip /tmp/fund-latest.dump.gz
+    pg_restore --host 127.0.0.1 --port 5432 \
+      --no-owner --no-acl \
+      --dbname fund --clean --if-exists /tmp/fund-latest.dump
+    echo "Database seeded"
+  '';
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail

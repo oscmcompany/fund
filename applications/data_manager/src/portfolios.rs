@@ -1,6 +1,6 @@
-use crate::data::{create_portfolio_dataframe, Portfolio};
+use crate::data::{create_allocation_dataframe, Allocation};
 use crate::state::State;
-use crate::storage::{query_portfolio_dataframe_from_s3, write_portfolio_dataframe_to_s3};
+use crate::storage::{query_allocation_dataframe_from_s3, write_allocation_dataframe_to_s3};
 use axum::{
     extract::{Json, Query, State as AxumState},
     http::StatusCode,
@@ -13,22 +13,22 @@ use std::io::Cursor;
 use tracing::{info, warn};
 
 #[derive(Deserialize)]
-pub struct SavePortfolioPayload {
-    pub data: Vec<Portfolio>,
+pub struct SaveAllocationPayload {
+    pub data: Vec<Allocation>,
     pub timestamp: DateTime<Utc>,
 }
 
 pub async fn save(
     AxumState(state): AxumState<State>,
-    Json(payload): Json<SavePortfolioPayload>,
+    Json(payload): Json<SaveAllocationPayload>,
 ) -> impl IntoResponse {
-    let portfolio = match create_portfolio_dataframe(payload.data) {
+    let allocation = match create_allocation_dataframe(payload.data) {
         Ok(df) => df,
         Err(err) => {
-            warn!("Failed to create portfolio DataFrame: {}", err);
+            warn!("Failed to create allocation DataFrame: {}", err);
             return (
                 StatusCode::BAD_REQUEST,
-                format!("Invalid portfolio data: {}", err),
+                format!("Invalid allocation data: {}", err),
             )
                 .into_response();
         }
@@ -36,12 +36,12 @@ pub async fn save(
 
     let timestamp = payload.timestamp;
 
-    match write_portfolio_dataframe_to_s3(&state, &portfolio, &timestamp).await {
+    match write_allocation_dataframe_to_s3(&state, &allocation, &timestamp).await {
         Ok(s3_key) => {
             info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
             let response_message = format!(
                 "DataFrame created with {} rows and uploaded to S3: {}",
-                portfolio.height(),
+                allocation.height(),
                 s3_key
             );
 
@@ -67,14 +67,14 @@ pub async fn get(
     AxumState(state): AxumState<State>,
     Query(parameters): Query<QueryParameters>,
 ) -> impl IntoResponse {
-    info!("Fetching portfolio from S3");
+    info!("Fetching allocation from S3");
 
     let timestamp: Option<DateTime<Utc>> = parameters.timestamp;
 
-    match query_portfolio_dataframe_from_s3(&state, timestamp).await {
+    match query_allocation_dataframe_from_s3(&state, timestamp).await {
         Ok(dataframe) => {
             if dataframe.height() == 0 {
-                info!("No portfolio data found, returning empty array");
+                info!("No allocation data found, returning empty array");
                 return (
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -93,7 +93,7 @@ pub async fn get(
                     let json_bytes = buffer.into_inner();
                     let json_string = String::from_utf8_lossy(&json_bytes).to_string();
                     info!(
-                        "Returning portfolio as JSON with {} rows",
+                        "Returning allocation as JSON with {} rows",
                         dataframe.height()
                     );
                     (

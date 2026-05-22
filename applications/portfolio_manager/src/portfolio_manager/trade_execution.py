@@ -11,13 +11,13 @@ logger = structlog.get_logger()
 
 
 def get_positions(
-    prior_portfolio_tickers: list[str],
+    prior_allocation_tickers: list[str],
     held_tickers: set[str],
     optimal_portfolio: pl.DataFrame,
 ) -> tuple[list[dict], list[dict]]:
     close_positions = [
         {"ticker": ticker}
-        for ticker in prior_portfolio_tickers
+        for ticker in prior_allocation_tickers
         if ticker not in held_tickers
     ]
 

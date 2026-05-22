@@ -16,14 +16,27 @@ static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new
 
 const SCHEMA_SQL: &str = include_str!("../../../schema.sql");
 
-/// Lines from schema.sql that require pg_cron (not available in vanilla Postgres).
+/// Lines from schema.sql that require pg_cron or TimescaleDB (not available in vanilla Postgres).
 fn filter_schema_for_test(schema: &str) -> String {
+    let mut inside_cron_block = false;
     schema
         .lines()
         .filter(|line| {
             let trimmed = line.trim().to_lowercase();
+            if trimmed.starts_with("do $do$") {
+                inside_cron_block = true;
+            }
+            if inside_cron_block {
+                if trimmed.starts_with("$do$;") {
+                    inside_cron_block = false;
+                }
+                return false;
+            }
             !trimmed.starts_with("create extension if not exists pg_cron")
+                && !trimmed.starts_with("create extension if not exists timescaledb")
                 && !trimmed.starts_with("select cron.schedule")
+                && !trimmed.starts_with("select create_hypertable")
+                && !trimmed.starts_with("select add_retention_policy")
         })
         .collect::<Vec<_>>()
         .join("\n")

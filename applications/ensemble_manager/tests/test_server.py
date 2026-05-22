@@ -475,7 +475,7 @@ def test_artifact_polling_detects_new_key_and_swaps() -> None:
         ):
 
             async def _fake(func: object, *_a: object, **_kw: object) -> object:
-                if func is find_latest_artifact_key:
+                if func is _resolve_artifact_key:
                     return "new/output/model.tar.gz"
                 return mock_model
 
@@ -543,7 +543,7 @@ def test_artifact_polling_download_failure_cleans_up() -> None:
         ):
 
             async def _fake(func: object, *_a: object, **_kw: object) -> object:
-                if func is find_latest_artifact_key:
+                if func is _resolve_artifact_key:
                     return "new/output/model.tar.gz"
                 if func is download_and_extract_artifacts:
                     message = "S3 download failed"
