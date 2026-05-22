@@ -102,16 +102,12 @@ in {
 
   services.postgres = {
     enable = true;
-    package = pkgs.postgresql_16.withPackages (p: [
-      # overrideAttrs is required here: p.timescaledb comes from the PostgreSQL
-      # extension package set inside withPackages, which does not inherit top-level
-      # nixpkgs.config.allowUnfree. This is the standard pattern for enabling
-      # TimescaleDB (TSL-licensed) via withPackages in devenv.
-      (p.timescaledb.overrideAttrs (old: {
-        meta = old.meta // {license = pkgs.lib.licenses.tsl // {free = true;};};
-      }))
-      p.pg_cron
-    ]);
+    # allowUnfree: true in devenv.yaml enables the TSL-licensed timescaledb extension.
+    package = pkgs.postgresql_16;
+    extensions = extensions: [
+      extensions.timescaledb
+      extensions.pg_cron
+    ];
     port = 5432;
     listen_addresses = "127.0.0.1";
     initialDatabases = [

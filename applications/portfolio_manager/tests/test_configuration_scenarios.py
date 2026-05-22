@@ -20,6 +20,7 @@ The scenarios are grouped as follows:
 """
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock
 
 import polars as pl
@@ -59,7 +60,7 @@ def _long(
     dollar_amount: float = 1_000.0,
     entry_price: float = 100.0,
     pair_id: str = "pair-1",
-) -> dict:
+) -> dict[str, Any]:
     return {
         "ticker": ticker,
         "pair_id": pair_id,
@@ -77,7 +78,7 @@ def _short(
     entry_price: float = 100.0,
     quantity: int | None = 10,
     pair_id: str = "pair-1",
-) -> dict:
+) -> dict[str, Any]:
     return {
         "ticker": ticker,
         "pair_id": pair_id,
@@ -123,7 +124,7 @@ def _make_entry_prices(
     return prices
 
 
-def _sized_to_open_positions(sized: pl.DataFrame) -> list[dict]:
+def _sized_to_open_positions(sized: pl.DataFrame) -> list[dict[str, Any]]:
     return [
         {
             "ticker": row["ticker"],
@@ -647,8 +648,10 @@ def test_integration_intraday_sizing_produces_larger_positions_than_overnight() 
 #   1. An initial portfolio is established (pairs opened).
 #   2. On the next rebalance some pairs are closed and replaced with new ones.
 #
-# The mock client's get_account() return value is updated between the close and
-# open phases to reflect Alpaca's behaviour of restoring buying power once short
+# The refreshed buying power after closes is passed directly to execute_open_positions
+# as the refreshed_buying_power argument. In
+# test_rebalance_capital_recycling_closes_enable_new_opens the mock's get_account()
+# return value is also updated to simulate Alpaca restoring buying power once short
 # positions are covered (margin released).
 
 
@@ -757,11 +760,14 @@ def test_rebalance_partial_replacement_cycle() -> None:
 
     # Cycle 2: TICK00-TICK04 are held (no action); TICK05-TICK09 are closed.
     # New pairs TICK10-TICK19 replace the 5 closing pairs.
-    held_pair_ids = {f"TICK{i:02d}A-TICK{i:02d}B" for i in range(5)}
+    closing_pairs = REQUIRED_PAIRS // 2
+    held_pair_ids = {f"TICK{i:02d}A-TICK{i:02d}B" for i in range(REQUIRED_PAIRS // 2)}
     closing_rows = initial_sized.filter(~pl.col("pair_id").is_in(held_pair_ids))
     close_positions = [
         {"ticker": row["ticker"]} for row in closing_rows.iter_rows(named=True)
     ]
+    # Size a full REQUIRED_PAIRS batch from new tickers (as run_rebalance does), then
+    # filter to only the pairs that replace the closing ones.
     replacement_sized = size_pairs_with_volatility_parity(
         _make_candidate_pairs(offset=REQUIRED_PAIRS),
         maximum_capital=maximum_capital,
@@ -773,20 +779,26 @@ def test_rebalance_partial_replacement_cycle() -> None:
         overnight_margin_rate_low_price=config.overnight_margin_rate_low_price,
         short_buying_power_buffer=config.short_buying_power_buffer,
     )
+    replacement_pair_ids = {
+        f"TICK{i + REQUIRED_PAIRS:02d}A-TICK{i + REQUIRED_PAIRS:02d}B"
+        for i in range(closing_pairs)
+    }
+    replacement_rows = replacement_sized.filter(
+        pl.col("pair_id").is_in(replacement_pair_ids)
+    )
 
     _close_results, closed_count = execute_close_positions(client, close_positions)
     refreshed_buying_power = maximum_capital * 10
     _open_results, opened_count = execute_open_positions(
         client,
-        _sized_to_open_positions(replacement_sized),
+        _sized_to_open_positions(replacement_rows),
         refreshed_buying_power,
         50_000.0,
         config,
     )
 
-    closing_pairs = REQUIRED_PAIRS // 2
     assert closed_count == closing_pairs * 2  # 5 pairs * 2 legs = 10 tickers
-    assert opened_count == REQUIRED_PAIRS * 2  # 10 new pairs fully opened
+    assert opened_count == closing_pairs * 2  # 5 replacement pairs opened
 
 
 def test_rebalance_capital_recycling_closes_enable_new_opens() -> None:
@@ -830,6 +842,12 @@ def test_rebalance_capital_recycling_closes_enable_new_opens() -> None:
         constrained_client, new_open_positions, low_buying_power, 50_000.0, config
     )
     assert failed_count == 0
+    skipped = [result for result in _failed_results if result["status"] == "skipped"]
+    # Long legs skip with insufficient_buying_power; short legs skip with
+    # long_leg_failed because their paired long leg was blocked by buying power.
+    # Both indicate buying power is the root cause, not an unrelated error.
+    buying_power_reasons = {"insufficient_buying_power", "long_leg_failed"}
+    assert all(result["reason"] in buying_power_reasons for result in skipped)
 
     # Now simulate the rebalance cycle: close prior pairs, then refresh account.
     close_positions = [
