@@ -108,7 +108,7 @@ in {
       # nixpkgs.config.allowUnfree. This is the standard pattern for enabling
       # TimescaleDB (TSL-licensed) via withPackages in devenv.
       (p.timescaledb.overrideAttrs (old: {
-        meta = old.meta // {license = lib.licenses.tsl // {free = true;};};
+        meta = old.meta // {license = pkgs.lib.licenses.tsl // {free = true;};};
       }))
       p.pg_cron
     ]);
