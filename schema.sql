@@ -164,7 +164,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Nightly equity bar sync: weekdays at 5:00 AM UTC (covers EDT 1 AM ET)
+-- Nightly equity bar sync: weekdays at 05:00 UTC
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
@@ -175,10 +175,11 @@ $do$;
 
 -- events: append-only outbox for cross-service event coordination
 CREATE TABLE IF NOT EXISTS events (
-    id          BIGSERIAL   PRIMARY KEY,
+    id          BIGSERIAL   NOT NULL,
     event_type  TEXT        NOT NULL,
     payload     JSONB       NOT NULL DEFAULT '{}',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, created_at)
 );
 
 SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE);
@@ -226,7 +227,7 @@ CREATE TABLE IF NOT EXISTS event_consumer_offsets (
 -- the predictions_schema pandera definition in ensemble_manager.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
 CREATE TABLE IF NOT EXISTS predictions (
-    id              BIGSERIAL        PRIMARY KEY,
+    id              BIGSERIAL        NOT NULL,
     correlation_id  UUID             NOT NULL,
     model_run_id    TEXT             NOT NULL,
     ticker          TEXT             NOT NULL,
@@ -235,13 +236,13 @@ CREATE TABLE IF NOT EXISTS predictions (
     quantile_50     DOUBLE PRECISION NOT NULL,
     quantile_90     DOUBLE PRECISION NOT NULL,
     created_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    UNIQUE (ticker, timestamp)
+    PRIMARY KEY (ticker, timestamp)
 );
 
 SELECT create_hypertable('predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT add_retention_policy('predictions', INTERVAL '7 days', if_not_exists => TRUE);
 
--- Daily inference trigger: weekdays at 14:00 UTC (10:00 AM ET)
+-- Daily inference trigger: weekdays at 14:00 UTC
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'predictions-requested') THEN
