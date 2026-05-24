@@ -4,6 +4,16 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
+-- pg_parquet is installed on Linux deployments via nix/pg_parquet.nix.
+-- Silently skipped on environments where the extension is not available (e.g., macOS dev).
+DO $do$
+BEGIN
+    CREATE EXTENSION IF NOT EXISTS pg_parquet;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'pg_parquet not available, skipping: %', SQLERRM;
+END;
+$do$;
+
 -- equity_bars: Rolling buffer for equity bar data (last 90 days; ensemble needs 70-day lookback)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
 CREATE TABLE IF NOT EXISTS equity_bars (
@@ -52,6 +62,31 @@ CREATE TABLE IF NOT EXISTS equity_quotes (
 SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC);
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+
+-- archive_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
+-- Reads the S3 bucket name from the app.data_bucket_name database GUC (set by data-manager on startup).
+-- pg_parquet must be installed and S3 credentials must be available to the PostgreSQL process.
+CREATE OR REPLACE FUNCTION archive_equity_quotes() RETURNS void AS $$
+DECLARE
+    archive_date DATE := CURRENT_DATE;
+    s3_path      TEXT;
+BEGIN
+    s3_path := format(
+        's3://%s/equity/quotes/daily/year=%s/month=%s/day=%s/data.parquet',
+        current_setting('app.data_bucket_name'),
+        to_char(archive_date, 'YYYY'),
+        to_char(archive_date, 'MM'),
+        to_char(archive_date, 'DD')
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_quotes WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        archive_date::timestamptz,
+        (archive_date + 1)::timestamptz,
+        s3_path
+    );
+    DELETE FROM equity_quotes WHERE timestamp < (CURRENT_DATE + 1)::timestamptz;
+END;
+$$ LANGUAGE plpgsql;
 
 -- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
 CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
@@ -298,6 +333,19 @@ BEGIN
             'intraday-check',
             '*/5 14-20 * * 1-5',
             $$SELECT emit_event('intraday_check', '{}')$$
+        );
+    END IF;
+END;
+$do$;
+
+-- Daily quote archival: weekdays at 20:05 UTC (5 min after 4 PM Eastern market close)
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.schedule(
+            'archive-quotes',
+            '5 20 * * 1-5',
+            $$SELECT archive_equity_quotes()$$
         );
     END IF;
 END;

@@ -107,6 +107,11 @@ in {
     extensions = extensions: [
       extensions.timescaledb
       extensions.pg_cron
+      # pg_parquet: buildPgrxExtension marks all Darwin builds broken by default.
+      # The flag is overcautious — pgrx supports macOS and pg_parquet works on Darwin.
+      ((pkgs.callPackage ./nix/pg_parquet.nix {postgresql = pkgs.postgresql_16;}).overrideAttrs (old: {
+        meta = old.meta // {broken = false;};
+      }))
     ];
     port = 5432;
     listen_addresses = "127.0.0.1";
@@ -117,7 +122,7 @@ in {
       }
     ];
     settings = {
-      shared_preload_libraries = "timescaledb,pg_cron";
+      shared_preload_libraries = "timescaledb,pg_cron,pg_parquet";
       "cron.database_name" = "fund";
     };
   };
