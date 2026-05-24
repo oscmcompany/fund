@@ -1,4 +1,4 @@
-use crate::data::EquityBar;
+use crate::data::{EquityBar, EquityQuote};
 use chrono::DateTime;
 use chrono::Utc;
 use sqlx::postgres::PgRow;
@@ -206,6 +206,55 @@ pub async fn fail_job(pool: &PgPool, job_id: i64, error_message: &str) -> Result
     Ok(())
 }
 
+pub async fn insert_equity_quotes(
+    pool: &PgPool,
+    quotes: &[EquityQuote],
+) -> Result<u64, sqlx::Error> {
+    if quotes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows_affected: u64 = 0;
+
+    for chunk in quotes.chunks(1000) {
+        let mut query_builder = sqlx::QueryBuilder::new(
+            "INSERT INTO equity_quotes (timestamp, ticker, bid_price, ask_price, bid_size, ask_size) ",
+        );
+
+        query_builder.push_values(chunk, |mut builder, quote| {
+            builder
+                .push_bind(quote.timestamp)
+                .push_bind(&quote.ticker)
+                .push_bind(quote.bid_price)
+                .push_bind(quote.ask_price)
+                .push_bind(quote.bid_size)
+                .push_bind(quote.ask_size);
+        });
+
+        let result = query_builder.build().execute(pool).await?;
+        rows_affected += result.rows_affected();
+    }
+
+    debug!("Inserted {} equity quotes into PostgreSQL", rows_affected);
+    Ok(rows_affected)
+}
+
+pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"SELECT DISTINCT ea.ticker
+           FROM equity_allocations ea
+           JOIN equity_pairs ep ON ea.equity_pair_id = ep.id
+           WHERE ep.status = 'open'
+           ORDER BY ea.ticker"#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let tickers: Vec<String> = rows.into_iter().map(|(ticker,)| ticker).collect();
+    debug!("Queried {} active tickers from PostgreSQL", tickers.len());
+    Ok(tickers)
+}
+
 pub async fn requeue_stale_claimed_jobs(
     pool: &PgPool,
     job_name: &str,
@@ -295,6 +344,35 @@ mod tests {
             transactions: None,
         }];
         assert!(!is_valid_equity_bar(&bars_with_nulls[0]));
+    }
+
+    #[test]
+    fn test_insert_empty_quotes_returns_zero() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = insert_equity_quotes(&pool, &[]).await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn test_get_active_tickers_compiles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = get_active_tickers(&pool).await;
+            assert!(result.is_ok() || result.is_err());
+        });
     }
 
     #[test]

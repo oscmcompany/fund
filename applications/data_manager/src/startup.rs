@@ -1,3 +1,4 @@
+use crate::equity_quotes::spawn_quote_stream;
 use crate::router::create_app_with_state;
 use crate::scheduler::spawn_sync_scheduler;
 use crate::state::State;
@@ -50,6 +51,7 @@ pub async fn run_server(bind_address: &str) -> std::io::Result<()> {
     let state = State::from_env().await;
     let listener = TcpListener::bind(bind_address).await?;
     spawn_sync_scheduler(state.clone());
+    spawn_quote_stream(state.clone());
     let app = create_app_with_state(state);
 
     serve_app(listener, app).await
@@ -230,6 +232,8 @@ mod tests {
         let _massive_base_guard =
             EnvironmentVariableGuard::set("MASSIVE_BASE_URL", "http://127.0.0.1:1");
         let _massive_key_guard = EnvironmentVariableGuard::set("MASSIVE_API_KEY", "test-api-key");
+        let _alpaca_key_guard = EnvironmentVariableGuard::set("ALPACA_KEY_ID", "test-key-id");
+        let _alpaca_secret_guard = EnvironmentVariableGuard::set("ALPACA_SECRET", "test-secret");
         let _database_url_guard = EnvironmentVariableGuard::remove("DATABASE_URL");
 
         let result = run_server("invalid-address").await;

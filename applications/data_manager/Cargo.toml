@@ -46,7 +46,9 @@ aws-config = "1.8.15"
 aws-sdk-s3 = "1.129"
 aws-credential-types = "1.2.14"
 duckdb = { version = "1.10502.0", features = ["r2d2", "chrono"] }
+futures-util = "0.3"
 thiserror = "2.0.3"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 tracing-appender = "0.2"
 
 [dev-dependencies]

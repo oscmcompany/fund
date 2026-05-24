@@ -30,8 +30,8 @@ SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => 
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
-    bid_price   NUMERIC     NOT NULL,
-    ask_price   NUMERIC     NOT NULL,
+    bid_price   DOUBLE PRECISION NOT NULL,
+    ask_price   DOUBLE PRECISION NOT NULL,
     bid_size    INTEGER     NOT NULL,
     ask_size    INTEGER     NOT NULL
 );
@@ -241,6 +241,23 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 SELECT create_hypertable('predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT add_retention_policy('predictions', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- Intraday rebalance check: every 5 minutes during market hours (14:00–20:59 UTC, weekdays).
+-- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
+-- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
+-- A compile-time assertion in that file enforces the invariant — update both together.
+-- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
+        PERFORM cron.schedule(
+            'intraday-check',
+            '*/5 14-20 * * 1-5',
+            $$SELECT emit_event('intraday_check', '{}')$$
+        );
+    END IF;
+END;
+$do$;
 
 -- Daily inference trigger: weekdays at 14:00 UTC
 DO $do$

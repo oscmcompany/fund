@@ -1,4 +1,5 @@
 use crate::errors::Error;
+use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use serde::Deserialize;
 use std::io::Cursor;
@@ -238,6 +239,16 @@ pub fn create_performance_snapshot_dataframe(
     );
 
     Ok(dataframe)
+}
+
+#[derive(Debug, Clone)]
+pub struct EquityQuote {
+    pub timestamp: DateTime<Utc>,
+    pub ticker: String,
+    pub bid_price: f64,
+    pub ask_price: f64,
+    pub bid_size: i32,
+    pub ask_size: i32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
