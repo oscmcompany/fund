@@ -36,7 +36,10 @@ pub fn spawn_quote_stream(state: State) {
 async fn quote_stream_supervisor(state: State) {
     loop {
         match run_quote_stream(&state).await {
-            Ok(()) => info!("Quote stream exited, restarting"),
+            Ok(()) => {
+                info!("Quote stream exited cleanly, reconnecting in 5s");
+                sleep(Duration::from_secs(5)).await;
+            }
             Err(error) => {
                 warn!("Quote stream error: {}, restarting in 30s", error);
                 sleep(Duration::from_secs(30)).await;
@@ -91,6 +94,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
     write.send(Message::Text(auth_json.into())).await?;
 
     // Wait for auth response
+    let mut authenticated = false;
     if let Some(Ok(Message::Text(text))) = read.next().await {
         let messages: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
         for message in &messages {
@@ -103,10 +107,16 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                         .unwrap_or("unknown");
                     return Err(format!("Alpaca auth error {}: {}", code, msg).into());
                 }
-                Some("success") => info!("Alpaca authentication successful"),
+                Some("success") => {
+                    info!("Alpaca authentication successful");
+                    authenticated = true;
+                }
                 _ => {}
             }
         }
+    }
+    if !authenticated {
+        return Err("Alpaca authentication response not received".into());
     }
 
     // Subscribe to current active symbols
@@ -213,7 +223,10 @@ async fn flush_quotes(pool: &sqlx::PgPool, buffer: &mut Vec<EquityQuote>) {
     let count = quotes.len();
     match database::insert_equity_quotes(pool, &quotes).await {
         Ok(_) => info!("Flushed {} quote(s) to database", count),
-        Err(error) => error!("Failed to flush quotes to database: {}", error),
+        Err(error) => {
+            error!("Failed to flush quotes to database: {}", error);
+            *buffer = quotes;
+        }
     }
 }
 
@@ -233,8 +246,8 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
             let ticker = message.get("S").and_then(|s| s.as_str())?.to_string();
             let bid_price = message.get("bp").and_then(|v| v.as_f64())?;
             let ask_price = message.get("ap").and_then(|v| v.as_f64())?;
-            let bid_size = message.get("bs").and_then(|v| v.as_i64())? as i32;
-            let ask_size = message.get("as").and_then(|v| v.as_i64())? as i32;
+            let bid_size = i32::try_from(message.get("bs").and_then(|v| v.as_i64())?).ok()?;
+            let ask_size = i32::try_from(message.get("as").and_then(|v| v.as_i64())?).ok()?;
             let timestamp_str = message.get("t").and_then(|v| v.as_str())?;
             let timestamp = timestamp_str.parse::<DateTime<Utc>>().ok()?;
 

@@ -371,7 +371,7 @@ mod tests {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = get_active_tickers(&pool).await;
-            assert!(result.is_ok() || result.is_err());
+            assert!(result.is_err());
         });
     }
 
@@ -390,7 +390,7 @@ mod tests {
                 std::time::Duration::from_secs(2 * 3600),
             )
             .await;
-            assert!(result.is_ok() || result.is_err());
+            assert!(result.is_err());
         });
     }
 }

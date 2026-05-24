@@ -63,10 +63,8 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
-        let alpaca_key_id =
-            std::env::var("ALPACA_KEY_ID").expect("ALPACA_KEY_ID environment variable must be set");
-        let alpaca_secret =
-            std::env::var("ALPACA_SECRET").expect("ALPACA_SECRET environment variable must be set");
+        let alpaca_key_id = std::env::var("ALPACA_KEY_ID").unwrap_or_default();
+        let alpaca_secret = std::env::var("ALPACA_SECRET").unwrap_or_default();
         let alpaca_feed = std::env::var("ALPACA_FEED").unwrap_or_else(|_| "iex".to_string());
         info!("Using Alpaca feed: {}", alpaca_feed);
 
