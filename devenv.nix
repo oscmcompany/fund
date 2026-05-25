@@ -124,6 +124,7 @@ in {
     settings = {
       shared_preload_libraries = "timescaledb,pg_cron,pg_parquet";
       "cron.database_name" = "fund";
+      "cron.timezone" = "UTC";
     };
   };
 

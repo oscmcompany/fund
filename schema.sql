@@ -8,9 +8,11 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 -- Silently skipped on environments where the extension is not available (e.g., macOS dev).
 DO $do$
 BEGIN
-    CREATE EXTENSION IF NOT EXISTS pg_parquet;
-EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'pg_parquet not available, skipping: %', SQLERRM;
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_parquet') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_parquet;
+    ELSE
+        RAISE WARNING 'pg_parquet is not available; quote archival is disabled';
+    END IF;
 END;
 $do$;
 
@@ -69,11 +71,15 @@ SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => 
 CREATE OR REPLACE FUNCTION archive_equity_quotes() RETURNS void AS $$
 DECLARE
     archive_date DATE := CURRENT_DATE;
+    bucket_name  TEXT := current_setting('app.data_bucket_name', true);
     s3_path      TEXT;
 BEGIN
+    IF bucket_name IS NULL OR bucket_name = '' THEN
+        RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot archive equity quotes';
+    END IF;
     s3_path := format(
         's3://%s/equity/quotes/daily/year=%s/month=%s/day=%s/data.parquet',
-        current_setting('app.data_bucket_name'),
+        bucket_name,
         to_char(archive_date, 'YYYY'),
         to_char(archive_date, 'MM'),
         to_char(archive_date, 'DD')
@@ -84,7 +90,9 @@ BEGIN
         (archive_date + 1)::timestamptz,
         s3_path
     );
-    DELETE FROM equity_quotes WHERE timestamp < (CURRENT_DATE + 1)::timestamptz;
+    DELETE FROM equity_quotes
+    WHERE timestamp >= archive_date::timestamptz
+      AND timestamp < (archive_date + 1)::timestamptz;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -338,13 +346,14 @@ BEGIN
 END;
 $do$;
 
--- Daily quote archival: weekdays at 20:05 UTC (5 min after 4 PM Eastern market close)
+-- Daily quote archival: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
+-- and after 4 PM Eastern market close in both EDT and EST)
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
         PERFORM cron.schedule(
             'archive-quotes',
-            '5 20 * * 1-5',
+            '5 21 * * 1-5',
             $$SELECT archive_equity_quotes()$$
         );
     END IF;
