@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 aws-config = "1.8.15"
 aws-sdk-s3 = "1.129"
 aws-credential-types = "1.2.14"
-duckdb = { version = "1.10502.0", features = ["r2d2", "chrono"] }
+duckdb = { version = "1.10503.1", features = ["r2d2", "chrono"] }
 thiserror = "2.0.3"
 tracing-appender = "0.2"
 
