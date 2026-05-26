@@ -1,4 +1,8 @@
-{pkgs, ...}: let
+{
+  pkgs,
+  lib,
+  ...
+}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -10,6 +14,7 @@
 
   bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
 in {
+  cachix.enable = false;
   dotenv.enable = true;
 
   languages = {
@@ -139,6 +144,7 @@ in {
     duckdb
     gh
     git
+    rainfrog
     jq
     llvmPackages.llvm
     markdownlint-cli
