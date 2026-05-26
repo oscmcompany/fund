@@ -328,7 +328,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         pl.col("pair_id").is_in(successful_pair_ids)
     )
     held_rows = prior_allocation.filter(pl.col("ticker").is_in(held_tickers))
-    final_allocation = pl.concat([successful_open_rows, held_rows])
+    final_allocation = pl.concat([successful_open_rows, held_rows], how="diagonal")
     save_succeeded = await save_allocation(final_allocation, current_timestamp)
 
     all_results = close_results + open_results
