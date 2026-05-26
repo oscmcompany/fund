@@ -51,6 +51,8 @@ mod tests {
             std::env::set_var("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
+            std::env::set_var("ALPACA_KEY_ID", "test-key-id");
+            std::env::set_var("ALPACA_SECRET", "test-secret");
             std::env::set_var("RUST_LOG", "data_manager=debug,tower_http=debug");
             std::env::remove_var("DATABASE_URL");
         }
@@ -63,6 +65,8 @@ mod tests {
             std::env::remove_var("AWS_S3_DATA_BUCKET_NAME");
             std::env::remove_var("MASSIVE_BASE_URL");
             std::env::remove_var("MASSIVE_API_KEY");
+            std::env::remove_var("ALPACA_KEY_ID");
+            std::env::remove_var("ALPACA_SECRET");
             std::env::remove_var("RUST_LOG");
         }
     }

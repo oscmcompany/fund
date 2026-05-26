@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::Client as S3Client;
 use reqwest::Client as HTTPClient;
 use sqlx::PgPool;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
@@ -23,6 +25,10 @@ pub struct State {
     pub last_sync_epoch: Arc<AtomicU64>,
     pub pool: Option<PgPool>,
     pub database_url_configured: bool,
+    pub alpaca_key_id: String,
+    pub alpaca_secret: String,
+    pub alpaca_feed: String,
+    pub active_symbols: Arc<RwLock<HashSet<String>>>,
 }
 
 impl State {
@@ -56,6 +62,11 @@ impl State {
 
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
+
+        let alpaca_key_id = std::env::var("ALPACA_KEY_ID").unwrap_or_default();
+        let alpaca_secret = std::env::var("ALPACA_SECRET").unwrap_or_default();
+        let alpaca_feed = std::env::var("ALPACA_FEED").unwrap_or_else(|_| "iex".to_string());
+        info!("Using Alpaca feed: {}", alpaca_feed);
 
         let (pool, database_url_configured) = match std::env::var("DATABASE_URL") {
             Ok(database_url) => {
@@ -91,6 +102,10 @@ impl State {
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool,
             database_url_configured,
+            alpaca_key_id,
+            alpaca_secret,
+            alpaca_feed,
+            active_symbols: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -109,6 +124,10 @@ impl State {
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool: None,
             database_url_configured: false,
+            alpaca_key_id: String::new(),
+            alpaca_secret: String::new(),
+            alpaca_feed: "iex".to_string(),
+            active_symbols: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
