@@ -1,7 +1,7 @@
 import os
 import sys
 import tarfile
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import boto3
 import structlog
@@ -54,7 +54,7 @@ def _resolve_artifact_run_id(
         latest_artifact = max(
             file_objects_with_timestamps, key=lambda x: x["last_modified"]
         )
-        selected_option = cast("str", latest_artifact["name"])
+        selected_option = latest_artifact["name"]
         logger.info(
             "GitHub Actions detected, selecting latest artifact",
             selected_option=selected_option,
