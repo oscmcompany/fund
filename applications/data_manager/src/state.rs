@@ -9,6 +9,8 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::database::set_data_bucket_guc;
+
 #[derive(Clone)]
 pub struct MassiveSecrets {
     pub base: String,
@@ -74,6 +76,9 @@ impl State {
                 match PgPool::connect(&database_url).await {
                     Ok(pool) => {
                         info!("Connected to PostgreSQL");
+                        if let Err(error) = set_data_bucket_guc(&pool, &bucket_name).await {
+                            warn!("Failed to set app.data_bucket_name database GUC: {}", error);
+                        }
                         (Some(pool), true)
                     }
                     Err(error) => {
