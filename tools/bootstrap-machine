@@ -61,37 +61,18 @@ step() {
 }
 
 ensure_nix_trusted_user() {
+  local nix_conf="/etc/nix/nix.conf"
   local user
   user="$(whoami)"
-
-  # Determinate Systems installer manages /etc/nix/nix.conf as read-only;
-  # custom settings must go in /etc/nix/nix.custom.conf.
-  # Fall back to /etc/nix/nix.conf for traditional Nix installs.
-  local custom_conf="/etc/nix/nix.custom.conf"
-  local nix_conf="/etc/nix/nix.conf"
-
-  # Check whether the user is already trusted in either config file
-  for conf in "$custom_conf" "$nix_conf"; do
-    if [[ -f "$conf" ]] && grep -qE "^trusted-users\s*=.*\b${user}\b" "$conf"; then
-      return 0
+  if [[ -f "$nix_conf" ]] && ! grep -qE "^trusted-users\s*=.*\b${user}\b" "$nix_conf"; then
+    echo "Adding $user to Nix trusted-users..."
+    if grep -qE "^trusted-users\s*=" "$nix_conf"; then
+      sudo sed -i "s/^trusted-users\s*=.*/& $user/" "$nix_conf"
+    else
+      echo "trusted-users = root $user" | sudo tee -a "$nix_conf" >/dev/null
     fi
-  done
-
-  echo "Adding $user to Nix trusted-users..."
-
-  # Prefer nix.custom.conf (Determinate installer); fall back to nix.conf
-  local target="$nix_conf"
-  if [[ -L "$nix_conf" ]] || [[ -f "$custom_conf" ]]; then
-    target="$custom_conf"
+    sudo systemctl restart nix-daemon 2>/dev/null || true
   fi
-
-  if [[ -f "$target" ]] && grep -qE "^trusted-users\s*=" "$target"; then
-    sudo sed -i "s/^trusted-users\s*=.*/& $user/" "$target"
-  else
-    echo "trusted-users = root $user" | sudo tee -a "$target" >/dev/null
-  fi
-
-  sudo systemctl restart nix-daemon 2>/dev/null || true
 }
 
 # --------------------------------------------------------------------------- #

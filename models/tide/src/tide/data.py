@@ -674,8 +674,6 @@ class Data:
                     quantile_values * daily_return_standard_deviation
                 ) + daily_return_mean
 
-                unscaled_quantiles = np.sort(unscaled_quantiles)
-
                 row = {
                     "ticker": ticker_str,
                     "timestamp": timestamp,

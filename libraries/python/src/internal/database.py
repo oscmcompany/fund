@@ -82,10 +82,12 @@ async def listen_for_events(
 ) -> None:
     """Listen on a pg_notify channel and invoke handler with each notification payload.
 
-    Runs until cancelled. Opens a dedicated autocommit connection per call so
-    concurrent listeners do not share a single notifies() stream. The handler
-    receives the raw notification payload string (event_type for the 'events'
-    channel). Handler exceptions are logged and the loop continues.
+    Runs until cancelled or the PostgreSQL connection drops. Callers should wrap
+    this in a retry loop to reconnect on connection loss. Opens a dedicated
+    autocommit connection per call so concurrent listeners do not share a single
+    notifies() stream. The handler receives the raw notification payload string
+    (event_type for the 'events' channel). Handler exceptions are logged and the
+    loop continues.
     """
     database_url = _get_database_url()
     async with await AsyncConnection.connect(

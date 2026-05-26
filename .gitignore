@@ -18,5 +18,3 @@ data/
 .claude/tasks/
 .scratchpad/
 .devenv
-.env
-.understand-anything

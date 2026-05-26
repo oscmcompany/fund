@@ -4,6 +4,18 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
+-- pg_parquet is installed on Linux deployments via nix/pg_parquet.nix.
+-- Silently skipped on environments where the extension is not available (e.g., macOS dev).
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_parquet') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_parquet;
+    ELSE
+        RAISE WARNING 'pg_parquet is not available; quote archival is disabled';
+    END IF;
+END;
+$do$;
+
 -- equity_bars: Rolling buffer for equity bar data (last 90 days; ensemble needs 70-day lookback)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
 CREATE TABLE IF NOT EXISTS equity_bars (
@@ -25,6 +37,20 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_
 CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
+-- Migrate equity_quotes column types from NUMERIC to DOUBLE PRECISION if running against an older schema.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_quotes' AND column_name = 'bid_price' AND data_type = 'numeric'
+    ) THEN
+        ALTER TABLE equity_quotes
+            ALTER COLUMN bid_price TYPE DOUBLE PRECISION,
+            ALTER COLUMN ask_price TYPE DOUBLE PRECISION;
+    END IF;
+END;
+$do$;
+
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
 CREATE TABLE IF NOT EXISTS equity_quotes (
@@ -38,6 +64,37 @@ CREATE TABLE IF NOT EXISTS equity_quotes (
 SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC);
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+
+-- archive_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
+-- Reads the S3 bucket name from the app.data_bucket_name database GUC (set by data-manager on startup).
+-- pg_parquet must be installed and S3 credentials must be available to the PostgreSQL process.
+CREATE OR REPLACE FUNCTION archive_equity_quotes() RETURNS void AS $$
+DECLARE
+    archive_date DATE := CURRENT_DATE;
+    bucket_name  TEXT := current_setting('app.data_bucket_name', true);
+    s3_path      TEXT;
+BEGIN
+    IF bucket_name IS NULL OR bucket_name = '' THEN
+        RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot archive equity quotes';
+    END IF;
+    s3_path := format(
+        's3://%s/equity/quotes/daily/year=%s/month=%s/day=%s/data.parquet',
+        bucket_name,
+        to_char(archive_date, 'YYYY'),
+        to_char(archive_date, 'MM'),
+        to_char(archive_date, 'DD')
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_quotes WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        archive_date::timestamptz,
+        (archive_date + 1)::timestamptz,
+        s3_path
+    );
+    DELETE FROM equity_quotes
+    WHERE timestamp >= archive_date::timestamptz
+      AND timestamp < (archive_date + 1)::timestamptz;
+END;
+$$ LANGUAGE plpgsql;
 
 -- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
 CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
@@ -69,6 +126,21 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     UNIQUE (pair_id, opened_at)
 );
 
+-- Drop equity_allocations (and equity_orders that reference it) if running against the old schema
+-- (target_weight/reference_price columns). The new schema is incompatible: it requires FKs to
+-- equity_pairs (a new table), so old rows cannot be preserved.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_allocations' AND column_name = 'target_weight'
+    ) THEN
+        DROP TABLE IF EXISTS equity_orders;
+        DROP TABLE equity_allocations;
+    END IF;
+END;
+$do$;
+
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
 CREATE TABLE IF NOT EXISTS equity_allocations (
@@ -96,6 +168,21 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     limit_price      NUMERIC,
     alpaca_order_id  TEXT        NOT NULL
 );
+
+-- Add FK from equity_orders.allocation_id to equity_allocations if running against a pre-migration schema
+-- that had allocation_id as a plain UUID with no constraint.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_name = 'equity_orders' AND constraint_name = 'equity_orders_allocation_id_fkey'
+    ) THEN
+        ALTER TABLE equity_orders
+            ADD CONSTRAINT equity_orders_allocation_id_fkey
+            FOREIGN KEY (allocation_id) REFERENCES equity_allocations(id);
+    END IF;
+END;
+$do$;
 
 -- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
@@ -241,6 +328,37 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 SELECT create_hypertable('predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT add_retention_policy('predictions', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
+-- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
+-- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
+-- A compile-time assertion in that file enforces the invariant — update both together.
+-- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
+        PERFORM cron.schedule(
+            'intraday-check',
+            '*/5 14-20 * * 1-5',
+            $$SELECT emit_event('intraday_check', '{}')$$
+        );
+    END IF;
+END;
+$do$;
+
+-- Daily quote archival: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
+-- and after 4 PM Eastern market close in both EDT and EST)
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.schedule(
+            'archive-quotes',
+            '5 21 * * 1-5',
+            $$SELECT archive_equity_quotes()$$
+        );
+    END IF;
+END;
+$do$;
 
 -- Daily inference trigger: weekdays at 14:00 UTC
 DO $do$
