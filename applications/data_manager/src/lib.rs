@@ -2,7 +2,6 @@ pub mod data;
 pub mod database;
 pub mod equity_bars;
 pub mod equity_details;
-pub mod equity_quotes;
 pub mod errors;
 pub mod health;
 pub mod performance;

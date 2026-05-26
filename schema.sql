@@ -30,8 +30,8 @@ SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => 
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
-    bid_price   DOUBLE PRECISION NOT NULL,
-    ask_price   DOUBLE PRECISION NOT NULL,
+    bid_price   NUMERIC     NOT NULL,
+    ask_price   NUMERIC     NOT NULL,
     bid_size    INTEGER     NOT NULL,
     ask_size    INTEGER     NOT NULL
 );
