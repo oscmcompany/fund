@@ -1,83 +1,26 @@
 import asyncio
-from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+import os
 
-import httpx
 import structlog
 from fastapi import status
+from internal.database import get_consumer_offset, listen_for_events
 
 from .alpaca_client import AlpacaClient
 from .configuration import Configuration
-from .rebalance import run_rebalance
+from .rebalance import get_latest_predictions_correlation_id, run_rebalance
 
 logger = structlog.get_logger()
 
-_EASTERN = ZoneInfo("America/New_York")
 _background_tasks: set[asyncio.Task] = set()
-_REBALANCE_HOUR = 10
-_REBALANCE_MINUTE = 0
-_WEEKEND_WEEKDAY_MIN = 5
 
 
-def _seconds_until_next_rebalance() -> float:
-    now = datetime.now(tz=UTC)
-    now_eastern = now.astimezone(_EASTERN)
-    target_eastern = now_eastern.replace(
-        hour=_REBALANCE_HOUR,
-        minute=_REBALANCE_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if now_eastern >= target_eastern:
-        target_eastern = target_eastern + timedelta(days=1)
-    # Skip weekends; market clock handles holidays
-    while target_eastern.weekday() >= _WEEKEND_WEEKDAY_MIN:
-        target_eastern = target_eastern + timedelta(days=1)
-    target = target_eastern.astimezone(UTC)
-    return (target - now).total_seconds()
-
-
-async def _already_rebalanced_today(data_manager_base_url: str) -> bool:
-    today = datetime.now(tz=_EASTERN).date()
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(url=f"{data_manager_base_url}/portfolios")
-        if response.status_code >= 400:  # noqa: PLR2004
-            logger.warning(
-                "Data manager error for portfolio check, skipping rebalance",
-                status_code=response.status_code,
-            )
-            return True
-        data = response.json()
-        if not data:
-            return False
-        for row in data:
-            timestamp_value = row.get("timestamp")
-            if timestamp_value is not None:
-                row_date = datetime.fromtimestamp(
-                    float(timestamp_value) / 1000, tz=_EASTERN
-                ).date()
-                if row_date == today:
-                    return True
-    except Exception as error:
-        logger.exception(
-            "Failed to check prior portfolio for idempotency guard, skipping rebalance",
-            error=str(error),
-        )
-        return True
-    return False
-
-
-async def spawn_rebalance_scheduler(
+async def spawn_event_listener(
     alpaca_client: AlpacaClient,
     configuration: Configuration,
-    data_manager_base_url: str,
     rebalance_lock: asyncio.Lock,
 ) -> asyncio.Task:
     task = asyncio.create_task(
-        _rebalance_loop(
-            alpaca_client, configuration, data_manager_base_url, rebalance_lock
-        )
+        _event_listener_loop(alpaca_client, configuration, rebalance_lock)
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -124,73 +67,113 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
                 return
 
 
-async def _rebalance_loop(  # noqa: C901
+async def _handle_predictions_completed(
     alpaca_client: AlpacaClient,
     configuration: Configuration,
-    data_manager_base_url: str,
     rebalance_lock: asyncio.Lock,
 ) -> None:
-    now_eastern = datetime.now(tz=UTC).astimezone(_EASTERN)
-    catch_up = (
-        now_eastern.weekday() < _WEEKEND_WEEKDAY_MIN
-        and now_eastern.hour >= _REBALANCE_HOUR
-        and not await _already_rebalanced_today(data_manager_base_url)
-    )
-    if catch_up:
-        logger.info("Missed rebalance window detected, running immediately")
+    if rebalance_lock.locked():
+        logger.info("Rebalance already in progress, skipping predictions_completed")
+        return
+
+    try:
+        market_open = alpaca_client.is_market_open()
+    except Exception as error:
+        logger.exception("Failed to check market open status", error=str(error))
+        return
+
+    if not market_open:
+        logger.info("Market is closed, skipping rebalance on predictions_completed")
+        return
+
+    logger.info("Starting event-triggered portfolio rebalance")
+    try:
+        async with rebalance_lock:
+            response = await run_rebalance(alpaca_client, configuration)
+        if response.status_code != status.HTTP_200_OK:
+            logger.warning(
+                "Event-triggered rebalance completed with non-200 status",
+                status_code=response.status_code,
+            )
+    except Exception as error:
+        logger.exception("Event-triggered portfolio rebalance failed", error=str(error))
+
+
+async def _handle_intraday_check(
+    alpaca_client: AlpacaClient,
+    configuration: Configuration,
+    rebalance_lock: asyncio.Lock,
+) -> None:
+    if rebalance_lock.locked():
+        logger.info("Rebalance already in progress, skipping intraday_check")
+        return
+
+    try:
+        market_open = alpaca_client.is_market_open()
+    except Exception as error:
+        logger.exception("Failed to check market open status", error=str(error))
+        return
+
+    if not market_open:
+        logger.info("Market is closed, skipping rebalance on intraday_check")
+        return
+
+    correlation_id = await get_latest_predictions_correlation_id()
+    if not correlation_id:
+        logger.info("No predictions available for intraday_check, skipping")
+        return
+
+    logger.info("Starting intraday rebalance check", correlation_id=correlation_id)
+    try:
+        async with rebalance_lock:
+            response = await run_rebalance(alpaca_client, configuration, correlation_id)
+        if response.status_code != status.HTTP_200_OK:
+            logger.warning(
+                "Intraday rebalance completed with non-200 status",
+                status_code=response.status_code,
+            )
+    except Exception as error:
+        logger.exception("Intraday portfolio rebalance failed", error=str(error))
+
+
+async def _event_listener_loop(
+    alpaca_client: AlpacaClient,
+    configuration: Configuration,
+    rebalance_lock: asyncio.Lock,
+) -> None:
+    if not os.environ.get("DATABASE_URL"):
+        logger.info("Event listener disabled, no DATABASE_URL configured")
+        return
+
+    consumer_name = "portfolio-manager"
 
     while True:
         try:
-            if not catch_up:
-                wait_seconds = _seconds_until_next_rebalance()
-                logger.info(
-                    "Waiting for next portfolio rebalance",
-                    seconds_until_rebalance=int(wait_seconds),
-                )
-                await asyncio.sleep(wait_seconds)
-            catch_up = False
+            await get_consumer_offset(consumer_name)
 
-            now_eastern = datetime.now(tz=UTC).astimezone(_EASTERN)
-            if now_eastern.weekday() >= _WEEKEND_WEEKDAY_MIN:
-                logger.info("Weekend detected, skipping scheduled rebalance")
-                continue
-
-            try:
-                market_open = alpaca_client.is_market_open()
-            except Exception as error:
-                logger.exception("Failed to check market open status", error=str(error))
-                continue
-
-            if not market_open:
-                logger.info("Market is closed, skipping scheduled rebalance")
-                continue
-
-            if await _already_rebalanced_today(data_manager_base_url):
-                logger.info("Portfolio already rebalanced today, skipping")
-                continue
-
-            if rebalance_lock.locked():
-                logger.info("Rebalance already in progress, skipping scheduled run")
-                continue
-
-            logger.info("Starting scheduled portfolio rebalance")
-            try:
-                async with rebalance_lock:
-                    response = await run_rebalance(alpaca_client, configuration)
-                if response.status_code != status.HTTP_200_OK:
-                    logger.warning(
-                        "Scheduled rebalance completed with non-200 status",
-                        status_code=response.status_code,
+            async def handler(event_type: str) -> None:
+                if event_type == "predictions_completed":
+                    logger.info("Received predictions_completed event")
+                    task = asyncio.create_task(
+                        _handle_predictions_completed(
+                            alpaca_client, configuration, rebalance_lock
+                        )
                     )
-            except Exception as error:
-                logger.exception(
-                    "Scheduled portfolio rebalance failed", error=str(error)
-                )
+                    _background_tasks.add(task)
+                    task.add_done_callback(_background_tasks.discard)
+                elif event_type == "intraday_check":
+                    logger.info("Received intraday_check event")
+                    task = asyncio.create_task(
+                        _handle_intraday_check(
+                            alpaca_client, configuration, rebalance_lock
+                        )
+                    )
+                    _background_tasks.add(task)
+                    task.add_done_callback(_background_tasks.discard)
+
+            await listen_for_events("events", handler)
         except asyncio.CancelledError:
-            logger.info("Rebalance scheduler cancelled")
             return
-        except Exception as error:
-            logger.exception(
-                "Unexpected error in rebalance loop, retrying next cycle",
-                error=str(error),
-            )
+        except Exception:
+            logger.exception("Event listener error, reconnecting in 30s")
+            await asyncio.sleep(30)

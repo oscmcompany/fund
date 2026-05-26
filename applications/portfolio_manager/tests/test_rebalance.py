@@ -13,6 +13,8 @@ from portfolio_manager.portfolio_state import (
 )
 from portfolio_manager.rebalance import (
     _prune_pairs_with_invalid_entry_price,
+    get_latest_predictions_correlation_id,
+    get_raw_predictions,
     run_rebalance,
 )
 from portfolio_manager.trade_execution import get_positions
@@ -983,3 +985,99 @@ def test_run_rebalance_empty_predictions_returns_200(
 
     assert response.status_code == status.HTTP_200_OK
     mock_consolidate.assert_not_called()
+
+
+# --- get_latest_predictions_correlation_id ---
+
+
+def _make_mock_pool(execute_result: object) -> MagicMock:
+    mock_result = AsyncMock()
+    mock_result.fetchone = AsyncMock(return_value=execute_result)
+    mock_connection = AsyncMock()
+    mock_connection.execute = AsyncMock(return_value=mock_result)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value.__aenter__ = AsyncMock(
+        return_value=mock_connection
+    )
+    mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+    return mock_pool
+
+
+def test_get_latest_predictions_correlation_id_returns_id_when_row_exists() -> None:
+    mock_pool = _make_mock_pool(("test-uuid-value",))
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(get_latest_predictions_correlation_id())
+
+    assert result == "test-uuid-value"
+
+
+def test_get_latest_predictions_correlation_id_returns_none_when_no_rows() -> None:
+    mock_pool = _make_mock_pool(None)
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(get_latest_predictions_correlation_id())
+
+    assert result is None
+
+
+# --- get_raw_predictions ---
+
+
+def _make_mock_pool_with_fetchall(rows: list) -> MagicMock:
+    mock_result = AsyncMock()
+    mock_result.fetchall = AsyncMock(return_value=rows)
+    mock_connection = AsyncMock()
+    mock_connection.execute = AsyncMock(return_value=mock_result)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value.__aenter__ = AsyncMock(
+        return_value=mock_connection
+    )
+    mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+    return mock_pool
+
+
+def test_get_raw_predictions_returns_dataframe_with_correlation_id() -> None:
+    rows = [
+        ("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0),
+        ("MSFT", 1_700_000_000_000, 280.0, 300.0, 320.0),
+    ]
+    mock_pool = _make_mock_pool_with_fetchall(rows)
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(get_raw_predictions("abc-correlation-id"))
+
+    assert len(result) == 2  # noqa: PLR2004
+    assert "ticker" in result.columns
+    assert "quantile_50" in result.columns
+
+
+def test_get_raw_predictions_returns_dataframe_without_correlation_id() -> None:
+    rows = [("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0)]
+    mock_pool = _make_mock_pool_with_fetchall(rows)
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(get_raw_predictions())
+
+    assert len(result) == 1
+
+
+def test_get_raw_predictions_returns_empty_dataframe_when_no_rows() -> None:
+    mock_pool = _make_mock_pool_with_fetchall([])
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(get_raw_predictions("no-results-id"))
+
+    assert len(result) == 0
+    assert "ticker" in result.columns
+    assert "quantile_10" in result.columns
