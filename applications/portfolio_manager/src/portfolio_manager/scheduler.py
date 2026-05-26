@@ -1,9 +1,10 @@
 import asyncio
 import os
+from typing import Any
 
 import structlog
 from fastapi import status
-from internal.database import get_consumer_offset, listen_for_events
+from internal.database import listen_for_events, update_consumer_offset
 
 from .alpaca_client import AlpacaClient
 from .configuration import Configuration
@@ -71,6 +72,7 @@ async def _handle_predictions_completed(
     alpaca_client: AlpacaClient,
     configuration: Configuration,
     rebalance_lock: asyncio.Lock,
+    correlation_id: str | None,
 ) -> None:
     if rebalance_lock.locked():
         logger.info("Rebalance already in progress, skipping predictions_completed")
@@ -86,10 +88,12 @@ async def _handle_predictions_completed(
         logger.info("Market is closed, skipping rebalance on predictions_completed")
         return
 
-    logger.info("Starting event-triggered portfolio rebalance")
+    logger.info(
+        "Starting event-triggered portfolio rebalance", correlation_id=correlation_id
+    )
     try:
         async with rebalance_lock:
-            response = await run_rebalance(alpaca_client, configuration)
+            response = await run_rebalance(alpaca_client, configuration, correlation_id)
         if response.status_code != status.HTTP_200_OK:
             logger.warning(
                 "Event-triggered rebalance completed with non-200 status",
@@ -149,18 +153,21 @@ async def _event_listener_loop(
 
     while True:
         try:
-            await get_consumer_offset(consumer_name)
 
-            async def handler(event_type: str) -> None:
+            async def handler(
+                event_type: str, event_id: int, payload: dict[str, Any]
+            ) -> None:
                 if event_type == "predictions_completed":
                     logger.info("Received predictions_completed event")
+                    correlation_id = payload.get("correlation_id")
                     task = asyncio.create_task(
                         _handle_predictions_completed(
-                            alpaca_client, configuration, rebalance_lock
+                            alpaca_client, configuration, rebalance_lock, correlation_id
                         )
                     )
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
+                    await update_consumer_offset(consumer_name, event_id)
                 elif event_type == "intraday_check":
                     logger.info("Received intraday_check event")
                     task = asyncio.create_task(
@@ -170,6 +177,7 @@ async def _event_listener_loop(
                     )
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
+                    await update_consumer_offset(consumer_name, event_id)
 
             await listen_for_events("events", handler)
         except asyncio.CancelledError:

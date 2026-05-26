@@ -12,7 +12,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import boto3
 import polars as pl
@@ -22,9 +22,9 @@ from fastapi import FastAPI, Request, Response, status
 from internal.database import (
     close_pool,
     emit_event,
-    get_consumer_offset,
     get_pool,
     listen_for_events,
+    update_consumer_offset,
 )
 from internal.equity_bars_schema import equity_bars_schema
 from internal.timestamps import to_timestamp_milliseconds
@@ -83,6 +83,7 @@ AWS_S3_DATA_BUCKET_NAME = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
 _swap_lock = threading.Lock()
 _CLEANUP_DELAY_SECONDS = 120
 _background_tasks: set[asyncio.Task] = set()
+_inference_lock: asyncio.Lock = asyncio.Lock()
 
 
 def find_latest_artifact_key(
@@ -461,8 +462,19 @@ def _compute_predictions(
         return None
 
 
-async def _run_predictions_from_event(app: FastAPI) -> None:  # noqa: PLR0915
+async def _run_predictions_from_event(app: FastAPI) -> None:
     """Fetch data, run inference, persist to PG, and emit completion event."""
+    if _inference_lock.locked():
+        logger.info("Inference already in progress, skipping predictions_requested")
+        return
+    await _inference_lock.acquire()
+    try:
+        await _run_predictions_from_event_inner(app)
+    finally:
+        _inference_lock.release()
+
+
+async def _run_predictions_from_event_inner(app: FastAPI) -> None:  # noqa: PLR0915
     correlation_id = str(uuid.uuid4())
     model_run_id = getattr(app.state, "current_run_id", "") or ""
 
@@ -491,6 +503,16 @@ async def _run_predictions_from_event(app: FastAPI) -> None:  # noqa: PLR0915
 
     s3_client = cast("S3Client", getattr(app.state, "s3_data_client", None))
     data_bucket = getattr(app.state, "data_bucket_name", "")
+
+    if s3_client is None or not data_bucket:
+        prediction_errors_total.labels(stage="fetch_equity_details").inc()
+        logger.error("S3 data client or bucket not configured")
+        await emit_event(
+            "predictions_failed",
+            {"correlation_id": correlation_id, "reason": "s3_not_configured"},
+        )
+        observe_duration(timer_start)
+        return
 
     try:
         equity_details_data = await _fetch_equity_details(s3_client, data_bucket)
@@ -567,14 +589,16 @@ async def _event_listener_task(app: FastAPI) -> None:
 
     while True:
         try:
-            await get_consumer_offset(consumer_name)
 
-            async def handler(event_type: str) -> None:
+            async def handler(
+                event_type: str, event_id: int, _payload: dict[str, Any]
+            ) -> None:
                 if event_type == "predictions_requested":
                     logger.info("Received predictions_requested event")
                     task = asyncio.create_task(_run_predictions_from_event(app))
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
+                    await update_consumer_offset(consumer_name, event_id)
 
             await listen_for_events("events", handler)
         except asyncio.CancelledError:
@@ -886,7 +910,7 @@ def metrics_endpoint() -> Response:
 
 @application.post("/model/predictions")
 @application.post("/predictions")
-async def create_predictions(request: Request) -> Response:
+async def create_predictions(request: Request) -> Response:  # noqa: PLR0911
     prediction_requests_total.inc()
     timer_start = start_timer()
     logger.info("Starting prediction generation process")
@@ -913,6 +937,12 @@ async def create_predictions(request: Request) -> Response:
 
     s3_client = cast("S3Client", getattr(request.app.state, "s3_data_client", None))
     data_bucket = getattr(request.app.state, "data_bucket_name", "")
+
+    if s3_client is None or not data_bucket:
+        prediction_errors_total.labels(stage="fetch_equity_details").inc()
+        logger.error("S3 data client or bucket not configured")
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
         equity_details_data = await _fetch_equity_details(s3_client, data_bucket)
@@ -944,12 +974,27 @@ async def create_predictions(request: Request) -> Response:
         observe_duration(timer_start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    correlation_id = str(uuid.uuid4())
+    model_run_id = getattr(request.app.state, "current_run_id", "") or ""
+
+    try:
+        await _insert_predictions(validated_predictions, correlation_id, model_run_id)
+    except Exception:
+        prediction_errors_total.labels(stage="save_predictions").inc()
+        logger.exception("Failed to insert predictions into database")
+        observe_duration(timer_start)
+        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    await emit_event("predictions_completed", {"correlation_id": correlation_id})
+
     prediction_batch_count.set(1)
     prediction_row_count.set(validated_predictions.height)
     observe_duration(timer_start)
-    logger.info("Successfully generated predictions")
+    logger.info("Successfully generated predictions", correlation_id=correlation_id)
 
     return Response(
-        content=json.dumps({"data": validated_predictions.to_dicts()}).encode("utf-8"),
+        content=json.dumps(
+            {"correlation_id": correlation_id, "data": validated_predictions.to_dicts()}
+        ).encode("utf-8"),
         status_code=status.HTTP_200_OK,
     )

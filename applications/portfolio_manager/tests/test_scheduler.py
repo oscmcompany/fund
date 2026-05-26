@@ -9,6 +9,8 @@ from portfolio_manager.scheduler import (
     _handle_intraday_check,
     _handle_predictions_completed,
     _status_logger_loop,
+    spawn_event_listener,
+    spawn_status_logger,
 )
 
 # --- _handle_predictions_completed ---
@@ -24,7 +26,9 @@ def test_handle_predictions_completed_calls_run_rebalance_when_market_open() -> 
     async def run() -> None:
         lock = asyncio.Lock()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
 
     asyncio.run(run())
     mock_run_rebalance.assert_called_once()
@@ -38,7 +42,9 @@ def test_handle_predictions_completed_skips_when_lock_held() -> None:
         lock = asyncio.Lock()
         await lock.acquire()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
 
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
@@ -52,7 +58,9 @@ def test_handle_predictions_completed_skips_when_market_closed() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
 
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
@@ -66,7 +74,9 @@ def test_handle_predictions_completed_handles_market_open_exception() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
 
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
@@ -85,7 +95,9 @@ def test_handle_predictions_completed_logs_warning_on_non_200() -> None:
             patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
             patch("portfolio_manager.scheduler.logger") as mock_logger,
         ):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
             mock_logger.warning.assert_called_once()
 
     asyncio.run(run())
@@ -99,7 +111,9 @@ def test_handle_predictions_completed_handles_run_rebalance_exception() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(mock_alpaca, Configuration(), lock)
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
 
     asyncio.run(run())
     mock_run_rebalance.assert_called_once()
@@ -211,10 +225,6 @@ def test_event_listener_loop_reconnects_on_error() -> None:
         with (
             patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
             patch(
-                "portfolio_manager.scheduler.get_consumer_offset",
-                AsyncMock(return_value=0),
-            ),
-            patch(
                 "portfolio_manager.scheduler.listen_for_events",
                 side_effect=fake_listen_for_events,
             ),
@@ -227,6 +237,108 @@ def test_event_listener_loop_reconnects_on_error() -> None:
 
     asyncio.run(run())
     assert call_count["count"] == 2  # noqa: PLR2004
+
+
+def test_event_listener_loop_dispatches_predictions_completed() -> None:
+    mock_alpaca = MagicMock()
+    captured_handler: list = []
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+
+        async def fake_listen_for_events(_channel: str, handler: object) -> None:
+            captured_handler.append(handler)
+            raise asyncio.CancelledError
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
+            patch(
+                "portfolio_manager.scheduler.listen_for_events",
+                side_effect=fake_listen_for_events,
+            ),
+            patch(
+                "portfolio_manager.scheduler.update_consumer_offset",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "portfolio_manager.scheduler._handle_predictions_completed",
+                AsyncMock(),
+            ) as mock_handle,
+        ):
+            await _event_listener_loop(mock_alpaca, Configuration(), lock)
+            if captured_handler:
+                await captured_handler[0](
+                    "predictions_completed", 42, {"correlation_id": "cid-123"}
+                )
+            mock_handle.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_event_listener_loop_dispatches_intraday_check() -> None:
+    mock_alpaca = MagicMock()
+    captured_handler: list = []
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+
+        async def fake_listen_for_events(_channel: str, handler: object) -> None:
+            captured_handler.append(handler)
+            raise asyncio.CancelledError
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
+            patch(
+                "portfolio_manager.scheduler.listen_for_events",
+                side_effect=fake_listen_for_events,
+            ),
+            patch(
+                "portfolio_manager.scheduler.update_consumer_offset",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "portfolio_manager.scheduler._handle_intraday_check",
+                AsyncMock(),
+            ) as mock_handle,
+        ):
+            await _event_listener_loop(mock_alpaca, Configuration(), lock)
+            if captured_handler:
+                await captured_handler[0]("intraday_check", 43, {})
+            mock_handle.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_spawn_event_listener_creates_task() -> None:
+    mock_alpaca = MagicMock()
+
+    async def run() -> asyncio.Task:
+        lock = asyncio.Lock()
+        with (
+            patch.dict("os.environ", {}),
+            patch(
+                "portfolio_manager.scheduler.listen_for_events",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ),
+        ):
+            task = await spawn_event_listener(mock_alpaca, Configuration(), lock)
+            assert isinstance(task, asyncio.Task)
+            task.cancel()
+            return task
+
+    asyncio.run(run())
+
+
+def test_spawn_status_logger_creates_task() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.side_effect = asyncio.CancelledError
+
+    async def run() -> None:
+        task = await spawn_status_logger(mock_alpaca)
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+
+    asyncio.run(run())
 
 
 # --- _status_logger_loop ---
