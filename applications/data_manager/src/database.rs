@@ -255,18 +255,6 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
     Ok(tickers)
 }
 
-pub async fn set_data_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
-    let alter_statement: String = sqlx::query_scalar(
-        r#"SELECT format('ALTER DATABASE %I SET "app.data_bucket_name" = %L', current_database(), $1)"#,
-    )
-    .bind(bucket_name)
-    .fetch_one(pool)
-    .await?;
-    sqlx::query(&alter_statement).execute(pool).await?;
-    info!("Set app.data_bucket_name database GUC to {}", bucket_name);
-    Ok(())
-}
-
 pub async fn requeue_stale_claimed_jobs(
     pool: &PgPool,
     job_name: &str,
@@ -402,20 +390,6 @@ mod tests {
                 std::time::Duration::from_secs(2 * 3600),
             )
             .await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_set_data_bucket_guc_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
-            let result = set_data_bucket_guc(&pool, "test-bucket").await;
             assert!(result.is_err());
         });
     }
