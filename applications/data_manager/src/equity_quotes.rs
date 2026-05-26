@@ -30,6 +30,10 @@ pub fn spawn_quote_stream(state: State) {
         info!("PostgreSQL not available, quote stream disabled");
         return;
     }
+    if state.alpaca_key_id.is_empty() || state.alpaca_secret.is_empty() {
+        info!("Alpaca credentials not configured, quote stream disabled");
+        return;
+    }
     tokio::spawn(quote_stream_supervisor(state));
 }
 

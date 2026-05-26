@@ -1,103 +1,57 @@
 import asyncio
-import io
 import json
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
 import pytest
 from botocore.exceptions import ClientError
 from ensemble_manager.server import (
     _artifact_polling_task,
+    _compute_predictions,
+    _fetch_equity_details,
+    _inference_lock,
+    _insert_predictions,
+    _prepare_inference_data,
     _resolve_artifact_key,
+    _run_predictions_from_event,
     _sync_run_metadata,
     application,
     cleanup_model_directory,
     download_and_extract_artifacts,
     find_latest_artifact_key,
-    parse_responses,
 )
 from fastapi import FastAPI, status
 from fastapi.testclient import TestClient
 
 
-def test_create_predictions_some_tickers_dropped_continues() -> None:
-    data = pl.DataFrame(
-        {
-            "ticker": ["AAPL", "AAPL"],
-            "close_price": [15.0, 20.0],
-        }
-    )
-    mock_tide_data = MagicMock()
-    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
-
+def test_create_predictions_compute_returns_none_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
     application.state.tide_model = MagicMock()
+    application.state.s3_data_client = MagicMock()
+    application.state.data_bucket_name = "test-bucket"
 
     with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
-        patch("ensemble_manager.server.parse_responses") as mock_parse,
-        patch("ensemble_manager.server.Data.load") as mock_data_load,
-        patch("ensemble_manager.server.Model.load"),
-        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
-        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
+        patch(
+            "ensemble_manager.server._fetch_equity_details", new_callable=AsyncMock
+        ) as mock_details,
+        patch("ensemble_manager.server._prepare_inference_data") as mock_prepare,
+        patch("ensemble_manager.server._compute_predictions") as mock_compute,
     ):
-        mock_response = MagicMock()
-        mock_response.raise_for_status.return_value = None
-        mock_requests_get.return_value = mock_response
-        mock_parse.return_value = data
-        mock_data_load.return_value = mock_tide_data
-        mock_filter.return_value = data
-
-        mock_tide_data.get_dataset.return_value = MagicMock(__len__=lambda _: 0)
+        mock_bars.return_value = pl.DataFrame()
+        mock_details.return_value = pl.DataFrame()
+        mock_prepare.return_value = pl.DataFrame()
+        mock_compute.return_value = None
 
         client = TestClient(application, raise_server_exceptions=False)
         response = client.post("/predictions")
 
     assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    assert call(stage="ticker_filtering") not in mock_errors.labels.call_args_list
-
-
-def test_create_predictions_all_tickers_dropped_returns_500() -> None:
-    data = pl.DataFrame(
-        {
-            "ticker": ["TSLA", "TSLA"],
-            "close_price": [15.0, 20.0],
-        }
-    )
-    empty_data = pl.DataFrame({"ticker": pl.Series([], dtype=pl.Utf8)})
-    mock_tide_data = MagicMock()
-    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
-
-    application.state.model_directory = "/fake/model/dir"
-    application.state.tide_model = MagicMock()
-
-    with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
-        patch("ensemble_manager.server.parse_responses") as mock_parse,
-        patch("ensemble_manager.server.Data.load") as mock_data_load,
-        patch("ensemble_manager.server.Model.load"),
-        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
-        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
-    ):
-        mock_response = MagicMock()
-        mock_response.raise_for_status.return_value = None
-        mock_requests_get.return_value = mock_response
-        mock_parse.return_value = data
-        mock_data_load.return_value = mock_tide_data
-        mock_filter.return_value = empty_data
-
-        mock_errors_instance = MagicMock()
-        mock_errors.labels.return_value = mock_errors_instance
-
-        client = TestClient(application, raise_server_exceptions=False)
-        response = client.post("/predictions")
-
-    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
-    mock_errors.labels.assert_called_with(stage="ticker_filtering")
-    mock_errors_instance.inc.assert_called_once()
 
 
 def test_resolve_artifact_key_uses_latest_by_default() -> None:
@@ -171,12 +125,14 @@ def test_create_predictions_fetch_equity_bars_fails_returns_500() -> None:
     application.state.tide_model = MagicMock()
 
     with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_fetch,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
         mock_errors_instance = MagicMock()
         mock_errors.labels.return_value = mock_errors_instance
-        mock_requests_get.side_effect = Exception("connection refused")
+        mock_fetch.side_effect = Exception("connection refused")
 
         client = TestClient(application, raise_server_exceptions=False)
         response = client.post("/predictions")
@@ -189,20 +145,22 @@ def test_create_predictions_fetch_equity_bars_fails_returns_500() -> None:
 def test_create_predictions_fetch_equity_details_fails_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
     application.state.tide_model = MagicMock()
+    application.state.s3_data_client = MagicMock()
+    application.state.data_bucket_name = "test-bucket"
 
     with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
+        patch(
+            "ensemble_manager.server._fetch_equity_details", new_callable=AsyncMock
+        ) as mock_details,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
         mock_errors_instance = MagicMock()
         mock_errors.labels.return_value = mock_errors_instance
-
-        equity_bars_response = MagicMock()
-        equity_bars_response.raise_for_status.return_value = None
-        mock_requests_get.side_effect = [
-            equity_bars_response,
-            Exception("equity details unavailable"),
-        ]
+        mock_bars.return_value = pl.DataFrame()
+        mock_details.side_effect = Exception("equity details unavailable")
 
         client = TestClient(application, raise_server_exceptions=False)
         response = client.post("/predictions")
@@ -212,22 +170,27 @@ def test_create_predictions_fetch_equity_details_fails_returns_500() -> None:
     mock_errors_instance.inc.assert_called_once()
 
 
-def test_create_predictions_parse_responses_fails_returns_500() -> None:
+def test_create_predictions_prepare_data_fails_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
     application.state.tide_model = MagicMock()
+    application.state.s3_data_client = MagicMock()
+    application.state.data_bucket_name = "test-bucket"
 
     with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
-        patch("ensemble_manager.server.parse_responses") as mock_parse,
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
+        patch(
+            "ensemble_manager.server._fetch_equity_details", new_callable=AsyncMock
+        ) as mock_details,
+        patch("ensemble_manager.server._prepare_inference_data") as mock_prepare,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
         mock_errors_instance = MagicMock()
         mock_errors.labels.return_value = mock_errors_instance
-
-        mock_response = MagicMock()
-        mock_response.raise_for_status.return_value = None
-        mock_requests_get.return_value = mock_response
-        mock_parse.side_effect = Exception("parse failed")
+        mock_bars.return_value = pl.DataFrame()
+        mock_details.return_value = pl.DataFrame()
+        mock_prepare.side_effect = Exception("prepare failed")
 
         client = TestClient(application, raise_server_exceptions=False)
         response = client.post("/predictions")
@@ -237,42 +200,171 @@ def test_create_predictions_parse_responses_fails_returns_500() -> None:
     mock_errors_instance.inc.assert_called_once()
 
 
-def test_create_predictions_apply_preprocessing_fails_returns_500() -> None:
-    data = pl.DataFrame(
-        {
-            "ticker": ["AAPL", "AAPL"],
-            "close_price": [15.0, 20.0],
-        }
-    )
-    mock_tide_data = MagicMock()
-    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
-    mock_tide_data.apply_and_set_data.side_effect = ValueError("unknown category")
-
+def test_create_predictions_s3_not_configured_returns_500() -> None:
     application.state.model_directory = "/fake/model/dir"
     application.state.tide_model = MagicMock()
+    application.state.s3_data_client = None
+    application.state.data_bucket_name = ""
 
     with (
-        patch("ensemble_manager.server.requests.get") as mock_requests_get,
-        patch("ensemble_manager.server.parse_responses") as mock_parse,
-        patch("ensemble_manager.server.Data.load") as mock_data_load,
-        patch("ensemble_manager.server.Model.load"),
-        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
         patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
     ):
-        mock_response = MagicMock()
-        mock_response.raise_for_status.return_value = None
-        mock_requests_get.return_value = mock_response
-        mock_parse.return_value = data
-        mock_data_load.return_value = mock_tide_data
-        mock_filter.return_value = data
-
         mock_errors_instance = MagicMock()
         mock_errors.labels.return_value = mock_errors_instance
+        mock_bars.return_value = pl.DataFrame()
 
         client = TestClient(application, raise_server_exceptions=False)
         response = client.post("/predictions")
 
     assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    mock_errors.labels.assert_called_with(stage="fetch_equity_details")
+    mock_errors_instance.inc.assert_called_once()
+
+
+def test_create_predictions_insert_fails_returns_500() -> None:
+    application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
+    application.state.s3_data_client = MagicMock()
+    application.state.data_bucket_name = "test-bucket"
+    application.state.current_run_id = "run-abc"
+
+    mock_predictions = pl.DataFrame({"ticker": ["AAPL"]})
+
+    with (
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
+        patch(
+            "ensemble_manager.server._fetch_equity_details", new_callable=AsyncMock
+        ) as mock_details,
+        patch("ensemble_manager.server._prepare_inference_data") as mock_prepare,
+        patch("ensemble_manager.server._compute_predictions") as mock_compute,
+        patch(
+            "ensemble_manager.server._insert_predictions", new_callable=AsyncMock
+        ) as mock_insert,
+        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+    ):
+        mock_errors_instance = MagicMock()
+        mock_errors.labels.return_value = mock_errors_instance
+        mock_bars.return_value = pl.DataFrame()
+        mock_details.return_value = pl.DataFrame()
+        mock_prepare.return_value = pl.DataFrame()
+        mock_compute.return_value = mock_predictions
+        mock_insert.side_effect = Exception("db error")
+
+        client = TestClient(application, raise_server_exceptions=False)
+        response = client.post("/predictions")
+
+    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+    mock_errors.labels.assert_called_with(stage="save_predictions")
+    mock_errors_instance.inc.assert_called_once()
+
+
+def test_create_predictions_success_persists_and_emits_event() -> None:
+    application.state.model_directory = "/fake/model/dir"
+    application.state.tide_model = MagicMock()
+    application.state.s3_data_client = MagicMock()
+    application.state.data_bucket_name = "test-bucket"
+    application.state.current_run_id = "run-xyz"
+
+    mock_predictions = pl.DataFrame({"ticker": ["AAPL"], "score": [0.8]})
+
+    with (
+        patch(
+            "ensemble_manager.server._fetch_equity_bars", new_callable=AsyncMock
+        ) as mock_bars,
+        patch(
+            "ensemble_manager.server._fetch_equity_details", new_callable=AsyncMock
+        ) as mock_details,
+        patch("ensemble_manager.server._prepare_inference_data") as mock_prepare,
+        patch("ensemble_manager.server._compute_predictions") as mock_compute,
+        patch(
+            "ensemble_manager.server._insert_predictions", new_callable=AsyncMock
+        ) as mock_insert,
+        patch(
+            "ensemble_manager.server.emit_event", new_callable=AsyncMock
+        ) as mock_emit,
+    ):
+        mock_bars.return_value = pl.DataFrame()
+        mock_details.return_value = pl.DataFrame()
+        mock_prepare.return_value = pl.DataFrame()
+        mock_compute.return_value = mock_predictions
+        mock_insert.return_value = None
+        mock_emit.return_value = None
+
+        client = TestClient(application, raise_server_exceptions=False)
+        response = client.post("/predictions")
+
+    assert response.status_code == status.HTTP_200_OK
+    body = json.loads(response.content)
+    assert "correlation_id" in body
+    assert "data" in body
+    mock_insert.assert_called_once()
+    mock_emit.assert_called_once_with(
+        "predictions_completed", {"correlation_id": body["correlation_id"]}
+    )
+
+
+def test_run_predictions_from_event_skips_when_locked() -> None:
+    async def run() -> None:
+        await _inference_lock.acquire()
+        try:
+            await _run_predictions_from_event(MagicMock())
+        finally:
+            _inference_lock.release()
+
+    asyncio.run(run())
+
+
+def test_compute_predictions_all_tickers_dropped_returns_none() -> None:
+    data = pl.DataFrame({"ticker": ["TSLA"], "close_price": [15.0]})
+    empty_data = pl.DataFrame({"ticker": pl.Series([], dtype=pl.Utf8)})
+    mock_tide_data = MagicMock()
+    mock_tide_data.mappings = {"ticker": {"AAPL": 0, "MSFT": 1}}
+
+    with (
+        patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
+        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+    ):
+        mock_data_load.return_value = mock_tide_data
+        mock_filter.return_value = empty_data
+        mock_errors_instance = MagicMock()
+        mock_errors.labels.return_value = mock_errors_instance
+
+        result = _compute_predictions(
+            MagicMock(), "/fake/dir", data, __import__("datetime").datetime.now()
+        )
+
+    assert result is None
+    mock_errors.labels.assert_called_with(stage="ticker_filtering")
+    mock_errors_instance.inc.assert_called_once()
+
+
+def test_compute_predictions_apply_preprocessing_fails_returns_none() -> None:
+    data = pl.DataFrame({"ticker": ["AAPL"], "close_price": [15.0]})
+    mock_tide_data = MagicMock()
+    mock_tide_data.mappings = {"ticker": {"AAPL": 0}}
+    mock_tide_data.apply_and_set_data.side_effect = ValueError("unknown category")
+
+    with (
+        patch("ensemble_manager.server.Data.load") as mock_data_load,
+        patch("ensemble_manager.server.filter_to_trained_tickers") as mock_filter,
+        patch("ensemble_manager.server.prediction_errors_total") as mock_errors,
+    ):
+        mock_data_load.return_value = mock_tide_data
+        mock_filter.return_value = data
+        mock_errors_instance = MagicMock()
+        mock_errors.labels.return_value = mock_errors_instance
+
+        result = _compute_predictions(
+            MagicMock(), "/fake/dir", data, __import__("datetime").datetime.now()
+        )
+
+    assert result is None
     mock_errors.labels.assert_called_with(stage="apply_preprocessing")
     mock_errors_instance.inc.assert_called_once()
 
@@ -394,7 +486,7 @@ def test_cleanup_model_directory_skips_dot() -> None:
     cleanup_model_directory(".")
 
 
-def test_parse_responses_returns_consolidated_dataframe() -> None:
+def test_prepare_inference_data_returns_consolidated_dataframe() -> None:
     equity_bars = pl.DataFrame(
         {
             "ticker": ["AAPL", "AAPL", "MSFT"],
@@ -405,26 +497,18 @@ def test_parse_responses_returns_consolidated_dataframe() -> None:
             "close_price": [152.0, 153.0, 302.0],
             "volume": [2_000_000, 2_100_000, 1_500_000],
             "volume_weighted_average_price": [151.5, 152.5, 301.0],
-            "transactions": [100, 110, 90],
+            "transactions": [None, None, None],
         }
     )
-    equity_bars_bytes = io.BytesIO()
-    equity_bars.write_parquet(equity_bars_bytes)
-
-    equity_details_csv = (
-        b"ticker,sector,industry\nAAPL,TECHNOLOGY,SOFTWARE\nMSFT,TECHNOLOGY,SOFTWARE\n"
+    equity_details = pl.DataFrame(
+        {
+            "ticker": ["AAPL", "MSFT"],
+            "sector": ["TECHNOLOGY", "TECHNOLOGY"],
+            "industry": ["SOFTWARE", "SOFTWARE"],
+        }
     )
 
-    equity_bars_response = MagicMock()
-    equity_bars_response.content = equity_bars_bytes.getvalue()
-
-    equity_details_response = MagicMock()
-    equity_details_response.content = equity_details_csv
-
-    result = parse_responses(
-        equity_bars_response=equity_bars_response,
-        equity_details_response=equity_details_response,
-    )
+    result = _prepare_inference_data(equity_bars, equity_details)
 
     assert "ticker" in result.columns
     assert "close_price" in result.columns
@@ -669,3 +753,68 @@ def test_sync_run_metadata_handles_empty_run_id() -> None:
         mock_pool.assert_not_called()
 
     asyncio.run(_run())
+
+
+# --- _fetch_equity_details ---
+
+
+def test_fetch_equity_details_returns_dataframe() -> None:
+    csv_content = (
+        b"ticker,sector,industry\nAAPL,TECHNOLOGY,SOFTWARE\nMSFT,TECHNOLOGY,SOFTWARE\n"
+    )
+    mock_body = MagicMock()
+    mock_body.read.return_value = csv_content
+    mock_s3 = MagicMock()
+    mock_s3.get_object.return_value = {"Body": mock_body}
+
+    async def _run() -> None:
+        result = await _fetch_equity_details(mock_s3, "test-bucket")
+        assert "ticker" in result.columns
+        assert "sector" in result.columns
+        assert len(result) == 2  # noqa: PLR2004
+
+    asyncio.run(_run())
+
+
+def test_fetch_equity_details_raises_on_s3_error() -> None:
+    mock_s3 = MagicMock()
+    mock_s3.get_object.side_effect = Exception("S3 error")
+
+    async def _run() -> None:
+        with pytest.raises(Exception, match="S3 error"):
+            await _fetch_equity_details(mock_s3, "test-bucket")
+
+    asyncio.run(_run())
+
+
+# --- _insert_predictions ---
+
+
+def test_insert_predictions_executes_upsert() -> None:
+    predictions = pl.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "timestamp": [1_700_000_000_000],
+            "quantile_10": [140.0],
+            "quantile_50": [150.0],
+            "quantile_90": [160.0],
+        }
+    )
+    mock_cursor = AsyncMock()
+    mock_connection = MagicMock()
+    mock_connection.cursor.return_value.__aenter__ = AsyncMock(return_value=mock_cursor)
+    mock_connection.cursor.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value.__aenter__ = AsyncMock(
+        return_value=mock_connection
+    )
+    mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
+
+    async def _run() -> None:
+        with patch(
+            "ensemble_manager.server.get_pool", AsyncMock(return_value=mock_pool)
+        ):
+            await _insert_predictions(predictions, "corr-id", "run-id")
+
+    asyncio.run(_run())
+    mock_cursor.executemany.assert_awaited_once()

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
@@ -78,16 +79,18 @@ async def emit_event(event_type: str, payload: dict[str, Any]) -> None:
 
 async def listen_for_events(
     channel: str,
-    handler: Callable[[str], Awaitable[None]],
+    handler: Callable[[str, int, dict[str, Any]], Awaitable[None]],
 ) -> None:
-    """Listen on a pg_notify channel and invoke handler with each notification payload.
+    """Listen on a pg_notify channel and invoke handler with each notification.
 
     Runs until cancelled or the PostgreSQL connection drops. Callers should wrap
     this in a retry loop to reconnect on connection loss. Opens a dedicated
     autocommit connection per call so concurrent listeners do not share a single
-    notifies() stream. The handler receives the raw notification payload string
-    (event_type for the 'events' channel). Handler exceptions are logged and the
-    loop continues.
+    notifies() stream.
+
+    The handler receives (event_type, event_id, payload) parsed from the JSON
+    NOTIFY payload emitted by the notify_event() trigger. Handler exceptions are
+    logged and the loop continues.
     """
     database_url = _get_database_url()
     async with await AsyncConnection.connect(
@@ -97,7 +100,11 @@ async def listen_for_events(
         logger.info("Listening on channel", channel=channel)
         async for notification in connection.notifies():
             try:
-                await handler(notification.payload)
+                data = json.loads(notification.payload)
+                event_type: str = data["event_type"]
+                event_id: int = data["event_id"]
+                event_payload: dict[str, Any] = data.get("payload") or {}
+                await handler(event_type, event_id, event_payload)
             except Exception:
                 logger.exception(
                     "Event handler failed",

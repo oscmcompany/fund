@@ -168,6 +168,9 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                         {
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
+                        if let Err(error) = database::emit_equity_bars_synced(pool).await {
+                            warn!("Failed to emit equity_bars_synced: {}", error);
+                        }
                         state.mark_synced();
                     }
                     Ok(None) => {
@@ -230,6 +233,9 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                     database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
                 {
                     warn!("Failed to complete job {}: {}", job_id, error);
+                }
+                if let Err(error) = database::emit_equity_bars_synced(pool).await {
+                    warn!("Failed to emit equity_bars_synced: {}", error);
                 }
                 state.mark_synced();
             }

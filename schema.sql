@@ -68,12 +68,17 @@ SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => 
 -- archive_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
 -- Reads the S3 bucket name from the app.data_bucket_name database GUC (set by data-manager on startup).
 -- pg_parquet must be installed and S3 credentials must be available to the PostgreSQL process.
+-- Returns early with a WARNING if pg_parquet is not installed.
 CREATE OR REPLACE FUNCTION archive_equity_quotes() RETURNS void AS $$
 DECLARE
     archive_date DATE := CURRENT_DATE;
     bucket_name  TEXT := current_setting('app.data_bucket_name', true);
     s3_path      TEXT;
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
+        RAISE WARNING 'pg_parquet is not installed; skipping quote archival';
+        RETURN;
+    END IF;
     IF bucket_name IS NULL OR bucket_name = '' THEN
         RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot archive equity quotes';
     END IF;
@@ -273,10 +278,18 @@ SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE
 CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id);
 SELECT add_retention_policy('events', INTERVAL '30 days', if_not_exists => TRUE);
 
--- notify_event: fires pg_notify on the 'events' channel after each insert
+-- notify_event: fires pg_notify on the 'events' channel after each insert.
+-- Payload is JSON with event_id, event_type, and the event payload so consumers
+-- can update offsets and access structured data without an extra DB round-trip.
 CREATE OR REPLACE FUNCTION notify_event() RETURNS trigger AS $$
 BEGIN
-    PERFORM pg_notify('events', NEW.event_type);
+    PERFORM pg_notify('events',
+        json_build_object(
+            'event_id',   NEW.id,
+            'event_type', NEW.event_type,
+            'payload',    NEW.payload
+        )::text
+    );
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -348,9 +361,11 @@ $do$;
 
 -- Daily quote archival: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
 -- and after 4 PM Eastern market close in both EDT and EST)
+-- Only scheduled when pg_parquet is available; archive_equity_quotes() also guards at runtime.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
         PERFORM cron.schedule(
             'archive-quotes',
             '5 21 * * 1-5',
