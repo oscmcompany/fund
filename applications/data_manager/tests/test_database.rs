@@ -3,7 +3,6 @@ mod common;
 use data_manager::data::EquityBar;
 use data_manager::database::{
     claim_pending_job, complete_job, fail_job, insert_equity_bars, query_recent_equity_bars,
-    set_data_bucket_guc,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -307,34 +306,6 @@ async fn test_complete_job() {
         .await
         .unwrap();
     assert_eq!(row.0, "completed");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_set_data_bucket_guc_persists() {
-    let pool = get_pg_pool().await;
-
-    set_data_bucket_guc(&pool, "fund-test-data").await.unwrap();
-
-    // ALTER DATABASE persists the GUC in pg_db_role_setting for all future connections.
-    // Verify the setting appears there with the expected value.
-    let settings: Vec<String> = sqlx::query_scalar(
-        "SELECT unnest(setconfig) FROM pg_db_role_setting \
-         WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()) \
-         AND setrole = 0",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-
-    assert!(
-        settings
-            .iter()
-            .any(|setting| setting.contains("app.data_bucket_name")
-                && setting.contains("fund-test-data")),
-        "Expected app.data_bucket_name GUC to be persisted, got: {:?}",
-        settings
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
