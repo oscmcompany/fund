@@ -591,15 +591,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
     mock_pairs_schema.validate.side_effect = lambda df: df
-    # Use the full portfolio schema (including quantity/notional) so that pl.concat
-    # in run_rebalance does not fail on schema mismatch.
-    mock_prior_portfolio.return_value = pl.DataFrame(
-        schema={
-            **_PRIOR_ALLOCATION_SCHEMA,
-            "quantity": pl.Int64,
-            "notional": pl.Float64,
-        }
-    )
+    mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
     mock_account.cash_amount = 10000.0
@@ -687,13 +679,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
     mock_pairs_schema.validate.side_effect = lambda df: df
-    mock_prior_portfolio.return_value = pl.DataFrame(
-        schema={
-            **_PRIOR_ALLOCATION_SCHEMA,
-            "quantity": pl.Int64,
-            "notional": pl.Float64,
-        }
-    )
+    mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
     mock_account.cash_amount = 10000.0
@@ -783,13 +769,7 @@ def test_run_rebalance_saves_only_opened_rows(
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
     mock_pairs_schema.validate.side_effect = lambda df: df
-    mock_prior_portfolio.return_value = pl.DataFrame(
-        schema={
-            **_PRIOR_ALLOCATION_SCHEMA,
-            "quantity": pl.Int64,
-            "notional": pl.Float64,
-        }
-    )
+    mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # AMD (short) is skipped; only NVDA (long) opened successfully.
     mock_execute_open.return_value = (
         [
@@ -901,13 +881,7 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
     mock_pairs_schema.validate.side_effect = lambda df: df
-    mock_prior_portfolio.return_value = pl.DataFrame(
-        schema={
-            **_PRIOR_ALLOCATION_SCHEMA,
-            "quantity": pl.Int64,
-            "notional": pl.Float64,
-        }
-    )
+    mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # Both legs succeed — the full pair should be saved.
     mock_execute_open.return_value = (
         [
