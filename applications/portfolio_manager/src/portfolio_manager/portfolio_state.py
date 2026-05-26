@@ -28,6 +28,8 @@ _PRIOR_ALLOCATION_SCHEMA: dict[str, type] = {
     "action": pl.String,
     "pair_id": pl.String,
     "entry_price": pl.Float64,
+    "quantity": pl.Int64,
+    "notional": pl.Float64,
 }
 
 

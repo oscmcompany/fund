@@ -25,20 +25,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_
 CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- Migrate equity_quotes column types from NUMERIC to DOUBLE PRECISION if running against an older schema.
-DO $do$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_quotes' AND column_name = 'bid_price' AND data_type = 'numeric'
-    ) THEN
-        ALTER TABLE equity_quotes
-            ALTER COLUMN bid_price TYPE DOUBLE PRECISION,
-            ALTER COLUMN ask_price TYPE DOUBLE PRECISION;
-    END IF;
-END;
-$do$;
-
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
 CREATE TABLE IF NOT EXISTS equity_quotes (
@@ -83,21 +69,6 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     UNIQUE (pair_id, opened_at)
 );
 
--- Drop equity_allocations (and equity_orders that reference it) if running against the old schema
--- (target_weight/reference_price columns). The new schema is incompatible: it requires FKs to
--- equity_pairs (a new table), so old rows cannot be preserved.
-DO $do$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_allocations' AND column_name = 'target_weight'
-    ) THEN
-        DROP TABLE IF EXISTS equity_orders;
-        DROP TABLE equity_allocations;
-    END IF;
-END;
-$do$;
-
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
 CREATE TABLE IF NOT EXISTS equity_allocations (
@@ -125,21 +96,6 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     limit_price      NUMERIC,
     alpaca_order_id  TEXT        NOT NULL
 );
-
--- Add FK from equity_orders.allocation_id to equity_allocations if running against a pre-migration schema
--- that had allocation_id as a plain UUID with no constraint.
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.table_constraints
-        WHERE table_name = 'equity_orders' AND constraint_name = 'equity_orders_allocation_id_fkey'
-    ) THEN
-        ALTER TABLE equity_orders
-            ADD CONSTRAINT equity_orders_allocation_id_fkey
-            FOREIGN KEY (allocation_id) REFERENCES equity_allocations(id);
-    END IF;
-END;
-$do$;
 
 -- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
@@ -285,23 +241,6 @@ CREATE TABLE IF NOT EXISTS predictions (
 
 SELECT create_hypertable('predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT add_retention_policy('predictions', INTERVAL '7 days', if_not_exists => TRUE);
-
--- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
--- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
--- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
--- A compile-time assertion in that file enforces the invariant — update both together.
--- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
-        PERFORM cron.schedule(
-            'intraday-check',
-            '*/5 14-20 * * 1-5',
-            $$SELECT emit_event('intraday_check', '{}')$$
-        );
-    END IF;
-END;
-$do$;
 
 -- Daily inference trigger: weekdays at 14:00 UTC
 DO $do$
