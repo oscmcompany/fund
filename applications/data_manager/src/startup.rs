@@ -92,14 +92,15 @@ async fn migrate_equity_details(state: &State) {
                 .into_iter()
                 .zip(sectors.into_iter())
                 .zip(industries.into_iter())
-                .filter_map(
-                    |((ticker, sector), industry)| match (ticker, sector, industry) {
-                        (Some(t), Some(s), Some(i)) => {
-                            Some((t.to_string(), s.to_string(), i.to_string()))
-                        }
-                        _ => None,
-                    },
-                )
+                .filter_map(|((ticker, sector), industry)| {
+                    ticker.map(|ticker_value| {
+                        (
+                            ticker_value.to_string(),
+                            sector.unwrap_or("NOT AVAILABLE").to_string(),
+                            industry.unwrap_or("NOT AVAILABLE").to_string(),
+                        )
+                    })
+                })
                 .collect();
 
             match populate_equity_details_if_empty(pool, rows).await {

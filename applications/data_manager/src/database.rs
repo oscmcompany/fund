@@ -269,8 +269,10 @@ pub async fn populate_equity_details_if_empty(
     pool: &PgPool,
     rows: Vec<(String, String, String)>,
 ) -> Result<u64, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM equity_details")
-        .fetch_one(pool)
+        .fetch_one(&mut *transaction)
         .await?;
 
     if count.0 > 0 {
@@ -301,9 +303,11 @@ pub async fn populate_equity_details_if_empty(
 
         query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
 
-        let result = query_builder.build().execute(pool).await?;
+        let result = query_builder.build().execute(&mut *transaction).await?;
         rows_affected += result.rows_affected();
     }
+
+    transaction.commit().await?;
 
     info!(
         "Populated equity_details with {} rows from S3 migration",

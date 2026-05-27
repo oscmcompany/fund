@@ -98,6 +98,12 @@ async def _handle_predictions_completed(
     )
     try:
         async with rebalance_lock:
+            if await already_rebalanced_today():
+                logger.info(
+                    "Already rebalanced today, skipping (post-lock check)",
+                    correlation_id=correlation_id,
+                )
+                return
             response = await run_rebalance(
                 alpaca_client,
                 configuration,

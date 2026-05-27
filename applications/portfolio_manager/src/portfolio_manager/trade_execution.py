@@ -223,7 +223,9 @@ def _try_open_single_position(  # noqa: PLR0911
                 deducting=buying_power_cost,
             )
             new_buying_power = remaining_buying_power - buying_power_cost
-        submitted_quantity = short_qty if side == TradeSide.SELL else None
+        submitted_quantity = (
+            short_qty if side == TradeSide.SELL else position.get("quantity")
+        )
         return (  # noqa: TRY300
             {
                 **base_result,

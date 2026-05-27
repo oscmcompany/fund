@@ -230,7 +230,7 @@ async def save_rebalance(  # noqa: PLR0913
                                     and leg_entry_price > 0
                                     and leg_notional
                                 ):
-                                    submitted_qty = int(leg_notional / leg_entry_price)
+                                    submitted_qty = leg_notional / leg_entry_price
                                 if submitted_qty is not None and submitted_qty > 0:
                                     await connection.execute(
                                         """INSERT INTO equity_orders
@@ -301,10 +301,11 @@ async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
 async def save_closed_pair(record: dict[str, Any]) -> bool:
     try:
         closed_at = datetime.fromtimestamp(record["closed_timestamp"] // 1000, tz=UTC)
+        opened_at = datetime.fromtimestamp(record["entry_timestamp"] // 1000, tz=UTC)
 
         pool = await get_pool()
         async with pool.connection() as connection:
-            await connection.execute(
+            cursor = await connection.execute(
                 """UPDATE equity_pairs
                    SET status = 'closed',
                        closed_at = %s,
@@ -312,15 +313,23 @@ async def save_closed_pair(record: dict[str, Any]) -> bool:
                        return_percent = %s,
                        holding_days = %s
                    WHERE pair_id = %s
-                     AND status = 'open'""",
+                     AND status = 'open'
+                     AND opened_at = %s""",
                 (
                     closed_at,
                     record["realized_profit_and_loss"],
                     record["return_percent"],
                     record["holding_days"],
                     record["pair_id"],
+                    opened_at,
                 ),
             )
+            if cursor.rowcount == 0:
+                logger.warning(
+                    "Closed pair update matched no open row",
+                    pair_id=record["pair_id"],
+                )
+                return False
         logger.info("Saved closed pair record")
         return True  # noqa: TRY300
     except Exception as error:

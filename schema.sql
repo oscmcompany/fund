@@ -206,7 +206,7 @@ BEGIN
         ALTER TABLE equity_allocations ADD COLUMN notional NUMERIC;
         ALTER TABLE equity_allocations
             ADD CONSTRAINT equity_allocations_quantity_notional_check
-            CHECK (quantity IS NOT NULL OR notional IS NOT NULL);
+            CHECK (quantity IS NOT NULL OR notional IS NOT NULL) NOT VALID;
     END IF;
 END;
 $do$;
