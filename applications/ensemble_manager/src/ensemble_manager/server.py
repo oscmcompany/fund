@@ -309,7 +309,7 @@ async def _insert_predictions(
     pool = await get_pool()
     async with pool.connection() as connection, connection.cursor() as cursor:
         await cursor.executemany(
-            """INSERT INTO predictions
+            """INSERT INTO equity_predictions
                        (correlation_id, model_run_id, ticker, timestamp,
                         quantile_10, quantile_50, quantile_90)
                    VALUES (%s, %s, %s, %s, %s, %s, %s)

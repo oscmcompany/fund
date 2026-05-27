@@ -1,16 +1,13 @@
 import asyncio
-import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import polars as pl
 import pytest
 from fastapi import status
 from portfolio_manager.portfolio_state import (
     _PRIOR_ALLOCATION_SCHEMA,
     evaluate_prior_pairs,
-    get_prior_allocation,
 )
 from portfolio_manager.rebalance import (
     _prune_pairs_with_invalid_entry_price,
@@ -289,103 +286,6 @@ def test_evaluate_prior_pairs_holds_multiple_pairs_independently() -> None:
     assert result == {"AAPL", "MSFT"}
 
 
-# --- get_prior_allocation ---
-
-
-def _make_mock_http_client(mock_response: MagicMock) -> AsyncMock:
-    mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.get.return_value = mock_response
-    mock_client.post.return_value = mock_response
-    return mock_client
-
-
-def test_get_prior_allocation_returns_empty_dataframe_on_empty_array_response() -> None:
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.text = "[]"
-    mock_client = _make_mock_http_client(mock_response)
-    with patch(
-        "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
-    ):
-        result = asyncio.run(get_prior_allocation())
-    assert result.is_empty()
-    assert "pair_id" in result.columns
-
-
-def test_get_prior_allocation_returns_dataframe_with_pair_id_on_success() -> None:
-    data = [
-        {
-            "ticker": "AAPL",
-            "timestamp": 1735689600000,
-            "side": "LONG",
-            "dollar_amount": 1000.0,
-            "action": "OPEN_POSITION",
-            "pair_id": "AAPL-MSFT",
-        }
-    ]
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.text = json.dumps(data)
-    mock_response.json.return_value = data
-    mock_client = _make_mock_http_client(mock_response)
-    with patch(
-        "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
-    ):
-        result = asyncio.run(get_prior_allocation())
-    assert result.height == 1
-    assert "pair_id" in result.columns
-    assert result["pair_id"][0] == "AAPL-MSFT"
-
-
-def test_get_prior_allocation_raises_on_error_response() -> None:
-    mock_response = MagicMock()
-    mock_response.status_code = 500
-    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-        message="500 Internal Server Error",
-        request=MagicMock(),
-        response=mock_response,
-    )
-    mock_client = _make_mock_http_client(mock_response)
-    with (
-        patch(
-            "portfolio_manager.portfolio_state.httpx.AsyncClient",
-            return_value=mock_client,
-        ),
-        pytest.raises(httpx.HTTPStatusError),
-    ):
-        asyncio.run(get_prior_allocation())
-
-
-def test_get_prior_allocation_raises_on_parse_error() -> None:
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.raise_for_status.return_value = None
-    mock_response.text = '{"not": "a list"}'
-    mock_response.json.side_effect = ValueError("invalid json")
-    mock_client = _make_mock_http_client(mock_response)
-    with (
-        patch(
-            "portfolio_manager.portfolio_state.httpx.AsyncClient",
-            return_value=mock_client,
-        ),
-        pytest.raises(ValueError, match="invalid json"),
-    ):
-        asyncio.run(get_prior_allocation())
-
-
-def test_get_prior_allocation_returns_empty_dataframe_on_whitespace_response() -> None:
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_response.text = "  "
-    mock_client = _make_mock_http_client(mock_response)
-    with patch(
-        "portfolio_manager.portfolio_state.httpx.AsyncClient", return_value=mock_client
-    ):
-        result = asyncio.run(get_prior_allocation())
-    assert result.is_empty()
-
-
 # --- pair-level entry price filtering ---
 
 
@@ -529,7 +429,7 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
 )
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -566,15 +466,21 @@ def test_get_positions_close_count_matches_non_held_prior_tickers(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),
@@ -618,7 +524,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
 
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -655,15 +561,21 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),
@@ -707,7 +619,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -744,15 +656,21 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),
@@ -810,7 +728,7 @@ def test_run_rebalance_saves_only_opened_rows(
 
     asyncio.run(run_rebalance(mock_client))
 
-    saved_df = mock_save.call_args[0][0]
+    saved_df = mock_save.call_args.kwargs["successful_pair_rows"]
     saved_tickers = saved_df["ticker"].to_list()
     assert "NVDA" not in saved_tickers
     assert "AMD" not in saved_tickers
@@ -819,7 +737,7 @@ def test_run_rebalance_saves_only_opened_rows(
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -856,15 +774,21 @@ def test_run_rebalance_saves_only_opened_rows(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),
@@ -921,7 +845,7 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
 
     asyncio.run(run_rebalance(mock_client))
 
-    saved_df = mock_save.call_args[0][0]
+    saved_df = mock_save.call_args.kwargs["successful_pair_rows"]
     saved_tickers = saved_df["ticker"].to_list()
     assert "NVDA" in saved_tickers
     assert "AMD" in saved_tickers
@@ -934,15 +858,21 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
+    return_value=(pl.DataFrame(), None),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
 @patch(
     "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(),
 )
 def test_run_rebalance_empty_predictions_returns_200(
@@ -1022,29 +952,30 @@ def _make_mock_pool_with_fetchall(rows: list) -> MagicMock:
 
 def test_get_raw_predictions_returns_dataframe_with_correlation_id() -> None:
     rows = [
-        ("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0),
-        ("MSFT", 1_700_000_000_000, 280.0, 300.0, 320.0),
+        ("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0, "run-abc"),
+        ("MSFT", 1_700_000_000_000, 280.0, 300.0, 320.0, "run-abc"),
     ]
     mock_pool = _make_mock_pool_with_fetchall(rows)
 
     with patch(
         "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = asyncio.run(get_raw_predictions("abc-correlation-id"))
+        result, model_run_id = asyncio.run(get_raw_predictions("abc-correlation-id"))
 
     assert len(result) == 2  # noqa: PLR2004
     assert "ticker" in result.columns
     assert "quantile_50" in result.columns
+    assert model_run_id == "run-abc"
 
 
 def test_get_raw_predictions_returns_dataframe_without_correlation_id() -> None:
-    rows = [("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0)]
+    rows = [("AAPL", 1_700_000_000_000, 140.0, 150.0, 160.0, "run-xyz")]
     mock_pool = _make_mock_pool_with_fetchall(rows)
 
     with patch(
         "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = asyncio.run(get_raw_predictions())
+        result, _ = asyncio.run(get_raw_predictions())
 
     assert len(result) == 1
 
@@ -1055,11 +986,12 @@ def test_get_raw_predictions_returns_empty_dataframe_when_no_rows() -> None:
     with patch(
         "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = asyncio.run(get_raw_predictions("no-results-id"))
+        result, model_run_id = asyncio.run(get_raw_predictions("no-results-id"))
 
     assert len(result) == 0
     assert "ticker" in result.columns
     assert "quantile_10" in result.columns
+    assert model_run_id is None
 
 
 # --- get_optimal_portfolio ---
@@ -1212,7 +1144,7 @@ def test_record_performance_closes_pairs_and_records_snapshot() -> None:
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=False,
 )
@@ -1249,12 +1181,21 @@ def test_record_performance_closes_pairs_and_records_snapshot() -> None:
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
-@patch("portfolio_manager.rebalance.fetch_equity_details", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),
@@ -1318,7 +1259,7 @@ def test_run_rebalance_returns_207_when_save_allocation_fails(
 @patch("portfolio_manager.rebalance.execute_open_positions")
 @patch("portfolio_manager.rebalance._record_performance", new_callable=AsyncMock)
 @patch(
-    "portfolio_manager.rebalance.save_allocation",
+    "portfolio_manager.rebalance.save_rebalance",
     new_callable=AsyncMock,
     return_value=True,
 )
@@ -1355,12 +1296,21 @@ def test_run_rebalance_returns_207_when_save_allocation_fails(
 @patch(
     "portfolio_manager.rebalance.get_raw_predictions",
     new_callable=AsyncMock,
-    return_value=pl.DataFrame({"ticker": ["NVDA"]}),
+    return_value=(pl.DataFrame({"ticker": ["NVDA"]}), None),
 )
-@patch("portfolio_manager.rebalance.fetch_spy_prices", return_value=pl.DataFrame())
-@patch("portfolio_manager.rebalance.fetch_equity_details", return_value=pl.DataFrame())
+@patch(
+    "portfolio_manager.rebalance.fetch_spy_prices",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
+@patch(
+    "portfolio_manager.rebalance.fetch_equity_details",
+    new_callable=AsyncMock,
+    return_value=pl.DataFrame(),
+)
 @patch(
     "portfolio_manager.rebalance.fetch_historical_prices",
+    new_callable=AsyncMock,
     return_value=pl.DataFrame(
         schema={"ticker": pl.Utf8, "timestamp": pl.Float64, "close_price": pl.Float64}
     ),

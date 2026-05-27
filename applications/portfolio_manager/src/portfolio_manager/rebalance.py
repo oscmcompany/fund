@@ -21,13 +21,12 @@ from .performance import (
 )
 from .portfolio_schema import pairs_schema, portfolio_schema
 from .portfolio_state import (
-    DATA_MANAGER_BASE_URL,
     evaluate_prior_pairs,
     get_last_portfolio_value,
     get_prior_allocation,
-    save_allocation,
     save_closed_pair,
     save_performance_snapshot,
+    save_rebalance,
 )
 from .regime import classify_regime
 from .risk_management import size_pairs_with_volatility_parity
@@ -61,6 +60,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     alpaca_client: AlpacaClient,
     configuration: Configuration | None = None,
     correlation_id: str | None = None,
+    trigger_reason: str = "manual",
 ) -> Response:
     if configuration is None:
         configuration = Configuration()
@@ -86,11 +86,9 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        historical_prices = fetch_historical_prices(
-            DATA_MANAGER_BASE_URL, current_timestamp
-        )
-        equity_details = fetch_equity_details(DATA_MANAGER_BASE_URL)
-        spy_prices = fetch_spy_prices(DATA_MANAGER_BASE_URL, current_timestamp)
+        historical_prices = await fetch_historical_prices(current_timestamp)
+        equity_details = await fetch_equity_details()
+        spy_prices = await fetch_spy_prices(current_timestamp)
         logger.info(
             "Retrieved historical data",
             prices_count=historical_prices.height,
@@ -104,7 +102,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        ensemble_predictions = await get_raw_predictions(correlation_id)
+        ensemble_predictions, model_run_id = await get_raw_predictions(correlation_id)
         logger.info("Retrieved predictions", count=len(ensemble_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
@@ -324,7 +322,14 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     )
     held_rows = prior_allocation.filter(pl.col("ticker").is_in(held_tickers))
     final_allocation = pl.concat([successful_open_rows, held_rows], how="diagonal")
-    save_succeeded = await save_allocation(final_allocation, current_timestamp)
+    save_succeeded = await save_rebalance(
+        triggered_at=current_timestamp,
+        trigger_reason=trigger_reason,
+        model_run_id=model_run_id,
+        successful_pair_rows=successful_open_rows,
+        candidate_pairs=candidate_pairs,
+        open_results=open_results,
+    )
 
     all_results = close_results + open_results
     failed_trades = [r for r in all_results if r["status"] == "failed"]
@@ -367,16 +372,20 @@ async def get_latest_predictions_correlation_id() -> str | None:
     pool = await get_pool()
     async with pool.connection() as connection:
         result = await connection.execute(
-            "SELECT correlation_id FROM predictions ORDER BY created_at DESC LIMIT 1"
+            "SELECT correlation_id FROM equity_predictions"
+            " ORDER BY created_at DESC LIMIT 1"
         )
         row = await result.fetchone()
     return str(row[0]) if row else None
 
 
-async def get_raw_predictions(correlation_id: str | None = None) -> pl.DataFrame:
+async def get_raw_predictions(
+    correlation_id: str | None = None,
+) -> tuple[pl.DataFrame, str | None]:
     """Query predictions from PostgreSQL for the given correlation_id.
 
     If correlation_id is None, uses the most recently inserted set of predictions.
+    Returns (predictions_dataframe, model_run_id).
     """
     pool = await get_pool()
     async with pool.connection() as connection:
@@ -384,8 +393,8 @@ async def get_raw_predictions(correlation_id: str | None = None) -> pl.DataFrame
             result = await connection.execute(
                 """SELECT ticker,
                           EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
-                          quantile_10, quantile_50, quantile_90
-                   FROM predictions
+                          quantile_10, quantile_50, quantile_90, model_run_id
+                   FROM equity_predictions
                    WHERE correlation_id = %s
                    ORDER BY ticker, timestamp""",
                 (correlation_id,),
@@ -394,10 +403,10 @@ async def get_raw_predictions(correlation_id: str | None = None) -> pl.DataFrame
             result = await connection.execute(
                 """SELECT ticker,
                           EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
-                          quantile_10, quantile_50, quantile_90
-                   FROM predictions
+                          quantile_10, quantile_50, quantile_90, model_run_id
+                   FROM equity_predictions
                    WHERE correlation_id = (
-                       SELECT correlation_id FROM predictions
+                       SELECT correlation_id FROM equity_predictions
                        ORDER BY created_at DESC LIMIT 1
                    )
                    ORDER BY ticker, timestamp"""
@@ -405,24 +414,31 @@ async def get_raw_predictions(correlation_id: str | None = None) -> pl.DataFrame
         rows = await result.fetchall()
 
     if not rows:
-        return pl.DataFrame(
-            schema={
-                "ticker": pl.String,
-                "timestamp": pl.Int64,
-                "quantile_10": pl.Float64,
-                "quantile_50": pl.Float64,
-                "quantile_90": pl.Float64,
-            }
+        return (
+            pl.DataFrame(
+                schema={
+                    "ticker": pl.String,
+                    "timestamp": pl.Int64,
+                    "quantile_10": pl.Float64,
+                    "quantile_50": pl.Float64,
+                    "quantile_90": pl.Float64,
+                }
+            ),
+            None,
         )
 
-    return pl.DataFrame(
-        {
-            "ticker": [row[0] for row in rows],
-            "timestamp": [row[1] for row in rows],
-            "quantile_10": [row[2] for row in rows],
-            "quantile_50": [row[3] for row in rows],
-            "quantile_90": [row[4] for row in rows],
-        }
+    model_run_id = str(rows[0][5]) if rows[0][5] is not None else None
+    return (
+        pl.DataFrame(
+            {
+                "ticker": [row[0] for row in rows],
+                "timestamp": [row[1] for row in rows],
+                "quantile_10": [row[2] for row in rows],
+                "quantile_50": [row[3] for row in rows],
+                "quantile_90": [row[4] for row in rows],
+            }
+        ),
+        model_run_id,
     )
 
 

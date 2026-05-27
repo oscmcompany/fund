@@ -171,6 +171,9 @@ def build_performance_snapshot(  # noqa: PLR0913
     period_return: float,
     open_pair_count: int,
     timestamp: datetime,
+    gross_return: float = 0.0,
+    net_return: float = 0.0,
+    total_slippage_cost: float = 0.0,
 ) -> dict[str, Any]:
     return {
         "timestamp": int(timestamp.timestamp() * 1000),
@@ -179,6 +182,9 @@ def build_performance_snapshot(  # noqa: PLR0913
         "spy_close": spy_close,
         "period_return_percent": period_return,
         "open_pair_count": open_pair_count,
+        "gross_return": gross_return,
+        "net_return": net_return,
+        "total_slippage_cost": total_slippage_cost,
     }
 
 
