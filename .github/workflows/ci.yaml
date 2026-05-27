@@ -40,3 +40,9 @@ jobs:
           restore-keys: uv-
       - name: Run all CI checks
         run: devenv --secretspec-provider env --secretspec-profile development tasks run --mode before checks:ci
+      - name: Show Python coverage report
+        if: always()
+        run: |
+          if [ -f .coverage_output/python_report.txt ]; then
+            cat .coverage_output/python_report.txt
+          fi
