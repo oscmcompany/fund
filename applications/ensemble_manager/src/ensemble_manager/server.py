@@ -467,11 +467,8 @@ async def _run_predictions_from_event(app: FastAPI) -> None:
     if _inference_lock.locked():
         logger.info("Inference already in progress, skipping predictions_requested")
         return
-    await _inference_lock.acquire()
-    try:
+    async with _inference_lock:
         await _run_predictions_from_event_inner(app)
-    finally:
-        _inference_lock.release()
 
 
 async def _run_predictions_from_event_inner(app: FastAPI) -> None:  # noqa: PLR0915

@@ -101,9 +101,27 @@ async def listen_for_events(
         async for notification in connection.notifies():
             try:
                 data = json.loads(notification.payload)
-                event_type: str = data["event_type"]
-                event_id: int = data["event_id"]
-                event_payload: dict[str, Any] = data.get("payload") or {}
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "Ignoring malformed event notification",
+                        channel=channel,
+                        payload=notification.payload,
+                    )
+                    continue
+                event_type = data.get("event_type")
+                event_id = data.get("event_id")
+                event_payload = data.get("payload") or {}
+                if (
+                    not isinstance(event_type, str)
+                    or not isinstance(event_id, int)
+                    or not isinstance(event_payload, dict)
+                ):
+                    logger.warning(
+                        "Ignoring malformed event notification",
+                        channel=channel,
+                        payload=notification.payload,
+                    )
+                    continue
                 await handler(event_type, event_id, event_payload)
             except Exception:
                 logger.exception(
