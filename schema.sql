@@ -270,6 +270,9 @@ CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp
     ON equity_portfolio_snapshots (snapshot_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp
     ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_eod_date
+    ON equity_portfolio_snapshots ((snapshot_timestamp::date))
+    WHERE snapshot_type = 'eod';
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
@@ -453,6 +456,16 @@ BEGIN
 END;
 $do$;
 
+-- Remove legacy archive-quotes cron job and function on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.unschedule('archive-quotes');
+    END IF;
+END;
+$do$;
+DROP FUNCTION IF EXISTS archive_equity_quotes();
+
 -- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
 -- and after 4 PM Eastern market close in both EDT and EST)
 -- Only scheduled when pg_parquet is available; export_equity_quotes() also guards at runtime.
@@ -514,12 +527,22 @@ BEGIN
         to_char(export_date, 'DD')
     );
     EXECUTE format(
-        'COPY (SELECT * FROM equity_bars WHERE timestamp >= %L) TO %L',
-        (export_date - INTERVAL '120 days')::timestamptz,
+        'COPY (SELECT * FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        export_date::timestamptz,
+        (export_date + INTERVAL '1 day')::timestamptz,
         s3_path
     );
 END;
 $$ LANGUAGE plpgsql;
+
+-- Remove legacy export-training-parquet cron job on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-training-parquet') THEN
+        PERFORM cron.unschedule('export-training-parquet');
+    END IF;
+END;
+$do$;
 
 -- Nightly equity bars export: weekdays at 21:30 UTC
 -- Only scheduled when pg_parquet is available; export_equity_bars() also guards at runtime.
@@ -571,6 +594,15 @@ BEGIN
         base_path || '/portfolio_snapshots.parquet');
 END;
 $$ LANGUAGE plpgsql;
+
+-- Remove legacy backup-trading-history cron job on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-trading-history') THEN
+        PERFORM cron.unschedule('backup-trading-history');
+    END IF;
+END;
+$do$;
 
 -- Nightly trading history export: weekdays at 21:45 UTC (after record-eod-snapshot at 21:15 so today's snapshot is included).
 -- Only scheduled when pg_parquet is available; export_trading_history() also guards at runtime.

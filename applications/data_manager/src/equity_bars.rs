@@ -1,7 +1,6 @@
 use crate::data::EquityBar;
 use crate::database;
 use crate::state::State;
-use crate::storage::query_equity_bars_parquet_from_s3;
 use axum::{
     body::Body,
     extract::{Json, Query, State as AxumState},
@@ -17,13 +16,6 @@ use tracing::{debug, info, warn};
 #[derive(Deserialize)]
 pub struct DailySync {
     pub date: DateTime<Utc>,
-}
-
-#[derive(Deserialize)]
-pub struct QueryParameters {
-    tickers: Option<String>,
-    start_timestamp: Option<DateTime<Utc>>,
-    end_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -51,73 +43,6 @@ struct MassiveResponse {
     results_count: u64,
     status: String,
     results: Option<Vec<BarResult>>,
-}
-
-pub async fn query(
-    AxumState(state): AxumState<State>,
-    Query(parameters): Query<QueryParameters>,
-) -> impl IntoResponse {
-    info!(
-        "Querying equity data from S3 partitioned files, tickers: {:?}, start: {:?}, end: {:?}",
-        parameters.tickers, parameters.start_timestamp, parameters.end_timestamp
-    );
-
-    let tickers: Option<Vec<String>> = match &parameters.tickers {
-        Some(tickers_str) if !tickers_str.is_empty() => {
-            let vec: Vec<String> = tickers_str
-                .split(',')
-                .map(|s| s.trim().to_uppercase())
-                .collect();
-            if vec.is_empty() {
-                debug!("Ticker list was empty after parsing");
-                None
-            } else {
-                debug!("Parsed {} tickers: {:?}", vec.len(), vec);
-                Some(vec)
-            }
-        }
-        _ => {
-            debug!("No tickers specified, querying all");
-            None
-        }
-    };
-
-    match query_equity_bars_parquet_from_s3(
-        &state,
-        tickers,
-        parameters.start_timestamp,
-        parameters.end_timestamp,
-    )
-    .await
-    {
-        Ok(parquet_data) => {
-            info!(
-                "Query successful, returning {} bytes of parquet data",
-                parquet_data.len()
-            );
-            let mut response = Response::new(Body::from(parquet_data));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                "application/octet-stream".parse().unwrap(),
-            );
-            response.headers_mut().insert(
-                "Content-Disposition",
-                "attachment; filename=\"equity_data.parquet\""
-                    .parse()
-                    .unwrap(),
-            );
-            *response.status_mut() = StatusCode::OK;
-            response
-        }
-        Err(err) => {
-            warn!("Failed to query S3 data: {}", err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Query failed: {}", err),
-            )
-                .into_response()
-        }
-    }
 }
 
 pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Option<usize>, String> {
@@ -249,9 +174,12 @@ pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Opti
             })
             .collect();
 
-        if let Err(error) = database::insert_equity_bars(pool, &equity_bars).await {
-            warn!("Failed to write equity bars to PostgreSQL: {}", error);
-        }
+        database::insert_equity_bars(pool, &equity_bars)
+            .await
+            .map_err(|error| {
+                warn!("Failed to write equity bars to PostgreSQL: {}", error);
+                format!("Failed to insert equity bars: {}", error)
+            })?;
     }
 
     Ok(Some(bar_count))

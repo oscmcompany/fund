@@ -17,7 +17,6 @@ pub fn create_app_with_state(state: State) -> Router {
     Router::new()
         .route("/health", get(health::get_health))
         .route("/equity-bars", post(equity_bars::sync))
-        .route("/equity-bars", get(equity_bars::query))
         .route("/equity-bars/recent", get(equity_bars::query_recent))
         .route("/equity-details", get(equity_details::get))
         .route("/equity-details", post(equity_details::sync))

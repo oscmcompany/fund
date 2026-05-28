@@ -655,7 +655,7 @@ def test_handle_eod_snapshot_uses_zero_return_when_no_previous_value() -> None:
     assert snapshot["gross_return"] == pytest.approx(0.0)
 
 
-def test_handle_eod_snapshot_logs_warning_when_save_fails() -> None:
+def test_handle_eod_snapshot_raises_when_save_fails() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.get_account.return_value = AlpacaAccount(
         cash_amount=500.0,
@@ -673,21 +673,25 @@ def test_handle_eod_snapshot_logs_warning_when_save_fails() -> None:
                 "portfolio_manager.scheduler.save_performance_snapshot",
                 AsyncMock(return_value=False),
             ),
-            patch("portfolio_manager.scheduler.logger") as mock_logger,
+            pytest.raises(
+                RuntimeError, match="Failed to persist EOD performance snapshot"
+            ),
         ):
             await _handle_eod_snapshot_requested(mock_alpaca)
-            mock_logger.warning.assert_called_once()
 
     asyncio.run(run())
 
 
-def test_handle_eod_snapshot_logs_exception_on_account_error() -> None:
+def test_handle_eod_snapshot_raises_on_account_error() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.get_account.side_effect = RuntimeError("alpaca down")
 
     async def run() -> None:
-        with patch("portfolio_manager.scheduler.logger") as mock_logger:
+        with (
+            patch("portfolio_manager.scheduler.logger") as mock_logger,
+            pytest.raises(RuntimeError, match="alpaca down"),
+        ):
             await _handle_eod_snapshot_requested(mock_alpaca)
-            mock_logger.exception.assert_called_once()
+        mock_logger.exception.assert_called_once()
 
     asyncio.run(run())

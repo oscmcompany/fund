@@ -93,6 +93,8 @@ in {
     # S3 bucket names derived from FUND_PROFILE
     AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
     AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
+    AWS_S3_TRAINING_BUCKET_NAME = "fund-${bucketSlug}-training";
+    AWS_S3_COLD_STORAGE_BUCKET_NAME = "fund-${bucketSlug}-cold-storage";
 
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";

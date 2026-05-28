@@ -84,7 +84,7 @@ async def _handle_eod_snapshot_requested(alpaca_client: AlpacaClient) -> None:
         logger.exception(
             "Failed to fetch account data for EOD snapshot", error=str(error)
         )
-        return
+        raise
 
     portfolio_value = float(account.equity)
     previous_value = await get_last_portfolio_value()
@@ -103,13 +103,13 @@ async def _handle_eod_snapshot_requested(alpaca_client: AlpacaClient) -> None:
     }
     saved = await save_performance_snapshot(snapshot, snapshot_type="eod")
     if not saved:
-        logger.warning("Failed to persist EOD performance snapshot")
-    else:
-        logger.info(
-            "Saved EOD performance snapshot",
-            portfolio_value=portfolio_value,
-            eod_return=eod_return,
-        )
+        message = "Failed to persist EOD performance snapshot"
+        raise RuntimeError(message)
+    logger.info(
+        "Saved EOD performance snapshot",
+        portfolio_value=portfolio_value,
+        eod_return=eod_return,
+    )
 
 
 async def _handle_equity_bars_synced() -> None:
@@ -230,11 +230,7 @@ async def _event_listener_loop(
                     await update_consumer_offset(consumer_name, event_id)
                 elif event_type == "eod_snapshot_requested":
                     logger.info("Received eod_snapshot_requested event")
-                    task = asyncio.create_task(
-                        _handle_eod_snapshot_requested(alpaca_client)
-                    )
-                    _background_tasks.add(task)
-                    task.add_done_callback(_background_tasks.discard)
+                    await _handle_eod_snapshot_requested(alpaca_client)
                     await update_consumer_offset(consumer_name, event_id)
 
             await listen_for_events("events", handler)
