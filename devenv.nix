@@ -469,8 +469,6 @@ in {
 
   profiles.apps.module = {
     env = {
-      FUND_DATA_MANAGER_BASE_URL = "http://localhost:8080";
-      FUND_ENSEMBLE_MANAGER_BASE_URL = "http://localhost:8082";
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
@@ -512,10 +510,10 @@ in {
         waitForDataManager = ''
           attempt=0
           max_attempts=90
-          while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
+              echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
               exit 1
             fi
             sleep 2
@@ -541,16 +539,13 @@ in {
         waitForDeps = ''
           attempt=0
           max_attempts=90
-          for endpoint in http://localhost:8080/health http://localhost:8082/health; do
-            attempt=0
-            while ! curl -sf "$endpoint" > /dev/null 2>&1; do
-              attempt=$((attempt + 1))
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "Dependency $endpoint did not become healthy after $((max_attempts * 2)) seconds"
-                exit 1
-              fi
-              sleep 2
-            done
+          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
+              exit 1
+            fi
+            sleep 2
           done
         '';
         uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";

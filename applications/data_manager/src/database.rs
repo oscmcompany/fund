@@ -40,13 +40,10 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
             .iter()
             .map(|bar| match bar.transactions {
                 Some(transactions) => i64::try_from(transactions).map(Some).map_err(|_| {
-                    sqlx::Error::Protocol(
-                        format!(
-                            "transactions value {} for {} at {} exceeds BIGINT",
-                            transactions, bar.ticker, bar.timestamp
-                        )
-                        .into(),
-                    )
+                    sqlx::Error::Protocol(format!(
+                        "transactions value {} for {} at {} exceeds BIGINT",
+                        transactions, bar.ticker, bar.timestamp
+                    ))
                 }),
                 None => Ok(None),
             })
@@ -328,6 +325,39 @@ pub async fn set_data_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(),
     Ok(())
 }
 
+pub async fn set_training_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
+    let alter_statement: String = sqlx::query_scalar(
+        r#"SELECT format('ALTER DATABASE %I SET "app.training_bucket_name" = %L', current_database(), $1)"#,
+    )
+    .bind(bucket_name)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(&alter_statement).execute(pool).await?;
+    info!(
+        "Set app.training_bucket_name database GUC to {}",
+        bucket_name
+    );
+    Ok(())
+}
+
+pub async fn set_cold_storage_bucket_guc(
+    pool: &PgPool,
+    bucket_name: &str,
+) -> Result<(), sqlx::Error> {
+    let alter_statement: String = sqlx::query_scalar(
+        r#"SELECT format('ALTER DATABASE %I SET "app.cold_storage_bucket_name" = %L', current_database(), $1)"#,
+    )
+    .bind(bucket_name)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(&alter_statement).execute(pool).await?;
+    info!(
+        "Set app.cold_storage_bucket_name database GUC to {}",
+        bucket_name
+    );
+    Ok(())
+}
+
 pub async fn requeue_stale_claimed_jobs(
     pool: &PgPool,
     job_name: &str,
@@ -491,6 +521,34 @@ mod tests {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = set_data_bucket_guc(&pool, "test-bucket").await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_set_training_bucket_guc_compiles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = set_training_bucket_guc(&pool, "test-training-bucket").await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_set_cold_storage_bucket_guc_compiles() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = set_cold_storage_bucket_guc(&pool, "test-cold-storage-bucket").await;
             assert!(result.is_err());
         });
     }

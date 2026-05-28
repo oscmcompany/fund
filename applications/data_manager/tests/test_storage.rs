@@ -2,18 +2,12 @@ mod common;
 
 use chrono::{TimeZone, Utc};
 use data_manager::{
-    data::{
-        create_allocation_dataframe, create_equity_bar_dataframe, create_predictions_dataframe,
-        Allocation, EquityBar, Prediction,
-    },
+    data::{create_equity_bar_dataframe, EquityBar},
     state::{MassiveSecrets, State},
     storage::{
-        date_to_int, escape_sql_ticker, format_performance_s3_key, format_s3_key, is_valid_ticker,
-        query_allocation_dataframe_from_s3, query_equity_bars_parquet_from_s3,
-        query_predictions_dataframe_from_s3, read_equity_details_dataframe_from_s3,
-        sanitize_duckdb_config_value, write_allocation_dataframe_to_s3,
-        write_equity_bars_dataframe_to_s3, write_equity_details_dataframe_to_s3,
-        write_predictions_dataframe_to_s3, PredictionQuery, DUCKDB_CONFIG_VALUE_MAX_LENGTH,
+        date_to_int, escape_sql_ticker, is_valid_ticker, query_equity_bars_parquet_from_s3,
+        read_equity_details_dataframe_from_s3, sanitize_duckdb_config_value,
+        DUCKDB_CONFIG_VALUE_MAX_LENGTH,
     },
 };
 use polars::prelude::*;
@@ -21,28 +15,6 @@ use serial_test::serial;
 use std::io::Cursor;
 
 use common::{create_test_s3_client, put_test_object, setup_test_bucket, test_bucket_name};
-
-fn sample_prediction() -> Prediction {
-    Prediction {
-        ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600_000,
-        quantile_10: 190.0,
-        quantile_50: 200.0,
-        quantile_90: 210.0,
-    }
-}
-
-fn sample_allocation() -> Allocation {
-    Allocation {
-        ticker: "AAPL".to_string(),
-        timestamp: 1_735_689_600_000,
-        side: "LONG".to_string(),
-        dollar_amount: 10_000.0,
-        action: "BUY".to_string(),
-        pair_id: "AAPL-MSFT".to_string(),
-        entry_price: Some(150.0),
-    }
-}
 
 fn sample_equity_bar() -> EquityBar {
     EquityBar {
@@ -76,6 +48,25 @@ async fn create_state(endpoint: &str) -> State {
     )
 }
 
+async fn seed_equity_bars_parquet(
+    s3: &aws_sdk_s3::Client,
+    bars: Vec<EquityBar>,
+    timestamp: &chrono::DateTime<Utc>,
+) {
+    let mut dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut dataframe)
+        .unwrap();
+    let key = format!(
+        "equity/bars/daily/year={}/month={}/day={}/data.parquet",
+        timestamp.format("%Y"),
+        timestamp.format("%m"),
+        timestamp.format("%d")
+    );
+    put_test_object(s3, &key, buffer).await;
+}
+
 #[test]
 fn test_is_valid_ticker() {
     assert!(is_valid_ticker("AAPL"));
@@ -85,17 +76,6 @@ fn test_is_valid_ticker() {
     assert!(!is_valid_ticker(""));
     assert!(!is_valid_ticker("AAPL$"));
     assert!(!is_valid_ticker("AAPL;DROP"));
-}
-
-#[test]
-fn test_format_s3_key() {
-    let timestamp = fixed_date_time();
-    let key = format_s3_key(&timestamp, "predictions");
-
-    assert_eq!(
-        key,
-        "equity/predictions/daily/year=2025/month=01/day=01/data.parquet"
-    );
 }
 
 #[test]
@@ -112,175 +92,12 @@ fn test_escape_sql_ticker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_write_and_query_predictions_round_trip() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-    let timestamp = fixed_date_time();
-
-    let predictions_dataframe = create_predictions_dataframe(vec![sample_prediction()]).unwrap();
-    let s3_key = write_predictions_dataframe_to_s3(&state, &predictions_dataframe, &timestamp)
-        .await
-        .unwrap();
-
-    assert_eq!(
-        s3_key,
-        "equity/predictions/daily/year=2025/month=01/day=01/data.parquet"
-    );
-
-    let query_results = query_predictions_dataframe_from_s3(
-        &state,
-        vec![PredictionQuery {
-            ticker: "AAPL".to_string(),
-            timestamp: timestamp.timestamp_millis(),
-        }],
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(query_results.height(), 1);
-    assert_eq!(
-        query_results
-            .column("ticker")
-            .unwrap()
-            .str()
-            .unwrap()
-            .get(0),
-        Some("AAPL")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_query_predictions_returns_empty_dataframe_when_no_rows_match() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-    let timestamp = fixed_date_time();
-
-    let predictions_dataframe = create_predictions_dataframe(vec![sample_prediction()]).unwrap();
-    write_predictions_dataframe_to_s3(&state, &predictions_dataframe, &timestamp)
-        .await
-        .unwrap();
-
-    let query_results = query_predictions_dataframe_from_s3(
-        &state,
-        vec![PredictionQuery {
-            ticker: "MSFT".to_string(),
-            timestamp: timestamp.timestamp_millis(),
-        }],
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(query_results.height(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_query_predictions_errors_when_query_positions_are_empty() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-
-    let result = query_predictions_dataframe_from_s3(&state, vec![]).await;
-
-    assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("No positions provided"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_write_and_query_allocation_round_trip() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-    let timestamp = fixed_date_time();
-
-    let allocation_dataframe = create_allocation_dataframe(vec![sample_allocation()]).unwrap();
-    write_allocation_dataframe_to_s3(&state, &allocation_dataframe, &timestamp)
-        .await
-        .unwrap();
-
-    let query_results = query_allocation_dataframe_from_s3(&state, Some(timestamp))
-        .await
-        .unwrap();
-
-    assert_eq!(query_results.height(), 1);
-    assert_eq!(
-        query_results
-            .column("ticker")
-            .unwrap()
-            .str()
-            .unwrap()
-            .get(0),
-        Some("AAPL")
-    );
-    assert_eq!(
-        query_results
-            .column("action")
-            .unwrap()
-            .str()
-            .unwrap()
-            .get(0),
-        Some("BUY")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_query_allocation_without_timestamp_uses_latest_partition() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-
-    let old_timestamp = Utc.with_ymd_and_hms(2024, 12, 31, 0, 0, 0).unwrap();
-    let new_timestamp = fixed_date_time();
-
-    let old_allocation = Allocation {
-        ticker: "OLD".to_string(),
-        ..sample_allocation()
-    };
-    let new_allocation = Allocation {
-        ticker: "NEW".to_string(),
-        ..sample_allocation()
-    };
-
-    let old_dataframe = create_allocation_dataframe(vec![old_allocation]).unwrap();
-    let new_dataframe = create_allocation_dataframe(vec![new_allocation]).unwrap();
-
-    write_allocation_dataframe_to_s3(&state, &old_dataframe, &old_timestamp)
-        .await
-        .unwrap();
-    write_allocation_dataframe_to_s3(&state, &new_dataframe, &new_timestamp)
-        .await
-        .unwrap();
-
-    let query_results = query_allocation_dataframe_from_s3(&state, None)
-        .await
-        .unwrap();
-
-    assert_eq!(query_results.height(), 1);
-    assert_eq!(
-        query_results
-            .column("ticker")
-            .unwrap()
-            .str()
-            .unwrap()
-            .get(0),
-        Some("NEW")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 async fn test_write_and_query_equity_bars_round_trip() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
-    let bars_dataframe = create_equity_bar_dataframe(vec![sample_equity_bar()]).unwrap();
-    write_equity_bars_dataframe_to_s3(&state, &bars_dataframe, &timestamp)
-        .await
-        .unwrap();
+    seed_equity_bars_parquet(&s3, vec![sample_equity_bar()], &timestamp).await;
 
     let parquet_bytes = query_equity_bars_parquet_from_s3(
         &state,
@@ -399,17 +216,12 @@ async fn test_read_equity_details_dataframe_from_s3_returns_error_for_invalid_ut
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_equity_bars_without_date_range_uses_defaults() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
-    // Use fixed date to avoid flakiness from midnight rollover
     let test_date = fixed_date_time();
-    let bars_dataframe = create_equity_bar_dataframe(vec![sample_equity_bar()]).unwrap();
-    write_equity_bars_dataframe_to_s3(&state, &bars_dataframe, &test_date)
-        .await
-        .unwrap();
+    seed_equity_bars_parquet(&s3, vec![sample_equity_bar()], &test_date).await;
 
-    // Query with explicit date range around test_date to ensure deterministic results
     let parquet_bytes = query_equity_bars_parquet_from_s3(
         &state,
         Some(vec!["AAPL".to_string()]),
@@ -427,24 +239,23 @@ async fn test_query_equity_bars_without_date_range_uses_defaults() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_query_equity_bars_without_ticker_filter_returns_all() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
+    let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
     let timestamp = fixed_date_time();
 
-    let bars_dataframe = create_equity_bar_dataframe(vec![
-        sample_equity_bar(),
-        EquityBar {
-            ticker: "GOOGL".to_string(),
-            ..sample_equity_bar()
-        },
-    ])
-    .unwrap();
+    seed_equity_bars_parquet(
+        &s3,
+        vec![
+            sample_equity_bar(),
+            EquityBar {
+                ticker: "GOOGL".to_string(),
+                ..sample_equity_bar()
+            },
+        ],
+        &timestamp,
+    )
+    .await;
 
-    write_equity_bars_dataframe_to_s3(&state, &bars_dataframe, &timestamp)
-        .await
-        .unwrap();
-
-    // Query with None tickers — covers "No ticker filter applied" path
     let parquet_bytes = query_equity_bars_parquet_from_s3(
         &state,
         None,
@@ -479,61 +290,4 @@ fn test_sanitize_duckdb_config_value_rejects_injection() {
     assert!(sanitize_duckdb_config_value("").is_err());
     assert!(sanitize_duckdb_config_value(&"a".repeat(DUCKDB_CONFIG_VALUE_MAX_LENGTH + 1)).is_err());
     assert!(sanitize_duckdb_config_value("value;another").is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_write_equity_details_dataframe_to_s3_success() {
-    let (endpoint, _s3, _env_guard) = setup_test_bucket().await;
-    let state = create_state(&endpoint).await;
-
-    let dataframe = df!(
-        "ticker" => vec!["AAPL"],
-        "sector" => vec!["TECHNOLOGY"],
-        "industry" => vec!["CONSUMER ELECTRONICS"],
-    )
-    .unwrap();
-
-    let s3_key = write_equity_details_dataframe_to_s3(&state, &dataframe)
-        .await
-        .unwrap();
-
-    assert_eq!(s3_key, "equity/details/details.csv");
-
-    let read_back = read_equity_details_dataframe_from_s3(&state).await.unwrap();
-    assert_eq!(read_back.height(), 1);
-    assert_eq!(
-        read_back.column("ticker").unwrap().str().unwrap().get(0),
-        Some("AAPL")
-    );
-    assert_eq!(
-        read_back.column("sector").unwrap().str().unwrap().get(0),
-        Some("TECHNOLOGY")
-    );
-    assert_eq!(
-        read_back.column("industry").unwrap().str().unwrap().get(0),
-        Some("CONSUMER ELECTRONICS")
-    );
-}
-
-#[test]
-fn test_format_performance_s3_key_live() {
-    let timestamp = fixed_date_time();
-    let key = format_performance_s3_key(&timestamp, "live");
-
-    assert_eq!(
-        key,
-        "performance/live/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
-    );
-}
-
-#[test]
-fn test_format_performance_s3_key_closed_pairs() {
-    let timestamp = fixed_date_time();
-    let key = format_performance_s3_key(&timestamp, "closed_pairs");
-
-    assert_eq!(
-        key,
-        "performance/closed_pairs/year=2025/month=01/day=01/hour=00/minute=00/second=00/1735689600000.parquet"
-    );
 }

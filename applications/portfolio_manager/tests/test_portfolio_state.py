@@ -517,3 +517,53 @@ def test_get_last_portfolio_value_returns_none_on_db_error() -> None:
         result = asyncio.run(get_last_portfolio_value())
 
     assert result is None
+
+
+def test_save_performance_snapshot_eod_passes_return_values() -> None:
+    mock_pool = _make_pool_mock()
+    snapshot = {
+        "timestamp": 1704067200000,
+        "portfolio_value": 10500.0,
+        "gross_return": 0.05,
+        "net_return": 0.048,
+        "total_slippage_cost": 0.0,
+    }
+
+    with patch(
+        "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(save_performance_snapshot(snapshot, snapshot_type="eod"))
+
+    assert result is True
+    execute_call = (
+        mock_pool.connection.return_value.__aenter__.return_value.execute.call_args
+    )
+    args = execute_call[0][1]
+    assert args[1] == "eod"
+    assert args[3] == pytest.approx(0.05)
+    assert args[4] == pytest.approx(0.048)
+
+
+def test_save_performance_snapshot_intraday_sets_null_returns() -> None:
+    mock_pool = _make_pool_mock()
+    snapshot = {
+        "timestamp": 1704067200000,
+        "portfolio_value": 10500.0,
+        "gross_return": 0.05,
+        "net_return": 0.048,
+        "total_slippage_cost": 2.0,
+    }
+
+    with patch(
+        "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(save_performance_snapshot(snapshot))
+
+    assert result is True
+    execute_call = (
+        mock_pool.connection.return_value.__aenter__.return_value.execute.call_args
+    )
+    args = execute_call[0][1]
+    assert args[1] == "intraday"
+    assert args[3] is None
+    assert args[4] is None

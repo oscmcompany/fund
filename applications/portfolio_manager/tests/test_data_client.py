@@ -129,22 +129,6 @@ def test_fetch_historical_prices_filters_by_tickers_when_provided() -> None:
     assert "ANY(%s)" in call_args[0][0]
 
 
-def test_fetch_historical_prices_accepts_datamanager_base_url_shim() -> None:
-    mock_pool = _make_pool_mock([])
-
-    with patch(
-        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(
-            fetch_historical_prices(
-                datetime(2024, 1, 2, tzinfo=UTC),
-                datamanager_base_url="http://ignored",
-            )
-        )
-
-    assert result.is_empty()
-
-
 # --- fetch_equity_details ---
 
 
@@ -192,19 +176,6 @@ def test_fetch_equity_details_raises_on_db_error() -> None:
         pytest.raises(PriceDataUnavailableError),
     ):
         asyncio.run(fetch_equity_details())
-
-
-def test_fetch_equity_details_accepts_datamanager_base_url_shim() -> None:
-    mock_pool = _make_pool_mock([])
-
-    with patch(
-        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(
-            fetch_equity_details(datamanager_base_url="http://ignored")
-        )
-
-    assert result.is_empty()
 
 
 # --- fetch_spy_prices ---
@@ -285,19 +256,3 @@ def test_fetch_spy_prices_raises_on_db_error() -> None:
         pytest.raises(PriceDataUnavailableError),
     ):
         asyncio.run(fetch_spy_prices(datetime(2024, 1, 1, tzinfo=UTC)))
-
-
-def test_fetch_spy_prices_accepts_datamanager_base_url_shim() -> None:
-    mock_pool = _make_pool_mock([])
-
-    with patch(
-        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(
-            fetch_spy_prices(
-                datetime(2024, 1, 3, tzinfo=UTC),
-                datamanager_base_url="http://ignored",
-            )
-        )
-
-    assert result.is_empty()

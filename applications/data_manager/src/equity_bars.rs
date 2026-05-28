@@ -1,7 +1,7 @@
 use crate::data::EquityBar;
 use crate::database;
 use crate::state::State;
-use crate::storage::{query_equity_bars_parquet_from_s3, write_equity_bars_dataframe_to_s3};
+use crate::storage::query_equity_bars_parquet_from_s3;
 use axum::{
     body::Body,
     extract::{Json, Query, State as AxumState},
@@ -120,10 +120,7 @@ pub async fn query(
     }
 }
 
-pub async fn fetch_and_store(
-    state: &State,
-    date: &DateTime<Utc>,
-) -> Result<Option<String>, String> {
+pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Option<usize>, String> {
     let massive_api_key = state.massive.key.clone();
 
     let date_str = date.with_timezone(&Eastern).format("%Y-%m-%d").to_string();
@@ -223,74 +220,7 @@ pub async fn fetch_and_store(
 
     info!("Successfully parsed {} bar results", bars.len());
 
-    let tickers: Vec<String> = bars.iter().map(|b| b.ticker.clone()).collect();
-    let volumes: Vec<Option<i64>> = bars
-        .iter()
-        .map(|b| {
-            b.v.and_then(|v| {
-                if v.is_finite() && v >= 0.0 {
-                    let rounded = v.round();
-                    if rounded <= i64::MAX as f64 {
-                        Some(rounded as i64)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
-    let volume_weighted_average_prices: Vec<Option<f64>> = bars.iter().map(|b| b.vw).collect();
-    let open_prices: Vec<Option<f64>> = bars.iter().map(|b| b.o).collect();
-    let close_prices: Vec<Option<f64>> = bars.iter().map(|b| b.c).collect();
-    let high_prices: Vec<Option<f64>> = bars.iter().map(|b| b.h).collect();
-    let low_prices: Vec<Option<f64>> = bars.iter().map(|b| b.l).collect();
-    let timestamps: Vec<i64> = bars.iter().map(|b| b.t as i64).collect();
-    let transactions: Vec<Option<u64>> = bars.iter().map(|b| b.n).collect();
-
-    info!("Creating DataFrame from bar data");
-    let data = df! {
-        "ticker" => tickers,
-        "timestamp" => timestamps,
-        "open_price" => open_prices,
-        "high_price" => high_prices,
-        "low_price" => low_prices,
-        "close_price" => close_prices,
-        "volume" => volumes,
-        "volume_weighted_average_price" => volume_weighted_average_prices,
-        "transactions" => transactions,
-    }
-    .map_err(|err| {
-        warn!("Failed to create DataFrame: {}", err);
-        "Failed to create equity bars DataFrame".to_string()
-    })?;
-
-    info!(
-        "Created DataFrame with {} rows and {} columns",
-        data.height(),
-        data.width()
-    );
-    debug!("DataFrame schema: {:?}", data.schema());
-
-    info!("Uploading DataFrame to S3");
-    let s3_key = write_equity_bars_dataframe_to_s3(state, &data, date)
-        .await
-        .map_err(|err| {
-            warn!(
-                "Failed to upload to S3: {}, rows: {}, columns: {}, date: {}",
-                err,
-                data.height(),
-                data.width(),
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            );
-            format!(
-                "Failed to upload equity bars to storage for date {}",
-                date.with_timezone(&Eastern).format("%Y-%m-%d")
-            )
-        })?;
-
-    info!("Successfully uploaded DataFrame to S3 at key: {}", s3_key);
+    let bar_count = bars.len();
 
     if let Some(pool) = &state.pool {
         let equity_bars: Vec<EquityBar> = bars
@@ -324,7 +254,7 @@ pub async fn fetch_and_store(
         }
     }
 
-    Ok(Some(s3_key))
+    Ok(Some(bar_count))
 }
 
 #[derive(Deserialize)]
@@ -430,8 +360,8 @@ pub async fn sync(
     }
 
     match fetch_and_store(&state, &payload.date).await {
-        Ok(Some(s3_key)) => {
-            let response_message = format!("Data fetched and uploaded to S3: {}", s3_key);
+        Ok(Some(bar_count)) => {
+            let response_message = format!("Data synced: {} bars stored", bar_count);
             (StatusCode::OK, response_message).into_response()
         }
         Ok(None) => (

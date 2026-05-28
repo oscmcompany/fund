@@ -248,32 +248,39 @@ async def save_rebalance(  # noqa: PLR0913
         return False
 
 
-async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
+async def save_performance_snapshot(
+    snapshot: dict[str, Any],
+    snapshot_type: str = "intraday",
+) -> bool:
     try:
-        timestamp_seconds = snapshot["timestamp"] // 1000
-        snapshot_date = datetime.fromtimestamp(timestamp_seconds, tz=UTC).date()
+        snapshot_timestamp = datetime.fromtimestamp(
+            snapshot["timestamp"] / 1000.0, tz=UTC
+        )
+
+        if snapshot_type == "eod":
+            gross_return = snapshot.get("gross_return")
+            net_return = snapshot.get("net_return")
+        else:
+            gross_return = None
+            net_return = None
 
         pool = await get_pool()
         async with pool.connection() as connection:
             await connection.execute(
                 """INSERT INTO equity_portfolio_snapshots
-                   (snapshot_date, net_asset_value,
+                   (snapshot_timestamp, snapshot_type, net_asset_value,
                     gross_return, net_return, total_slippage_cost)
-                   VALUES (%s, %s, %s, %s, %s)
-                   ON CONFLICT (snapshot_date) DO UPDATE
-                   SET net_asset_value = EXCLUDED.net_asset_value,
-                       gross_return = EXCLUDED.gross_return,
-                       net_return = EXCLUDED.net_return,
-                       total_slippage_cost = EXCLUDED.total_slippage_cost""",
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
                 (
-                    snapshot_date,
+                    snapshot_timestamp,
+                    snapshot_type,
                     snapshot["portfolio_value"],
-                    snapshot["gross_return"],
-                    snapshot["net_return"],
+                    gross_return,
+                    net_return,
                     snapshot["total_slippage_cost"],
                 ),
             )
-        logger.info("Saved performance snapshot")
+        logger.info("Saved performance snapshot", snapshot_type=snapshot_type)
         return True  # noqa: TRY300
     except Exception as error:
         logger.exception("Failed to save performance snapshot", error=str(error))
@@ -326,7 +333,8 @@ async def get_last_portfolio_value() -> float | None:
             result = await connection.execute(
                 """SELECT net_asset_value::double precision
                    FROM equity_portfolio_snapshots
-                   ORDER BY snapshot_date DESC
+                   WHERE snapshot_type = 'eod'
+                   ORDER BY snapshot_timestamp DESC
                    LIMIT 1"""
             )
             row = await result.fetchone()

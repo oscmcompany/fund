@@ -66,7 +66,7 @@ pub fn spawn_sync_scheduler(state: State) {
     tokio::spawn(listen_loop(listen_state));
 }
 
-async fn run_equity_bar_sync(state: &State) -> Result<Option<String>, String> {
+async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
     let now_utc = Utc::now();
     let sync_date = sync_date_for(now_utc);
     let sync_noon_eastern = Eastern
@@ -98,8 +98,8 @@ async fn sync_loop(state: State) {
         }
 
         match run_equity_bar_sync(&state).await {
-            Ok(Some(s3_key)) => {
-                info!("Equity bar sync completed, s3_key: {}", s3_key);
+            Ok(Some(bar_count)) => {
+                info!("Equity bar sync completed, bar_count: {}", bar_count);
                 state.mark_synced();
             }
             Ok(None) => {
@@ -161,10 +161,13 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             Ok(Some(job_id)) => {
                 info!("Draining pending equity-bar-sync job on reconnect");
                 match run_equity_bar_sync(state).await {
-                    Ok(Some(s3_key)) => {
-                        if let Err(error) =
-                            database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key))
-                                .await
+                    Ok(Some(bar_count)) => {
+                        if let Err(error) = database::complete_job(
+                            pool,
+                            job_id,
+                            &format!("bar_count: {}", bar_count),
+                        )
+                        .await
                         {
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
@@ -227,10 +230,10 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         let sync_utc = sync_noon_eastern.with_timezone(&Utc);
 
         match fetch_and_store(state, &sync_utc).await {
-            Ok(Some(s3_key)) => {
-                info!("LISTEN-triggered sync completed, s3_key: {}", s3_key);
+            Ok(Some(bar_count)) => {
+                info!("LISTEN-triggered sync completed, bar_count: {}", bar_count);
                 if let Err(error) =
-                    database::complete_job(pool, job_id, &format!("s3_key: {}", s3_key)).await
+                    database::complete_job(pool, job_id, &format!("bar_count: {}", bar_count)).await
                 {
                     warn!("Failed to complete job {}: {}", job_id, error);
                 }
