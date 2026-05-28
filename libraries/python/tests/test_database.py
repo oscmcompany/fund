@@ -5,16 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import internal.database as database_module
 import pytest
-from internal.database import (
-    _get_database_url,
-    close_pool,
-    emit_event,
-    get_connection,
-    get_consumer_offset,
-    get_pool,
-    listen_for_events,
-    update_consumer_offset,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +17,7 @@ def test_get_database_url_raises_when_env_var_missing() -> None:
         patch.dict("os.environ", {}, clear=True),
         pytest.raises(ValueError, match="DATABASE_URL environment variable is not set"),
     ):
-        _get_database_url()
+        database_module._get_database_url()  # noqa: SLF001
 
 
 def test_get_pool_creates_pool_and_opens_it() -> None:
@@ -39,7 +29,7 @@ def test_get_pool_creates_pool_and_opens_it() -> None:
                 "internal.database.AsyncConnectionPool", return_value=mock_pool
             ) as mock_cls,
         ):
-            result = await get_pool()
+            result = await database_module.get_pool()
             mock_cls.assert_called_once()
             mock_pool.open.assert_awaited_once()
             assert result is mock_pool
@@ -52,7 +42,7 @@ def test_get_pool_returns_existing_pool_without_reinitializing() -> None:
         existing_pool = AsyncMock()
         database_module._pool = existing_pool  # noqa: SLF001
         with patch("internal.database.AsyncConnectionPool") as mock_cls:
-            result = await get_pool()
+            result = await database_module.get_pool()
             mock_cls.assert_not_called()
             assert result is existing_pool
 
@@ -63,7 +53,7 @@ def test_close_pool_closes_and_clears_pool() -> None:
     async def _run() -> None:
         mock_pool = AsyncMock()
         database_module._pool = mock_pool  # noqa: SLF001
-        await close_pool()
+        await database_module.close_pool()
         mock_pool.close.assert_awaited_once()
         assert database_module._pool is None  # noqa: SLF001
 
@@ -72,7 +62,7 @@ def test_close_pool_closes_and_clears_pool() -> None:
 
 def test_close_pool_does_nothing_when_pool_is_none() -> None:
     async def _run() -> None:
-        await close_pool()
+        await database_module.close_pool()
 
     asyncio.run(_run())
 
@@ -83,7 +73,7 @@ def test_get_connection_commits_on_success() -> None:
         patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
         patch("internal.database.Connection.connect", return_value=mock_conn),
     ):
-        with get_connection() as connection:
+        with database_module.get_connection() as connection:
             assert connection is mock_conn
         mock_conn.commit.assert_called_once()
         mock_conn.close.assert_called_once()
@@ -92,13 +82,13 @@ def test_get_connection_commits_on_success() -> None:
 def test_get_connection_rolls_back_and_reraises_on_exception() -> None:
     mock_conn = MagicMock()
     message = "test error"
-    with (
+    with (  # noqa: SIM117
         patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
         patch("internal.database.Connection.connect", return_value=mock_conn),
-        pytest.raises(RuntimeError, match=message),
-        get_connection(),
     ):
-        raise RuntimeError(message)
+        with pytest.raises(RuntimeError, match=message):
+            with database_module.get_connection():
+                raise RuntimeError(message)
     mock_conn.rollback.assert_called_once()
     mock_conn.close.assert_called_once()
 
@@ -111,7 +101,7 @@ def test_emit_event_executes_pg_function_via_pool() -> None:
         mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with patch("internal.database.get_pool", AsyncMock(return_value=mock_pool)):
-            await emit_event("rebalance_completed", {"key": "value"})
+            await database_module.emit_event("rebalance_completed", {"key": "value"})
 
         mock_conn.execute.assert_awaited_once()
         sql, _ = mock_conn.execute.call_args[0]
@@ -150,7 +140,7 @@ def test_listen_for_events_invokes_handler_with_parsed_notification() -> None:
                 AsyncMock(return_value=mock_cm),
             ),
         ):
-            await listen_for_events("test_channel", handler)
+            await database_module.listen_for_events("test_channel", handler)
 
         assert len(received) == 1
         assert received[0] == ("test_event", 42, {"x": 1})
@@ -179,6 +169,7 @@ def test_listen_for_events_logs_handler_exception_and_continues() -> None:
 
         async def _notifies() -> AsyncGenerator[MagicMock, None]:
             yield notification
+            yield notification
 
         mock_conn.notifies = MagicMock(return_value=_notifies())
 
@@ -193,9 +184,9 @@ def test_listen_for_events_logs_handler_exception_and_continues() -> None:
                 AsyncMock(return_value=mock_cm),
             ),
         ):
-            await listen_for_events("test_channel", failing_handler)
+            await database_module.listen_for_events("test_channel", failing_handler)
 
-        assert call_count == 1
+        assert call_count == 2  # noqa: PLR2004
 
     asyncio.run(_run())
 
@@ -211,7 +202,7 @@ def test_get_consumer_offset_returns_last_event_id_when_row_exists() -> None:
         mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with patch("internal.database.get_pool", AsyncMock(return_value=mock_pool)):
-            result = await get_consumer_offset("my_consumer")
+            result = await database_module.get_consumer_offset("my_consumer")
 
         assert result == 99  # noqa: PLR2004
 
@@ -229,7 +220,7 @@ def test_get_consumer_offset_returns_zero_when_no_row() -> None:
         mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with patch("internal.database.get_pool", AsyncMock(return_value=mock_pool)):
-            result = await get_consumer_offset("unknown_consumer")
+            result = await database_module.get_consumer_offset("unknown_consumer")
 
         assert result == 0
 
@@ -244,7 +235,7 @@ def test_update_consumer_offset_executes_upsert() -> None:
         mock_pool.connection.return_value.__aexit__ = AsyncMock(return_value=None)
 
         with patch("internal.database.get_pool", AsyncMock(return_value=mock_pool)):
-            await update_consumer_offset("my_consumer", 42)
+            await database_module.update_consumer_offset("my_consumer", 42)
 
         mock_conn.execute.assert_awaited_once()
         sql, _ = mock_conn.execute.call_args[0]

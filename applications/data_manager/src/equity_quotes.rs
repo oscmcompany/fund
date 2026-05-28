@@ -175,7 +175,17 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
             }
             notification = pg_listener.recv() => {
                 match notification {
-                    Ok(notification) if notification.payload() == "rebalance_completed" => {
+                    Ok(notification) => {
+                        let parsed: serde_json::Value =
+                            match serde_json::from_str(notification.payload()) {
+                                Ok(value) => value,
+                                Err(_) => continue,
+                            };
+                        if parsed.get("event_type").and_then(|v| v.as_str())
+                            != Some("rebalance_completed")
+                        {
+                            continue;
+                        }
                         info!("Received rebalance_completed, refreshing quote subscriptions");
                         refresh_active_symbols(state, pool).await;
 
@@ -199,7 +209,6 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                             info!("Resubscribed to {} symbol(s)", symbols.len());
                         }
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         warn!("PostgreSQL events listener error: {}", error);
                         return Err(error.into());
