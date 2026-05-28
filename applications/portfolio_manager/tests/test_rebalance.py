@@ -1015,9 +1015,6 @@ def test_get_optimal_portfolio_returns_schema_validated_portfolio() -> None:
             entry_prices={},
             exposure_scale=1.0,
             short_buying_power_buffer=0.1,
-            hold_overnight=False,
-            overnight_margin_rate_standard=0.25,
-            overnight_margin_rate_low_price=0.5,
         )
     assert result is mock_sized
     mock_schema.validate.assert_called_once_with(mock_sized)

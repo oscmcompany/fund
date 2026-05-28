@@ -77,13 +77,10 @@ async def _lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
         api_secret=ALPACA_API_SECRET,
         is_paper=os.getenv("ALPACA_IS_PAPER", "true").lower() == "true",
     )
-    _app.state.configuration = Configuration(
-        hold_overnight=os.getenv("FUND_HOLD_OVERNIGHT", "true").lower() == "true",
-    )
+    _app.state.configuration = Configuration()
     logger.info(
         "Portfolio manager initialized",
         is_paper=_app.state.alpaca_client.is_paper,
-        hold_overnight=_app.state.configuration.hold_overnight,
     )
     _app.state.scheduler_task = await spawn_event_listener(
         alpaca_client=_app.state.alpaca_client,

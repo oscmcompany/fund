@@ -447,15 +447,3 @@ BEGIN
 END;
 $do$;
 
--- Daily inference trigger: weekdays at 14:00 UTC
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'predictions-requested') THEN
-        PERFORM cron.schedule(
-            'predictions-requested',
-            '0 14 * * 1-5',
-            $$SELECT emit_event('predictions_requested', '{}')$$
-        );
-    END IF;
-END;
-$do$;

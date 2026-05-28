@@ -89,6 +89,27 @@ async def fetch_equity_details(
     )
 
 
+async def fetch_live_quote_mid_prices(tickers: list[str]) -> dict[str, float]:
+    if not tickers:
+        return {}
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT DISTINCT ON (ticker) ticker, bid_price, ask_price
+                   FROM equity_quotes
+                   WHERE ticker = ANY(%s)
+                   ORDER BY ticker, timestamp DESC""",
+                (tickers,),
+            )
+            rows = await result.fetchall()
+    except Exception as error:
+        message = f"Failed to fetch live quote mid-prices from database: {error}"
+        raise PriceDataUnavailableError(message) from error
+
+    return {row[0]: (row[1] + row[2]) / 2.0 for row in rows}
+
+
 async def fetch_spy_prices(
     reference_date: datetime,
     lookback_days: int = 90,
