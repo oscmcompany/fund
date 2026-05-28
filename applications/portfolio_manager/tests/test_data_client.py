@@ -105,6 +105,30 @@ def test_fetch_historical_prices_raises_on_db_error() -> None:
         asyncio.run(fetch_historical_prices(datetime(2024, 1, 1, tzinfo=UTC)))
 
 
+def test_fetch_historical_prices_filters_by_tickers_when_provided() -> None:
+    rows = [
+        ("AAPL", 1704067200000, 150.0),
+        ("MSFT", 1704067200000, 300.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(
+            fetch_historical_prices(
+                datetime(2024, 1, 2, tzinfo=UTC),
+                tickers=["AAPL", "MSFT"],
+            )
+        )
+
+    assert result.height == 2  # noqa: PLR2004
+    call_args = (
+        mock_pool.connection.return_value.__aenter__.return_value.execute.call_args
+    )
+    assert "ANY(%s)" in call_args[0][0]
+
+
 def test_fetch_historical_prices_accepts_datamanager_base_url_shim() -> None:
     mock_pool = _make_pool_mock([])
 

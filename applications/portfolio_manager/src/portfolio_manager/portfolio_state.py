@@ -500,24 +500,30 @@ def evaluate_held_pairs_from_quotes(
 
         if long_live is None or short_live is None:
             logger.warning(
-                "Missing live quote for pair, closing normally",
+                "Missing live quote for pair, holding for this cycle",
                 pair_id=pair_id,
                 long_ticker=long_ticker,
                 short_ticker=short_ticker,
             )
+            held_tickers.add(long_ticker)
+            held_tickers.add(short_ticker)
             continue
 
         if long_live <= 0 or short_live <= 0:
             logger.warning(
-                "Non-positive live quote for pair, closing normally",
+                "Non-positive live quote for pair, holding for this cycle",
                 pair_id=pair_id,
             )
+            held_tickers.add(long_ticker)
+            held_tickers.add(short_ticker)
             continue
 
         matrix = _build_pair_price_matrix(
             equity_bars, long_ticker, short_ticker, pair_id
         )
         if matrix is None:
+            held_tickers.add(long_ticker)
+            held_tickers.add(short_ticker)
             continue
 
         # Append the live mid-price as the current observation.

@@ -129,21 +129,21 @@ def test_evaluate_held_pairs_from_quotes_returns_empty_when_portfolio_empty() ->
     assert result == set()
 
 
-def test_evaluate_held_pairs_from_quotes_skips_pair_when_live_price_missing() -> None:
+def test_evaluate_held_pairs_from_quotes_holds_pair_when_live_price_missing() -> None:
     prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
     bars = _make_equity_bars_for_pair("AAPL", "MSFT")
-    # Only provide live price for AAPL, not MSFT.
+    # Only provide live price for AAPL, not MSFT — pair should be held, not closed.
     result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 110.0})
-    assert result == set()
+    assert result == {"AAPL", "MSFT"}
 
 
-def test_evaluate_held_pairs_from_quotes_skips_pair_when_live_price_nonpositive() -> (
+def test_evaluate_held_pairs_from_quotes_holds_pair_when_live_price_nonpositive() -> (
     None
 ):
     prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
     bars = _make_equity_bars_for_pair("AAPL", "MSFT")
     result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 0.0, "MSFT": 90.0})
-    assert result == set()
+    assert result == {"AAPL", "MSFT"}
 
 
 def test_evaluate_held_pairs_from_quotes_holds_pair_when_z_score_in_range() -> None:
@@ -156,12 +156,12 @@ def test_evaluate_held_pairs_from_quotes_holds_pair_when_z_score_in_range() -> N
     assert isinstance(result, set)
 
 
-def test_evaluate_held_pairs_from_quotes_skips_pair_with_insufficient_history() -> None:
+def test_evaluate_held_pairs_from_quotes_holds_pair_with_insufficient_history() -> None:
     prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
-    # Only 5 rows of history — below the 30-row minimum.
+    # Only 5 rows of history — below the 30-row minimum; pair held for cycle.
     bars = _make_equity_bars_for_pair("AAPL", "MSFT", rows=5)
     result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 101.0, "MSFT": 91.0})
-    assert result == set()
+    assert result == {"AAPL", "MSFT"}
 
 
 def test_evaluate_held_pairs_from_quotes_skips_malformed_pair() -> None:

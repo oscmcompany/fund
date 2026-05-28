@@ -106,9 +106,11 @@ async def _handle_intraday_check(  # noqa: C901, PLR0911
     prior_allocation = await get_prior_allocation()
     if not prior_allocation.is_empty():
         current_timestamp = datetime.now(tz=UTC)
+        prior_tickers = prior_allocation["ticker"].to_list()
         try:
             equity_bars = await fetch_historical_prices(
-                reference_date=current_timestamp
+                reference_date=current_timestamp,
+                tickers=prior_tickers,
             )
         except Exception as error:
             logger.exception(
@@ -116,7 +118,6 @@ async def _handle_intraday_check(  # noqa: C901, PLR0911
                 error=str(error),
             )
             return
-        prior_tickers = prior_allocation["ticker"].to_list()
         try:
             live_mid_prices = await fetch_live_quote_mid_prices(prior_tickers)
         except Exception as error:
