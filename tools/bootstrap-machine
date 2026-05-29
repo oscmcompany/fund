@@ -276,7 +276,7 @@ if [[ "$PROD" != true && "$PROFILE" != "production" && "$PROFILE" != "paper" ]];
   # shellcheck disable=SC1090
   source "$DOTENV"
   set +a
-  "$REPO_ROOT/tools/create-dev-buckets" "${FUND_PROFILE:-$PROFILE}"
+  "$REPO_ROOT/tools/create-development-buckets" "${FUND_PROFILE:-$PROFILE}"
 fi
 
 # Patch devenv.yaml secretspec profile to match this environment

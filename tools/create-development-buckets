@@ -25,4 +25,4 @@ create_bucket() {
 create_bucket "$DATA_BUCKET"
 create_bucket "$ARTIFACTS_BUCKET"
 
-echo "Dev buckets ready for profile $PROFILE"
+echo "Development buckets ready for profile $PROFILE"
