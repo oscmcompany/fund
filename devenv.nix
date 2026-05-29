@@ -511,6 +511,8 @@ in {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
+      # Pin to last known-good tinygrad artifact (May 27 artifact is Burn binary, not safetensors)
+      MODEL_VERSION = "2026-05-22-02-34-59-139";
     };
 
     scripts.cleanup-services.exec = ''
