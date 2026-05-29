@@ -121,6 +121,8 @@ async def fetch_live_quote_mid_prices(tickers: list[str]) -> dict[str, float]:
 async def fetch_spy_prices(
     reference_date: datetime,
     lookback_days: int = 90,
+    # TODO(#876): remove datamanager_base_url in Phase 9  # noqa: FIX002
+    datamanager_base_url: str = "",  # noqa: ARG001
 ) -> pl.DataFrame:
     start_timestamp = reference_date - timedelta(days=lookback_days)
 
