@@ -348,11 +348,9 @@ in {
   scripts.toml-checks.exec = ''
     set -euo pipefail
     echo "Running TOML checks"
-    find . -name "*.toml" \
-      -not -path "./.devenv/*" \
-      -not -path "./target/*" \
-      -not -path "./.venv/*" \
-      -not -path "./models/tide/.devenv/*" \
+    find . \
+      \( -path "./.devenv" -o -path "./target" -o -path "./.venv" -o -path "./models/tide/.devenv" \) -prune \
+      -o -name "*.toml" -print \
       | xargs taplo fmt --check --no-auto-config
     echo "TOML checks completed successfully"
   '';

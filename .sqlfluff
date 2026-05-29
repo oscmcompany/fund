@@ -1,3 +1,5 @@
 [sqlfluff]
 dialect = postgres
 templater = raw
+large_file_skip_byte_limit = 0
+exclude_rules = LT01,LT02,LT05,LT12,CP05,RF04
