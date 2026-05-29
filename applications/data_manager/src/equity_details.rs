@@ -15,7 +15,7 @@ pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
     match read_equity_details_csv_from_s3(&state).await {
         Ok(csv_content) => {
             let mut dataframe = match create_equity_details_dataframe(csv_content) {
-                Ok(df) => df,
+                Ok(parsed_dataframe) => parsed_dataframe,
                 Err(err) => {
                     warn!("Failed to parse equity details CSV: {}", err);
                     return (

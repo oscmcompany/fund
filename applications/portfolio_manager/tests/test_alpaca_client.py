@@ -166,7 +166,7 @@ def test_open_position_sell_submits_order(mock_sleep: MagicMock) -> None:
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 
 
-_EXPECTED_SELL_QTY = 10  # int(500.0 / 50.0)
+_EXPECTED_SELL_QUANTITY = 10  # int(500.0 / 50.0)
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
@@ -178,13 +178,13 @@ def test_open_position_sell_uses_qty_not_notional(mock_sleep: MagicMock) -> None
         side=TradeSide.SELL,
         dollar_amount=500.0,
         entry_price=50.0,
-        quantity=_EXPECTED_SELL_QTY,
+        quantity=_EXPECTED_SELL_QUANTITY,
     )
 
     submitted = mock_trading.submit_order.call_args
     order_request = submitted[1]["order_data"] if submitted[1] else submitted[0][0]
     assert order_request.side == OrderSide.SELL
-    assert order_request.qty == _EXPECTED_SELL_QTY
+    assert order_request.qty == _EXPECTED_SELL_QUANTITY
     assert not hasattr(order_request, "notional") or order_request.notional is None
     mock_sleep.assert_called_once_with(client.rate_limit_sleep)
 

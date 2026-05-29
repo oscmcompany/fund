@@ -15,13 +15,13 @@ from portfolio_manager.portfolio_schema import (
 
 
 class _MockPolarsData:
-    def __init__(self, df: pl.DataFrame) -> None:
-        self.lazyframe = df.lazy()
+    def __init__(self, dataframe: pl.DataFrame) -> None:
+        self.lazyframe = dataframe.lazy()
         self.key = "side"
 
 
-def _as_polars_data(df: pl.DataFrame) -> PolarsData:
-    return cast("PolarsData", _MockPolarsData(df))
+def _as_polars_data(dataframe: pl.DataFrame) -> PolarsData:
+    return cast("PolarsData", _MockPolarsData(dataframe))
 
 
 _TICKERS = [

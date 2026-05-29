@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
-def to_timestamp_milliseconds(dt: datetime) -> int:
+def to_timestamp_milliseconds(datetime_value: datetime) -> int:
     """Convert a datetime to a Unix timestamp in milliseconds (ms).
 
     All timestamps in this project use Unix milliseconds (Python int, Polars
@@ -16,14 +16,17 @@ def to_timestamp_milliseconds(dt: datetime) -> int:
       WebSocket feeds we plan to add.
 
     Uses integer-only timedelta arithmetic to avoid floating-point truncation
-    errors. Do not use int(dt.timestamp() * 1000) as the float intermediate
+    errors. Do not use int(datetime_value.timestamp() * 1000) as the float intermediate
     can yield off-by-1ms results for some datetimes.
 
-    Raises ValueError if dt is not timezone-aware, as naive datetimes produce
-    system-timezone-dependent results.
+    Raises ValueError if datetime_value is not timezone-aware, as naive
+    datetimes produce system-timezone-dependent results.
     """
-    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+    if (
+        datetime_value.tzinfo is None
+        or datetime_value.tzinfo.utcoffset(datetime_value) is None
+    ):
         message = "Datetime must be timezone-aware"
         raise ValueError(message)
-    delta = dt - _EPOCH
+    delta = datetime_value - _EPOCH
     return delta.days * 86_400_000 + delta.seconds * 1000 + delta.microseconds // 1000

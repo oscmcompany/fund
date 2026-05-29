@@ -58,7 +58,7 @@ def compute_realized_profit_and_loss(
 
     joined = closing_pair.join(current_prices, on="ticker", how="left")
 
-    total_pnl = 0.0
+    total_profit_and_loss = 0.0
     total_invested = 0.0
 
     for row in joined.iter_rows(named=True):
@@ -82,15 +82,17 @@ def compute_realized_profit_and_loss(
         total_invested += dollar_amount
 
         if side == "LONG":
-            position_pnl = dollar_amount * (close_price / entry_price - 1.0)
+            position_profit_and_loss = dollar_amount * (close_price / entry_price - 1.0)
         else:
-            position_pnl = dollar_amount * (1.0 - close_price / entry_price)
+            position_profit_and_loss = dollar_amount * (1.0 - close_price / entry_price)
 
-        total_pnl += position_pnl
+        total_profit_and_loss += position_profit_and_loss
 
-    return_percent = total_pnl / total_invested if total_invested > 0 else 0.0
+    return_percent = (
+        total_profit_and_loss / total_invested if total_invested > 0 else 0.0
+    )
 
-    return (total_pnl, return_percent)
+    return (total_profit_and_loss, return_percent)
 
 
 def compute_sharpe_ratio(returns: list[float]) -> float | None:
@@ -153,11 +155,13 @@ def compute_calmar_ratio(
     return annual_return / maximum_drawdown
 
 
-def compute_win_rate(closed_pairs_pnl: list[float]) -> float | None:
-    if not closed_pairs_pnl:
+def compute_win_rate(closed_pairs_profit_and_loss: list[float]) -> float | None:
+    if not closed_pairs_profit_and_loss:
         return None
-    winning_count = sum(1 for pnl in closed_pairs_pnl if pnl > 0)
-    return winning_count / len(closed_pairs_pnl)
+    winning_count = sum(
+        1 for profit_and_loss in closed_pairs_profit_and_loss if profit_and_loss > 0
+    )
+    return winning_count / len(closed_pairs_profit_and_loss)
 
 
 def compute_spy_relative_return(portfolio_return: float, spy_return: float) -> float:

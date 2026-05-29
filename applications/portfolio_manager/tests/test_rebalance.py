@@ -503,7 +503,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
@@ -597,7 +597,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
@@ -693,7 +693,7 @@ def test_run_rebalance_saves_only_opened_rows(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # AMD (short) is skipped; only NVDA (long) opened successfully.
     mock_execute_open.return_value = (
@@ -811,7 +811,7 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # Both legs succeed — the full pair should be saved.
     mock_execute_open.return_value = (
@@ -1006,7 +1006,7 @@ def test_get_optimal_portfolio_returns_schema_validated_portfolio() -> None:
         ),
         patch("portfolio_manager.rebalance.portfolio_schema") as mock_schema,
     ):
-        mock_schema.validate.side_effect = lambda df: df
+        mock_schema.validate.side_effect = lambda dataframe: dataframe
         result = get_optimal_portfolio(
             candidate_pairs=pl.DataFrame(),
             maximum_capital=10000.0,
@@ -1216,7 +1216,7 @@ def test_run_rebalance_returns_207_when_save_allocation_fails(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     mock_execute_open.return_value = (
         [
@@ -1330,7 +1330,7 @@ def test_run_rebalance_returns_200_when_record_performance_raises(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     mock_record.side_effect = RuntimeError("metrics failure")
     mock_execute_open.return_value = (

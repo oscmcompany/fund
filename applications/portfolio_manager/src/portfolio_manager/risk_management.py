@@ -211,7 +211,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
         exposure_scale=exposure_scale,
     )
 
-    timestamp_val = to_timestamp_milliseconds(current_timestamp)
+    timestamp_milliseconds = to_timestamp_milliseconds(current_timestamp)
 
     long_entry_prices = [
         entry_prices.get(ticker, 0.0) for ticker in pairs["long_ticker"].to_list()
@@ -221,7 +221,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     # Alpaca BUY orders use notional (fractional shares are supported).
     long_positions = pairs.select(
         pl.col("long_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
+        pl.lit(timestamp_milliseconds).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.LONG.value).alias("side"),
         pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
@@ -236,7 +236,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     # Alpaca SELL orders must use qty (fractional short sells are not supported).
     short_positions = pairs.select(
         pl.col("short_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
+        pl.lit(timestamp_milliseconds).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.SHORT.value).alias("side"),
         pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),

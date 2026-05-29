@@ -143,8 +143,10 @@ class AlpacaClient:
         if side == TradeSide.SELL:
             # Alpaca does not support fractional short sells; whole shares only.
             # Use the pre-computed quantity when available to avoid recomputation.
-            qty = quantity if quantity is not None else int(dollar_amount / entry_price)
-            if qty == 0:
+            share_count = (
+                quantity if quantity is not None else int(dollar_amount / entry_price)
+            )
+            if share_count == 0:
                 message = (
                     f"Cannot short {ticker}: dollar_amount {dollar_amount} "
                     f"is less than one share at entry_price {entry_price}"
@@ -152,7 +154,7 @@ class AlpacaClient:
                 raise ValueError(message)
             order_request = OrderRequest(
                 symbol=ticker.upper(),
-                qty=qty,
+                qty=share_count,
                 side=OrderSide.SELL,
                 type=OrderType.MARKET,
                 time_in_force=TimeInForce.DAY,

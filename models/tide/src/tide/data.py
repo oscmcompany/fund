@@ -171,22 +171,22 @@ class CleanData(Stage):
         # Collect stats across all columns before filtering so counts reflect the
         # original data and rows with multiple bad columns are reported accurately
         column_stats: dict[str, dict[str, int]] = {}
-        for col in CONTINUOUS_COLUMNS:
-            series = data[col]
+        for column in CONTINUOUS_COLUMNS:
+            series = data[column]
             nan_count = int(series.is_nan().sum() or 0)
             null_count = int(series.is_null().sum() or 0)
             inf_count = int(series.is_infinite().sum() or 0)
             if nan_count > 0 or null_count > 0 or inf_count > 0:
-                column_stats[col] = {
+                column_stats[column] = {
                     "nan_count": nan_count,
                     "null_count": null_count,
                     "inf_count": inf_count,
                 }
 
-        for col, stats in column_stats.items():
+        for column, stats in column_stats.items():
             logger.warning(
                 "Invalid values in continuous column before scaling",
-                column=col,
+                column=column,
                 **stats,
             )
 
@@ -194,10 +194,10 @@ class CleanData(Stage):
             data = data.filter(
                 pl.all_horizontal(
                     [
-                        pl.col(col).is_not_nan()
-                        & pl.col(col).is_not_null()
-                        & pl.col(col).is_finite()
-                        for col in CONTINUOUS_COLUMNS
+                        pl.col(column).is_not_nan()
+                        & pl.col(column).is_not_null()
+                        & pl.col(column).is_finite()
+                        for column in CONTINUOUS_COLUMNS
                     ]
                 )
             )
@@ -224,29 +224,29 @@ class ScaleAndEncode(Stage):
         self.scaler = Scaler()
         self.scaler.fit(data[CONTINUOUS_COLUMNS])
 
-        for col in CONTINUOUS_COLUMNS:
-            mean_val = self.scaler.means[col].item()
-            std_val = self.scaler.standard_deviations[col].item()
-            if np.isnan(mean_val) or np.isnan(std_val):
+        for column in CONTINUOUS_COLUMNS:
+            mean_value = self.scaler.means[column].item()
+            std_value = self.scaler.standard_deviations[column].item()
+            if np.isnan(mean_value) or np.isnan(std_value):
                 message = (
-                    f"Scaler has NaN values for column '{col}': "
-                    f"mean={mean_val}, std={std_val}"
+                    f"Scaler has NaN values for column '{column}': "
+                    f"mean={mean_value}, std={std_value}"
                 )
                 raise ValueError(message)
 
         data = data.with_columns(
             *[
-                (pl.col(col) - self.scaler.means[col])
-                / self.scaler.standard_deviations[col]
-                for col in CONTINUOUS_COLUMNS
+                (pl.col(column) - self.scaler.means[column])
+                / self.scaler.standard_deviations[column]
+                for column in CONTINUOUS_COLUMNS
             ]
         )
 
-        for col in CONTINUOUS_COLUMNS:
-            nan_count = data.filter(pl.col(col).is_nan()).height
+        for column in CONTINUOUS_COLUMNS:
+            nan_count = data.filter(pl.col(column).is_nan()).height
             if nan_count > 0:
                 message = (
-                    f"NaN values after scaling column '{col}': "
+                    f"NaN values after scaling column '{column}': "
                     f"{nan_count}/{data.height} rows"
                 )
                 raise ValueError(message)
@@ -273,7 +273,7 @@ def _create_mapping_and_encoding(
     column: str,
 ) -> tuple[pl.DataFrame, CategoryMapping]:
     unique_values = sorted(data[column].unique().to_list())
-    mapping = {val: idx for idx, val in enumerate(unique_values)}
+    mapping = {value: index for index, value in enumerate(unique_values)}
     data = data.with_columns(
         pl.col(column).replace(mapping).cast(pl.Int32).alias(column)
     )
@@ -355,17 +355,17 @@ class Data:
 
         data = data.with_columns(
             *[
-                (pl.col(col) - self.scaler.means[col])
-                / self.scaler.standard_deviations[col]
-                for col in self.continuous_columns
+                (pl.col(column) - self.scaler.means[column])
+                / self.scaler.standard_deviations[column]
+                for column in self.continuous_columns
             ]
         )
 
-        for col in self.continuous_columns:
-            nan_count = data.filter(pl.col(col).is_nan()).height
+        for column in self.continuous_columns:
+            nan_count = data.filter(pl.col(column).is_nan()).height
             if nan_count > 0:
                 message = (
-                    f"NaN values after scaling column '{col}': "
+                    f"NaN values after scaling column '{column}': "
                     f"{nan_count}/{data.height} rows"
                 )
                 raise ValueError(message)
@@ -418,7 +418,7 @@ class Data:
             self.data.sort("timestamp")
             .group_by("ticker")
             .agg(pl.col("*").tail(maximum_encoder_length))
-            .explode([col for col in self.data.columns if col != "ticker"])
+            .explode([column for column in self.data.columns if column != "ticker"])
         )
 
     def get_dimensions(self) -> dict[str, int]:
@@ -508,35 +508,37 @@ class Data:
         total_tickers = len(ticker_groups)
         logger.info("Dataset creation started", total_tickers=total_tickers)
 
-        for idx, ticker_df in enumerate(ticker_groups.values()):
-            if idx % 25 == 0:
+        for index, ticker_dataframe in enumerate(ticker_groups.values()):
+            if index % 25 == 0:
                 logger.info(
-                    "Dataset progress", ticker_idx=idx, total_tickers=total_tickers
+                    "Dataset progress", ticker_idx=index, total_tickers=total_tickers
                 )
 
-            cat_array = ticker_df[self.categorical_columns].to_numpy().astype(np.int32)
+            cat_array = (
+                ticker_dataframe[self.categorical_columns].to_numpy().astype(np.int32)
+            )
             cont_array = (
-                ticker_df[self.continuous_columns].to_numpy().astype(np.float32)
+                ticker_dataframe[self.continuous_columns].to_numpy().astype(np.float32)
             )
             static_array = (
-                ticker_df[self.static_categorical_columns]
+                ticker_dataframe[self.static_categorical_columns]
                 .head(1)
                 .to_numpy()
                 .astype(np.int32)
             )
             target_array = (
-                ticker_df[["daily_return"]].to_numpy().astype(np.float32)
+                ticker_dataframe[["daily_return"]].to_numpy().astype(np.float32)
                 if has_targets
                 else None
             )
 
-            num_rows = len(ticker_df)
+            num_rows = len(ticker_dataframe)
             num_windows = num_rows - input_length - output_length + 1
 
             if num_windows <= 0:
                 logger.debug(
                     "Skipping ticker with insufficient rows",
-                    ticker=ticker_df["ticker"][0],
+                    ticker=ticker_dataframe["ticker"][0],
                     num_rows=num_rows,
                     required=input_length + output_length,
                 )
@@ -595,11 +597,12 @@ class Data:
         with open(os.path.join(directory_path, "tide_data_scaler.json"), "w") as f:  # noqa: PTH118, PTH123
             # convert DataFrames to dictionary of scalars (first row)
             means_dict = {
-                col: self.scaler.means[col].item() for col in self.scaler.means.columns
+                column: self.scaler.means[column].item()
+                for column in self.scaler.means.columns
             }
             stdevs_dict = {
-                col: self.scaler.standard_deviations[col].item()
-                for col in self.scaler.standard_deviations.columns
+                column: self.scaler.standard_deviations[column].item()
+                for column in self.scaler.standard_deviations.columns
             }
 
             json.dump(
@@ -647,15 +650,15 @@ class Data:
         ticker_reverse_mapping = {v: k for k, v in self.mappings["ticker"].items()}
 
         rows = []
-        for batch_idx in range(batch_size):
+        for batch_index in range(batch_size):
             ticker_encoded = int(
-                input_batch["static_categorical_features"][batch_idx, 0, 0].item()
+                input_batch["static_categorical_features"][batch_index, 0, 0].item()
             )
             ticker_str = ticker_reverse_mapping[ticker_encoded]
 
-            for time_idx in range(output_length):
+            for time_index in range(output_length):
                 timestamp = to_timestamp_milliseconds(
-                    (current_datetime + timedelta(days=time_idx)).replace(
+                    (current_datetime + timedelta(days=time_index)).replace(
                         hour=0,
                         minute=0,
                         second=0,
@@ -663,7 +666,7 @@ class Data:
                     )
                 )
 
-                quantile_values = predictions_array[batch_idx, time_idx, :]
+                quantile_values = predictions_array[batch_index, time_index, :]
 
                 daily_return_mean = self.scaler.means["daily_return"].item()
                 daily_return_standard_deviation = self.scaler.standard_deviations[

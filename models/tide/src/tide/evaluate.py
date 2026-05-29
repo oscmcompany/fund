@@ -20,7 +20,9 @@ class DriftResult:
     baseline_crps: float | None
 
 
-def compute_crps(predictions: pl.DataFrame, actuals: pl.DataFrame) -> float:
+def compute_continuous_ranked_probability_score(
+    predictions: pl.DataFrame, actuals: pl.DataFrame
+) -> float:
     """Compute CRPS via pinball loss across quantile_10, quantile_50, quantile_90.
 
     predictions schema: quantile_10, quantile_50, quantile_90
@@ -216,7 +218,9 @@ def evaluate(
 
     actuals_dataframe = pl.DataFrame({"daily_return": targets_flat.tolist()})
 
-    crps = compute_crps(predictions_dataframe, actuals_dataframe)
+    continuous_ranked_probability_score = compute_continuous_ranked_probability_score(
+        predictions_dataframe, actuals_dataframe
+    )
     directional_accuracy = compute_directional_accuracy(
         predictions_dataframe, actuals_dataframe
     )
@@ -226,14 +230,14 @@ def evaluate(
 
     logger.info(
         "Evaluation complete",
-        crps=crps,
+        crps=continuous_ranked_probability_score,
         directional_accuracy=directional_accuracy,
         quantile_coverage=quantile_coverage,
         total_steps=total_steps,
     )
 
     return {
-        "crps": crps,
+        "crps": continuous_ranked_probability_score,
         "directional_accuracy": directional_accuracy,
         "quantile_coverage": quantile_coverage,
     }
