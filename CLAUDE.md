@@ -19,7 +19,25 @@ This is a collection of guidelines and references.
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
 - Add in-line code comments only where necessary for clarity; include language-appropriate docstrings for functions and
   modules
-- Use full word variables in code whenever possible
+- Spell identifiers out fully in code (variables, functions, fields, modules): prefer `dataframe` over
+  `df`, `message` over `msg`, `error_message` over `err_msg`, `quantity` over `qty`, `index` over `idx`,
+  `column` over `col`, `value` over `val`, `volatility` over `vol`, `profit_and_loss` over `pnl`,
+  `timezone` over `tz`, and `aggregate` over `agg`
+- Expand metric and domain acronyms in identifiers too: `root_mean_squared_error` (not `rmse`),
+  `mean_absolute_error` (not `mae`), `mean_squared_error` (not `mse`), `r_squared` (not `r2`),
+  `continuous_ranked_probability_score` (not `crps`), `end_of_day` (not `eod`), and `postgres` (not `pg`)
+- Keep only universally-understood acronyms as-is: formats, protocols, and identity (`csv`, `json`,
+  `sql`, `http`, `url`, `uri`, `io`, `id`, `uuid`, `api`) and established domain or proper-noun terms
+  (`aws`, `utc`, `etf`, `ohlcv`, `guc`); case acronyms as ordinary words per language convention
+  (Rust `HttpClient`/`Uuid`, Python `api_key`/`http_client`), not all-caps runs
+- Never rename fixed external identifiers: devenv profile names (`apps`, `ml`), the `awssm` secretspec
+  provider, the `tide` model and package name, environment variables and secret keys (e.g.
+  `DATABASE_URL`, `ALPACA_API_KEY_ID`), library import aliases (`np`, `pl`, `pa`), linter directives
+  (`noqa`), and external library fields and parameters (e.g. the Alpaca/Massive `vw` deserialization
+  field, datetime `tz=`/`tzinfo`)
+- Apply the spell-it-out rule to new code, to identifiers you touch, and to dedicated cleanup passes;
+  already-shipped database and schema identifiers (index, constraint, and column names) and stored
+  values are effectively fixed and change only via an explicit migration
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
 - Scan and remove unused dependencies from `pyproject.toml` files; move duplicate dependencies into root workspace `pyproject.toml`
