@@ -271,7 +271,7 @@ CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp
     ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_end_of_day_date
-    ON equity_portfolio_snapshots ((snapshot_timestamp::date))
+    ON equity_portfolio_snapshots (((snapshot_timestamp AT TIME ZONE 'UTC')::date))
     WHERE snapshot_type = 'end_of_day';
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)

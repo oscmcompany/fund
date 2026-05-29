@@ -39,12 +39,12 @@ ALTER TABLE equity_portfolio_snapshots
     ADD CONSTRAINT equity_portfolio_snapshots_snapshot_type_check
     CHECK (snapshot_type IN ('intraday', 'end_of_day'));
 
--- 3. Rebuild the partial unique index under its new name and predicate.
---    Original definition: ON equity_portfolio_snapshots ((snapshot_timestamp::date))
---    WHERE snapshot_type = 'eod'.
+-- 3. Rebuild the partial unique index under its new name and predicate. The date
+--    expression is anchored to UTC so it is IMMUTABLE; a bare snapshot_timestamp::date
+--    cast on a timestamptz depends on the session timezone and cannot be indexed.
 DROP INDEX IF EXISTS uq_equity_portfolio_snapshots_eod_date;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_end_of_day_date
-    ON equity_portfolio_snapshots ((snapshot_timestamp::date))
+    ON equity_portfolio_snapshots (((snapshot_timestamp AT TIME ZONE 'UTC')::date))
     WHERE snapshot_type = 'end_of_day';
 
 -- 4. Remove the old pg_cron job and stored function so the renamed versions do
