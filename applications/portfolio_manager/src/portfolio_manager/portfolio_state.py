@@ -28,6 +28,24 @@ _PRIOR_ALLOCATION_SCHEMA: dict[str, type] = {
 }
 
 
+async def already_rebalanced_today() -> bool:
+    # TODO(Phase 7): remove once intraday check replaces daily guard  # noqa: FIX002
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT COUNT(*) FROM equity_rebalance_sessions
+                   WHERE triggered_at >= CURRENT_DATE::timestamptz
+                     AND triggered_at < (CURRENT_DATE + INTERVAL '1 day')::timestamptz
+                     AND status = 'completed'"""
+            )
+            row = await result.fetchone()
+        return bool(row and row[0] > 0)
+    except Exception as error:
+        logger.exception("Failed to check daily rebalance status", error=str(error))
+        return False
+
+
 async def get_prior_allocation() -> pl.DataFrame:
     empty = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     try:

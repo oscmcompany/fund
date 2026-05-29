@@ -86,6 +86,13 @@ def test_fetch_historical_prices_deduplicates_ticker_timestamp() -> None:
     assert result.height == 1
     assert result["close_price"][0] == pytest.approx(150.0)
 
+def test_fetch_historical_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("connection refused"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
 
 def test_fetch_historical_prices_raises_on_db_error() -> None:
     mock_connection = MagicMock()
@@ -268,6 +275,17 @@ def test_fetch_spy_prices_deduplicates_timestamp() -> None:
     assert result.height == 1
     assert result["close_price"][0] == pytest.approx(450.0)
 
+    assert result.height == 1
+    assert result["close_price"][0] == pytest.approx(450.0)
+
+
+def test_fetch_spy_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("timeout"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
 
 def test_fetch_spy_prices_raises_on_db_error() -> None:
     mock_connection = MagicMock()

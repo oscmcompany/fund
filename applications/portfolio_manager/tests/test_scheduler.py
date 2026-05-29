@@ -180,6 +180,10 @@ def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> 
     _, kwargs = mock_run_rebalance.call_args
     assert kwargs.get("held_tickers") == held_tickers
 
+def test_handle_predictions_completed_skips_when_market_closed() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = False
+    mock_run_rebalance = AsyncMock()
 
 def test_handle_intraday_check_calls_run_rebalance_when_no_prior_allocation() -> None:
     mock_alpaca = MagicMock()
@@ -213,7 +217,7 @@ def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.is_market_open.return_value = True
     mock_response = MagicMock()
-    mock_response.status_code = 200
+    mock_response.status_code = 500
     mock_run_rebalance = AsyncMock(return_value=mock_response)
 
     async def run() -> None:
@@ -235,6 +239,7 @@ def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
     mock_run_rebalance.assert_called_once()
     assert mock_run_rebalance.call_args.args[2] == "abc-123"
 
+# --- _handle_intraday_check ---
 
 def test_handle_intraday_check_skips_when_historical_prices_fetch_fails() -> None:
     mock_alpaca = MagicMock()
