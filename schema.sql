@@ -106,10 +106,24 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
     id              UUID        PRIMARY KEY,
     triggered_at    TIMESTAMPTZ NOT NULL,
     trigger_reason  TEXT        NOT NULL,
-    model_run_id    TEXT        NOT NULL, -- set by the training pipeline; references model_runs.run_id
+    model_run_id    TEXT,       -- set by the training pipeline; references model_runs.run_id; nullable when unavailable
     completed_at    TIMESTAMPTZ,
     status          TEXT        NOT NULL
 );
+
+-- Drop NOT NULL on model_run_id if running against the old schema that had it NOT NULL.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_rebalance_sessions'
+          AND column_name = 'model_run_id'
+          AND is_nullable = 'NO'
+    ) THEN
+        ALTER TABLE equity_rebalance_sessions ALTER COLUMN model_run_id DROP NOT NULL;
+    END IF;
+END;
+$do$;
 
 -- equity_pairs: one row per cointegrated pair per rebalance cycle
 -- Entry signals (z_score, hedge_ratio, signal_strength) are recorded at the time of opening.
@@ -127,9 +141,22 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     opened_at                  TIMESTAMPTZ NOT NULL,
     closed_at                  TIMESTAMPTZ,
     realized_profit_and_loss   NUMERIC,
+    return_percent             NUMERIC,
     holding_days               INTEGER,
     UNIQUE (pair_id, opened_at)
 );
+
+-- Add return_percent column if running against an older schema that lacked it.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_pairs' AND column_name = 'return_percent'
+    ) THEN
+        ALTER TABLE equity_pairs ADD COLUMN return_percent NUMERIC;
+    END IF;
+END;
+$do$;
 
 -- Drop equity_allocations (and equity_orders that reference it) if running against the old schema
 -- (target_weight/reference_price columns). The new schema is incompatible: it requires FKs to
@@ -148,18 +175,41 @@ $do$;
 
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
+-- quantity: whole-share intent for SHORT legs (nullable for LONG legs).
+-- notional: dollar amount for LONG legs (nullable for SHORT legs).
+-- CHECK ensures at least one of quantity or notional is set per row.
 CREATE TABLE IF NOT EXISTS equity_allocations (
     id               UUID        PRIMARY KEY,
     rebalance_id     UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
     equity_pair_id   UUID        NOT NULL REFERENCES equity_pairs(id),
     generated_at     TIMESTAMPTZ NOT NULL,
-    model_run_id     TEXT        NOT NULL, -- set by the training pipeline; references model_runs.run_id
+    model_run_id     TEXT,       -- set by the training pipeline; references model_runs.run_id; nullable when unavailable
     ticker           TEXT        NOT NULL,
     side             TEXT        NOT NULL CHECK (side IN ('LONG', 'SHORT')),
     action           TEXT        NOT NULL CHECK (action IN ('OPEN_POSITION', 'CLOSE_POSITION', 'UNSPECIFIED')),
     dollar_amount    NUMERIC     NOT NULL,
-    entry_price      NUMERIC
+    entry_price      NUMERIC,
+    quantity         NUMERIC,
+    notional         NUMERIC,
+    CONSTRAINT equity_allocations_quantity_notional_check
+        CHECK (quantity IS NOT NULL OR notional IS NOT NULL)
 );
+
+-- Add quantity and notional columns with CHECK if running against an older schema.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_allocations' AND column_name = 'quantity'
+    ) THEN
+        ALTER TABLE equity_allocations ADD COLUMN quantity NUMERIC;
+        ALTER TABLE equity_allocations ADD COLUMN notional NUMERIC;
+        ALTER TABLE equity_allocations
+            ADD CONSTRAINT equity_allocations_quantity_notional_check
+            CHECK (quantity IS NOT NULL OR notional IS NOT NULL) NOT VALID;
+    END IF;
+END;
+$do$;
 
 -- equity_orders: orders submitted to Alpaca, linked to allocations
 CREATE TABLE IF NOT EXISTS equity_orders (
@@ -208,6 +258,15 @@ CREATE TABLE IF NOT EXISTS equity_trades (
     price                   NUMERIC     NOT NULL,
     side                    TEXT        NOT NULL,
     slippage_basis_points   NUMERIC
+);
+
+-- equity_details: Ticker metadata (sector, industry) seeded from S3 on first startup.
+-- Ongoing updates are owned by data-manager when equity details are refreshed.
+-- Source: equity/details/details.csv in the data S3 bucket.
+CREATE TABLE IF NOT EXISTS equity_details (
+    ticker    TEXT NOT NULL PRIMARY KEY,
+    sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',
+    industry  TEXT NOT NULL DEFAULT 'NOT AVAILABLE'
 );
 
 -- model_runs: Training metadata for model artifacts and evaluation metrics
@@ -322,11 +381,24 @@ CREATE TABLE IF NOT EXISTS event_consumer_offsets (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- predictions: model output quantiles (7-day rolling buffer)
+-- Rename predictions to equity_predictions on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'predictions'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables WHERE table_name = 'equity_predictions'
+    ) THEN
+        ALTER TABLE predictions RENAME TO equity_predictions;
+    END IF;
+END;
+$do$;
+
+-- equity_predictions: model output quantiles (7-day rolling buffer)
 -- Columns match the Prediction struct in data_manager/src/data.rs and
 -- the predictions_schema pandera definition in ensemble_manager.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
-CREATE TABLE IF NOT EXISTS predictions (
+CREATE TABLE IF NOT EXISTS equity_predictions (
     id              BIGSERIAL        NOT NULL,
     correlation_id  UUID             NOT NULL,
     model_run_id    TEXT             NOT NULL,
@@ -339,8 +411,41 @@ CREATE TABLE IF NOT EXISTS predictions (
     PRIMARY KEY (ticker, timestamp)
 );
 
-SELECT create_hypertable('predictions', by_range('timestamp'), if_not_exists => TRUE);
-SELECT add_retention_policy('predictions', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
+SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
+-- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
+-- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
+-- A compile-time assertion in that file enforces the invariant — update both together.
+-- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
+        PERFORM cron.schedule(
+            'intraday-check',
+            '*/5 14-20 * * 1-5',
+            $$SELECT emit_event('intraday_check', '{}')$$
+        );
+    END IF;
+END;
+$do$;
+
+-- Daily quote archival: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
+-- and after 4 PM Eastern market close in both EDT and EST)
+-- Only scheduled when pg_parquet is available; archive_equity_quotes() also guards at runtime.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.schedule(
+            'archive-quotes',
+            '5 21 * * 1-5',
+            $$SELECT archive_equity_quotes()$$
+        );
+    END IF;
+END;
+$do$;
 
 -- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
 -- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.

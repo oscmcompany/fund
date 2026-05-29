@@ -1,22 +1,17 @@
-import io
-import os
-from datetime import UTC, datetime, timedelta
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import numpy as np
 import polars as pl
 import structlog
+from internal.database import get_pool
 
 from .enums import PositionSide
 from .risk_management import Z_SCORE_HOLD_THRESHOLD, Z_SCORE_STOP_LOSS
 from .statistical_arbitrage import CORRELATION_WINDOW_DAYS, compute_spread_zscore
 
 logger = structlog.get_logger()
-
-DATA_MANAGER_BASE_URL = os.getenv(
-    "FUND_DATA_MANAGER_BASE_URL", "http://data-manager:8080"
-)
 
 _MINIMUM_PAIR_PRICE_ROWS = 30
 
@@ -33,138 +28,329 @@ _PRIOR_ALLOCATION_SCHEMA: dict[str, type] = {
 }
 
 
+async def already_rebalanced_today() -> bool:
+    # TODO(Phase 7): remove once intraday check replaces daily guard  # noqa: FIX002
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT COUNT(*) FROM equity_rebalance_sessions
+                   WHERE triggered_at >= CURRENT_DATE::timestamptz
+                     AND triggered_at < (CURRENT_DATE + INTERVAL '1 day')::timestamptz
+                     AND status = 'completed'"""
+            )
+            row = await result.fetchone()
+        return bool(row and row[0] > 0)
+    except Exception as error:
+        logger.exception("Failed to check daily rebalance status", error=str(error))
+        return False
+
+
 async def get_prior_allocation() -> pl.DataFrame:
     empty = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(url=f"{DATA_MANAGER_BASE_URL}/portfolios")
-    response.raise_for_status()
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT ea.ticker,
+                          EXTRACT(EPOCH FROM
+                              ea.generated_at)::bigint * 1000 AS timestamp,
+                          ea.side,
+                          ea.dollar_amount::double precision,
+                          ea.action,
+                          ep.pair_id,
+                          ea.entry_price::double precision,
+                          ea.quantity::bigint,
+                          ea.notional::double precision
+                   FROM equity_allocations ea
+                   JOIN equity_pairs ep ON ea.equity_pair_id = ep.id
+                   WHERE ep.status = 'open'
+                   ORDER BY ea.ticker"""
+            )
+            rows = await result.fetchall()
+    except Exception as error:
+        logger.exception(
+            "Failed to fetch prior allocation from database", error=str(error)
+        )
+        raise
 
-    response_text = response.text.strip()
-    if not response_text or response_text == "[]":
+    if not rows:
         logger.info("Prior allocation is empty")
         return empty
 
-    try:
-        prior_allocation_data = response.json()
-
-        if not prior_allocation_data:
-            return empty
-
-        prior_allocation = pl.DataFrame(
-            prior_allocation_data, schema=_PRIOR_ALLOCATION_SCHEMA
-        )
-
-        if prior_allocation.is_empty():
-            return empty
-
-        logger.info("Retrieved prior allocation", count=prior_allocation.height)
-        return prior_allocation  # noqa: TRY300
-
-    except (
-        ValueError,
-        pl.exceptions.PolarsError,
-    ) as e:
-        logger.exception("Failed to parse prior allocation JSON", error=str(e))
-        raise
+    dataframe = pl.DataFrame(
+        {
+            "ticker": [row[0] for row in rows],
+            "timestamp": [row[1] for row in rows],
+            "side": [row[2] for row in rows],
+            "dollar_amount": [row[3] for row in rows],
+            "action": [row[4] for row in rows],
+            "pair_id": [row[5] for row in rows],
+            "entry_price": [row[6] for row in rows],
+            "quantity": [row[7] for row in rows],
+            "notional": [row[8] for row in rows],
+        },
+        schema=_PRIOR_ALLOCATION_SCHEMA,
+    )
+    logger.info("Retrieved prior allocation", count=dataframe.height)
+    return dataframe
 
 
-async def save_allocation(
-    allocation: pl.DataFrame, current_timestamp: datetime
+async def save_rebalance(  # noqa: PLR0913
+    triggered_at: datetime,
+    trigger_reason: str,
+    model_run_id: str | None,
+    successful_pair_rows: pl.DataFrame,
+    candidate_pairs: pl.DataFrame,
+    open_results: list[dict[str, Any]],
 ) -> bool:
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url=f"{DATA_MANAGER_BASE_URL}/portfolios",
-                json={
-                    "timestamp": current_timestamp.isoformat(),
-                    "data": allocation.to_dicts(),
-                },
-            )
-        response.raise_for_status()
-        logger.info("Saved allocation state", count=allocation.height)
+        session_id = str(uuid.uuid4())
+        completed_at = datetime.now(tz=UTC)
+        order_by_ticker = {
+            r["ticker"]: r for r in open_results if r.get("status") == "success"
+        }
+
+        pool = await get_pool()
+        async with pool.connection() as connection:  # noqa: SIM117
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO equity_rebalance_sessions
+                       (id, triggered_at, trigger_reason,
+                        model_run_id, completed_at, status)
+                       VALUES (%s, %s, %s, %s, %s, %s)""",
+                    (
+                        session_id,
+                        triggered_at,
+                        trigger_reason,
+                        model_run_id,
+                        completed_at,
+                        "completed",
+                    ),
+                )
+
+                if not successful_pair_rows.is_empty():
+                    pair_ids = successful_pair_rows["pair_id"].unique().to_list()
+                    for pair_id_str in pair_ids:
+                        pair_legs = successful_pair_rows.filter(
+                            pl.col("pair_id") == pair_id_str
+                        )
+                        candidate_row = candidate_pairs.filter(
+                            pl.col("pair_id") == pair_id_str
+                        )
+                        if candidate_row.is_empty():
+                            logger.warning(
+                                "Candidate pair not found for session, skipping",
+                                pair_id=pair_id_str,
+                            )
+                            continue
+
+                        long_legs = pair_legs.filter(
+                            pl.col("side") == PositionSide.LONG.value
+                        )
+                        short_legs = pair_legs.filter(
+                            pl.col("side") == PositionSide.SHORT.value
+                        )
+                        if long_legs.is_empty() or short_legs.is_empty():
+                            logger.warning(
+                                "Incomplete pair legs in session, skipping",
+                                pair_id=pair_id_str,
+                            )
+                            continue
+
+                        pair_uuid = str(uuid.uuid4())
+                        await connection.execute(
+                            """INSERT INTO equity_pairs
+                               (id, rebalance_id, pair_id, long_ticker, short_ticker,
+                                z_score, hedge_ratio, signal_strength,
+                                status, opened_at)
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (
+                                pair_uuid,
+                                session_id,
+                                pair_id_str,
+                                long_legs["ticker"][0],
+                                short_legs["ticker"][0],
+                                float(candidate_row["z_score"][0]),
+                                float(candidate_row["hedge_ratio"][0]),
+                                float(candidate_row["signal_strength"][0]),
+                                "open",
+                                triggered_at,
+                            ),
+                        )
+
+                        for leg in pair_legs.iter_rows(named=True):
+                            allocation_uuid = str(uuid.uuid4())
+                            ticker = leg["ticker"]
+                            leg_entry_price = leg.get("entry_price")
+                            leg_quantity = leg.get("quantity")
+                            leg_notional = leg.get("notional")
+
+                            await connection.execute(
+                                """INSERT INTO equity_allocations
+                                   (id, rebalance_id, equity_pair_id, generated_at,
+                                    model_run_id, ticker, side, action, dollar_amount,
+                                    entry_price, quantity, notional)
+                                   VALUES (%s, %s, %s, %s,
+                                           %s, %s, %s, %s, %s, %s, %s, %s)""",
+                                (
+                                    allocation_uuid,
+                                    session_id,
+                                    pair_uuid,
+                                    triggered_at,
+                                    model_run_id,
+                                    ticker,
+                                    leg["side"],
+                                    leg.get("action", "OPEN_POSITION"),
+                                    float(leg["dollar_amount"]),
+                                    float(leg_entry_price)
+                                    if leg_entry_price is not None
+                                    else None,
+                                    int(leg_quantity)
+                                    if leg_quantity is not None
+                                    else None,
+                                    float(leg_notional)
+                                    if leg_notional is not None
+                                    else None,
+                                ),
+                            )
+
+                            order_result = order_by_ticker.get(ticker)
+                            if order_result and order_result.get("alpaca_order_id"):
+                                order_side = order_result.get("side")
+                                order_side_str = (
+                                    order_side.value
+                                    if hasattr(order_side, "value")
+                                    else str(order_side)
+                                )
+                                submitted_qty = order_result.get("submitted_quantity")
+                                if (
+                                    submitted_qty is None
+                                    and leg_entry_price
+                                    and leg_entry_price > 0
+                                    and leg_notional
+                                ):
+                                    submitted_qty = leg_notional / leg_entry_price
+                                if submitted_qty is not None and submitted_qty > 0:
+                                    await connection.execute(
+                                        """INSERT INTO equity_orders
+                                           (id, allocation_id, submitted_at,
+                                            ticker, side,
+                                            quantity, order_type, alpaca_order_id)
+                                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                                        (
+                                            str(uuid.uuid4()),
+                                            allocation_uuid,
+                                            triggered_at,
+                                            ticker,
+                                            order_side_str,
+                                            float(submitted_qty),
+                                            "market",
+                                            order_result["alpaca_order_id"],
+                                        ),
+                                    )
+
+        pair_count = (
+            successful_pair_rows["pair_id"].n_unique()
+            if not successful_pair_rows.is_empty()
+            else 0
+        )
+        logger.info(
+            "Saved rebalance session",
+            trigger_reason=trigger_reason,
+            pair_count=pair_count,
+        )
         return True  # noqa: TRY300
-    except Exception as e:
-        logger.exception("Failed to save allocation state", error=str(e))
+    except Exception as error:
+        logger.exception("Failed to save rebalance session", error=str(error))
         return False
 
 
 async def save_performance_snapshot(snapshot: dict[str, Any]) -> bool:
     try:
-        timestamp_millis = snapshot["timestamp"]
-        timestamp_seconds, timestamp_millis_remainder = divmod(timestamp_millis, 1000)
-        snapshot_timestamp = datetime.fromtimestamp(timestamp_seconds, tz=UTC).replace(
-            microsecond=timestamp_millis_remainder * 1000
-        )
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
-                json={
-                    "timestamp": snapshot_timestamp.isoformat(),
-                    "data": snapshot,
-                },
+        timestamp_seconds = snapshot["timestamp"] // 1000
+        snapshot_date = datetime.fromtimestamp(timestamp_seconds, tz=UTC).date()
+
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            await connection.execute(
+                """INSERT INTO equity_portfolio_snapshots
+                   (snapshot_date, net_asset_value,
+                    gross_return, net_return, total_slippage_cost)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (snapshot_date) DO UPDATE
+                   SET net_asset_value = EXCLUDED.net_asset_value,
+                       gross_return = EXCLUDED.gross_return,
+                       net_return = EXCLUDED.net_return,
+                       total_slippage_cost = EXCLUDED.total_slippage_cost""",
+                (
+                    snapshot_date,
+                    snapshot["portfolio_value"],
+                    snapshot["gross_return"],
+                    snapshot["net_return"],
+                    snapshot["total_slippage_cost"],
+                ),
             )
-        response.raise_for_status()
         logger.info("Saved performance snapshot")
         return True  # noqa: TRY300
-    except Exception as e:
-        logger.exception("Failed to save performance snapshot", error=str(e))
+    except Exception as error:
+        logger.exception("Failed to save performance snapshot", error=str(error))
         return False
-
-
-get_prior_portfolio = get_prior_allocation
-save_portfolio = save_allocation
 
 
 async def save_closed_pair(record: dict[str, Any]) -> bool:
     try:
-        closed_timestamp_millis = record["closed_timestamp"]
-        closed_timestamp_seconds, closed_millis_remainder = divmod(
-            closed_timestamp_millis, 1000
-        )
-        closed_timestamp = datetime.fromtimestamp(
-            closed_timestamp_seconds, tz=UTC
-        ).replace(microsecond=closed_millis_remainder * 1000)
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url=f"{DATA_MANAGER_BASE_URL}/performance/closed-pairs",
-                json={
-                    "timestamp": closed_timestamp.isoformat(),
-                    "data": record,
-                },
+        closed_at = datetime.fromtimestamp(record["closed_timestamp"] // 1000, tz=UTC)
+        opened_at = datetime.fromtimestamp(record["entry_timestamp"] // 1000, tz=UTC)
+
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            cursor = await connection.execute(
+                """UPDATE equity_pairs
+                   SET status = 'closed',
+                       closed_at = %s,
+                       realized_profit_and_loss = %s,
+                       return_percent = %s,
+                       holding_days = %s
+                   WHERE pair_id = %s
+                     AND status = 'open'
+                     AND opened_at = %s""",
+                (
+                    closed_at,
+                    record["realized_profit_and_loss"],
+                    record["return_percent"],
+                    record["holding_days"],
+                    record["pair_id"],
+                    opened_at,
+                ),
             )
-        response.raise_for_status()
+            if cursor.rowcount == 0:
+                logger.warning(
+                    "Closed pair update matched no open row",
+                    pair_id=record["pair_id"],
+                )
+                return False
         logger.info("Saved closed pair record")
         return True  # noqa: TRY300
-    except Exception as e:
-        logger.exception("Failed to save closed pair record", error=str(e))
+    except Exception as error:
+        logger.exception("Failed to save closed pair record", error=str(error))
         return False
 
 
 async def get_last_portfolio_value() -> float | None:
     try:
-        now = datetime.now(tz=UTC)
-        seven_days_ago = now - timedelta(days=7)
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(
-                url=f"{DATA_MANAGER_BASE_URL}/performance/snapshots",
-                params={
-                    "start_timestamp": seven_days_ago.isoformat(),
-                    "end_timestamp": now.isoformat(),
-                },
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT net_asset_value::double precision
+                   FROM equity_portfolio_snapshots
+                   ORDER BY snapshot_date DESC
+                   LIMIT 1"""
             )
-
-        response.raise_for_status()
-
-        dataframe = pl.read_parquet(io.BytesIO(response.content))
-
-        if dataframe.height == 0:
-            return None
-
-        return float(dataframe["portfolio_value"][-1])
-
-    except Exception as e:
-        logger.exception("Failed to retrieve last portfolio value", error=str(e))
+            row = await result.fetchone()
+        return float(row[0]) if row else None
+    except Exception as error:
+        logger.exception("Failed to retrieve last portfolio value", error=str(error))
         return None
 
 

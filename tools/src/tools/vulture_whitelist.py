@@ -6,3 +6,4 @@ from tenacity import RetryCallState
 
 _ = S3Client  # used in type annotations
 _ = RetryCallState  # used in string annotation for type checker
+datamanager_base_url  # shim param retained until Phase 9 cleanup

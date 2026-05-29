@@ -25,13 +25,41 @@ def test_handle_predictions_completed_calls_run_rebalance_when_market_open() -> 
 
     async def run() -> None:
         lock = asyncio.Lock()
-        with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.already_rebalanced_today",
+                AsyncMock(return_value=False),
+            ),
+        ):
             await _handle_predictions_completed(
                 mock_alpaca, Configuration(), lock, None
             )
 
     asyncio.run(run())
     mock_run_rebalance.assert_called_once()
+
+
+def test_handle_predictions_completed_skips_when_already_rebalanced_today() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock()
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.already_rebalanced_today",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await _handle_predictions_completed(
+                mock_alpaca, Configuration(), lock, None
+            )
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_not_called()
 
 
 def test_handle_predictions_completed_skips_when_lock_held() -> None:
@@ -93,6 +121,10 @@ def test_handle_predictions_completed_logs_warning_on_non_200() -> None:
         lock = asyncio.Lock()
         with (
             patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.already_rebalanced_today",
+                AsyncMock(return_value=False),
+            ),
             patch("portfolio_manager.scheduler.logger") as mock_logger,
         ):
             await _handle_predictions_completed(
@@ -110,13 +142,20 @@ def test_handle_predictions_completed_handles_run_rebalance_exception() -> None:
 
     async def run() -> None:
         lock = asyncio.Lock()
-        with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.already_rebalanced_today",
+                AsyncMock(return_value=False),
+            ),
+        ):
             await _handle_predictions_completed(
                 mock_alpaca, Configuration(), lock, None
             )
 
     asyncio.run(run())
     mock_run_rebalance.assert_called_once()
+    assert mock_run_rebalance.call_args.args[2] == "abc-123"
 
 
 # --- _handle_intraday_check ---

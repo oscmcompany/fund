@@ -106,6 +106,7 @@ ignore = ["COM812"]
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**/*.py" = ["S101"]
 "**/features/steps/**/*.py" = ["S101"]
+"tools/src/tools/vulture_whitelist.py" = ["B018", "F821"]
 
 [tool.ty.rules]
 unresolved-import = "ignore"
@@ -113,6 +114,12 @@ invalid-return-type = "error"
 invalid-argument-type = "error"
 unresolved-reference = "error"
 missing-argument = "ignore"
+
+[[tool.ty.overrides]]
+# Vulture whitelist contains bare name expressions that ty cannot resolve
+include = ["tools/src/tools/vulture_whitelist.py"]
+[tool.ty.overrides.rules]
+unresolved-reference = "ignore"
 
 [[tool.ty.overrides]]
 # Pulumi infrastructure has complex generics that type checkers struggle with

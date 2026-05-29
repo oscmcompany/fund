@@ -1,10 +1,8 @@
-import io
-from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock, patch
+import asyncio
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
-import polars as pl
 import pytest
-import requests
 from portfolio_manager.data_client import (
     fetch_equity_details,
     fetch_historical_prices,
@@ -13,236 +11,269 @@ from portfolio_manager.data_client import (
 from portfolio_manager.exceptions import PriceDataUnavailableError
 
 
-def _make_parquet_bytes(dataframe: pl.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    dataframe.write_parquet(buffer)
-    return buffer.getvalue()
+def _make_pool_mock(rows: list) -> MagicMock:
+    mock_result = AsyncMock()
+    mock_result.fetchall.return_value = rows
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(return_value=mock_result)
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
+    return mock_pool
 
 
-def _make_csv_bytes(dataframe: pl.DataFrame) -> bytes:
-    return dataframe.write_csv().encode()
+# --- fetch_historical_prices ---
 
 
 def test_fetch_historical_prices_returns_expected_columns() -> None:
-    raw = pl.DataFrame(
-        {
-            "ticker": ["AAPL", "MSFT"],
-            "timestamp": ["2024-01-01", "2024-01-01"],
-            "close_price": [150.0, 300.0],
-            "extra_column": [1, 2],
-        }
-    )
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+    rows = [
+        ("AAPL", 1704067200000, 150.0),
+        ("MSFT", 1704067200000, 300.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = fetch_historical_prices(
-            "http://localhost", datetime(2024, 1, 2, tzinfo=UTC)
-        )
+        result = asyncio.run(fetch_historical_prices(datetime(2024, 1, 2, tzinfo=UTC)))
 
     assert result.columns == ["ticker", "timestamp", "close_price"]
-    assert result.height == raw.height
+    assert result.height == 2  # noqa: PLR2004
 
 
 def test_fetch_historical_prices_drops_null_close_prices() -> None:
-    raw = pl.DataFrame(
-        {
-            "ticker": ["AAPL", "MSFT", "GOOG"],
-            "timestamp": ["2024-01-01", "2024-01-01", "2024-01-01"],
-            "close_price": [150.0, None, 200.0],
-        }
-    )
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+    rows = [
+        ("AAPL", 1704067200000, 150.0),
+        ("MSFT", 1704067200000, None),
+        ("GOOG", 1704067200000, 200.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = fetch_historical_prices(
-            "http://localhost", datetime(2024, 1, 2, tzinfo=UTC)
-        )
+        result = asyncio.run(fetch_historical_prices(datetime(2024, 1, 2, tzinfo=UTC)))
 
-    assert result.height == raw.height - 1
+    assert result.height == 2  # noqa: PLR2004
     assert "MSFT" not in result["ticker"].to_list()
 
 
-def test_fetch_historical_prices_sends_correct_query_params() -> None:
-    reference_date = datetime(2024, 4, 1, tzinfo=UTC)
-    raw = pl.DataFrame({"ticker": [], "timestamp": [], "close_price": []})
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+def test_fetch_historical_prices_returns_empty_dataframe_when_no_rows() -> None:
+    mock_pool = _make_pool_mock([])
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
-    ) as mock_get:
-        fetch_historical_prices(
-            "http://datamanager:8080", reference_date, lookback_days=90
-        )
-
-    expected_start = (reference_date - timedelta(days=90)).isoformat()
-    mock_get.assert_called_once_with(
-        url="http://datamanager:8080/equity-bars",
-        params={
-            "start_timestamp": expected_start,
-            "end_timestamp": reference_date.isoformat(),
-        },
-        timeout=120,
-    )
-
-
-def test_fetch_historical_prices_raises_on_http_error() -> None:
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
-
-    with (
-        patch("portfolio_manager.data_client.requests.get", return_value=mock_response),
-        pytest.raises(PriceDataUnavailableError),
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        fetch_historical_prices("http://localhost", datetime(2024, 1, 1, tzinfo=UTC))
+        result = asyncio.run(fetch_historical_prices(datetime(2024, 1, 2, tzinfo=UTC)))
+
+    assert result.is_empty()
+    assert result.columns == ["ticker", "timestamp", "close_price"]
 
 
-def test_fetch_historical_prices_raises_on_network_error() -> None:
+def test_fetch_historical_prices_deduplicates_ticker_timestamp() -> None:
+    rows = [
+        ("AAPL", 1704067200000, 149.0),
+        ("AAPL", 1704067200000, 150.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(fetch_historical_prices(datetime(2024, 1, 2, tzinfo=UTC)))
+
+    assert result.height == 1
+    assert result["close_price"][0] == pytest.approx(150.0)
+
+
+def test_fetch_historical_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("connection refused"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
+
     with (
         patch(
-            "portfolio_manager.data_client.requests.get",
-            side_effect=requests.RequestException("Connection refused"),
+            "portfolio_manager.data_client.get_pool",
+            AsyncMock(return_value=mock_pool),
         ),
         pytest.raises(PriceDataUnavailableError),
     ):
-        fetch_historical_prices("http://localhost", datetime(2024, 1, 1, tzinfo=UTC))
+        asyncio.run(fetch_historical_prices(datetime(2024, 1, 1, tzinfo=UTC)))
+
+
+def test_fetch_historical_prices_accepts_datamanager_base_url_shim() -> None:
+    mock_pool = _make_pool_mock([])
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(
+            fetch_historical_prices(
+                datetime(2024, 1, 2, tzinfo=UTC),
+                datamanager_base_url="http://ignored",
+            )
+        )
+
+    assert result.is_empty()
+
+
+# --- fetch_equity_details ---
 
 
 def test_fetch_equity_details_returns_expected_columns() -> None:
-    raw = pl.DataFrame(
-        {
-            "ticker": ["AAPL", "MSFT"],
-            "sector": ["Technology", "Technology"],
-            "extra_column": ["foo", "bar"],
-        }
-    )
-    mock_response = MagicMock()
-    mock_response.content = _make_csv_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+    rows = [
+        ("AAPL", "Technology"),
+        ("MSFT", "Technology"),
+    ]
+    mock_pool = _make_pool_mock(rows)
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = fetch_equity_details("http://localhost")
+        result = asyncio.run(fetch_equity_details())
 
     assert result.columns == ["ticker", "sector"]
-    assert result.height == raw.height
+    assert result.height == 2  # noqa: PLR2004
 
 
-def test_fetch_equity_details_raises_on_http_error() -> None:
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = requests.HTTPError("404 Not Found")
+def test_fetch_equity_details_returns_empty_dataframe_when_no_rows() -> None:
+    mock_pool = _make_pool_mock([])
 
-    with (
-        patch("portfolio_manager.data_client.requests.get", return_value=mock_response),
-        pytest.raises(PriceDataUnavailableError),
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        fetch_equity_details("http://localhost")
+        result = asyncio.run(fetch_equity_details())
+
+    assert result.is_empty()
+    assert result.columns == ["ticker", "sector"]
 
 
-def test_fetch_equity_details_raises_on_network_error() -> None:
+def test_fetch_equity_details_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("db error"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
+
     with (
         patch(
-            "portfolio_manager.data_client.requests.get",
-            side_effect=requests.RequestException("Timeout"),
+            "portfolio_manager.data_client.get_pool",
+            AsyncMock(return_value=mock_pool),
         ),
         pytest.raises(PriceDataUnavailableError),
     ):
-        fetch_equity_details("http://localhost")
+        asyncio.run(fetch_equity_details())
+
+
+def test_fetch_equity_details_accepts_datamanager_base_url_shim() -> None:
+    mock_pool = _make_pool_mock([])
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(
+            fetch_equity_details(datamanager_base_url="http://ignored")
+        )
+
+    assert result.is_empty()
+
+
+# --- fetch_spy_prices ---
 
 
 def test_fetch_spy_prices_returns_expected_columns() -> None:
-    raw = pl.DataFrame(
-        {
-            "ticker": ["SPY", "SPY"],
-            "timestamp": ["2024-01-01", "2024-01-02"],
-            "close_price": [450.0, 452.0],
-            "extra_column": [1, 2],
-        }
-    )
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+    rows = [
+        ("SPY", 1704067200000, 450.0),
+        ("SPY", 1704153600000, 452.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = fetch_spy_prices("http://localhost", datetime(2024, 1, 3, tzinfo=UTC))
+        result = asyncio.run(fetch_spy_prices(datetime(2024, 1, 3, tzinfo=UTC)))
 
     assert result.columns == ["ticker", "timestamp", "close_price"]
-    assert result.height == raw.height
+    assert result.height == 2  # noqa: PLR2004
 
 
 def test_fetch_spy_prices_drops_null_close_prices() -> None:
-    raw = pl.DataFrame(
-        {
-            "ticker": ["SPY", "SPY"],
-            "timestamp": ["2024-01-01", "2024-01-02"],
-            "close_price": [450.0, None],
-        }
-    )
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+    rows = [
+        ("SPY", 1704067200000, 450.0),
+        ("SPY", 1704153600000, None),
+    ]
+    mock_pool = _make_pool_mock(rows)
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = fetch_spy_prices("http://localhost", datetime(2024, 1, 3, tzinfo=UTC))
+        result = asyncio.run(fetch_spy_prices(datetime(2024, 1, 3, tzinfo=UTC)))
 
     assert result.height == 1
 
 
-def test_fetch_spy_prices_sends_correct_query_params() -> None:
-    reference_date = datetime(2024, 4, 1, tzinfo=UTC)
-    raw = pl.DataFrame({"ticker": [], "timestamp": [], "close_price": []})
-    mock_response = MagicMock()
-    mock_response.content = _make_parquet_bytes(raw)
-    mock_response.raise_for_status.return_value = None
+def test_fetch_spy_prices_returns_empty_dataframe_when_no_rows() -> None:
+    mock_pool = _make_pool_mock([])
 
     with patch(
-        "portfolio_manager.data_client.requests.get", return_value=mock_response
-    ) as mock_get:
-        fetch_spy_prices("http://datamanager:8080", reference_date, lookback_days=90)
-
-    expected_start = (reference_date - timedelta(days=90)).isoformat()
-    mock_get.assert_called_once_with(
-        url="http://datamanager:8080/equity-bars",
-        params={
-            "tickers": "SPY",
-            "start_timestamp": expected_start,
-            "end_timestamp": reference_date.isoformat(),
-        },
-        timeout=120,
-    )
-
-
-def test_fetch_spy_prices_raises_on_http_error() -> None:
-    mock_response = MagicMock()
-    mock_response.raise_for_status.side_effect = requests.HTTPError("500 Server Error")
-
-    with (
-        patch("portfolio_manager.data_client.requests.get", return_value=mock_response),
-        pytest.raises(PriceDataUnavailableError),
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        fetch_spy_prices("http://localhost", datetime(2024, 1, 1, tzinfo=UTC))
+        result = asyncio.run(fetch_spy_prices(datetime(2024, 1, 3, tzinfo=UTC)))
+
+    assert result.is_empty()
+    assert result.columns == ["ticker", "timestamp", "close_price"]
 
 
-def test_fetch_spy_prices_raises_on_network_error() -> None:
+def test_fetch_spy_prices_deduplicates_timestamp() -> None:
+    rows = [
+        ("SPY", 1704067200000, 449.0),
+        ("SPY", 1704067200000, 450.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(fetch_spy_prices(datetime(2024, 1, 3, tzinfo=UTC)))
+
+    assert result.height == 1
+    assert result["close_price"][0] == pytest.approx(450.0)
+
+
+def test_fetch_spy_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("timeout"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
+
     with (
         patch(
-            "portfolio_manager.data_client.requests.get",
-            side_effect=requests.RequestException("Connection refused"),
+            "portfolio_manager.data_client.get_pool",
+            AsyncMock(return_value=mock_pool),
         ),
         pytest.raises(PriceDataUnavailableError),
     ):
-        fetch_spy_prices("http://localhost", datetime(2024, 1, 1, tzinfo=UTC))
+        asyncio.run(fetch_spy_prices(datetime(2024, 1, 1, tzinfo=UTC)))
+
+
+def test_fetch_spy_prices_accepts_datamanager_base_url_shim() -> None:
+    mock_pool = _make_pool_mock([])
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(
+            fetch_spy_prices(
+                datetime(2024, 1, 3, tzinfo=UTC),
+                datamanager_base_url="http://ignored",
+            )
+        )
+
+    assert result.is_empty()

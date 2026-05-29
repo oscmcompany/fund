@@ -265,6 +265,57 @@ pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+pub async fn populate_equity_details_if_empty(
+    pool: &PgPool,
+    rows: Vec<(String, String, String)>,
+) -> Result<u64, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM equity_details")
+        .fetch_one(&mut *transaction)
+        .await?;
+
+    if count.0 > 0 {
+        info!(
+            "equity_details already populated with {} rows, skipping migration",
+            count.0
+        );
+        return Ok(0);
+    }
+
+    if rows.is_empty() {
+        warn!("equity_details is empty and no rows provided; skipping migration");
+        return Ok(0);
+    }
+
+    let mut rows_affected: u64 = 0;
+
+    for chunk in rows.chunks(1000) {
+        let mut query_builder =
+            sqlx::QueryBuilder::new("INSERT INTO equity_details (ticker, sector, industry) ");
+
+        query_builder.push_values(chunk, |mut builder, (ticker, sector, industry)| {
+            builder
+                .push_bind(ticker)
+                .push_bind(sector)
+                .push_bind(industry);
+        });
+
+        query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
+
+        let result = query_builder.build().execute(&mut *transaction).await?;
+        rows_affected += result.rows_affected();
+    }
+
+    transaction.commit().await?;
+
+    info!(
+        "Populated equity_details with {} rows from S3 migration",
+        rows_affected
+    );
+    Ok(rows_affected)
+}
+
 pub async fn set_data_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
     let alter_statement: String = sqlx::query_scalar(
         r#"SELECT format('ALTER DATABASE %I SET "app.data_bucket_name" = %L', current_database(), $1)"#,

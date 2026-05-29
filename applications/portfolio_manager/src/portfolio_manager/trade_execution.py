@@ -200,7 +200,7 @@ def _try_open_single_position(  # noqa: PLR0911
         )
 
     try:
-        alpaca_client.open_position(
+        alpaca_order_id = alpaca_client.open_position(
             ticker=ticker,
             side=side,
             dollar_amount=dollar_amount,
@@ -223,7 +223,19 @@ def _try_open_single_position(  # noqa: PLR0911
                 deducting=buying_power_cost,
             )
             new_buying_power = remaining_buying_power - buying_power_cost
-        return ({**base_result, "status": "success"}, True, new_buying_power)  # noqa: TRY300
+        submitted_quantity = (
+            short_qty if side == TradeSide.SELL else position.get("quantity")
+        )
+        return (  # noqa: TRY300
+            {
+                **base_result,
+                "status": "success",
+                "alpaca_order_id": alpaca_order_id,
+                "submitted_quantity": submitted_quantity,
+            },
+            True,
+            new_buying_power,
+        )
     except InsufficientBuyingPowerError as e:
         logger.warning(
             "Insufficient buying power for position",

@@ -125,7 +125,7 @@ class AlpacaClient:
         dollar_amount: float,
         entry_price: float,
         quantity: int | None = None,
-    ) -> None:
+    ) -> str:
         if dollar_amount <= 0:
             message = (
                 f"Cannot open position for {ticker}: "
@@ -170,7 +170,8 @@ class AlpacaClient:
             )
 
         try:
-            self.trading_client.submit_order(order_data=order_request)
+            order = self.trading_client.submit_order(order_data=order_request)
+            alpaca_order_id = str(getattr(order, "id", ""))
         except APIError as e:
             error_str = str(e).lower()
             if "insufficient buying power" in error_str or "buying_power" in error_str:
@@ -186,6 +187,7 @@ class AlpacaClient:
             raise
 
         time.sleep(self.rate_limit_sleep)
+        return alpaca_order_id
 
     @_alpaca_retry
     def get_shortable_tickers(self, tickers: list[str]) -> set[str]:

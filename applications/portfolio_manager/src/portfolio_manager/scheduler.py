@@ -8,6 +8,7 @@ from internal.database import listen_for_events, update_consumer_offset
 
 from .alpaca_client import AlpacaClient
 from .configuration import Configuration
+from .portfolio_state import already_rebalanced_today
 from .rebalance import get_latest_predictions_correlation_id, run_rebalance
 
 logger = structlog.get_logger()
@@ -88,12 +89,27 @@ async def _handle_predictions_completed(
         logger.info("Market is closed, skipping rebalance on predictions_completed")
         return
 
+    if await already_rebalanced_today():
+        logger.info("Already rebalanced today, skipping predictions_completed")
+        return
+
     logger.info(
         "Starting event-triggered portfolio rebalance", correlation_id=correlation_id
     )
     try:
         async with rebalance_lock:
-            response = await run_rebalance(alpaca_client, configuration, correlation_id)
+            if await already_rebalanced_today():
+                logger.info(
+                    "Already rebalanced today, skipping (post-lock check)",
+                    correlation_id=correlation_id,
+                )
+                return
+            response = await run_rebalance(
+                alpaca_client,
+                configuration,
+                correlation_id,
+                trigger_reason="predictions_completed",
+            )
         if response.status_code != status.HTTP_200_OK:
             logger.warning(
                 "Event-triggered rebalance completed with non-200 status",
@@ -130,7 +146,12 @@ async def _handle_intraday_check(
     logger.info("Starting intraday rebalance check", correlation_id=correlation_id)
     try:
         async with rebalance_lock:
-            response = await run_rebalance(alpaca_client, configuration, correlation_id)
+            response = await run_rebalance(
+                alpaca_client,
+                configuration,
+                correlation_id,
+                trigger_reason="intraday_check",
+            )
         if response.status_code != status.HTTP_200_OK:
             logger.warning(
                 "Intraday rebalance completed with non-200 status",
