@@ -136,6 +136,10 @@ def test_handle_intraday_check_skips_when_all_pairs_held() -> None:
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
 
+def test_handle_predictions_completed_skips_when_market_closed() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = False
+    mock_run_rebalance = AsyncMock()
 
 def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> None:
     mock_alpaca = MagicMock()
@@ -237,6 +241,7 @@ def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
     mock_run_rebalance.assert_called_once()
     assert mock_run_rebalance.call_args.args[2] == "abc-123"
 
+# --- _handle_intraday_check ---
 
 def test_handle_intraday_check_skips_when_historical_prices_fetch_fails() -> None:
     mock_alpaca = MagicMock()
