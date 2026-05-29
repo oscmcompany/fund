@@ -15,20 +15,16 @@ This is a collection of guidelines and references.
 - AWS S3 is used for blob storage (data bucket and model artifacts bucket)
 - AWS Secrets Manager stores secrets in secretspec format (`secretspec/{project}/{profile}/{key}`)
 - Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
-- Python servers primarily use [FastAPI](https://fastapi.tiangolo.com/)
 - Use `devenv tasks run checks:python` for comprehensive Python checks
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
-- Add in-line code comments only where necessary for clarity
+- Add in-line code comments only where necessary for clarity; include language-appropriate docstrings for functions and
+  modules
 - Use full word variables in code whenever possible
 - Follow Rust and Python recommended casing conventions
 - Strictly use Python version 3.12.10
-- Folder names under the `applications/` directory should end with `model` for machine learning services
-  and end with `manager` for all others
-- Scan and remove unused dependencies from `pyproject.toml` files
-- Move duplicate dependencies into root workspace `pyproject.toml`
+- Scan and remove unused dependencies from `pyproject.toml` files; move duplicate dependencies into root workspace `pyproject.toml`
 - Introduce new dependencies only after approval
 - Include type hints on all Python function parameters and return types
-- Rust servers primarily use [Axum](https://docs.rs/axum/latest/axum/)
 - Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and
   [Rust](https://docs.rs/polars/latest/polars/) dataframes
 - Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
@@ -43,13 +39,11 @@ This is a collection of guidelines and references.
 - When debugging or fixing bugs, check structured logs and error log files in `/var/log/fund/` to understand what happened
 - After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
 - When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow commented instructions
-- Only use labels already available on the GitHub repository for issues and pull requests
 - When naming branches, use an all-lowercase, hyphenated, and concise summary of the work being done
 - `tools/` folder contains development utilities and scripts
 - `applications/` folder contains deployable services
 - `libraries/` folder contains shared code resources
 - `models/` folder contains model definitions and training code
-- The artifact-watcher process polls S3 for new model artifacts and restarts ensemble-manager
 - See `README.md` "Principles" section for developer philosophy
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
@@ -66,16 +60,7 @@ This is a collection of guidelines and references.
 - Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone
 - When possible, use GitHub's GraphQL API directly for scripts and tools where token efficiency matters
 - When the user indicates pull request review bots have provided feedback, suggest running `/update-pull-request`
-  with the pull request number
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash commands
-- Guard against division by zero when computing ratios or percentages from
-  DataFrame aggregations
-- When Polars `Series.sum()` is used on a potentially empty or all-null
-  series, handle the `None` return case
-- Pin GitHub Actions to version tags in deployment workflows; `@main` is
-  acceptable for CI but not for CD
-- `devenv tasks run` supports prefix group execution: `checks:python` runs
-  all `checks:python:*` subtasks
-- With `devenv hook` configured in your shell rc, the devenv environment
-  activates automatically on `cd`. Pre-commit hooks have access to `alejandra`,
-  `ruff`, and `cargo fmt` without needing `devenv shell` wrapper.
+- Guard against division by zero when computing ratios or percentages from DataFrame aggregations
+- When Polars `Series.sum()` is used on a potentially empty or all-null series, handle the `None` return case
+- `devenv tasks run` supports prefix group execution: `checks:python` runs all `checks:python:*` subtasks

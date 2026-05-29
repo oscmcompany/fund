@@ -1,0 +1,5 @@
+include = ["**/*.toml"]
+exclude = [".devenv/**", "target/**", ".venv/**", "models/tide/.devenv/**"]
+
+[schema]
+enabled = false

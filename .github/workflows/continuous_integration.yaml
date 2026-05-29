@@ -1,16 +1,14 @@
 ---
-name: Continuous Integration
-run-name: Continuous Integration
+name: Continuous integration
+run-name: Continuous integration
 on:
   pull_request:
-
 permissions:
   contents: read
   pull-requests: read
-
 jobs:
   ci:
-    name: CI checks
+    name: Continuous integration checks
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -19,8 +17,10 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-      - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
         with:
           use-flakehub: false
       - name: Install devenv
@@ -31,15 +31,17 @@ jobs:
           workspaces: .
           cache-on-failure: false
           shared-key: rust-continuous-integration
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: true
       - name: Cache Python dependencies
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
           key: uv-${{ hashFiles('**/pyproject.toml', 'uv.lock') }}
           restore-keys: uv-
-      - name: Run all CI checks
-        run: devenv --secretspec-provider env --secretspec-profile development tasks run --mode before checks:ci
+      - name: Run all continuous integration checks
+        run: >-
+          devenv --secretspec-provider env --secretspec-profile development
+          tasks run --mode before checks:continuous-integration
       - name: Show Python coverage report
         if: always()
         run: |

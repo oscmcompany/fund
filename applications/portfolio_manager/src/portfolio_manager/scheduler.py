@@ -124,7 +124,6 @@ async def _handle_intraday_check(  # noqa: C901, PLR0911
     alpaca_client: AlpacaClient,
     configuration: Configuration,
     rebalance_lock: asyncio.Lock,
-    correlation_id: str | None,
 ) -> None:
     if rebalance_lock.locked():
         logger.info("Rebalance already in progress, skipping intraday_check")
