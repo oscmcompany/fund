@@ -1,14 +1,16 @@
 import asyncio
 import os
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from fastapi import status
-from internal.database import listen_for_events, update_consumer_offset
+from internal.database import emit_event, listen_for_events, update_consumer_offset
 
 from .alpaca_client import AlpacaClient
 from .configuration import Configuration
-from .portfolio_state import already_rebalanced_today
+from .data_client import fetch_historical_prices, fetch_live_quote_mid_prices
+from .portfolio_state import evaluate_held_pairs_from_quotes, get_prior_allocation
 from .rebalance import get_latest_predictions_correlation_id, run_rebalance
 
 logger = structlog.get_logger()
@@ -69,60 +71,19 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
                 return
 
 
-async def _handle_predictions_completed(
+async def _handle_equity_bars_synced() -> None:
+    try:
+        await emit_event("predictions_requested", {})
+        logger.info("Emitted predictions_requested after equity bars sync")
+    except Exception as error:
+        logger.exception("Failed to emit predictions_requested event", error=str(error))
+
+
+async def _handle_intraday_check(  # noqa: C901, PLR0911
     alpaca_client: AlpacaClient,
     configuration: Configuration,
     rebalance_lock: asyncio.Lock,
     correlation_id: str | None,
-) -> None:
-    if rebalance_lock.locked():
-        logger.info("Rebalance already in progress, skipping predictions_completed")
-        return
-
-    try:
-        market_open = alpaca_client.is_market_open()
-    except Exception as error:
-        logger.exception("Failed to check market open status", error=str(error))
-        return
-
-    if not market_open:
-        logger.info("Market is closed, skipping rebalance on predictions_completed")
-        return
-
-    if await already_rebalanced_today():
-        logger.info("Already rebalanced today, skipping predictions_completed")
-        return
-
-    logger.info(
-        "Starting event-triggered portfolio rebalance", correlation_id=correlation_id
-    )
-    try:
-        async with rebalance_lock:
-            if await already_rebalanced_today():
-                logger.info(
-                    "Already rebalanced today, skipping (post-lock check)",
-                    correlation_id=correlation_id,
-                )
-                return
-            response = await run_rebalance(
-                alpaca_client,
-                configuration,
-                correlation_id,
-                trigger_reason="predictions_completed",
-            )
-        if response.status_code != status.HTTP_200_OK:
-            logger.warning(
-                "Event-triggered rebalance completed with non-200 status",
-                status_code=response.status_code,
-            )
-    except Exception as error:
-        logger.exception("Event-triggered portfolio rebalance failed", error=str(error))
-
-
-async def _handle_intraday_check(
-    alpaca_client: AlpacaClient,
-    configuration: Configuration,
-    rebalance_lock: asyncio.Lock,
 ) -> None:
     if rebalance_lock.locked():
         logger.info("Rebalance already in progress, skipping intraday_check")
@@ -143,6 +104,38 @@ async def _handle_intraday_check(
         logger.info("No predictions available for intraday_check, skipping")
         return
 
+    prior_allocation = await get_prior_allocation()
+    if not prior_allocation.is_empty():
+        current_timestamp = datetime.now(tz=UTC)
+        prior_tickers = prior_allocation["ticker"].to_list()
+        try:
+            equity_bars = await fetch_historical_prices(
+                reference_date=current_timestamp,
+                tickers=prior_tickers,
+            )
+        except Exception as error:
+            logger.exception(
+                "Failed to fetch historical prices for intraday check",
+                error=str(error),
+            )
+            return
+        try:
+            live_mid_prices = await fetch_live_quote_mid_prices(prior_tickers)
+        except Exception as error:
+            logger.exception(
+                "Failed to fetch live quote mid-prices for intraday check",
+                error=str(error),
+            )
+            return
+        held_tickers = evaluate_held_pairs_from_quotes(
+            prior_allocation, equity_bars, live_mid_prices
+        )
+        if held_tickers >= set(prior_tickers):
+            logger.info("All held pairs continuing, skipping intraday rebalance")
+            return
+    else:
+        held_tickers = set()
+
     logger.info("Starting intraday rebalance check", correlation_id=correlation_id)
     try:
         async with rebalance_lock:
@@ -151,6 +144,7 @@ async def _handle_intraday_check(
                 configuration,
                 correlation_id,
                 trigger_reason="intraday_check",
+                held_tickers=held_tickers,
             )
         if response.status_code != status.HTTP_200_OK:
             logger.warning(
@@ -176,16 +170,11 @@ async def _event_listener_loop(
         try:
 
             async def handler(
-                event_type: str, event_id: int, payload: dict[str, Any]
+                event_type: str, event_id: int, _payload: dict[str, Any]
             ) -> None:
-                if event_type == "predictions_completed":
-                    logger.info("Received predictions_completed event")
-                    correlation_id = payload.get("correlation_id")
-                    task = asyncio.create_task(
-                        _handle_predictions_completed(
-                            alpaca_client, configuration, rebalance_lock, correlation_id
-                        )
-                    )
+                if event_type == "equity_bars_synced":
+                    logger.info("Received equity_bars_synced event")
+                    task = asyncio.create_task(_handle_equity_bars_synced())
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
                     await update_consumer_offset(consumer_name, event_id)

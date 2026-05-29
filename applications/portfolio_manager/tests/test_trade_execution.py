@@ -231,48 +231,8 @@ def test_execute_open_positions_handles_generic_exception_on_short() -> None:
     assert "unexpected error" in results[1]["error"]
 
 
-def test_execute_open_positions_opens_short_overnight_standard_rate() -> None:
-    config = Configuration(
-        hold_overnight=True,
-        short_buying_power_buffer=1.03,
-        overnight_margin_rate_standard=0.30,
-        low_price_threshold=5.0,
-    )
-    client = _make_mock_client()
-    # entry_price=100.0 >= low_price_threshold=5.0 → standard rate
-    # short buying_power_cost = 10 * 100 * (1.03 + 0.30) = 1330
-    positions = [
-        _long(ticker="AAPL", dollar_amount=1000.0),
-        _short(ticker="MSFT", entry_price=100.0, quantity=10),
-    ]
-    results, count = execute_open_positions(client, positions, 5000.0, 50000.0, config)
-    assert count == 2  # noqa: PLR2004
-    assert results[1]["status"] == "success"
-    assert results[1]["side"] == TradeSide.SELL
-
-
-def test_execute_open_positions_opens_short_overnight_low_price_rate() -> None:
-    config = Configuration(
-        hold_overnight=True,
-        short_buying_power_buffer=1.03,
-        overnight_margin_rate_low_price=1.00,
-        low_price_threshold=5.0,
-    )
-    client = _make_mock_client()
-    # entry_price=3.0 < low_price_threshold=5.0 → low price rate
-    # short buying_power_cost = 100 * 3.0 * (1.03 + 1.00) = 609
-    positions = [
-        _long(ticker="AAPL", dollar_amount=300.0),
-        _short(ticker="MSFT", entry_price=3.0, dollar_amount=300.0, quantity=100),
-    ]
-    results, count = execute_open_positions(client, positions, 10000.0, 50000.0, config)
-    assert count == 2  # noqa: PLR2004
-    assert results[1]["status"] == "success"
-    assert results[1]["side"] == TradeSide.SELL
-
-
-def test_execute_open_positions_opens_short_intraday_no_margin() -> None:
-    config = Configuration(hold_overnight=False, short_buying_power_buffer=1.03)
+def test_execute_open_positions_opens_short_with_buffer_cost() -> None:
+    config = Configuration(short_buying_power_buffer=1.03)
     client = _make_mock_client()
     # short buying_power_cost = 10 * 100 * 1.03 = 1030
     positions = [
@@ -328,7 +288,7 @@ def test_execute_open_positions_uses_precomputed_quantity_for_short() -> None:
 
 
 def test_execute_open_positions_skips_short_when_insufficient_buying_power() -> None:
-    config = Configuration(hold_overnight=False, short_buying_power_buffer=1.03)
+    config = Configuration(short_buying_power_buffer=1.03)
     client = _make_mock_client()
     # short buying_power_cost = 10 * 100 * 1.03 = 1030
     # Long (1000) fits; after refresh short (1030) exceeds the new 100 balance

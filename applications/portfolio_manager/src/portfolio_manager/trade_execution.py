@@ -164,23 +164,6 @@ def _try_open_single_position(  # noqa: PLR0911
         buying_power_cost = (
             short_qty * entry_price * configuration.short_buying_power_buffer
         )
-
-        if configuration.hold_overnight:
-            # Overnight maintenance margin: 30% for stocks >= $5, 100% for < $5.
-            margin_rate = (
-                configuration.overnight_margin_rate_low_price
-                if entry_price < configuration.low_price_threshold
-                else configuration.overnight_margin_rate_standard
-            )
-            overnight_margin_reserve = short_qty * entry_price * margin_rate
-            buying_power_cost += overnight_margin_reserve
-            logger.info(
-                "Overnight margin reserve for short position",
-                ticker=ticker,
-                short_qty=short_qty,
-                overnight_margin_reserve=overnight_margin_reserve,
-                margin_rate=margin_rate,
-            )
     else:
         buying_power_cost = dollar_amount
 

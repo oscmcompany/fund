@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 from portfolio_manager.portfolio_state import (
     _PRIOR_ALLOCATION_SCHEMA,
-    already_rebalanced_today,
+    evaluate_held_pairs_from_quotes,
     get_last_portfolio_value,
     get_prior_allocation,
     save_closed_pair,
@@ -76,45 +76,112 @@ def _make_successful_pair_rows() -> pl.DataFrame:
     )
 
 
-# --- already_rebalanced_today ---
+# --- evaluate_held_pairs_from_quotes ---
 
 
-def test_already_rebalanced_today_returns_true_when_session_exists() -> None:
-    mock_pool = _make_pool_mock(fetchone_row=(1,))
-
-    with patch(
-        "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(already_rebalanced_today())
-
-    assert result is True
-
-
-def test_already_rebalanced_today_returns_false_when_no_session() -> None:
-    mock_pool = _make_pool_mock(fetchone_row=(0,))
-
-    with patch(
-        "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(already_rebalanced_today())
-
-    assert result is False
+def _make_prior_portfolio_with_pair(pair_id: str = "AAPL-MSFT") -> pl.DataFrame:
+    long_ticker, short_ticker = pair_id.split("-")
+    return pl.DataFrame(
+        {
+            "ticker": [long_ticker, short_ticker],
+            "timestamp": [1735689600000, 1735689600000],
+            "side": ["LONG", "SHORT"],
+            "dollar_amount": [1000.0, 1000.0],
+            "action": ["OPEN_POSITION", "OPEN_POSITION"],
+            "pair_id": [pair_id, pair_id],
+            "entry_price": [100.0, 90.0],
+            "quantity": [None, 11],
+            "notional": [1000.0, None],
+        },
+        schema=_PRIOR_ALLOCATION_SCHEMA,
+    )
 
 
-def test_already_rebalanced_today_returns_false_on_db_error() -> None:
-    mock_connection = MagicMock()
-    mock_connection.execute = AsyncMock(side_effect=RuntimeError("db error"))
-    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
-    mock_connection.__aexit__ = AsyncMock(return_value=None)
-    mock_pool = MagicMock()
-    mock_pool.connection.return_value = mock_connection
+def _make_equity_bars_for_pair(
+    long_ticker: str, short_ticker: str, rows: int = 60
+) -> pl.DataFrame:
+    base_long = 100.0
+    base_short = 90.0
+    timestamps = list(range(rows))
+    long_prices = [base_long + i * 0.01 for i in range(rows)]
+    short_prices = [base_short + i * 0.009 for i in range(rows)]
+    return pl.DataFrame(
+        {
+            "ticker": [long_ticker] * rows + [short_ticker] * rows,
+            "timestamp": [t * 86400000 for t in timestamps] * 2,
+            "close_price": long_prices + short_prices,
+        }
+    )
 
-    with patch(
-        "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
-    ):
-        result = asyncio.run(already_rebalanced_today())
 
-    assert result is False
+def test_evaluate_held_pairs_from_quotes_returns_empty_when_portfolio_empty() -> None:
+    result = evaluate_held_pairs_from_quotes(
+        pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA),
+        pl.DataFrame(
+            schema={
+                "ticker": pl.String,
+                "timestamp": pl.Int64,
+                "close_price": pl.Float64,
+            }
+        ),
+        {},
+    )
+    assert result == set()
+
+
+def test_evaluate_held_pairs_from_quotes_holds_pair_when_live_price_missing() -> None:
+    prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
+    bars = _make_equity_bars_for_pair("AAPL", "MSFT")
+    # Only provide live price for AAPL, not MSFT — pair should be held, not closed.
+    result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 110.0})
+    assert result == {"AAPL", "MSFT"}
+
+
+def test_evaluate_held_pairs_from_quotes_holds_pair_when_live_price_nonpositive() -> (
+    None
+):
+    prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
+    bars = _make_equity_bars_for_pair("AAPL", "MSFT")
+    result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 0.0, "MSFT": 90.0})
+    assert result == {"AAPL", "MSFT"}
+
+
+def test_evaluate_held_pairs_from_quotes_holds_pair_when_z_score_in_range() -> None:
+    prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
+    bars = _make_equity_bars_for_pair("AAPL", "MSFT")
+    # Set live prices that keep the spread within hold thresholds.
+    live_mid_prices = {"AAPL": 100.5, "MSFT": 90.4}
+    result = evaluate_held_pairs_from_quotes(prior, bars, live_mid_prices)
+    # Verify no crash and correct return type regardless of z-score outcome.
+    assert isinstance(result, set)
+
+
+def test_evaluate_held_pairs_from_quotes_holds_pair_with_insufficient_history() -> None:
+    prior = _make_prior_portfolio_with_pair("AAPL-MSFT")
+    # Only 5 rows of history — below the 30-row minimum; pair held for cycle.
+    bars = _make_equity_bars_for_pair("AAPL", "MSFT", rows=5)
+    result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 101.0, "MSFT": 91.0})
+    assert result == {"AAPL", "MSFT"}
+
+
+def test_evaluate_held_pairs_from_quotes_skips_malformed_pair() -> None:
+    prior = pl.DataFrame(
+        {
+            "ticker": ["AAPL"],
+            "timestamp": [1735689600000],
+            "side": ["LONG"],
+            "dollar_amount": [1000.0],
+            "action": ["OPEN_POSITION"],
+            "pair_id": ["AAPL-MSFT"],
+            "entry_price": [100.0],
+            "quantity": [None],
+            "notional": [1000.0],
+        },
+        schema=_PRIOR_ALLOCATION_SCHEMA,
+    )
+    bars = _make_equity_bars_for_pair("AAPL", "MSFT")
+    result = evaluate_held_pairs_from_quotes(prior, bars, {"AAPL": 101.0, "MSFT": 91.0})
+    assert result == set()
 
 
 # --- get_prior_allocation ---

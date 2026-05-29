@@ -2,67 +2,50 @@ import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import polars as pl
 from portfolio_manager.alpaca_client import AlpacaAccount
 from portfolio_manager.configuration import Configuration
 from portfolio_manager.scheduler import (
     _event_listener_loop,
+    _handle_equity_bars_synced,
     _handle_intraday_check,
-    _handle_predictions_completed,
     _status_logger_loop,
     spawn_event_listener,
     spawn_status_logger,
 )
 
-# --- _handle_predictions_completed ---
+# --- _handle_equity_bars_synced ---
 
 
-def test_handle_predictions_completed_calls_run_rebalance_when_market_open() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_run_rebalance = AsyncMock(return_value=mock_response)
+def test_handle_equity_bars_synced_emits_predictions_requested() -> None:
+    mock_emit = AsyncMock()
 
     async def run() -> None:
-        lock = asyncio.Lock()
-        with (
-            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
-            patch(
-                "portfolio_manager.scheduler.already_rebalanced_today",
-                AsyncMock(return_value=False),
-            ),
-        ):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
+        with patch("portfolio_manager.scheduler.emit_event", mock_emit):
+            await _handle_equity_bars_synced()
 
     asyncio.run(run())
-    mock_run_rebalance.assert_called_once()
+    mock_emit.assert_called_once_with("predictions_requested", {})
 
 
-def test_handle_predictions_completed_skips_when_already_rebalanced_today() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
-    mock_run_rebalance = AsyncMock()
+def test_handle_equity_bars_synced_handles_emit_exception() -> None:
+    mock_emit = AsyncMock(side_effect=Exception("db error"))
 
     async def run() -> None:
-        lock = asyncio.Lock()
         with (
-            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
-            patch(
-                "portfolio_manager.scheduler.already_rebalanced_today",
-                AsyncMock(return_value=True),
-            ),
+            patch("portfolio_manager.scheduler.emit_event", mock_emit),
+            patch("portfolio_manager.scheduler.logger") as mock_logger,
         ):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
+            await _handle_equity_bars_synced()
+            mock_logger.exception.assert_called_once()
 
     asyncio.run(run())
-    mock_run_rebalance.assert_not_called()
 
 
-def test_handle_predictions_completed_skips_when_lock_held() -> None:
+# --- _handle_intraday_check ---
+
+
+def test_handle_intraday_check_skips_when_lock_held() -> None:
     mock_alpaca = MagicMock()
     mock_run_rebalance = AsyncMock()
 
@@ -70,15 +53,13 @@ def test_handle_predictions_completed_skips_when_lock_held() -> None:
         lock = asyncio.Lock()
         await lock.acquire()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
 
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
 
 
-def test_handle_predictions_completed_skips_when_market_closed() -> None:
+def test_handle_intraday_check_skips_when_market_closed() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.is_market_open.return_value = False
     mock_run_rebalance = AsyncMock()
@@ -86,102 +67,10 @@ def test_handle_predictions_completed_skips_when_market_closed() -> None:
     async def run() -> None:
         lock = asyncio.Lock()
         with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
-
-    asyncio.run(run())
-    mock_run_rebalance.assert_not_called()
-
-
-def test_handle_predictions_completed_handles_market_open_exception() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.side_effect = Exception("market check failed")
-    mock_run_rebalance = AsyncMock()
-
-    async def run() -> None:
-        lock = asyncio.Lock()
-        with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
-
-    asyncio.run(run())
-    mock_run_rebalance.assert_not_called()
-
-
-def test_handle_predictions_completed_logs_warning_on_non_200() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
-    mock_response = MagicMock()
-    mock_response.status_code = 500
-    mock_run_rebalance = AsyncMock(return_value=mock_response)
-
-    async def run() -> None:
-        lock = asyncio.Lock()
-        with (
-            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
-            patch(
-                "portfolio_manager.scheduler.already_rebalanced_today",
-                AsyncMock(return_value=False),
-            ),
-            patch("portfolio_manager.scheduler.logger") as mock_logger,
-        ):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
-            mock_logger.warning.assert_called_once()
-
-    asyncio.run(run())
-
-
-def test_handle_predictions_completed_handles_run_rebalance_exception() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
-    mock_run_rebalance = AsyncMock(side_effect=Exception("rebalance failed"))
-
-    async def run() -> None:
-        lock = asyncio.Lock()
-        with (
-            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
-            patch(
-                "portfolio_manager.scheduler.already_rebalanced_today",
-                AsyncMock(return_value=False),
-            ),
-        ):
-            await _handle_predictions_completed(
-                mock_alpaca, Configuration(), lock, None
-            )
-
-    asyncio.run(run())
-    mock_run_rebalance.assert_called_once()
-    assert mock_run_rebalance.call_args.args[2] == "abc-123"
-
-
-# --- _handle_intraday_check ---
-
-
-def test_handle_intraday_check_calls_run_rebalance_with_correlation_id() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
-    mock_response = MagicMock()
-    mock_response.status_code = 200
-    mock_run_rebalance = AsyncMock(return_value=mock_response)
-
-    async def run() -> None:
-        lock = asyncio.Lock()
-        with (
-            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
-            patch(
-                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
-                AsyncMock(return_value="abc-123"),
-            ),
-        ):
             await _handle_intraday_check(mock_alpaca, Configuration(), lock)
 
     asyncio.run(run())
-    mock_run_rebalance.assert_called_once()
-    assert mock_run_rebalance.call_args.args[2] == "abc-123"
+    mock_run_rebalance.assert_not_called()
 
 
 def test_handle_intraday_check_skips_when_no_predictions_available() -> None:
@@ -204,23 +93,252 @@ def test_handle_intraday_check_skips_when_no_predictions_available() -> None:
     mock_run_rebalance.assert_not_called()
 
 
-def test_handle_intraday_check_skips_when_lock_held() -> None:
+def test_handle_intraday_check_skips_when_all_pairs_held() -> None:
     mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
     mock_run_rebalance = AsyncMock()
+
+    prior_allocation = pl.DataFrame(
+        {"ticker": ["AAPL", "MSFT"], "side": ["long", "short"]}
+    )
+    # Both tickers are in held_tickers so all pairs continue.
+    held_tickers = {"AAPL", "MSFT"}
 
     async def run() -> None:
         lock = asyncio.Lock()
-        await lock.acquire()
-        with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-1"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=prior_allocation),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_historical_prices",
+                AsyncMock(return_value=pl.DataFrame()),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_live_quote_mid_prices",
+                AsyncMock(return_value={"AAPL": 150.0, "MSFT": 300.0}),
+            ),
+            patch(
+                "portfolio_manager.scheduler.evaluate_held_pairs_from_quotes",
+                return_value=held_tickers,
+            ),
+        ):
             await _handle_intraday_check(mock_alpaca, Configuration(), lock)
 
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
 
 
-def test_handle_intraday_check_skips_when_market_closed() -> None:
+def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_run_rebalance = AsyncMock(return_value=mock_response)
+
+    prior_allocation = pl.DataFrame(
+        {"ticker": ["AAPL", "MSFT"], "side": ["long", "short"]}
+    )
+    # Only AAPL is held; MSFT pair is closing.
+    held_tickers: set[str] = {"AAPL"}
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-2"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=prior_allocation),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_historical_prices",
+                AsyncMock(return_value=pl.DataFrame()),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_live_quote_mid_prices",
+                AsyncMock(return_value={"AAPL": 150.0, "MSFT": 300.0}),
+            ),
+            patch(
+                "portfolio_manager.scheduler.evaluate_held_pairs_from_quotes",
+                return_value=held_tickers,
+            ),
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_called_once()
+    _, kwargs = mock_run_rebalance.call_args
+    assert kwargs.get("held_tickers") == held_tickers
+
+def test_handle_predictions_completed_skips_when_market_closed() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.is_market_open.return_value = False
+    mock_run_rebalance = AsyncMock()
+
+def test_handle_intraday_check_calls_run_rebalance_when_no_prior_allocation() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_run_rebalance = AsyncMock(return_value=mock_response)
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-3"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=pl.DataFrame({"ticker": [], "side": []})),
+            ),
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_called_once()
+    _, kwargs = mock_run_rebalance.call_args
+    assert kwargs.get("held_tickers") == set()
+
+
+def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_response = MagicMock()
+    mock_response.status_code = 500
+    mock_run_rebalance = AsyncMock(return_value=mock_response)
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="abc-123"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=pl.DataFrame({"ticker": [], "side": []})),
+            ),
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_called_once()
+    assert mock_run_rebalance.call_args.args[2] == "abc-123"
+
+# --- _handle_intraday_check ---
+
+def test_handle_intraday_check_skips_when_historical_prices_fetch_fails() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock()
+
+    prior_allocation = pl.DataFrame(
+        {"ticker": ["AAPL", "MSFT"], "side": ["long", "short"]}
+    )
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-4"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=prior_allocation),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_historical_prices",
+                AsyncMock(side_effect=Exception("db error")),
+            ),
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_not_called()
+
+
+def test_handle_intraday_check_skips_when_live_prices_fetch_fails() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_run_rebalance = AsyncMock()
+
+    prior_allocation = pl.DataFrame(
+        {"ticker": ["AAPL", "MSFT"], "side": ["long", "short"]}
+    )
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-5"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=prior_allocation),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_historical_prices",
+                AsyncMock(return_value=pl.DataFrame()),
+            ),
+            patch(
+                "portfolio_manager.scheduler.fetch_live_quote_mid_prices",
+                AsyncMock(side_effect=Exception("quotes unavailable")),
+            ),
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_not_called()
+
+
+def test_handle_intraday_check_logs_warning_on_non_200() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = True
+    mock_response = MagicMock()
+    mock_response.status_code = 500
+    mock_run_rebalance = AsyncMock(return_value=mock_response)
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance),
+            patch(
+                "portfolio_manager.scheduler.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="cid-6"),
+            ),
+            patch(
+                "portfolio_manager.scheduler.get_prior_allocation",
+                AsyncMock(return_value=pl.DataFrame({"ticker": [], "side": []})),
+            ),
+            patch("portfolio_manager.scheduler.logger") as mock_logger,
+        ):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+            mock_logger.warning.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_handle_intraday_check_handles_market_open_exception() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.side_effect = Exception("market check failed")
     mock_run_rebalance = AsyncMock()
 
     async def run() -> None:
@@ -278,7 +396,7 @@ def test_event_listener_loop_reconnects_on_error() -> None:
     assert call_count["count"] == 2  # noqa: PLR2004
 
 
-def test_event_listener_loop_dispatches_predictions_completed() -> None:
+def test_event_listener_loop_dispatches_equity_bars_synced() -> None:
     mock_alpaca = MagicMock()
     captured_handler: list = []
 
@@ -300,15 +418,13 @@ def test_event_listener_loop_dispatches_predictions_completed() -> None:
                 AsyncMock(return_value=None),
             ),
             patch(
-                "portfolio_manager.scheduler._handle_predictions_completed",
+                "portfolio_manager.scheduler._handle_equity_bars_synced",
                 AsyncMock(),
             ) as mock_handle,
         ):
             await _event_listener_loop(mock_alpaca, Configuration(), lock)
             if captured_handler:
-                await captured_handler[0](
-                    "predictions_completed", 42, {"correlation_id": "cid-123"}
-                )
+                await captured_handler[0]("equity_bars_synced", 42, {})
             mock_handle.assert_called_once()
 
     asyncio.run(run())

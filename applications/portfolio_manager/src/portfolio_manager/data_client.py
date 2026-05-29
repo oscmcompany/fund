@@ -12,6 +12,7 @@ logger = structlog.get_logger(__name__)
 async def fetch_historical_prices(
     reference_date: datetime,
     lookback_days: int = 120,
+    tickers: list[str] | None = None,
     # TODO(#876): remove datamanager_base_url in Phase 9  # noqa: FIX002
     datamanager_base_url: str = "",  # noqa: ARG001
 ) -> pl.DataFrame:
@@ -20,15 +21,27 @@ async def fetch_historical_prices(
     try:
         pool = await get_pool()
         async with pool.connection() as connection:
-            result = await connection.execute(
-                """SELECT ticker,
-                          EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
-                          close_price
-                   FROM equity_bars
-                   WHERE timestamp >= %s AND timestamp <= %s
-                   ORDER BY ticker, timestamp""",
-                (start_timestamp, reference_date),
-            )
+            if tickers is not None:
+                result = await connection.execute(
+                    """SELECT ticker,
+                              EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
+                              close_price
+                       FROM equity_bars
+                       WHERE timestamp >= %s AND timestamp <= %s
+                         AND ticker = ANY(%s)
+                       ORDER BY ticker, timestamp""",
+                    (start_timestamp, reference_date, tickers),
+                )
+            else:
+                result = await connection.execute(
+                    """SELECT ticker,
+                              EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
+                              close_price
+                       FROM equity_bars
+                       WHERE timestamp >= %s AND timestamp <= %s
+                       ORDER BY ticker, timestamp""",
+                    (start_timestamp, reference_date),
+                )
             rows = await result.fetchall()
     except Exception as error:
         message = f"Failed to fetch historical prices from database: {error}"
@@ -87,6 +100,27 @@ async def fetch_equity_details(
             "sector": [row[1] for row in rows],
         }
     )
+
+
+async def fetch_live_quote_mid_prices(tickers: list[str]) -> dict[str, float]:
+    if not tickers:
+        return {}
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            result = await connection.execute(
+                """SELECT DISTINCT ON (ticker) ticker, bid_price, ask_price
+                   FROM equity_quotes
+                   WHERE ticker = ANY(%s)
+                   ORDER BY ticker, timestamp DESC""",
+                (tickers,),
+            )
+            rows = await result.fetchall()
+    except Exception as error:
+        message = f"Failed to fetch live quote mid-prices from database: {error}"
+        raise PriceDataUnavailableError(message) from error
+
+    return {row[0]: (row[1] + row[2]) / 2.0 for row in rows}
 
 
 async def fetch_spy_prices(

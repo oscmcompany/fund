@@ -61,6 +61,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     configuration: Configuration | None = None,
     correlation_id: str | None = None,
     trigger_reason: str = "manual",
+    held_tickers: set[str] | None = None,
 ) -> Response:
     if configuration is None:
         configuration = Configuration()
@@ -138,21 +139,22 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         metrics.observe_duration(start)
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    try:
-        held_tickers = evaluate_prior_pairs(prior_allocation, historical_prices)
-        logger.info(
-            "Evaluated prior pairs",
-            held_count=len(held_tickers),
-            closing_count=len(prior_allocation_tickers) - len(held_tickers),
-        )
-    except Exception as e:
-        logger.exception("Failed to evaluate prior pairs", error=str(e))
-        metrics.rebalance_errors_total.labels(stage="evaluate_pairs").inc()
-        metrics.observe_duration(start)
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    if held_tickers is None:
+        try:
+            held_tickers = evaluate_prior_pairs(prior_allocation, historical_prices)
+            logger.info(
+                "Evaluated prior pairs",
+                held_count=len(held_tickers),
+                closing_count=len(prior_allocation_tickers) - len(held_tickers),
+            )
+        except Exception as e:
+            logger.exception("Failed to evaluate prior pairs", error=str(e))
+            metrics.rebalance_errors_total.labels(stage="evaluate_pairs").inc()
+            metrics.observe_duration(start)
+            return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     consolidated_signals = consolidated_signals.filter(
-        ~pl.col("ticker").is_in(prior_allocation_tickers)
+        ~pl.col("ticker").is_in(held_tickers)
     )
 
     try:
@@ -233,9 +235,6 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
             entry_prices=entry_prices_map,
             exposure_scale=exposure_scale,
             short_buying_power_buffer=configuration.short_buying_power_buffer,
-            hold_overnight=configuration.hold_overnight,
-            overnight_margin_rate_standard=configuration.overnight_margin_rate_standard,
-            overnight_margin_rate_low_price=configuration.overnight_margin_rate_low_price,
         )
         logger.info("Created optimal portfolio", count=len(optimal_portfolio))
     except InsufficientPairsError as e:
@@ -450,9 +449,6 @@ def get_optimal_portfolio(  # noqa: PLR0913
     entry_prices: dict[str, float],
     exposure_scale: float,
     short_buying_power_buffer: float,
-    hold_overnight: bool,  # noqa: FBT001
-    overnight_margin_rate_standard: float,
-    overnight_margin_rate_low_price: float,
 ) -> pl.DataFrame:
     optimal_portfolio = size_pairs_with_volatility_parity(
         candidate_pairs=candidate_pairs,
@@ -462,9 +458,6 @@ def get_optimal_portfolio(  # noqa: PLR0913
         entry_prices=entry_prices,
         exposure_scale=exposure_scale,
         short_buying_power_buffer=short_buying_power_buffer,
-        hold_overnight=hold_overnight,
-        overnight_margin_rate_standard=overnight_margin_rate_standard,
-        overnight_margin_rate_low_price=overnight_margin_rate_low_price,
     )
 
     return portfolio_schema.validate(optimal_portfolio)

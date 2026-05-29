@@ -86,6 +86,13 @@ def test_fetch_historical_prices_deduplicates_ticker_timestamp() -> None:
     assert result.height == 1
     assert result["close_price"][0] == pytest.approx(150.0)
 
+def test_fetch_historical_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("connection refused"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
 
 def test_fetch_historical_prices_raises_on_db_error() -> None:
     mock_connection = MagicMock()
@@ -103,6 +110,30 @@ def test_fetch_historical_prices_raises_on_db_error() -> None:
         pytest.raises(PriceDataUnavailableError),
     ):
         asyncio.run(fetch_historical_prices(datetime(2024, 1, 1, tzinfo=UTC)))
+
+
+def test_fetch_historical_prices_filters_by_tickers_when_provided() -> None:
+    rows = [
+        ("AAPL", 1704067200000, 150.0),
+        ("MSFT", 1704067200000, 300.0),
+    ]
+    mock_pool = _make_pool_mock(rows)
+
+    with patch(
+        "portfolio_manager.data_client.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result = asyncio.run(
+            fetch_historical_prices(
+                datetime(2024, 1, 2, tzinfo=UTC),
+                tickers=["AAPL", "MSFT"],
+            )
+        )
+
+    assert result.height == 2  # noqa: PLR2004
+    call_args = (
+        mock_pool.connection.return_value.__aenter__.return_value.execute.call_args
+    )
+    assert "ANY(%s)" in call_args[0][0]
 
 
 def test_fetch_historical_prices_accepts_datamanager_base_url_shim() -> None:
@@ -244,6 +275,17 @@ def test_fetch_spy_prices_deduplicates_timestamp() -> None:
     assert result.height == 1
     assert result["close_price"][0] == pytest.approx(450.0)
 
+    assert result.height == 1
+    assert result["close_price"][0] == pytest.approx(450.0)
+
+
+def test_fetch_spy_prices_raises_on_db_error() -> None:
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(side_effect=RuntimeError("timeout"))
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
 
 def test_fetch_spy_prices_raises_on_db_error() -> None:
     mock_connection = MagicMock()
