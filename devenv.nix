@@ -389,6 +389,11 @@ in {
     echo "  git diff Cargo.lock uv.lock"
   '';
 
+  scripts.trigger-rebalance.exec = ''
+    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('intraday_check',
+    '{}')"
+  '';
+
   scripts.backfill-bars.exec = ''
     set -euo pipefail
 
