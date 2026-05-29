@@ -155,6 +155,7 @@ def test_handle_predictions_completed_handles_run_rebalance_exception() -> None:
 
     asyncio.run(run())
     mock_run_rebalance.assert_called_once()
+    assert mock_run_rebalance.call_args.args[2] == "abc-123"
 
 
 # --- _handle_intraday_check ---
