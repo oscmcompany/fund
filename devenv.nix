@@ -287,17 +287,10 @@ in {
     echo "Rust code formatting check passed"
   '';
 
-  scripts.rust-check.exec = ''
-    set -euo pipefail
-    echo "Check Rust packages"
-    cargo check --workspace
-    echo "Rust packages checked successfully"
-  '';
-
   scripts.rust-lint.exec = ''
     set -euo pipefail
     echo "Running Rust lint checks"
-    cargo clippy
+    cargo clippy --workspace
     echo "Rust linting completed successfully"
   '';
 
@@ -448,13 +441,9 @@ in {
 
     "checks:rust:format".exec = "rust-format";
 
-    "checks:rust:check" = {
-      exec = "rust-check";
-      after = ["checks:rust:format"];
-    };
     "checks:rust:lint" = {
       exec = "rust-lint";
-      after = ["checks:rust:check"];
+      after = ["checks:rust:format"];
     };
     "checks:rust:test" = {
       exec = "rust-test";
@@ -491,9 +480,9 @@ in {
 
     "data:backfill-bars".exec = "backfill-bars";
 
-    "checks:ci" = {
+    "checks:continuous-integration" = {
       exec = ''
-        echo "All CI checks passed"
+        echo "All continuous integration checks passed"
       '';
       after = [
         "checks:nix"
@@ -663,7 +652,7 @@ in {
       echo ""
       echo "  Tasks (devenv tasks run):"
       echo "    checks:python       All Python checks (parallel after install)"
-      echo "    checks:rust         All Rust checks (parallel after cargo check)"
+      echo "    checks:rust         All Rust checks (sequential: format, lint, test)"
       echo "    checks:markdown     Markdown lint"
       echo "    checks:yaml         YAML lint"
       echo "    checks:toml         TOML format check"
