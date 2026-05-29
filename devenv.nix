@@ -116,6 +116,7 @@ in {
 
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
+    PGDATABASE = "fund";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -548,7 +549,7 @@ in {
         waitForDataManager = ''
           attempt=0
           max_attempts=90
-          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
+          while ! pg_isready -h localhost -p 5432 -d fund > /dev/null 2>&1; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
@@ -577,7 +578,7 @@ in {
         waitForDeps = ''
           attempt=0
           max_attempts=90
-          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
+          while ! pg_isready -h localhost -p 5432 -d fund > /dev/null 2>&1; do
             attempt=$((attempt + 1))
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
