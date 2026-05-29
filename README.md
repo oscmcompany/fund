@@ -14,14 +14,14 @@ Below are resources for the project and repository.
 
 ### Setup
 
-On a fresh machine with the repo cloned, run the bootstrap script:
+On a fresh machine with the repository cloned, run the bootstrap script:
 
 ```sh
 ./tools/bootstrap-machine --profile dev/yourname
 ./tools/bootstrap-machine --profile production --prod  # production with secret validation
 ```
 
-Add the devenv shell hook to auto-activate the environment on `cd`:
+Add the `devenv shell` hook to auto-activate the environment on `cd`:
 
 ```sh
 # zsh (~/.zshrc)
@@ -50,7 +50,7 @@ Once bootstrapped:
 # Environment auto-activates on cd with devenv hook configured
 devenv shell                    # or: enter manually without hook
 devenv --profile apps up        # start application services
-devenv --profile ml shell       # ML training environment
+devenv --profile ml shell       # machine learning training environment
 ```
 
 Production runs on a VM with `devenv --profile apps up` and secretspec for secret injection.
