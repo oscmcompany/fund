@@ -1,10 +1,9 @@
-import os
 from datetime import UTC, datetime
 
-import httpx
 import polars as pl
 import structlog
 from fastapi import Response, status
+from internal.database import emit_event, get_pool
 
 from . import metrics
 from .alpaca_client import AlpacaAccount, AlpacaClient
@@ -41,11 +40,6 @@ from .trade_execution import (
 
 logger = structlog.get_logger()
 
-ENSEMBLE_MANAGER_BASE_URL = os.getenv(
-    "FUND_ENSEMBLE_MANAGER_BASE_URL",
-    "http://ensemble-manager:8080",
-)
-
 
 def _prune_pairs_with_invalid_entry_price(portfolio: pl.DataFrame) -> pl.DataFrame:
     invalid_pair_ids = (
@@ -66,6 +60,7 @@ def _prune_pairs_with_invalid_entry_price(portfolio: pl.DataFrame) -> pl.DataFra
 async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     alpaca_client: AlpacaClient,
     configuration: Configuration | None = None,
+    correlation_id: str | None = None,
 ) -> Response:
     if configuration is None:
         configuration = Configuration()
@@ -109,7 +104,7 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
         return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     try:
-        ensemble_predictions = await get_raw_predictions()
+        ensemble_predictions = await get_raw_predictions(correlation_id)
         logger.info("Retrieved predictions", count=len(ensemble_predictions))
     except Exception as e:
         logger.exception("Failed to retrieve predictions", error=str(e))
@@ -359,16 +354,76 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
     if failed_trades or not save_succeeded:
         return Response(status_code=status.HTTP_207_MULTI_STATUS)
 
+    try:
+        await emit_event("rebalance_completed", {})
+    except Exception:
+        logger.exception("Failed to emit rebalance_completed event")
+
     return Response(status_code=status.HTTP_200_OK)
 
 
-async def get_raw_predictions() -> pl.DataFrame:
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        response = await client.post(
-            url=f"{ENSEMBLE_MANAGER_BASE_URL}/predictions",
+async def get_latest_predictions_correlation_id() -> str | None:
+    """Return the correlation_id of the most recently inserted predictions row."""
+    pool = await get_pool()
+    async with pool.connection() as connection:
+        result = await connection.execute(
+            "SELECT correlation_id FROM predictions ORDER BY created_at DESC LIMIT 1"
         )
-        response.raise_for_status()
-        return pl.DataFrame(response.json()["data"])
+        row = await result.fetchone()
+    return str(row[0]) if row else None
+
+
+async def get_raw_predictions(correlation_id: str | None = None) -> pl.DataFrame:
+    """Query predictions from PostgreSQL for the given correlation_id.
+
+    If correlation_id is None, uses the most recently inserted set of predictions.
+    """
+    pool = await get_pool()
+    async with pool.connection() as connection:
+        if correlation_id:
+            result = await connection.execute(
+                """SELECT ticker,
+                          EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
+                          quantile_10, quantile_50, quantile_90
+                   FROM predictions
+                   WHERE correlation_id = %s
+                   ORDER BY ticker, timestamp""",
+                (correlation_id,),
+            )
+        else:
+            result = await connection.execute(
+                """SELECT ticker,
+                          EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp,
+                          quantile_10, quantile_50, quantile_90
+                   FROM predictions
+                   WHERE correlation_id = (
+                       SELECT correlation_id FROM predictions
+                       ORDER BY created_at DESC LIMIT 1
+                   )
+                   ORDER BY ticker, timestamp"""
+            )
+        rows = await result.fetchall()
+
+    if not rows:
+        return pl.DataFrame(
+            schema={
+                "ticker": pl.String,
+                "timestamp": pl.Int64,
+                "quantile_10": pl.Float64,
+                "quantile_50": pl.Float64,
+                "quantile_90": pl.Float64,
+            }
+        )
+
+    return pl.DataFrame(
+        {
+            "ticker": [row[0] for row in rows],
+            "timestamp": [row[1] for row in rows],
+            "quantile_10": [row[2] for row in rows],
+            "quantile_50": [row[3] for row in rows],
+            "quantile_90": [row[4] for row in rows],
+        }
+    )
 
 
 def get_optimal_portfolio(  # noqa: PLR0913

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
@@ -78,14 +79,18 @@ async def emit_event(event_type: str, payload: dict[str, Any]) -> None:
 
 async def listen_for_events(
     channel: str,
-    handler: Callable[[str], Awaitable[None]],
+    handler: Callable[[str, int, dict[str, Any]], Awaitable[None]],
 ) -> None:
-    """Listen on a pg_notify channel and invoke handler with each notification payload.
+    """Listen on a pg_notify channel and invoke handler with each notification.
 
-    Runs until cancelled. Opens a dedicated autocommit connection per call so
-    concurrent listeners do not share a single notifies() stream. The handler
-    receives the raw notification payload string (event_type for the 'events'
-    channel). Handler exceptions are logged and the loop continues.
+    Runs until cancelled or the PostgreSQL connection drops. Callers should wrap
+    this in a retry loop to reconnect on connection loss. Opens a dedicated
+    autocommit connection per call so concurrent listeners do not share a single
+    notifies() stream.
+
+    The handler receives (event_type, event_id, payload) parsed from the JSON
+    NOTIFY payload emitted by the notify_event() trigger. Handler exceptions are
+    logged and the loop continues.
     """
     database_url = _get_database_url()
     async with await AsyncConnection.connect(
@@ -95,7 +100,29 @@ async def listen_for_events(
         logger.info("Listening on channel", channel=channel)
         async for notification in connection.notifies():
             try:
-                await handler(notification.payload)
+                data = json.loads(notification.payload)
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "Ignoring malformed event notification",
+                        channel=channel,
+                        payload=notification.payload,
+                    )
+                    continue
+                event_type = data.get("event_type")
+                event_id = data.get("event_id")
+                event_payload = data.get("payload") or {}
+                if (
+                    not isinstance(event_type, str)
+                    or not isinstance(event_id, int)
+                    or not isinstance(event_payload, dict)
+                ):
+                    logger.warning(
+                        "Ignoring malformed event notification",
+                        channel=channel,
+                        payload=notification.payload,
+                    )
+                    continue
+                await handler(event_type, event_id, event_payload)
             except Exception:
                 logger.exception(
                     "Event handler failed",

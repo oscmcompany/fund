@@ -243,10 +243,11 @@ in {
     echo "Running Python tests"
     export CC=clang
     mkdir -p .coverage_output
+    uv run coverage erase
     uv run coverage run -m pytest --tb=short -q
     uv run coverage combine 2>/dev/null || true
     uv run coverage xml -o .coverage_output/python.xml
-    uv run coverage report --fail-under=80
+    uv run coverage report --fail-under=80 | tee .coverage_output/python_report.txt
     echo "Python tests completed successfully"
   '';
 

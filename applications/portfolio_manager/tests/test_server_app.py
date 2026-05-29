@@ -165,7 +165,7 @@ def test_lifespan_initializes_client_and_scheduler() -> None:
                 "portfolio_manager.server.AlpacaClient", return_value=mock_alpaca
             ) as mock_alpaca_client,
             patch(
-                "portfolio_manager.server.spawn_rebalance_scheduler",
+                "portfolio_manager.server.spawn_event_listener",
                 AsyncMock(return_value=future),
             ) as mock_spawn_scheduler,
             patch(
@@ -210,10 +210,16 @@ def test_create_portfolio_calls_run_rebalance() -> None:
         with (
             patch("portfolio_manager.server._rebalance_lock", lock),
             patch("portfolio_manager.server.run_rebalance", mock_run),
+            patch(
+                "portfolio_manager.server.get_latest_predictions_correlation_id",
+                AsyncMock(return_value="test-correlation-id"),
+            ),
         ):
             return await create_portfolio()
 
     response = asyncio.run(run())
 
     assert response.status_code == status.HTTP_200_OK
-    mock_run.assert_called_once_with(mock_alpaca, mock_configuration)
+    mock_run.assert_called_once_with(
+        mock_alpaca, mock_configuration, "test-correlation-id"
+    )
