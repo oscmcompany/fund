@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::database::set_data_bucket_guc;
+use crate::database::{set_cold_storage_bucket_guc, set_data_bucket_guc, set_training_bucket_guc};
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -23,6 +23,8 @@ pub struct State {
     pub massive: MassiveSecrets,
     pub s3_client: S3Client,
     pub bucket_name: String,
+    pub training_bucket_name: String,
+    pub cold_storage_bucket_name: String,
     pub last_s3_ok_epoch: Arc<AtomicU64>,
     pub last_sync_epoch: Arc<AtomicU64>,
     pub pool: Option<PgPool>,
@@ -56,7 +58,15 @@ impl State {
 
         let bucket_name = std::env::var("AWS_S3_DATA_BUCKET_NAME")
             .expect("AWS_S3_DATA_BUCKET_NAME environment variable must be set");
-        info!("Using S3 bucket: {}", bucket_name);
+        info!("Using S3 data bucket: {}", bucket_name);
+
+        let training_bucket_name = std::env::var("AWS_S3_TRAINING_BUCKET_NAME")
+            .expect("AWS_S3_TRAINING_BUCKET_NAME environment variable must be set");
+        info!("Using S3 training bucket: {}", training_bucket_name);
+
+        let cold_storage_bucket_name = std::env::var("AWS_S3_COLD_STORAGE_BUCKET_NAME")
+            .expect("AWS_S3_COLD_STORAGE_BUCKET_NAME environment variable must be set");
+        info!("Using S3 cold storage bucket: {}", cold_storage_bucket_name);
 
         let massive_base_url = std::env::var("MASSIVE_BASE_URL")
             .expect("MASSIVE_BASE_URL environment variable must be set");
@@ -78,6 +88,22 @@ impl State {
                         info!("Connected to PostgreSQL");
                         if let Err(error) = set_data_bucket_guc(&pool, &bucket_name).await {
                             warn!("Failed to set app.data_bucket_name database GUC: {}", error);
+                        }
+                        if let Err(error) =
+                            set_training_bucket_guc(&pool, &training_bucket_name).await
+                        {
+                            warn!(
+                                "Failed to set app.training_bucket_name database GUC: {}",
+                                error
+                            );
+                        }
+                        if let Err(error) =
+                            set_cold_storage_bucket_guc(&pool, &cold_storage_bucket_name).await
+                        {
+                            warn!(
+                                "Failed to set app.cold_storage_bucket_name database GUC: {}",
+                                error
+                            );
                         }
                         (Some(pool), true)
                     }
@@ -103,6 +129,8 @@ impl State {
             },
             s3_client,
             bucket_name,
+            training_bucket_name,
+            cold_storage_bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool,
@@ -125,6 +153,8 @@ impl State {
             massive,
             s3_client,
             bucket_name,
+            training_bucket_name: String::new(),
+            cold_storage_bucket_name: String::new(),
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
             pool: None,

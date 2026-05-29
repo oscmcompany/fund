@@ -13,8 +13,6 @@ async def fetch_historical_prices(
     reference_date: datetime,
     lookback_days: int = 120,
     tickers: list[str] | None = None,
-    # TODO(#876): remove datamanager_base_url in Phase 9  # noqa: FIX002
-    datamanager_base_url: str = "",  # noqa: ARG001
 ) -> pl.DataFrame:
     start_timestamp = reference_date - timedelta(days=lookback_days)
 
@@ -76,10 +74,7 @@ async def fetch_historical_prices(
     return deduped
 
 
-async def fetch_equity_details(
-    # TODO(#876): remove datamanager_base_url in Phase 9  # noqa: FIX002
-    datamanager_base_url: str = "",  # noqa: ARG001
-) -> pl.DataFrame:
+async def fetch_equity_details() -> pl.DataFrame:
     try:
         pool = await get_pool()
         async with pool.connection() as connection:

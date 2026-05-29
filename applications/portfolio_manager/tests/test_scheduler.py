@@ -3,10 +3,12 @@ import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import polars as pl
+import pytest
 from portfolio_manager.alpaca_client import AlpacaAccount
 from portfolio_manager.configuration import Configuration
 from portfolio_manager.scheduler import (
     _event_listener_loop,
+    _handle_eod_snapshot_requested,
     _handle_equity_bars_synced,
     _handle_intraday_check,
     _status_logger_loop,
@@ -134,6 +136,10 @@ def test_handle_intraday_check_skips_when_all_pairs_held() -> None:
     asyncio.run(run())
     mock_run_rebalance.assert_not_called()
 
+def test_handle_predictions_completed_skips_when_market_closed() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.is_market_open.return_value = False
+    mock_run_rebalance = AsyncMock()
 
 def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> None:
     mock_alpaca = MagicMock()
@@ -180,10 +186,6 @@ def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> 
     _, kwargs = mock_run_rebalance.call_args
     assert kwargs.get("held_tickers") == held_tickers
 
-def test_handle_predictions_completed_skips_when_market_closed() -> None:
-    mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = False
-    mock_run_rebalance = AsyncMock()
 
 def test_handle_intraday_check_calls_run_rebalance_when_no_prior_allocation() -> None:
     mock_alpaca = MagicMock()
@@ -217,7 +219,7 @@ def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
     mock_alpaca = MagicMock()
     mock_alpaca.is_market_open.return_value = True
     mock_response = MagicMock()
-    mock_response.status_code = 500
+    mock_response.status_code = 200
     mock_run_rebalance = AsyncMock(return_value=mock_response)
 
     async def run() -> None:
@@ -593,3 +595,108 @@ def test_status_logger_loop_exits_on_cancellation() -> None:
         asyncio.run(run())
 
     mock_logger.info.assert_any_call("Status logger cancelled")
+
+
+# --- _handle_eod_snapshot_requested ---
+
+
+def test_handle_eod_snapshot_saves_eod_snapshot() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.return_value = AlpacaAccount(
+        cash_amount=500.0,
+        buying_power=1000.0,
+        equity=10500.0,
+    )
+
+    mock_save = AsyncMock(return_value=True)
+    previous_value = 10000.0
+
+    async def run() -> None:
+        with (
+            patch(
+                "portfolio_manager.scheduler.get_last_portfolio_value",
+                AsyncMock(return_value=previous_value),
+            ),
+            patch("portfolio_manager.scheduler.save_performance_snapshot", mock_save),
+        ):
+            await _handle_eod_snapshot_requested(mock_alpaca)
+
+    asyncio.run(run())
+
+    mock_save.assert_called_once()
+    call_args = mock_save.call_args
+    snapshot = call_args[0][0]
+    assert call_args[1]["snapshot_type"] == "eod"
+    assert snapshot["portfolio_value"] == pytest.approx(10500.0)
+    assert snapshot["gross_return"] == pytest.approx(0.05)
+    assert snapshot["net_return"] == pytest.approx(0.05)
+    assert snapshot["total_slippage_cost"] == 0.0
+
+
+def test_handle_eod_snapshot_uses_zero_return_when_no_previous_value() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.return_value = AlpacaAccount(
+        cash_amount=500.0,
+        buying_power=1000.0,
+        equity=10500.0,
+    )
+
+    mock_save = AsyncMock(return_value=True)
+
+    async def run() -> None:
+        with (
+            patch(
+                "portfolio_manager.scheduler.get_last_portfolio_value",
+                AsyncMock(return_value=None),
+            ),
+            patch("portfolio_manager.scheduler.save_performance_snapshot", mock_save),
+        ):
+            await _handle_eod_snapshot_requested(mock_alpaca)
+
+    asyncio.run(run())
+
+    call_args = mock_save.call_args
+    snapshot = call_args[0][0]
+    assert snapshot["gross_return"] == pytest.approx(0.0)
+
+
+def test_handle_eod_snapshot_raises_when_save_fails() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.return_value = AlpacaAccount(
+        cash_amount=500.0,
+        buying_power=1000.0,
+        equity=10500.0,
+    )
+
+    async def run() -> None:
+        with (
+            patch(
+                "portfolio_manager.scheduler.get_last_portfolio_value",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "portfolio_manager.scheduler.save_performance_snapshot",
+                AsyncMock(return_value=False),
+            ),
+            pytest.raises(
+                RuntimeError, match="Failed to persist EOD performance snapshot"
+            ),
+        ):
+            await _handle_eod_snapshot_requested(mock_alpaca)
+
+    asyncio.run(run())
+
+
+def test_handle_eod_snapshot_raises_on_account_error() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.get_account.side_effect = RuntimeError("alpaca down")
+
+    async def run() -> None:
+        with (
+            patch("portfolio_manager.scheduler.logger") as mock_logger,
+            pytest.raises(RuntimeError, match="alpaca down"),
+        ):
+            await _handle_eod_snapshot_requested(mock_alpaca)
+        mock_logger.exception.assert_called_once()
+
+    asyncio.run(run())

@@ -65,39 +65,39 @@ SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists =
 CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC);
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
 
--- archive_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
+-- export_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
 -- Reads the S3 bucket name from the app.data_bucket_name database GUC (set by data-manager on startup).
 -- pg_parquet must be installed and S3 credentials must be available to the PostgreSQL process.
 -- Returns early with a WARNING if pg_parquet is not installed.
-CREATE OR REPLACE FUNCTION archive_equity_quotes() RETURNS void AS $$
+CREATE OR REPLACE FUNCTION export_equity_quotes() RETURNS void AS $$
 DECLARE
-    archive_date DATE := CURRENT_DATE;
+    export_date DATE := CURRENT_DATE;
     bucket_name  TEXT := current_setting('app.data_bucket_name', true);
     s3_path      TEXT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
-        RAISE WARNING 'pg_parquet is not installed; skipping quote archival';
+        RAISE WARNING 'pg_parquet is not installed; skipping equity quotes export';
         RETURN;
     END IF;
     IF bucket_name IS NULL OR bucket_name = '' THEN
-        RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot archive equity quotes';
+        RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot export equity quotes';
     END IF;
     s3_path := format(
         's3://%s/equity/quotes/daily/year=%s/month=%s/day=%s/data.parquet',
         bucket_name,
-        to_char(archive_date, 'YYYY'),
-        to_char(archive_date, 'MM'),
-        to_char(archive_date, 'DD')
+        to_char(export_date, 'YYYY'),
+        to_char(export_date, 'MM'),
+        to_char(export_date, 'DD')
     );
     EXECUTE format(
         'COPY (SELECT * FROM equity_quotes WHERE timestamp >= %L AND timestamp < %L) TO %L',
-        archive_date::timestamptz,
-        (archive_date + 1)::timestamptz,
+        export_date::timestamptz,
+        (export_date + 1)::timestamptz,
         s3_path
     );
     DELETE FROM equity_quotes
-    WHERE timestamp >= archive_date::timestamptz
-      AND timestamp < (archive_date + 1)::timestamptz;
+    WHERE timestamp >= export_date::timestamptz
+      AND timestamp < (export_date + 1)::timestamptz;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -239,15 +239,40 @@ BEGIN
 END;
 $do$;
 
--- equity_portfolio_snapshots: nightly materialized portfolio state for historical charting
+-- Migrate equity_portfolio_snapshots from the old snapshot_date-keyed schema to the new
+-- per-rebalance schema with snapshot_type.  Old rows cannot be preserved (incompatible PK).
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_portfolio_snapshots' AND column_name = 'snapshot_date'
+    ) THEN
+        DROP TABLE equity_portfolio_snapshots;
+    END IF;
+END;
+$do$;
+
+-- equity_portfolio_snapshots: per-rebalance portfolio state snapshots
+-- 'intraday' rows are recorded after each live rebalance; gross_return and net_return are NULL.
+-- 'eod' rows are recorded once per trading day at market close; all columns are populated.
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
-    snapshot_date        DATE        NOT NULL PRIMARY KEY,
+    id                   BIGSERIAL   NOT NULL PRIMARY KEY,
+    snapshot_timestamp   TIMESTAMPTZ NOT NULL,
+    snapshot_type        TEXT        NOT NULL CHECK (snapshot_type IN ('intraday', 'eod')),
     net_asset_value      NUMERIC     NOT NULL,
-    gross_return         NUMERIC     NOT NULL,
-    net_return           NUMERIC     NOT NULL,
+    gross_return         NUMERIC,
+    net_return           NUMERIC,
     total_slippage_cost  NUMERIC     NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp
+    ON equity_portfolio_snapshots (snapshot_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp
+    ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_eod_date
+    ON equity_portfolio_snapshots ((snapshot_timestamp::date))
+    WHERE snapshot_type = 'eod';
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
@@ -431,17 +456,164 @@ BEGIN
 END;
 $do$;
 
--- Daily quote archival: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
+-- Remove legacy archive-quotes cron job and function on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.unschedule('archive-quotes');
+    END IF;
+END;
+$do$;
+DROP FUNCTION IF EXISTS archive_equity_quotes();
+
+-- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
 -- and after 4 PM Eastern market close in both EDT and EST)
--- Only scheduled when pg_parquet is available; archive_equity_quotes() also guards at runtime.
+-- Only scheduled when pg_parquet is available; export_equity_quotes() also guards at runtime.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
-       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
         PERFORM cron.schedule(
-            'archive-quotes',
+            'export-equity-quotes',
             '5 21 * * 1-5',
-            $$SELECT archive_equity_quotes()$$
+            $$SELECT export_equity_quotes()$$
+        );
+    END IF;
+END;
+$do$;
+
+-- record_eod_snapshot: emits an event for portfolio-manager to record the day's final NAV and compute returns.
+CREATE OR REPLACE FUNCTION record_eod_snapshot() RETURNS void AS $$
+BEGIN
+    PERFORM emit_event('eod_snapshot_requested', '{}');
+END;
+$$ LANGUAGE plpgsql;
+
+-- Nightly EOD snapshot trigger: weekdays at 21:15 UTC (after market close, after quote archival).
+-- Runs first so the snapshot is persisted before export_trading_history runs at 21:45.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-eod-snapshot') THEN
+        PERFORM cron.schedule(
+            'record-eod-snapshot',
+            '15 21 * * 1-5',
+            $$SELECT record_eod_snapshot()$$
+        );
+    END IF;
+END;
+$do$;
+
+-- export_equity_bars: exports equity_bars for the past 120 days to S3 Parquet for model training.
+-- Reads the training S3 bucket name from the app.training_bucket_name GUC (set by data-manager on startup).
+-- Returns early with a WARNING if pg_parquet is not installed.
+CREATE OR REPLACE FUNCTION export_equity_bars() RETURNS void AS $$
+DECLARE
+    export_date  DATE := CURRENT_DATE;
+    bucket_name  TEXT := current_setting('app.training_bucket_name', true);
+    s3_path      TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
+        RAISE WARNING 'pg_parquet is not installed; skipping equity bars export';
+        RETURN;
+    END IF;
+    IF bucket_name IS NULL OR bucket_name = '' THEN
+        RAISE EXCEPTION 'app.training_bucket_name GUC is not set; cannot export equity bars';
+    END IF;
+    s3_path := format(
+        's3://%s/equity/bars/daily/year=%s/month=%s/day=%s/data.parquet',
+        bucket_name,
+        to_char(export_date, 'YYYY'),
+        to_char(export_date, 'MM'),
+        to_char(export_date, 'DD')
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        export_date::timestamptz,
+        (export_date + INTERVAL '1 day')::timestamptz,
+        s3_path
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Remove legacy export-training-parquet cron job on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-training-parquet') THEN
+        PERFORM cron.unschedule('export-training-parquet');
+    END IF;
+END;
+$do$;
+
+-- Nightly equity bars export: weekdays at 21:30 UTC
+-- Only scheduled when pg_parquet is available; export_equity_bars() also guards at runtime.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
+        PERFORM cron.schedule(
+            'export-equity-bars',
+            '30 21 * * 1-5',
+            $$SELECT export_equity_bars()$$
+        );
+    END IF;
+END;
+$do$;
+
+-- export_trading_history: exports irreplaceable trading tables to S3 Parquet cold storage.
+-- Reads the cold storage bucket name from the app.cold_storage_bucket_name GUC (set by data-manager on startup).
+-- Returns early with a WARNING if pg_parquet is not installed.
+CREATE OR REPLACE FUNCTION export_trading_history() RETURNS void AS $$
+DECLARE
+    export_date  DATE := CURRENT_DATE;
+    bucket_name  TEXT := current_setting('app.cold_storage_bucket_name', true);
+    base_path    TEXT;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
+        RAISE WARNING 'pg_parquet is not installed; skipping trading history export';
+        RETURN;
+    END IF;
+    IF bucket_name IS NULL OR bucket_name = '' THEN
+        RAISE EXCEPTION 'app.cold_storage_bucket_name GUC is not set; cannot export trading history';
+    END IF;
+    base_path := format(
+        's3://%s/trading-history/year=%s/month=%s/day=%s',
+        bucket_name,
+        to_char(export_date, 'YYYY'),
+        to_char(export_date, 'MM'),
+        to_char(export_date, 'DD')
+    );
+    EXECUTE format('COPY (SELECT * FROM equity_rebalance_sessions) TO %L',
+        base_path || '/rebalance_sessions.parquet');
+    EXECUTE format('COPY (SELECT * FROM equity_pairs) TO %L',
+        base_path || '/pairs.parquet');
+    EXECUTE format('COPY (SELECT * FROM equity_allocations) TO %L',
+        base_path || '/allocations.parquet');
+    EXECUTE format('COPY (SELECT * FROM equity_orders) TO %L',
+        base_path || '/orders.parquet');
+    EXECUTE format('COPY (SELECT * FROM equity_portfolio_snapshots) TO %L',
+        base_path || '/portfolio_snapshots.parquet');
+END;
+$$ LANGUAGE plpgsql;
+
+-- Remove legacy backup-trading-history cron job on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-trading-history') THEN
+        PERFORM cron.unschedule('backup-trading-history');
+    END IF;
+END;
+$do$;
+
+-- Nightly trading history export: weekdays at 21:45 UTC (after record-eod-snapshot at 21:15 so today's snapshot is included).
+-- Only scheduled when pg_parquet is available; export_trading_history() also guards at runtime.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
+        PERFORM cron.schedule(
+            'export-trading-history',
+            '45 21 * * 1-5',
+            $$SELECT export_trading_history()$$
         );
     END IF;
 END;

@@ -10,7 +10,12 @@ from internal.database import emit_event, listen_for_events, update_consumer_off
 from .alpaca_client import AlpacaClient
 from .configuration import Configuration
 from .data_client import fetch_historical_prices, fetch_live_quote_mid_prices
-from .portfolio_state import evaluate_held_pairs_from_quotes, get_prior_allocation
+from .portfolio_state import (
+    evaluate_held_pairs_from_quotes,
+    get_last_portfolio_value,
+    get_prior_allocation,
+    save_performance_snapshot,
+)
 from .rebalance import get_latest_predictions_correlation_id, run_rebalance
 
 logger = structlog.get_logger()
@@ -69,6 +74,42 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
             except asyncio.CancelledError:
                 logger.info("Status logger cancelled")
                 return
+
+
+async def _handle_eod_snapshot_requested(alpaca_client: AlpacaClient) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        account = await loop.run_in_executor(None, alpaca_client.get_account)
+    except Exception as error:
+        logger.exception(
+            "Failed to fetch account data for EOD snapshot", error=str(error)
+        )
+        raise
+
+    portfolio_value = float(account.equity)
+    previous_value = await get_last_portfolio_value()
+
+    if previous_value is not None and previous_value > 0:
+        eod_return = (portfolio_value - previous_value) / previous_value
+    else:
+        eod_return = 0.0
+
+    snapshot = {
+        "timestamp": int(datetime.now(tz=UTC).timestamp() * 1000),
+        "portfolio_value": portfolio_value,
+        "gross_return": eod_return,
+        "net_return": eod_return,
+        "total_slippage_cost": 0.0,
+    }
+    saved = await save_performance_snapshot(snapshot, snapshot_type="eod")
+    if not saved:
+        message = "Failed to persist EOD performance snapshot"
+        raise RuntimeError(message)
+    logger.info(
+        "Saved EOD performance snapshot",
+        portfolio_value=portfolio_value,
+        eod_return=eod_return,
+    )
 
 
 async def _handle_equity_bars_synced() -> None:
@@ -187,6 +228,10 @@ async def _event_listener_loop(
                     )
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
+                    await update_consumer_offset(consumer_name, event_id)
+                elif event_type == "eod_snapshot_requested":
+                    logger.info("Received eod_snapshot_requested event")
+                    await _handle_eod_snapshot_requested(alpaca_client)
                     await update_consumer_offset(consumer_name, event_id)
 
             await listen_for_events("events", handler)
