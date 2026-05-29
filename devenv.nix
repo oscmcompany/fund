@@ -68,9 +68,27 @@ in {
       language = "system";
       fail_fast = true;
     };
+    toml-checks = {
+      enable = true;
+      name = "Check all TOML code";
+      entry = "toml-checks";
+      files = "\\.toml$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
+    sql-checks = {
+      enable = true;
+      name = "Check all SQL code";
+      entry = "sql-checks";
+      files = "\\.sql$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
     nix-lint = {
       enable = true;
-      name = "Lint all Nix code";
+      name = "Check all Nix code";
       entry = "nix-lint";
       files = "\\.nix$";
       pass_filenames = false;
@@ -105,6 +123,9 @@ in {
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
     SECRETSPEC_PROFILE = fundProfile;
+
+    # Disable AWS CLI pager so secrets output is not paged
+    AWS_PAGER = "";
   };
 
   services.postgres = {
@@ -153,6 +174,8 @@ in {
     postgresql_16
     ruff
     rustup
+    statix
+    taplo
     uv
     xenon
   ];
@@ -322,11 +345,33 @@ in {
     echo "YAML checks completed successfully"
   '';
 
+  scripts.toml-checks.exec = ''
+    set -euo pipefail
+    echo "Running TOML checks"
+    find . -name "*.toml" \
+      -not -path "./.devenv/*" \
+      -not -path "./target/*" \
+      -not -path "./.venv/*" \
+      -not -path "./models/tide/.devenv/*" \
+      | xargs taplo fmt --check --no-auto-config
+    echo "TOML checks completed successfully"
+  '';
+
+  scripts.sql-checks.exec = ''
+    set -euo pipefail
+    echo "Running SQL checks"
+    uvx sqlfluff lint .
+    echo "SQL checks completed successfully"
+  '';
+
   scripts.nix-lint.exec = ''
     set -euo pipefail
-    echo "Linting Nix files"
+    echo "Checking Nix code formatting"
     alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target --exclude ./models/tide/.devenv .
-    echo "Nix lint check passed"
+    echo "Nix formatting check passed"
+    echo "Running Nix static analysis"
+    statix check -c .statix.toml .
+    echo "Nix checks completed successfully"
   '';
 
   scripts.bump-deps.exec = ''
@@ -422,6 +467,8 @@ in {
 
     "checks:markdown".exec = "markdown-checks";
     "checks:yaml".exec = "yaml-checks";
+    "checks:toml".exec = "toml-checks";
+    "checks:sql".exec = "sql-checks";
     "checks:nix".exec = "nix-lint";
 
     # --- Model training ---
@@ -454,6 +501,8 @@ in {
         "checks:nix"
         "checks:markdown"
         "checks:yaml"
+        "checks:toml"
+        "checks:sql"
         "checks:python:format"
         "checks:python:lint"
         "checks:python:type-check"
@@ -589,41 +638,45 @@ in {
 
   enterShell = ''
     mkdir -p /var/log/fund 2>/dev/null || true
-    echo "Fund development environment (profile: $FUND_PROFILE)"
-    echo ""
-    echo "  Buckets:"
-    echo "    Data:      $AWS_S3_DATA_BUCKET_NAME"
-    echo "    Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
-    echo ""
-    echo "  Profiles:"
-    echo "    devenv --profile apps up      Start application services"
-    echo "    devenv --profile ml shell     ML training environment"
-    echo ""
-    echo "  Services (apps profile):"
-    echo "    Data Manager:     localhost:8080"
-    echo "    Portfolio Manager: localhost:8081"
-    echo "    Ensemble Manager: localhost:8082"
-    echo "    PostgreSQL:       localhost:5432/fund"
-    echo ""
-    echo "  Secrets (secretspec):"
-    echo "    secretspec check          Validate production secrets"
-    echo "    secretspec set <KEY>      Set a secret value"
-    echo ""
-    echo "  AWS:"
-    echo "    aws-buckets       List fund S3 buckets"
-    echo "    aws-secrets       List fund secrets"
-    echo ""
-    echo "  Tasks (devenv tasks run):"
-    echo "    checks:python       All Python checks (parallel after install)"
-    echo "    checks:rust         All Rust checks (parallel after cargo check)"
-    echo "    checks:markdown     Markdown lint"
-    echo "    checks:yaml         YAML lint"
-    echo "    checks:nix          Nix lint (alejandra)"
-    echo "    data:backfill-bars  Backfill historical equity bar data"
-    echo "    models:tide:train   Train tide model and upload artifacts"
-    echo ""
-    echo "  Utilities:"
-    echo "    bump-deps           Update all dependency lockfiles"
+    {
+      echo "Fund development environment (profile: $FUND_PROFILE)"
+      echo ""
+      echo "  Buckets:"
+      echo "    Data:      $AWS_S3_DATA_BUCKET_NAME"
+      echo "    Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+      echo ""
+      echo "  Profiles:"
+      echo "    devenv --profile apps up      Start application services"
+      echo "    devenv --profile ml shell     ML training environment"
+      echo ""
+      echo "  Services (apps profile):"
+      echo "    Data Manager:     localhost:8080"
+      echo "    Portfolio Manager: localhost:8081"
+      echo "    Ensemble Manager: localhost:8082"
+      echo "    PostgreSQL:       localhost:5432/fund"
+      echo ""
+      echo "  Secrets (secretspec):"
+      echo "    secretspec check          Validate production secrets"
+      echo "    secretspec set <KEY>      Set a secret value"
+      echo ""
+      echo "  AWS:"
+      echo "    aws-buckets       List fund S3 buckets"
+      echo "    aws-secrets       List fund secrets"
+      echo ""
+      echo "  Tasks (devenv tasks run):"
+      echo "    checks:python       All Python checks (parallel after install)"
+      echo "    checks:rust         All Rust checks (parallel after cargo check)"
+      echo "    checks:markdown     Markdown lint"
+      echo "    checks:yaml         YAML lint"
+      echo "    checks:toml         TOML format check"
+      echo "    checks:sql          SQL lint (PostgreSQL)"
+      echo "    checks:nix          Nix checks (alejandra + statix)"
+      echo "    data:backfill-bars  Backfill historical equity bar data"
+      echo "    models:tide:train   Train tide model and upload artifacts"
+      echo ""
+      echo "  Utilities:"
+      echo "    bump-deps           Update all dependency lockfiles"
+    } >&2
   '';
 
   enterTest = ''
