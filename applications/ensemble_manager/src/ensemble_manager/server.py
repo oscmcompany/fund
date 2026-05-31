@@ -78,8 +78,6 @@ structlog.contextvars.bind_contextvars(
 
 logger = structlog.get_logger()
 
-AWS_S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "")
-
 _swap_lock = threading.Lock()
 _CLEANUP_DELAY_SECONDS = 120
 _background_tasks: set[asyncio.Task] = set()
@@ -821,7 +819,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
         app.state.current_artifact_key = None
         logger.info("Loading model from local", directory=model_directory)
 
-    data_bucket = AWS_S3_BUCKET_NAME
+    data_bucket = os.environ.get("AWS_S3_BUCKET_NAME", "")
     if data_bucket:
         app.state.s3_data_client = boto3.client("s3")
         app.state.data_bucket_name = data_bucket

@@ -244,18 +244,30 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
+# 6b. Validate secretspec profile is defined
+# --------------------------------------------------------------------------- #
+if [[ "$PROFILE" != "production" ]]; then
+  if ! grep -qF "[profiles.\"${PROFILE}\"]" "$REPO_ROOT/secretspec.toml"; then
+    echo "Error: Profile '${PROFILE}' is not defined in secretspec.toml."
+    echo "  Add a [profiles.\"${PROFILE}\"] section to secretspec.toml, commit it,"
+    echo "  then re-run bootstrap."
+    exit 1
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
 # 7. Generate .env from .env.example
 # --------------------------------------------------------------------------- #
 DOTENV="$REPO_ROOT/.env"
 
 if [[ ! -f "$DOTENV" ]]; then
   step "Creating .env (profile: $PROFILE)"
-  sed "s|dev/yourname|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
+  sed "s|development/your.name|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
 
   # Production needs extra vars
   if [[ "$PRODUCTION" == true ]]; then
     cat >> "$DOTENV" << 'EOF'
-AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
+AWS_S3_MODEL_ARTIFACT_PATH=models/tide/
 MASSIVE_BASE_URL=https://api.massive.com
 EOF
   fi
