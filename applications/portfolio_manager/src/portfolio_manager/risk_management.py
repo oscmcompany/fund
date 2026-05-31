@@ -11,9 +11,16 @@ from .exceptions import InsufficientPairsError
 
 logger = structlog.get_logger()
 
+# Minimum number of pairs required to construct a diversified portfolio.
 REQUIRED_PAIRS = 10
+# Z-score magnitude below which a pair is held without action (mean-reversion zone).
 Z_SCORE_HOLD_THRESHOLD = 0.5
+# Z-score magnitude at which a pair is force-closed regardless of direction
+# (spread has diverged beyond the expected mean-reversion window).
 Z_SCORE_STOP_LOSS = 4.0
+# Relative bounds applied to each pair's weight by the beta-neutral SLSQP optimizer.
+# A pair can be weighted as low as 0.5x or as high as 2.0x its equal-allocation share,
+# keeping the optimizer anchored near volatility-parity while allowing beta reduction.
 BETA_WEIGHT_LOWER_BOUND = 0.5
 BETA_WEIGHT_UPPER_BOUND = 2.0
 

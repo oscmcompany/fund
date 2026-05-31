@@ -56,15 +56,25 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
         query_builder.push_values(
             chunk.iter().zip(transaction_values.iter()),
             |mut builder, (bar, transactions)| {
-                let time = DateTime::<Utc>::from_timestamp_millis(bar.timestamp).unwrap();
+                let time = DateTime::<Utc>::from_timestamp_millis(bar.timestamp)
+                    .expect("Alpaca API timestamp must be a valid millisecond epoch value");
                 builder
                     .push_bind(&bar.ticker)
                     .push_bind(time)
-                    .push_bind(bar.open_price.unwrap())
-                    .push_bind(bar.high_price.unwrap())
-                    .push_bind(bar.low_price.unwrap())
-                    .push_bind(bar.close_price.unwrap())
-                    .push_bind(bar.volume.unwrap())
+                    .push_bind(
+                        bar.open_price
+                            .expect("equity bar open_price must be present"),
+                    )
+                    .push_bind(
+                        bar.high_price
+                            .expect("equity bar high_price must be present"),
+                    )
+                    .push_bind(bar.low_price.expect("equity bar low_price must be present"))
+                    .push_bind(
+                        bar.close_price
+                            .expect("equity bar close_price must be present"),
+                    )
+                    .push_bind(bar.volume.expect("equity bar volume must be present"))
                     .push_bind(bar.volume_weighted_average_price)
                     .push_bind(*transactions);
             },
