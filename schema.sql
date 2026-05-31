@@ -66,13 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (
 SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
 
 -- export_equity_quotes: exports the current trading day's quotes to S3 Parquet then purges them.
--- Reads the S3 bucket name from the app.data_bucket_name database GUC (set by data-manager on startup).
+-- Reads the S3 bucket name from the app.bucket_name database GUC (set by data-manager on startup).
 -- pg_parquet must be installed and S3 credentials must be available to the PostgreSQL process.
 -- Returns early with a WARNING if pg_parquet is not installed.
 CREATE OR REPLACE FUNCTION export_equity_quotes() RETURNS void AS $$
 DECLARE
     export_date DATE := CURRENT_DATE;
-    bucket_name  TEXT := current_setting('app.data_bucket_name', true);
+    bucket_name  TEXT := current_setting('app.bucket_name', true);
     s3_path      TEXT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
@@ -80,10 +80,10 @@ BEGIN
         RETURN;
     END IF;
     IF bucket_name IS NULL OR bucket_name = '' THEN
-        RAISE EXCEPTION 'app.data_bucket_name GUC is not set; cannot export equity quotes';
+        RAISE EXCEPTION 'app.bucket_name GUC is not set; cannot export equity quotes';
     END IF;
     s3_path := format(
-        's3://%s/equity/quotes/daily/year=%s/month=%s/day=%s/data.parquet',
+        's3://%s/data/equity/quotes/year=%s/month=%s/day=%s/data.parquet',
         bucket_name,
         to_char(export_date, 'YYYY'),
         to_char(export_date, 'MM'),
@@ -287,7 +287,7 @@ CREATE TABLE IF NOT EXISTS equity_trades (
 
 -- equity_details: Ticker metadata (sector, industry) seeded from S3 on first startup.
 -- Ongoing updates are owned by data-manager when equity details are refreshed.
--- Source: equity/details/details.csv in the data S3 bucket.
+-- Source: data/equity/details/details.csv in the S3 bucket.
 CREATE TABLE IF NOT EXISTS equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,
     sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',
@@ -504,12 +504,12 @@ END;
 $do$;
 
 -- export_equity_bars: exports equity_bars for the past 120 days to S3 Parquet for model training.
--- Reads the training S3 bucket name from the app.training_bucket_name GUC (set by data-manager on startup).
+-- Reads the S3 bucket name from the app.bucket_name GUC (set by data-manager on startup).
 -- Returns early with a WARNING if pg_parquet is not installed.
 CREATE OR REPLACE FUNCTION export_equity_bars() RETURNS void AS $$
 DECLARE
     export_date  DATE := CURRENT_DATE;
-    bucket_name  TEXT := current_setting('app.training_bucket_name', true);
+    bucket_name  TEXT := current_setting('app.bucket_name', true);
     s3_path      TEXT;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
@@ -517,10 +517,10 @@ BEGIN
         RETURN;
     END IF;
     IF bucket_name IS NULL OR bucket_name = '' THEN
-        RAISE EXCEPTION 'app.training_bucket_name GUC is not set; cannot export equity bars';
+        RAISE EXCEPTION 'app.bucket_name GUC is not set; cannot export equity bars';
     END IF;
     s3_path := format(
-        's3://%s/equity/bars/daily/year=%s/month=%s/day=%s/data.parquet',
+        's3://%s/data/equity/bars/year=%s/month=%s/day=%s/data.parquet',
         bucket_name,
         to_char(export_date, 'YYYY'),
         to_char(export_date, 'MM'),
@@ -560,38 +560,45 @@ END;
 $do$;
 
 -- export_trading_history: exports irreplaceable trading tables to S3 Parquet cold storage.
--- Reads the cold storage bucket name from the app.cold_storage_bucket_name GUC (set by data-manager on startup).
+-- Reads the S3 bucket name from the app.bucket_name GUC (set by data-manager on startup).
 -- Returns early with a WARNING if pg_parquet is not installed.
 CREATE OR REPLACE FUNCTION export_trading_history() RETURNS void AS $$
 DECLARE
     export_date  DATE := CURRENT_DATE;
-    bucket_name  TEXT := current_setting('app.cold_storage_bucket_name', true);
-    base_path    TEXT;
+    bucket_name  TEXT := current_setting('app.bucket_name', true);
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet') THEN
         RAISE WARNING 'pg_parquet is not installed; skipping trading history export';
         RETURN;
     END IF;
     IF bucket_name IS NULL OR bucket_name = '' THEN
-        RAISE EXCEPTION 'app.cold_storage_bucket_name GUC is not set; cannot export trading history';
+        RAISE EXCEPTION 'app.bucket_name GUC is not set; cannot export trading history';
     END IF;
-    base_path := format(
-        's3://%s/trading-history/year=%s/month=%s/day=%s',
-        bucket_name,
-        to_char(export_date, 'YYYY'),
-        to_char(export_date, 'MM'),
-        to_char(export_date, 'DD')
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_rebalance_sessions) TO %L',
+        format('s3://%s/exports/equity/rebalance-sessions/year=%s/month=%s/day=%s/data.parquet',
+               bucket_name, to_char(export_date, 'YYYY'), to_char(export_date, 'MM'), to_char(export_date, 'DD'))
     );
-    EXECUTE format('COPY (SELECT * FROM equity_rebalance_sessions) TO %L',
-        base_path || '/rebalance_sessions.parquet');
-    EXECUTE format('COPY (SELECT * FROM equity_pairs) TO %L',
-        base_path || '/pairs.parquet');
-    EXECUTE format('COPY (SELECT * FROM equity_allocations) TO %L',
-        base_path || '/allocations.parquet');
-    EXECUTE format('COPY (SELECT * FROM equity_orders) TO %L',
-        base_path || '/orders.parquet');
-    EXECUTE format('COPY (SELECT * FROM equity_portfolio_snapshots) TO %L',
-        base_path || '/portfolio_snapshots.parquet');
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_pairs) TO %L',
+        format('s3://%s/exports/equity/pairs/year=%s/month=%s/day=%s/data.parquet',
+               bucket_name, to_char(export_date, 'YYYY'), to_char(export_date, 'MM'), to_char(export_date, 'DD'))
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_allocations) TO %L',
+        format('s3://%s/exports/equity/allocations/year=%s/month=%s/day=%s/data.parquet',
+               bucket_name, to_char(export_date, 'YYYY'), to_char(export_date, 'MM'), to_char(export_date, 'DD'))
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_orders) TO %L',
+        format('s3://%s/exports/equity/orders/year=%s/month=%s/day=%s/data.parquet',
+               bucket_name, to_char(export_date, 'YYYY'), to_char(export_date, 'MM'), to_char(export_date, 'DD'))
+    );
+    EXECUTE format(
+        'COPY (SELECT * FROM equity_portfolio_snapshots) TO %L',
+        format('s3://%s/exports/equity/portfolio-snapshots/year=%s/month=%s/day=%s/data.parquet',
+               bucket_name, to_char(export_date, 'YYYY'), to_char(export_date, 'MM'), to_char(export_date, 'DD'))
+    );
 END;
 $$ LANGUAGE plpgsql;
 

@@ -53,7 +53,7 @@ def read_equity_bars_from_s3(
         month = current_date.strftime("%m")
         day = current_date.strftime("%d")
 
-        key = f"equity/bars/daily/year={year}/month={month}/day={day}/data.parquet"
+        key = f"data/equity/bars/year={year}/month={month}/day={day}/data.parquet"
 
         try:
             response = s3_client.get_object(Bucket=bucket_name, Key=key)
@@ -100,7 +100,7 @@ def read_categories_from_s3(
     bucket_name: str,
 ) -> pl.DataFrame:
     """Read categories CSV from S3."""
-    key = "equity/details/details.csv"
+    key = "data/equity/details/details.csv"
 
     logger.info("Reading categories from S3", bucket=bucket_name, key=key)
 
@@ -364,8 +364,8 @@ def write_evaluation_results(
     results: dict[str, float],
     run_id: str,
 ) -> None:
-    """Write evaluation results as JSON to artifacts/tide/{run_id}/evaluation.json."""
-    key = f"artifacts/tide/{run_id}/evaluation.json"
+    """Write evaluation results as JSON to models/tide/{run_id}/evaluation.json."""
+    key = f"models/tide/{run_id}/evaluation.json"
 
     logger.info(
         "Writing evaluation results",

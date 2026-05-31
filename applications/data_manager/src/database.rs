@@ -313,48 +313,15 @@ pub async fn populate_equity_details_if_empty(
     Ok(rows_affected)
 }
 
-pub async fn set_data_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
+pub async fn set_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
     let alter_statement: String = sqlx::query_scalar(
-        r#"SELECT format('ALTER DATABASE %I SET "app.data_bucket_name" = %L', current_database(), $1)"#,
+        r#"SELECT format('ALTER DATABASE %I SET "app.bucket_name" = %L', current_database(), $1)"#,
     )
     .bind(bucket_name)
     .fetch_one(pool)
     .await?;
     sqlx::query(&alter_statement).execute(pool).await?;
-    info!("Set app.data_bucket_name database GUC to {}", bucket_name);
-    Ok(())
-}
-
-pub async fn set_training_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
-    let alter_statement: String = sqlx::query_scalar(
-        r#"SELECT format('ALTER DATABASE %I SET "app.training_bucket_name" = %L', current_database(), $1)"#,
-    )
-    .bind(bucket_name)
-    .fetch_one(pool)
-    .await?;
-    sqlx::query(&alter_statement).execute(pool).await?;
-    info!(
-        "Set app.training_bucket_name database GUC to {}",
-        bucket_name
-    );
-    Ok(())
-}
-
-pub async fn set_cold_storage_bucket_guc(
-    pool: &PgPool,
-    bucket_name: &str,
-) -> Result<(), sqlx::Error> {
-    let alter_statement: String = sqlx::query_scalar(
-        r#"SELECT format('ALTER DATABASE %I SET "app.cold_storage_bucket_name" = %L', current_database(), $1)"#,
-    )
-    .bind(bucket_name)
-    .fetch_one(pool)
-    .await?;
-    sqlx::query(&alter_statement).execute(pool).await?;
-    info!(
-        "Set app.cold_storage_bucket_name database GUC to {}",
-        bucket_name
-    );
+    info!("Set app.bucket_name database GUC to {}", bucket_name);
     Ok(())
 }
 
@@ -512,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_data_bucket_guc_compiles() {
+    fn test_set_bucket_guc_compiles() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -520,35 +487,7 @@ mod tests {
         rt.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
-            let result = set_data_bucket_guc(&pool, "test-bucket").await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_set_training_bucket_guc_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
-            let result = set_training_bucket_guc(&pool, "test-training-bucket").await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_set_cold_storage_bucket_guc_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
-            let result = set_cold_storage_bucket_guc(&pool, "test-cold-storage-bucket").await;
+            let result = set_bucket_guc(&pool, "test-bucket").await;
             assert!(result.is_err());
         });
     }

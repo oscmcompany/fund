@@ -306,13 +306,7 @@ mod tests {
         let _secret_key_guard =
             EnvironmentVariableGuard::set("AWS_SECRET_ACCESS_KEY", "test-secret-key");
         let _metadata_guard = EnvironmentVariableGuard::set("AWS_EC2_METADATA_DISABLED", "true");
-        let _bucket_guard = EnvironmentVariableGuard::set("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
-        let _training_bucket_guard =
-            EnvironmentVariableGuard::set("AWS_S3_TRAINING_BUCKET_NAME", "test-training-bucket");
-        let _cold_storage_bucket_guard = EnvironmentVariableGuard::set(
-            "AWS_S3_COLD_STORAGE_BUCKET_NAME",
-            "test-cold-storage-bucket",
-        );
+        let _bucket_guard = EnvironmentVariableGuard::set("AWS_S3_BUCKET_NAME", "test-bucket");
         let _massive_base_guard =
             EnvironmentVariableGuard::set("MASSIVE_BASE_URL", "http://127.0.0.1:1");
         let _massive_key_guard = EnvironmentVariableGuard::set("MASSIVE_API_KEY", "test-api-key");

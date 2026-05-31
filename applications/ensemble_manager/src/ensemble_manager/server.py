@@ -78,7 +78,7 @@ structlog.contextvars.bind_contextvars(
 
 logger = structlog.get_logger()
 
-AWS_S3_DATA_BUCKET_NAME = os.getenv("AWS_S3_DATA_BUCKET_NAME", "")
+AWS_S3_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME", "")
 
 _swap_lock = threading.Lock()
 _CLEANUP_DELAY_SECONDS = 120
@@ -270,7 +270,7 @@ async def _fetch_equity_details(s3_client: "S3Client", bucket: str) -> pl.DataFr
     response = await asyncio.to_thread(
         s3_client.get_object,
         Bucket=bucket,
-        Key="equity/details/details.csv",
+        Key="data/equity/details/details.csv",
     )
     csv_bytes: bytes = response["Body"].read()
     equity_details_data = pl.read_csv(io.BytesIO(csv_bytes))
@@ -704,8 +704,8 @@ async def _sync_run_metadata(
 
 async def _artifact_polling_task(app: FastAPI) -> None:
     """Background task that polls S3 for new model artifacts."""
-    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
-    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
+    bucket = os.environ.get("AWS_S3_BUCKET_NAME")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "models/tide/")
 
     if not bucket:
         logger.info("Artifact polling disabled, no bucket configured")
@@ -787,8 +787,8 @@ async def _artifact_polling_task(app: FastAPI) -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
     """Load model artifacts from S3 at startup."""
 
-    bucket = os.environ.get("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
-    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "artifacts/tide/")
+    bucket = os.environ.get("AWS_S3_BUCKET_NAME")
+    artifact_path = os.environ.get("AWS_S3_MODEL_ARTIFACT_PATH", "models/tide/")
     model_directory = "."
     s3_client: S3Client | None = None
 
@@ -821,7 +821,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:  # noqa: PLR0915
         app.state.current_artifact_key = None
         logger.info("Loading model from local", directory=model_directory)
 
-    data_bucket = AWS_S3_DATA_BUCKET_NAME
+    data_bucket = AWS_S3_BUCKET_NAME
     if data_bucket:
         app.state.s3_data_client = boto3.client("s3")
         app.state.data_bucket_name = data_bucket

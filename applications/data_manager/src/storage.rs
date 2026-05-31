@@ -8,7 +8,7 @@ use polars::prelude::*;
 use std::io::Cursor;
 use tracing::{debug, error, info, warn};
 
-const EQUITY_DETAILS_KEY: &str = "equity/details/details.csv";
+const EQUITY_DETAILS_KEY: &str = "data/equity/details/details.csv";
 pub const DUCKDB_CONFIG_VALUE_MAX_LENGTH: usize = 4096;
 
 pub fn is_valid_ticker(ticker: &str) -> bool {
@@ -184,7 +184,7 @@ pub async fn query_equity_bars_parquet_from_s3(
     );
 
     // Use glob pattern with hive partitioning to handle missing files gracefully
-    let s3_glob = format!("s3://{}/equity/bars/daily/**/*.parquet", state.bucket_name);
+    let s3_glob = format!("s3://{}/data/equity/bars/**/*.parquet", state.bucket_name);
 
     info!("Using S3 glob pattern: {}", s3_glob);
 

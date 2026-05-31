@@ -9,8 +9,7 @@ if [[ -z "$PROFILE" ]]; then
 fi
 
 SLUG="${PROFILE//[\/.]/-}"
-DATA_BUCKET="fund-${SLUG}-data"
-ARTIFACTS_BUCKET="fund-${SLUG}-model-artifacts"
+BUCKET="oscm-fund-${SLUG}"
 
 create_bucket() {
   local bucket="$1"
@@ -22,7 +21,6 @@ create_bucket() {
   fi
 }
 
-create_bucket "$DATA_BUCKET"
-create_bucket "$ARTIFACTS_BUCKET"
+create_bucket "$BUCKET"
 
-echo "Development buckets ready for profile $PROFILE"
+echo "Development bucket ready for profile $PROFILE"

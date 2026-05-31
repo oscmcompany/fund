@@ -59,7 +59,7 @@ async fn seed_equity_bars_parquet(
         .finish(&mut dataframe)
         .unwrap();
     let key = format!(
-        "equity/bars/daily/year={}/month={}/day={}/data.parquet",
+        "data/equity/bars/year={}/month={}/day={}/data.parquet",
         timestamp.format("%Y"),
         timestamp.format("%m"),
         timestamp.format("%d")
@@ -185,7 +185,7 @@ async fn test_read_equity_details_dataframe_from_s3_success() {
 
     put_test_object(
         &s3,
-        "equity/details/details.csv",
+        "data/equity/details/details.csv",
         b"ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n".to_vec(),
     )
     .await;
@@ -205,7 +205,12 @@ async fn test_read_equity_details_dataframe_from_s3_returns_error_for_invalid_ut
     let (endpoint, s3, _env_guard) = setup_test_bucket().await;
     let state = create_state(&endpoint).await;
 
-    put_test_object(&s3, "equity/details/details.csv", vec![0xff, 0xfe, 0xfd]).await;
+    put_test_object(
+        &s3,
+        "data/equity/details/details.csv",
+        vec![0xff, 0xfe, 0xfd],
+    )
+    .await;
 
     let result = read_equity_details_dataframe_from_s3(&state).await;
 

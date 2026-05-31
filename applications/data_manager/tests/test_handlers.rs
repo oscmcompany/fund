@@ -62,7 +62,7 @@ async fn test_equity_details_get_returns_csv_content() {
 
     put_test_object(
         &s3,
-        "equity/details/details.csv",
+        "data/equity/details/details.csv",
         b"ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n".to_vec(),
     )
     .await;

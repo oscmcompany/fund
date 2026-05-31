@@ -48,12 +48,7 @@ mod tests {
         // 1. Test is marked with #[serial] to prevent concurrent execution
         // 2. Env vars are set synchronously before spawning async tasks
         unsafe {
-            std::env::set_var("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
-            std::env::set_var("AWS_S3_TRAINING_BUCKET_NAME", "test-training-bucket");
-            std::env::set_var(
-                "AWS_S3_COLD_STORAGE_BUCKET_NAME",
-                "test-cold-storage-bucket",
-            );
+            std::env::set_var("AWS_S3_BUCKET_NAME", "test-bucket");
             std::env::set_var("MASSIVE_BASE_URL", "http://test");
             std::env::set_var("MASSIVE_API_KEY", "test-key");
             std::env::set_var("ALPACA_KEY_ID", "test-key-id");
@@ -67,9 +62,7 @@ mod tests {
         assert_eq!(exit_code, 1);
 
         unsafe {
-            std::env::remove_var("AWS_S3_DATA_BUCKET_NAME");
-            std::env::remove_var("AWS_S3_TRAINING_BUCKET_NAME");
-            std::env::remove_var("AWS_S3_COLD_STORAGE_BUCKET_NAME");
+            std::env::remove_var("AWS_S3_BUCKET_NAME");
             std::env::remove_var("MASSIVE_BASE_URL");
             std::env::remove_var("MASSIVE_API_KEY");
             std::env::remove_var("ALPACA_KEY_ID");

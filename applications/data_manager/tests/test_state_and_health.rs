@@ -76,9 +76,9 @@ async fn test_state_new_sets_all_fields() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-#[should_panic(expected = "AWS_S3_DATA_BUCKET_NAME environment variable must be set")]
+#[should_panic(expected = "AWS_S3_BUCKET_NAME environment variable must be set")]
 async fn test_state_from_env_panics_when_required_variables_are_missing() {
-    let _aws_bucket_guard = EnvironmentVariableGuard::remove("AWS_S3_DATA_BUCKET_NAME");
+    let _aws_bucket_guard = EnvironmentVariableGuard::remove("AWS_S3_BUCKET_NAME");
     let _massive_base_guard = EnvironmentVariableGuard::remove("MASSIVE_BASE_URL");
     let _massive_key_guard = EnvironmentVariableGuard::remove("MASSIVE_API_KEY");
     let _region_guard = EnvironmentVariableGuard::set("AWS_REGION", "us-east-1");
@@ -90,7 +90,7 @@ async fn test_state_from_env_panics_when_required_variables_are_missing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_state_from_env_uses_environment_values() {
-    let _aws_bucket_guard = EnvironmentVariableGuard::set("AWS_S3_DATA_BUCKET_NAME", "env-bucket");
+    let _aws_bucket_guard = EnvironmentVariableGuard::set("AWS_S3_BUCKET_NAME", "env-bucket");
     let _massive_base_guard =
         EnvironmentVariableGuard::set("MASSIVE_BASE_URL", "https://massive.example");
     let _massive_key_guard = EnvironmentVariableGuard::set("MASSIVE_API_KEY", "env-api-key");
