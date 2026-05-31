@@ -4,11 +4,11 @@ set -euo pipefail
 PROFILE="${1:-}"
 if [[ -z "$PROFILE" ]]; then
   echo "Usage: $(basename "$0") <profile>"
-  echo "  e.g. $(basename "$0") dev/chris"
+  echo "  e.g. $(basename "$0") development/chris.addy"
   exit 1
 fi
 
-SLUG="${PROFILE//\//-}"
+SLUG="${PROFILE//[\/.]/-}"
 DATA_BUCKET="fund-${SLUG}-data"
 ARTIFACTS_BUCKET="fund-${SLUG}-model-artifacts"
 

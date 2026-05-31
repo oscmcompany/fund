@@ -4,19 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PROD=false
+PRODUCTION=false
 NONINTERACTIVE=false
 PROFILE=""
 OS="$(uname -s)"
 
 usage() {
-  echo "Usage: $(basename "$0") --profile <name> [--prod] [--noninteractive]"
+  echo "Usage: $(basename "$0") --profile <name> [--production] [--noninteractive]"
   echo ""
   echo "Bootstrap a fresh machine for the fund development environment."
   echo ""
   echo "Options:"
-  echo "  --profile <name>    Fund profile (e.g., dev/chris, production) [required]"
-  echo "  --prod              Configure production environment and validate secrets"
+  echo "  --profile <name>    Fund profile (e.g., development/chris.addy, production) [required]"
+  echo "  --production        Configure production environment and validate secrets"
   echo "  --noninteractive    Skip the final exec \$SHELL (for use from automation)"
   echo "  -h, --help          Show this help message"
   exit "${1:-0}"
@@ -32,8 +32,8 @@ while [[ $# -gt 0 ]]; do
       PROFILE="$2"
       shift 2
       ;;
-    --prod)
-      PROD=true
+    --production)
+      PRODUCTION=true
       shift
       ;;
     --noninteractive)
@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$PROFILE" ]]; then
-  echo "Error: --profile is required (e.g., --profile dev/chris or --profile production)"
+  echo "Error: --profile is required (e.g., --profile development/chris.addy or --profile production)"
   usage 1
 fi
 
@@ -253,7 +253,7 @@ if [[ ! -f "$DOTENV" ]]; then
   sed "s|dev/yourname|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
 
   # Production needs extra vars
-  if [[ "$PROD" == true ]]; then
+  if [[ "$PRODUCTION" == true ]]; then
     cat >> "$DOTENV" << 'EOF'
 AWS_S3_MODEL_ARTIFACT_PATH=artifacts/tide/
 MASSIVE_BASE_URL=https://api.massive.com
@@ -270,7 +270,7 @@ else
   echo ".env already exists, skipping creation"
 fi
 
-if [[ "$PROD" != true && "$PROFILE" != "production" && "$PROFILE" != "paper" ]]; then
+if [[ "$PRODUCTION" != true && "$PROFILE" != "production" ]]; then
   step "Ensuring dev S3 buckets exist"
   set -a
   # shellcheck disable=SC1090
@@ -309,7 +309,7 @@ devenv shell -- echo "devenv environment built successfully"
 # --------------------------------------------------------------------------- #
 # 10. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
-if [[ "$PROD" == true ]]; then
+if [[ "$PRODUCTION" == true ]]; then
   echo "Validating secrets via secretspec..."
   devenv shell -- secretspec check || echo "Run 'secretspec set <KEY>' to populate missing secrets"
 fi
@@ -322,7 +322,7 @@ step "Bootstrap complete"
 echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
-if [[ "$PROD" == true ]]; then
+if [[ "$PRODUCTION" == true ]]; then
   echo "  tmux new-session -d -s fund 'devenv --profile apps up'"
   echo "  tmux attach -t fund        # attach to services session"
 else
@@ -330,7 +330,7 @@ else
   echo "  devenv --profile apps up  # start application services"
   echo ""
   echo "For production setup, re-run with:"
-  echo "  $(basename "$0") --profile production --prod"
+  echo "  $(basename "$0") --profile production --production"
 fi
 
 # Replace current shell so Nix paths are on PATH

@@ -10,9 +10,9 @@
     if rawFundProfile == ""
     then "development"
     else rawFundProfile;
-  isDeployed = builtins.elem fundProfile ["production" "paper"];
+  isDeployed = fundProfile == "production" || lib.hasPrefix "development/" fundProfile;
 
-  bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
+  bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
 in {
   cachix.enable = false;
   dotenv.enable = true;
