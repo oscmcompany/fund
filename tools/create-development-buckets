@@ -4,13 +4,12 @@ set -euo pipefail
 PROFILE="${1:-}"
 if [[ -z "$PROFILE" ]]; then
   echo "Usage: $(basename "$0") <profile>"
-  echo "  e.g. $(basename "$0") dev/chris"
+  echo "  e.g. $(basename "$0") development/chris.addy"
   exit 1
 fi
 
-SLUG="${PROFILE//\//-}"
-DATA_BUCKET="fund-${SLUG}-data"
-ARTIFACTS_BUCKET="fund-${SLUG}-model-artifacts"
+SLUG="${PROFILE//[\/.]/-}"
+BUCKET="oscm-fund-${SLUG}"
 
 create_bucket() {
   local bucket="$1"
@@ -22,7 +21,6 @@ create_bucket() {
   fi
 }
 
-create_bucket "$DATA_BUCKET"
-create_bucket "$ARTIFACTS_BUCKET"
+create_bucket "$BUCKET"
 
-echo "Development buckets ready for profile $PROFILE"
+echo "Development bucket ready for profile $PROFILE"

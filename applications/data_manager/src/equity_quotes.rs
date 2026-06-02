@@ -65,7 +65,7 @@ async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
 }
 
 async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let pool = state.pool.as_ref().unwrap();
+    let pool = state.pool.as_ref().ok_or("database pool not initialized")?;
 
     refresh_active_symbols(state, pool).await;
 

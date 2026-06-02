@@ -62,7 +62,7 @@ def prepare_data(
         raise ValueError(message) from err
     s3_client = data_block.credentials.get_boto3_session().client("s3")
 
-    output_key = f"data/tide/{artifact_timestamp}/filtered_data.parquet"
+    output_key = f"models/tide/{artifact_timestamp}/filtered_data.parquet"
 
     logger.info(
         "Preparing training data",
@@ -145,7 +145,7 @@ def train_tide_model(
                 checkpoint_directory=checkpoint_directory,
             )
 
-        artifact_folder = f"artifacts/tide/{artifact_timestamp}"
+        artifact_folder = f"models/tide/{artifact_timestamp}"
         artifact_key = f"{artifact_folder}/output/model.tar.gz"
         metadata_key = f"{artifact_folder}/run_metadata.json"
 
@@ -275,7 +275,7 @@ def evaluate_tide_model(
     prior_evaluations = fetch_prior_evaluations(
         s3_client=s3_client,
         bucket_name=artifacts_bucket,
-        artifact_prefix="artifacts/tide/",
+        artifact_prefix="models/tide/",
         run_count=7,
     )
 

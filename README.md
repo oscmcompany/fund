@@ -59,13 +59,13 @@ Production runs on a VM with `devenv --profile apps up` and secretspec for secre
 
 An unordered and non-exhaustive list we work towards:
 
-> Test in production
-> Always roll forward
-> Systems over process
-> No code is good code
-> Never write documentation
-> Be explicit
-> Git is truth
+> Test in production  
+> Always roll forward  
+> Systems over process  
+> No code is good code  
+> Never write documentation  
+> Be explicit  
+> Git is truth  
 
 ### Links
 

@@ -10,9 +10,9 @@
     if rawFundProfile == ""
     then "development"
     else rawFundProfile;
-  isDeployed = builtins.elem fundProfile ["production" "paper"];
+  isDeployed = fundProfile == "production" || lib.hasPrefix "development/" fundProfile;
 
-  bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
+  bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
 in {
   cachix.enable = false;
   dotenv.enable = true;
@@ -108,11 +108,8 @@ in {
     # Active profile
     FUND_PROFILE = fundProfile;
 
-    # S3 bucket names derived from FUND_PROFILE
-    AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
-    AWS_S3_TRAINING_BUCKET_NAME = "fund-${bucketSlug}-training";
-    AWS_S3_COLD_STORAGE_BUCKET_NAME = "fund-${bucketSlug}-cold-storage";
+    # S3 bucket name derived from FUND_PROFILE
+    AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
 
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
@@ -196,8 +193,7 @@ in {
     set -euo pipefail
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
-    echo "  Data:      $AWS_S3_DATA_BUCKET_NAME"
-    echo "  Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+    echo "  Bucket: $AWS_S3_BUCKET_NAME"
     echo ""
     buckets=$(aws s3 ls)
     printf '%s\n' "$buckets" | grep fund || echo "No fund buckets found"
@@ -637,9 +633,7 @@ in {
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""
-      echo "  Buckets:"
-      echo "    Data:      $AWS_S3_DATA_BUCKET_NAME"
-      echo "    Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+      echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
       echo "    devenv --profile apps up      Start application services"
