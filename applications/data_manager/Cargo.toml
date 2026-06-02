@@ -55,7 +55,7 @@ tracing-appender = "0.2"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.13", features = ["json"] }
 mockito = "1.7"
-serial_test = "3.4"
+serial_test = "3.5"
 testcontainers = "0.24"
 testcontainers-modules = { version = "0.12", features = [
   "localstack",
