@@ -435,6 +435,47 @@ def test_open_position_succeeds_when_order_transitions_from_pending_new(
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_raises_when_polled_order_is_rejected(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_order = MagicMock()
+    mock_order.id = "order-abc"
+    mock_order.status = "pending_new"
+    mock_trading.submit_order.return_value = mock_order
+
+    mock_polled_order = MagicMock()
+    mock_polled_order.status = "rejected"
+    mock_trading.get_order_by_id.return_value = mock_polled_order
+
+    with pytest.raises(RuntimeError, match="rejected by Alpaca"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
+
+    mock_trading.get_order_by_id.assert_called_once_with("order-abc")
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_succeeds_when_poll_raises_exception(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_order = MagicMock()
+    mock_order.id = "order-def"
+    mock_order.status = "pending_new"
+    mock_trading.submit_order.return_value = mock_order
+    mock_trading.get_order_by_id.side_effect = OSError("network error")
+
+    result = client.open_position(
+        ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+    )
+
+    assert result == "order-def"
+    mock_trading.get_order_by_id.assert_called_once_with("order-def")
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
 def test_close_position_returns_true_on_success(mock_sleep: MagicMock) -> None:
     client, mock_trading = _make_client()
 

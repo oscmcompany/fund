@@ -150,6 +150,19 @@ class AlpacaClient:
                     ticker=ticker,
                     alpaca_order_id=alpaca_order_id,
                 )
+                # Cannot confirm status; treat as submitted rather than failing.
+                return
+            if order_status == "rejected":
+                logger.error(
+                    "Order rejected by Alpaca after poll",
+                    ticker=ticker,
+                    alpaca_order_id=alpaca_order_id,
+                )
+                message = (
+                    f"Order for {ticker} was rejected by Alpaca"
+                    f" (order_id={alpaca_order_id})"
+                )
+                raise RuntimeError(message)
             if order_status == "pending_new":
                 logger.error(
                     "Order remains pending_new after poll",

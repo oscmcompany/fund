@@ -396,8 +396,11 @@ def test_execute_open_positions_logs_dangling_long_when_short_fails() -> None:
     assert results[1]["status"] == "failed"
     mock_logger.warning.assert_called_once()
     warning_kwargs = mock_logger.warning.call_args[1]
+    assert warning_kwargs["pair_id"] == "pair-1"
     assert warning_kwargs["long_ticker"] == "AAPL"
     assert warning_kwargs["short_ticker"] == "MSFT"
+    assert warning_kwargs["short_status"] == "failed"
+    assert warning_kwargs["short_reason"] == "short failed"
 
 
 def test_execute_open_positions_logs_dangling_long_when_short_skipped() -> None:
@@ -417,6 +420,12 @@ def test_execute_open_positions_logs_dangling_long_when_short_skipped() -> None:
         if "dangling" in warning_call[0][0]
     ]
     assert len(dangling_calls) == 1
+    warning_kwargs = dangling_calls[0][1]
+    assert warning_kwargs["pair_id"] == "pair-1"
+    assert warning_kwargs["long_ticker"] == "AAPL"
+    assert warning_kwargs["short_ticker"] == "MSFT"
+    assert warning_kwargs["short_status"] == "skipped"
+    assert warning_kwargs["short_reason"] == "insufficient_equity_for_short"
 
 
 def test_execute_open_positions_uses_computed_short_qty_when_quantity_is_none() -> None:
