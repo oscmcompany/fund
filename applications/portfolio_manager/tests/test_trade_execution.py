@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from portfolio_manager.alpaca_client import AlpacaAccount, AlpacaClient
 from portfolio_manager.configuration import Configuration
@@ -379,6 +379,44 @@ def test_execute_open_positions_returns_empty_for_no_positions() -> None:
     )
     assert results == []
     assert count == 0
+
+
+def test_execute_open_positions_logs_dangling_long_when_short_fails() -> None:
+    client = _make_mock_client()
+    client.open_position.side_effect = [None, RuntimeError("short failed")]
+
+    positions = [_long(ticker="AAPL"), _short(ticker="MSFT", quantity=10)]
+    with patch("portfolio_manager.trade_execution.logger") as mock_logger:
+        results, count = execute_open_positions(
+            client, positions, 10000.0, 50000.0, _DEFAULT_CONFIG
+        )
+
+    assert count == 1
+    assert results[0]["status"] == "success"
+    assert results[1]["status"] == "failed"
+    mock_logger.warning.assert_called_once()
+    warning_kwargs = mock_logger.warning.call_args[1]
+    assert warning_kwargs["long_ticker"] == "AAPL"
+    assert warning_kwargs["short_ticker"] == "MSFT"
+
+
+def test_execute_open_positions_logs_dangling_long_when_short_skipped() -> None:
+    config = Configuration(minimum_short_equity=2000.0)
+    client = _make_mock_client()
+
+    positions = [_long(ticker="AAPL"), _short(ticker="MSFT")]
+    with patch("portfolio_manager.trade_execution.logger") as mock_logger:
+        results, _ = execute_open_positions(client, positions, 10000.0, 500.0, config)
+
+    assert results[0]["status"] == "success"
+    assert results[1]["status"] == "skipped"
+    mock_logger.warning.assert_called()
+    dangling_calls = [
+        warning_call
+        for warning_call in mock_logger.warning.call_args_list
+        if "dangling" in warning_call[0][0]
+    ]
+    assert len(dangling_calls) == 1
 
 
 def test_execute_open_positions_uses_computed_short_qty_when_quantity_is_none() -> None:

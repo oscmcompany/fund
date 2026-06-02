@@ -375,6 +375,66 @@ def test_open_position_reraises_other_api_errors() -> None:
 
 
 @patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_raises_when_order_is_rejected(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_order = MagicMock()
+    mock_order.id = "order-123"
+    mock_order.status = "rejected"
+    mock_trading.submit_order.return_value = mock_order
+
+    with pytest.raises(RuntimeError, match="rejected by Alpaca"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_raises_when_order_remains_pending_new_after_poll(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_order = MagicMock()
+    mock_order.id = "order-456"
+    mock_order.status = "pending_new"
+    mock_trading.submit_order.return_value = mock_order
+
+    mock_polled_order = MagicMock()
+    mock_polled_order.status = "pending_new"
+    mock_trading.get_order_by_id.return_value = mock_polled_order
+
+    with pytest.raises(RuntimeError, match="remains pending_new"):
+        client.open_position(
+            ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+        )
+
+    mock_trading.get_order_by_id.assert_called_once_with("order-456")
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_open_position_succeeds_when_order_transitions_from_pending_new(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_order = MagicMock()
+    mock_order.id = "order-789"
+    mock_order.status = "pending_new"
+    mock_trading.submit_order.return_value = mock_order
+
+    mock_polled_order = MagicMock()
+    mock_polled_order.status = "new"
+    mock_trading.get_order_by_id.return_value = mock_polled_order
+
+    result = client.open_position(
+        ticker="AAPL", side=TradeSide.BUY, dollar_amount=500.0, entry_price=50.0
+    )
+
+    assert result == "order-789"
+    mock_trading.get_order_by_id.assert_called_once_with("order-789")
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
 def test_close_position_returns_true_on_success(mock_sleep: MagicMock) -> None:
     client, mock_trading = _make_client()
 

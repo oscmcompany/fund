@@ -934,6 +934,19 @@ def test_get_latest_predictions_correlation_id_returns_none_when_no_rows() -> No
     assert result is None
 
 
+def test_get_latest_predictions_correlation_id_filters_to_current_date() -> None:
+    mock_pool = _make_mock_pool(None)
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ) as _:
+        mock_connection = mock_pool.connection.return_value.__aenter__.return_value
+        asyncio.run(get_latest_predictions_correlation_id())
+
+    sql = mock_connection.execute.call_args[0][0]
+    assert "CURRENT_DATE" in sql
+
+
 # --- get_raw_predictions ---
 
 
@@ -991,6 +1004,33 @@ def test_get_raw_predictions_returns_empty_dataframe_when_no_rows() -> None:
     assert len(result) == 0
     assert "ticker" in result.columns
     assert "quantile_10" in result.columns
+    assert model_run_id is None
+
+
+def test_get_raw_predictions_without_correlation_id_filters_to_current_date() -> None:
+    mock_pool = _make_mock_pool_with_fetchall([])
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        mock_connection = mock_pool.connection.return_value.__aenter__.return_value
+        asyncio.run(get_raw_predictions())
+
+    sql = mock_connection.execute.call_args[0][0]
+    assert "CURRENT_DATE" in sql
+
+
+def test_get_raw_predictions_returns_empty_when_predictions_are_stale() -> None:
+    # Simulate the CURRENT_DATE filter excluding yesterday's predictions by
+    # returning no rows from the database.
+    mock_pool = _make_mock_pool_with_fetchall([])
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result, model_run_id = asyncio.run(get_raw_predictions())
+
+    assert result.is_empty()
     assert model_run_id is None
 
 
