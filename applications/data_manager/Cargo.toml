@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3.23", features = [
   "json",
 ] }
 aws-config = "1.8.15"
-aws-sdk-s3 = "1.129"
+aws-sdk-s3 = "1.134"
 aws-credential-types = "1.2.14"
 duckdb = { version = "1.10502.0", features = ["r2d2", "chrono"] }
 futures-util = "0.3"
