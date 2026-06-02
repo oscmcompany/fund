@@ -118,6 +118,63 @@ class AlpacaClient:
             equity=float(cast("str", account.equity)),
         )
 
+    def _confirm_order_status(
+        self,
+        ticker: str,
+        alpaca_order_id: str,
+        order: object,
+    ) -> None:
+        """Check submitted order status and raise if rejected or stuck pending_new."""
+        order_status = str(getattr(order, "status", ""))
+
+        if order_status == "rejected":
+            logger.error(
+                "Order rejected by Alpaca",
+                ticker=ticker,
+                alpaca_order_id=alpaca_order_id,
+            )
+            message = (
+                f"Order for {ticker} was rejected by Alpaca"
+                f" (order_id={alpaca_order_id})"
+            )
+            raise RuntimeError(message)
+
+        if order_status == "pending_new":
+            time.sleep(1)
+            try:
+                polled_order = self.trading_client.get_order_by_id(alpaca_order_id)
+                order_status = str(getattr(polled_order, "status", ""))
+            except Exception:
+                logger.exception(
+                    "Failed to poll order status after pending_new",
+                    ticker=ticker,
+                    alpaca_order_id=alpaca_order_id,
+                )
+                # Cannot confirm status; treat as submitted rather than failing.
+                return
+            if order_status == "rejected":
+                logger.error(
+                    "Order rejected by Alpaca after poll",
+                    ticker=ticker,
+                    alpaca_order_id=alpaca_order_id,
+                )
+                message = (
+                    f"Order for {ticker} was rejected by Alpaca"
+                    f" (order_id={alpaca_order_id})"
+                )
+                raise RuntimeError(message)
+            if order_status == "pending_new":
+                logger.error(
+                    "Order remains pending_new after poll",
+                    ticker=ticker,
+                    alpaca_order_id=alpaca_order_id,
+                )
+                message = (
+                    f"Order for {ticker} remains pending_new after poll"
+                    f" (order_id={alpaca_order_id})"
+                )
+                raise RuntimeError(message)
+
     def open_position(
         self,
         ticker: str,
@@ -172,6 +229,7 @@ class AlpacaClient:
         try:
             order = self.trading_client.submit_order(order_data=order_request)
             alpaca_order_id = str(getattr(order, "id", ""))
+            self._confirm_order_status(ticker, alpaca_order_id, order)
         except APIError as e:
             error_str = str(e).lower()
             if "insufficient buying power" in error_str or "buying_power" in error_str:
