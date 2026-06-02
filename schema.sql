@@ -90,7 +90,7 @@ BEGIN
         to_char(export_date, 'DD')
     );
     EXECUTE format(
-        'COPY (SELECT * FROM equity_quotes WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        'COPY (SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size FROM equity_quotes WHERE timestamp >= %L AND timestamp < %L) TO %L',
         export_date::timestamptz,
         (export_date + 1)::timestamptz,
         s3_path
@@ -195,6 +195,8 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
         CHECK (quantity IS NOT NULL OR notional IS NOT NULL)
 );
 
+CREATE INDEX IF NOT EXISTS idx_equity_allocations_rebalance_id ON equity_allocations (rebalance_id);
+
 -- Add quantity and notional columns with CHECK if running against an older schema.
 DO $do$
 BEGIN
@@ -223,6 +225,8 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     limit_price      NUMERIC,
     alpaca_order_id  TEXT        NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_equity_orders_allocation_id ON equity_orders (allocation_id);
 
 -- Add FK from equity_orders.allocation_id to equity_allocations if running against a pre-migration schema
 -- that had allocation_id as a plain UUID with no constraint.
@@ -423,8 +427,8 @@ $do$;
 -- Columns match the Prediction struct in data_manager/src/data.rs and
 -- the predictions_schema pandera definition in ensemble_manager.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
+-- Identity is (ticker, timestamp) — the TimescaleDB primary key; no surrogate id column.
 CREATE TABLE IF NOT EXISTS equity_predictions (
-    id              BIGSERIAL        NOT NULL,
     correlation_id  UUID             NOT NULL,
     model_run_id    TEXT             NOT NULL,
     ticker          TEXT             NOT NULL,
@@ -527,7 +531,7 @@ BEGIN
         to_char(export_date, 'DD')
     );
     EXECUTE format(
-        'COPY (SELECT * FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        'COPY (SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions, inserted_at FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
         export_date::timestamptz,
         (export_date + INTERVAL '1 day')::timestamptz,
         s3_path

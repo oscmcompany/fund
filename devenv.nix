@@ -476,9 +476,9 @@ in {
 
     "data:backfill-bars".exec = "backfill-bars";
 
-    "checks:continuous-integration" = {
+    "checks:base" = {
       exec = ''
-        echo "All continuous integration checks passed"
+        echo "All base checks passed"
       '';
       after = [
         "checks:nix"
@@ -486,6 +486,15 @@ in {
         "checks:yaml"
         "checks:toml"
         "checks:sql"
+      ];
+    };
+
+    "checks:continuous-integration" = {
+      exec = ''
+        echo "All continuous integration checks passed"
+      '';
+      after = [
+        "checks:base"
         "checks:python:format"
         "checks:python:lint"
         "checks:python:type-check"
@@ -645,6 +654,7 @@ in {
       echo "    aws-secrets       List fund secrets"
       echo ""
       echo "  Tasks (devenv tasks run):"
+      echo "    checks:base         Non-language checks (nix, markdown, yaml, toml, sql)"
       echo "    checks:python       All Python checks (parallel after install)"
       echo "    checks:rust         All Rust checks (sequential: format, lint, test)"
       echo "    checks:markdown     Markdown lint"

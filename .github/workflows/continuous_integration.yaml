@@ -14,6 +14,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      - name: Detect changed file types
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+            python:
+              - '**/*.py'
+              - '**/pyproject.toml'
+              - '**/uv.lock'
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
@@ -26,24 +39,44 @@ jobs:
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
       - name: Cache Rust dependencies
+        if: steps.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
           cache-on-failure: false
           shared-key: rust-continuous-integration
           save-if: true
+      - name: Cache llvm-cov artifacts
+        if: steps.changes.outputs.rust == 'true'
+        uses: actions/cache@v4
+        with:
+          path: target/llvm-cov-target
+          key: llvm-cov-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            llvm-cov-${{ runner.os }}-
       - name: Cache Python dependencies
+        if: steps.changes.outputs.python == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/uv
           key: uv-${{ hashFiles('**/pyproject.toml', 'uv.lock') }}
           restore-keys: uv-
-      - name: Run all continuous integration checks
+      - name: Run base checks
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
-          tasks run --mode before checks:continuous-integration
+          tasks run checks:base
+      - name: Run Rust checks
+        if: steps.changes.outputs.rust == 'true'
+        run: >-
+          devenv --secretspec-provider env --secretspec-profile development
+          tasks run checks:rust
+      - name: Run Python checks
+        if: steps.changes.outputs.python == 'true'
+        run: >-
+          devenv --secretspec-provider env --secretspec-profile development
+          tasks run checks:python
       - name: Show Python coverage report
-        if: always()
+        if: always() && steps.changes.outputs.python == 'true'
         run: |
           if [ -f .coverage_output/python_report.txt ]; then
             cat .coverage_output/python_report.txt
