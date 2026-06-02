@@ -266,6 +266,21 @@ CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Reconcile databases created before the eod -> end_of_day rename. No-ops on a fresh
+-- database; on an existing one they migrate stored values and swap the CHECK constraint
+-- so end_of_day INSERTs are accepted. The old constraint is dropped BEFORE the UPDATE so
+-- the new value does not violate the still-active old check.
+ALTER TABLE equity_portfolio_snapshots
+    DROP CONSTRAINT IF EXISTS equity_portfolio_snapshots_snapshot_type_check;
+UPDATE equity_portfolio_snapshots
+    SET snapshot_type = 'end_of_day'
+    WHERE snapshot_type = 'eod';
+ALTER TABLE equity_portfolio_snapshots
+    ADD CONSTRAINT equity_portfolio_snapshots_snapshot_type_check
+    CHECK (snapshot_type IN ('intraday', 'end_of_day'));
+-- Drop the pre-rename partial unique index; the renamed, UTC-anchored index is created below.
+DROP INDEX IF EXISTS uq_equity_portfolio_snapshots_eod_date;
+
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp
     ON equity_portfolio_snapshots (snapshot_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp
@@ -502,6 +517,24 @@ BEGIN
     END IF;
 END;
 $do$;
+
+-- Reconcile databases created before the eod -> end_of_day rename: remove the old pg_cron
+-- job so it does not fire alongside record-end-of-day-snapshot (which would produce
+-- duplicate end-of-day snapshots and orphaned eod_snapshot_requested events).
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-eod-snapshot') THEN
+        PERFORM cron.unschedule('record-eod-snapshot');
+    END IF;
+END;
+$do$;
+
+-- Drop the pre-rename function and rename any not-yet-consumed events so the new consumer
+-- still processes them (harmless on already-consumed rows; consumers track progress by id).
+DROP FUNCTION IF EXISTS record_eod_snapshot();
+UPDATE events
+    SET event_type = 'end_of_day_snapshot_requested'
+    WHERE event_type = 'eod_snapshot_requested';
 
 -- export_equity_bars: exports equity_bars for the past 120 days to S3 Parquet for model training.
 -- Reads the training S3 bucket name from the app.training_bucket_name GUC (set by data-manager on startup).

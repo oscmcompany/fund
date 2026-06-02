@@ -235,6 +235,19 @@ def test_open_position_sell_raises_value_error_for_zero_qty() -> None:
         )
 
 
+def test_open_position_sell_raises_value_error_for_negative_qty() -> None:
+    client, _ = _make_client()
+
+    with pytest.raises(ValueError, match="quantity must be positive"):
+        client.open_position(
+            ticker="AAPL",
+            side=TradeSide.SELL,
+            dollar_amount=1000.0,
+            entry_price=100.0,
+            quantity=-5,
+        )
+
+
 def test_open_position_raises_value_error_for_zero_amount() -> None:
     client, _ = _make_client()
 

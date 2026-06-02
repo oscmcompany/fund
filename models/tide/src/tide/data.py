@@ -511,7 +511,7 @@ class Data:
         for index, ticker_dataframe in enumerate(ticker_groups.values()):
             if index % 25 == 0:
                 logger.info(
-                    "Dataset progress", ticker_idx=index, total_tickers=total_tickers
+                    "Dataset progress", ticker_index=index, total_tickers=total_tickers
                 )
 
             cat_array = (

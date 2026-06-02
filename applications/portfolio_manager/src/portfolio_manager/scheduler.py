@@ -82,7 +82,7 @@ async def _handle_end_of_day_snapshot_requested(alpaca_client: AlpacaClient) -> 
         account = await loop.run_in_executor(None, alpaca_client.get_account)
     except Exception as error:
         logger.exception(
-            "Failed to fetch account data for EOD snapshot", error=str(error)
+            "Failed to fetch account data for end-of-day snapshot", error=str(error)
         )
         raise
 
@@ -103,10 +103,10 @@ async def _handle_end_of_day_snapshot_requested(alpaca_client: AlpacaClient) -> 
     }
     saved = await save_performance_snapshot(snapshot, snapshot_type="end_of_day")
     if not saved:
-        message = "Failed to persist EOD performance snapshot"
+        message = "Failed to persist end-of-day performance snapshot"
         raise RuntimeError(message)
     logger.info(
-        "Saved EOD performance snapshot",
+        "Saved end-of-day performance snapshot",
         portfolio_value=portfolio_value,
         end_of_day_return=end_of_day_return,
     )

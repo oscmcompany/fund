@@ -674,7 +674,7 @@ def test_handle_end_of_day_snapshot_raises_when_save_fails() -> None:
                 AsyncMock(return_value=False),
             ),
             pytest.raises(
-                RuntimeError, match="Failed to persist EOD performance snapshot"
+                RuntimeError, match="Failed to persist end-of-day performance snapshot"
             ),
         ):
             await _handle_end_of_day_snapshot_requested(mock_alpaca)

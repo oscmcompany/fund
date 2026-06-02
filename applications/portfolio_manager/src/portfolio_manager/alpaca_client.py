@@ -146,11 +146,17 @@ class AlpacaClient:
             share_count = (
                 quantity if quantity is not None else int(dollar_amount / entry_price)
             )
-            if share_count == 0:
-                message = (
-                    f"Cannot short {ticker}: dollar_amount {dollar_amount} "
-                    f"is less than one share at entry_price {entry_price}"
-                )
+            if share_count <= 0:
+                if quantity is not None:
+                    message = (
+                        f"Cannot short {ticker}: quantity must be positive, "
+                        f"got {quantity}"
+                    )
+                else:
+                    message = (
+                        f"Cannot short {ticker}: dollar_amount {dollar_amount} "
+                        f"is less than one share at entry_price {entry_price}"
+                    )
                 raise ValueError(message)
             order_request = OrderRequest(
                 symbol=ticker.upper(),
