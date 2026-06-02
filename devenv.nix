@@ -1,8 +1,4 @@
-{
-  pkgs,
-  lib,
-  ...
-}: let
+{pkgs, ...}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
