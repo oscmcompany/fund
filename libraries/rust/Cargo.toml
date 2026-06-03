@@ -1,0 +1,24 @@
+[package]
+name = "internal"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "internal"
+path = "src/lib.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = [
+  "postgres",
+  "macros",
+  "uuid",
+  "chrono",
+  "rust_decimal",
+  "json",
+] }
+uuid = { version = "1", features = ["serde", "v4"] }

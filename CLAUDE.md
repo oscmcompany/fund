@@ -82,3 +82,5 @@ This is a collection of guidelines and references.
 - Guard against division by zero when computing ratios or percentages from DataFrame aggregations
 - When Polars `Series.sum()` is used on a potentially empty or all-null series, handle the `None` return case
 - `devenv tasks run` supports prefix group execution: `checks:python` runs all `checks:python:*` subtasks
+- Prefer validated constructors with private fields over public struct literals — a value in scope should be proof of its
+  own validity, not a candidate for re-checking downstream

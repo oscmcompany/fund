@@ -2724,6 +2724,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "internal"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "num-traits",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5329,6 +5342,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
+ "rust_decimal",
  "rustls 0.23.40",
  "serde",
  "serde_json",
@@ -5339,6 +5353,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -5412,6 +5427,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.8.6",
  "rsa",
+ "rust_decimal",
  "serde",
  "sha1 0.10.6",
  "sha2 0.10.9",
@@ -5420,6 +5436,7 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -5450,6 +5467,7 @@ dependencies = [
  "memchr",
  "once_cell",
  "rand 0.8.6",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5458,6 +5476,7 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -5484,6 +5503,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
