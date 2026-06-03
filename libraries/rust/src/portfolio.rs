@@ -178,7 +178,7 @@ impl Portfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orders::{FilledOrder, Order, PendingPair};
+    use crate::orders::{FilledOrder, Order, OrderSide, PendingPair};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use uuid::Uuid;
@@ -201,7 +201,7 @@ mod tests {
         let long_order = Order::<crate::orders::Pending>::new(
             Uuid::new_v4(),
             long_ticker.to_string(),
-            "LONG".to_string(),
+            OrderSide::Long,
             Decimal::from(100),
             "market".to_string(),
             None,
@@ -211,7 +211,7 @@ mod tests {
         let short_order = Order::<crate::orders::Pending>::new(
             Uuid::new_v4(),
             short_ticker.to_string(),
-            "SHORT".to_string(),
+            OrderSide::Short,
             Decimal::from(100),
             "market".to_string(),
             None,
@@ -313,7 +313,7 @@ mod tests {
         let long_order = Order::<crate::orders::Pending>::new(
             Uuid::new_v4(),
             "AAPL".to_string(),
-            "LONG".to_string(),
+            OrderSide::Long,
             Decimal::from(100),
             "market".to_string(),
             None,
@@ -323,7 +323,7 @@ mod tests {
         let short_order = Order::<crate::orders::Pending>::new(
             Uuid::new_v4(),
             "WMT".to_string(),
-            "SHORT".to_string(),
+            OrderSide::Short,
             Decimal::from(100),
             "market".to_string(),
             None,

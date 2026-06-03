@@ -13,6 +13,26 @@ use uuid::Uuid;
 
 use crate::primitives::{Dollars, Shares};
 
+/// The side of an order: long (buy) or short (sell/borrow).
+///
+/// Serializes as `"LONG"` or `"SHORT"` to match the database `CHECK` constraint on
+/// `equity_allocations.side` and `equity_orders.side`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderSide {
+    Long,
+    Short,
+}
+
+impl std::fmt::Display for OrderSide {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OrderSide::Long => write!(formatter, "LONG"),
+            OrderSide::Short => write!(formatter, "SHORT"),
+        }
+    }
+}
+
 /// Sealing module: prevents external crates from implementing `OrderState`.
 mod private {
     pub trait Sealed {}
@@ -57,7 +77,7 @@ impl OrderState for Cancelled {}
 pub struct Order<S: OrderState> {
     pub id: Uuid,
     pub ticker: String,
-    pub side: String,
+    pub side: OrderSide,
     pub quantity: Decimal,
     pub order_type: String,
     pub limit_price: Option<Decimal>,
@@ -74,7 +94,7 @@ impl Order<Pending> {
     pub fn new(
         id: Uuid,
         ticker: String,
-        side: String,
+        side: OrderSide,
         quantity: Decimal,
         order_type: String,
         limit_price: Option<Decimal>,
@@ -100,7 +120,7 @@ impl Order<Pending> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderRequest {
     pub ticker: String,
-    pub side: String,
+    pub side: OrderSide,
     pub quantity: Shares,
     pub order_type: String,
     pub limit_price: Option<Dollars>,
@@ -219,11 +239,11 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
-    fn make_pending_order(ticker: &str, side: &str) -> Order<Pending> {
+    fn make_pending_order(ticker: &str, side: OrderSide) -> Order<Pending> {
         Order::<Pending>::new(
             Uuid::new_v4(),
             ticker.to_string(),
-            side.to_string(),
+            side,
             Decimal::from(100),
             "market".to_string(),
             None,
@@ -242,8 +262,8 @@ mod tests {
 
     fn make_pending_pair(long_ticker: &str, short_ticker: &str) -> PendingPair {
         PendingPair {
-            long: make_pending_order(long_ticker, "LONG"),
-            short: make_pending_order(short_ticker, "SHORT"),
+            long: make_pending_order(long_ticker, OrderSide::Long),
+            short: make_pending_order(short_ticker, OrderSide::Short),
             long_beta: 1.1,
             short_beta: 0.9,
         }
@@ -256,7 +276,7 @@ mod tests {
         let order = Order::<Pending>::new(
             id,
             "AAPL".to_string(),
-            "LONG".to_string(),
+            OrderSide::Long,
             Decimal::from(50),
             "market".to_string(),
             None,
@@ -264,7 +284,7 @@ mod tests {
             now,
         );
         assert_eq!(order.ticker, "AAPL");
-        assert_eq!(order.side, "LONG");
+        assert_eq!(order.side, OrderSide::Long);
         assert_eq!(order.quantity, Decimal::from(50));
         assert!(order.fill_price.is_none());
         assert!(order.limit_price.is_none());
@@ -275,7 +295,7 @@ mod tests {
         let order = Order::<Pending>::new(
             Uuid::new_v4(),
             "MSFT".to_string(),
-            "SHORT".to_string(),
+            OrderSide::Short,
             Decimal::from(25),
             "limit".to_string(),
             Some(Decimal::from(420)),
@@ -289,13 +309,13 @@ mod tests {
     fn test_order_request_construction() {
         let request = OrderRequest {
             ticker: "NVDA".to_string(),
-            side: "LONG".to_string(),
-            quantity: Shares(Decimal::from(10)),
+            side: OrderSide::Long,
+            quantity: Shares::new(Decimal::from(10)).unwrap(),
             order_type: "market".to_string(),
             limit_price: None,
         };
         assert_eq!(request.ticker, "NVDA");
-        assert_eq!(request.quantity.0, Decimal::from(10));
+        assert_eq!(request.quantity.value(), Decimal::from(10));
     }
 
     #[test]

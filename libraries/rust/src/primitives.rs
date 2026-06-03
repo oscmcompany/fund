@@ -26,9 +26,46 @@ impl std::fmt::Display for RangeError {
 
 impl std::error::Error for RangeError {}
 
-/// Whole share count.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Shares(pub Decimal);
+/// Error returned when constructing a `Shares` with a non-positive quantity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharesError;
+
+impl std::fmt::Display for SharesError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Share quantity must be positive.")
+    }
+}
+
+impl std::error::Error for SharesError {}
+
+/// Whole share count (always positive).
+///
+/// The inner field is private; use `Shares::new()` to construct and `value()` to read.
+/// Deserialization validates positivity, preventing zero or negative quantities from serde.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Shares(Decimal);
+
+impl Shares {
+    /// Creates a new `Shares`, returning an error if `quantity` is not positive.
+    pub fn new(quantity: Decimal) -> Result<Self, SharesError> {
+        if quantity <= Decimal::ZERO {
+            return Err(SharesError);
+        }
+        Ok(Shares(quantity))
+    }
+
+    /// Returns the inner `Decimal` value.
+    pub fn value(self) -> Decimal {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Shares {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <Decimal as Deserialize<'de>>::deserialize(deserializer)?;
+        Shares::new(raw).map_err(de::Error::custom)
+    }
+}
 
 /// Dollar amount.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,9 +185,26 @@ mod tests {
     }
 
     #[test]
-    fn test_shares_construction() {
-        let shares = Shares(Decimal::from(100));
-        assert_eq!(shares.0, Decimal::from(100));
+    fn test_shares_new_accepts_positive() {
+        let shares = Shares::new(Decimal::from(100)).unwrap();
+        assert_eq!(shares.value(), Decimal::from(100));
+    }
+
+    #[test]
+    fn test_shares_new_rejects_zero() {
+        let error = Shares::new(Decimal::ZERO).unwrap_err();
+        assert_eq!(error, SharesError);
+    }
+
+    #[test]
+    fn test_shares_new_rejects_negative() {
+        let error = Shares::new(Decimal::from(-1)).unwrap_err();
+        assert_eq!(error, SharesError);
+    }
+
+    #[test]
+    fn test_shares_error_display() {
+        assert!(format!("{}", SharesError).contains("positive"));
     }
 
     #[test]
