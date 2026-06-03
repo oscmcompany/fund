@@ -257,7 +257,7 @@ async def save_performance_snapshot(
             snapshot["timestamp"] / 1000.0, tz=UTC
         )
 
-        if snapshot_type == "eod":
+        if snapshot_type == "end_of_day":
             gross_return = snapshot.get("gross_return")
             net_return = snapshot.get("net_return")
         else:
@@ -333,7 +333,7 @@ async def get_last_portfolio_value() -> float | None:
             result = await connection.execute(
                 """SELECT net_asset_value::double precision
                    FROM equity_portfolio_snapshots
-                   WHERE snapshot_type = 'eod'
+                   WHERE snapshot_type = 'end_of_day'
                    ORDER BY snapshot_timestamp DESC
                    LIMIT 1"""
             )

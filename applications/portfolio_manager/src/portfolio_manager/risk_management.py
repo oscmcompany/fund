@@ -11,9 +11,16 @@ from .exceptions import InsufficientPairsError
 
 logger = structlog.get_logger()
 
+# Minimum number of pairs required to construct a diversified portfolio.
 REQUIRED_PAIRS = 10
+# Z-score magnitude below which a pair is held without action (mean-reversion zone).
 Z_SCORE_HOLD_THRESHOLD = 0.5
+# Z-score magnitude at which a pair is force-closed regardless of direction
+# (spread has diverged beyond the expected mean-reversion window).
 Z_SCORE_STOP_LOSS = 4.0
+# Relative bounds applied to each pair's weight by the beta-neutral SLSQP optimizer.
+# A pair can be weighted as low as 0.5x or as high as 2.0x its equal-allocation share,
+# keeping the optimizer anchored near volatility-parity while allowing beta reduction.
 BETA_WEIGHT_LOWER_BOUND = 0.5
 BETA_WEIGHT_UPPER_BOUND = 2.0
 
@@ -211,7 +218,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
         exposure_scale=exposure_scale,
     )
 
-    timestamp_val = to_timestamp_milliseconds(current_timestamp)
+    timestamp_milliseconds = to_timestamp_milliseconds(current_timestamp)
 
     long_entry_prices = [
         entry_prices.get(ticker, 0.0) for ticker in pairs["long_ticker"].to_list()
@@ -221,7 +228,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     # Alpaca BUY orders use notional (fractional shares are supported).
     long_positions = pairs.select(
         pl.col("long_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
+        pl.lit(timestamp_milliseconds).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.LONG.value).alias("side"),
         pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),
@@ -236,7 +243,7 @@ def size_pairs_with_volatility_parity(  # noqa: PLR0913
     # Alpaca SELL orders must use qty (fractional short sells are not supported).
     short_positions = pairs.select(
         pl.col("short_ticker").alias("ticker"),
-        pl.lit(timestamp_val).cast(pl.Int64).alias("timestamp"),
+        pl.lit(timestamp_milliseconds).cast(pl.Int64).alias("timestamp"),
         pl.lit(PositionSide.SHORT.value).alias("side"),
         pl.col("_short_dollar_amount").alias("dollar_amount"),
         pl.lit(PositionAction.OPEN_POSITION.value).alias("action"),

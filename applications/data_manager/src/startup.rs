@@ -59,21 +59,21 @@ async fn migrate_equity_details(state: &State) {
     match read_equity_details_dataframe_from_s3(state).await {
         Ok(dataframe) => {
             let tickers = match dataframe.column("ticker") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing ticker column: {}", err);
                     return;
                 }
             };
             let sectors = match dataframe.column("sector") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing sector column: {}", err);
                     return;
                 }
             };
             let industries = match dataframe.column("industry") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing industry column: {}", err);
                     return;
@@ -306,13 +306,7 @@ mod tests {
         let _secret_key_guard =
             EnvironmentVariableGuard::set("AWS_SECRET_ACCESS_KEY", "test-secret-key");
         let _metadata_guard = EnvironmentVariableGuard::set("AWS_EC2_METADATA_DISABLED", "true");
-        let _bucket_guard = EnvironmentVariableGuard::set("AWS_S3_DATA_BUCKET_NAME", "test-bucket");
-        let _training_bucket_guard =
-            EnvironmentVariableGuard::set("AWS_S3_TRAINING_BUCKET_NAME", "test-training-bucket");
-        let _cold_storage_bucket_guard = EnvironmentVariableGuard::set(
-            "AWS_S3_COLD_STORAGE_BUCKET_NAME",
-            "test-cold-storage-bucket",
-        );
+        let _bucket_guard = EnvironmentVariableGuard::set("AWS_S3_BUCKET_NAME", "test-bucket");
         let _massive_base_guard =
             EnvironmentVariableGuard::set("MASSIVE_BASE_URL", "http://127.0.0.1:1");
         let _massive_key_guard = EnvironmentVariableGuard::set("MASSIVE_API_KEY", "test-api-key");

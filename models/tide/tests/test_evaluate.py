@@ -3,7 +3,7 @@ import pytest
 from tide.evaluate import (
     DriftResult,
     check_drift,
-    compute_crps,
+    compute_continuous_ranked_probability_score,
     compute_directional_accuracy,
     compute_quantile_coverage,
 )
@@ -29,7 +29,7 @@ def _make_actuals(daily_return: list[float]) -> pl.DataFrame:
     return pl.DataFrame({"daily_return": daily_return})
 
 
-def test_compute_crps_returns_float() -> None:
+def test_compute_continuous_ranked_probability_score_returns_float() -> None:
     predictions = _make_predictions(
         quantile_10=[-0.01, -0.02],
         quantile_50=[0.01, 0.02],
@@ -37,12 +37,12 @@ def test_compute_crps_returns_float() -> None:
     )
     actuals = _make_actuals([0.015, 0.025])
 
-    result = compute_crps(predictions, actuals)
+    result = compute_continuous_ranked_probability_score(predictions, actuals)
 
     assert isinstance(result, float)
 
 
-def test_compute_crps_perfect_predictions_returns_zero() -> None:
+def test_compute_continuous_ranked_probability_score_zero_for_perfect_input() -> None:
     # When quantile_50 equals actual and quantile_10/90 bracket it tightly,
     # the pinball loss approaches zero
     value = 0.05
@@ -53,12 +53,12 @@ def test_compute_crps_perfect_predictions_returns_zero() -> None:
     )
     actuals = _make_actuals([value])
 
-    result = compute_crps(predictions, actuals)
+    result = compute_continuous_ranked_probability_score(predictions, actuals)
 
     assert abs(result) < _FLOAT_TOLERANCE
 
 
-def test_compute_crps_positive_for_imperfect_predictions() -> None:
+def test_compute_continuous_ranked_probability_score_positive_for_imperfect() -> None:
     predictions = _make_predictions(
         quantile_10=[-0.10],
         quantile_50=[0.10],
@@ -66,7 +66,7 @@ def test_compute_crps_positive_for_imperfect_predictions() -> None:
     )
     actuals = _make_actuals([-0.05])
 
-    result = compute_crps(predictions, actuals)
+    result = compute_continuous_ranked_probability_score(predictions, actuals)
 
     assert result > 0.0
 

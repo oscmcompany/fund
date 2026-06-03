@@ -353,19 +353,19 @@ class Model:
                 indices = _rng.permutation(num_samples)
 
                 for step in range(total_batches):
-                    batch_idx = indices[
+                    batch_index = indices[
                         step * batch_size : (step + 1) * batch_size
                     ].tolist()
                     batch = {
-                        "past_continuous_features": gpu_past_continuous[batch_idx],
-                        "past_categorical_features": gpu_past_categorical[batch_idx],
+                        "past_continuous_features": gpu_past_continuous[batch_index],
+                        "past_categorical_features": gpu_past_categorical[batch_index],
                         "future_categorical_features": gpu_future_categorical[
-                            batch_idx
+                            batch_index
                         ],
                         "static_categorical_features": gpu_static_categorical[
-                            batch_idx
+                            batch_index
                         ],
-                        "targets": gpu_targets[batch_idx],
+                        "targets": gpu_targets[batch_index],
                     }
 
                     combined_input_features, targets, batch_size_actual = (
@@ -506,23 +506,23 @@ class Model:
             total_batches = (num_samples + batch_size - 1) // batch_size
 
             for step in range(total_batches):
-                batch_idx = np.arange(
+                batch_index = np.arange(
                     step * batch_size, min((step + 1) * batch_size, num_samples)
                 )
                 batch = {
                     "past_continuous_features": Tensor(
-                        dataset.past_continuous[batch_idx]
+                        dataset.past_continuous[batch_index]
                     ),
                     "past_categorical_features": Tensor(
-                        dataset.past_categorical[batch_idx]
+                        dataset.past_categorical[batch_index]
                     ),
                     "future_categorical_features": Tensor(
-                        dataset.future_categorical[batch_idx]
+                        dataset.future_categorical[batch_index]
                     ),
                     "static_categorical_features": Tensor(
-                        dataset.static_categorical[batch_idx]
+                        dataset.static_categorical[batch_index]
                     ),
-                    "targets": Tensor(dataset.targets[batch_idx]),
+                    "targets": Tensor(dataset.targets[batch_index]),
                 }
 
                 combined_input, targets, batch_size_actual = (

@@ -503,7 +503,7 @@ def test_run_rebalance_refreshes_account_after_closing_positions(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
@@ -597,7 +597,7 @@ def test_run_rebalance_returns_500_when_account_refresh_fails(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
 
     mock_account = MagicMock()
@@ -693,7 +693,7 @@ def test_run_rebalance_saves_only_opened_rows(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # AMD (short) is skipped; only NVDA (long) opened successfully.
     mock_execute_open.return_value = (
@@ -811,7 +811,7 @@ def test_run_rebalance_saves_complete_pairs_when_both_legs_succeed(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     # Both legs succeed — the full pair should be saved.
     mock_execute_open.return_value = (
@@ -934,6 +934,19 @@ def test_get_latest_predictions_correlation_id_returns_none_when_no_rows() -> No
     assert result is None
 
 
+def test_get_latest_predictions_correlation_id_filters_to_current_date() -> None:
+    mock_pool = _make_mock_pool(None)
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ) as _:
+        mock_connection = mock_pool.connection.return_value.__aenter__.return_value
+        asyncio.run(get_latest_predictions_correlation_id())
+
+    sql = mock_connection.execute.call_args[0][0]
+    assert "CURRENT_DATE" in sql
+
+
 # --- get_raw_predictions ---
 
 
@@ -994,6 +1007,33 @@ def test_get_raw_predictions_returns_empty_dataframe_when_no_rows() -> None:
     assert model_run_id is None
 
 
+def test_get_raw_predictions_without_correlation_id_filters_to_current_date() -> None:
+    mock_pool = _make_mock_pool_with_fetchall([])
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        mock_connection = mock_pool.connection.return_value.__aenter__.return_value
+        asyncio.run(get_raw_predictions())
+
+    sql = mock_connection.execute.call_args[0][0]
+    assert "CURRENT_DATE" in sql
+
+
+def test_get_raw_predictions_returns_empty_when_predictions_are_stale() -> None:
+    # Simulate the CURRENT_DATE filter excluding yesterday's predictions by
+    # returning no rows from the database.
+    mock_pool = _make_mock_pool_with_fetchall([])
+
+    with patch(
+        "portfolio_manager.rebalance.get_pool", AsyncMock(return_value=mock_pool)
+    ):
+        result, model_run_id = asyncio.run(get_raw_predictions())
+
+    assert result.is_empty()
+    assert model_run_id is None
+
+
 # --- get_optimal_portfolio ---
 
 
@@ -1006,7 +1046,7 @@ def test_get_optimal_portfolio_returns_schema_validated_portfolio() -> None:
         ),
         patch("portfolio_manager.rebalance.portfolio_schema") as mock_schema,
     ):
-        mock_schema.validate.side_effect = lambda df: df
+        mock_schema.validate.side_effect = lambda dataframe: dataframe
         result = get_optimal_portfolio(
             candidate_pairs=pl.DataFrame(),
             maximum_capital=10000.0,
@@ -1216,7 +1256,7 @@ def test_run_rebalance_returns_207_when_save_allocation_fails(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     mock_execute_open.return_value = (
         [
@@ -1330,7 +1370,7 @@ def test_run_rebalance_returns_200_when_record_performance_raises(
 ) -> None:
     optimal = _make_optimal_portfolio()
     mock_optimal_portfolio.return_value = optimal
-    mock_pairs_schema.validate.side_effect = lambda df: df
+    mock_pairs_schema.validate.side_effect = lambda dataframe: dataframe
     mock_prior_portfolio.return_value = pl.DataFrame(schema=_PRIOR_ALLOCATION_SCHEMA)
     mock_record.side_effect = RuntimeError("metrics failure")
     mock_execute_open.return_value = (

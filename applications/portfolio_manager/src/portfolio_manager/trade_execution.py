@@ -341,6 +341,14 @@ def execute_open_positions(  # noqa: C901, PLR0912, PLR0915
         if short_succeeded:
             opened_count += 1
         else:
+            logger.warning(
+                "Short leg failed after long leg succeeded, dangling long exposure",
+                pair_id=pair_id,
+                long_ticker=long_leg["ticker"],
+                short_ticker=short_leg["ticker"],
+                short_status=short_result.get("status"),
+                short_reason=short_result.get("reason") or short_result.get("error"),
+            )
             reason = short_result.get("reason", "")
             if reason == "insufficient_buying_power":
                 skipped_insufficient_buying_power += 1

@@ -3,7 +3,7 @@ mod common;
 use data_manager::data::EquityBar;
 use data_manager::database::{
     claim_pending_job, complete_job, fail_job, insert_equity_bars, query_recent_equity_bars,
-    set_data_bucket_guc,
+    set_bucket_guc,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -311,10 +311,10 @@ async fn test_complete_job() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn test_set_data_bucket_guc_persists() {
+async fn test_set_bucket_guc_persists() {
     let pool = get_pg_pool().await;
 
-    set_data_bucket_guc(&pool, "fund-test-data").await.unwrap();
+    set_bucket_guc(&pool, "fund-test-data").await.unwrap();
 
     // ALTER DATABASE persists the GUC in pg_db_role_setting for all future connections.
     // Verify the setting appears there with the expected value.
@@ -328,11 +328,10 @@ async fn test_set_data_bucket_guc_persists() {
     .unwrap();
 
     assert!(
-        settings
-            .iter()
-            .any(|setting| setting.contains("app.data_bucket_name")
-                && setting.contains("fund-test-data")),
-        "Expected app.data_bucket_name GUC to be persisted, got: {:?}",
+        settings.iter().any(
+            |setting| setting.contains("app.bucket_name") && setting.contains("fund-test-data")
+        ),
+        "Expected app.bucket_name GUC to be persisted, got: {:?}",
         settings
     );
 }

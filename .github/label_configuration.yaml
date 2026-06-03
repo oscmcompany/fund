@@ -23,3 +23,13 @@ yaml:
       - any-glob-to-any-file:
           - "**/*.yml"
           - "**/*.yaml"
+
+postgresql:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.sql"
+
+toml:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.toml"

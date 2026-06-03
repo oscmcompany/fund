@@ -4,4 +4,5 @@ members = [
     "applications/data_manager",
     "applications/ensemble_model",
     "models/tide_model",
+    "libraries/rust"
 ]

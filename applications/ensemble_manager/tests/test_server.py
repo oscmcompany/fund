@@ -330,7 +330,7 @@ def test_artifact_polling_detects_new_key_and_swaps() -> None:
         with (
             patch.dict(
                 "os.environ",
-                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+                {"AWS_S3_BUCKET_NAME": "bucket"},
             ),
             patch("ensemble_manager.server.boto3.client"),
             patch(
@@ -368,7 +368,7 @@ def test_artifact_polling_same_key_no_swap() -> None:
         with (
             patch.dict(
                 "os.environ",
-                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+                {"AWS_S3_BUCKET_NAME": "bucket"},
             ),
             patch("ensemble_manager.server.boto3.client"),
             patch(
@@ -400,7 +400,7 @@ def test_artifact_polling_download_failure_cleans_up() -> None:
         with (
             patch.dict(
                 "os.environ",
-                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+                {"AWS_S3_BUCKET_NAME": "bucket"},
             ),
             patch("ensemble_manager.server.boto3.client"),
             patch(
@@ -439,7 +439,7 @@ def test_artifact_polling_transient_s3_error_continues() -> None:
         with (
             patch.dict(
                 "os.environ",
-                {"AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME": "bucket"},
+                {"AWS_S3_BUCKET_NAME": "bucket"},
             ),
             patch("ensemble_manager.server.boto3.client"),
             patch(
@@ -470,8 +470,8 @@ def test_artifact_polling_no_bucket_returns_immediately() -> None:
         app = MagicMock(spec=FastAPI)
 
         with patch.dict("os.environ", {}, clear=False):
-            if "AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME" in os.environ:
-                del os.environ["AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"]
+            if "AWS_S3_BUCKET_NAME" in os.environ:
+                del os.environ["AWS_S3_BUCKET_NAME"]
             await _artifact_polling_task(app)
 
     asyncio.run(_run())

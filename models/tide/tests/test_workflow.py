@@ -67,7 +67,7 @@ def test_prepare_data_uses_versioned_output_key(
     call_kwargs = mock_prepare.call_args.kwargs
     assert (
         call_kwargs["output_key"]
-        == f"data/tide/{artifact_timestamp}/filtered_data.parquet"
+        == f"models/tide/{artifact_timestamp}/filtered_data.parquet"
     )
 
 
@@ -117,7 +117,7 @@ def test_train_tide_model_downloads_trains_uploads(
         )
 
     assert result.startswith(
-        "s3://artifacts-bucket/artifacts/tide/2024-01-31-00-00-00-000/"
+        "s3://artifacts-bucket/models/tide/2024-01-31-00-00-00-000/"
     )
     mock_s3.get_object.assert_called_once()
     expected_put_object_calls = 2  # model.tar.gz + run_metadata.json

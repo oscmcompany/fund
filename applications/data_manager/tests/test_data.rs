@@ -39,19 +39,19 @@ fn test_create_equity_bar_dataframe_valid_data() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar()];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    assert_eq!(df.height(), 1);
-    assert_eq!(df.width(), 9);
-    assert!(df.column("ticker").is_ok());
-    assert!(df.column("timestamp").is_ok());
-    assert!(df.column("open_price").is_ok());
-    assert!(df.column("high_price").is_ok());
-    assert!(df.column("low_price").is_ok());
-    assert!(df.column("close_price").is_ok());
-    assert!(df.column("volume").is_ok());
-    assert!(df.column("volume_weighted_average_price").is_ok());
-    assert!(df.column("transactions").is_ok());
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(dataframe.width(), 9);
+    assert!(dataframe.column("ticker").is_ok());
+    assert!(dataframe.column("timestamp").is_ok());
+    assert!(dataframe.column("open_price").is_ok());
+    assert!(dataframe.column("high_price").is_ok());
+    assert!(dataframe.column("low_price").is_ok());
+    assert!(dataframe.column("close_price").is_ok());
+    assert!(dataframe.column("volume").is_ok());
+    assert!(dataframe.column("volume_weighted_average_price").is_ok());
+    assert!(dataframe.column("transactions").is_ok());
 }
 
 #[test]
@@ -59,9 +59,15 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar_lowercase()];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    let ticker = dataframe
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
 
     assert_eq!(ticker, "GOOGL");
 }
@@ -81,9 +87,15 @@ fn test_create_equity_bar_dataframe_whitespace_trimming() {
         transactions: Some(500),
     }];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    let ticker = dataframe
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(ticker, "ECC");
 }
 
@@ -92,11 +104,11 @@ fn test_create_equity_bar_dataframe_mixed_case_tickers() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar(), sample_equity_bar_lowercase()];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    assert_eq!(df.height(), 2);
+    assert_eq!(dataframe.height(), 2);
 
-    let tickers = df
+    let tickers = dataframe
         .column("ticker")
         .unwrap()
         .str()
@@ -113,10 +125,10 @@ fn test_create_equity_bar_dataframe_empty_vec() {
     initialize_test_tracing();
     let bars: Vec<EquityBar> = vec![];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    assert_eq!(df.height(), 0);
-    assert_eq!(df.width(), 9);
+    assert_eq!(dataframe.height(), 0);
+    assert_eq!(dataframe.width(), 9);
 }
 
 #[test]
@@ -134,11 +146,11 @@ fn test_create_equity_bar_dataframe_with_none_prices() {
         transactions: None,
     }];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    assert_eq!(df.height(), 1);
+    assert_eq!(dataframe.height(), 1);
 
-    let close_price = df.column("close_price").unwrap();
+    let close_price = dataframe.column("close_price").unwrap();
     assert_eq!(close_price.len(), 1);
 }
 
@@ -151,10 +163,10 @@ fn test_create_equity_bar_dataframe_multiple_rows() {
         sample_equity_bar(),
     ];
 
-    let df = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(bars).unwrap();
 
-    assert_eq!(df.height(), 3);
-    assert_eq!(df.width(), 9);
+    assert_eq!(dataframe.height(), 3);
+    assert_eq!(dataframe.width(), 9);
 }
 
 // Tests for create_equity_details_dataframe
@@ -165,13 +177,13 @@ fn test_create_equity_details_dataframe_valid_csv() {
     let csv_content =
         "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\nGOOGL,Technology,Internet Services\n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    assert_eq!(df.height(), 2);
-    assert_eq!(df.width(), 3);
-    assert!(df.column("ticker").is_ok());
-    assert!(df.column("sector").is_ok());
-    assert!(df.column("industry").is_ok());
+    assert_eq!(dataframe.height(), 2);
+    assert_eq!(dataframe.width(), 3);
+    assert!(dataframe.column("ticker").is_ok());
+    assert!(dataframe.column("sector").is_ok());
+    assert!(dataframe.column("industry").is_ok());
 }
 
 #[test]
@@ -180,15 +192,27 @@ fn test_create_equity_details_dataframe_whitespace_trimming() {
     let csv_content =
         "ticker,sector,industry\nECC           ,  Technology  ,  Consumer Electronics  \n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    let ticker = dataframe
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(ticker, "ECC");
 
-    let sector = df.column("sector").unwrap().str().unwrap().get(0).unwrap();
+    let sector = dataframe
+        .column("sector")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(sector, "TECHNOLOGY");
 
-    let industry = df
+    let industry = dataframe
         .column("industry")
         .unwrap()
         .str()
@@ -203,15 +227,27 @@ fn test_create_equity_details_dataframe_uppercase_normalization() {
     initialize_test_tracing();
     let csv_content = "ticker,sector,industry\naapl,technology,consumer electronics\n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    let ticker = df.column("ticker").unwrap().str().unwrap().get(0).unwrap();
+    let ticker = dataframe
+        .column("ticker")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(ticker, "AAPL");
 
-    let sector = df.column("sector").unwrap().str().unwrap().get(0).unwrap();
+    let sector = dataframe
+        .column("sector")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(sector, "TECHNOLOGY");
 
-    let industry = df
+    let industry = dataframe
         .column("industry")
         .unwrap()
         .str()
@@ -226,14 +262,20 @@ fn test_create_equity_details_dataframe_with_nulls() {
     initialize_test_tracing();
     let csv_content = "ticker,sector,industry\nAAPL,,\n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    assert_eq!(df.height(), 1);
+    assert_eq!(dataframe.height(), 1);
 
-    let sector = df.column("sector").unwrap().str().unwrap().get(0).unwrap();
+    let sector = dataframe
+        .column("sector")
+        .unwrap()
+        .str()
+        .unwrap()
+        .get(0)
+        .unwrap();
     assert_eq!(sector, "NOT AVAILABLE");
 
-    let industry = df
+    let industry = dataframe
         .column("industry")
         .unwrap()
         .str()
@@ -249,11 +291,11 @@ fn test_create_equity_details_dataframe_extra_columns() {
     let csv_content =
         "ticker,sector,industry,extra_column\nAAPL,Technology,Consumer Electronics,Extra\n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    assert_eq!(df.height(), 1);
-    assert_eq!(df.width(), 3);
-    assert!(df.column("extra_column").is_err());
+    assert_eq!(dataframe.height(), 1);
+    assert_eq!(dataframe.width(), 3);
+    assert!(dataframe.column("extra_column").is_err());
 }
 
 #[test]
@@ -303,10 +345,10 @@ fn test_create_equity_details_dataframe_empty_csv() {
     initialize_test_tracing();
     let csv_content = "ticker,sector,industry\n";
 
-    let df = create_equity_details_dataframe(csv_content.to_string()).unwrap();
+    let dataframe = create_equity_details_dataframe(csv_content.to_string()).unwrap();
 
-    assert_eq!(df.height(), 0);
-    assert_eq!(df.width(), 3);
+    assert_eq!(dataframe.height(), 0);
+    assert_eq!(dataframe.width(), 3);
 }
 
 #[test]
@@ -318,11 +360,13 @@ fn test_create_equity_details_dataframe_malformed_csv() {
     let result = create_equity_details_dataframe(csv_content.to_string());
 
     assert!(result.is_err());
-    let err_msg = result.unwrap_err().to_string();
+    let error_message = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("Polars") || err_msg.contains("parse") || err_msg.contains("column"),
+        error_message.contains("Polars")
+            || error_message.contains("parse")
+            || error_message.contains("column"),
         "Expected parse error but got: {}",
-        err_msg
+        error_message
     );
 }
 

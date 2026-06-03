@@ -1,8 +1,4 @@
-{
-  pkgs,
-  lib,
-  ...
-}: let
+{pkgs, ...}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -10,9 +6,9 @@
     if rawFundProfile == ""
     then "development"
     else rawFundProfile;
-  isDeployed = builtins.elem fundProfile ["production" "paper"];
+  isDeployed = fundProfile == "production" || lib.hasPrefix "development/" fundProfile;
 
-  bucketSlug = builtins.replaceStrings ["/"] ["-"] fundProfile;
+  bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
 in {
   cachix.enable = false;
   dotenv.enable = true;
@@ -108,14 +104,12 @@ in {
     # Active profile
     FUND_PROFILE = fundProfile;
 
-    # S3 bucket names derived from FUND_PROFILE
-    AWS_S3_DATA_BUCKET_NAME = "fund-${bucketSlug}-data";
-    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "fund-${bucketSlug}-model-artifacts";
-    AWS_S3_TRAINING_BUCKET_NAME = "fund-${bucketSlug}-training";
-    AWS_S3_COLD_STORAGE_BUCKET_NAME = "fund-${bucketSlug}-cold-storage";
+    # S3 bucket name derived from FUND_PROFILE
+    AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
 
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
+    PGDATABASE = "fund";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -192,12 +186,22 @@ in {
     echo "Database seeded"
   '';
 
+  scripts.db-migrate.exec = ''
+    set -euo pipefail
+    echo "Waiting for PostgreSQL..."
+    while ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; do sleep 1; done
+    echo "Applying schema migrations..."
+    psql -h localhost -p 5432 -d fund \
+      -f ${./schema.sql} \
+      --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
+    echo "Schema migrations applied"
+  '';
+
   scripts.aws-buckets.exec = ''
     set -euo pipefail
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
-    echo "  Data:      $AWS_S3_DATA_BUCKET_NAME"
-    echo "  Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+    echo "  Bucket: $AWS_S3_BUCKET_NAME"
     echo ""
     buckets=$(aws s3 ls)
     printf '%s\n' "$buckets" | grep fund || echo "No fund buckets found"
@@ -377,6 +381,11 @@ in {
     echo "  git diff Cargo.lock uv.lock"
   '';
 
+  scripts.trigger-rebalance.exec = ''
+    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('intraday_check',
+    '{}')"
+  '';
+
   scripts.backfill-bars.exec = ''
     set -euo pipefail
 
@@ -480,9 +489,9 @@ in {
 
     "data:backfill-bars".exec = "backfill-bars";
 
-    "checks:continuous-integration" = {
+    "checks:base" = {
       exec = ''
-        echo "All continuous integration checks passed"
+        echo "All base checks passed"
       '';
       after = [
         "checks:nix"
@@ -490,6 +499,15 @@ in {
         "checks:yaml"
         "checks:toml"
         "checks:sql"
+      ];
+    };
+
+    "checks:continuous-integration" = {
+      exec = ''
+        echo "All continuous integration checks passed"
+      '';
+      after = [
+        "checks:base"
         "checks:python:format"
         "checks:python:lint"
         "checks:python:type-check"
@@ -510,6 +528,8 @@ in {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
+      # Pin to last known-good tinygrad artifact (May 27 artifact is Burn binary, not safetensors)
+      MODEL_VERSION = "2026-05-22-02-34-59-139";
     };
 
     scripts.cleanup-services.exec = ''
@@ -532,70 +552,73 @@ in {
           sleep 1
         fi
       '';
+
+      waitForPostgres = ''
+        attempt=0
+        max_attempts=90
+        while ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; do
+          attempt=$((attempt + 1))
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "PostgreSQL (fund database) did not become ready after $((max_attempts * 2)) seconds"
+            exit 1
+          fi
+          sleep 2
+        done
+      '';
+
+      applySchema = ''
+        echo "Applying schema migrations..."
+        psql -h localhost -p 5432 -d fund \
+          -f ${./schema.sql} \
+          --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
+        echo "Schema migrations applied"
+      '';
     in {
       data-manager.exec =
         if isDeployed
         then ''
+          set -euo pipefail
+          ${waitForPostgres}
+          ${applySchema}
           ${killPort "8080"}
           exec secretspec run -- cargo run -p data_manager --release
         ''
         else ''
+          set -euo pipefail
+          ${waitForPostgres}
+          ${applySchema}
           ${killPort "8080"}
           exec secretspec run -- cargo watch -x 'run -p data_manager'
         '';
 
       ensemble-manager.exec = let
-        waitForDataManager = ''
-          attempt=0
-          max_attempts=90
-          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
-            attempt=$((attempt + 1))
-            if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
-              exit 1
-            fi
-            sleep 2
-          done
-        '';
         uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
       in
         if isDeployed
         then ''
-          ${waitForDataManager}
+          ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
-          ${waitForDataManager}
+          ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd} --reload
         '';
 
       portfolio-manager.exec = let
-        waitForDeps = ''
-          attempt=0
-          max_attempts=90
-          while ! pg_isready -h localhost -p 5432 > /dev/null 2>&1; do
-            attempt=$((attempt + 1))
-            if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "PostgreSQL did not become ready after $((max_attempts * 2)) seconds"
-              exit 1
-            fi
-            sleep 2
-          done
-        '';
         uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
       in
         if isDeployed
         then ''
-          ${waitForDeps}
+          ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
-          ${waitForDeps}
+          ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
         '';
@@ -628,9 +651,7 @@ in {
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""
-      echo "  Buckets:"
-      echo "    Data:      $AWS_S3_DATA_BUCKET_NAME"
-      echo "    Artifacts: $AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME"
+      echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
       echo "    devenv --profile apps up      Start application services"
@@ -651,6 +672,7 @@ in {
       echo "    aws-secrets       List fund secrets"
       echo ""
       echo "  Tasks (devenv tasks run):"
+      echo "    checks:base         Non-language checks (nix, markdown, yaml, toml, sql)"
       echo "    checks:python       All Python checks (parallel after install)"
       echo "    checks:rust         All Rust checks (sequential: format, lint, test)"
       echo "    checks:markdown     Markdown lint"

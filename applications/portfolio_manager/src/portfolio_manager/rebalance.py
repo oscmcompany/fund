@@ -367,11 +367,15 @@ async def run_rebalance(  # noqa: PLR0911, PLR0912, PLR0915, C901
 
 
 async def get_latest_predictions_correlation_id() -> str | None:
-    """Return the correlation_id of the most recently inserted predictions row."""
+    """Return the correlation_id of today's most recently inserted predictions row.
+
+    Returns None if no predictions were generated today.
+    """
     pool = await get_pool()
     async with pool.connection() as connection:
         result = await connection.execute(
             "SELECT correlation_id FROM equity_predictions"
+            " WHERE created_at::date = CURRENT_DATE"
             " ORDER BY created_at DESC LIMIT 1"
         )
         row = await result.fetchone()
@@ -383,7 +387,8 @@ async def get_raw_predictions(
 ) -> tuple[pl.DataFrame, str | None]:
     """Query predictions from PostgreSQL for the given correlation_id.
 
-    If correlation_id is None, uses the most recently inserted set of predictions.
+    If correlation_id is None, uses the most recently inserted set of predictions
+    generated today. Stale predictions from a prior trading day return empty results.
     Returns (predictions_dataframe, model_run_id).
     """
     pool = await get_pool()
@@ -406,6 +411,7 @@ async def get_raw_predictions(
                    FROM equity_predictions
                    WHERE correlation_id = (
                        SELECT correlation_id FROM equity_predictions
+                       WHERE created_at::date = CURRENT_DATE
                        ORDER BY created_at DESC LIMIT 1
                    )
                    ORDER BY ticker, timestamp"""

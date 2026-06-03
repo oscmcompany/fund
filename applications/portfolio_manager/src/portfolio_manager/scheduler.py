@@ -76,13 +76,13 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
                 return
 
 
-async def _handle_eod_snapshot_requested(alpaca_client: AlpacaClient) -> None:
+async def _handle_end_of_day_snapshot_requested(alpaca_client: AlpacaClient) -> None:
     loop = asyncio.get_running_loop()
     try:
         account = await loop.run_in_executor(None, alpaca_client.get_account)
     except Exception as error:
         logger.exception(
-            "Failed to fetch account data for EOD snapshot", error=str(error)
+            "Failed to fetch account data for end-of-day snapshot", error=str(error)
         )
         raise
 
@@ -90,25 +90,25 @@ async def _handle_eod_snapshot_requested(alpaca_client: AlpacaClient) -> None:
     previous_value = await get_last_portfolio_value()
 
     if previous_value is not None and previous_value > 0:
-        eod_return = (portfolio_value - previous_value) / previous_value
+        end_of_day_return = (portfolio_value - previous_value) / previous_value
     else:
-        eod_return = 0.0
+        end_of_day_return = 0.0
 
     snapshot = {
         "timestamp": int(datetime.now(tz=UTC).timestamp() * 1000),
         "portfolio_value": portfolio_value,
-        "gross_return": eod_return,
-        "net_return": eod_return,
+        "gross_return": end_of_day_return,
+        "net_return": end_of_day_return,
         "total_slippage_cost": 0.0,
     }
-    saved = await save_performance_snapshot(snapshot, snapshot_type="eod")
+    saved = await save_performance_snapshot(snapshot, snapshot_type="end_of_day")
     if not saved:
-        message = "Failed to persist EOD performance snapshot"
+        message = "Failed to persist end-of-day performance snapshot"
         raise RuntimeError(message)
     logger.info(
-        "Saved EOD performance snapshot",
+        "Saved end-of-day performance snapshot",
         portfolio_value=portfolio_value,
-        eod_return=eod_return,
+        end_of_day_return=end_of_day_return,
     )
 
 
@@ -228,9 +228,9 @@ async def _event_listener_loop(
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
                     await update_consumer_offset(consumer_name, event_id)
-                elif event_type == "eod_snapshot_requested":
-                    logger.info("Received eod_snapshot_requested event")
-                    await _handle_eod_snapshot_requested(alpaca_client)
+                elif event_type == "end_of_day_snapshot_requested":
+                    logger.info("Received end_of_day_snapshot_requested event")
+                    await _handle_end_of_day_snapshot_requested(alpaca_client)
                     await update_consumer_offset(consumer_name, event_id)
 
             await listen_for_events("events", handler)

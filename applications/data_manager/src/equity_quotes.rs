@@ -65,7 +65,7 @@ async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
 }
 
 async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let pool = state.pool.as_ref().unwrap();
+    let pool = state.pool.as_ref().ok_or("database pool not initialized")?;
 
     refresh_active_symbols(state, pool).await;
 
@@ -105,11 +105,11 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
             match message.get("T").and_then(|t| t.as_str()) {
                 Some("error") => {
                     let code = message.get("code").and_then(|c| c.as_i64()).unwrap_or(0);
-                    let msg = message
+                    let error_message = message
                         .get("msg")
                         .and_then(|m| m.as_str())
                         .unwrap_or("unknown");
-                    return Err(format!("Alpaca auth error {}: {}", code, msg).into());
+                    return Err(format!("Alpaca auth error {}: {}", code, error_message).into());
                 }
                 Some("success") => {
                     info!("Alpaca authentication successful");
@@ -149,8 +149,8 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
 
     loop {
         tokio::select! {
-            msg = read.next() => {
-                match msg {
+            message = read.next() => {
+                match message {
                     Some(Ok(Message::Text(text))) => {
                         let parsed = parse_quote_messages(&text);
                         quote_buffer.extend(parsed);

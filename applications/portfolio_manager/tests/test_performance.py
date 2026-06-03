@@ -358,19 +358,19 @@ def test_compute_win_rate_returns_none_for_empty_list() -> None:
 
 
 def test_compute_win_rate_correct_fraction_for_mixed_wins_and_losses() -> None:
-    pnl_list = [100.0, -50.0, 200.0, -30.0]
-    result = compute_win_rate(pnl_list)
+    profit_and_loss_list = [100.0, -50.0, 200.0, -30.0]
+    result = compute_win_rate(profit_and_loss_list)
     assert result == pytest.approx(0.5)
 
 
 def test_compute_win_rate_all_wins() -> None:
-    pnl_list = [10.0, 20.0, 30.0]
-    assert compute_win_rate(pnl_list) == pytest.approx(1.0)
+    profit_and_loss_list = [10.0, 20.0, 30.0]
+    assert compute_win_rate(profit_and_loss_list) == pytest.approx(1.0)
 
 
 def test_compute_win_rate_no_wins() -> None:
-    pnl_list = [-10.0, -20.0]
-    assert compute_win_rate(pnl_list) == pytest.approx(0.0)
+    profit_and_loss_list = [-10.0, -20.0]
+    assert compute_win_rate(profit_and_loss_list) == pytest.approx(0.0)
 
 
 # --- compute_spy_relative_return ---
