@@ -182,7 +182,7 @@ impl PendingPair {
             quantity: long_fill.filled_quantity,
             order_type: self.long.order_type,
             limit_price: self.long.limit_price,
-            alpaca_order_id: long_fill.alpaca_order_id,
+            alpaca_order_id: self.long.alpaca_order_id,
             submitted_at: self.long.submitted_at,
             fill_price: Some(long_fill.fill_price),
             _state: PhantomData::<Filled>,
@@ -195,7 +195,7 @@ impl PendingPair {
             quantity: short_fill.filled_quantity,
             order_type: self.short.order_type,
             limit_price: self.short.limit_price,
-            alpaca_order_id: short_fill.alpaca_order_id,
+            alpaca_order_id: self.short.alpaca_order_id,
             submitted_at: self.short.submitted_at,
             fill_price: Some(short_fill.fill_price),
             _state: PhantomData::<Filled>,
@@ -303,6 +303,8 @@ mod tests {
         let pair = make_pending_pair("AAPL", "MSFT");
         let long_ticker = pair.long.ticker.clone();
         let short_ticker = pair.short.ticker.clone();
+        let long_alpaca_id = pair.long.alpaca_order_id.clone();
+        let short_alpaca_id = pair.short.alpaca_order_id.clone();
 
         let filled = pair
             .confirm(
@@ -319,6 +321,9 @@ mod tests {
         assert_eq!(filled.short_notional.0, Decimal::from(10_000));
         assert_eq!(filled.long_beta, 1.1);
         assert_eq!(filled.short_beta, 0.9);
+        // Broker order ID is preserved from the submitted order, not taken from the fill payload.
+        assert_eq!(filled.long.alpaca_order_id, long_alpaca_id);
+        assert_eq!(filled.short.alpaca_order_id, short_alpaca_id);
     }
 
     #[test]

@@ -10,26 +10,26 @@ use serde::{Deserialize, Serialize};
 /// `created_at` timestamp.
 pub const PREDICTIONS_STALENESS_WINDOW_HOURS: i64 = 20;
 
-/// Error returned when constructing a `StalenessWindow` with a zero duration.
+/// Error returned when constructing a `StalenessWindow` with a non-positive duration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZeroDurationError;
 
 impl std::fmt::Display for ZeroDurationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "Staleness window duration must not be zero.")
+        write!(formatter, "Staleness window duration must be positive.")
     }
 }
 
 impl std::error::Error for ZeroDurationError {}
 
-/// A validated non-zero duration representing the maximum age for fresh data.
+/// A validated positive duration representing the maximum age for fresh data.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StalenessWindow(pub Duration);
 
 impl StalenessWindow {
-    /// Creates a new `StalenessWindow`, returning an error if `duration` is zero.
+    /// Creates a new `StalenessWindow`, returning an error if `duration` is non-positive.
     pub fn new(duration: Duration) -> Result<Self, ZeroDurationError> {
-        if duration.is_zero() {
+        if duration <= Duration::zero() {
             return Err(ZeroDurationError);
         }
         Ok(StalenessWindow(duration))
@@ -37,7 +37,8 @@ impl StalenessWindow {
 
     /// Returns the staleness window for equity predictions (20 hours).
     pub fn predictions() -> Self {
-        StalenessWindow(Duration::hours(PREDICTIONS_STALENESS_WINDOW_HOURS))
+        StalenessWindow::new(Duration::hours(PREDICTIONS_STALENESS_WINDOW_HOURS))
+            .expect("PREDICTIONS_STALENESS_WINDOW_HOURS must be positive")
     }
 }
 
@@ -110,10 +111,16 @@ mod tests {
     }
 
     #[test]
+    fn test_staleness_window_new_rejects_negative() {
+        let error = StalenessWindow::new(Duration::hours(-1)).unwrap_err();
+        assert_eq!(error, ZeroDurationError);
+    }
+
+    #[test]
     fn test_zero_duration_error_display() {
         let error = ZeroDurationError;
         let message = format!("{}", error);
-        assert!(message.contains("zero"));
+        assert!(message.contains("positive"));
     }
 
     #[test]

@@ -90,10 +90,17 @@ impl std::error::Error for PortfolioError {}
 /// - no single ticker exceeds `concentration_cap` of total gross notional
 /// - each pair is dollar-neutral within `DOLLAR_NEUTRAL_TOLERANCE`
 /// - net portfolio beta is within `beta_tolerance` of zero
+///
+/// The inner field is private; use `pairs()` to access the validated pairs.
 #[derive(Debug)]
-pub struct Portfolio(pub Vec<FilledPair>);
+pub struct Portfolio(Vec<FilledPair>);
 
 impl Portfolio {
+    /// Returns the validated pairs in this portfolio.
+    pub fn pairs(&self) -> &[FilledPair] {
+        &self.0
+    }
+
     /// Constructs a `Portfolio`, enforcing all invariants from `constraints`.
     ///
     /// Returns `Err` with the first violated constraint.
@@ -110,7 +117,7 @@ impl Portfolio {
         let total_gross_notional: f64 = pairs
             .iter()
             .flat_map(|pair| [pair.long_notional.0, pair.short_notional.0])
-            .filter_map(|decimal| decimal.to_f64())
+            .map(|decimal| decimal.to_f64().unwrap_or(0.0))
             .sum();
 
         if total_gross_notional > 0.0 {
@@ -127,7 +134,7 @@ impl Portfolio {
                     .or_insert(0.0) += short_notional;
             }
 
-            let cap = constraints.concentration_cap.0 .0;
+            let cap = constraints.concentration_cap.0.value();
             for (ticker, notional) in &ticker_notionals {
                 let fraction = notional / total_gross_notional;
                 if fraction > cap {
@@ -407,8 +414,8 @@ mod tests {
     #[test]
     fn test_constraints_construction() {
         let constraints = make_constraints();
-        assert_eq!(constraints.drawdown_threshold.0 .0, 0.10);
-        assert_eq!(constraints.concentration_cap.0 .0, 0.20);
+        assert_eq!(constraints.drawdown_threshold.0.value(), 0.10);
+        assert_eq!(constraints.concentration_cap.0.value(), 0.20);
         assert_eq!(constraints.minimum_pairs.0.get(), 10);
         assert_eq!(constraints.beta_tolerance.0, 0.1);
     }

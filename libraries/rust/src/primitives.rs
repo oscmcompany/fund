@@ -4,7 +4,7 @@
 //! errors rather than silent runtime surprises.
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 /// Error returned when constructing a validated primitive with an out-of-range value.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,8 +35,11 @@ pub struct Shares(pub Decimal);
 pub struct Dollars(pub Decimal);
 
 /// Percentage in the range `[0.0, 1.0]`.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct Percent(pub f64);
+///
+/// The inner field is private; use `Percent::new()` to construct and `value()` to read.
+/// Deserialization validates the range, preventing out-of-range values from serde.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize)]
+pub struct Percent(f64);
 
 impl Percent {
     /// Creates a new `Percent`, returning an error if `value` is outside `[0.0, 1.0]`.
@@ -49,6 +52,18 @@ impl Percent {
             });
         }
         Ok(Percent(value))
+    }
+
+    /// Returns the inner `f64` value.
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Percent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = f64::deserialize(deserializer)?;
+        Percent::new(raw).map_err(de::Error::custom)
     }
 }
 
@@ -75,7 +90,7 @@ mod tests {
     #[test]
     fn test_percent_new_accepts_zero() {
         let percent = Percent::new(0.0).unwrap();
-        assert_eq!(percent.0, 0.0);
+        assert_eq!(percent.value(), 0.0);
     }
 
     #[test]
@@ -165,6 +180,6 @@ mod tests {
     #[test]
     fn test_allocation_construction() {
         let allocation = Allocation(Percent::new(0.25).unwrap());
-        assert_eq!(allocation.0 .0, 0.25);
+        assert_eq!(allocation.0.value(), 0.25);
     }
 }

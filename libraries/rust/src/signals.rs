@@ -57,6 +57,8 @@ pub enum SignalGateError {
     /// All signals have identical predicted returns, producing a degenerate
     /// quantile spread where normalization would assign uniform confidence.
     DegenerateQuantileSpread,
+    /// At least one signal has a non-finite (`NaN` or `±inf`) predicted return.
+    NonFiniteReturn,
 }
 
 impl std::fmt::Display for SignalGateError {
@@ -72,6 +74,10 @@ impl std::fmt::Display for SignalGateError {
                 formatter,
                 "All predicted returns are identical; quantile spread is degenerate."
             ),
+            SignalGateError::NonFiniteReturn => write!(
+                formatter,
+                "One or more signals contain a non-finite predicted return."
+            ),
         }
     }
 }
@@ -83,19 +89,23 @@ impl std::error::Error for SignalGateError {}
 /// Constructed only via `::new()`, which enforces:
 /// - non-empty signal list
 /// - regime confidence above the configured floor
+/// - all `predicted_return` values are finite (no `NaN` or `±inf`)
 /// - non-degenerate quantile spread across predicted returns
+///
+/// Fields are private; use the provided accessors to read values.
 #[derive(Debug)]
 pub struct GatedSignals {
-    pub signals: Vec<Signal>,
-    pub regime: Regime,
-    pub confidence: Percent,
+    signals: Vec<Signal>,
+    regime: Regime,
+    confidence: Percent,
 }
 
 impl GatedSignals {
     /// Constructs `GatedSignals` after validating all gate invariants.
     ///
     /// Returns `Err` if signals is empty, regime confidence is below `floor`,
-    /// or all signals have identical `predicted_return` values.
+    /// any signal has a non-finite `predicted_return`, or all signals have
+    /// identical `predicted_return` values.
     pub fn new(
         signals: Vec<Signal>,
         regime_result: RegimeResult,
@@ -105,11 +115,20 @@ impl GatedSignals {
             return Err(SignalGateError::EmptySignals);
         }
 
-        if regime_result.confidence.0 < floor.0 .0 {
+        let regime_confidence = regime_result.confidence.value();
+        let confidence_floor = floor.0.value();
+        if regime_confidence < confidence_floor {
             return Err(SignalGateError::BelowConfidenceFloor {
-                confidence: regime_result.confidence.0,
-                floor: floor.0 .0,
+                confidence: regime_confidence,
+                floor: confidence_floor,
             });
+        }
+
+        if signals
+            .iter()
+            .any(|signal| !signal.predicted_return.is_finite())
+        {
+            return Err(SignalGateError::NonFiniteReturn);
         }
 
         let maximum_return = signals
@@ -130,6 +149,21 @@ impl GatedSignals {
             regime: regime_result.state,
             confidence: regime_result.confidence,
         })
+    }
+
+    /// Returns a slice of the validated signals.
+    pub fn signals(&self) -> &[Signal] {
+        &self.signals
+    }
+
+    /// Returns a reference to the regime state.
+    pub fn regime(&self) -> &Regime {
+        &self.regime
+    }
+
+    /// Returns the regime confidence.
+    pub fn confidence(&self) -> Percent {
+        self.confidence
     }
 }
 
@@ -237,9 +271,9 @@ mod tests {
             ConfidenceFloor(Percent::new(0.5).unwrap()),
         )
         .unwrap();
-        assert_eq!(gated.signals.len(), 5);
-        assert_eq!(gated.regime, Regime::MeanReversion);
-        assert_eq!(gated.confidence.0, 0.8);
+        assert_eq!(gated.signals().len(), 5);
+        assert_eq!(*gated.regime(), Regime::MeanReversion);
+        assert_eq!(gated.confidence().value(), 0.8);
     }
 
     #[test]
@@ -251,7 +285,31 @@ mod tests {
             ConfidenceFloor(Percent::new(0.5).unwrap()),
         )
         .unwrap();
-        assert_eq!(gated.confidence.0, 0.5);
+        assert_eq!(gated.confidence().value(), 0.5);
+    }
+
+    #[test]
+    fn test_gated_signals_new_rejects_nan_return() {
+        let signals = make_signals(&[0.01, f64::NAN, 0.03]);
+        let error = GatedSignals::new(
+            signals,
+            make_regime_result(0.8),
+            ConfidenceFloor(Percent::new(0.5).unwrap()),
+        )
+        .unwrap_err();
+        assert_eq!(error, SignalGateError::NonFiniteReturn);
+    }
+
+    #[test]
+    fn test_gated_signals_new_rejects_inf_return() {
+        let signals = make_signals(&[0.01, f64::INFINITY, 0.03]);
+        let error = GatedSignals::new(
+            signals,
+            make_regime_result(0.8),
+            ConfidenceFloor(Percent::new(0.5).unwrap()),
+        )
+        .unwrap_err();
+        assert_eq!(error, SignalGateError::NonFiniteReturn);
     }
 
     #[test]
@@ -267,12 +325,15 @@ mod tests {
 
         let error = SignalGateError::DegenerateQuantileSpread;
         assert!(format!("{}", error).contains("degenerate"));
+
+        let error = SignalGateError::NonFiniteReturn;
+        assert!(format!("{}", error).contains("non-finite"));
     }
 
     #[test]
     fn test_confidence_floor_construction() {
         let floor = ConfidenceFloor(Percent::new(0.6).unwrap());
-        assert_eq!(floor.0 .0, 0.6);
+        assert_eq!(floor.0.value(), 0.6);
     }
 
     #[test]
@@ -282,6 +343,6 @@ mod tests {
             confidence: Percent::new(0.75).unwrap(),
         };
         assert_eq!(result.state, Regime::Trending);
-        assert_eq!(result.confidence.0, 0.75);
+        assert_eq!(result.confidence.value(), 0.75);
     }
 }
