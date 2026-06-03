@@ -84,9 +84,9 @@ def test_size_pairs_with_volatility_parity_short_uses_whole_share_dollar_amount(
     for row in short_rows.iter_rows(named=True):
         entry_price = row["entry_price"]
         dollar_amount = row["dollar_amount"]
-        qty = int(dollar_amount / entry_price)
-        # dollar_amount must equal qty * entry_price (whole-share adjusted)
-        assert dollar_amount == pytest.approx(qty * entry_price)
+        quantity = int(dollar_amount / entry_price)
+        # dollar_amount must equal quantity * entry_price (whole-share adjusted)
+        assert dollar_amount == pytest.approx(quantity * entry_price)
 
 
 def test_size_pairs_with_volatility_parity_long_matches_short_dollar_amount() -> None:

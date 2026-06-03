@@ -519,7 +519,7 @@ def test_get_last_portfolio_value_returns_none_on_db_error() -> None:
     assert result is None
 
 
-def test_save_performance_snapshot_eod_passes_return_values() -> None:
+def test_save_performance_snapshot_end_of_day_passes_return_values() -> None:
     mock_pool = _make_pool_mock()
     snapshot = {
         "timestamp": 1704067200000,
@@ -532,14 +532,16 @@ def test_save_performance_snapshot_eod_passes_return_values() -> None:
     with patch(
         "portfolio_manager.portfolio_state.get_pool", AsyncMock(return_value=mock_pool)
     ):
-        result = asyncio.run(save_performance_snapshot(snapshot, snapshot_type="eod"))
+        result = asyncio.run(
+            save_performance_snapshot(snapshot, snapshot_type="end_of_day")
+        )
 
     assert result is True
     execute_call = (
         mock_pool.connection.return_value.__aenter__.return_value.execute.call_args
     )
     args = execute_call[0][1]
-    assert args[1] == "eod"
+    assert args[1] == "end_of_day"
     assert args[3] == pytest.approx(0.05)
     assert args[4] == pytest.approx(0.048)
 

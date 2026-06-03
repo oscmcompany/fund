@@ -258,11 +258,11 @@ $do$;
 
 -- equity_portfolio_snapshots: per-rebalance portfolio state snapshots
 -- 'intraday' rows are recorded after each live rebalance; gross_return and net_return are NULL.
--- 'eod' rows are recorded once per trading day at market close; all columns are populated.
+-- 'end_of_day' rows are recorded once per trading day at market close; all columns are populated.
 CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
     id                   BIGSERIAL   NOT NULL PRIMARY KEY,
     snapshot_timestamp   TIMESTAMPTZ NOT NULL,
-    snapshot_type        TEXT        NOT NULL CHECK (snapshot_type IN ('intraday', 'eod')),
+    snapshot_type        TEXT        NOT NULL CHECK (snapshot_type IN ('intraday', 'end_of_day')),
     net_asset_value      NUMERIC     NOT NULL,
     gross_return         NUMERIC,
     net_return           NUMERIC,
@@ -270,13 +270,28 @@ CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Reconcile databases created before the eod -> end_of_day rename. No-ops on a fresh
+-- database; on an existing one they migrate stored values and swap the CHECK constraint
+-- so end_of_day INSERTs are accepted. The old constraint is dropped BEFORE the UPDATE so
+-- the new value does not violate the still-active old check.
+ALTER TABLE equity_portfolio_snapshots
+    DROP CONSTRAINT IF EXISTS equity_portfolio_snapshots_snapshot_type_check;
+UPDATE equity_portfolio_snapshots
+    SET snapshot_type = 'end_of_day'
+    WHERE snapshot_type = 'eod';
+ALTER TABLE equity_portfolio_snapshots
+    ADD CONSTRAINT equity_portfolio_snapshots_snapshot_type_check
+    CHECK (snapshot_type IN ('intraday', 'end_of_day'));
+-- Drop the pre-rename partial unique index; the renamed, UTC-anchored index is created below.
+DROP INDEX IF EXISTS uq_equity_portfolio_snapshots_eod_date;
+
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp
     ON equity_portfolio_snapshots (snapshot_timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp
     ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_eod_date
-    ON equity_portfolio_snapshots ((snapshot_timestamp::date))
-    WHERE snapshot_type = 'eod';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_end_of_day_date
+    ON equity_portfolio_snapshots (((snapshot_timestamp AT TIME ZONE 'UTC')::date))
+    WHERE snapshot_type = 'end_of_day';
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
 CREATE TABLE IF NOT EXISTS equity_trades (
@@ -486,10 +501,10 @@ BEGIN
 END;
 $do$;
 
--- record_eod_snapshot: emits an event for portfolio-manager to record the day's final NAV and compute returns.
-CREATE OR REPLACE FUNCTION record_eod_snapshot() RETURNS void AS $$
+-- record_end_of_day_snapshot: emits an event for portfolio-manager to record the day's final NAV and compute returns.
+CREATE OR REPLACE FUNCTION record_end_of_day_snapshot() RETURNS void AS $$
 BEGIN
-    PERFORM emit_event('eod_snapshot_requested', '{}');
+    PERFORM emit_event('end_of_day_snapshot_requested', '{}');
 END;
 $$ LANGUAGE plpgsql;
 
@@ -497,15 +512,33 @@ $$ LANGUAGE plpgsql;
 -- Runs first so the snapshot is persisted before export_trading_history runs at 21:45.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-eod-snapshot') THEN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-end-of-day-snapshot') THEN
         PERFORM cron.schedule(
-            'record-eod-snapshot',
+            'record-end-of-day-snapshot',
             '15 21 * * 1-5',
-            $$SELECT record_eod_snapshot()$$
+            $$SELECT record_end_of_day_snapshot()$$
         );
     END IF;
 END;
 $do$;
+
+-- Reconcile databases created before the eod -> end_of_day rename: remove the old pg_cron
+-- job so it does not fire alongside record-end-of-day-snapshot (which would produce
+-- duplicate end-of-day snapshots and orphaned eod_snapshot_requested events).
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-eod-snapshot') THEN
+        PERFORM cron.unschedule('record-eod-snapshot');
+    END IF;
+END;
+$do$;
+
+-- Drop the pre-rename function and rename any not-yet-consumed events so the new consumer
+-- still processes them (harmless on already-consumed rows; consumers track progress by id).
+DROP FUNCTION IF EXISTS record_eod_snapshot();
+UPDATE events
+    SET event_type = 'end_of_day_snapshot_requested'
+    WHERE event_type = 'eod_snapshot_requested';
 
 -- export_equity_bars: exports equity_bars for the past 120 days to S3 Parquet for model training.
 -- Reads the S3 bucket name from the app.bucket_name GUC (set by data-manager on startup).
@@ -615,7 +648,7 @@ BEGIN
 END;
 $do$;
 
--- Nightly trading history export: weekdays at 21:45 UTC (after record-eod-snapshot at 21:15 so today's snapshot is included).
+-- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15 so today's snapshot is included).
 -- Only scheduled when pg_parquet is available; export_trading_history() also guards at runtime.
 DO $do$
 BEGIN

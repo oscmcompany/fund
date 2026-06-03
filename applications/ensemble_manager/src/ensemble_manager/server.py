@@ -273,9 +273,9 @@ async def _fetch_equity_details(s3_client: "S3Client", bucket: str) -> pl.DataFr
     csv_bytes: bytes = response["Body"].read()
     equity_details_data = pl.read_csv(io.BytesIO(csv_bytes))
     equity_details_data = equity_details_data.with_columns(
-        pl.col(col).str.strip_chars()
-        for col in equity_details_data.columns
-        if equity_details_data[col].dtype == pl.String
+        pl.col(column).str.strip_chars()
+        for column in equity_details_data.columns
+        if equity_details_data[column].dtype == pl.String
     )
     equity_details_validated = equity_details_schema.validate(equity_details_data)
     return cast(

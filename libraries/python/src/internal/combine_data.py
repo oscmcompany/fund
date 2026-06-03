@@ -53,7 +53,7 @@ def combine_equity_bars_and_details(
     )
 
     missing_columns = [
-        col for col in retained_columns if col not in consolidated_data.columns
+        column for column in retained_columns if column not in consolidated_data.columns
     ]
     if missing_columns:
         logger.error(

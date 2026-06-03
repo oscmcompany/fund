@@ -59,21 +59,21 @@ async fn migrate_equity_details(state: &State) {
     match read_equity_details_dataframe_from_s3(state).await {
         Ok(dataframe) => {
             let tickers = match dataframe.column("ticker") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing ticker column: {}", err);
                     return;
                 }
             };
             let sectors = match dataframe.column("sector") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing sector column: {}", err);
                     return;
                 }
             };
             let industries = match dataframe.column("industry") {
-                Ok(col) => col.str().map(|s| s.into_iter().collect::<Vec<_>>()),
+                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
                 Err(err) => {
                     tracing::warn!("equity_details migration: missing industry column: {}", err);
                     return;
