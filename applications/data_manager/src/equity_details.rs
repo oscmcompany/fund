@@ -1,7 +1,7 @@
 use crate::errors::Error;
 use crate::state::State;
 use internal::market::{EquityDetails, Ticker};
-use tracing::info;
+use tracing::{info, warn};
 
 const EQUITY_DETAILS_KEY: &str = "data/equity/details/details.csv";
 
@@ -57,6 +57,7 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Err
     let industry_index = headers.iter().position(|h| *h == "industry").unwrap();
 
     let mut details = Vec::new();
+    let mut rejected_rows: usize = 0;
 
     for line in lines {
         if line.trim().is_empty() {
@@ -74,6 +75,7 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Err
         }
 
         let Some(ticker) = Ticker::new(fields[ticker_index]) else {
+            rejected_rows += 1;
             continue;
         };
 
@@ -96,6 +98,13 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Err
             sector,
             industry,
         });
+    }
+
+    if rejected_rows > 0 {
+        warn!(
+            "Discarded {} row(s) with invalid ticker symbols while parsing equity details CSV",
+            rejected_rows
+        );
     }
 
     Ok(details)

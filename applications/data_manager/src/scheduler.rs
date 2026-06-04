@@ -62,7 +62,7 @@ pub fn spawn_sync_scheduler(state: State) {
     // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
     // unavailable (e.g., local development without a database). In production the
     // pg_cron + LISTEN/NOTIFY path (listen_loop) is the sole trigger mechanism.
-    if state.database.pool().is_none() {
+    if !state.database.is_configured() {
         tokio::spawn(sync_loop(state));
     }
     tokio::spawn(listen_loop(listen_state));

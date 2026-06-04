@@ -1,7 +1,7 @@
 //! Raw ingest record types from market data providers (Alpaca, Massive).
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::FromRow;
 
 /// A normalized US equity ticker symbol.
@@ -13,7 +13,7 @@ use sqlx::FromRow;
 /// The private field prevents construction without going through [`Ticker::new`],
 /// which trims, uppercases, and validates the raw input. A `Ticker` in scope is
 /// proof that the symbol passed format validation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, sqlx::Type)]
 #[sqlx(transparent)]
 pub struct Ticker(String);
 
@@ -24,7 +24,7 @@ impl Ticker {
     /// the US equity ticker format. Returns `None` if the normalized value does not
     /// match.
     pub fn new(raw: &str) -> Option<Self> {
-        let normalized = raw.trim().to_uppercase();
+        let normalized = raw.trim().to_ascii_uppercase();
         if is_valid_ticker_format(&normalized) {
             Some(Self(normalized))
         } else {
@@ -62,6 +62,17 @@ impl PartialEq<String> for Ticker {
     }
 }
 
+impl<'de> Deserialize<'de> for Ticker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ticker::new(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid ticker: {}", raw)))
+    }
+}
+
 fn is_valid_ticker_format(normalized: &str) -> bool {
     match normalized.split_once('.') {
         Some((base, suffix)) => is_valid_base(base) && is_valid_suffix(suffix),
@@ -80,7 +91,7 @@ fn is_valid_suffix(s: &str) -> bool {
 /// Daily OHLCV equity bar record.
 ///
 /// Timestamps are stored as `TIMESTAMPTZ` in PostgreSQL. The `inserted_at` field
-/// is set by the database on insert.
+/// is set by the caller at ingest time and explicitly bound in the upsert query.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityBar {
     pub ticker: Ticker,

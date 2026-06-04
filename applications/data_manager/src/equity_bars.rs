@@ -51,7 +51,7 @@ struct MassiveResponse {
 /// validation, has missing OHLCV fields, or has an unrepresentable volume.
 fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Option<EquityBar> {
     let ticker = Ticker::new(&result.ticker)?;
-    let timestamp = DateTime::from_timestamp(result.t as i64, 0)?;
+    let timestamp = DateTime::from_timestamp_millis(i64::try_from(result.t).ok()?)?;
     let open_price = result.o?;
     let high_price = result.h?;
     let low_price = result.l?;
@@ -87,7 +87,7 @@ async fn write_equity_bars_to_s3(
     trading_date: &TradingDate,
     bars: &[EquityBar],
 ) -> Result<(), String> {
-    let mut dataframe = create_equity_bar_dataframe(bars.to_vec())
+    let mut dataframe = create_equity_bar_dataframe(bars)
         .map_err(|error| format!("Failed to create DataFrame: {}", error))?;
 
     let mut buffer = Vec::new();
@@ -217,7 +217,7 @@ pub async fn fetch_and_store(
         warn!("Failed to write equity bars to S3: {}", error);
     }
 
-    Ok(Some(raw_count))
+    Ok(Some(equity_bars.len()))
 }
 
 pub async fn sync(
@@ -252,7 +252,7 @@ pub async fn sync(
 #[cfg(test)]
 mod tests {
     use super::{parse_equity_bar, EquityBarResult};
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
 
     fn make_valid_result() -> EquityBarResult {
         EquityBarResult {
@@ -262,7 +262,7 @@ mod tests {
             l: Some(99.0),
             n: Some(1_000),
             o: Some(100.0),
-            t: 1_735_689_600,
+            t: 1_735_689_600_000,
             v: Some(2_000_000.0),
             vw: Some(104.0),
         }
@@ -276,6 +276,8 @@ mod tests {
         assert_eq!(bar.open_price, 100.0);
         assert_eq!(bar.close_price, 105.0);
         assert_eq!(bar.volume, 2_000_000);
+        let expected_timestamp = DateTime::from_timestamp_millis(1_735_689_600_000).unwrap();
+        assert_eq!(bar.timestamp, expected_timestamp);
     }
 
     #[test]

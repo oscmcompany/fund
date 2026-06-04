@@ -246,6 +246,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::{AlpacaCredentials, DatabaseState};
+    use serial_test::serial;
 
     #[test]
     fn test_database_state_not_configured_pool_is_none() {
@@ -268,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_alpaca_credentials_from_env_returns_none_when_key_id_missing() {
         // SAFETY: protected by serial test runner conventions; env mutation is
         // scoped to the test process.
@@ -292,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_alpaca_credentials_from_env_returns_none_when_secret_missing() {
         let original_key = std::env::var("ALPACA_KEY_ID").ok();
         let original_secret = std::env::var("ALPACA_SECRET").ok();
@@ -314,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_alpaca_credentials_feed_defaults_to_iex() {
         let original_key = std::env::var("ALPACA_KEY_ID").ok();
         let original_secret = std::env::var("ALPACA_SECRET").ok();

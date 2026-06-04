@@ -41,7 +41,7 @@ fn test_create_equity_bar_dataframe_valid_data() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar()];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 1);
     assert_eq!(dataframe.width(), 10);
@@ -62,7 +62,7 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar_lowercase()];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     let ticker = dataframe
         .column("ticker")
@@ -92,7 +92,7 @@ fn test_create_equity_bar_dataframe_whitespace_trimming() {
         inserted_at: timestamp,
     }];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     let ticker = dataframe
         .column("ticker")
@@ -109,7 +109,7 @@ fn test_create_equity_bar_dataframe_mixed_case_tickers() {
     initialize_test_tracing();
     let bars = vec![sample_equity_bar(), sample_equity_bar_lowercase()];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 2);
 
@@ -130,7 +130,7 @@ fn test_create_equity_bar_dataframe_empty_vec() {
     initialize_test_tracing();
     let bars: Vec<EquityBar> = vec![];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 0);
     assert_eq!(dataframe.width(), 10);
@@ -145,7 +145,7 @@ fn test_create_equity_bar_dataframe_multiple_rows() {
         sample_equity_bar(),
     ];
 
-    let dataframe = create_equity_bar_dataframe(bars).unwrap();
+    let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 3);
     assert_eq!(dataframe.width(), 10);
@@ -157,7 +157,7 @@ fn test_equity_bar_dataframe_parquet_roundtrip() {
     use std::io::Cursor;
 
     let original_bars = vec![sample_equity_bar()];
-    let original_df = create_equity_bar_dataframe(original_bars.clone()).unwrap();
+    let original_df = create_equity_bar_dataframe(&original_bars).unwrap();
 
     let mut buffer = Vec::new();
     ParquetWriter::new(&mut buffer)
@@ -193,7 +193,7 @@ fn test_parquet_empty_dataframe_roundtrip() {
     use std::io::Cursor;
 
     let empty_bars: Vec<EquityBar> = vec![];
-    let original_df = create_equity_bar_dataframe(empty_bars).unwrap();
+    let original_df = create_equity_bar_dataframe(&empty_bars).unwrap();
 
     let mut buffer = Vec::new();
     ParquetWriter::new(&mut buffer)

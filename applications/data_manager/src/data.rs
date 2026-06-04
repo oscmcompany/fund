@@ -30,7 +30,7 @@ impl TradingDate {
     }
 }
 
-pub fn create_equity_bar_dataframe(equity_bars_rows: Vec<EquityBar>) -> Result<DataFrame, Error> {
+pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<DataFrame, Error> {
     debug!(
         "Creating equity bar DataFrame from {} rows",
         equity_bars_rows.len()
