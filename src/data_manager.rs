@@ -12,7 +12,6 @@ pub mod router;
 pub mod scheduler;
 pub mod startup;
 pub mod state;
-pub mod storage;
 
 /// Initialize tracing and run the HTTP server, returning a process exit code.
 pub async fn run(bind_address: &str) -> i32 {

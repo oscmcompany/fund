@@ -1,6 +1,7 @@
 use crate::data_manager::data::EquityQuote;
 use crate::data_manager::database;
 use crate::data_manager::state::State;
+use crate::domain::market::Ticker;
 use chrono::DateTime;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -26,11 +27,11 @@ const _: () = assert!(
 );
 
 pub fn spawn_quote_stream(state: State) {
-    if state.pool.is_none() {
+    if state.database.pool().is_none() {
         info!("PostgreSQL not available, quote stream disabled");
         return;
     }
-    if state.alpaca_key_id.is_empty() || state.alpaca_secret.is_empty() {
+    if state.alpaca_credentials.is_none() {
         info!("Alpaca credentials not configured, quote stream disabled");
         return;
     }
@@ -55,7 +56,10 @@ async fn quote_stream_supervisor(state: State) {
 async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
     match database::get_active_tickers(pool).await {
         Ok(tickers) => {
-            let symbol_set: HashSet<String> = tickers.into_iter().collect();
+            let symbol_set: HashSet<Ticker> = tickers
+                .into_iter()
+                .filter_map(|t| Ticker::new(&t))
+                .collect();
             info!("Refreshed active symbols, count: {}", symbol_set.len());
             let mut guard = state.active_symbols.write().await;
             *guard = symbol_set;
@@ -65,14 +69,21 @@ async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
 }
 
 async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let pool = state.pool.as_ref().ok_or("database pool not initialized")?;
+    let pool = state
+        .database
+        .pool()
+        .ok_or("database pool not initialized")?;
+    let credentials = state
+        .alpaca_credentials
+        .as_ref()
+        .ok_or("Alpaca credentials not configured")?;
 
     refresh_active_symbols(state, pool).await;
 
-    let url = format!("{}/{}", ALPACA_WS_BASE_URL, state.alpaca_feed);
+    let url = format!("{}/{}", ALPACA_WS_BASE_URL, credentials.feed());
     info!(
         "Connecting to Alpaca quote stream, feed: {}",
-        state.alpaca_feed
+        credentials.feed()
     );
 
     let (ws_stream, _) = connect_async(&url).await?;
@@ -91,8 +102,8 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
     // Authenticate
     let auth_json = serde_json::json!({
         "action": "auth",
-        "key": state.alpaca_key_id,
-        "secret": state.alpaca_secret,
+        "key": credentials.key_id(),
+        "secret": credentials.secret(),
     })
     .to_string();
     write.send(Message::Text(auth_json.into())).await?;
@@ -125,7 +136,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
 
     // Subscribe to current active symbols
     {
-        let symbols: Vec<String> = state.active_symbols.read().await.iter().cloned().collect();
+        let symbols: Vec<Ticker> = state.active_symbols.read().await.iter().cloned().collect();
         if !symbols.is_empty() {
             let subscribe_json = serde_json::json!({
                 "action": "subscribe",
@@ -197,7 +208,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                         .to_string();
                         write.send(Message::Text(unsubscribe_json.into())).await?;
 
-                        let symbols: Vec<String> =
+                        let symbols: Vec<Ticker> =
                             state.active_symbols.read().await.iter().cloned().collect();
                         if !symbols.is_empty() {
                             let subscribe_json = serde_json::json!({
@@ -256,7 +267,10 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
                 return None;
             }
 
-            let ticker = message.get("S").and_then(|s| s.as_str())?.to_string();
+            let ticker = message
+                .get("S")
+                .and_then(|s| s.as_str())
+                .and_then(Ticker::new)?;
             let bid_price = message.get("bp").and_then(|v| v.as_f64())?;
             let ask_price = message.get("ap").and_then(|v| v.as_f64())?;
             let bid_size = i32::try_from(message.get("bs").and_then(|v| v.as_i64())?).ok()?;

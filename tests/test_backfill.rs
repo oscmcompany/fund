@@ -2,7 +2,7 @@ mod common;
 
 use chrono::NaiveDate;
 use fund::data_manager::{
-    equity_bars::{backfill, noon_eastern_utc},
+    equity_bars::backfill,
     state::{MassiveSecrets, State},
 };
 use mockito::{Matcher, Server};
@@ -44,20 +44,10 @@ async fn create_state(massive_base: String, s3_endpoint: &str) -> State {
     )
 }
 
-#[test]
-fn test_noon_eastern_utc_maps_to_seventeen_hundred_in_winter() {
-    // January is Eastern Standard Time (UTC-5), so noon Eastern is 17:00 UTC.
-    let date = NaiveDate::from_ymd_opt(2025, 1, 2).unwrap();
-    assert_eq!(
-        noon_eastern_utc(date).to_rfc3339(),
-        "2025-01-02T17:00:00+00:00"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_backfill_start_after_end_returns_error() {
-    let (endpoint, _s3, _guard) = setup_test_bucket().await;
+    let (endpoint, _s3) = setup_test_bucket().await;
     let state = create_state("http://127.0.0.1:1".to_string(), &endpoint).await;
 
     let result = backfill(
@@ -73,7 +63,7 @@ async fn test_backfill_start_after_end_returns_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_backfill_writes_s3_and_skips_weekends() {
-    let (endpoint, s3, _guard) = setup_test_bucket().await;
+    let (endpoint, s3) = setup_test_bucket().await;
 
     // 2025-01-03 is Friday and 2025-01-06 is Monday; 2025-01-04/05 are weekend.
     let mut massive_server = Server::new_async().await;
@@ -105,12 +95,11 @@ async fn test_backfill_writes_s3_and_skips_weekends() {
     assert_eq!(summary.days_failed, 0);
     assert_eq!(summary.total_bars, 2);
 
-    // The Friday partition must exist with the pandera-contract schema:
-    // Int64 millisecond timestamp and no inserted_at column.
+    // The Friday partition must exist with an Int64 millisecond timestamp.
     let object = s3
         .get_object()
         .bucket(test_bucket_name())
-        .key("data/equity/bars/year=2025/month=01/day=03/data.parquet")
+        .key("data/equity/bars/daily/year=2025/month=01/day=03/data.parquet")
         .send()
         .await
         .expect("Friday partition should exist");
@@ -128,5 +117,4 @@ async fn test_backfill_writes_s3_and_skips_weekends() {
         dataframe.column("timestamp").unwrap().dtype(),
         &DataType::Int64
     );
-    assert!(dataframe.column("inserted_at").is_err());
 }

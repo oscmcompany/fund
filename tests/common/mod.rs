@@ -61,24 +61,6 @@ impl Drop for EnvironmentVariableGuard {
     }
 }
 
-pub struct DuckDbEnvironmentGuard {
-    _guards: Vec<EnvironmentVariableGuard>,
-}
-
-impl DuckDbEnvironmentGuard {
-    pub fn new(endpoint_host_port: &str) -> Self {
-        let guards = vec![
-            EnvironmentVariableGuard::set("AWS_REGION", TEST_REGION),
-            EnvironmentVariableGuard::set("AWS_ACCESS_KEY_ID", TEST_ACCESS_KEY),
-            EnvironmentVariableGuard::set("AWS_SECRET_ACCESS_KEY", TEST_SECRET_KEY),
-            EnvironmentVariableGuard::set("AWS_EC2_METADATA_DISABLED", "true"),
-            EnvironmentVariableGuard::set("DUCKDB_S3_ENDPOINT", endpoint_host_port),
-            EnvironmentVariableGuard::set("DUCKDB_S3_USE_SSL", "false"),
-        ];
-        Self { _guards: guards }
-    }
-}
-
 pub fn initialize_test_tracing() {
     TRACING_INIT.call_once(|| {
         let _ = tracing_subscriber::fmt()
@@ -154,9 +136,9 @@ pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
     S3Client::from_conf(s3_config)
 }
 
-/// Start LocalStack, create the test bucket, clean it, configure DuckDB env vars,
-/// and return the endpoint URL and a ready-to-use S3 client.
-pub async fn setup_test_bucket() -> (String, S3Client, DuckDbEnvironmentGuard) {
+/// Start LocalStack, create the test bucket, clean it, and return the endpoint URL
+/// and a ready-to-use S3 client.
+pub async fn setup_test_bucket() -> (String, S3Client) {
     initialize_test_tracing();
 
     let endpoint = get_localstack_endpoint().await;
@@ -167,13 +149,7 @@ pub async fn setup_test_bucket() -> (String, S3Client, DuckDbEnvironmentGuard) {
 
     clean_bucket(&s3_client).await;
 
-    let host_port = endpoint
-        .strip_prefix("http://")
-        .unwrap_or(&endpoint)
-        .to_string();
-    let env_guard = DuckDbEnvironmentGuard::new(&host_port);
-
-    (endpoint, s3_client, env_guard)
+    (endpoint, s3_client)
 }
 
 pub async fn clean_bucket(s3_client: &S3Client) {

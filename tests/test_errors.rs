@@ -1,15 +1,29 @@
 use fund::data_manager::errors::Error;
 
 #[test]
-fn test_error_display_formats_messages() {
-    let other_error = Error::Other("example message".to_string());
-    assert_eq!(other_error.to_string(), "Other error: example message");
+fn test_error_display_other_variant() {
+    let error = Error::Other("example message".to_string());
+    assert_eq!(error.to_string(), "Other error: example message");
+}
 
-    let connection = duckdb::Connection::open_in_memory().unwrap();
-    let duckdb_error = connection
-        .execute_batch("SELECT * FROM missing_table")
-        .unwrap_err();
-    let wrapped_error = Error::DuckDB(duckdb_error);
+#[test]
+fn test_error_display_no_data_variant() {
+    let error = Error::NoData;
+    assert_eq!(error.to_string(), "No data found");
+}
 
-    assert!(wrapped_error.to_string().contains("DuckDB error"));
+#[test]
+fn test_error_display_polars_variant() {
+    use polars::prelude::*;
+    let polars_error = PolarsError::ColumnNotFound("missing_col".into());
+    let error = Error::Polars(polars_error);
+    assert!(error.to_string().contains("Polars error"));
+}
+
+#[test]
+fn test_error_from_polars_conversion() {
+    use polars::prelude::*;
+    let polars_error = PolarsError::ColumnNotFound("col".into());
+    let error: Error = polars_error.into();
+    assert!(error.to_string().contains("Polars error"));
 }

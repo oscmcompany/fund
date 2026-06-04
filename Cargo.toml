@@ -26,12 +26,10 @@ required-features = ["ensemble_model"]
 [features]
 default = ["data_manager", "ensemble_model"]
 data_manager = [
-  "dep:duckdb",
   "dep:chrono-tz",
   "dep:urlencoding",
   "dep:tokio-tungstenite",
   "dep:futures-util",
-  "dep:aws-credential-types",
 ]
 ensemble_model = [
   "dep:burn",
@@ -86,14 +84,12 @@ num-traits = "0.2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 # data_manager-only (optional; enabled by the `data_manager` feature)
-duckdb = { version = "1.10502.0", features = ["r2d2", "chrono"], optional = true }
 chrono-tz = { version = "0.10", optional = true }
 urlencoding = { version = "2.1.3", optional = true }
 tokio-tungstenite = { version = "0.26", features = [
   "rustls-tls-native-roots",
 ], optional = true }
 futures-util = { version = "0.3", optional = true }
-aws-credential-types = { version = "1.2.14", optional = true }
 
 # ensemble_model-only (optional; enabled by the `ensemble_model` feature)
 burn = { version = "0.16", features = ["ndarray"], optional = true }
@@ -103,6 +99,7 @@ tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
 
 [dev-dependencies]
+aws-credential-types = "1.2.14"
 tower = { version = "0.5", features = ["util"] }
 mockito = "1.7"
 serial_test = "3.4"

@@ -1,72 +1,241 @@
-use crate::data_manager::data::create_equity_details_dataframe;
+use crate::data_manager::errors::Error;
 use crate::data_manager::state::State;
-use crate::data_manager::storage::read_equity_details_csv_from_s3;
-use axum::{
-    extract::State as AxumState,
-    http::{header, StatusCode},
-    response::IntoResponse,
-};
-use polars::prelude::*;
+use crate::domain::market::{EquityDetails, Ticker};
 use tracing::{info, warn};
 
-pub async fn get(AxumState(state): AxumState<State>) -> impl IntoResponse {
-    info!("Fetching equity details CSV from S3");
+const EQUITY_DETAILS_KEY: &str = "data/equity/details/details.csv";
 
-    match read_equity_details_csv_from_s3(&state).await {
-        Ok(csv_content) => {
-            let mut dataframe = match create_equity_details_dataframe(csv_content) {
-                Ok(parsed_dataframe) => parsed_dataframe,
-                Err(err) => {
-                    warn!("Failed to parse equity details CSV: {}", err);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to parse equity details: {}", err),
-                    )
-                        .into_response();
-                }
-            };
+async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Error> {
+    info!("Reading equity details CSV from S3");
 
-            let mut buffer = Vec::new();
-            if let Err(err) = CsvWriter::new(&mut buffer).finish(&mut dataframe) {
-                warn!("Failed to serialize equity details DataFrame: {}", err);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to serialize equity details: {}", err),
-                )
-                    .into_response();
-            }
+    let response = state
+        .s3_client
+        .get_object()
+        .bucket(&state.bucket_name)
+        .key(EQUITY_DETAILS_KEY)
+        .send()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to get object from S3: {}", e)))?;
 
-            let csv_output = match String::from_utf8(buffer) {
-                Ok(s) => s,
-                Err(err) => {
-                    warn!("Equity details CSV output is not valid UTF-8: {}", err);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to serialize equity details: invalid UTF-8",
-                    )
-                        .into_response();
-                }
-            };
-            let mut response = csv_output.into_response();
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("text/csv; charset=utf-8"),
-            );
-            *response.status_mut() = StatusCode::OK;
-            response
-        }
-        Err(err) => {
-            warn!("Failed to fetch equity details from S3: {}", err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to fetch equity details: {}", err),
-            )
-                .into_response()
-        }
-    }
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|e| Error::Other(format!("Failed to read response body: {}", e)))?
+        .into_bytes();
+
+    let csv_content = String::from_utf8(bytes.to_vec())
+        .map_err(|e| Error::Other(format!("Failed to convert bytes to UTF-8: {}", e)))?;
+
+    info!(
+        "Successfully read CSV from S3, size: {} bytes",
+        csv_content.len()
+    );
+
+    Ok(csv_content)
 }
 
-pub async fn sync(_state: AxumState<State>) -> impl IntoResponse {
-    warn!("Equity details sync is not implemented");
-    (StatusCode::NOT_IMPLEMENTED, "Sync is not implemented").into_response()
+fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Error> {
+    let mut lines = csv_content.lines();
+
+    let header_line = match lines.next() {
+        Some(line) => line,
+        None => return Ok(Vec::new()),
+    };
+
+    let headers: Vec<&str> = header_line.split(',').map(|h| h.trim()).collect();
+
+    for column in &["ticker", "sector", "industry"] {
+        if !headers.iter().any(|h| h == column) {
+            let message = format!("CSV missing required column: {}", column);
+            return Err(Error::Other(message));
+        }
+    }
+
+    let ticker_index = headers.iter().position(|h| *h == "ticker").unwrap();
+    let sector_index = headers.iter().position(|h| *h == "sector").unwrap();
+    let industry_index = headers.iter().position(|h| *h == "industry").unwrap();
+
+    let mut details = Vec::new();
+    let mut rejected_rows: usize = 0;
+
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() != headers.len() {
+            let message = format!(
+                "Malformed CSV row: expected {} fields, got {}",
+                headers.len(),
+                fields.len()
+            );
+            return Err(Error::Other(message));
+        }
+
+        let Some(ticker) = Ticker::new(fields[ticker_index]) else {
+            rejected_rows += 1;
+            continue;
+        };
+
+        let sector_raw = fields[sector_index].trim().to_uppercase();
+        let sector = if sector_raw.is_empty() {
+            "NOT AVAILABLE".to_string()
+        } else {
+            sector_raw
+        };
+
+        let industry_raw = fields[industry_index].trim().to_uppercase();
+        let industry = if industry_raw.is_empty() {
+            "NOT AVAILABLE".to_string()
+        } else {
+            industry_raw
+        };
+
+        details.push(EquityDetails {
+            ticker,
+            sector,
+            industry,
+        });
+    }
+
+    if rejected_rows > 0 {
+        warn!(
+            "Discarded {} row(s) with invalid ticker symbols while parsing equity details CSV",
+            rejected_rows
+        );
+    }
+
+    Ok(details)
+}
+
+pub async fn read_equity_details_from_s3(state: &State) -> Result<Vec<EquityDetails>, Error> {
+    let csv_content = read_equity_details_csv_from_s3(state).await?;
+    let details = parse_equity_details_csv(&csv_content)?;
+    info!("Successfully parsed {} equity details rows", details.len());
+    Ok(details)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_equity_details_csv;
+
+    #[test]
+    fn test_parse_equity_details_csv_valid() {
+        let csv = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\nGOOGL,Technology,Internet Services\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].ticker, "AAPL");
+        assert_eq!(details[0].sector, "TECHNOLOGY");
+        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
+        assert_eq!(details[1].ticker, "GOOGL");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_whitespace_trimming() {
+        let csv =
+            "ticker,sector,industry\nECC           ,  Technology  ,  Consumer Electronics  \n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker, "ECC");
+        assert_eq!(details[0].sector, "TECHNOLOGY");
+        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_uppercase_normalization() {
+        let csv = "ticker,sector,industry\naapl,technology,consumer electronics\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker, "AAPL");
+        assert_eq!(details[0].sector, "TECHNOLOGY");
+        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_empty_sector_and_industry_filled() {
+        let csv = "ticker,sector,industry\nAAPL,,\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].sector, "NOT AVAILABLE");
+        assert_eq!(details[0].industry, "NOT AVAILABLE");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_extra_columns_ignored() {
+        let csv =
+            "ticker,sector,industry,extra_column\nAAPL,Technology,Consumer Electronics,Extra\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker, "AAPL");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_missing_ticker_column() {
+        let csv = "sector,industry\nTechnology,Consumer Electronics\n";
+        let result = parse_equity_details_csv(csv);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing required column"));
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_missing_sector_column() {
+        let csv = "ticker,industry\nAAPL,Consumer Electronics\n";
+        let result = parse_equity_details_csv(csv);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing required column"));
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_missing_industry_column() {
+        let csv = "ticker,sector\nAAPL,Technology\n";
+        let result = parse_equity_details_csv(csv);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing required column"));
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_empty_header_only() {
+        let csv = "ticker,sector,industry\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_empty_input() {
+        let details = parse_equity_details_csv("").unwrap();
+        assert_eq!(details.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_malformed_row_too_few_fields() {
+        let csv = "ticker,sector,industry\nAAPL,Technology\n";
+        let result = parse_equity_details_csv(csv);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Malformed CSV row"));
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_malformed_row_too_many_fields() {
+        let csv = "ticker,sector,industry\nGOOGL,Technology,Internet Services,Extra\n";
+        let result = parse_equity_details_csv(csv);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Malformed CSV row"));
+    }
 }
