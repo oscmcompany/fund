@@ -563,8 +563,12 @@ BEGIN
         to_char(export_date, 'MM'),
         to_char(export_date, 'DD')
     );
+    -- Emit timestamp as Unix milliseconds (BIGINT) and uppercase ticker so the
+    -- exported schema matches the equity_bars_schema pandera contract and the
+    -- data_manager backfill writer (both use Int64 millisecond timestamps).
+    -- inserted_at is intentionally omitted; it is not part of that schema.
     EXECUTE format(
-        'COPY (SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions, inserted_at FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
+        'COPY (SELECT UPPER(ticker) AS ticker, (EXTRACT(EPOCH FROM timestamp) * 1000)::bigint AS timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions FROM equity_bars WHERE timestamp >= %L AND timestamp < %L) TO %L',
         export_date::timestamptz,
         (export_date + INTERVAL '1 day')::timestamptz,
         s3_path

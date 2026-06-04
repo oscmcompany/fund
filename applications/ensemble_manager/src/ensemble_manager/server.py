@@ -50,7 +50,8 @@ from .predictions_schema import predictions_schema
 from .preprocess import filter_equity_bars, filter_to_trained_tickers
 
 try:
-    _error_log_path = Path("/var/log/fund/ensemble-manager-errors.log")
+    _log_directory = os.environ.get("FUND_LOG_DIR", "/var/log/fund")
+    _error_log_path = Path(_log_directory) / "ensemble-manager-errors.log"
     _error_log_path.parent.mkdir(parents=True, exist_ok=True)
     _error_file_handler = logging.FileHandler(_error_log_path)
     _error_file_handler.setLevel(logging.ERROR)

@@ -6,11 +6,25 @@
     if rawFundProfile == ""
     then "development"
     else rawFundProfile;
-  isDeployed = fundProfile == "production" || lib.hasPrefix "development/" fundProfile;
+  # Deployment is about WHERE the services run (the exe.dev VM), not which
+  # profile/secrets are in use: a developer uses their `development/<name>`
+  # profile both locally (hot-reload dev) and on a VM. Production is always
+  # deployed; any other environment opts in explicitly by exporting
+  # FUND_DEPLOYED=true on the VM, so local development defaults to dev mode.
+  isDeployed = fundProfile == "production" || builtins.getEnv "FUND_DEPLOYED" == "true";
 
   bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
+
+  # Log directory. Deployed profiles keep the root-owned /var/log/fund path
+  # (provisioned on the VM, where logrotate and monitoring expect it). Local
+  # development points FUND_LOG_DIR at an XDG state path so file logging works
+  # without sudo.
+  homeDirectory = builtins.getEnv "HOME";
+  fundLogDir =
+    if isDeployed
+    then "/var/log/fund"
+    else "${homeDirectory}/.local/state/fund/log";
 in {
-  cachix.enable = false;
   dotenv.enable = true;
 
   languages = {
@@ -103,6 +117,9 @@ in {
 
     # Active profile
     FUND_PROFILE = fundProfile;
+
+    # Writable log directory for local file logging (see fundLogDir above)
+    FUND_LOG_DIR = fundLogDir;
 
     # S3 bucket name derived from FUND_PROFILE
     AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
@@ -397,23 +414,12 @@ in {
 
     END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
 
-    echo "Waiting for data-manager to be healthy..."
-    attempt=0
-    max_attempts=30
-    while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-      attempt=$((attempt + 1))
-      if [ "$attempt" -ge "$max_attempts" ]; then
-        echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
-        exit 1
-      fi
-      sleep 2
-    done
-    echo "Data-manager is healthy"
-
+    # Fetches grouped daily bars from Massive and writes them straight to S3 as
+    # Hive-partitioned Parquet. No HTTP server or Postgres required: historical
+    # bars are consumed by model training directly from S3.
     echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
-    secretspec run -- uv run --package tools python -m tools.sync_equity_bars_data \
-      http://localhost:8080 \
-      "{\"start_date\": \"$BACKFILL_START_DATE\", \"end_date\": \"$END_DATE\"}"
+    secretspec run -- cargo run --no-default-features --features data_manager --bin backfill -- \
+      "$BACKFILL_START_DATE" "$END_DATE"
   '';
 
   tasks = {
@@ -523,7 +529,7 @@ in {
 
   # --- Profiles ---
 
-  profiles.apps.module = {
+  profiles.applications.module = {
     env = {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
@@ -581,14 +587,14 @@ in {
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
-          exec secretspec run -- cargo run -p data_manager --release
+          exec secretspec run -- cargo run --no-default-features --features data_manager --bin data_manager --release
         ''
         else ''
           set -euo pipefail
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
-          exec secretspec run -- cargo watch -x 'run -p data_manager'
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
         '';
 
       ensemble-manager.exec = let
@@ -647,17 +653,17 @@ in {
   };
 
   enterShell = ''
-    mkdir -p /var/log/fund 2>/dev/null || true
+    mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""
       echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
-      echo "    devenv --profile apps up      Start application services"
+      echo "    devenv --profile applications up      Start application services"
       echo "    devenv --profile ml shell     ML training environment"
       echo ""
-      echo "  Services (apps profile):"
+      echo "  Services (applications profile):"
       echo "    Data Manager:     localhost:8080"
       echo "    Portfolio Manager: localhost:8081"
       echo "    Ensemble Manager: localhost:8082"
