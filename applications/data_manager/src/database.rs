@@ -1,84 +1,32 @@
-use crate::data::{EquityBar, EquityQuote};
-use chrono::DateTime;
-use chrono::Utc;
-use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use internal::market::{EquityBar, EquityDetails, EquityQuote};
+use sqlx::PgPool;
 use tracing::{debug, info, warn};
-
-fn is_valid_equity_bar(bar: &EquityBar) -> bool {
-    bar.open_price.is_some()
-        && bar.high_price.is_some()
-        && bar.low_price.is_some()
-        && bar.close_price.is_some()
-        && bar.volume.is_some()
-        && DateTime::<Utc>::from_timestamp_millis(bar.timestamp).is_some()
-}
 
 pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
     if bars.is_empty() {
         return Ok(0);
     }
 
-    let valid_bars: Vec<&EquityBar> = bars.iter().filter(|bar| is_valid_equity_bar(bar)).collect();
-
-    let skipped = bars.len() - valid_bars.len();
-    if skipped > 0 {
-        warn!(
-            "Skipping {} bars with null OHLCV or invalid timestamp",
-            skipped
-        );
-    }
-
-    if valid_bars.is_empty() {
-        return Ok(0);
-    }
-
     let mut rows_affected: u64 = 0;
 
-    for chunk in valid_bars.chunks(1000) {
-        let transaction_values: Vec<Option<i64>> = chunk
-            .iter()
-            .map(|bar| match bar.transactions {
-                Some(transactions) => i64::try_from(transactions).map(Some).map_err(|_| {
-                    sqlx::Error::Protocol(format!(
-                        "transactions value {} for {} at {} exceeds BIGINT",
-                        transactions, bar.ticker, bar.timestamp
-                    ))
-                }),
-                None => Ok(None),
-            })
-            .collect::<Result<Vec<Option<i64>>, sqlx::Error>>()?;
-
+    for chunk in bars.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO equity_bars (ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions) ",
+            "INSERT INTO equity_bars (ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions, inserted_at) ",
         );
 
-        query_builder.push_values(
-            chunk.iter().zip(transaction_values.iter()),
-            |mut builder, (bar, transactions)| {
-                let time = DateTime::<Utc>::from_timestamp_millis(bar.timestamp)
-                    .expect("Alpaca API timestamp must be a valid millisecond epoch value");
-                builder
-                    .push_bind(&bar.ticker)
-                    .push_bind(time)
-                    .push_bind(
-                        bar.open_price
-                            .expect("equity bar open_price must be present"),
-                    )
-                    .push_bind(
-                        bar.high_price
-                            .expect("equity bar high_price must be present"),
-                    )
-                    .push_bind(bar.low_price.expect("equity bar low_price must be present"))
-                    .push_bind(
-                        bar.close_price
-                            .expect("equity bar close_price must be present"),
-                    )
-                    .push_bind(bar.volume.expect("equity bar volume must be present"))
-                    .push_bind(bar.volume_weighted_average_price)
-                    .push_bind(*transactions);
-            },
-        );
+        query_builder.push_values(chunk, |mut builder, bar| {
+            builder
+                .push_bind(&bar.ticker)
+                .push_bind(bar.timestamp)
+                .push_bind(bar.open_price)
+                .push_bind(bar.high_price)
+                .push_bind(bar.low_price)
+                .push_bind(bar.close_price)
+                .push_bind(bar.volume)
+                .push_bind(bar.volume_weighted_average_price)
+                .push_bind(bar.transactions)
+                .push_bind(bar.inserted_at);
+        });
 
         query_builder.push(
             " ON CONFLICT (ticker, timestamp) DO UPDATE SET \
@@ -89,7 +37,7 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
              volume = EXCLUDED.volume, \
              volume_weighted_average_price = EXCLUDED.volume_weighted_average_price, \
              transactions = EXCLUDED.transactions, \
-             inserted_at = now()",
+             inserted_at = EXCLUDED.inserted_at",
         );
 
         let result = query_builder.build().execute(pool).await?;
@@ -98,65 +46,6 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
 
     info!("Inserted {} equity bars into PostgreSQL", rows_affected);
     Ok(rows_affected)
-}
-
-pub async fn query_recent_equity_bars(
-    pool: &PgPool,
-    tickers: Option<&[String]>,
-    days_back: i32,
-) -> Result<Vec<EquityBar>, sqlx::Error> {
-    debug!(
-        "Querying recent equity bars, days_back: {}, tickers: {:?}",
-        days_back, tickers
-    );
-
-    let rows: Vec<PgRow> = match tickers {
-        Some(ticker_list) if !ticker_list.is_empty() => {
-            sqlx::query(
-                r#"SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
-                   FROM equity_bars
-                   WHERE timestamp >= now() - make_interval(days => $1)
-                     AND ticker = ANY($2)
-                   ORDER BY ticker, timestamp"#,
-            )
-            .bind(days_back)
-            .bind(ticker_list)
-            .fetch_all(pool)
-            .await?
-        }
-        Some(_) => return Ok(Vec::new()),
-        _ => {
-            sqlx::query(
-                r#"SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume, volume_weighted_average_price, transactions
-                   FROM equity_bars
-                   WHERE timestamp >= now() - make_interval(days => $1)
-                   ORDER BY ticker, timestamp"#,
-            )
-            .bind(days_back)
-            .fetch_all(pool)
-            .await?
-        }
-    };
-
-    let bars: Vec<EquityBar> = rows.iter().map(equity_bar_from_row).collect();
-    info!("Queried {} equity bars from PostgreSQL", bars.len());
-    Ok(bars)
-}
-
-fn equity_bar_from_row(row: &PgRow) -> EquityBar {
-    let timestamp: DateTime<Utc> = row.get("timestamp");
-    let transactions: Option<i64> = row.get("transactions");
-    EquityBar {
-        ticker: row.get("ticker"),
-        timestamp: timestamp.timestamp_millis(),
-        open_price: row.get::<Option<f64>, _>("open_price"),
-        high_price: row.get::<Option<f64>, _>("high_price"),
-        low_price: row.get::<Option<f64>, _>("low_price"),
-        close_price: row.get::<Option<f64>, _>("close_price"),
-        volume: row.get::<Option<i64>, _>("volume"),
-        volume_weighted_average_price: row.get("volume_weighted_average_price"),
-        transactions: transactions.map(|t| t as u64),
-    }
 }
 
 pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i64>, sqlx::Error> {
@@ -274,7 +163,7 @@ pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
 
 pub async fn populate_equity_details_if_empty(
     pool: &PgPool,
-    rows: Vec<(String, String, String)>,
+    rows: &[EquityDetails],
 ) -> Result<u64, sqlx::Error> {
     let mut transaction = pool.begin().await?;
 
@@ -301,11 +190,11 @@ pub async fn populate_equity_details_if_empty(
         let mut query_builder =
             sqlx::QueryBuilder::new("INSERT INTO equity_details (ticker, sector, industry) ");
 
-        query_builder.push_values(chunk, |mut builder, (ticker, sector, industry)| {
+        query_builder.push_values(chunk, |mut builder, details| {
             builder
-                .push_bind(ticker)
-                .push_bind(sector)
-                .push_bind(industry);
+                .push_bind(&details.ticker)
+                .push_bind(&details.sector)
+                .push_bind(&details.industry);
         });
 
         query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
@@ -358,31 +247,35 @@ pub async fn requeue_stale_claimed_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::EquityBar;
+    use chrono::Utc;
+    use internal::market::{EquityBar, Ticker};
 
     fn sample_bars() -> Vec<EquityBar> {
+        let now = Utc::now();
         vec![
             EquityBar {
-                ticker: "AAPL".to_string(),
-                timestamp: 1700000000000,
-                open_price: Some(150.0),
-                high_price: Some(155.0),
-                low_price: Some(149.0),
-                close_price: Some(153.0),
-                volume: Some(1000000),
+                ticker: Ticker::new("AAPL").unwrap(),
+                timestamp: now,
+                open_price: 150.0,
+                high_price: 155.0,
+                low_price: 149.0,
+                close_price: 153.0,
+                volume: 1_000_000,
                 volume_weighted_average_price: Some(152.0),
-                transactions: Some(50000),
+                transactions: Some(50_000),
+                inserted_at: now,
             },
             EquityBar {
-                ticker: "MSFT".to_string(),
-                timestamp: 1700000000000,
-                open_price: Some(350.0),
-                high_price: Some(355.0),
-                low_price: Some(349.0),
-                close_price: Some(353.0),
-                volume: Some(500000),
+                ticker: Ticker::new("MSFT").unwrap(),
+                timestamp: now,
+                open_price: 350.0,
+                high_price: 355.0,
+                low_price: 349.0,
+                close_price: 353.0,
+                volume: 500_000,
                 volume_weighted_average_price: Some(352.0),
-                transactions: Some(25000),
+                transactions: Some(25_000),
+                inserted_at: now,
             },
         ]
     }
@@ -397,11 +290,11 @@ mod tests {
 
     #[test]
     fn test_insert_empty_bars_returns_zero() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = insert_equity_bars(&pool, &[]).await;
@@ -411,28 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bars_with_null_ohlcv_are_filtered() {
-        let bars_with_nulls = vec![EquityBar {
-            ticker: "AAPL".to_string(),
-            timestamp: 1700000000000,
-            open_price: None,
-            high_price: None,
-            low_price: None,
-            close_price: None,
-            volume: None,
-            volume_weighted_average_price: None,
-            transactions: None,
-        }];
-        assert!(!is_valid_equity_bar(&bars_with_nulls[0]));
-    }
-
-    #[test]
     fn test_insert_empty_quotes_returns_zero() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = insert_equity_quotes(&pool, &[]).await;
@@ -443,11 +320,11 @@ mod tests {
 
     #[test]
     fn test_get_active_tickers_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = get_active_tickers(&pool).await;
@@ -457,11 +334,11 @@ mod tests {
 
     #[test]
     fn test_requeue_stale_claimed_jobs_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = requeue_stale_claimed_jobs(
@@ -476,11 +353,11 @@ mod tests {
 
     #[test]
     fn test_emit_equity_bars_synced_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = emit_equity_bars_synced(&pool).await;
@@ -490,11 +367,11 @@ mod tests {
 
     #[test]
     fn test_set_bucket_guc_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = set_bucket_guc(&pool, "test-bucket").await;

@@ -1,9 +1,9 @@
 mod common;
 
-use data_manager::data::EquityBar;
+use chrono::Utc;
+use data_manager::data::{EquityBar, Ticker};
 use data_manager::database::{
-    claim_pending_job, complete_job, fail_job, insert_equity_bars, query_recent_equity_bars,
-    set_bucket_guc,
+    claim_pending_job, complete_job, fail_job, insert_equity_bars, set_bucket_guc,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -84,29 +84,31 @@ async fn get_pg_pool() -> PgPool {
 }
 
 fn sample_bars() -> Vec<EquityBar> {
-    let now_millis = chrono::Utc::now().timestamp_millis();
+    let now = Utc::now();
     vec![
         EquityBar {
-            ticker: "AAPL".to_string(),
-            timestamp: now_millis,
-            open_price: Some(150.0),
-            high_price: Some(155.0),
-            low_price: Some(149.0),
-            close_price: Some(153.0),
-            volume: Some(1_000_000),
+            ticker: Ticker::new("AAPL").unwrap(),
+            timestamp: now,
+            open_price: 150.0,
+            high_price: 155.0,
+            low_price: 149.0,
+            close_price: 153.0,
+            volume: 1_000_000,
             volume_weighted_average_price: Some(152.0),
             transactions: Some(50_000),
+            inserted_at: now,
         },
         EquityBar {
-            ticker: "MSFT".to_string(),
-            timestamp: now_millis,
-            open_price: Some(350.0),
-            high_price: Some(355.0),
-            low_price: Some(349.0),
-            close_price: Some(353.0),
-            volume: Some(500_000),
+            ticker: Ticker::new("MSFT").unwrap(),
+            timestamp: now,
+            open_price: 350.0,
+            high_price: 355.0,
+            low_price: 349.0,
+            close_price: 353.0,
+            volume: 500_000,
             volume_weighted_average_price: Some(352.0),
             transactions: Some(25_000),
+            inserted_at: now,
         },
     ]
 }
@@ -128,7 +130,16 @@ async fn test_insert_and_query_equity_bars() {
     let rows = insert_equity_bars(&pool, &bars).await.unwrap();
     assert_eq!(rows, 2);
 
-    let result = query_recent_equity_bars(&pool, None, 1).await.unwrap();
+    let result: Vec<EquityBar> = sqlx::query_as(
+        "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, \
+         volume, volume_weighted_average_price, transactions, inserted_at \
+         FROM equity_bars \
+         WHERE timestamp >= now() - interval '1 day'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
     assert_eq!(result.len(), 2);
 
     let tickers: Vec<&str> = result.iter().map(|b| b.ticker.as_str()).collect();
@@ -136,34 +147,10 @@ async fn test_insert_and_query_equity_bars() {
     assert!(tickers.contains(&"MSFT"));
 
     let aapl = result.iter().find(|b| b.ticker == "AAPL").unwrap();
-    assert_eq!(aapl.open_price, Some(150.0));
-    assert_eq!(aapl.close_price, Some(153.0));
-    assert_eq!(aapl.volume, Some(1_000_000));
+    assert_eq!(aapl.open_price, 150.0);
+    assert_eq!(aapl.close_price, 153.0);
+    assert_eq!(aapl.volume, 1_000_000);
     assert_eq!(aapl.transactions, Some(50_000));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_insert_equity_bars_rejects_transactions_overflow() {
-    let pool = get_pg_pool().await;
-    clean_tables(&pool).await;
-
-    let bar = EquityBar {
-        ticker: "AAPL".to_string(),
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        open_price: Some(150.0),
-        high_price: Some(155.0),
-        low_price: Some(149.0),
-        close_price: Some(153.0),
-        volume: Some(1_000_000),
-        volume_weighted_average_price: Some(152.0),
-        transactions: Some(u64::MAX),
-    };
-
-    let error = insert_equity_bars(&pool, &[bar]).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("transactions value 18446744073709551615"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -175,10 +162,16 @@ async fn test_query_with_ticker_filter() {
     let bars = sample_bars();
     insert_equity_bars(&pool, &bars).await.unwrap();
 
-    let tickers = vec!["AAPL".to_string()];
-    let result = query_recent_equity_bars(&pool, Some(&tickers), 1)
-        .await
-        .unwrap();
+    let result: Vec<EquityBar> = sqlx::query_as(
+        "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, \
+         volume, volume_weighted_average_price, transactions, inserted_at \
+         FROM equity_bars \
+         WHERE ticker = 'AAPL'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].ticker, "AAPL");
 }
@@ -189,22 +182,32 @@ async fn test_query_old_bars_excluded() {
     let pool = get_pg_pool().await;
     clean_tables(&pool).await;
 
-    let old_timestamp = chrono::Utc::now().timestamp_millis() - (15 * 24 * 60 * 60 * 1000);
+    let old_timestamp = Utc::now() - chrono::Duration::days(15);
     let old_bars = vec![EquityBar {
-        ticker: "OLD".to_string(),
+        ticker: Ticker::new("OLD").unwrap(),
         timestamp: old_timestamp,
-        open_price: Some(100.0),
-        high_price: Some(105.0),
-        low_price: Some(99.0),
-        close_price: Some(102.0),
-        volume: Some(10_000),
+        open_price: 100.0,
+        high_price: 105.0,
+        low_price: 99.0,
+        close_price: 102.0,
+        volume: 10_000,
         volume_weighted_average_price: Some(101.0),
         transactions: Some(500),
+        inserted_at: old_timestamp,
     }];
 
     insert_equity_bars(&pool, &old_bars).await.unwrap();
 
-    let result = query_recent_equity_bars(&pool, None, 7).await.unwrap();
+    let result: Vec<EquityBar> = sqlx::query_as(
+        "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, \
+         volume, volume_weighted_average_price, transactions, inserted_at \
+         FROM equity_bars \
+         WHERE timestamp >= now() - interval '7 days'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
     assert!(
         result.is_empty(),
         "Bars from 15 days ago should not appear in 7-day query"
@@ -221,14 +224,21 @@ async fn test_upsert_updates_existing_bar() {
     insert_equity_bars(&pool, &bars).await.unwrap();
 
     let mut updated = bars.clone();
-    updated[0].close_price = Some(160.0);
+    updated[0].close_price = 160.0;
     insert_equity_bars(&pool, &updated).await.unwrap();
 
-    let result = query_recent_equity_bars(&pool, None, 1).await.unwrap();
+    let result: Vec<EquityBar> = sqlx::query_as(
+        "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, \
+         volume, volume_weighted_average_price, transactions, inserted_at \
+         FROM equity_bars",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
     let aapl = result.iter().find(|b| b.ticker == "AAPL").unwrap();
     assert_eq!(
-        aapl.close_price,
-        Some(160.0),
+        aapl.close_price, 160.0,
         "Upsert should have updated close_price"
     );
 }
