@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::debug;
 
-use crate::state::State;
+use crate::state::{DatabaseState, State};
 
 const S3_HEALTH_TTL_SECS: u64 = 60;
 
@@ -32,12 +32,10 @@ pub async fn get_health(AxumState(state): AxumState<State>) -> impl IntoResponse
         ok
     };
 
-    let postgres_status = if state.pool.is_some() {
-        "ok"
-    } else if state.database_url_configured {
-        "error"
-    } else {
-        "disabled"
+    let postgres_status = match &state.database {
+        DatabaseState::Connected(_) => "ok",
+        DatabaseState::ConnectFailed => "error",
+        DatabaseState::NotConfigured => "disabled",
     };
 
     let degraded = !s3_ok || postgres_status == "error";

@@ -4,12 +4,85 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::Client as S3Client;
+use internal::market::Ticker;
 use reqwest::Client as HTTPClient;
 use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::database::set_bucket_guc;
+
+/// Alpaca API credentials.
+///
+/// The private fields enforce that credentials are only constructed when both
+/// `ALPACA_KEY_ID` and `ALPACA_SECRET` are non-empty. An `AlpacaCredentials`
+/// in scope is proof that both values were present at initialization.
+#[derive(Clone)]
+pub struct AlpacaCredentials {
+    key_id: String,
+    secret: String,
+    feed: String,
+}
+
+impl AlpacaCredentials {
+    /// Reads credentials from environment variables.
+    ///
+    /// Returns `None` if either `ALPACA_KEY_ID` or `ALPACA_SECRET` is absent or empty.
+    /// The `ALPACA_FEED` variable defaults to `"iex"` if not set.
+    pub fn from_env() -> Option<Self> {
+        let key_id = std::env::var("ALPACA_KEY_ID").unwrap_or_default();
+        let secret = std::env::var("ALPACA_SECRET").unwrap_or_default();
+        if key_id.is_empty() || secret.is_empty() {
+            return None;
+        }
+        let feed = std::env::var("ALPACA_FEED").unwrap_or_else(|_| "iex".to_string());
+        Some(Self {
+            key_id,
+            secret,
+            feed,
+        })
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    pub fn feed(&self) -> &str {
+        &self.feed
+    }
+}
+
+/// Database connection state.
+///
+/// Encodes three distinct states:
+/// - `NotConfigured`: `DATABASE_URL` was not set; PostgreSQL is intentionally disabled.
+/// - `ConnectFailed`: `DATABASE_URL` was set but the connection attempt failed.
+/// - `Connected`: A live `PgPool` is available for queries.
+#[derive(Clone)]
+pub enum DatabaseState {
+    NotConfigured,
+    ConnectFailed,
+    Connected(PgPool),
+}
+
+impl DatabaseState {
+    /// Returns a reference to the pool if connected, or `None` otherwise.
+    pub fn pool(&self) -> Option<&PgPool> {
+        match self {
+            DatabaseState::Connected(pool) => Some(pool),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if `DATABASE_URL` was configured (whether or not the connection succeeded).
+    pub fn is_configured(&self) -> bool {
+        !matches!(self, DatabaseState::NotConfigured)
+    }
+}
 
 #[derive(Clone)]
 pub struct MassiveSecrets {
@@ -25,12 +98,9 @@ pub struct State {
     pub bucket_name: String,
     pub last_s3_ok_epoch: Arc<AtomicU64>,
     pub last_sync_epoch: Arc<AtomicU64>,
-    pub pool: Option<PgPool>,
-    pub database_url_configured: bool,
-    pub alpaca_key_id: String,
-    pub alpaca_secret: String,
-    pub alpaca_feed: String,
-    pub active_symbols: Arc<RwLock<HashSet<String>>>,
+    pub database: DatabaseState,
+    pub alpaca_credentials: Option<AlpacaCredentials>,
+    pub active_symbols: Arc<RwLock<HashSet<Ticker>>>,
 }
 
 impl State {
@@ -65,12 +135,14 @@ impl State {
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
-        let alpaca_key_id = std::env::var("ALPACA_KEY_ID").unwrap_or_default();
-        let alpaca_secret = std::env::var("ALPACA_SECRET").unwrap_or_default();
-        let alpaca_feed = std::env::var("ALPACA_FEED").unwrap_or_else(|_| "iex".to_string());
-        info!("Using Alpaca feed: {}", alpaca_feed);
+        let alpaca_credentials = AlpacaCredentials::from_env();
+        if let Some(ref credentials) = alpaca_credentials {
+            info!("Using Alpaca feed: {}", credentials.feed());
+        } else {
+            info!("Alpaca credentials not configured");
+        }
 
-        let (pool, database_url_configured) = match std::env::var("DATABASE_URL") {
+        let database = match std::env::var("DATABASE_URL") {
             Ok(database_url) => {
                 debug!("Connecting to PostgreSQL");
                 match PgPool::connect(&database_url).await {
@@ -79,17 +151,17 @@ impl State {
                         if let Err(error) = set_bucket_guc(&pool, &bucket_name).await {
                             warn!("Failed to set app.bucket_name database GUC: {}", error);
                         }
-                        (Some(pool), true)
+                        DatabaseState::Connected(pool)
                     }
                     Err(error) => {
                         warn!("Failed to connect to PostgreSQL: {}", error);
-                        (None, true)
+                        DatabaseState::ConnectFailed
                     }
                 }
             }
             Err(_) => {
                 info!("DATABASE_URL not set, PostgreSQL disabled");
-                (None, false)
+                DatabaseState::NotConfigured
             }
         };
 
@@ -105,11 +177,8 @@ impl State {
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
-            pool,
-            database_url_configured,
-            alpaca_key_id,
-            alpaca_secret,
-            alpaca_feed,
+            database,
+            alpaca_credentials,
             active_symbols: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -127,11 +196,8 @@ impl State {
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
             last_sync_epoch: Arc::new(AtomicU64::new(0)),
-            pool: None,
-            database_url_configured: false,
-            alpaca_key_id: String::new(),
-            alpaca_secret: String::new(),
-            alpaca_feed: "iex".to_string(),
+            database: DatabaseState::NotConfigured,
+            alpaca_credentials: None,
             active_symbols: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -174,5 +240,106 @@ impl State {
             .unwrap_or_default()
             .as_secs();
         self.last_sync_epoch.store(now, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AlpacaCredentials, DatabaseState};
+
+    #[test]
+    fn test_database_state_not_configured_pool_is_none() {
+        assert!(DatabaseState::NotConfigured.pool().is_none());
+    }
+
+    #[test]
+    fn test_database_state_connect_failed_pool_is_none() {
+        assert!(DatabaseState::ConnectFailed.pool().is_none());
+    }
+
+    #[test]
+    fn test_database_state_not_configured_is_not_configured() {
+        assert!(!DatabaseState::NotConfigured.is_configured());
+    }
+
+    #[test]
+    fn test_database_state_connect_failed_is_configured() {
+        assert!(DatabaseState::ConnectFailed.is_configured());
+    }
+
+    #[test]
+    fn test_alpaca_credentials_from_env_returns_none_when_key_id_missing() {
+        // SAFETY: protected by serial test runner conventions; env mutation is
+        // scoped to the test process.
+        let original_key = std::env::var("ALPACA_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        unsafe {
+            std::env::remove_var("ALPACA_KEY_ID");
+            std::env::set_var("ALPACA_SECRET", "test-secret");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_SECRET", v),
+                None => std::env::remove_var("ALPACA_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_alpaca_credentials_from_env_returns_none_when_secret_missing() {
+        let original_key = std::env::var("ALPACA_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        unsafe {
+            std::env::set_var("ALPACA_KEY_ID", "test-key");
+            std::env::remove_var("ALPACA_SECRET");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_SECRET", v),
+                None => std::env::remove_var("ALPACA_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_alpaca_credentials_feed_defaults_to_iex() {
+        let original_key = std::env::var("ALPACA_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        let original_feed = std::env::var("ALPACA_FEED").ok();
+        unsafe {
+            std::env::set_var("ALPACA_KEY_ID", "test-key");
+            std::env::set_var("ALPACA_SECRET", "test-secret");
+            std::env::remove_var("ALPACA_FEED");
+        }
+        let credentials = AlpacaCredentials::from_env().unwrap();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_SECRET", v),
+                None => std::env::remove_var("ALPACA_SECRET"),
+            }
+            match original_feed {
+                Some(v) => std::env::set_var("ALPACA_FEED", v),
+                None => std::env::remove_var("ALPACA_FEED"),
+            }
+        }
+        assert_eq!(credentials.feed(), "iex");
+        assert_eq!(credentials.key_id(), "test-key");
+        assert_eq!(credentials.secret(), "test-secret");
     }
 }

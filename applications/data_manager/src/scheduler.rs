@@ -1,3 +1,4 @@
+use crate::data::TradingDate;
 use crate::database;
 use crate::equity_bars::fetch_and_store;
 use crate::state::State;
@@ -51,8 +52,9 @@ fn duration_until_next_sync(now: DateTime<Utc>) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-fn sync_date_for(now: DateTime<Utc>) -> NaiveDate {
-    prior_trading_day(now.with_timezone(&Eastern).date_naive())
+fn sync_date_for(now: DateTime<Utc>) -> TradingDate {
+    TradingDate::from_naive_date(prior_trading_day(now.with_timezone(&Eastern).date_naive()))
+        .expect("prior_trading_day always returns a weekday")
 }
 
 pub fn spawn_sync_scheduler(state: State) {
@@ -60,27 +62,19 @@ pub fn spawn_sync_scheduler(state: State) {
     // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
     // unavailable (e.g., local development without a database). In production the
     // pg_cron + LISTEN/NOTIFY path (listen_loop) is the sole trigger mechanism.
-    if state.pool.is_none() {
+    if state.database.pool().is_none() {
         tokio::spawn(sync_loop(state));
     }
     tokio::spawn(listen_loop(listen_state));
 }
 
 async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
-    let now_utc = Utc::now();
-    let sync_date = sync_date_for(now_utc);
-    let sync_noon_eastern = Eastern
-        .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
-        .earliest()
-        .unwrap();
-    let sync_utc = sync_noon_eastern.with_timezone(&Utc);
-
+    let trading_date = sync_date_for(Utc::now());
     info!(
         "Starting equity bar sync for {}",
-        sync_date.format("%Y-%m-%d")
+        trading_date.as_naive_date().format("%Y-%m-%d")
     );
-
-    fetch_and_store(state, &sync_utc).await
+    fetch_and_store(state, &trading_date).await
 }
 
 async fn sync_loop(state: State) {
@@ -113,7 +107,7 @@ async fn sync_loop(state: State) {
 }
 
 async fn listen_loop(state: State) {
-    let pool = match &state.pool {
+    let pool = match state.database.pool() {
         Some(pool) => pool.clone(),
         None => {
             info!("PostgreSQL not available, LISTEN handler disabled");
@@ -221,15 +215,9 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             }
         };
 
-        let now_utc = Utc::now();
-        let sync_date = sync_date_for(now_utc);
-        let sync_noon_eastern = Eastern
-            .from_local_datetime(&sync_date.and_hms_opt(12, 0, 0).unwrap())
-            .earliest()
-            .unwrap();
-        let sync_utc = sync_noon_eastern.with_timezone(&Utc);
+        let trading_date = sync_date_for(Utc::now());
 
-        match fetch_and_store(state, &sync_utc).await {
+        match fetch_and_store(state, &trading_date).await {
             Ok(Some(bar_count)) => {
                 info!("LISTEN-triggered sync completed, bar_count: {}", bar_count);
                 if let Err(error) =
@@ -365,7 +353,10 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sync_date = sync_date_for(now);
-        assert_eq!(sync_date, NaiveDate::from_ymd_opt(2026, 4, 27).unwrap());
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 4, 27).unwrap()
+        );
     }
 
     #[test]
@@ -376,7 +367,10 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sync_date = sync_date_for(now);
-        assert_eq!(sync_date, NaiveDate::from_ymd_opt(2026, 4, 24).unwrap());
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()
+        );
     }
 
     #[test]
@@ -387,6 +381,9 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let sync_date = sync_date_for(now);
-        assert_eq!(sync_date, NaiveDate::from_ymd_opt(2026, 4, 28).unwrap());
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
+        );
     }
 }

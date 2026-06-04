@@ -1,9 +1,9 @@
 use crate::database::populate_equity_details_if_empty;
+use crate::equity_details::read_equity_details_from_s3;
 use crate::equity_quotes::spawn_quote_stream;
 use crate::router::create_app_with_state;
 use crate::scheduler::spawn_sync_scheduler;
 use crate::state::State;
-use crate::storage::read_equity_details_dataframe_from_s3;
 use axum::Router;
 use std::env;
 use tokio::net::TcpListener;
@@ -48,7 +48,7 @@ pub async fn serve_app(listener: TcpListener, app: Router) -> std::io::Result<()
 }
 
 async fn migrate_equity_details(state: &State) {
-    let pool = match state.pool.as_ref() {
+    let pool = match state.database.pool() {
         Some(pool) => pool,
         None => {
             tracing::debug!("No database pool; skipping equity_details migration");
@@ -56,63 +56,16 @@ async fn migrate_equity_details(state: &State) {
         }
     };
 
-    match read_equity_details_dataframe_from_s3(state).await {
-        Ok(dataframe) => {
-            let tickers = match dataframe.column("ticker") {
-                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
-                Err(err) => {
-                    tracing::warn!("equity_details migration: missing ticker column: {}", err);
-                    return;
-                }
-            };
-            let sectors = match dataframe.column("sector") {
-                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
-                Err(err) => {
-                    tracing::warn!("equity_details migration: missing sector column: {}", err);
-                    return;
-                }
-            };
-            let industries = match dataframe.column("industry") {
-                Ok(column) => column.str().map(|s| s.into_iter().collect::<Vec<_>>()),
-                Err(err) => {
-                    tracing::warn!("equity_details migration: missing industry column: {}", err);
-                    return;
-                }
-            };
-
-            let (tickers, sectors, industries) = match (tickers, sectors, industries) {
-                (Ok(t), Ok(s), Ok(i)) => (t, s, i),
-                _ => {
-                    tracing::warn!("equity_details migration: failed to read string columns");
-                    return;
-                }
-            };
-
-            let rows: Vec<(String, String, String)> = tickers
-                .into_iter()
-                .zip(sectors.into_iter())
-                .zip(industries.into_iter())
-                .filter_map(|((ticker, sector), industry)| {
-                    ticker.map(|ticker_value| {
-                        (
-                            ticker_value.to_string(),
-                            sector.unwrap_or("NOT AVAILABLE").to_string(),
-                            industry.unwrap_or("NOT AVAILABLE").to_string(),
-                        )
-                    })
-                })
-                .collect();
-
-            match populate_equity_details_if_empty(pool, rows).await {
-                Ok(count) if count > 0 => {
-                    tracing::info!("Seeded equity_details from S3 ({} rows)", count);
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!("equity_details migration failed: {}", err);
-                }
+    match read_equity_details_from_s3(state).await {
+        Ok(details) => match populate_equity_details_if_empty(pool, &details).await {
+            Ok(count) if count > 0 => {
+                tracing::info!("Seeded equity_details from S3 ({} rows)", count);
             }
-        }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!("equity_details migration failed: {}", err);
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 "Could not read equity details from S3 for migration: {}",

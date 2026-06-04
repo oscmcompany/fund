@@ -15,6 +15,7 @@ path = "src/main.rs"
 axum = "0.8.4"
 chrono = { version = "0.4.44", features = ["serde"] }
 chrono-tz = "0.10"
+internal = { path = "../../libraries/rust" }
 polars = { version = "0.51.0", features = [
   "json",
   "lazy",
@@ -44,14 +45,13 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 aws-config = "1.8.15"
 aws-sdk-s3 = "1.129"
-aws-credential-types = "1.2.14"
-duckdb = { version = "1.10502.0", features = ["r2d2", "chrono"] }
 futures-util = "0.3"
 thiserror = "2.0.3"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 tracing-appender = "0.2"
 
 [dev-dependencies]
+aws-credential-types = "1.2.14"
 tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.13", features = ["json"] }
 mockito = "1.7"

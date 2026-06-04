@@ -1,15 +1,15 @@
-use crate::data::EquityBar;
+use crate::data::{create_equity_bar_dataframe, EquityBar, TradingDate};
 use crate::database;
 use crate::state::State;
+use aws_sdk_s3::primitives::ByteStream;
 use axum::{
-    body::Body,
-    extract::{Json, Query, State as AxumState},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    extract::{Json, State as AxumState},
+    http::StatusCode,
+    response::IntoResponse,
 };
-use chrono::{DateTime, Datelike, Utc, Weekday};
-use chrono_tz::US::Eastern;
-use polars::prelude::*;
+use chrono::{DateTime, Datelike, Utc};
+use internal::market::Ticker;
+use polars::prelude::ParquetWriter;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -18,8 +18,12 @@ pub struct DailySync {
     pub date: DateTime<Utc>,
 }
 
+/// Raw equity bar record as received from the Massive grouped-daily API.
+/// All OHLCV fields are optional because the API may omit them for thinly
+/// traded or halted instruments. The boundary morphism `parse_equity_bar`
+/// converts this into a validated `EquityBar`.
 #[derive(Deserialize, Debug)]
-struct BarResult {
+struct EquityBarResult {
     #[serde(rename = "T")]
     ticker: String,
     c: Option<f64>,
@@ -32,29 +36,99 @@ struct BarResult {
     vw: Option<f64>,
 }
 
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
+/// Minimal deserialization target for the Massive grouped-daily response.
+/// Unknown fields (adjusted, queryCount, request_id, status) are ignored
+/// by serde's default behaviour.
+#[derive(Deserialize)]
 struct MassiveResponse {
-    adjusted: bool,
-    #[serde(rename = "queryCount")]
-    query_count: u64,
-    request_id: String,
-    #[serde(rename = "resultsCount")]
+    #[serde(rename = "resultsCount", default)]
     results_count: u64,
-    status: String,
-    results: Option<Vec<BarResult>>,
+    results: Option<Vec<EquityBarResult>>,
 }
 
-pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Option<usize>, String> {
+/// Boundary morphism: converts an untrusted `EquityBarResult` into a validated
+/// `EquityBar`. Returns `None` for any record that fails ticker format
+/// validation, has missing OHLCV fields, or has an unrepresentable volume.
+fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Option<EquityBar> {
+    let ticker = Ticker::new(&result.ticker)?;
+    let timestamp = DateTime::from_timestamp(result.t as i64, 0)?;
+    let open_price = result.o?;
+    let high_price = result.h?;
+    let low_price = result.l?;
+    let close_price = result.c?;
+    let volume = result
+        .v
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .and_then(|v| {
+            let rounded = v.round();
+            if rounded <= i64::MAX as f64 {
+                Some(rounded as i64)
+            } else {
+                None
+            }
+        })?;
+
+    Some(EquityBar {
+        ticker,
+        timestamp,
+        open_price,
+        high_price,
+        low_price,
+        close_price,
+        volume,
+        volume_weighted_average_price: result.vw,
+        transactions: result.n.and_then(|n| i64::try_from(n).ok()),
+        inserted_at,
+    })
+}
+
+async fn write_equity_bars_to_s3(
+    state: &State,
+    trading_date: &TradingDate,
+    bars: &[EquityBar],
+) -> Result<(), String> {
+    let mut dataframe = create_equity_bar_dataframe(bars.to_vec())
+        .map_err(|error| format!("Failed to create DataFrame: {}", error))?;
+
+    let mut buffer = Vec::new();
+    ParquetWriter::new(&mut buffer)
+        .finish(&mut dataframe)
+        .map_err(|error| format!("Failed to serialize Parquet: {}", error))?;
+
+    let date = trading_date.as_naive_date();
+    let key = format!(
+        "data/equity/bars/daily/year={}/month={:02}/day={:02}/data.parquet",
+        date.year(),
+        date.month(),
+        date.day()
+    );
+
+    state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .body(ByteStream::from(buffer))
+        .send()
+        .await
+        .map_err(|error| format!("Failed to upload to S3: {}", error))?;
+
+    info!("Wrote equity bars Parquet to S3: {}", key);
+    Ok(())
+}
+
+pub async fn fetch_and_store(
+    state: &State,
+    trading_date: &TradingDate,
+) -> Result<Option<usize>, String> {
     let massive_api_key = state.massive.key.clone();
 
-    let date_str = date.with_timezone(&Eastern).format("%Y-%m-%d").to_string();
+    let date_str = trading_date.as_naive_date().format("%Y-%m-%d").to_string();
     let url = format!(
         "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
         state.massive.base, date_str
     );
 
-    info!("url: {}", url);
     info!("Sending request to Massive API");
     let response = state
         .http_client
@@ -97,83 +171,40 @@ pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Opti
         "Received response body, length: {} bytes",
         text_content.len()
     );
-    info!("Parsing JSON response");
 
-    let json_content: serde_json::Value = serde_json::from_str(&text_content).map_err(|err| {
+    let massive_response: MassiveResponse = serde_json::from_str(&text_content).map_err(|err| {
         warn!("Failed to parse JSON response: {}", err);
         let truncated: String = text_content.chars().take(500).collect();
         warn!("Raw response (first 500 chars): {}", truncated);
         "Invalid JSON response from API".to_string()
     })?;
 
-    debug!("JSON parsed successfully");
+    info!("API results count: {}", massive_response.results_count);
 
-    if let Some(status) = json_content.get("status") {
-        info!("API response status field: {}", status);
-    }
-    if let Some(results_count) = json_content.get("resultsCount") {
-        info!("API response resultsCount: {}", results_count);
-    }
-
-    let results = match json_content.get("results") {
-        Some(results) => {
-            info!("Found results field in response");
-            results
-        }
-        None => {
-            warn!("No results field found in response");
-            debug!(
-                "Response keys: {:?}",
-                json_content
-                    .as_object()
-                    .map(|o| o.keys().collect::<Vec<_>>())
-            );
-            return Ok(None);
-        }
+    let Some(results) = massive_response.results else {
+        warn!("No results field in API response");
+        return Ok(None);
     };
 
-    info!("Parsing results into BarResult structs");
-    let bars: Vec<BarResult> =
-        serde_json::from_value::<Vec<BarResult>>(results.clone()).map_err(|err| {
-            warn!("Failed to parse results into BarResult structs: {}", err);
-            warn!("Results type: {:?}", results.as_array().map(|a| a.len()));
-            if let Some(first_result) = results.as_array().and_then(|a| a.first()) {
-                warn!("First result sample: {}", first_result);
-            }
-            "Failed to parse equity bar results".to_string()
-        })?;
+    if results.is_empty() {
+        return Ok(None);
+    }
 
-    info!("Successfully parsed {} bar results", bars.len());
+    let raw_count = results.len();
+    let inserted_at = Utc::now();
 
-    let bar_count = bars.len();
+    let equity_bars: Vec<EquityBar> = results
+        .iter()
+        .filter_map(|result| parse_equity_bar(result, inserted_at))
+        .collect();
 
-    if let Some(pool) = &state.pool {
-        let equity_bars: Vec<EquityBar> = bars
-            .iter()
-            .map(|b| EquityBar {
-                ticker: b.ticker.clone(),
-                timestamp: b.t as i64,
-                open_price: b.o,
-                high_price: b.h,
-                low_price: b.l,
-                close_price: b.c,
-                volume: b.v.and_then(|v| {
-                    if v.is_finite() && v >= 0.0 {
-                        let rounded = v.round();
-                        if rounded <= i64::MAX as f64 {
-                            Some(rounded as i64)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }),
-                volume_weighted_average_price: b.vw,
-                transactions: b.n,
-            })
-            .collect();
+    debug!(
+        "Converted {}/{} results to valid equity bars",
+        equity_bars.len(),
+        raw_count
+    );
 
+    if let Some(pool) = state.database.pool() {
         database::insert_equity_bars(pool, &equity_bars)
             .await
             .map_err(|error| {
@@ -182,93 +213,11 @@ pub async fn fetch_and_store(state: &State, date: &DateTime<Utc>) -> Result<Opti
             })?;
     }
 
-    Ok(Some(bar_count))
-}
-
-#[derive(Deserialize)]
-pub struct RecentQueryParameters {
-    tickers: Option<String>,
-    days: Option<i32>,
-}
-
-pub async fn query_recent(
-    AxumState(state): AxumState<State>,
-    Query(parameters): Query<RecentQueryParameters>,
-) -> impl IntoResponse {
-    let days_back = parameters.days.unwrap_or(10);
-    if !(1..=30).contains(&days_back) {
-        return (StatusCode::BAD_REQUEST, "days must be between 1 and 30").into_response();
+    if let Err(error) = write_equity_bars_to_s3(state, trading_date, &equity_bars).await {
+        warn!("Failed to write equity bars to S3: {}", error);
     }
 
-    let pool = match &state.pool {
-        Some(pool) => pool,
-        None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL not available").into_response();
-        }
-    };
-
-    let tickers: Option<Vec<String>> = parameters.tickers.as_ref().and_then(|tickers_str| {
-        let parsed: Vec<String> = tickers_str
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_uppercase())
-            .collect();
-        if parsed.is_empty() {
-            None
-        } else {
-            Some(parsed)
-        }
-    });
-
-    match database::query_recent_equity_bars(pool, tickers.as_deref(), days_back).await {
-        Ok(bars) => {
-            let dataframe = crate::data::create_equity_bar_dataframe(bars);
-            match dataframe {
-                Ok(dataframe) => {
-                    let mut buffer = Vec::new();
-                    let mut dataframe = dataframe;
-                    if let Err(error) = ParquetWriter::new(&mut buffer).finish(&mut dataframe) {
-                        warn!("Failed to serialize parquet: {}", error);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to serialize response",
-                        )
-                            .into_response();
-                    }
-                    let mut response = Response::new(Body::from(buffer));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        "application/octet-stream".parse().unwrap(),
-                    );
-                    response.headers_mut().insert(
-                        "Content-Disposition",
-                        "attachment; filename=\"equity_data.parquet\""
-                            .parse()
-                            .unwrap(),
-                    );
-                    *response.status_mut() = StatusCode::OK;
-                    response
-                }
-                Err(error) => {
-                    warn!("Failed to create DataFrame from cache: {}", error);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Query failed: {}", error),
-                    )
-                        .into_response()
-                }
-            }
-        }
-        Err(error) => {
-            warn!("Failed to query PostgreSQL cache: {}", error);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Cache query failed: {}", error),
-            )
-                .into_response()
-        }
-    }
+    Ok(Some(raw_count))
 }
 
 pub async fn sync(
@@ -277,17 +226,16 @@ pub async fn sync(
 ) -> impl IntoResponse {
     info!("Sync date: {}", payload.date);
 
-    let weekday = payload.date.weekday();
-    if weekday == Weekday::Sat || weekday == Weekday::Sun {
+    let Some(trading_date) = TradingDate::from_naive_date(payload.date.date_naive()) else {
         info!("Skipping weekend date: {}", payload.date.format("%Y-%m-%d"));
         return (
             StatusCode::OK,
             "Skipping weekend, no trading data available",
         )
             .into_response();
-    }
+    };
 
-    match fetch_and_store(&state, &payload.date).await {
+    match fetch_and_store(&state, &trading_date).await {
         Ok(Some(bar_count)) => {
             let response_message = format!("Data synced: {} bars stored", bar_count);
             (StatusCode::OK, response_message).into_response()
@@ -298,5 +246,118 @@ pub async fn sync(
         )
             .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_equity_bar, EquityBarResult};
+    use chrono::Utc;
+
+    fn make_valid_result() -> EquityBarResult {
+        EquityBarResult {
+            ticker: "AAPL".to_string(),
+            c: Some(105.0),
+            h: Some(110.0),
+            l: Some(99.0),
+            n: Some(1_000),
+            o: Some(100.0),
+            t: 1_735_689_600,
+            v: Some(2_000_000.0),
+            vw: Some(104.0),
+        }
+    }
+
+    #[test]
+    fn test_parse_equity_bar_valid() {
+        let result = make_valid_result();
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.ticker, "AAPL");
+        assert_eq!(bar.open_price, 100.0);
+        assert_eq!(bar.close_price, 105.0);
+        assert_eq!(bar.volume, 2_000_000);
+    }
+
+    #[test]
+    fn test_parse_equity_bar_normalizes_ticker() {
+        let mut result = make_valid_result();
+        result.ticker = "  aapl  ".to_string();
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.ticker, "AAPL");
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_invalid_ticker() {
+        let mut result = make_valid_result();
+        result.ticker = "TOOLONG".to_string();
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_missing_open_price() {
+        let mut result = make_valid_result();
+        result.o = None;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_missing_high_price() {
+        let mut result = make_valid_result();
+        result.h = None;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_missing_low_price() {
+        let mut result = make_valid_result();
+        result.l = None;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_missing_close_price() {
+        let mut result = make_valid_result();
+        result.c = None;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_nan_volume() {
+        let mut result = make_valid_result();
+        result.v = Some(f64::NAN);
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_negative_volume() {
+        let mut result = make_valid_result();
+        result.v = Some(-1.0);
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_volume_overflow() {
+        let mut result = make_valid_result();
+        result.v = Some(f64::MAX);
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_optional_fields_can_be_none() {
+        let mut result = make_valid_result();
+        result.vw = None;
+        result.n = None;
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert!(bar.volume_weighted_average_price.is_none());
+        assert!(bar.transactions.is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_class_share_ticker_with_valid_format() {
+        // BRK.B is a valid Alpaca ticker format and should parse successfully.
+        let mut result = make_valid_result();
+        result.ticker = "BRK.B".to_string();
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.ticker, "BRK.B");
     }
 }
