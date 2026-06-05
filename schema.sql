@@ -1,12 +1,12 @@
 -- Fund platform PostgreSQL schema
 -- TimescaleDB operational data layer, model metadata, and job scheduling
 
-CREATE EXTENSION IF NOT EXISTS timescaledb;
-CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION timescaledb;
+CREATE EXTENSION pg_cron;
 
 -- equity_bars: Rolling buffer for equity bar data (last 90 days; ensemble needs 70-day lookback)
 -- Source: Massive API (historical), Alpaca REST (EOD backfill)
-CREATE TABLE IF NOT EXISTS equity_bars (
+CREATE TABLE equity_bars (
     ticker                        TEXT             NOT NULL,
     timestamp                     TIMESTAMPTZ      NOT NULL,
     open_price                    DOUBLE PRECISION NOT NULL,
@@ -20,14 +20,14 @@ CREATE TABLE IF NOT EXISTS equity_bars (
     PRIMARY KEY (ticker, timestamp)
 );
 
-SELECT create_hypertable('equity_bars', by_range('timestamp'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_at); -- noqa: PG01
-CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC); -- noqa: PG01
-SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
+SELECT create_hypertable('equity_bars', by_range('timestamp'));
+CREATE INDEX idx_equity_bars_inserted_at ON equity_bars (inserted_at); -- noqa: PG01
+CREATE INDEX idx_equity_bars_timestamp ON equity_bars (timestamp DESC); -- noqa: PG01
+SELECT add_retention_policy('equity_bars', INTERVAL '90 days');
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
 -- Exported to S3 Parquet daily then purged; future use: replay simulation
-CREATE TABLE IF NOT EXISTS equity_quotes (
+CREATE TABLE equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
     bid_price   DOUBLE PRECISION NOT NULL,
@@ -35,24 +35,24 @@ CREATE TABLE IF NOT EXISTS equity_quotes (
     bid_size    INTEGER     NOT NULL,
     ask_size    INTEGER     NOT NULL
 );
-SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC); -- noqa: PG01
-SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+SELECT create_hypertable('equity_quotes', by_range('timestamp'));
+CREATE INDEX idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC); -- noqa: PG01
+SELECT add_retention_policy('equity_quotes', INTERVAL '1 day');
 
 -- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
-CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
+CREATE TABLE equity_rebalance_sessions (
     id              UUID        PRIMARY KEY,
     triggered_at    TIMESTAMPTZ NOT NULL,
     trigger_reason  TEXT        NOT NULL,
     model_run_id    TEXT,       -- set by the training pipeline; references model_runs.run_id; nullable when unavailable
     completed_at    TIMESTAMPTZ,
-    status          TEXT        NOT NULL
+    status          TEXT        NOT NULL CHECK (status IN ('completed', 'failed'))
 );
 
 -- equity_pairs: one row per cointegrated pair per rebalance cycle
 -- Entry signals (z_score, hedge_ratio, signal_strength) are recorded at the time of opening.
 -- Matches the pairs_schema pandera definition and ClosedPair struct in data_manager/src/data.rs.
-CREATE TABLE IF NOT EXISTS equity_pairs (
+CREATE TABLE equity_pairs (
     id                         UUID        PRIMARY KEY,
     rebalance_id               UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
     pair_id                    TEXT        NOT NULL,
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
 -- quantity: whole-share intent for SHORT legs (nullable for LONG legs).
 -- notional: dollar amount for LONG legs (nullable for SHORT legs).
 -- CHECK ensures at least one of quantity or notional is set per row.
-CREATE TABLE IF NOT EXISTS equity_allocations (
+CREATE TABLE equity_allocations (
     id               UUID        PRIMARY KEY,
     rebalance_id     UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
     equity_pair_id   UUID        NOT NULL REFERENCES equity_pairs(id),
@@ -92,10 +92,10 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
         CHECK (quantity IS NOT NULL OR notional IS NOT NULL)
 );
 
-CREATE INDEX IF NOT EXISTS idx_equity_allocations_rebalance_id ON equity_allocations (rebalance_id); -- noqa: PG01
+CREATE INDEX idx_equity_allocations_rebalance_id ON equity_allocations (rebalance_id); -- noqa: PG01
 
 -- equity_orders: orders submitted to Alpaca, linked to allocations
-CREATE TABLE IF NOT EXISTS equity_orders (
+CREATE TABLE equity_orders (
     id               UUID        PRIMARY KEY,
     allocation_id    UUID        NOT NULL REFERENCES equity_allocations(id),
     submitted_at     TIMESTAMPTZ NOT NULL,
@@ -107,12 +107,12 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     alpaca_order_id  TEXT        NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_equity_orders_allocation_id ON equity_orders (allocation_id); -- noqa: PG01
+CREATE INDEX idx_equity_orders_allocation_id ON equity_orders (allocation_id); -- noqa: PG01
 
 -- equity_portfolio_snapshots: per-rebalance portfolio state snapshots
 -- 'intraday' rows are recorded after each live rebalance; gross_return and net_return are NULL.
 -- 'end_of_day' rows are recorded once per trading day at market close; all columns are populated.
-CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
+CREATE TABLE equity_portfolio_snapshots (
     id                   BIGSERIAL   NOT NULL PRIMARY KEY,
     snapshot_timestamp   TIMESTAMPTZ NOT NULL,
     snapshot_type        TEXT        NOT NULL CHECK (snapshot_type IN ('intraday', 'end_of_day')),
@@ -123,16 +123,16 @@ CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp -- noqa: PG01
+CREATE INDEX idx_equity_portfolio_snapshots_timestamp -- noqa: PG01
     ON equity_portfolio_snapshots (snapshot_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp -- noqa: PG01
+CREATE INDEX idx_equity_portfolio_snapshots_type_timestamp -- noqa: PG01
     ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_end_of_day_date -- noqa: PG01
+CREATE UNIQUE INDEX uq_equity_portfolio_snapshots_end_of_day_date -- noqa: PG01
     ON equity_portfolio_snapshots (((snapshot_timestamp AT TIME ZONE 'UTC')::date))
     WHERE snapshot_type = 'end_of_day';
 
 -- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
-CREATE TABLE IF NOT EXISTS equity_trades (
+CREATE TABLE equity_trades (
     timestamp               TIMESTAMPTZ NOT NULL,
     ticker                  TEXT        NOT NULL,
     order_id                UUID        NOT NULL,
@@ -145,14 +145,14 @@ CREATE TABLE IF NOT EXISTS equity_trades (
 -- equity_details: Ticker metadata (sector, industry) seeded from S3 on first startup.
 -- Ongoing updates are owned by data-manager when equity details are refreshed.
 -- Source: data/equity/details/details.csv in the S3 bucket.
-CREATE TABLE IF NOT EXISTS equity_details (
+CREATE TABLE equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,
     sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',
     industry  TEXT NOT NULL DEFAULT 'NOT AVAILABLE'
 );
 
 -- model_runs: Training metadata for model artifacts and evaluation metrics
-CREATE TABLE IF NOT EXISTS model_runs (
+CREATE TABLE model_runs (
     id                                  BIGSERIAL PRIMARY KEY,
     run_id                              TEXT NOT NULL UNIQUE,
     model_name                          TEXT NOT NULL DEFAULT 'tide',
@@ -171,11 +171,11 @@ CREATE TABLE IF NOT EXISTS model_runs (
     completed_at                        TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status); -- noqa: PG01
-CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC); -- noqa: PG01
+CREATE INDEX idx_model_runs_status ON model_runs (status); -- noqa: PG01
+CREATE INDEX idx_model_runs_started_at ON model_runs (started_at DESC); -- noqa: PG01
 
 -- scheduled_jobs: Job queue for pg_cron + LISTEN/NOTIFY
-CREATE TABLE IF NOT EXISTS scheduled_jobs (
+CREATE TABLE scheduled_jobs (
     id           BIGSERIAL    PRIMARY KEY,
     job_name     TEXT         NOT NULL,
     scheduled_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     result       TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_pending -- noqa: PG01
+CREATE INDEX idx_scheduled_jobs_pending -- noqa: PG01
     ON scheduled_jobs (job_name, status) WHERE status = 'pending';
 
 -- Notify function: insert row then send NOTIFY on channel "jobs"
@@ -198,16 +198,10 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Nightly equity bar sync: weekdays at 05:00 UTC
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
-        PERFORM cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
 
 -- events: append-only outbox for cross-service event coordination
-CREATE TABLE IF NOT EXISTS events (
+CREATE TABLE events (
     id          BIGSERIAL   NOT NULL,
     event_type  TEXT        NOT NULL,
     payload     JSONB       NOT NULL DEFAULT '{}',
@@ -215,9 +209,9 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (id, created_at)
 );
 
-SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id); -- noqa: PG01
-SELECT add_retention_policy('events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT create_hypertable('events', by_range('created_at'));
+CREATE INDEX idx_events_type_id ON events (event_type, id); -- noqa: PG01
+SELECT add_retention_policy('events', INTERVAL '30 days');
 
 -- notify_event: fires pg_notify on the 'events' channel after each insert.
 -- Payload is JSON with event_id, event_type, and the event payload so consumers
@@ -235,19 +229,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger
-        WHERE tgname = 'events_notify'
-          AND tgrelid = 'events'::regclass
-    ) THEN
-        CREATE TRIGGER events_notify
-            AFTER INSERT ON events
-            FOR EACH ROW EXECUTE FUNCTION notify_event();
-    END IF;
-END;
-$do$;
+CREATE TRIGGER events_notify
+    AFTER INSERT ON events
+    FOR EACH ROW EXECUTE FUNCTION notify_event();
 
 -- emit_event: inserts an event row; the trigger fires pg_notify automatically
 CREATE OR REPLACE FUNCTION emit_event(event_type TEXT, payload JSONB) RETURNS void AS $$
@@ -257,7 +241,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- event_consumer_offsets: tracks per-consumer polling progress for restart recovery
-CREATE TABLE IF NOT EXISTS event_consumer_offsets (
+CREATE TABLE event_consumer_offsets (
     consumer_name  TEXT        PRIMARY KEY,
     last_event_id  BIGINT      NOT NULL DEFAULT 0,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -268,7 +252,7 @@ CREATE TABLE IF NOT EXISTS event_consumer_offsets (
 -- the predictions_schema pandera definition in ensemble_manager.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
 -- Identity is (ticker, timestamp) — the TimescaleDB primary key; no surrogate id column.
-CREATE TABLE IF NOT EXISTS equity_predictions (
+CREATE TABLE equity_predictions (
     correlation_id  UUID             NOT NULL,
     model_run_id    TEXT             NOT NULL,
     ticker          TEXT             NOT NULL,
@@ -280,25 +264,15 @@ CREATE TABLE IF NOT EXISTS equity_predictions (
     PRIMARY KEY (ticker, timestamp)
 );
 
-SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
-SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT create_hypertable('equity_predictions', by_range('timestamp'));
+SELECT add_retention_policy('equity_predictions', INTERVAL '7 days');
 
 -- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
 -- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
 -- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
 -- A compile-time assertion in that file enforces the invariant — update both together.
 -- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
-        PERFORM cron.schedule(
-            'intraday-check',
-            '*/5 14-20 * * 1-5',
-            $$SELECT emit_event('intraday_check', '{}')$$
-        );
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('intraday-check', '*/5 14-20 * * 1-5', $$SELECT emit_event('intraday_check', '{}')$$);
 
 -- record_end_of_day_snapshot: emits an event for portfolio-manager to record the day's final NAV and compute returns.
 CREATE OR REPLACE FUNCTION record_end_of_day_snapshot() RETURNS void AS $$
@@ -309,76 +283,18 @@ $$ LANGUAGE plpgsql;
 
 -- Nightly EOD snapshot trigger: weekdays at 21:15 UTC (after market close, after quote archival).
 -- Runs first so the snapshot is persisted before export_trading_history runs at 21:45.
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-end-of-day-snapshot') THEN
-        PERFORM cron.schedule(
-            'record-end-of-day-snapshot',
-            '15 21 * * 1-5',
-            $$SELECT record_end_of_day_snapshot()$$
-        );
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('record-end-of-day-snapshot', '15 21 * * 1-5', $$SELECT record_end_of_day_snapshot()$$);
 
 -- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
 -- and after 4 PM Eastern market close in both EDT and EST).
 -- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    PERFORM cron.unschedule('export-equity-quotes');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
-        PERFORM cron.schedule(
-            'export-equity-quotes',
-            '5 21 * * 1-5',
-            $$SELECT schedule_job('export-equity-quotes')$$
-        );
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('export-equity-quotes', '5 21 * * 1-5', $$SELECT schedule_job('export-equity-quotes')$$);
 
 -- Nightly equity bars export: weekdays at 21:30 UTC.
 -- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    PERFORM cron.unschedule('export-equity-bars');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
-        PERFORM cron.schedule(
-            'export-equity-bars',
-            '30 21 * * 1-5',
-            $$SELECT schedule_job('export-equity-bars')$$
-        );
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('export-equity-bars', '30 21 * * 1-5', $$SELECT schedule_job('export-equity-bars')$$);
 
 -- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15
 -- so today's snapshot is included).
 -- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    PERFORM cron.unschedule('export-trading-history');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
-        PERFORM cron.schedule(
-            'export-trading-history',
-            '45 21 * * 1-5',
-            $$SELECT schedule_job('export-trading-history')$$
-        );
-    END IF;
-END;
-$do$;
+SELECT cron.schedule('export-trading-history', '45 21 * * 1-5', $$SELECT schedule_job('export-trading-history')$$);

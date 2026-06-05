@@ -95,6 +95,19 @@ in {
       language = "system";
       fail_fast = true;
     };
+    # Verifies that sqlx query metadata in .sqlx/ is current with respect to the queries
+    # in data_manager source. Run `cargo sqlx prepare` against a live database to regenerate
+    # the cache when queries change. Scope this hook to data_manager only; expand to include
+    # other crates as they adopt sqlx macros.
+    sqlx-prepare-check = {
+      enable = true;
+      name = "Verify sqlx query cache (data_manager)";
+      entry = "cargo sqlx prepare --check --manifest-path applications/data_manager/Cargo.toml";
+      files = "^applications/data_manager/.*\\.rs$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
   };
 
   env = {

@@ -94,38 +94,261 @@ fn is_valid_suffix(s: &str) -> bool {
 /// is set by the caller at ingest time and explicitly bound in the upsert query.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityBar {
-    pub ticker: Ticker,
+    ticker: Ticker,
     /// UTC timestamp for the trading day this bar covers.
-    pub timestamp: DateTime<Utc>,
-    pub open_price: f64,
-    pub high_price: f64,
-    pub low_price: f64,
-    pub close_price: f64,
+    timestamp: DateTime<Utc>,
+    open_price: f64,
+    high_price: f64,
+    low_price: f64,
+    close_price: f64,
     /// Whole share units. Fractional values from the source API are rounded on ingest.
-    pub volume: i64,
-    pub volume_weighted_average_price: Option<f64>,
-    pub transactions: Option<i64>,
+    volume: i64,
+    volume_weighted_average_price: Option<f64>,
+    transactions: Option<i64>,
     /// Set by the database at insert time.
-    pub inserted_at: DateTime<Utc>,
+    inserted_at: DateTime<Utc>,
+}
+
+impl EquityBar {
+    /// Constructs an `EquityBar` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ticker: Ticker,
+        timestamp: DateTime<Utc>,
+        open_price: f64,
+        high_price: f64,
+        low_price: f64,
+        close_price: f64,
+        volume: i64,
+        volume_weighted_average_price: Option<f64>,
+        transactions: Option<i64>,
+        inserted_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            ticker,
+            timestamp,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            volume,
+            volume_weighted_average_price,
+            transactions,
+            inserted_at,
+        }
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn open_price(&self) -> f64 {
+        self.open_price
+    }
+
+    pub fn high_price(&self) -> f64 {
+        self.high_price
+    }
+
+    pub fn low_price(&self) -> f64 {
+        self.low_price
+    }
+
+    pub fn close_price(&self) -> f64 {
+        self.close_price
+    }
+
+    pub fn volume(&self) -> i64 {
+        self.volume
+    }
+
+    pub fn volume_weighted_average_price(&self) -> Option<f64> {
+        self.volume_weighted_average_price
+    }
+
+    pub fn transactions(&self) -> Option<i64> {
+        self.transactions
+    }
+
+    pub fn inserted_at(&self) -> DateTime<Utc> {
+        self.inserted_at
+    }
 }
 
 /// Intraday bid/ask quote record from the Alpaca WebSocket stream.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityQuote {
-    pub timestamp: DateTime<Utc>,
-    pub ticker: Ticker,
-    pub bid_price: f64,
-    pub ask_price: f64,
-    pub bid_size: i32,
-    pub ask_size: i32,
+    timestamp: DateTime<Utc>,
+    ticker: Ticker,
+    bid_price: f64,
+    ask_price: f64,
+    bid_size: i32,
+    ask_size: i32,
+}
+
+impl EquityQuote {
+    /// Constructs an `EquityQuote` from validated field values.
+    pub fn new(
+        timestamp: DateTime<Utc>,
+        ticker: Ticker,
+        bid_price: f64,
+        ask_price: f64,
+        bid_size: i32,
+        ask_size: i32,
+    ) -> Self {
+        Self {
+            timestamp,
+            ticker,
+            bid_price,
+            ask_price,
+            bid_size,
+            ask_size,
+        }
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn bid_price(&self) -> f64 {
+        self.bid_price
+    }
+
+    pub fn ask_price(&self) -> f64 {
+        self.ask_price
+    }
+
+    pub fn bid_size(&self) -> i32 {
+        self.bid_size
+    }
+
+    pub fn ask_size(&self) -> i32 {
+        self.ask_size
+    }
 }
 
 /// Ticker metadata record seeded from the S3 details CSV.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct EquityDetails {
-    pub ticker: Ticker,
-    pub sector: String,
-    pub industry: String,
+pub struct EquityDetail {
+    ticker: Ticker,
+    sector: String,
+    industry: String,
+}
+
+impl EquityDetail {
+    /// Constructs an `EquityDetail` from validated field values.
+    pub fn new(ticker: Ticker, sector: String, industry: String) -> Self {
+        Self {
+            ticker,
+            sector,
+            industry,
+        }
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn sector(&self) -> &str {
+        &self.sector
+    }
+
+    pub fn industry(&self) -> &str {
+        &self.industry
+    }
+}
+
+/// A non-empty collection of [`EquityBar`] records.
+///
+/// The `Option`-returning constructor enforces that a value in scope always
+/// contains at least one bar. Callers that receive `None` know immediately that
+/// there is nothing to process or store.
+#[derive(Debug, Clone)]
+pub struct EquityBars(Vec<EquityBar>);
+
+impl EquityBars {
+    /// Returns `None` if `bars` is empty.
+    pub fn new(bars: Vec<EquityBar>) -> Option<Self> {
+        if bars.is_empty() {
+            None
+        } else {
+            Some(Self(bars))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityBar] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityQuote`] records.
+#[derive(Debug, Clone)]
+pub struct EquityQuotes(Vec<EquityQuote>);
+
+impl EquityQuotes {
+    /// Returns `None` if `quotes` is empty.
+    pub fn new(quotes: Vec<EquityQuote>) -> Option<Self> {
+        if quotes.is_empty() {
+            None
+        } else {
+            Some(Self(quotes))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityQuote] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityDetail`] records.
+#[derive(Debug, Clone)]
+pub struct EquityDetails(Vec<EquityDetail>);
+
+impl EquityDetails {
+    /// Returns `None` if `details` is empty.
+    pub fn new(details: Vec<EquityDetail>) -> Option<Self> {
+        if details.is_empty() {
+            None
+        } else {
+            Some(Self(details))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityDetail] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -245,95 +468,150 @@ mod tests {
     #[test]
     fn test_equity_bar_construction_with_all_fields() {
         let now = Utc::now();
-        let bar = EquityBar {
-            ticker: Ticker::new("AAPL").unwrap(),
-            timestamp: now,
-            open_price: 150.0,
-            high_price: 155.0,
-            low_price: 149.0,
-            close_price: 153.0,
-            volume: 1_000_000,
-            volume_weighted_average_price: Some(152.0),
-            transactions: Some(50_000),
-            inserted_at: now,
-        };
-        assert_eq!(bar.ticker.as_str(), "AAPL");
-        assert_eq!(bar.open_price, 150.0);
-        assert_eq!(bar.volume, 1_000_000);
+        let bar = EquityBar::new(
+            Ticker::new("AAPL").unwrap(),
+            now,
+            150.0,
+            155.0,
+            149.0,
+            153.0,
+            1_000_000,
+            Some(152.0),
+            Some(50_000),
+            now,
+        );
+        assert_eq!(bar.ticker().as_str(), "AAPL");
+        assert_eq!(bar.open_price(), 150.0);
+        assert_eq!(bar.volume(), 1_000_000);
     }
 
     #[test]
     fn test_equity_bar_clone() {
         let now = Utc::now();
-        let bar = EquityBar {
-            ticker: Ticker::new("GOOG").unwrap(),
-            timestamp: now,
-            open_price: 100.0,
-            high_price: 105.0,
-            low_price: 99.0,
-            close_price: 103.0,
-            volume: 500_000,
-            volume_weighted_average_price: Some(102.0),
-            transactions: Some(25_000),
-            inserted_at: now,
-        };
+        let bar = EquityBar::new(
+            Ticker::new("GOOG").unwrap(),
+            now,
+            100.0,
+            105.0,
+            99.0,
+            103.0,
+            500_000,
+            Some(102.0),
+            Some(25_000),
+            now,
+        );
         let cloned = bar.clone();
-        assert_eq!(cloned.ticker.as_str(), "GOOG");
-        assert_eq!(cloned.close_price, 103.0);
+        assert_eq!(cloned.ticker().as_str(), "GOOG");
+        assert_eq!(cloned.close_price(), 103.0);
     }
 
     #[test]
     fn test_equity_quote_construction() {
-        let quote = EquityQuote {
-            timestamp: Utc::now(),
-            ticker: Ticker::new("AAPL").unwrap(),
-            bid_price: 150.50,
-            ask_price: 150.55,
-            bid_size: 10,
-            ask_size: 5,
-        };
-        assert_eq!(quote.ticker.as_str(), "AAPL");
-        assert_eq!(quote.bid_price, 150.50);
-        assert_eq!(quote.ask_price, 150.55);
-        assert_eq!(quote.bid_size, 10);
-        assert_eq!(quote.ask_size, 5);
+        let quote = EquityQuote::new(
+            Utc::now(),
+            Ticker::new("AAPL").unwrap(),
+            150.50,
+            150.55,
+            10,
+            5,
+        );
+        assert_eq!(quote.ticker().as_str(), "AAPL");
+        assert_eq!(quote.bid_price(), 150.50);
+        assert_eq!(quote.ask_price(), 150.55);
+        assert_eq!(quote.bid_size(), 10);
+        assert_eq!(quote.ask_size(), 5);
     }
 
     #[test]
     fn test_equity_quote_clone() {
-        let quote = EquityQuote {
-            timestamp: Utc::now(),
-            ticker: Ticker::new("MSFT").unwrap(),
-            bid_price: 420.10,
-            ask_price: 420.20,
-            bid_size: 2,
-            ask_size: 4,
-        };
+        let quote = EquityQuote::new(
+            Utc::now(),
+            Ticker::new("MSFT").unwrap(),
+            420.10,
+            420.20,
+            2,
+            4,
+        );
         let cloned = quote.clone();
-        assert_eq!(cloned.ticker.as_str(), "MSFT");
-        assert_eq!(cloned.bid_price, 420.10);
+        assert_eq!(cloned.ticker().as_str(), "MSFT");
+        assert_eq!(cloned.bid_price(), 420.10);
     }
 
     #[test]
-    fn test_equity_details_construction() {
-        let details = EquityDetails {
-            ticker: Ticker::new("AAPL").unwrap(),
-            sector: "TECHNOLOGY".to_string(),
-            industry: "SOFTWARE".to_string(),
-        };
-        assert_eq!(details.ticker.as_str(), "AAPL");
-        assert_eq!(details.sector, "TECHNOLOGY");
-        assert_eq!(details.industry, "SOFTWARE");
+    fn test_equity_detail_construction() {
+        let detail = EquityDetail::new(
+            Ticker::new("AAPL").unwrap(),
+            "TECHNOLOGY".to_string(),
+            "SOFTWARE".to_string(),
+        );
+        assert_eq!(detail.ticker().as_str(), "AAPL");
+        assert_eq!(detail.sector(), "TECHNOLOGY");
+        assert_eq!(detail.industry(), "SOFTWARE");
     }
 
     #[test]
-    fn test_equity_details_clone() {
-        let details = EquityDetails {
-            ticker: Ticker::new("NVDA").unwrap(),
-            sector: "TECHNOLOGY".to_string(),
-            industry: "SEMICONDUCTORS".to_string(),
-        };
-        let cloned = details.clone();
-        assert_eq!(cloned.ticker.as_str(), "NVDA");
+    fn test_equity_detail_clone() {
+        let detail = EquityDetail::new(
+            Ticker::new("NVDA").unwrap(),
+            "TECHNOLOGY".to_string(),
+            "SEMICONDUCTORS".to_string(),
+        );
+        let cloned = detail.clone();
+        assert_eq!(cloned.ticker().as_str(), "NVDA");
+    }
+
+    #[test]
+    fn test_equity_bars_new_returns_some_for_nonempty() {
+        let now = Utc::now();
+        let bar = EquityBar::new(
+            Ticker::new("AAPL").unwrap(),
+            now,
+            150.0,
+            155.0,
+            149.0,
+            153.0,
+            1_000_000,
+            None,
+            None,
+            now,
+        );
+        let bars = EquityBars::new(vec![bar]);
+        assert!(bars.is_some());
+        assert_eq!(bars.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_equity_bars_new_returns_none_for_empty() {
+        assert!(EquityBars::new(vec![]).is_none());
+    }
+
+    #[test]
+    fn test_equity_quotes_new_returns_some_for_nonempty() {
+        let quote = EquityQuote::new(Utc::now(), Ticker::new("AAPL").unwrap(), 150.0, 150.5, 1, 1);
+        let quotes = EquityQuotes::new(vec![quote]);
+        assert!(quotes.is_some());
+        assert_eq!(quotes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_equity_quotes_new_returns_none_for_empty() {
+        assert!(EquityQuotes::new(vec![]).is_none());
+    }
+
+    #[test]
+    fn test_equity_details_new_returns_some_for_nonempty() {
+        let detail = EquityDetail::new(
+            Ticker::new("AAPL").unwrap(),
+            "TECHNOLOGY".to_string(),
+            "SOFTWARE".to_string(),
+        );
+        let details = EquityDetails::new(vec![detail]);
+        assert!(details.is_some());
+        assert_eq!(details.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_equity_details_new_returns_none_for_empty() {
+        assert!(EquityDetails::new(vec![]).is_none());
     }
 }

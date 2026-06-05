@@ -22,22 +22,12 @@ const SCHEMA_SQL: &str = include_str!("../../../schema.sql");
 
 /// Lines from schema.sql that require pg_cron or TimescaleDB (not available in vanilla Postgres).
 fn filter_schema_for_test(schema: &str) -> String {
-    let mut inside_cron_block = false;
     schema
         .lines()
         .filter(|line| {
             let trimmed = line.trim().to_lowercase();
-            if trimmed.starts_with("do $do$") {
-                inside_cron_block = true;
-            }
-            if inside_cron_block {
-                if trimmed.starts_with("$do$;") {
-                    inside_cron_block = false;
-                }
-                return false;
-            }
-            !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("create extension if not exists timescaledb")
+            !trimmed.starts_with("create extension pg_cron")
+                && !trimmed.starts_with("create extension timescaledb")
                 && !trimmed.starts_with("select cron.schedule")
                 && !trimmed.starts_with("select create_hypertable")
                 && !trimmed.starts_with("select add_retention_policy")
@@ -89,30 +79,30 @@ async fn get_pg_pool() -> PgPool {
 fn sample_bars() -> Vec<EquityBar> {
     let now = Utc::now();
     vec![
-        EquityBar {
-            ticker: Ticker::new("AAPL").unwrap(),
-            timestamp: now,
-            open_price: 150.0,
-            high_price: 155.0,
-            low_price: 149.0,
-            close_price: 153.0,
-            volume: 1_000_000,
-            volume_weighted_average_price: Some(152.0),
-            transactions: Some(50_000),
-            inserted_at: now,
-        },
-        EquityBar {
-            ticker: Ticker::new("MSFT").unwrap(),
-            timestamp: now,
-            open_price: 350.0,
-            high_price: 355.0,
-            low_price: 349.0,
-            close_price: 353.0,
-            volume: 500_000,
-            volume_weighted_average_price: Some(352.0),
-            transactions: Some(25_000),
-            inserted_at: now,
-        },
+        EquityBar::new(
+            Ticker::new("AAPL").unwrap(),
+            now,
+            150.0,
+            155.0,
+            149.0,
+            153.0,
+            1_000_000,
+            Some(152.0),
+            Some(50_000),
+            now,
+        ),
+        EquityBar::new(
+            Ticker::new("MSFT").unwrap(),
+            now,
+            350.0,
+            355.0,
+            349.0,
+            353.0,
+            500_000,
+            Some(352.0),
+            Some(25_000),
+            now,
+        ),
     ]
 }
 
@@ -145,15 +135,18 @@ async fn test_insert_and_query_equity_bars() {
 
     assert_eq!(result.len(), 2);
 
-    let tickers: Vec<&str> = result.iter().map(|b| b.ticker.as_str()).collect();
+    let tickers: Vec<&str> = result.iter().map(|b| b.ticker().as_str()).collect();
     assert!(tickers.contains(&"AAPL"));
     assert!(tickers.contains(&"MSFT"));
 
-    let aapl = result.iter().find(|b| b.ticker == "AAPL").unwrap();
-    assert_eq!(aapl.open_price, 150.0);
-    assert_eq!(aapl.close_price, 153.0);
-    assert_eq!(aapl.volume, 1_000_000);
-    assert_eq!(aapl.transactions, Some(50_000));
+    let aapl = result
+        .iter()
+        .find(|b| b.ticker().as_str() == "AAPL")
+        .unwrap();
+    assert_eq!(aapl.open_price(), 150.0);
+    assert_eq!(aapl.close_price(), 153.0);
+    assert_eq!(aapl.volume(), 1_000_000);
+    assert_eq!(aapl.transactions(), Some(50_000));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -176,7 +169,7 @@ async fn test_query_with_ticker_filter() {
     .unwrap();
 
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0].ticker, "AAPL");
+    assert_eq!(result[0].ticker().as_str(), "AAPL");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -186,18 +179,18 @@ async fn test_query_old_bars_excluded() {
     clean_tables(&pool).await;
 
     let old_timestamp = Utc::now() - chrono::Duration::days(15);
-    let old_bars = vec![EquityBar {
-        ticker: Ticker::new("OLD").unwrap(),
-        timestamp: old_timestamp,
-        open_price: 100.0,
-        high_price: 105.0,
-        low_price: 99.0,
-        close_price: 102.0,
-        volume: 10_000,
-        volume_weighted_average_price: Some(101.0),
-        transactions: Some(500),
-        inserted_at: old_timestamp,
-    }];
+    let old_bars = vec![EquityBar::new(
+        Ticker::new("OLD").unwrap(),
+        old_timestamp,
+        100.0,
+        105.0,
+        99.0,
+        102.0,
+        10_000,
+        Some(101.0),
+        Some(500),
+        old_timestamp,
+    )];
 
     insert_equity_bars(&pool, &old_bars).await.unwrap();
 
@@ -226,8 +219,20 @@ async fn test_upsert_updates_existing_bar() {
     let bars = sample_bars();
     insert_equity_bars(&pool, &bars).await.unwrap();
 
-    let mut updated = bars.clone();
-    updated[0].close_price = 160.0;
+    let original = &bars[0];
+    let updated_first = EquityBar::new(
+        original.ticker().clone(),
+        original.timestamp(),
+        original.open_price(),
+        original.high_price(),
+        original.low_price(),
+        160.0,
+        original.volume(),
+        original.volume_weighted_average_price(),
+        original.transactions(),
+        original.inserted_at(),
+    );
+    let updated = vec![updated_first, bars[1].clone()];
     insert_equity_bars(&pool, &updated).await.unwrap();
 
     let result: Vec<EquityBar> = sqlx::query_as(
@@ -239,9 +244,13 @@ async fn test_upsert_updates_existing_bar() {
     .await
     .unwrap();
 
-    let aapl = result.iter().find(|b| b.ticker == "AAPL").unwrap();
+    let aapl = result
+        .iter()
+        .find(|b| b.ticker().as_str() == "AAPL")
+        .unwrap();
     assert_eq!(
-        aapl.close_price, 160.0,
+        aapl.close_price(),
+        160.0,
         "Upsert should have updated close_price"
     );
 }

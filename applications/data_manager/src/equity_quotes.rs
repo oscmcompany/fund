@@ -56,10 +56,7 @@ async fn quote_stream_supervisor(state: State) {
 async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
     match database::get_active_tickers(pool).await {
         Ok(tickers) => {
-            let symbol_set: HashSet<Ticker> = tickers
-                .into_iter()
-                .filter_map(|t| Ticker::new(&t))
-                .collect();
+            let symbol_set: HashSet<Ticker> = tickers.into_iter().collect();
             info!("Refreshed active symbols, count: {}", symbol_set.len());
             let mut guard = state.active_symbols.write().await;
             *guard = symbol_set;
@@ -254,6 +251,10 @@ async fn flush_quotes(pool: &sqlx::PgPool, buffer: &mut Vec<EquityQuote>) {
     }
 }
 
+/// Boundary morphism: converts an untrusted Alpaca WebSocket JSON payload into a
+/// validated `Vec<EquityQuote>`. Messages with unknown type codes, missing required
+/// fields, or unparseable timestamps are silently dropped; the caller receives only
+/// well-formed quotes.
 pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
     let messages: Vec<serde_json::Value> = match serde_json::from_str(text) {
         Ok(messages) => messages,
@@ -278,14 +279,9 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
             let timestamp_str = message.get("t").and_then(|v| v.as_str())?;
             let timestamp = timestamp_str.parse::<DateTime<Utc>>().ok()?;
 
-            Some(EquityQuote {
-                timestamp,
-                ticker,
-                bid_price,
-                ask_price,
-                bid_size,
-                ask_size,
-            })
+            Some(EquityQuote::new(
+                timestamp, ticker, bid_price, ask_price, bid_size, ask_size,
+            ))
         })
         .collect()
 }
@@ -303,12 +299,12 @@ mod tests {
 
         let quotes = parse_quote_messages(text);
         assert_eq!(quotes.len(), 2);
-        assert_eq!(quotes[0].ticker, "AAPL");
-        assert_eq!(quotes[0].bid_price, 150.50);
-        assert_eq!(quotes[0].ask_price, 150.55);
-        assert_eq!(quotes[0].bid_size, 5);
-        assert_eq!(quotes[0].ask_size, 3);
-        assert_eq!(quotes[1].ticker, "MSFT");
+        assert_eq!(quotes[0].ticker().as_str(), "AAPL");
+        assert_eq!(quotes[0].bid_price(), 150.50);
+        assert_eq!(quotes[0].ask_price(), 150.55);
+        assert_eq!(quotes[0].bid_size(), 5);
+        assert_eq!(quotes[0].ask_size(), 3);
+        assert_eq!(quotes[1].ticker().as_str(), "MSFT");
     }
 
     #[test]
@@ -322,7 +318,7 @@ mod tests {
 
         let quotes = parse_quote_messages(text);
         assert_eq!(quotes.len(), 1);
-        assert_eq!(quotes[0].ticker, "AAPL");
+        assert_eq!(quotes[0].ticker().as_str(), "AAPL");
     }
 
     #[test]

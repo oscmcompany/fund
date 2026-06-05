@@ -352,7 +352,7 @@ async fn run_export_job(
     match job_name {
         "export-equity-quotes" => export::export_equity_quotes(state, export_date).await,
         "export-equity-bars" => export::export_equity_bars(state, export_date).await,
-        "export-trading-history" => export::export_trading_history(state, export_date).await,
+        "export-trading-history" => export::export_equity_trading_history(state, export_date).await,
         _ => {
             let message = format!("Unknown export job: {}", job_name);
             Err(message)

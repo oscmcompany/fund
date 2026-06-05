@@ -1,4 +1,4 @@
-use crate::database::populate_equity_details_if_empty;
+use crate::database::seed_equity_details;
 use crate::equity_details::read_equity_details_from_s3;
 use crate::equity_quotes::spawn_quote_stream;
 use crate::router::create_app_with_state;
@@ -47,30 +47,27 @@ pub async fn serve_app(listener: TcpListener, app: Router) -> std::io::Result<()
     axum::serve(listener, app).await
 }
 
-async fn migrate_equity_details(state: &State) {
+async fn seed_equity_details_from_s3(state: &State) {
     let pool = match state.database.pool() {
         Some(pool) => pool,
         None => {
-            tracing::debug!("No database pool; skipping equity_details migration");
+            tracing::debug!("No database pool; skipping equity details seeding");
             return;
         }
     };
 
     match read_equity_details_from_s3(state).await {
-        Ok(details) => match populate_equity_details_if_empty(pool, &details).await {
+        Ok(details) => match seed_equity_details(pool, &details).await {
             Ok(count) if count > 0 => {
                 tracing::info!("Seeded equity_details from S3 ({} rows)", count);
             }
             Ok(_) => {}
             Err(err) => {
-                tracing::warn!("equity_details migration failed: {}", err);
+                tracing::warn!("Equity details seeding failed: {}", err);
             }
         },
         Err(err) => {
-            tracing::warn!(
-                "Could not read equity details from S3 for migration: {}",
-                err
-            );
+            tracing::warn!("Could not read equity details from S3 for seeding: {}", err);
         }
     }
 }
@@ -79,7 +76,7 @@ pub async fn run_server(bind_address: &str) -> std::io::Result<()> {
     tracing::info!("Starting data_manager service");
 
     let state = State::from_env().await;
-    migrate_equity_details(&state).await;
+    seed_equity_details_from_s3(&state).await;
     let listener = TcpListener::bind(bind_address).await?;
     spawn_sync_scheduler(state.clone());
     spawn_quote_stream(state.clone());

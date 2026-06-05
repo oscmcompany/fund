@@ -84,3 +84,9 @@ This is a collection of guidelines and references.
 - `devenv tasks run` supports prefix group execution: `checks:python` runs all `checks:python:*` subtasks
 - Prefer validated constructors with private fields over public struct literals — a value in scope should be proof of its
   own validity, not a candidate for re-checking downstream
+- Model data flows as typed morphisms: each function that accepts external data and returns an internal type is a
+  boundary morphism that enforces validity at the edge of the system
+- Place boundary morphisms at every external system boundary (API responses, S3 reads, database rows, WebSocket frames)
+  so that untrusted data never reaches domain logic
+- Prefer compile-time type errors over runtime errors: use enums and newtype wrappers so that invalid states cannot be
+  represented
