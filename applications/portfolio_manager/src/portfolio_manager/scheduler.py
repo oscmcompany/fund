@@ -82,9 +82,9 @@ async def _handle_end_of_day_liquidation_requested(
     rebalance_lock: asyncio.Lock,
 ) -> None:
     loop = asyncio.get_running_loop()
-    current_timestamp = datetime.now(tz=UTC)
 
     async with rebalance_lock:
+        current_timestamp = datetime.now(tz=UTC)
         try:
             closed_count = await loop.run_in_executor(
                 None, alpaca_client.close_all_positions

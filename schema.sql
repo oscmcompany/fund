@@ -523,18 +523,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- End-of-day liquidation trigger: weekdays at 19:45 UTC (3:45 PM EDT, 15 minutes before market close).
+-- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
+-- Uses a timezone-aware schedule so DST is handled correctly year-round.
 -- Fires before the intraday-check window ends so the rebalance lockout window in portfolio-manager
 -- prevents any new pairs from being opened after this point.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
-        PERFORM cron.schedule(
-            'end-of-day-liquidation',
-            '45 19 * * 1-5',
-            $$SELECT liquidate_end_of_day()$$
-        );
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
+        PERFORM cron.unschedule('end-of-day-liquidation');
     END IF;
+    PERFORM cron.schedule_in_timezone(
+        'end-of-day-liquidation',
+        '45 15 * * 1-5',
+        'America/New_York',
+        $$SELECT liquidate_end_of_day()$$
+    );
 END;
 $do$;
 

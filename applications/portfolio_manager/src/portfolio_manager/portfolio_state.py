@@ -1,6 +1,6 @@
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import polars as pl
@@ -248,7 +248,10 @@ async def save_rebalance(  # noqa: PLR0913
         return False
 
 
-async def close_all_open_pairs(closed_at: datetime, close_reason: str) -> bool:
+async def close_all_open_pairs(
+    closed_at: datetime,
+    close_reason: Literal["profit_taken", "stop_loss", "rebalance", "end_of_day"],
+) -> bool:
     """Mark all currently open equity pairs as closed in the database."""
     try:
         pool = await get_pool()
