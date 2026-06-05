@@ -143,8 +143,22 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     realized_profit_and_loss   NUMERIC,
     return_percent             NUMERIC,
     holding_days               INTEGER,
+    close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day')),
     UNIQUE (pair_id, opened_at)
 );
+
+-- Add close_reason column if running against an older schema that lacked it.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_pairs' AND column_name = 'close_reason'
+    ) THEN
+        ALTER TABLE equity_pairs ADD COLUMN close_reason TEXT
+            CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day'));
+    END IF;
+END;
+$do$;
 
 -- Add return_percent column if running against an older schema that lacked it.
 DO $do$
@@ -496,6 +510,29 @@ BEGIN
             'export-equity-quotes',
             '5 21 * * 1-5',
             $$SELECT export_equity_quotes()$$
+        );
+    END IF;
+END;
+$do$;
+
+-- liquidate_end_of_day: emits an event for portfolio-manager to close all open positions
+-- and mark all open pairs as closed before the market close.
+CREATE OR REPLACE FUNCTION liquidate_end_of_day() RETURNS void AS $$
+BEGIN
+    PERFORM emit_event('end_of_day_liquidation_requested', '{}');
+END;
+$$ LANGUAGE plpgsql;
+
+-- End-of-day liquidation trigger: weekdays at 19:45 UTC (3:45 PM EDT, 15 minutes before market close).
+-- Fires before the intraday-check window ends so the rebalance lockout window in portfolio-manager
+-- prevents any new pairs from being opened after this point.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
+        PERFORM cron.schedule(
+            'end-of-day-liquidation',
+            '45 19 * * 1-5',
+            $$SELECT liquidate_end_of_day()$$
         );
     END IF;
 END;

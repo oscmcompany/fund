@@ -248,6 +248,25 @@ async def save_rebalance(  # noqa: PLR0913
         return False
 
 
+async def close_all_open_pairs(closed_at: datetime, close_reason: str) -> bool:
+    """Mark all currently open equity pairs as closed in the database."""
+    try:
+        pool = await get_pool()
+        async with pool.connection() as connection:
+            cursor = await connection.execute(
+                """UPDATE equity_pairs
+                   SET status = 'closed', closed_at = %s, close_reason = %s
+                   WHERE status = 'open'""",
+                (closed_at, close_reason),
+            )
+        closed_count = cursor.rowcount
+        logger.info("Marked all open pairs as closed", closed_count=closed_count)
+        return True  # noqa: TRY300
+    except Exception as error:
+        logger.exception("Failed to close all open pairs in database", error=str(error))
+        return False
+
+
 async def save_performance_snapshot(
     snapshot: dict[str, Any],
     snapshot_type: str = "intraday",
@@ -300,7 +319,8 @@ async def save_closed_pair(record: dict[str, Any]) -> bool:
                        closed_at = %s,
                        realized_profit_and_loss = %s,
                        return_percent = %s,
-                       holding_days = %s
+                       holding_days = %s,
+                       close_reason = %s
                    WHERE pair_id = %s
                      AND status = 'open'
                      AND opened_at = %s""",
@@ -309,6 +329,7 @@ async def save_closed_pair(record: dict[str, Any]) -> bool:
                     record["realized_profit_and_loss"],
                     record["return_percent"],
                     record["holding_days"],
+                    record.get("close_reason", "rebalance"),
                     record["pair_id"],
                     opened_at,
                 ),
