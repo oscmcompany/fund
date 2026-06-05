@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use internal::market::{EquityBar, EquityDetails, EquityQuote};
 use internal::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
@@ -52,8 +52,11 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     Ok(rows_affected)
 }
 
-pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as(
+pub async fn claim_pending_job(
+    pool: &PgPool,
+    job_name: &str,
+) -> Result<Option<(i64, DateTime<Utc>)>, sqlx::Error> {
+    let row: Option<(i64, DateTime<Utc>)> = sqlx::query_as(
         r#"UPDATE scheduled_jobs
            SET claimed_at = now(), status = 'claimed'
            WHERE id = (
@@ -63,17 +66,16 @@ pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i
                LIMIT 1
                FOR UPDATE SKIP LOCKED
            )
-           RETURNING id"#,
+           RETURNING id, scheduled_at"#,
     )
     .bind(job_name)
     .fetch_optional(pool)
     .await?;
 
-    let job_id = row.map(|(id,)| id);
-    if let Some(id) = job_id {
+    if let Some((id, _)) = row {
         debug!("Claimed job {} with id {}", job_name, id);
     }
-    Ok(job_id)
+    Ok(row)
 }
 
 pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<(), sqlx::Error> {

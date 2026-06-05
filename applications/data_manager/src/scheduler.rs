@@ -100,8 +100,8 @@ async fn sync_loop(state: State) {
             Ok(None) => {
                 info!("No equity bar data available for scheduled sync");
             }
-            Err(err) => {
-                error!("Equity bar sync failed: {}", err);
+            Err(error) => {
+                error!("Equity bar sync failed: {}", error);
             }
         }
     }
@@ -153,7 +153,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
 
     loop {
         match database::claim_pending_job(pool, "equity-bar-sync").await {
-            Ok(Some(job_id)) => {
+            Ok(Some((job_id, _))) => {
                 info!("Draining pending equity-bar-sync job on reconnect");
                 match run_equity_bar_sync(state).await {
                     Ok(Some(bar_count)) => {
@@ -178,10 +178,10 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
                     }
-                    Err(err) => {
-                        error!("Drained equity-bar-sync job failed: {}", err);
-                        if let Err(error) = database::fail_job(pool, job_id, &err).await {
-                            warn!("Failed to fail drained job {}: {}", job_id, error);
+                    Err(error) => {
+                        error!("Drained equity-bar-sync job failed: {}", error);
+                        if let Err(fail_error) = database::fail_job(pool, job_id, &error).await {
+                            warn!("Failed to fail drained job {}: {}", job_id, fail_error);
                         }
                     }
                 }
@@ -199,11 +199,28 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         "export-equity-bars",
         "export-trading-history",
     ] {
+        match database::requeue_stale_claimed_jobs(
+            pool,
+            export_job,
+            std::time::Duration::from_secs(2 * 3600),
+        )
+        .await
+        {
+            Ok(count) if count > 0 => {
+                info!("Requeued {} stale claimed job(s) for {}", count, export_job)
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                "Failed to requeue stale claimed jobs for {}: {}",
+                export_job, error
+            ),
+        }
+
         loop {
             match database::claim_pending_job(pool, export_job).await {
-                Ok(Some(job_id)) => {
+                Ok(Some((job_id, scheduled_at))) => {
                     info!("Draining pending {} job on reconnect", export_job);
-                    let export_date = Utc::now().date_naive();
+                    let export_date = scheduled_at.date_naive();
                     let result = run_export_job(state, export_job, export_date).await;
                     match result {
                         Ok(count) => {
@@ -214,10 +231,10 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                                 warn!("Failed to complete drained job {}: {}", job_id, error);
                             }
                         }
-                        Err(ref err) => {
-                            error!("Drained {} failed: {}", export_job, err);
-                            if let Err(error) = database::fail_job(pool, job_id, err).await {
-                                warn!("Failed to fail drained job {}: {}", job_id, error);
+                        Err(ref error) => {
+                            error!("Drained {} failed: {}", export_job, error);
+                            if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
+                                warn!("Failed to fail drained job {}: {}", job_id, fail_error);
                             }
                         }
                     }
@@ -240,7 +257,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                 info!("Received NOTIFY for equity-bar-sync");
 
                 let job_id = match database::claim_pending_job(pool, "equity-bar-sync").await {
-                    Ok(Some(id)) => id,
+                    Ok(Some((id, _))) => id,
                     Ok(None) => {
                         info!("No pending equity-bar-sync job to claim");
                         continue;
@@ -278,11 +295,12 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                             warn!("Failed to complete job {}: {}", job_id, error);
                         }
                     }
-                    Err(err) => {
-                        error!("LISTEN-triggered sync failed: {}", err);
-                        if let Err(error) = database::fail_job(pool, job_id, &err.to_string()).await
+                    Err(error) => {
+                        error!("LISTEN-triggered sync failed: {}", error);
+                        if let Err(fail_error) =
+                            database::fail_job(pool, job_id, &error.to_string()).await
                         {
-                            warn!("Failed to fail job {}: {}", job_id, error);
+                            warn!("Failed to fail job {}: {}", job_id, fail_error);
                         }
                     }
                 }
@@ -290,8 +308,9 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             "export-equity-quotes" | "export-equity-bars" | "export-trading-history" => {
                 info!("Received NOTIFY for {}", payload);
 
-                let job_id = match database::claim_pending_job(pool, payload).await {
-                    Ok(Some(id)) => id,
+                let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
+                {
+                    Ok(Some(row)) => row,
                     Ok(None) => {
                         info!("No pending {} job to claim", payload);
                         continue;
@@ -302,7 +321,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                     }
                 };
 
-                let export_date = Utc::now().date_naive();
+                let export_date = scheduled_at.date_naive();
                 match run_export_job(state, payload, export_date).await {
                     Ok(count) => {
                         info!("{} completed, count: {}", payload, count);
@@ -312,10 +331,10 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                             warn!("Failed to complete job {}: {}", job_id, error);
                         }
                     }
-                    Err(ref err) => {
-                        error!("{} failed: {}", payload, err);
-                        if let Err(error) = database::fail_job(pool, job_id, err).await {
-                            warn!("Failed to fail job {}: {}", job_id, error);
+                    Err(ref error) => {
+                        error!("{} failed: {}", payload, error);
+                        if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
+                            warn!("Failed to fail job {}: {}", job_id, fail_error);
                         }
                     }
                 }

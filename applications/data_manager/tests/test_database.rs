@@ -305,7 +305,7 @@ async fn test_complete_job() {
     .await
     .unwrap();
 
-    let job_id = claim_pending_job(&pool, "equity-bar-sync")
+    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
         .await
         .unwrap()
         .unwrap();
@@ -396,7 +396,7 @@ async fn test_fail_job() {
     .await
     .unwrap();
 
-    let job_id = claim_pending_job(&pool, "equity-bar-sync")
+    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
         .await
         .unwrap()
         .unwrap();
