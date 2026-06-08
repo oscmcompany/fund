@@ -1,4 +1,8 @@
+use chrono::{DateTime, NaiveDate, Utc};
 use internal::market::{EquityBar, EquityDetails, EquityQuote};
+use internal::trading::{
+    EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
+};
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
@@ -48,8 +52,11 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     Ok(rows_affected)
 }
 
-pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as(
+pub async fn claim_pending_job(
+    pool: &PgPool,
+    job_name: &str,
+) -> Result<Option<(i64, DateTime<Utc>)>, sqlx::Error> {
+    let row: Option<(i64, DateTime<Utc>)> = sqlx::query_as(
         r#"UPDATE scheduled_jobs
            SET claimed_at = now(), status = 'claimed'
            WHERE id = (
@@ -59,17 +66,16 @@ pub async fn claim_pending_job(pool: &PgPool, job_name: &str) -> Result<Option<i
                LIMIT 1
                FOR UPDATE SKIP LOCKED
            )
-           RETURNING id"#,
+           RETURNING id, scheduled_at"#,
     )
     .bind(job_name)
     .fetch_optional(pool)
     .await?;
 
-    let job_id = row.map(|(id,)| id);
-    if let Some(id) = job_id {
+    if let Some((id, _)) = row {
         debug!("Claimed job {} with id {}", job_name, id);
     }
-    Ok(job_id)
+    Ok(row)
 }
 
 pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<(), sqlx::Error> {
@@ -212,16 +218,144 @@ pub async fn populate_equity_details_if_empty(
     Ok(rows_affected)
 }
 
-pub async fn set_bucket_guc(pool: &PgPool, bucket_name: &str) -> Result<(), sqlx::Error> {
-    let alter_statement: String = sqlx::query_scalar(
-        r#"SELECT format('ALTER DATABASE %I SET "app.bucket_name" = %L', current_database(), $1)"#,
+pub async fn query_equity_quotes_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<EquityQuote>, sqlx::Error> {
+    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let date_end = date
+        .succ_opt()
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    let quotes = sqlx::query_as::<_, EquityQuote>(
+        "SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size
+         FROM equity_quotes
+         WHERE timestamp >= $1 AND timestamp < $2
+         ORDER BY timestamp ASC",
     )
-    .bind(bucket_name)
-    .fetch_one(pool)
+    .bind(date_start)
+    .bind(date_end)
+    .fetch_all(pool)
     .await?;
-    sqlx::query(&alter_statement).execute(pool).await?;
-    info!("Set app.bucket_name database GUC to {}", bucket_name);
-    Ok(())
+
+    debug!("Queried {} equity quotes for {}", quotes.len(), date);
+    Ok(quotes)
+}
+
+pub async fn delete_equity_quotes_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<u64, sqlx::Error> {
+    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let date_end = date
+        .succ_opt()
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    let result = sqlx::query("DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2")
+        .bind(date_start)
+        .bind(date_end)
+        .execute(pool)
+        .await?;
+
+    let deleted = result.rows_affected();
+    info!(
+        "Deleted {} equity quotes from PostgreSQL for {}",
+        deleted, date
+    );
+    Ok(deleted)
+}
+
+pub async fn query_equity_bars_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<EquityBar>, sqlx::Error> {
+    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let date_end = date
+        .succ_opt()
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+
+    let bars = sqlx::query_as::<_, EquityBar>(
+        "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume,
+         volume_weighted_average_price, transactions, inserted_at
+         FROM equity_bars
+         WHERE timestamp >= $1 AND timestamp < $2
+         ORDER BY ticker ASC, timestamp ASC",
+    )
+    .bind(date_start)
+    .bind(date_end)
+    .fetch_all(pool)
+    .await?;
+
+    debug!("Queried {} equity bars for {}", bars.len(), date);
+    Ok(bars)
+}
+
+pub async fn query_equity_rebalance_sessions(
+    pool: &PgPool,
+) -> Result<Vec<EquityRebalanceSession>, sqlx::Error> {
+    sqlx::query_as::<_, EquityRebalanceSession>(
+        "SELECT id, triggered_at, trigger_reason, model_run_id, completed_at, status
+         FROM equity_rebalance_sessions
+         ORDER BY triggered_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::Error> {
+    sqlx::query_as::<_, EquityPair>(
+        "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,
+         signal_strength, status, opened_at, closed_at, realized_profit_and_loss,
+         return_percent, holding_days
+         FROM equity_pairs
+         ORDER BY opened_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn query_equity_allocations(pool: &PgPool) -> Result<Vec<EquityAllocation>, sqlx::Error> {
+    sqlx::query_as::<_, EquityAllocation>(
+        "SELECT id, rebalance_id, equity_pair_id, generated_at, model_run_id, ticker, side,
+         action, dollar_amount, entry_price, quantity, notional
+         FROM equity_allocations
+         ORDER BY generated_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn query_equity_orders(pool: &PgPool) -> Result<Vec<EquityOrder>, sqlx::Error> {
+    sqlx::query_as::<_, EquityOrder>(
+        "SELECT id, allocation_id, submitted_at, ticker, side, quantity, order_type,
+         limit_price, alpaca_order_id
+         FROM equity_orders
+         ORDER BY submitted_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn query_equity_portfolio_snapshots(
+    pool: &PgPool,
+) -> Result<Vec<EquityPortfolioSnapshot>, sqlx::Error> {
+    sqlx::query_as::<_, EquityPortfolioSnapshot>(
+        "SELECT id, snapshot_timestamp, snapshot_type, net_asset_value, gross_return,
+         net_return, total_slippage_cost, created_at
+         FROM equity_portfolio_snapshots
+         ORDER BY snapshot_timestamp ASC",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn requeue_stale_claimed_jobs(
@@ -366,7 +500,55 @@ mod tests {
     }
 
     #[test]
-    fn test_set_bucket_guc_compiles() {
+    fn test_query_equity_quotes_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = query_equity_quotes_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_delete_equity_quotes_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = delete_equity_quotes_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_bars_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = query_equity_bars_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_rebalance_sessions_compiles() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -374,7 +556,63 @@ mod tests {
         runtime.block_on(async {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
-            let result = set_bucket_guc(&pool, "test-bucket").await;
+            let result = query_equity_rebalance_sessions(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_pairs_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_equity_pairs(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_allocations_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_equity_allocations(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_orders_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_equity_orders(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_portfolio_snapshots_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_equity_portfolio_snapshots(&pool).await;
             assert!(result.is_err());
         });
     }

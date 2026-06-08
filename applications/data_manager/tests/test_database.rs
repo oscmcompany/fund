@@ -3,7 +3,10 @@ mod common;
 use chrono::Utc;
 use data_manager::data::{EquityBar, Ticker};
 use data_manager::database::{
-    claim_pending_job, complete_job, fail_job, insert_equity_bars, set_bucket_guc,
+    claim_pending_job, complete_job, fail_job, insert_equity_bars, query_equity_allocations,
+    query_equity_bars_for_date, query_equity_orders, query_equity_pairs,
+    query_equity_portfolio_snapshots, query_equity_quotes_for_date,
+    query_equity_rebalance_sessions,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -302,7 +305,7 @@ async fn test_complete_job() {
     .await
     .unwrap();
 
-    let job_id = claim_pending_job(&pool, "equity-bar-sync")
+    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
         .await
         .unwrap()
         .unwrap();
@@ -321,29 +324,62 @@ async fn test_complete_job() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn test_set_bucket_guc_persists() {
+async fn test_query_equity_quotes_for_date_returns_empty() {
     let pool = get_pg_pool().await;
+    use chrono::NaiveDate;
+    let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let quotes = query_equity_quotes_for_date(&pool, date).await.unwrap();
+    assert!(quotes.is_empty());
+}
 
-    set_bucket_guc(&pool, "fund-test-data").await.unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_bars_for_date_returns_empty_for_future_date() {
+    let pool = get_pg_pool().await;
+    use chrono::NaiveDate;
+    let date = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+    let bars = query_equity_bars_for_date(&pool, date).await.unwrap();
+    assert!(bars.is_empty());
+}
 
-    // ALTER DATABASE persists the GUC in pg_db_role_setting for all future connections.
-    // Verify the setting appears there with the expected value.
-    let settings: Vec<String> = sqlx::query_scalar(
-        "SELECT unnest(setconfig) FROM pg_db_role_setting \
-         WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database()) \
-         AND setrole = 0",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_rebalance_sessions_returns_empty() {
+    let pool = get_pg_pool().await;
+    let sessions = query_equity_rebalance_sessions(&pool).await.unwrap();
+    assert!(sessions.is_empty());
+}
 
-    assert!(
-        settings.iter().any(
-            |setting| setting.contains("app.bucket_name") && setting.contains("fund-test-data")
-        ),
-        "Expected app.bucket_name GUC to be persisted, got: {:?}",
-        settings
-    );
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_pairs_returns_empty() {
+    let pool = get_pg_pool().await;
+    let pairs = query_equity_pairs(&pool).await.unwrap();
+    assert!(pairs.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_allocations_returns_empty() {
+    let pool = get_pg_pool().await;
+    let allocations = query_equity_allocations(&pool).await.unwrap();
+    assert!(allocations.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_orders_returns_empty() {
+    let pool = get_pg_pool().await;
+    let orders = query_equity_orders(&pool).await.unwrap();
+    assert!(orders.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn test_query_equity_portfolio_snapshots_returns_empty() {
+    let pool = get_pg_pool().await;
+    let snapshots = query_equity_portfolio_snapshots(&pool).await.unwrap();
+    assert!(snapshots.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -360,7 +396,7 @@ async fn test_fail_job() {
     .await
     .unwrap();
 
-    let job_id = claim_pending_job(&pool, "equity-bar-sync")
+    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
         .await
         .unwrap()
         .unwrap();

@@ -10,8 +10,6 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::database::set_bucket_guc;
-
 /// Alpaca API credentials.
 ///
 /// The private fields enforce that credentials are only constructed when both
@@ -148,9 +146,6 @@ impl State {
                 match PgPool::connect(&database_url).await {
                     Ok(pool) => {
                         info!("Connected to PostgreSQL");
-                        if let Err(error) = set_bucket_guc(&pool, &bucket_name).await {
-                            warn!("Failed to set app.bucket_name database GUC: {}", error);
-                        }
                         DatabaseState::Connected(pool)
                     }
                     Err(error) => {
