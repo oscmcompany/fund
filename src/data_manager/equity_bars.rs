@@ -82,6 +82,22 @@ fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Opt
     })
 }
 
+/// S3 key for a day's equity bars.
+///
+/// This must stay byte-for-byte aligned with the nightly pg_parquet export
+/// (`export_equity_bars` in `schema.sql`) and the tide training reader so that
+/// backfilled and nightly files are read uniformly from one prefix; an earlier
+/// stray `daily/` segment here diverged from both and hid backfilled data from
+/// training.
+fn equity_bars_key(date: NaiveDate) -> String {
+    format!(
+        "data/equity/bars/year={}/month={:02}/day={:02}/data.parquet",
+        date.year(),
+        date.month(),
+        date.day()
+    )
+}
+
 async fn write_equity_bars_to_s3(
     state: &State,
     trading_date: &TradingDate,
@@ -95,13 +111,7 @@ async fn write_equity_bars_to_s3(
         .finish(&mut dataframe)
         .map_err(|error| format!("Failed to serialize Parquet: {}", error))?;
 
-    let date = trading_date.as_naive_date();
-    let key = format!(
-        "data/equity/bars/daily/year={}/month={:02}/day={:02}/data.parquet",
-        date.year(),
-        date.month(),
-        date.day()
-    );
+    let key = equity_bars_key(trading_date.as_naive_date());
 
     state
         .s3_client
@@ -117,6 +127,20 @@ async fn write_equity_bars_to_s3(
     Ok(())
 }
 
+/// Build the Massive grouped-daily bars URL for a date.
+///
+/// The configured `MASSIVE_BASE_URL` may carry a trailing slash (the
+/// `development/chris.addy` secret is `https://api.massive.com/`); joining it
+/// naively yields a `//` that the API answers with 404, so the base is
+/// normalized here before the path is appended.
+fn grouped_bars_url(base: &str, date: &str) -> String {
+    format!(
+        "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
+        base.trim_end_matches('/'),
+        date
+    )
+}
+
 async fn fetch_equity_bars_for_date(
     state: &State,
     trading_date: &TradingDate,
@@ -124,10 +148,7 @@ async fn fetch_equity_bars_for_date(
     let massive_api_key = state.massive.key.clone();
 
     let date_str = trading_date.as_naive_date().format("%Y-%m-%d").to_string();
-    let url = format!(
-        "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
-        state.massive.base, date_str
-    );
+    let url = grouped_bars_url(&state.massive.base, &date_str);
 
     info!("Sending request to Massive API");
     let response = state
@@ -345,8 +366,35 @@ pub async fn sync(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_equity_bar, EquityBarResult};
-    use chrono::{DateTime, Utc};
+    use super::{equity_bars_key, grouped_bars_url, parse_equity_bar, EquityBarResult};
+    use chrono::{DateTime, NaiveDate, Utc};
+
+    #[test]
+    fn test_equity_bars_key_matches_export_convention() {
+        // Must match `export_equity_bars` in schema.sql and the tide reader:
+        // `data/equity/bars/year=YYYY/month=MM/day=DD/data.parquet` (no `daily/`).
+        let date = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+        assert_eq!(
+            equity_bars_key(date),
+            "data/equity/bars/year=2026/month=06/day=05/data.parquet"
+        );
+    }
+
+    #[test]
+    fn test_grouped_bars_url_trims_trailing_slash() {
+        assert_eq!(
+            grouped_bars_url("https://api.massive.com/", "2026-06-05"),
+            "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/2026-06-05"
+        );
+    }
+
+    #[test]
+    fn test_grouped_bars_url_without_trailing_slash() {
+        assert_eq!(
+            grouped_bars_url("https://api.massive.com", "2026-06-05"),
+            "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/2026-06-05"
+        );
+    }
 
     fn make_valid_result() -> EquityBarResult {
         EquityBarResult {
