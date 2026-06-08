@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use internal::market::{EquityBar, EquityDetails, EquityQuote};
 use internal::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
@@ -218,17 +218,22 @@ pub async fn populate_equity_details_if_empty(
     Ok(rows_affected)
 }
 
+fn date_to_utc_range(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end = date
+        .checked_add_days(Days::new(1))
+        .expect("date out of representable range")
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    (start, end)
+}
+
 pub async fn query_equity_quotes_for_date(
     pool: &PgPool,
     date: NaiveDate,
 ) -> Result<Vec<EquityQuote>, sqlx::Error> {
-    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let date_end = date
-        .succ_opt()
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc();
+    let (date_start, date_end) = date_to_utc_range(date);
 
     let quotes = sqlx::query_as::<_, EquityQuote>(
         "SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size
@@ -249,13 +254,7 @@ pub async fn delete_equity_quotes_for_date(
     pool: &PgPool,
     date: NaiveDate,
 ) -> Result<u64, sqlx::Error> {
-    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let date_end = date
-        .succ_opt()
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc();
+    let (date_start, date_end) = date_to_utc_range(date);
 
     let result = sqlx::query("DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2")
         .bind(date_start)
@@ -275,13 +274,7 @@ pub async fn query_equity_bars_for_date(
     pool: &PgPool,
     date: NaiveDate,
 ) -> Result<Vec<EquityBar>, sqlx::Error> {
-    let date_start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let date_end = date
-        .succ_opt()
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc();
+    let (date_start, date_end) = date_to_utc_range(date);
 
     let bars = sqlx::query_as::<_, EquityBar>(
         "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume,

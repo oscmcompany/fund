@@ -351,21 +351,6 @@ END;
 $do$;
 DROP FUNCTION IF EXISTS archive_equity_quotes();
 
--- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
--- and after 4 PM Eastern market close in both EDT and EST)
--- Only scheduled when pg_parquet is available; export_equity_quotes() also guards at runtime.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
-       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
-        PERFORM cron.schedule(
-            'export-equity-quotes',
-            '5 21 * * 1-5',
-            $$SELECT export_equity_quotes()$$
-        );
-    END IF;
-END;
-$do$;
 
 -- liquidate_end_of_day: emits an event for portfolio-manager to close all open positions
 -- and mark all open pairs as closed before the market close.

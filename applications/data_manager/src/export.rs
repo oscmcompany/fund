@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_equity_quotes_returns_zero_when_no_database() {
+    fn test_export_equity_quotes_returns_error_when_no_database() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

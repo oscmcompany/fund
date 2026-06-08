@@ -1,6 +1,6 @@
 mod common;
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use data_manager::data::{EquityBar, Ticker};
 use data_manager::database::{
     claim_pending_job, complete_job, fail_job, insert_equity_bars, query_equity_allocations,
@@ -326,7 +326,7 @@ async fn test_complete_job() {
 #[serial]
 async fn test_query_equity_quotes_for_date_returns_empty() {
     let pool = get_pg_pool().await;
-    use chrono::NaiveDate;
+    clean_tables(&pool).await;
     let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
     let quotes = query_equity_quotes_for_date(&pool, date).await.unwrap();
     assert!(quotes.is_empty());
@@ -336,7 +336,7 @@ async fn test_query_equity_quotes_for_date_returns_empty() {
 #[serial]
 async fn test_query_equity_bars_for_date_returns_empty_for_future_date() {
     let pool = get_pg_pool().await;
-    use chrono::NaiveDate;
+    clean_tables(&pool).await;
     let date = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
     let bars = query_equity_bars_for_date(&pool, date).await.unwrap();
     assert!(bars.is_empty());
@@ -346,6 +346,7 @@ async fn test_query_equity_bars_for_date_returns_empty_for_future_date() {
 #[serial]
 async fn test_query_equity_rebalance_sessions_returns_empty() {
     let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
     let sessions = query_equity_rebalance_sessions(&pool).await.unwrap();
     assert!(sessions.is_empty());
 }
@@ -354,6 +355,7 @@ async fn test_query_equity_rebalance_sessions_returns_empty() {
 #[serial]
 async fn test_query_equity_pairs_returns_empty() {
     let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
     let pairs = query_equity_pairs(&pool).await.unwrap();
     assert!(pairs.is_empty());
 }
@@ -362,6 +364,7 @@ async fn test_query_equity_pairs_returns_empty() {
 #[serial]
 async fn test_query_equity_allocations_returns_empty() {
     let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
     let allocations = query_equity_allocations(&pool).await.unwrap();
     assert!(allocations.is_empty());
 }
@@ -370,6 +373,7 @@ async fn test_query_equity_allocations_returns_empty() {
 #[serial]
 async fn test_query_equity_orders_returns_empty() {
     let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
     let orders = query_equity_orders(&pool).await.unwrap();
     assert!(orders.is_empty());
 }
@@ -378,6 +382,7 @@ async fn test_query_equity_orders_returns_empty() {
 #[serial]
 async fn test_query_equity_portfolio_snapshots_returns_empty() {
     let pool = get_pg_pool().await;
+    clean_tables(&pool).await;
     let snapshots = query_equity_portfolio_snapshots(&pool).await.unwrap();
     assert!(snapshots.is_empty());
 }
