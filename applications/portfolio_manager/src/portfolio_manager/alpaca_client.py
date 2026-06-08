@@ -1,4 +1,5 @@
 import time
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import structlog
@@ -105,6 +106,19 @@ class AlpacaClient:
         clock: Clock = cast("Clock", self.trading_client.get_clock())
         time.sleep(self.rate_limit_sleep)
         return bool(clock.is_open)
+
+    @_alpaca_retry
+    def get_minutes_to_market_close(self) -> float | None:
+        """Return minutes until market close if the market is open, otherwise None."""
+        clock: Clock = cast("Clock", self.trading_client.get_clock())
+        time.sleep(self.rate_limit_sleep)
+        if not clock.is_open:
+            return None
+        next_close = clock.next_close
+        if next_close.tzinfo is None:
+            next_close = next_close.replace(tzinfo=UTC)
+        minutes_remaining = (next_close - datetime.now(tz=UTC)).total_seconds() / 60.0
+        return max(0.0, minutes_remaining)
 
     @_alpaca_retry
     def get_account(self) -> AlpacaAccount:
@@ -292,6 +306,19 @@ class AlpacaClient:
             }
             for position in positions
         ]
+
+    @_alpaca_retry
+    def close_all_positions(self) -> int:
+        """Close all open positions and cancel all open orders.
+
+        Returns the number of positions submitted for closing.
+        """
+        responses = cast(
+            "list[object]",
+            self.trading_client.close_all_positions(cancel_orders=True),
+        )
+        time.sleep(self.rate_limit_sleep)
+        return len(responses)
 
     @_alpaca_retry
     def close_position(
