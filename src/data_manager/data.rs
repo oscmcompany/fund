@@ -47,7 +47,12 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<Dat
         "volume" => equity_bars_rows.iter().map(|b| b.volume).collect::<Vec<i64>>(),
         "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
         "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
-        "inserted_at" => equity_bars_rows.iter().map(|b| b.inserted_at.timestamp_millis()).collect::<Vec<_>>(),
+        // `inserted_at` is deliberately excluded: the S3 parquet schema is the
+        // equity_bars_schema pandera contract (9 columns, Int64 timestamp),
+        // which the nightly pg_parquet export (export_equity_bars in schema.sql)
+        // also targets. Including inserted_at made backfilled files 10 columns
+        // wide and broke the tide training reader's per-day concat. inserted_at
+        // remains on the EquityBar row for the PostgreSQL insert path only.
     )
     .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 
@@ -62,8 +67,55 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<Dat
 
 #[cfg(test)]
 mod tests {
-    use super::TradingDate;
-    use chrono::NaiveDate;
+    use super::{create_equity_bar_dataframe, EquityBar, Ticker, TradingDate};
+    use chrono::{NaiveDate, Utc};
+    use polars::prelude::DataType;
+
+    fn sample_bar() -> EquityBar {
+        EquityBar {
+            ticker: Ticker::new("AAPL").unwrap(),
+            timestamp: Utc::now(),
+            open_price: 100.0,
+            high_price: 110.0,
+            low_price: 99.0,
+            close_price: 105.0,
+            volume: 2_000_000,
+            volume_weighted_average_price: Some(104.0),
+            transactions: Some(1_000),
+            inserted_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_equity_bar_dataframe_matches_pandera_contract() {
+        // The S3 parquet schema is the equity_bars_schema pandera contract:
+        // exactly these 9 columns in order, Int64 timestamp/transactions, and
+        // NO inserted_at. The nightly pg_parquet export targets the same shape,
+        // so backfilled and nightly files concat uniformly in the tide reader.
+        let dataframe = create_equity_bar_dataframe(&[sample_bar()]).unwrap();
+        assert_eq!(
+            dataframe.get_column_names_str(),
+            [
+                "ticker",
+                "timestamp",
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "volume",
+                "volume_weighted_average_price",
+                "transactions",
+            ]
+        );
+        assert_eq!(
+            dataframe.column("timestamp").unwrap().dtype(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            dataframe.column("transactions").unwrap().dtype(),
+            &DataType::Int64
+        );
+    }
 
     #[test]
     fn test_trading_date_accepts_monday() {
