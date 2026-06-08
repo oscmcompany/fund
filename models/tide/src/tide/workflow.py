@@ -343,7 +343,9 @@ def training_pipeline(
 
 if __name__ == "__main__":
     try:
-        lookback_days = int(os.getenv("FUND_LOOKBACK_DAYS", "365"))
+        # An env var set to the empty string is not "unset", so getenv's default
+        # would not apply; treat empty as unset and fall back to the default.
+        lookback_days = int(os.getenv("FUND_LOOKBACK_DAYS") or "365")
     except ValueError:
         logger.exception("FUND_LOOKBACK_DAYS must be a valid integer")
         sys.exit(1)

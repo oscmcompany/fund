@@ -15,6 +15,17 @@
 
   bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
 
+  # Training lookback window. Read from the environment so it can be overridden
+  # per run (e.g. FUND_LOOKBACK_DAYS=1200 devenv --profile ml ...); a hardcoded
+  # empty default would both shadow the override and break int parsing in the
+  # tide workflow, which only falls back to its own default when the var is
+  # unset, not when it is the empty string.
+  rawLookbackDays = builtins.getEnv "FUND_LOOKBACK_DAYS";
+  lookbackDays =
+    if rawLookbackDays == ""
+    then "365"
+    else rawLookbackDays;
+
   # Log directory. Deployed profiles keep the root-owned /var/log/fund path
   # (provisioned on the VM, where logrotate and monitoring expect it). Local
   # development points FUND_LOG_DIR at an XDG state path so file logging works
@@ -633,7 +644,7 @@ in {
 
   profiles.ml.module = {
     env = {
-      FUND_LOOKBACK_DAYS = "";
+      FUND_LOOKBACK_DAYS = lookbackDays;
       MLFLOW_TRACKING_URI = "";
       PREFECT_API_URL = "";
     };
