@@ -86,5 +86,6 @@ This is a collection of guidelines and references.
   own validity, not a candidate for re-checking downstream
 - `schema.sql` is the single source of truth for the database schema; all DDL must use idempotent forms
   (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`,
-  `DO $do$ IF NOT EXISTS cron.schedule(...)`, etc.) so the file can be safely re-run against any populated
-  database — never add migration-style `ALTER TABLE`, `DROP TABLE`, or bare `UPDATE` blocks
+  `DO` block checking `cron.job` for existence before calling `cron.schedule*(...)`, etc.)
+  so the file can be safely re-run against any populated database — never add migration-style
+  `ALTER TABLE`, `DROP TABLE`, or bare `UPDATE` blocks

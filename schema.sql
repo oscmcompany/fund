@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp D
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
--- Exported to S3 Parquet daily then purged; retained for auditing and TUI use.
+-- Exported to S3 Parquet daily, then purged from Postgres; the S3 copy is retained for auditing and TUI use.
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
@@ -109,6 +109,19 @@ CREATE TABLE IF NOT EXISTS equity_orders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_equity_orders_allocation_id ON equity_orders (allocation_id); -- noqa: PG01
+
+-- Idempotent constraint backfill: adds the side CHECK to existing deployments where CREATE TABLE was a no-op.
+-- NOT VALID skips scanning existing rows; safe to re-run.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'equity_orders_side_check' AND conrelid = 'equity_orders'::regclass
+    ) THEN
+        ALTER TABLE equity_orders ADD CONSTRAINT equity_orders_side_check CHECK (side IN ('LONG', 'SHORT')) NOT VALID;
+    END IF;
+END;
+$do$;
 
 -- equity_portfolio_snapshots: per-rebalance portfolio state snapshots
 -- 'intraday' rows are recorded after each live rebalance; gross_return and net_return are NULL.
