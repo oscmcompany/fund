@@ -178,7 +178,7 @@ in {
     xenon
   ];
 
-  scripts.db-seed.exec = ''
+  scripts.database-seed.exec = ''
     set -euo pipefail
     echo "Downloading latest database snapshot..."
     aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
@@ -188,17 +188,6 @@ in {
       --no-owner --no-acl \
       --dbname fund --clean --if-exists /tmp/fund-latest.dump
     echo "Database seeded"
-  '';
-
-  scripts.db-migrate.exec = ''
-    set -euo pipefail
-    echo "Waiting for PostgreSQL..."
-    while ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; do sleep 1; done
-    echo "Applying schema migrations..."
-    psql -h localhost -p 5432 -d fund \
-      -f ${./schema.sql} \
-      --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
-    echo "Schema migrations applied"
   '';
 
   scripts.aws-buckets.exec = ''

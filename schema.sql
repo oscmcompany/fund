@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp D
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
 -- equity_quotes: intraday bid/ask rolling 24-hour buffer
--- Exported to S3 Parquet daily then purged; future use: replay simulation
+-- Exported to S3 Parquet daily then purged; retained for auditing and TUI use.
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
@@ -71,46 +71,6 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     UNIQUE (pair_id, opened_at)
 );
 
--- Add close_reason column if running against an older schema that lacked it.
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_pairs' AND column_name = 'close_reason'
-    ) THEN
-        ALTER TABLE equity_pairs ADD COLUMN close_reason TEXT
-            CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day'));
-    END IF;
-END;
-$do$;
-
--- Add return_percent column if running against an older schema that lacked it.
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_pairs' AND column_name = 'return_percent'
-    ) THEN
-        ALTER TABLE equity_pairs ADD COLUMN return_percent NUMERIC;
-    END IF;
-END;
-$do$;
-
--- Drop equity_allocations (and equity_orders that reference it) if running against the old schema
--- (target_weight/reference_price columns). The new schema is incompatible: it requires FKs to
--- equity_pairs (a new table), so old rows cannot be preserved.
-DO $do$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_allocations' AND column_name = 'target_weight'
-    ) THEN
-        DROP TABLE IF EXISTS equity_orders;
-        DROP TABLE equity_allocations;
-    END IF;
-END;
-$do$;
-
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
 -- quantity: whole-share intent for SHORT legs (nullable for LONG legs).
@@ -141,7 +101,7 @@ CREATE TABLE IF NOT EXISTS equity_orders (
     allocation_id    UUID        NOT NULL REFERENCES equity_allocations(id),
     submitted_at     TIMESTAMPTZ NOT NULL,
     ticker           TEXT        NOT NULL,
-    side             TEXT        NOT NULL,
+    side             TEXT        NOT NULL CHECK (side IN ('LONG', 'SHORT')),
     quantity         NUMERIC     NOT NULL,
     order_type       TEXT        NOT NULL,
     limit_price      NUMERIC,
@@ -341,17 +301,6 @@ BEGIN
 END;
 $do$;
 
--- Remove legacy archive-quotes cron job and function on existing deployments.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
-        PERFORM cron.unschedule('archive-quotes');
-    END IF;
-END;
-$do$;
-DROP FUNCTION IF EXISTS archive_equity_quotes();
-
-
 -- liquidate_end_of_day: emits an event for portfolio-manager to close all open positions
 -- and mark all open pairs as closed before the market close.
 CREATE OR REPLACE FUNCTION liquidate_end_of_day() RETURNS void AS $$
@@ -366,15 +315,14 @@ $$ LANGUAGE plpgsql;
 -- prevents any new pairs from being opened after this point.
 DO $do$
 BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
-        PERFORM cron.unschedule('end-of-day-liquidation');
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
+        PERFORM cron.schedule_in_timezone(
+            'end-of-day-liquidation',
+            '45 15 * * 1-5',
+            'America/New_York',
+            $$SELECT liquidate_end_of_day()$$
+        );
     END IF;
-    PERFORM cron.schedule_in_timezone(
-        'end-of-day-liquidation',
-        '45 15 * * 1-5',
-        'America/New_York',
-        $$SELECT liquidate_end_of_day()$$
-    );
 END;
 $do$;
 
@@ -404,12 +352,6 @@ $do$;
 -- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
 BEGIN
-    PERFORM cron.unschedule('export-equity-quotes');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
-DO $do$
-BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
         PERFORM cron.schedule(
             'export-equity-quotes',
@@ -422,12 +364,6 @@ $do$;
 
 -- Nightly equity bars export: weekdays at 21:30 UTC.
 -- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    PERFORM cron.unschedule('export-equity-bars');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
@@ -443,12 +379,6 @@ $do$;
 -- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15
 -- so today's snapshot is included).
 -- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    PERFORM cron.unschedule('export-trading-history');
-EXCEPTION WHEN OTHERS THEN NULL;
-END;
-$do$;
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
