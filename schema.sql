@@ -67,8 +67,49 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     realized_profit_and_loss   NUMERIC,
     return_percent             NUMERIC,
     holding_days               INTEGER,
+    close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day')),
     UNIQUE (pair_id, opened_at)
 );
+
+-- Add close_reason column if running against an older schema that lacked it.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_pairs' AND column_name = 'close_reason'
+    ) THEN
+        ALTER TABLE equity_pairs ADD COLUMN close_reason TEXT
+            CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day'));
+    END IF;
+END;
+$do$;
+
+-- Add return_percent column if running against an older schema that lacked it.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_pairs' AND column_name = 'return_percent'
+    ) THEN
+        ALTER TABLE equity_pairs ADD COLUMN return_percent NUMERIC;
+    END IF;
+END;
+$do$;
+
+-- Drop equity_allocations (and equity_orders that reference it) if running against the old schema
+-- (target_weight/reference_price columns). The new schema is incompatible: it requires FKs to
+-- equity_pairs (a new table), so old rows cannot be preserved.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_allocations' AND column_name = 'target_weight'
+    ) THEN
+        DROP TABLE IF EXISTS equity_orders;
+        DROP TABLE equity_allocations;
+    END IF;
+END;
+$do$;
 
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
@@ -297,6 +338,58 @@ BEGIN
             $$SELECT emit_event('intraday_check', '{}')$$
         );
     END IF;
+END;
+$do$;
+
+-- Remove legacy archive-quotes cron job and function on existing deployments.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'archive-quotes') THEN
+        PERFORM cron.unschedule('archive-quotes');
+    END IF;
+END;
+$do$;
+DROP FUNCTION IF EXISTS archive_equity_quotes();
+
+-- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
+-- and after 4 PM Eastern market close in both EDT and EST)
+-- Only scheduled when pg_parquet is available; export_equity_quotes() also guards at runtime.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_parquet')
+       AND NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
+        PERFORM cron.schedule(
+            'export-equity-quotes',
+            '5 21 * * 1-5',
+            $$SELECT export_equity_quotes()$$
+        );
+    END IF;
+END;
+$do$;
+
+-- liquidate_end_of_day: emits an event for portfolio-manager to close all open positions
+-- and mark all open pairs as closed before the market close.
+CREATE OR REPLACE FUNCTION liquidate_end_of_day() RETURNS void AS $$
+BEGIN
+    PERFORM emit_event('end_of_day_liquidation_requested', '{}');
+END;
+$$ LANGUAGE plpgsql;
+
+-- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
+-- Uses a timezone-aware schedule so DST is handled correctly year-round.
+-- Fires before the intraday-check window ends so the rebalance lockout window in portfolio-manager
+-- prevents any new pairs from being opened after this point.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
+        PERFORM cron.unschedule('end-of-day-liquidation');
+    END IF;
+    PERFORM cron.schedule_in_timezone(
+        'end-of-day-liquidation',
+        '45 15 * * 1-5',
+        'America/New_York',
+        $$SELECT liquidate_end_of_day()$$
+    );
 END;
 $do$;
 

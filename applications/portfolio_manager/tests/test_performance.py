@@ -461,6 +461,7 @@ def test_build_closed_pair_record_returns_dict_with_all_required_keys() -> None:
     assert "realized_profit_and_loss" in result
     assert "return_percent" in result
     assert "holding_days" in result
+    assert "close_reason" in result
 
 
 def test_build_closed_pair_record_holding_days_computed_correctly() -> None:
@@ -497,3 +498,4 @@ def test_build_closed_pair_record_correct_values() -> None:
     assert result["dollar_amount"] == pytest.approx(2000.0)
     assert result["realized_profit_and_loss"] == pytest.approx(100.0)
     assert result["return_percent"] == pytest.approx(0.05)
+    assert result["close_reason"] == "rebalance"
