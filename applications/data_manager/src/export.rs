@@ -48,9 +48,9 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
 
 /// Exports all trading history tables to S3 Parquet.
 ///
-/// Exports equity_quotes, equity_rebalance_sessions, equity_pairs, equity_allocations,
-/// equity_orders, equity_portfolio_snapshots, and model_runs. Deletes the exported
-/// equity_quotes rows from the database after a successful S3 write.
+/// Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
+/// equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs. Deletes the
+/// exported equity_quotes rows from the database after a successful S3 write.
 pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<usize, String> {
     let pool = state
         .database
@@ -383,22 +383,22 @@ fn create_equity_prediction_dataframe(
 
 fn create_model_run_dataframe(model_runs: &[ModelRun]) -> Result<DataFrame, String> {
     df!(
-        "id" => model_runs.iter().map(|run| run.id).collect::<Vec<i64>>(),
-        "run_id" => model_runs.iter().map(|run| run.run_id.as_str()).collect::<Vec<&str>>(),
-        "model_name" => model_runs.iter().map(|run| run.model_name.as_str()).collect::<Vec<&str>>(),
-        "artifact_key" => model_runs.iter().map(|run| run.artifact_key.as_deref()).collect::<Vec<Option<&str>>>(),
-        "training_data_key" => model_runs.iter().map(|run| run.training_data_key.as_deref()).collect::<Vec<Option<&str>>>(),
-        "start_date" => model_runs.iter().map(|run| run.start_date.map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
-        "end_date" => model_runs.iter().map(|run| run.end_date.map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
-        "lookback_days" => model_runs.iter().map(|run| run.lookback_days).collect::<Vec<Option<i32>>>(),
-        "status" => model_runs.iter().map(|run| run.status.as_str()).collect::<Vec<&str>>(),
-        "continuous_ranked_probability_score" => model_runs.iter().map(|run| run.continuous_ranked_probability_score).collect::<Vec<Option<f64>>>(),
-        "directional_accuracy" => model_runs.iter().map(|run| run.directional_accuracy).collect::<Vec<Option<f64>>>(),
-        "quantile_coverage" => model_runs.iter().map(|run| run.quantile_coverage).collect::<Vec<Option<f64>>>(),
-        "drift_status" => model_runs.iter().map(|run| run.drift_status.as_deref()).collect::<Vec<Option<&str>>>(),
-        "stage_counts" => model_runs.iter().map(|run| run.stage_counts.as_ref().map(|value| value.to_string())).collect::<Vec<Option<String>>>(),
-        "started_at" => model_runs.iter().map(|run| run.started_at.timestamp_millis()).collect::<Vec<i64>>(),
-        "completed_at" => model_runs.iter().map(|run| run.completed_at.map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "id" => model_runs.iter().map(|model_run| model_run.id).collect::<Vec<i64>>(),
+        "run_id" => model_runs.iter().map(|model_run| model_run.run_id.as_str()).collect::<Vec<&str>>(),
+        "model_name" => model_runs.iter().map(|model_run| model_run.model_name.as_str()).collect::<Vec<&str>>(),
+        "artifact_key" => model_runs.iter().map(|model_run| model_run.artifact_key.as_deref()).collect::<Vec<Option<&str>>>(),
+        "training_data_key" => model_runs.iter().map(|model_run| model_run.training_data_key.as_deref()).collect::<Vec<Option<&str>>>(),
+        "start_date" => model_runs.iter().map(|model_run| model_run.start_date.map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
+        "end_date" => model_runs.iter().map(|model_run| model_run.end_date.map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
+        "lookback_days" => model_runs.iter().map(|model_run| model_run.lookback_days).collect::<Vec<Option<i32>>>(),
+        "status" => model_runs.iter().map(|model_run| model_run.status.as_str()).collect::<Vec<&str>>(),
+        "continuous_ranked_probability_score" => model_runs.iter().map(|model_run| model_run.continuous_ranked_probability_score).collect::<Vec<Option<f64>>>(),
+        "directional_accuracy" => model_runs.iter().map(|model_run| model_run.directional_accuracy).collect::<Vec<Option<f64>>>(),
+        "quantile_coverage" => model_runs.iter().map(|model_run| model_run.quantile_coverage).collect::<Vec<Option<f64>>>(),
+        "drift_status" => model_runs.iter().map(|model_run| model_run.drift_status.as_deref()).collect::<Vec<Option<&str>>>(),
+        "stage_counts" => model_runs.iter().map(|model_run| model_run.stage_counts.as_ref().map(|value| value.to_string())).collect::<Vec<Option<String>>>(),
+        "started_at" => model_runs.iter().map(|model_run| model_run.started_at.timestamp_millis()).collect::<Vec<i64>>(),
+        "completed_at" => model_runs.iter().map(|model_run| model_run.completed_at.map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
     )
     .map_err(|error| format!("Failed to create model run DataFrame: {}", error))
 }

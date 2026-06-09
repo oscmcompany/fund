@@ -413,8 +413,8 @@ $do$;
 
 -- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15
 -- so today's snapshot is included).
--- Exports equity_quotes, equity_rebalance_sessions, equity_pairs, equity_allocations,
--- equity_orders, equity_portfolio_snapshots, and model_runs; deletes exported equity_quotes rows.
+-- Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
+-- equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs; deletes exported equity_quotes rows.
 -- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
 BEGIN
