@@ -36,7 +36,11 @@ impl Default for TrainConfig {
             epoch_count: 20,
             batch_size: 512,
             early_stopping_patience: 3,
-            min_delta: 0.001,
+            // The scaled-return quantile loss sits around 1e-4, so the Python
+            // default min_delta of 1e-3 never registered an improvement and
+            // training always stopped after `patience`. Use a delta below the
+            // loss scale so genuine epoch-over-epoch gains keep training going.
+            min_delta: 1e-5,
         }
     }
 }

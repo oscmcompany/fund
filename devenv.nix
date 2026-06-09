@@ -135,6 +135,13 @@ in {
     # S3 bucket name derived from FUND_PROFILE
     AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
 
+    # Model artifacts live in the same per-profile bucket under models/tide/.
+    # The Rust trainer (tide_train) writes here and the ensemble inference
+    # service (AppState::from_env) reads here, so training and serving agree in
+    # both dev and production.
+    AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME = "oscm-fund-${bucketSlug}";
+    AWS_S3_MODEL_ARTIFACT_PATH = "models/tide/";
+
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
     PGDATABASE = "fund";
