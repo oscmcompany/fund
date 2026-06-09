@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -562,6 +563,127 @@ def test_close_position_reraises_other_api_errors() -> None:
 
     with pytest.raises(_FakeAPIError):
         client.close_position(ticker="AAPL")
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_minutes_to_market_close_returns_none_when_market_closed(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = False
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.get_minutes_to_market_close()
+
+    assert result is None
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_minutes_to_market_close_returns_minutes_when_market_open(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = True
+    mock_clock.next_close = datetime.now(tz=UTC) + timedelta(minutes=30)
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.get_minutes_to_market_close()
+
+    _expected_lower = 29.0
+    _expected_upper = 30.0
+    assert result is not None
+    assert _expected_lower < result <= _expected_upper
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_minutes_to_market_close_returns_zero_at_market_close(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = True
+    mock_clock.next_close = datetime.now(tz=UTC) - timedelta(seconds=5)
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.get_minutes_to_market_close()
+
+    assert result == 0.0
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_get_minutes_to_market_close_handles_naive_datetime(
+    mock_sleep: MagicMock,  # noqa: ARG001
+) -> None:
+    client, mock_trading = _make_client()
+    mock_clock = MagicMock()
+    mock_clock.is_open = True
+    # Naive datetime (no tzinfo) — should be treated as UTC.
+    naive_now = datetime.now(tz=UTC).replace(tzinfo=None)
+    mock_clock.next_close = naive_now + timedelta(minutes=15)
+    mock_trading.get_clock.return_value = mock_clock
+
+    result = client.get_minutes_to_market_close()
+
+    assert result is not None
+    assert result >= 0.0
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_close_all_positions_returns_count(mock_sleep: MagicMock) -> None:
+    client, mock_trading = _make_client()
+    mock_trading.close_all_positions.return_value = [MagicMock(), MagicMock()]
+
+    result = client.close_all_positions()
+
+    expected_count = 2
+    assert result == expected_count
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_close_all_positions_returns_zero_when_no_positions(
+    mock_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    mock_trading.close_all_positions.return_value = []
+
+    result = client.close_all_positions()
+
+    assert result == 0
+    mock_sleep.assert_called_once_with(client.rate_limit_sleep)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+def test_close_all_positions_passes_cancel_orders_true(mock_sleep: MagicMock) -> None:  # noqa: ARG001
+    client, mock_trading = _make_client()
+    mock_trading.close_all_positions.return_value = []
+
+    client.close_all_positions()
+
+    mock_trading.close_all_positions.assert_called_once_with(cancel_orders=True)
+
+
+@patch("portfolio_manager.alpaca_client.time.sleep")
+@patch("tenacity.nap.time.sleep")
+def test_close_all_positions_retries_on_transient_error(
+    mock_tenacity_sleep: MagicMock,
+    mock_rate_limit_sleep: MagicMock,
+) -> None:
+    client, mock_trading = _make_client()
+    transient_error = _FakeAPIError("service unavailable", status_code=503)
+    mock_trading.close_all_positions.side_effect = [transient_error, []]
+
+    result = client.close_all_positions()
+
+    expected_attempts = 2
+    assert result == 0
+    assert mock_trading.close_all_positions.call_count == expected_attempts
+    assert mock_tenacity_sleep is not None
+    assert mock_rate_limit_sleep.called
 
 
 def _make_mock_position(

@@ -1,6 +1,7 @@
 use crate::data_manager::data::TradingDate;
 use crate::data_manager::database;
 use crate::data_manager::equity_bars::fetch_and_store;
+use crate::data_manager::export;
 use crate::data_manager::state::State;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::US::Eastern;
@@ -99,8 +100,8 @@ async fn sync_loop(state: State) {
             Ok(None) => {
                 info!("No equity bar data available for scheduled sync");
             }
-            Err(err) => {
-                error!("Equity bar sync failed: {}", err);
+            Err(error) => {
+                error!("Equity bar sync failed: {}", error);
             }
         }
     }
@@ -152,7 +153,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
 
     loop {
         match database::claim_pending_job(pool, "equity-bar-sync").await {
-            Ok(Some(job_id)) => {
+            Ok(Some((job_id, _))) => {
                 info!("Draining pending equity-bar-sync job on reconnect");
                 match run_equity_bar_sync(state).await {
                     Ok(Some(bar_count)) => {
@@ -177,10 +178,10 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                             warn!("Failed to complete drained job {}: {}", job_id, error);
                         }
                     }
-                    Err(err) => {
-                        error!("Drained equity-bar-sync job failed: {}", err);
-                        if let Err(error) = database::fail_job(pool, job_id, &err).await {
-                            warn!("Failed to fail drained job {}: {}", job_id, error);
+                    Err(error) => {
+                        error!("Drained equity-bar-sync job failed: {}", error);
+                        if let Err(fail_error) = database::fail_job(pool, job_id, &error).await {
+                            warn!("Failed to fail drained job {}: {}", job_id, fail_error);
                         }
                     }
                 }
@@ -193,63 +194,175 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         }
     }
 
+    for export_job in &[
+        "export-equity-quotes",
+        "export-equity-bars",
+        "export-trading-history",
+    ] {
+        match database::requeue_stale_claimed_jobs(
+            pool,
+            export_job,
+            std::time::Duration::from_secs(2 * 3600),
+        )
+        .await
+        {
+            Ok(count) if count > 0 => {
+                info!("Requeued {} stale claimed job(s) for {}", count, export_job)
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                "Failed to requeue stale claimed jobs for {}: {}",
+                export_job, error
+            ),
+        }
+
+        loop {
+            match database::claim_pending_job(pool, export_job).await {
+                Ok(Some((job_id, scheduled_at))) => {
+                    info!("Draining pending {} job on reconnect", export_job);
+                    let export_date = scheduled_at.date_naive();
+                    let result = run_export_job(state, export_job, export_date).await;
+                    match result {
+                        Ok(count) => {
+                            if let Err(error) =
+                                database::complete_job(pool, job_id, &format!("count: {}", count))
+                                    .await
+                            {
+                                warn!("Failed to complete drained job {}: {}", job_id, error);
+                            }
+                        }
+                        Err(ref error) => {
+                            error!("Drained {} failed: {}", export_job, error);
+                            if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
+                                warn!("Failed to fail drained job {}: {}", job_id, fail_error);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    warn!("Failed to drain pending {} jobs: {}", export_job, error);
+                    break;
+                }
+            }
+        }
+    }
+
     loop {
         let notification = listener.recv().await?;
         let payload = notification.payload();
 
-        if payload != "equity-bar-sync" {
-            continue;
+        match payload {
+            "equity-bar-sync" => {
+                info!("Received NOTIFY for equity-bar-sync");
+
+                let job_id = match database::claim_pending_job(pool, "equity-bar-sync").await {
+                    Ok(Some((id, _))) => id,
+                    Ok(None) => {
+                        info!("No pending equity-bar-sync job to claim");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!("Failed to claim job: {}", error);
+                        continue;
+                    }
+                };
+
+                let trading_date = sync_date_for(Utc::now());
+
+                match fetch_and_store(state, &trading_date).await {
+                    Ok(Some(bar_count)) => {
+                        info!("LISTEN-triggered sync completed, bar_count: {}", bar_count);
+                        if let Err(error) = database::complete_job(
+                            pool,
+                            job_id,
+                            &format!("bar_count: {}", bar_count),
+                        )
+                        .await
+                        {
+                            warn!("Failed to complete job {}: {}", job_id, error);
+                        }
+                        if let Err(error) = database::emit_equity_bars_synced(pool).await {
+                            warn!("Failed to emit equity_bars_synced: {}", error);
+                        }
+                        state.mark_synced();
+                    }
+                    Ok(None) => {
+                        info!("No data available for LISTEN-triggered sync");
+                        if let Err(error) =
+                            database::complete_job(pool, job_id, "no data available").await
+                        {
+                            warn!("Failed to complete job {}: {}", job_id, error);
+                        }
+                    }
+                    Err(error) => {
+                        error!("LISTEN-triggered sync failed: {}", error);
+                        if let Err(fail_error) =
+                            database::fail_job(pool, job_id, &error.to_string()).await
+                        {
+                            warn!("Failed to fail job {}: {}", job_id, fail_error);
+                        }
+                    }
+                }
+            }
+            "export-equity-quotes" | "export-equity-bars" | "export-trading-history" => {
+                info!("Received NOTIFY for {}", payload);
+
+                let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) => {
+                        info!("No pending {} job to claim", payload);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!("Failed to claim {} job: {}", payload, error);
+                        continue;
+                    }
+                };
+
+                let export_date = scheduled_at.date_naive();
+                match run_export_job(state, payload, export_date).await {
+                    Ok(count) => {
+                        info!("{} completed, count: {}", payload, count);
+                        if let Err(error) =
+                            database::complete_job(pool, job_id, &format!("count: {}", count)).await
+                        {
+                            warn!("Failed to complete job {}: {}", job_id, error);
+                        }
+                    }
+                    Err(ref error) => {
+                        error!("{} failed: {}", payload, error);
+                        if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
+                            warn!("Failed to fail job {}: {}", job_id, fail_error);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+}
 
-        info!("Received NOTIFY for equity-bar-sync");
-
-        let job_id = match database::claim_pending_job(pool, "equity-bar-sync").await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                info!("No pending equity-bar-sync job to claim");
-                continue;
-            }
-            Err(error) => {
-                warn!("Failed to claim job: {}", error);
-                continue;
-            }
-        };
-
-        let trading_date = sync_date_for(Utc::now());
-
-        match fetch_and_store(state, &trading_date).await {
-            Ok(Some(bar_count)) => {
-                info!("LISTEN-triggered sync completed, bar_count: {}", bar_count);
-                if let Err(error) =
-                    database::complete_job(pool, job_id, &format!("bar_count: {}", bar_count)).await
-                {
-                    warn!("Failed to complete job {}: {}", job_id, error);
-                }
-                if let Err(error) = database::emit_equity_bars_synced(pool).await {
-                    warn!("Failed to emit equity_bars_synced: {}", error);
-                }
-                state.mark_synced();
-            }
-            Ok(None) => {
-                info!("No data available for LISTEN-triggered sync");
-                if let Err(error) = database::complete_job(pool, job_id, "no data available").await
-                {
-                    warn!("Failed to complete job {}: {}", job_id, error);
-                }
-            }
-            Err(err) => {
-                error!("LISTEN-triggered sync failed: {}", err);
-                if let Err(error) = database::fail_job(pool, job_id, &err.to_string()).await {
-                    warn!("Failed to fail job {}: {}", job_id, error);
-                }
-            }
+async fn run_export_job(
+    state: &State,
+    job_name: &str,
+    export_date: NaiveDate,
+) -> Result<usize, String> {
+    match job_name {
+        "export-equity-quotes" => export::export_equity_quotes(state, export_date).await,
+        "export-equity-bars" => export::export_equity_bars(state, export_date).await,
+        "export-trading-history" => export::export_trading_history(state, export_date).await,
+        _ => {
+            let message = format!("Unknown export job: {}", job_name);
+            Err(message)
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_until_next_sync, prior_trading_day, sync_date_for};
+    use super::{duration_until_next_sync, prior_trading_day, run_export_job, sync_date_for};
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use std::time::Duration;
@@ -385,5 +498,44 @@ mod tests {
             sync_date.as_naive_date(),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
         );
+    }
+
+    #[test]
+    fn test_run_export_job_returns_error_for_unknown_job() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use crate::data_manager::state::{MassiveSecrets, State};
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = run_export_job(&state, "unknown-job", date).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("Unknown export job"));
+        });
     }
 }

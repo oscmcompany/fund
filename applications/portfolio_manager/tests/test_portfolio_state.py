@@ -6,6 +6,7 @@ import polars as pl
 import pytest
 from portfolio_manager.portfolio_state import (
     _PRIOR_ALLOCATION_SCHEMA,
+    close_all_open_pairs,
     evaluate_held_pairs_from_quotes,
     get_last_portfolio_value,
     get_prior_allocation,
@@ -74,6 +75,65 @@ def _make_successful_pair_rows() -> pl.DataFrame:
             "notional": pl.Float64,
         },
     )
+
+
+# --- close_all_open_pairs ---
+
+
+def _make_pool_mock_with_rowcount(rowcount: int) -> MagicMock:
+    mock_cursor = AsyncMock()
+    mock_cursor.rowcount = rowcount
+    mock_connection = MagicMock()
+    mock_connection.execute = AsyncMock(return_value=mock_cursor)
+    mock_connection.__aenter__ = AsyncMock(return_value=mock_connection)
+    mock_connection.__aexit__ = AsyncMock(return_value=None)
+    mock_pool = MagicMock()
+    mock_pool.connection.return_value = mock_connection
+    return mock_pool
+
+
+def test_close_all_open_pairs_returns_true_and_updates_rows() -> None:
+    mock_pool = _make_pool_mock_with_rowcount(rowcount=3)
+    closed_at = datetime(2026, 6, 4, 20, 0, 0, tzinfo=UTC)
+
+    async def run() -> bool:
+        with patch(
+            "portfolio_manager.portfolio_state.get_pool",
+            AsyncMock(return_value=mock_pool),
+        ):
+            return await close_all_open_pairs(closed_at, close_reason="end_of_day")
+
+    result = asyncio.run(run())
+    assert result is True
+
+
+def test_close_all_open_pairs_returns_true_when_no_open_pairs() -> None:
+    mock_pool = _make_pool_mock_with_rowcount(rowcount=0)
+    closed_at = datetime(2026, 6, 4, 20, 0, 0, tzinfo=UTC)
+
+    async def run() -> bool:
+        with patch(
+            "portfolio_manager.portfolio_state.get_pool",
+            AsyncMock(return_value=mock_pool),
+        ):
+            return await close_all_open_pairs(closed_at, close_reason="end_of_day")
+
+    result = asyncio.run(run())
+    assert result is True
+
+
+def test_close_all_open_pairs_returns_false_on_database_error() -> None:
+    closed_at = datetime(2026, 6, 4, 20, 0, 0, tzinfo=UTC)
+
+    async def run() -> bool:
+        with patch(
+            "portfolio_manager.portfolio_state.get_pool",
+            AsyncMock(side_effect=Exception("db connection failed")),
+        ):
+            return await close_all_open_pairs(closed_at, close_reason="end_of_day")
+
+    result = asyncio.run(run())
+    assert result is False
 
 
 # --- evaluate_held_pairs_from_quotes ---
@@ -444,6 +504,7 @@ def test_save_closed_pair_returns_true_on_success() -> None:
         "realized_profit_and_loss": 50.0,
         "return_percent": 0.05,
         "holding_days": 1,
+        "close_reason": "rebalance",
     }
 
     with patch(

@@ -11,6 +11,7 @@ from .alpaca_client import AlpacaClient
 from .configuration import Configuration
 from .data_client import fetch_historical_prices, fetch_live_quote_mid_prices
 from .portfolio_state import (
+    close_all_open_pairs,
     evaluate_held_pairs_from_quotes,
     get_last_portfolio_value,
     get_prior_allocation,
@@ -76,6 +77,36 @@ async def _status_logger_loop(alpaca_client: AlpacaClient) -> None:
                 return
 
 
+async def _handle_end_of_day_liquidation_requested(
+    alpaca_client: AlpacaClient,
+    rebalance_lock: asyncio.Lock,
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    async with rebalance_lock:
+        current_timestamp = datetime.now(tz=UTC)
+        try:
+            closed_count = await loop.run_in_executor(
+                None, alpaca_client.close_all_positions
+            )
+            logger.info(
+                "Closed all positions for end of day", closed_count=closed_count
+            )
+        except Exception as error:
+            logger.exception(
+                "Failed to close all positions for end of day", error=str(error)
+            )
+            raise
+
+        pairs_closed = await close_all_open_pairs(
+            current_timestamp, close_reason="end_of_day"
+        )
+        if not pairs_closed:
+            message = "Failed to mark open pairs as closed in database"
+            raise RuntimeError(message)
+        logger.info("Marked all open pairs as closed in database")
+
+
 async def _handle_end_of_day_snapshot_requested(alpaca_client: AlpacaClient) -> None:
     loop = asyncio.get_running_loop()
     try:
@@ -130,13 +161,21 @@ async def _handle_intraday_check(  # noqa: C901, PLR0911
         return
 
     try:
-        market_open = alpaca_client.is_market_open()
+        minutes_to_close = alpaca_client.get_minutes_to_market_close()
     except Exception as error:
-        logger.exception("Failed to check market open status", error=str(error))
+        logger.exception("Failed to check market status", error=str(error))
         return
 
-    if not market_open:
+    if minutes_to_close is None:
         logger.info("Market is closed, skipping rebalance on intraday_check")
+        return
+
+    if minutes_to_close <= configuration.pre_close_lockout_minutes:
+        logger.info(
+            "Skipping rebalance, within pre-close lockout window",
+            minutes_to_close=minutes_to_close,
+            pre_close_lockout_minutes=configuration.pre_close_lockout_minutes,
+        )
         return
 
     correlation_id = await get_latest_predictions_correlation_id()
@@ -227,6 +266,12 @@ async def _event_listener_loop(
                     )
                     _background_tasks.add(task)
                     task.add_done_callback(_background_tasks.discard)
+                    await update_consumer_offset(consumer_name, event_id)
+                elif event_type == "end_of_day_liquidation_requested":
+                    logger.info("Received end_of_day_liquidation_requested event")
+                    await _handle_end_of_day_liquidation_requested(
+                        alpaca_client, rebalance_lock
+                    )
                     await update_consumer_offset(consumer_name, event_id)
                 elif event_type == "end_of_day_snapshot_requested":
                     logger.info("Received end_of_day_snapshot_requested event")

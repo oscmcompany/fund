@@ -8,6 +8,7 @@ from portfolio_manager.alpaca_client import AlpacaAccount
 from portfolio_manager.configuration import Configuration
 from portfolio_manager.scheduler import (
     _event_listener_loop,
+    _handle_end_of_day_liquidation_requested,
     _handle_end_of_day_snapshot_requested,
     _handle_equity_bars_synced,
     _handle_intraday_check,
@@ -63,7 +64,7 @@ def test_handle_intraday_check_skips_when_lock_held() -> None:
 
 def test_handle_intraday_check_skips_when_market_closed() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = False
+    mock_alpaca.get_minutes_to_market_close.return_value = None
     mock_run_rebalance = AsyncMock()
 
     async def run() -> None:
@@ -77,7 +78,7 @@ def test_handle_intraday_check_skips_when_market_closed() -> None:
 
 def test_handle_intraday_check_skips_when_no_predictions_available() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_run_rebalance = AsyncMock()
 
     async def run() -> None:
@@ -97,7 +98,7 @@ def test_handle_intraday_check_skips_when_no_predictions_available() -> None:
 
 def test_handle_intraday_check_skips_when_all_pairs_held() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_run_rebalance = AsyncMock()
 
     prior_allocation = pl.DataFrame(
@@ -139,7 +140,7 @@ def test_handle_intraday_check_skips_when_all_pairs_held() -> None:
 
 def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_run_rebalance = AsyncMock(return_value=mock_response)
@@ -185,7 +186,7 @@ def test_handle_intraday_check_calls_run_rebalance_when_some_pairs_closing() -> 
 
 def test_handle_intraday_check_calls_run_rebalance_when_no_prior_allocation() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_run_rebalance = AsyncMock(return_value=mock_response)
@@ -213,7 +214,7 @@ def test_handle_intraday_check_calls_run_rebalance_when_no_prior_allocation() ->
 
 def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_run_rebalance = AsyncMock(return_value=mock_response)
@@ -240,7 +241,7 @@ def test_handle_intraday_check_passes_correlation_id_to_run_rebalance() -> None:
 
 def test_handle_intraday_check_skips_when_historical_prices_fetch_fails() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_run_rebalance = AsyncMock()
 
     prior_allocation = pl.DataFrame(
@@ -272,7 +273,7 @@ def test_handle_intraday_check_skips_when_historical_prices_fetch_fails() -> Non
 
 def test_handle_intraday_check_skips_when_live_prices_fetch_fails() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_run_rebalance = AsyncMock()
 
     prior_allocation = pl.DataFrame(
@@ -308,7 +309,7 @@ def test_handle_intraday_check_skips_when_live_prices_fetch_fails() -> None:
 
 def test_handle_intraday_check_logs_warning_on_non_200() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.return_value = True
+    mock_alpaca.get_minutes_to_market_close.return_value = 60.0
     mock_response = MagicMock()
     mock_response.status_code = 500
     mock_run_rebalance = AsyncMock(return_value=mock_response)
@@ -333,9 +334,26 @@ def test_handle_intraday_check_logs_warning_on_non_200() -> None:
     asyncio.run(run())
 
 
+def test_handle_intraday_check_skips_when_within_pre_close_lockout_window() -> None:
+    mock_alpaca = MagicMock()
+    # 10 minutes to close is within the default 20-minute lockout window.
+    mock_alpaca.get_minutes_to_market_close.return_value = 10.0
+    mock_run_rebalance = AsyncMock()
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with patch("portfolio_manager.scheduler.run_rebalance", mock_run_rebalance):
+            await _handle_intraday_check(mock_alpaca, Configuration(), lock)
+
+    asyncio.run(run())
+    mock_run_rebalance.assert_not_called()
+
+
 def test_handle_intraday_check_handles_market_open_exception() -> None:
     mock_alpaca = MagicMock()
-    mock_alpaca.is_market_open.side_effect = Exception("market check failed")
+    mock_alpaca.get_minutes_to_market_close.side_effect = Exception(
+        "market check failed"
+    )
     mock_run_rebalance = AsyncMock()
 
     async def run() -> None:
@@ -422,6 +440,40 @@ def test_event_listener_loop_dispatches_equity_bars_synced() -> None:
             await _event_listener_loop(mock_alpaca, Configuration(), lock)
             if captured_handler:
                 await captured_handler[0]("equity_bars_synced", 42, {})
+            mock_handle.assert_called_once()
+
+    asyncio.run(run())
+
+
+def test_event_listener_loop_dispatches_end_of_day_liquidation_requested() -> None:
+    mock_alpaca = MagicMock()
+    captured_handler: list = []
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+
+        async def fake_listen_for_events(_channel: str, handler: object) -> None:
+            captured_handler.append(handler)
+            raise asyncio.CancelledError
+
+        with (
+            patch.dict("os.environ", {"DATABASE_URL": "postgresql://localhost/test"}),
+            patch(
+                "portfolio_manager.scheduler.listen_for_events",
+                side_effect=fake_listen_for_events,
+            ),
+            patch(
+                "portfolio_manager.scheduler.update_consumer_offset",
+                AsyncMock(return_value=None),
+            ),
+            patch(
+                "portfolio_manager.scheduler._handle_end_of_day_liquidation_requested",
+                AsyncMock(),
+            ) as mock_handle,
+        ):
+            await _event_listener_loop(mock_alpaca, Configuration(), lock)
+            if captured_handler:
+                await captured_handler[0]("end_of_day_liquidation_requested", 44, {})
             mock_handle.assert_called_once()
 
     asyncio.run(run())
@@ -590,6 +642,102 @@ def test_status_logger_loop_exits_on_cancellation() -> None:
         asyncio.run(run())
 
     mock_logger.info.assert_any_call("Status logger cancelled")
+
+
+# --- _handle_end_of_day_liquidation_requested ---
+
+
+def test_handle_end_of_day_liquidation_closes_positions_and_marks_pairs_closed() -> (
+    None
+):
+    mock_alpaca = MagicMock()
+    mock_alpaca.close_all_positions.return_value = 4
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch(
+                "portfolio_manager.scheduler.close_all_open_pairs",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await _handle_end_of_day_liquidation_requested(mock_alpaca, lock)
+
+    asyncio.run(run())
+    mock_alpaca.close_all_positions.assert_called_once()
+
+
+def test_handle_end_of_day_liquidation_acquires_rebalance_lock() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.close_all_positions.return_value = 2
+    lock_was_held: list[bool] = []
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+
+        async def mock_close_pairs(
+            _closed_at: object,
+            close_reason: str,  # noqa: ARG001
+        ) -> bool:
+            lock_was_held.append(lock.locked())
+            return True
+
+        with patch(
+            "portfolio_manager.scheduler.close_all_open_pairs",
+            side_effect=mock_close_pairs,
+        ):
+            await _handle_end_of_day_liquidation_requested(mock_alpaca, lock)
+
+    asyncio.run(run())
+    assert lock_was_held == [True]
+
+
+def test_handle_end_of_day_liquidation_raises_when_alpaca_close_fails() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.close_all_positions.side_effect = RuntimeError("alpaca error")
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with pytest.raises(RuntimeError, match="alpaca error"):
+            await _handle_end_of_day_liquidation_requested(mock_alpaca, lock)
+
+    asyncio.run(run())
+
+
+def test_handle_end_of_day_liquidation_raises_when_db_close_fails() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.close_all_positions.return_value = 2
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch(
+                "portfolio_manager.scheduler.close_all_open_pairs",
+                AsyncMock(return_value=False),
+            ),
+            pytest.raises(RuntimeError, match="Failed to mark open pairs as closed"),
+        ):
+            await _handle_end_of_day_liquidation_requested(mock_alpaca, lock)
+
+    asyncio.run(run())
+
+
+def test_handle_end_of_day_liquidation_succeeds_when_no_open_positions() -> None:
+    mock_alpaca = MagicMock()
+    mock_alpaca.close_all_positions.return_value = 0
+
+    async def run() -> None:
+        lock = asyncio.Lock()
+        with (
+            patch(
+                "portfolio_manager.scheduler.close_all_open_pairs",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await _handle_end_of_day_liquidation_requested(mock_alpaca, lock)
+
+    asyncio.run(run())
+    mock_alpaca.close_all_positions.assert_called_once()
 
 
 # --- _handle_end_of_day_snapshot_requested ---

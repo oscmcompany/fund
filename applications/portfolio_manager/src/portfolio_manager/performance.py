@@ -1,6 +1,6 @@
 import math
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import polars as pl
 import structlog
@@ -201,6 +201,9 @@ def build_closed_pair_record(  # noqa: PLR0913
     dollar_amount: float,
     realized_profit_and_loss: float,
     return_percent: float,
+    close_reason: Literal[
+        "profit_taken", "stop_loss", "rebalance", "end_of_day"
+    ] = "rebalance",
 ) -> dict[str, Any]:
     holding_days = (closed_timestamp - entry_timestamp) // (1000 * 60 * 60 * 24)
     return {
@@ -213,4 +216,5 @@ def build_closed_pair_record(  # noqa: PLR0913
         "realized_profit_and_loss": realized_profit_and_loss,
         "return_percent": return_percent,
         "holding_days": holding_days,
+        "close_reason": close_reason,
     }
