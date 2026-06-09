@@ -217,6 +217,11 @@ fn create_equity_quote_dataframe(quotes: &[EquityQuote]) -> Result<DataFrame, St
 }
 
 fn create_equity_bar_export_dataframe(bars: &[EquityBar]) -> Result<DataFrame, String> {
+    // The exported parquet must match the equity_bars_schema pandera contract
+    // (9 columns, Int64 millisecond timestamp) and the backfill writer
+    // (data::create_equity_bar_dataframe): the tide trainer concatenates the
+    // daily exports with backfilled files, so a schema drift breaks training.
+    // inserted_at stays on the EquityBar row for PostgreSQL only.
     df!(
         "ticker" => bars.iter().map(|bar| bar.ticker.as_str()).collect::<Vec<&str>>(),
         "timestamp" => bars.iter().map(|bar| bar.timestamp.timestamp_millis()).collect::<Vec<i64>>(),
@@ -227,7 +232,6 @@ fn create_equity_bar_export_dataframe(bars: &[EquityBar]) -> Result<DataFrame, S
         "volume" => bars.iter().map(|bar| bar.volume).collect::<Vec<i64>>(),
         "volume_weighted_average_price" => bars.iter().map(|bar| bar.volume_weighted_average_price).collect::<Vec<Option<f64>>>(),
         "transactions" => bars.iter().map(|bar| bar.transactions).collect::<Vec<Option<i64>>>(),
-        "inserted_at" => bars.iter().map(|bar| bar.inserted_at.timestamp_millis()).collect::<Vec<i64>>(),
     )
     .map_err(|error| format!("Failed to create equity bar export DataFrame: {}", error))
 }
@@ -471,22 +475,40 @@ mod tests {
     }
 
     #[test]
-    fn test_create_equity_bar_export_dataframe_columns_and_rows() {
+    fn test_create_equity_bar_export_dataframe_matches_pandera_contract() {
+        // The S3 parquet schema is the equity_bars_schema pandera contract:
+        // 9 columns, Int64 millisecond timestamp, no inserted_at. The tide
+        // trainer concatenates these daily exports with the backfill writer's
+        // files (create_equity_bar_dataframe), so the schemas must agree.
         let bars = sample_bars();
         let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
         assert_eq!(dataframe.height(), 1);
-        assert_eq!(dataframe.width(), 10);
-        assert!(dataframe.column("ticker").is_ok());
-        assert!(dataframe.column("open_price").is_ok());
-        assert!(dataframe.column("volume").is_ok());
-        assert!(dataframe.column("inserted_at").is_ok());
+        assert_eq!(
+            dataframe.get_column_names_str(),
+            vec![
+                "ticker",
+                "timestamp",
+                "open_price",
+                "high_price",
+                "low_price",
+                "close_price",
+                "volume",
+                "volume_weighted_average_price",
+                "transactions",
+            ]
+        );
+        assert!(dataframe.column("inserted_at").is_err());
+        assert_eq!(
+            dataframe.column("timestamp").unwrap().dtype(),
+            &DataType::Int64
+        );
     }
 
     #[test]
     fn test_create_equity_bar_export_dataframe_empty() {
         let dataframe = create_equity_bar_export_dataframe(&[]).unwrap();
         assert_eq!(dataframe.height(), 0);
-        assert_eq!(dataframe.width(), 10);
+        assert_eq!(dataframe.width(), 9);
     }
 
     #[test]
