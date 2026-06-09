@@ -15,12 +15,12 @@ use polars::prelude::*;
 use tracing::{error, info};
 
 use fund::common::observability::init_tracing;
-use fund::ensemble_model::predict::{consolidate_data, filter_equity_bars};
+use fund::ensemble_model::predict::consolidate_data;
 use fund::models::tide::artifact::{package_dir_to_tar_gz, upload_artifact};
 use fund::models::tide::config::ModelParameters;
 use fund::models::tide::data::input_feature_size;
 use fund::models::tide::evaluate::evaluate;
-use fund::models::tide::fit::{fit, write_artifact_json};
+use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
 use fund::models::tide::model::TideModel;
 use fund::models::tide::train::{train, TrainBackend, TrainConfig};
 
@@ -76,7 +76,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let consolidated = consolidate_data(equity_bars, equity_details)?;
-    let filtered = filter_equity_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
+    let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
     info!(rows = filtered.height(), "Consolidated and filtered");
 
     let fit_result = fit(filtered)?;

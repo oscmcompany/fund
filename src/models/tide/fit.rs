@@ -102,6 +102,49 @@ fn build_mapping(
         .collect())
 }
 
+/// Row-level training filter mirroring the Python trainer: keep rows whose
+/// close price and volume meet the thresholds (inclusive) and whose ticker
+/// contains no lowercase letters (lowercase variants are distinct instruments
+/// that would collide with the uppercase ticker after cleaning).
+pub fn filter_training_bars(
+    data: DataFrame,
+    minimum_close_price: f64,
+    minimum_volume: f64,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    let close_prices = data
+        .column("close_price")
+        .map_err(|e| e.to_string())?
+        .cast(&DataType::Float64)
+        .map_err(|e| e.to_string())?;
+    let close_prices = close_prices.f64().map_err(|e| e.to_string())?;
+    let volumes = data
+        .column("volume")
+        .map_err(|e| e.to_string())?
+        .cast(&DataType::Float64)
+        .map_err(|e| e.to_string())?;
+    let volumes = volumes.f64().map_err(|e| e.to_string())?;
+    let tickers = data
+        .column("ticker")
+        .map_err(|e| e.to_string())?
+        .str()
+        .map_err(|e| e.to_string())?;
+
+    let mask: BooleanChunked = close_prices
+        .into_iter()
+        .zip(volumes)
+        .zip(tickers)
+        .map(|((close_price, volume), ticker)| {
+            close_price.is_some_and(|value| value >= minimum_close_price)
+                && volume.is_some_and(|value| value >= minimum_volume)
+                && ticker
+                    .is_some_and(|value| !value.chars().any(|character| character.is_lowercase()))
+        })
+        .collect();
+
+    let filtered = data.filter(&mask).map_err(|e| e.to_string())?;
+    Ok(filtered)
+}
+
 /// Write the three artifact JSON files (scaler, mappings, parameters) the
 /// inference loader reads, into `directory`.
 pub fn write_artifact_json(
@@ -183,6 +226,65 @@ mod tests {
             assert!(result.scaler.standard_deviations.contains_key(*column));
             assert!(*result.scaler.standard_deviations.get(*column).unwrap() != 0.0);
         }
+    }
+
+    #[test]
+    fn test_filter_training_bars_is_row_level_and_inclusive() {
+        // Python: (close_price >= min) & (volume >= min) per row — a ticker
+        // with one qualifying row and one penny row keeps only the qualifying
+        // row, and rows exactly at the threshold are kept.
+        let data = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAA", "AAA", "BBB"]),
+            Column::new("timestamp".into(), vec![0_i64, 86_400_000, 0]),
+            Column::new("close_price".into(), vec![0.5_f64, 1.0, 250.0]),
+            Column::new("volume".into(), vec![100_000.0_f64, 100_000.0, 50_000.0]),
+        ])
+        .unwrap();
+
+        let filtered = filter_training_bars(data, 1.0, 100_000.0).unwrap();
+        assert_eq!(filtered.height(), 1);
+        let tickers: Vec<&str> = filtered
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(tickers, vec!["AAA"]);
+        let close: Vec<f64> = filtered
+            .column("close_price")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(close, vec![1.0]);
+    }
+
+    #[test]
+    fn test_filter_training_bars_drops_lowercase_tickers() {
+        // Python excludes tickers matching [a-z]: lowercase variants are
+        // distinct instruments that would collide once uppercased.
+        let data = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAPL", "AAPLw", "brk.a"]),
+            Column::new("timestamp".into(), vec![0_i64, 0, 0]),
+            Column::new("close_price".into(), vec![150.0_f64, 150.0, 150.0]),
+            Column::new(
+                "volume".into(),
+                vec![1_000_000.0_f64, 1_000_000.0, 1_000_000.0],
+            ),
+        ])
+        .unwrap();
+
+        let filtered = filter_training_bars(data, 1.0, 100_000.0).unwrap();
+        let tickers: Vec<&str> = filtered
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(tickers, vec!["AAPL"]);
     }
 
     #[test]

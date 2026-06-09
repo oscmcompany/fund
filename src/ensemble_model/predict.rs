@@ -163,6 +163,13 @@ pub fn consolidate_data(
                 .str()
                 .strip_chars(lit(" ")),
         ])
+        // Rows without a sector or industry cannot be categorically encoded;
+        // the Python pipeline drops them after the join.
+        .filter(
+            col("sector")
+                .is_not_null()
+                .and(col("industry").is_not_null()),
+        )
         .collect()
         .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
 
@@ -286,6 +293,33 @@ pub fn filter_to_trained_tickers(
     Ok(filtered)
 }
 
+/// Inverse-scale the predicted `daily_return` quantiles and sort them so they
+/// are monotonic, exactly as the Python postprocessing does (`np.sort` per
+/// row). Quantile crossing is routine in quantile regression; sorting is the
+/// standard rearrangement remedy.
+pub(crate) fn unscale_and_sort_quantiles(
+    scaled_quantiles: &[f64],
+    scaler: &crate::models::tide::data::Scaler,
+) -> Vec<f64> {
+    let mut unscaled: Vec<f64> = scaled_quantiles
+        .iter()
+        .map(|value| scaler.inverse_transform_value("daily_return", *value))
+        .collect();
+    unscaled.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    unscaled
+}
+
+/// Timestamp (UTC midnight, milliseconds) for horizon step `step`, where step 0
+/// is `now`'s date — matching the Python labeling `now + timedelta(days=step)`.
+pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
+    (now + Duration::days(step as i64))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+}
+
 pub fn generate_predictions(
     data: DataFrame,
     model_state: &ModelState,
@@ -332,6 +366,8 @@ pub fn generate_predictions(
     let reverse_ticker_map: std::collections::HashMap<i32, &String> =
         ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
 
+    let now = Utc::now();
+
     for sample_idx in 0..num_samples {
         let ticker_id = dataset.static_categorical[[sample_idx, 0, 0]];
         let ticker = reverse_ticker_map
@@ -342,45 +378,24 @@ pub fn generate_predictions(
         for t in 0..output_length {
             let base_idx = (sample_idx * output_length + t) * num_quantiles;
 
-            let q10_scaled = predictions_data[base_idx] as f64;
-            let q50_scaled = predictions_data[base_idx + 1] as f64;
-            let q90_scaled = predictions_data[base_idx + 2] as f64;
-
-            let q10 = model_state
-                .scaler
-                .inverse_transform_value("daily_return", q10_scaled);
-            let q50 = model_state
-                .scaler
-                .inverse_transform_value("daily_return", q50_scaled);
-            let q90 = model_state
-                .scaler
-                .inverse_transform_value("daily_return", q90_scaled);
-
-            let prediction_date = Utc::now() + Duration::days(t as i64 + 1);
-            let timestamp = prediction_date
-                .date_naive()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp_millis();
+            let scaled: Vec<f64> = (0..num_quantiles)
+                .map(|q| predictions_data[base_idx + q] as f64)
+                .collect();
+            let quantiles = unscale_and_sort_quantiles(&scaled, &model_state.scaler);
 
             results.push(serde_json::json!({
                 "ticker": ticker,
-                "timestamp": timestamp,
-                "quantile_10": q10,
-                "quantile_50": q50,
-                "quantile_90": q90,
+                "timestamp": step_timestamp_milliseconds(now, t),
+                "quantile_10": quantiles[0],
+                "quantile_50": quantiles[1],
+                "quantile_90": quantiles[2],
             }));
         }
     }
 
-    let target_offset = output_length as i64;
-    let target_date = (Utc::now() + Duration::days(target_offset))
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_millis();
+    // Persist the final horizon step, now + (output_length - 1) days, exactly
+    // like the Python service.
+    let target_date = step_timestamp_milliseconds(now, output_length - 1);
 
     let final_predictions: Vec<serde_json::Value> = results
         .into_iter()
@@ -585,6 +600,78 @@ mod tests {
         let result = validate_predictions(&predictions);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Duplicate"));
+    }
+
+    #[test]
+    fn test_unscale_and_sort_quantiles_repairs_crossing() {
+        let mut means = std::collections::HashMap::new();
+        means.insert("daily_return".to_string(), 0.0);
+        let mut standard_deviations = std::collections::HashMap::new();
+        standard_deviations.insert("daily_return".to_string(), 1.0);
+        let scaler = crate::models::tide::data::Scaler {
+            means,
+            standard_deviations,
+        };
+
+        // Crossed raw quantiles (q10 > q50) must come back monotonic.
+        let sorted = unscale_and_sort_quantiles(&[0.05, 0.02, 0.03], &scaler);
+        assert_eq!(sorted, vec![0.02, 0.03, 0.05]);
+    }
+
+    #[test]
+    fn test_step_timestamp_step_zero_is_today_midnight() {
+        // Python labels horizon step t as now + t days at midnight: step 0 is
+        // today, and the persisted target is step output_length - 1.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let midnight = chrono::NaiveDate::from_ymd_opt(2026, 6, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        assert_eq!(step_timestamp_milliseconds(now, 0), midnight);
+        assert_eq!(
+            step_timestamp_milliseconds(now, 4),
+            midnight + 4 * 86_400_000
+        );
+    }
+
+    #[test]
+    fn test_consolidate_data_drops_null_sector_or_industry() {
+        let bars = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAPL", "GOOG"]),
+            Column::new("timestamp".into(), vec![1000i64, 1000]),
+            Column::new("open_price".into(), vec![100.0, 200.0]),
+            Column::new("high_price".into(), vec![105.0, 205.0]),
+            Column::new("low_price".into(), vec![95.0, 195.0]),
+            Column::new("close_price".into(), vec![102.0, 202.0]),
+            Column::new("volume".into(), vec![1_000_000i64, 2_000_000]),
+            Column::new("volume_weighted_average_price".into(), vec![101.0, 201.0]),
+        ])
+        .unwrap();
+
+        let details = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAPL", "GOOG"]),
+            Column::new("sector".into(), vec![Some("Technology"), None::<&str>]),
+            Column::new(
+                "industry".into(),
+                vec![Some("Consumer Electronics"), Some("Internet")],
+            ),
+        ])
+        .unwrap();
+
+        let result = consolidate_data(bars, details).unwrap();
+        assert_eq!(result.height(), 1);
+        let tickers: Vec<&str> = result
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(tickers, vec!["AAPL"]);
     }
 
     #[test]

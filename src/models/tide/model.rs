@@ -156,6 +156,8 @@ impl<B: Backend> TideModel<B> {
 
         let combined = decoder_output + encoder_output;
         let combined = self.final_layer_norm.forward(combined);
+        // The Python model projects relu(x): `output_projection(x.relu())`.
+        let combined = burn::tensor::activation::relu(combined);
 
         let output = self.output_projection.forward(combined);
         output.reshape([batch_size, self.output_length * self.num_quantiles])
@@ -200,6 +202,55 @@ mod tests {
         let input = Tensor::<NdArray, 2>::zeros([2, 32], &device);
         let output = block.forward(input);
         assert_eq!(output.dims(), [2, 32]);
+    }
+
+    #[test]
+    fn test_forward_applies_relu_before_output_projection() {
+        let device = Default::default();
+        let input_size = 12;
+        let model: TideModel<NdArray> = TideModel::new(&device, input_size, 8, 1, 1, 2, 3, 0.0);
+
+        let input = Tensor::<NdArray, 1>::from_floats(
+            (0..(4 * input_size))
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &device,
+        )
+        .reshape([4, input_size]);
+
+        // Compose the expected output from the model's own components, applying
+        // relu to the layer-normed combination before the output projection as
+        // the Python trainer does (`output_projection(x.relu())`).
+        let hidden =
+            burn::tensor::activation::relu(model.feature_projection_1.forward(input.clone()));
+        let hidden = burn::tensor::activation::relu(model.feature_projection_2.forward(hidden));
+        let mut encoder_output = hidden;
+        for block in &model.encoder_blocks {
+            encoder_output = block.forward(encoder_output);
+        }
+        let mut decoder_output = encoder_output.clone();
+        for block in &model.decoder_blocks {
+            decoder_output = block.forward(decoder_output);
+        }
+        let combined = model
+            .final_layer_norm
+            .forward(decoder_output + encoder_output);
+        let expected: Vec<f32> = model
+            .output_projection
+            .forward(burn::tensor::activation::relu(combined))
+            .to_data()
+            .to_vec()
+            .unwrap();
+
+        let actual: Vec<f32> = model.forward(input).to_data().to_vec().unwrap();
+        assert_eq!(expected.len(), actual.len());
+        for (e, a) in expected.iter().zip(actual.iter()) {
+            assert!(
+                (e - a).abs() < 1e-6,
+                "forward must relu before the output projection: {e} vs {a}"
+            );
+        }
     }
 
     #[test]

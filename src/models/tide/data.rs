@@ -178,9 +178,10 @@ impl Data {
         Ok(Self::from_parts(data, scaler.clone(), mappings.clone()))
     }
 
-    /// Split the engineered frame into (train, validate) by a global date cutoff:
-    /// rows whose timestamp is before `min + (max - min) * validation_split` are
-    /// training, the rest are validation. Mirrors the Python trainer's date split.
+    /// Split the engineered frame into (train, validate) by a global date cutoff
+    /// at `min + (max - min) * validation_split`: rows at or before the cutoff
+    /// are training, later rows are validation (the Python trainer uses
+    /// `date <= split` for train).
     pub fn split_by_timestamp(
         &self,
         validation_split: f64,
@@ -191,8 +192,8 @@ impl Data {
         let max_ts = timestamps.max().unwrap_or(0);
         let cutoff = min_ts + (((max_ts - min_ts) as f64) * validation_split) as i64;
 
-        let train_mask = timestamps.lt(cutoff);
-        let valid_mask = timestamps.gt_eq(cutoff);
+        let train_mask = timestamps.lt_eq(cutoff);
+        let valid_mask = timestamps.gt(cutoff);
         let train = self.data.filter(&train_mask).map_err(|e| e.to_string())?;
         let valid = self.data.filter(&valid_mask).map_err(|e| e.to_string())?;
         Ok((train, valid))
@@ -380,7 +381,8 @@ fn window_frame(
 pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
     // Sort by [ticker, timestamp] so daily returns and the downstream windowing
     // are chronological and contiguous within each ticker, independent of the
-    // order rows arrived in. Returns reset to 0 at each ticker boundary.
+    // order rows arrived in. Each ticker's first row gets a null return (like
+    // pct_change over ticker in the Python pipeline); clean_data drops it.
     let data = data
         .sort(
             ["ticker", "timestamp"],
@@ -396,7 +398,7 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
     let mut day_of_year = Vec::with_capacity(height);
     let mut month = Vec::with_capacity(height);
     let mut year = Vec::with_capacity(height);
-    let mut daily_return = Vec::with_capacity(height);
+    let mut daily_return: Vec<Option<f32>> = Vec::with_capacity(height);
 
     let close_prices: Vec<f64> = data
         .column("close_price")
@@ -426,7 +428,8 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
         let date = datetime.date_naive();
 
-        day_of_week.push(date.weekday().num_days_from_monday() as i32);
+        // Monday = 1 .. Sunday = 7, matching polars dt.weekday() in Python.
+        day_of_week.push(date.weekday().number_from_monday() as i32);
         day_of_month.push(date.day() as i32);
         day_of_year.push(date.ordinal() as i32);
         month.push(date.month() as i32);
@@ -434,9 +437,9 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
 
         let same_ticker = i > 0 && tickers[i] == tickers[i - 1];
         if same_ticker && close_prices[i - 1] != 0.0 {
-            daily_return.push(((close_prices[i] / close_prices[i - 1]) - 1.0) as f32);
+            daily_return.push(Some(((close_prices[i] / close_prices[i - 1]) - 1.0) as f32));
         } else {
-            daily_return.push(0.0f32);
+            daily_return.push(None);
         }
     }
 
@@ -508,6 +511,19 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .not_equal("UNKNOWN");
 
     let cleaned = data.filter(&mask).map_err(|e| e.to_string())?;
+
+    // Drop rows without a finite daily return — each ticker's first observation
+    // and any division artifacts — matching the Python CleanData stage.
+    let returns = cleaned
+        .column("daily_return")
+        .map_err(|e| e.to_string())?
+        .f32()
+        .map_err(|e| e.to_string())?;
+    let finite_mask: BooleanChunked = returns
+        .into_iter()
+        .map(|value| value.is_some_and(f32::is_finite))
+        .collect();
+    let cleaned = cleaned.filter(&finite_mask).map_err(|e| e.to_string())?;
     Ok(cleaned)
 }
 
@@ -745,11 +761,10 @@ mod tests {
         assert!(valid.height() > 0);
     }
 
-    #[test]
-    fn test_engineer_features_resets_return_at_ticker_boundary() {
-        // Two tickers, unsorted input; engineer_features must sort and reset the
-        // first per-ticker return to 0 rather than carry across the boundary.
-        let frame = DataFrame::new(vec![
+    /// Two tickers, two days each, unsorted on input; close prices chosen so
+    /// each ticker's second-day return is 0.1.
+    fn raw_two_ticker_frame() -> DataFrame {
+        DataFrame::new(vec![
             Column::new("ticker".into(), vec!["BBB", "AAA", "BBB", "AAA"]),
             Column::new("timestamp".into(), vec![0_i64, 0, 86_400_000, 86_400_000]),
             Column::new("open_price".into(), vec![1.0_f64; 4]),
@@ -761,20 +776,95 @@ mod tests {
             Column::new("sector".into(), vec!["S", "S", "S", "S"]),
             Column::new("industry".into(), vec!["I", "I", "I", "I"]),
         ])
-        .unwrap();
+        .unwrap()
+    }
 
-        let engineered = engineer_features(frame).unwrap();
+    #[test]
+    fn test_engineer_features_nulls_first_row_per_ticker() {
+        // Mirrors the Python pct_change().over("ticker"): each ticker's first
+        // row has a null daily_return (dropped later by clean_data), never a
+        // synthetic zero and never a value carried across the ticker boundary.
+        let engineered = engineer_features(raw_two_ticker_frame()).unwrap();
         // Sorted by [ticker, timestamp]: AAA@0, AAA@1, BBB@0, BBB@1.
-        let returns: Vec<f32> = engineered
+        let returns: Vec<Option<f32>> = engineered
+            .column("daily_return")
+            .unwrap()
+            .f32()
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(returns[0], None); // AAA first row
+        assert!((returns[1].unwrap() - 0.1).abs() < 1e-6); // 22/20 - 1
+        assert_eq!(returns[2], None); // BBB first row
+        assert!((returns[3].unwrap() - 0.1).abs() < 1e-6); // 11/10 - 1
+    }
+
+    #[test]
+    fn test_clean_data_drops_null_return_rows() {
+        // Python's CleanData filters null/NaN/non-finite daily_return rows, so
+        // each ticker's first observation never reaches the scaler or windows.
+        let engineered = engineer_features(raw_two_ticker_frame()).unwrap();
+        let cleaned = clean_data(engineered).unwrap();
+        assert_eq!(cleaned.height(), 2);
+        let returns: Vec<f32> = cleaned
             .column("daily_return")
             .unwrap()
             .f32()
             .unwrap()
             .into_no_null_iter()
             .collect();
-        assert_eq!(returns[0], 0.0); // AAA first row
-        assert!((returns[1] - 0.1).abs() < 1e-6); // 22/20 - 1
-        assert_eq!(returns[2], 0.0); // BBB first row (boundary reset, not 11/22)
-        assert!((returns[3] - 0.1).abs() < 1e-6); // 11/10 - 1
+        assert!(returns.iter().all(|r| (r - 0.1).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_engineer_features_day_of_week_is_monday_based_one_to_seven() {
+        // Python uses polars dt.weekday(): Monday = 1 .. Sunday = 7.
+        let monday = chrono::NaiveDate::from_ymd_opt(2026, 6, 8)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let sunday = chrono::NaiveDate::from_ymd_opt(2026, 6, 14)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAA", "AAA"]),
+            Column::new("timestamp".into(), vec![monday, sunday]),
+            Column::new("open_price".into(), vec![1.0_f64; 2]),
+            Column::new("high_price".into(), vec![1.0_f64; 2]),
+            Column::new("low_price".into(), vec![1.0_f64; 2]),
+            Column::new("close_price".into(), vec![10.0_f64, 11.0]),
+            Column::new("volume".into(), vec![1.0_f64; 2]),
+            Column::new("volume_weighted_average_price".into(), vec![1.0_f64; 2]),
+            Column::new("sector".into(), vec!["S", "S"]),
+            Column::new("industry".into(), vec!["I", "I"]),
+        ])
+        .unwrap();
+
+        let engineered = engineer_features(frame).unwrap();
+        let day_of_week: Vec<i32> = engineered
+            .column("day_of_week")
+            .unwrap()
+            .i32()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(day_of_week, vec![1, 7]);
+    }
+
+    #[test]
+    fn test_split_by_timestamp_boundary_row_goes_to_train() {
+        // Python: train is date <= split, validation is date > split. With 11
+        // daily rows (0..=10 days) and split 0.8 the cutoff lands exactly on
+        // day 8, which must belong to train.
+        let data = empty_data(make_encoded_frame(1, 11));
+        let (train, valid) = data.split_by_timestamp(0.8).unwrap();
+        assert_eq!(train.height(), 9);
+        assert_eq!(valid.height(), 2);
     }
 }

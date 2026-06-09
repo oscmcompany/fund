@@ -68,6 +68,17 @@ pub async fn fetch_run_metadata(
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Order run folders newest-first for artifact resolution. The trainer's
+/// timestamped folder names sort lexicographically by recency, and callers try
+/// each candidate in turn so an incomplete newest folder (trainer crashed
+/// before uploading `output/model.tar.gz`) falls back to the previous run.
+pub(crate) fn candidate_folders_descending(prefixes: Vec<String>) -> Vec<String> {
+    let mut folders = prefixes;
+    folders.sort();
+    folders.reverse();
+    folders
+}
+
 pub async fn resolve_artifact_key(
     s3_client: &S3Client,
     bucket: &str,
@@ -83,28 +94,46 @@ pub async fn resolve_artifact_key(
         return Ok(format!("{prefix}{version}/output/model.tar.gz"));
     }
 
-    let response = s3_client
+    let mut folders: Vec<String> = Vec::new();
+    let mut pages = s3_client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(prefix)
         .delimiter("/")
-        .send()
-        .await
-        .map_err(|e| ArtifactError::S3(e.to_string()))?;
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|e| ArtifactError::S3(e.to_string()))?;
+        folders.extend(
+            page.common_prefixes()
+                .iter()
+                .filter_map(|p| p.prefix().map(String::from)),
+        );
+    }
 
-    let mut folders: Vec<String> = response
-        .common_prefixes()
-        .iter()
-        .filter_map(|p| p.prefix().map(String::from))
-        .collect();
+    // Try folders newest-first and verify the model object actually exists, so
+    // an incomplete run (trainer crashed before uploading) falls back to the
+    // previous good artifact instead of being retried forever.
+    for folder in candidate_folders_descending(folders) {
+        let key = format!("{folder}output/model.tar.gz");
+        match s3_client
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => {
+                debug!(key = key, "Resolved latest artifact key");
+                return Ok(key);
+            }
+            Err(error) => {
+                debug!(key = key, error = %error, "Run folder has no model artifact, trying older");
+            }
+        }
+    }
 
-    folders.sort();
-
-    let latest = folders.last().ok_or(ArtifactError::NoArtifacts)?;
-
-    let key = format!("{latest}output/model.tar.gz");
-    debug!(key = key, "Resolved latest artifact key");
-    Ok(key)
+    Err(ArtifactError::NoArtifacts)
 }
 
 fn resolve_local_artifact_key(
@@ -285,6 +314,23 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_candidate_folders_descending_orders_newest_first() {
+        let folders = candidate_folders_descending(vec![
+            "models/tide/2026-06-01-00-00-00-000/".to_string(),
+            "models/tide/2026-06-09-16-21-25-195/".to_string(),
+            "models/tide/2026-06-05-12-00-00-000/".to_string(),
+        ]);
+        assert_eq!(
+            folders,
+            vec![
+                "models/tide/2026-06-09-16-21-25-195/",
+                "models/tide/2026-06-05-12-00-00-000/",
+                "models/tide/2026-06-01-00-00-00-000/",
+            ]
+        );
+    }
 
     #[test]
     fn test_resolve_local_no_dir() {

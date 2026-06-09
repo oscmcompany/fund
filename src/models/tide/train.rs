@@ -45,6 +45,45 @@ impl Default for TrainConfig {
     }
 }
 
+/// Epoch-end checkpoint and early-stopping policy, mirroring the Python
+/// trainer: the best model is snapshotted on any improvement, while the
+/// early-stopping counter only resets on improvements larger than `min_delta`.
+pub(crate) struct EarlyStopping {
+    best_checkpoint_metric: f64,
+    best_stopping_metric: f64,
+    epochs_without_improvement: usize,
+}
+
+impl EarlyStopping {
+    pub(crate) fn new() -> Self {
+        Self {
+            best_checkpoint_metric: f64::INFINITY,
+            best_stopping_metric: f64::INFINITY,
+            epochs_without_improvement: 0,
+        }
+    }
+
+    /// Observe an epoch's stopping metric. Returns `(snapshot, stop)`: whether
+    /// to checkpoint the current model and whether to stop training.
+    pub(crate) fn observe(&mut self, metric: f64, min_delta: f64, patience: usize) -> (bool, bool) {
+        let snapshot = metric < self.best_checkpoint_metric;
+        if snapshot {
+            self.best_checkpoint_metric = metric;
+        }
+
+        let stop = if metric < self.best_stopping_metric - min_delta {
+            self.best_stopping_metric = metric;
+            self.epochs_without_improvement = 0;
+            false
+        } else {
+            self.epochs_without_improvement += 1;
+            self.epochs_without_improvement >= patience
+        };
+
+        (snapshot, stop)
+    }
+}
+
 /// Train the model, returning the best-checkpoint model and the per-epoch
 /// training loss history.
 pub fn train(
@@ -69,8 +108,7 @@ pub fn train(
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
 
     let mut best_model = model.clone();
-    let mut best_metric = f64::INFINITY;
-    let mut epochs_without_improvement = 0usize;
+    let mut early_stopping = EarlyStopping::new();
 
     for epoch in 0..config.epoch_count {
         let mut order: Vec<usize> = (0..num_samples).collect();
@@ -132,16 +170,17 @@ pub fn train(
             "Epoch complete"
         );
 
-        if stopping_loss < best_metric - config.min_delta {
-            best_metric = stopping_loss;
+        let (snapshot, stop) = early_stopping.observe(
+            stopping_loss,
+            config.min_delta,
+            config.early_stopping_patience,
+        );
+        if snapshot {
             best_model = model.clone();
-            epochs_without_improvement = 0;
-        } else {
-            epochs_without_improvement += 1;
-            if epochs_without_improvement >= config.early_stopping_patience {
-                info!(epoch = epoch + 1, "Early stopping triggered");
-                break;
-            }
+        }
+        if stop {
+            info!(epoch = epoch + 1, "Early stopping triggered");
+            break;
         }
     }
 
@@ -227,6 +266,85 @@ mod tests {
             static_categorical,
             targets: Some(targets),
         }
+    }
+
+    #[test]
+    fn test_early_stopping_snapshots_below_min_delta_improvements() {
+        // Truth table from the Python trainer: any improvement checkpoints the
+        // model, but only improvements beyond min_delta reset the patience
+        // counter — small gains keep the best weights while still counting
+        // toward early stopping.
+        let mut policy = EarlyStopping::new();
+        assert_eq!(policy.observe(0.5, 1e-3, 2), (true, false));
+        // Better, but by less than min_delta: snapshot, counter advances.
+        assert_eq!(policy.observe(0.4999, 1e-3, 2), (true, false));
+        // Again better by a hair: snapshot, and patience 2 is now exhausted.
+        assert_eq!(policy.observe(0.4998, 1e-3, 2), (true, true));
+    }
+
+    #[test]
+    fn test_early_stopping_counter_resets_on_real_improvement() {
+        let mut policy = EarlyStopping::new();
+        assert_eq!(policy.observe(0.5, 1e-3, 2), (true, false));
+        assert_eq!(policy.observe(0.4999, 1e-3, 2), (true, false));
+        // A genuine improvement resets the counter, so no stop at patience 2.
+        assert_eq!(policy.observe(0.4, 1e-3, 2), (true, false));
+        assert_eq!(policy.observe(0.4, 1e-3, 2), (false, false));
+        assert_eq!(policy.observe(0.41, 1e-3, 2), (false, true));
+    }
+
+    #[test]
+    fn test_best_model_checkpointed_even_below_min_delta() {
+        // The Python trainer snapshots the best model whenever the stopping
+        // metric improves at all; min_delta only gates the early-stopping
+        // counter. With an enormous min_delta the counter never resets, but the
+        // returned model must still be the best epoch, not the initial weights.
+        let input_length = 3;
+        let output_length = 1;
+        let dataset = overfit_dataset(32, input_length, output_length);
+
+        let parameters = ModelParameters {
+            input_size: input_feature_size(input_length, output_length),
+            hidden_size: 16,
+            num_encoder_layers: 1,
+            num_decoder_layers: 1,
+            output_length,
+            input_length,
+            dropout_rate: 0.0,
+            quantiles: vec![0.1, 0.5, 0.9],
+            huber_delta: 0.0,
+        };
+
+        let device = Default::default();
+        let model = TideModel::<TrainBackend>::new(
+            &device,
+            parameters.input_size,
+            parameters.hidden_size,
+            parameters.num_encoder_layers,
+            parameters.num_decoder_layers,
+            parameters.output_length,
+            parameters.quantiles.len(),
+            parameters.dropout_rate,
+        );
+        let initial = model.clone();
+
+        let config = TrainConfig {
+            learning_rate: 0.01,
+            epoch_count: 10,
+            batch_size: 16,
+            early_stopping_patience: 1000,
+            min_delta: 1e9,
+        };
+
+        let (best, losses) = train(model, &dataset, None, &parameters, &config, &device);
+        assert_eq!(losses.len(), 10);
+
+        let initial_loss = validation_loss(&initial, &dataset, &parameters, config.batch_size);
+        let best_loss = validation_loss(&best, &dataset, &parameters, config.batch_size);
+        assert!(
+            best_loss < initial_loss,
+            "best model was not checkpointed: {best_loss} vs initial {initial_loss}"
+        );
     }
 
     #[test]

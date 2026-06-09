@@ -81,10 +81,17 @@ pub struct PipelineError {
 /// aren't left waiting. Without a pool, predictions are POSTed to the data
 /// manager as a fallback.
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
+    let start = Instant::now();
+    state.metrics.increment_requests();
+
     let correlation_id = Uuid::new_v4();
     let http_client = reqwest::Client::new();
 
     let result = run_pipeline_and_persist(state, &http_client, correlation_id).await;
+
+    state
+        .metrics
+        .observe_duration(start.elapsed().as_secs_f64());
 
     if let Err(error) = &result {
         state.metrics.increment_error(error.stage);
@@ -236,7 +243,6 @@ async fn run_pipeline_and_persist(
 
 async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
     let start = Instant::now();
-    state.metrics.increment_requests();
     info!("Prediction request received");
 
     let response = match run_predictions(&state).await {
@@ -247,14 +253,98 @@ async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
         ),
     };
 
-    let duration = start.elapsed();
-    state.metrics.observe_duration(duration.as_secs_f64());
     info!(
-        duration_ms = duration.as_millis(),
+        duration_ms = start.elapsed().as_millis(),
         "Prediction request complete"
     );
 
     response
+}
+
+/// Resolve the latest artifact and load it if it differs from the current
+/// model, recording training lineage in `model_runs`. Called once at startup
+/// (before the event consumer spawns, so a catch-up run has a model to use)
+/// and then from the polling loop.
+pub async fn poll_artifact_once(state: &AppState) {
+    let latest_key = match artifact::resolve_artifact_key(
+        &state.s3_client,
+        &state.artifact_bucket,
+        &state.artifact_prefix,
+        &state.model_version,
+        state.local_artifact_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(key) => key,
+        Err(e) => {
+            warn!(error = %e, "Failed to resolve artifact key");
+            return;
+        }
+    };
+
+    let current_key = {
+        let guard = state.model_state.lock().await;
+        guard.as_ref().map(|ms| ms.artifact_key.clone())
+    };
+
+    if current_key.as_deref() == Some(&latest_key) {
+        return;
+    }
+
+    info!(
+        current = current_key.as_deref().unwrap_or("none"),
+        latest = latest_key,
+        "New model artifact detected"
+    );
+
+    match artifact::download_and_load_model(
+        &state.s3_client,
+        &state.artifact_bucket,
+        &latest_key,
+        state.local_artifact_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(new_model_state) => {
+            // Record training lineage in model_runs so predictions written
+            // with this run_id join back to its metrics. Best-effort.
+            if let Some(pool) = &state.pool {
+                let run_id = new_model_state.run_id.clone();
+                match artifact::fetch_run_metadata(
+                    &state.s3_client,
+                    &state.artifact_bucket,
+                    &latest_key,
+                    state.local_artifact_dir.as_deref(),
+                )
+                .await
+                {
+                    Some(metadata) => {
+                        let record = database::ModelRunRecord::from_metadata(
+                            &run_id,
+                            &latest_key,
+                            &metadata,
+                        );
+                        if let Err(e) = database::upsert_model_run(pool, &record).await {
+                            warn!(error = %e, "Failed to upsert model_runs row");
+                        }
+                    }
+                    None => {
+                        warn!(
+                            run_id = run_id,
+                            "run_metadata.json unavailable; skipping model_runs upsert"
+                        );
+                    }
+                }
+            }
+
+            let mut guard = state.model_state.lock().await;
+            *guard = Some(new_model_state);
+            info!(artifact_key = latest_key, "Model hot-swapped");
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to load new model artifact");
+        }
+    }
 }
 
 pub async fn start_artifact_polling(state: AppState) {
@@ -262,86 +352,7 @@ pub async fn start_artifact_polling(state: AppState) {
 
     loop {
         tokio::time::sleep(poll_interval).await;
-
-        let latest_key = match artifact::resolve_artifact_key(
-            &state.s3_client,
-            &state.artifact_bucket,
-            &state.artifact_prefix,
-            &state.model_version,
-            state.local_artifact_dir.as_deref(),
-        )
-        .await
-        {
-            Ok(key) => key,
-            Err(e) => {
-                warn!(error = %e, "Failed to resolve artifact key");
-                continue;
-            }
-        };
-
-        let current_key = {
-            let guard = state.model_state.lock().await;
-            guard.as_ref().map(|ms| ms.artifact_key.clone())
-        };
-
-        if current_key.as_deref() == Some(&latest_key) {
-            continue;
-        }
-
-        info!(
-            current = current_key.as_deref().unwrap_or("none"),
-            latest = latest_key,
-            "New model artifact detected"
-        );
-
-        match artifact::download_and_load_model(
-            &state.s3_client,
-            &state.artifact_bucket,
-            &latest_key,
-            state.local_artifact_dir.as_deref(),
-        )
-        .await
-        {
-            Ok(new_model_state) => {
-                // Record training lineage in model_runs so predictions written
-                // with this run_id join back to its metrics. Best-effort.
-                if let Some(pool) = &state.pool {
-                    let run_id = new_model_state.run_id.clone();
-                    match artifact::fetch_run_metadata(
-                        &state.s3_client,
-                        &state.artifact_bucket,
-                        &latest_key,
-                        state.local_artifact_dir.as_deref(),
-                    )
-                    .await
-                    {
-                        Some(metadata) => {
-                            let record = database::ModelRunRecord::from_metadata(
-                                &run_id,
-                                &latest_key,
-                                &metadata,
-                            );
-                            if let Err(e) = database::upsert_model_run(pool, &record).await {
-                                warn!(error = %e, "Failed to upsert model_runs row");
-                            }
-                        }
-                        None => {
-                            warn!(
-                                run_id = run_id,
-                                "run_metadata.json unavailable; skipping model_runs upsert"
-                            );
-                        }
-                    }
-                }
-
-                let mut guard = state.model_state.lock().await;
-                *guard = Some(new_model_state);
-                info!(artifact_key = latest_key, "Model hot-swapped");
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to load new model artifact");
-            }
-        }
+        poll_artifact_once(&state).await;
     }
 }
 
@@ -419,6 +430,27 @@ mod tests {
         assert!(text.contains("ensemble_prediction_row_count"));
         assert!(text.contains("ensemble_model_load_timestamp"));
         assert!(text.contains("ensemble_model_artifact_info"));
+    }
+
+    #[tokio::test]
+    async fn test_run_predictions_records_request_metrics() {
+        // The Python service counts every prediction run (event-triggered
+        // included) and observes its duration; the shared run_predictions must
+        // record both so the consumer path isn't blind.
+        let state = make_test_state();
+
+        let result = run_predictions(&state).await;
+        assert!(result.is_err());
+
+        let rendered = state.metrics.render_prometheus(0, "");
+        assert!(
+            rendered.contains("ensemble_prediction_requests_total 1"),
+            "request counter not incremented by run_predictions"
+        );
+        assert!(
+            rendered.contains("ensemble_prediction_duration_seconds_count 1"),
+            "duration histogram not observed by run_predictions"
+        );
     }
 
     #[tokio::test]
