@@ -171,11 +171,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     info!(key = model_key, "Uploaded model artifact");
 
+    // Date range covered by the lookback window, for model_runs lineage.
+    let end_date = Utc::now().date_naive();
+    let start_date = end_date - Duration::days(lookback_days);
+
     let metadata = serde_json::json!({
         "artifact_timestamp": timestamp,
         "input_size": input_size,
         "input_length": INPUT_LENGTH,
         "output_length": OUTPUT_LENGTH,
+        "lookback_days": lookback_days,
+        "start_date": start_date.format("%Y-%m-%d").to_string(),
+        "end_date": end_date.format("%Y-%m-%d").to_string(),
         "epochs_run": losses.len(),
         "final_train_loss": losses.last().copied().unwrap_or_default(),
         "metrics": metrics,

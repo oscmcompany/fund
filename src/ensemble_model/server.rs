@@ -59,175 +59,150 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, body)
 }
 
-async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
-    let start = Instant::now();
-    state.metrics.increment_requests();
-    info!("Prediction request received");
+/// Successful outcome of a prediction run.
+pub struct PredictionRun {
+    pub predictions: serde_json::Value,
+    pub row_count: usize,
+}
 
-    let guard = state.model_state.lock().await;
-    let model_state = match guard.as_ref() {
-        Some(ms) => ms,
-        None => {
-            error!("Model not loaded");
-            state.metrics.increment_error("model_not_loaded");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Model not loaded"})),
-            );
-        }
-    };
+/// A prediction-pipeline failure, tagged with the stage that failed so callers
+/// can record metrics and emit `predictions_failed` with a reason.
+pub struct PipelineError {
+    pub stage: &'static str,
+    pub message: String,
+}
 
+/// Run the full prediction pipeline once and persist the result.
+///
+/// Shared by the HTTP handler and the Postgres event consumer. When a pool is
+/// configured, predictions are inserted into `equity_predictions` and a
+/// `predictions_completed` event is emitted on success; any stage failure emits
+/// `predictions_failed` (with the stage as the reason) so downstream consumers
+/// aren't left waiting. Without a pool, predictions are POSTed to the data
+/// manager as a fallback.
+pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
+    let correlation_id = Uuid::new_v4();
     let http_client = reqwest::Client::new();
 
-    let equity_bars = match predict::fetch_equity_bars_auto(
-        state.pool.as_ref(),
-        &state.data_manager_base_url,
-        &http_client,
-    )
-    .await
-    {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "fetch_equity_bars", "Prediction failed");
-            state.metrics.increment_error("fetch_equity_bars");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
+    let result = run_pipeline_and_persist(state, &http_client, correlation_id).await;
+
+    if let Err(error) = &result {
+        state.metrics.increment_error(error.stage);
+        error!(stage = error.stage, error = %error.message, "Prediction pipeline failed");
+        if let Some(pool) = &state.pool {
+            if let Err(emit_error) = database::emit_event(
+                pool,
+                "predictions_failed",
+                &serde_json::json!({
+                    "correlation_id": correlation_id.to_string(),
+                    "reason": error.stage,
+                }),
+            )
+            .await
+            {
+                warn!(error = %emit_error, "Failed to emit predictions_failed event");
+            }
         }
-    };
+    }
 
-    let equity_details = match predict::fetch_equity_details_auto(
-        state.pool.as_ref(),
-        &state.data_manager_base_url,
-        &http_client,
-    )
-    .await
-    {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "fetch_equity_details", "Prediction failed");
-            state.metrics.increment_error("fetch_equity_details");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
-        }
-    };
+    result
+}
 
-    let consolidated = match predict::consolidate_data(equity_bars, equity_details) {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "data_consolidation", "Prediction failed");
-            state.metrics.increment_error("data_consolidation");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
-        }
-    };
+async fn run_pipeline_and_persist(
+    state: &AppState,
+    http_client: &reqwest::Client,
+    correlation_id: Uuid,
+) -> Result<PredictionRun, PipelineError> {
+    // Inference holds the model lock across the data-fetch awaits, matching the
+    // original handler. The block yields the predictions plus the run id so the
+    // lock is released before persistence.
+    let (predictions, model_run_id) = {
+        let guard = state.model_state.lock().await;
+        let model_state = guard.as_ref().ok_or_else(|| PipelineError {
+            stage: "model_not_loaded",
+            message: "Model not loaded".to_string(),
+        })?;
 
-    let equity_filtered = match predict::filter_equity_bars(consolidated, 10.0, 1_000_000.0) {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "equity_bar_filtering", "Prediction failed");
-            state.metrics.increment_error("equity_bar_filtering");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
-        }
-    };
+        let equity_bars = predict::fetch_equity_bars_auto(
+            state.pool.as_ref(),
+            &state.data_manager_base_url,
+            http_client,
+        )
+        .await
+        .map_err(|e| PipelineError {
+            stage: "fetch_equity_bars",
+            message: e.to_string(),
+        })?;
 
-    let filtered = match predict::filter_to_trained_tickers(equity_filtered, model_state) {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "ticker_filtering", "Prediction failed");
-            state.metrics.increment_error("ticker_filtering");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
-        }
-    };
+        let equity_details = predict::fetch_equity_details_auto(
+            state.pool.as_ref(),
+            &state.data_manager_base_url,
+            http_client,
+        )
+        .await
+        .map_err(|e| PipelineError {
+            stage: "fetch_equity_details",
+            message: e.to_string(),
+        })?;
 
-    let prediction_result = predict::generate_predictions(filtered, model_state);
+        let consolidated =
+            predict::consolidate_data(equity_bars, equity_details).map_err(|e| PipelineError {
+                stage: "data_consolidation",
+                message: e.to_string(),
+            })?;
 
-    drop(guard);
+        let equity_filtered = predict::filter_equity_bars(consolidated, 10.0, 1_000_000.0)
+            .map_err(|e| PipelineError {
+                stage: "equity_bar_filtering",
+                message: e.to_string(),
+            })?;
 
-    let predictions = match prediction_result {
-        Ok(data) => data,
-        Err(e) => {
-            error!(error = %e, stage = "prediction", "Prediction failed");
-            state.metrics.increment_error("prediction");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            );
-        }
+        let filtered =
+            predict::filter_to_trained_tickers(equity_filtered, model_state).map_err(|e| {
+                PipelineError {
+                    stage: "ticker_filtering",
+                    message: e.to_string(),
+                }
+            })?;
+
+        let predictions =
+            predict::generate_predictions(filtered, model_state).map_err(|e| PipelineError {
+                stage: "prediction",
+                message: e.to_string(),
+            })?;
+
+        (predictions, model_state.run_id.clone())
     };
 
     if let Some(prediction_array) = predictions.as_array() {
-        if let Err(e) = predict::validate_predictions(prediction_array) {
-            error!(error = %e, stage = "validation", "Prediction validation failed");
-            state.metrics.increment_error("validation");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            );
-        }
-
+        predict::validate_predictions(prediction_array).map_err(|message| PipelineError {
+            stage: "validation",
+            message,
+        })?;
         state.metrics.set_batch_count(1);
         state.metrics.set_row_count(prediction_array.len() as u64);
     }
 
-    // Save predictions via PG when available, HTTP fallback otherwise
-    if let Some(pool) = &state.pool {
-        let correlation_id = Uuid::new_v4();
-        let model_run_id = {
-            let guard = state.model_state.lock().await;
-            guard
-                .as_ref()
-                .map(|ms| ms.artifact_key.clone())
-                .unwrap_or_default()
-        };
+    let row_count = predictions.as_array().map(|array| array.len()).unwrap_or(0);
 
+    if let Some(pool) = &state.pool {
         if let Some(prediction_array) = predictions.as_array() {
-            match database::insert_predictions(
+            let rows =
+                database::insert_predictions(pool, prediction_array, correlation_id, &model_run_id)
+                    .await
+                    .map_err(|e| PipelineError {
+                        stage: "insert_predictions",
+                        message: e.to_string(),
+                    })?;
+            info!(rows = rows, "Predictions inserted into PostgreSQL");
+            if let Err(e) = database::emit_event(
                 pool,
-                prediction_array,
-                correlation_id,
-                &model_run_id,
+                "predictions_completed",
+                &serde_json::json!({"correlation_id": correlation_id.to_string()}),
             )
             .await
             {
-                Ok(rows) => {
-                    info!(rows = rows, "Predictions inserted into PostgreSQL");
-                    if let Err(e) = database::emit_event(
-                        pool,
-                        "predictions_completed",
-                        &serde_json::json!({"correlation_id": correlation_id.to_string()}),
-                    )
-                    .await
-                    {
-                        warn!(error = %e, "Failed to emit predictions_completed event");
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to insert predictions into PostgreSQL");
-                    if let Err(event_error) = database::emit_event(
-                        pool,
-                        "predictions_failed",
-                        &serde_json::json!({
-                            "correlation_id": correlation_id.to_string(),
-                            "reason": "insert_predictions",
-                        }),
-                    )
-                    .await
-                    {
-                        warn!(error = %event_error, "Failed to emit predictions_failed event");
-                    }
-                }
+                warn!(error = %e, "Failed to emit predictions_completed event");
             }
         }
     } else {
@@ -253,6 +228,25 @@ async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
+    Ok(PredictionRun {
+        predictions,
+        row_count,
+    })
+}
+
+async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
+    let start = Instant::now();
+    state.metrics.increment_requests();
+    info!("Prediction request received");
+
+    let response = match run_predictions(&state).await {
+        Ok(run) => (StatusCode::OK, Json(run.predictions)),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.message})),
+        ),
+    };
+
     let duration = start.elapsed();
     state.metrics.observe_duration(duration.as_secs_f64());
     info!(
@@ -260,7 +254,7 @@ async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
         "Prediction request complete"
     );
 
-    (StatusCode::OK, Json(predictions))
+    response
 }
 
 pub async fn start_artifact_polling(state: AppState) {
@@ -309,6 +303,37 @@ pub async fn start_artifact_polling(state: AppState) {
         .await
         {
             Ok(new_model_state) => {
+                // Record training lineage in model_runs so predictions written
+                // with this run_id join back to its metrics. Best-effort.
+                if let Some(pool) = &state.pool {
+                    let run_id = new_model_state.run_id.clone();
+                    match artifact::fetch_run_metadata(
+                        &state.s3_client,
+                        &state.artifact_bucket,
+                        &latest_key,
+                        state.local_artifact_dir.as_deref(),
+                    )
+                    .await
+                    {
+                        Some(metadata) => {
+                            let record = database::ModelRunRecord::from_metadata(
+                                &run_id,
+                                &latest_key,
+                                &metadata,
+                            );
+                            if let Err(e) = database::upsert_model_run(pool, &record).await {
+                                warn!(error = %e, "Failed to upsert model_runs row");
+                            }
+                        }
+                        None => {
+                            warn!(
+                                run_id = run_id,
+                                "run_metadata.json unavailable; skipping model_runs upsert"
+                            );
+                        }
+                    }
+                }
+
                 let mut guard = state.model_state.lock().await;
                 *guard = Some(new_model_state);
                 info!(artifact_key = latest_key, "Model hot-swapped");

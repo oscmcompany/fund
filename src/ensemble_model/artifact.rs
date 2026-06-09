@@ -18,6 +18,56 @@ pub enum ArtifactError {
     ModelLoad(String),
 }
 
+/// Derive the training run id from an artifact key. For the canonical
+/// `<prefix>/<run_id>/output/model.tar.gz` layout this returns `<run_id>`;
+/// otherwise it falls back to the last path segment.
+pub fn run_id_from_artifact_key(artifact_key: &str) -> String {
+    if let Some(prefix) = artifact_key.strip_suffix("/output/model.tar.gz") {
+        return prefix.rsplit('/').next().unwrap_or(prefix).to_string();
+    }
+    artifact_key
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(artifact_key)
+        .to_string()
+}
+
+/// Best-effort fetch of the sibling `run_metadata.json` next to an artifact
+/// (`<prefix>/<run_id>/run_metadata.json`). Returns `None` on any failure so the
+/// caller can proceed without lineage metadata.
+pub async fn fetch_run_metadata(
+    s3_client: &S3Client,
+    bucket: &str,
+    artifact_key: &str,
+    local_dir: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let metadata_key = artifact_key
+        .strip_suffix("output/model.tar.gz")
+        .map(|base| format!("{base}run_metadata.json"));
+
+    if local_dir.is_some() {
+        let candidate = match &metadata_key {
+            Some(key) => PathBuf::from(key),
+            None => Path::new(artifact_key).join("run_metadata.json"),
+        };
+        return std::fs::read_to_string(&candidate)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok());
+    }
+
+    let key = metadata_key?;
+    let response = s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(&key)
+        .send()
+        .await
+        .ok()?;
+    let bytes = response.body.collect().await.ok()?.into_bytes();
+    serde_json::from_slice(&bytes).ok()
+}
+
 pub async fn resolve_artifact_key(
     s3_client: &S3Client,
     bucket: &str,
@@ -227,6 +277,7 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         categorical_columns,
         static_categorical_columns,
         artifact_key: artifact_key.to_string(),
+        run_id: run_id_from_artifact_key(artifact_key),
         load_timestamp,
     })
 }
@@ -240,6 +291,20 @@ mod tests {
         let result =
             resolve_local_artifact_key(Path::new("/nonexistent"), "artifacts/tide/", "latest");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_canonical() {
+        assert_eq!(
+            run_id_from_artifact_key("models/tide/2026-06-09-16-21-25-195/output/model.tar.gz"),
+            "2026-06-09-16-21-25-195"
+        );
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_fallback() {
+        assert_eq!(run_id_from_artifact_key("some/dir/run-x"), "run-x");
+        assert_eq!(run_id_from_artifact_key("run-y"), "run-y");
     }
 
     #[test]

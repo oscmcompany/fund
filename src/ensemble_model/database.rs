@@ -159,6 +159,146 @@ pub async fn emit_event(
     Ok(())
 }
 
+/// Return the last processed event id for a consumer, or 0 if not yet recorded.
+pub async fn get_consumer_offset(pool: &PgPool, consumer_name: &str) -> Result<i64, sqlx::Error> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1")
+            .bind(consumer_name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id).unwrap_or(0))
+}
+
+/// Upsert the last processed event id for a consumer. `GREATEST` guards against
+/// moving the offset backwards under concurrent updates.
+pub async fn update_consumer_offset(
+    pool: &PgPool,
+    consumer_name: &str,
+    last_event_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (consumer_name) DO UPDATE SET \
+           last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), \
+           updated_at = EXCLUDED.updated_at",
+    )
+    .bind(consumer_name)
+    .bind(last_event_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Id of the most recent event of `event_type` with id greater than `after_id`,
+/// used to catch up on a request that arrived while the consumer was down.
+pub async fn latest_event_after(
+    pool: &PgPool,
+    event_type: &str,
+    after_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT id FROM events WHERE event_type = $1 AND id > $2 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(event_type)
+    .bind(after_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+/// Lineage row for the `model_runs` table, extracted from a trained model's
+/// `run_metadata.json`.
+#[derive(Debug, Clone)]
+pub struct ModelRunRecord {
+    pub run_id: String,
+    pub artifact_key: String,
+    pub crps: Option<f64>,
+    pub directional_accuracy: Option<f64>,
+    pub quantile_coverage: Option<f64>,
+    pub lookback_days: Option<i32>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub training_data_key: Option<String>,
+    pub stage_counts: serde_json::Value,
+}
+
+impl ModelRunRecord {
+    /// Build a record from the trainer's `run_metadata.json`. Missing fields stay
+    /// `None`/null so the row can still be written.
+    pub fn from_metadata(run_id: &str, artifact_key: &str, metadata: &serde_json::Value) -> Self {
+        let metrics = &metadata["metrics"];
+        let stage_counts = metadata.get("stage_counts").cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "train_samples": metadata.get("train_samples"),
+                "validation_samples": metadata.get("validation_samples"),
+            })
+        });
+        Self {
+            run_id: run_id.to_string(),
+            artifact_key: artifact_key.to_string(),
+            crps: metrics.get("crps").and_then(|v| v.as_f64()),
+            directional_accuracy: metrics.get("directional_accuracy").and_then(|v| v.as_f64()),
+            quantile_coverage: metrics.get("quantile_coverage").and_then(|v| v.as_f64()),
+            lookback_days: metadata
+                .get("lookback_days")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
+            start_date: metadata
+                .get("start_date")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            end_date: metadata
+                .get("end_date")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            training_data_key: metadata
+                .get("training_data_key")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            stage_counts,
+        }
+    }
+}
+
+/// Upsert a `model_runs` lineage row so `equity_predictions.model_run_id` joins
+/// back to training metadata. Mirrors the prior Python `ensemble_manager` sync.
+pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO model_runs ( \
+             run_id, artifact_key, status, completed_at, \
+             continuous_ranked_probability_score, directional_accuracy, quantile_coverage, \
+             lookback_days, start_date, end_date, training_data_key, stage_counts \
+         ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7::date, $8::date, $9, $10::jsonb) \
+         ON CONFLICT (run_id) DO UPDATE SET \
+             artifact_key = EXCLUDED.artifact_key, \
+             status = EXCLUDED.status, \
+             completed_at = EXCLUDED.completed_at, \
+             continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score, \
+             directional_accuracy = EXCLUDED.directional_accuracy, \
+             quantile_coverage = EXCLUDED.quantile_coverage, \
+             lookback_days = EXCLUDED.lookback_days, \
+             start_date = EXCLUDED.start_date, \
+             end_date = EXCLUDED.end_date, \
+             training_data_key = EXCLUDED.training_data_key, \
+             stage_counts = EXCLUDED.stage_counts",
+    )
+    .bind(&record.run_id)
+    .bind(&record.artifact_key)
+    .bind(record.crps)
+    .bind(record.directional_accuracy)
+    .bind(record.quantile_coverage)
+    .bind(record.lookback_days)
+    .bind(&record.start_date)
+    .bind(&record.end_date)
+    .bind(&record.training_data_key)
+    .bind(record.stage_counts.to_string())
+    .execute(pool)
+    .await?;
+    info!(run_id = record.run_id, "Upserted model_runs lineage row");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +344,45 @@ mod tests {
             let result = query_equity_details(&pool).await;
             assert!(result.is_err());
         });
+    }
+
+    #[test]
+    fn test_model_run_record_from_metadata() {
+        let metadata = serde_json::json!({
+            "artifact_timestamp": "2026-06-09-16-21-25-195",
+            "lookback_days": 1200,
+            "start_date": "2023-02-25",
+            "end_date": "2026-06-09",
+            "training_data_key": "models/tide/2026-06-09-16-21-25-195/filtered_data.parquet",
+            "train_samples": 2529261,
+            "validation_samples": 531330,
+            "metrics": {
+                "crps": 0.0059,
+                "directional_accuracy": 0.617,
+                "quantile_coverage": 0.719
+            }
+        });
+        let record = ModelRunRecord::from_metadata(
+            "2026-06-09-16-21-25-195",
+            "models/tide/2026-06-09-16-21-25-195/output/model.tar.gz",
+            &metadata,
+        );
+        assert_eq!(record.run_id, "2026-06-09-16-21-25-195");
+        assert_eq!(record.crps, Some(0.0059));
+        assert_eq!(record.directional_accuracy, Some(0.617));
+        assert_eq!(record.quantile_coverage, Some(0.719));
+        assert_eq!(record.lookback_days, Some(1200));
+        assert_eq!(record.start_date.as_deref(), Some("2023-02-25"));
+        assert_eq!(record.stage_counts["train_samples"], 2529261);
+    }
+
+    #[test]
+    fn test_model_run_record_missing_fields_default_to_none() {
+        let metadata = serde_json::json!({});
+        let record = ModelRunRecord::from_metadata("run", "key", &metadata);
+        assert_eq!(record.crps, None);
+        assert_eq!(record.lookback_days, None);
+        assert_eq!(record.start_date, None);
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub struct ModelState {
     pub categorical_columns: Vec<String>,
     pub static_categorical_columns: Vec<String>,
     pub artifact_key: String,
+    /// Training run id (the timestamp segment of the artifact key). Written to
+    /// `equity_predictions.model_run_id` so predictions join `model_runs.run_id`.
+    pub run_id: String,
     pub load_timestamp: i64,
 }
 

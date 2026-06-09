@@ -1,7 +1,9 @@
-//! Ensemble model service: loads trained TiDE artifacts from S3 and serves
-//! predictions over HTTP.
+//! Ensemble model service: loads trained TiDE artifacts from S3, serves
+//! predictions over HTTP, and consumes `predictions_requested` events from the
+//! Postgres event bus.
 
 pub mod artifact;
+pub mod consumer;
 pub mod database;
 pub mod predict;
 pub mod server;
@@ -23,7 +25,8 @@ pub async fn run(bind_address: &str) {
 
     let app = server::create_router(state.clone());
 
-    tokio::spawn(server::start_artifact_polling(state));
+    tokio::spawn(server::start_artifact_polling(state.clone()));
+    consumer::spawn_event_consumer(state);
 
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await

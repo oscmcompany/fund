@@ -609,21 +609,22 @@ in {
           exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
         '';
 
-      ensemble-manager.exec = let
-        uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
-      in
+      # Rust ensemble_model (Burn): serves predictions over HTTP and consumes
+      # predictions_requested from the Postgres event bus. Replaces the former
+      # Python ensemble_manager (uvicorn/tinygrad).
+      ensemble-manager.exec =
         if isDeployed
         then ''
+          set -euo pipefail
           ${waitForPostgres}
           ${killPort "8082"}
-          export CC=clang
-          exec secretspec run -- ${uvicornCmd}
+          exec secretspec run -- cargo run --no-default-features --features ensemble_model --bin ensemble_model --release
         ''
         else ''
+          set -euo pipefail
           ${waitForPostgres}
           ${killPort "8082"}
-          export CC=clang
-          exec secretspec run -- ${uvicornCmd} --reload
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_model --bin ensemble_model'
         '';
 
       portfolio-manager.exec = let
