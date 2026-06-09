@@ -4,6 +4,7 @@ pub mod equity_bars;
 pub mod equity_details;
 pub mod equity_quotes;
 pub mod errors;
+pub mod export;
 pub mod health;
 pub mod router;
 pub mod scheduler;
