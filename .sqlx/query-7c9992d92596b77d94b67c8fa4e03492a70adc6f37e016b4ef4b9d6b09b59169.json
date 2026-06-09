@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c9992d92596b77d94b67c8fa4e03492a70adc6f37e016b4ef4b9d6b09b59169"
+}

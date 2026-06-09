@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, triggered_at, trigger_reason, model_run_id, completed_at, status\n         FROM equity_rebalance_sessions\n         ORDER BY triggered_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "triggered_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "trigger_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "model_run_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "status",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "9f9d192bd0e5fe1ed6b912eb4854f5d8394884619f0252d1750a727567f8711d"
+}

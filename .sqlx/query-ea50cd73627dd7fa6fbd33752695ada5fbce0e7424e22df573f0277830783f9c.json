@@ -1,0 +1,110 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, run_id, model_name, artifact_key, training_data_key, start_date, end_date,\n         lookback_days, status, continuous_ranked_probability_score, directional_accuracy,\n         quantile_coverage, drift_status, stage_counts, started_at, completed_at\n         FROM model_runs\n         ORDER BY started_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "artifact_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "training_data_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "start_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 6,
+        "name": "end_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 7,
+        "name": "lookback_days",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "continuous_ranked_probability_score",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 10,
+        "name": "directional_accuracy",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 11,
+        "name": "quantile_coverage",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 12,
+        "name": "drift_status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "stage_counts",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 14,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "ea50cd73627dd7fa6fbd33752695ada5fbce0e7424e22df573f0277830783f9c"
+}

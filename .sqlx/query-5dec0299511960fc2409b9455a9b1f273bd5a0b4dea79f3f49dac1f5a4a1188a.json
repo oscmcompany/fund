@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size\n         FROM equity_quotes\n         WHERE timestamp >= $1 AND timestamp < $2\n         ORDER BY timestamp ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "bid_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "ask_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "bid_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "ask_size",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5dec0299511960fc2409b9455a9b1f273bd5a0b4dea79f3f49dac1f5a4a1188a"
+}

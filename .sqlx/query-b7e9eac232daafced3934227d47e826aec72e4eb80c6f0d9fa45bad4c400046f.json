@@ -1,0 +1,98 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,\n         signal_strength, status, opened_at, closed_at, realized_profit_and_loss,\n         return_percent, holding_days\n         FROM equity_pairs\n         ORDER BY opened_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "rebalance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "pair_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "long_ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "short_ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "z_score",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "hedge_ratio",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "signal_strength",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 8,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "opened_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "closed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "realized_profit_and_loss",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 12,
+        "name": "return_percent",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 13,
+        "name": "holding_days",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b7e9eac232daafced3934227d47e826aec72e4eb80c6f0d9fa45bad4c400046f"
+}

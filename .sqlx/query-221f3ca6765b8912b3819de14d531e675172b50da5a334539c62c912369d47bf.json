@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume,\n         volume_weighted_average_price, transactions, inserted_at\n         FROM equity_bars\n         WHERE timestamp >= $1 AND timestamp < $2\n         ORDER BY ticker ASC, timestamp ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "open_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "high_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "low_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "close_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "volume",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "volume_weighted_average_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 8,
+        "name": "transactions",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "inserted_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "221f3ca6765b8912b3819de14d531e675172b50da5a334539c62c912369d47bf"
+}

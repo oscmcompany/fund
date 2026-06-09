@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scheduled_jobs\n           SET completed_at = now(), status = 'completed', result = $2\n           WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e4cb0ea30ec352987b0b7f20a6a89b7ac3614b80f4de5f6339cbb79385b2d72a"
+}

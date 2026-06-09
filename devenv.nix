@@ -105,6 +105,15 @@ in {
       language = "system";
       fail_fast = true;
     };
+    sqlx-prepare-check = {
+      enable = true;
+      name = "Check sqlx query metadata cache";
+      entry = "sqlx-prepare-check";
+      files = "(\\.rs|Cargo\\.(toml|lock))$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
   };
 
   env = {
@@ -118,6 +127,11 @@ in {
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
     PGDATABASE = "fund";
+
+    # sqlx compile-time query checking uses the committed .sqlx/ cache rather
+    # than a live database connection; run `cargo sqlx prepare --workspace` to
+    # regenerate the cache after changing queries.
+    SQLX_OFFLINE = "true";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -163,6 +177,7 @@ in {
     clang
     bacon
     cargo-llvm-cov
+    sqlx-cli
     cargo-watch
     curl
     duckdb
@@ -398,6 +413,18 @@ in {
 
   scripts.rust-checks.exec = ''
     devenv tasks run checks:rust
+  '';
+
+  scripts.sqlx-prepare-check.exec = ''
+    set -euo pipefail
+    if ! pg_isready -q 2>/dev/null; then
+      echo "sqlx prepare check skipped: database not available"
+      echo "Run 'devenv --profile apps up' then 'cargo sqlx prepare --workspace' to verify the cache"
+      exit 0
+    fi
+    echo "Checking sqlx query metadata cache is up to date"
+    cargo sqlx prepare --check --workspace
+    echo "sqlx prepare check passed"
   '';
 
   scripts.markdown-checks.exec = ''
