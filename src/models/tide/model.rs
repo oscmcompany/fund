@@ -123,6 +123,19 @@ impl<B: Backend> TideModel<B> {
         }
     }
 
+    /// Persist the model weights as a Burn record at `directory_path/tide_states`,
+    /// the exact stem [`TideModel::<NdArray>::load`] reads back. The on-disk file
+    /// gets the recorder's own extension; the loader re-derives it from the stem.
+    pub fn save(&self, directory_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(directory_path)?;
+        let record_path = directory_path.join("tide_states");
+        self.clone().save_file(
+            record_path,
+            &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
+        )?;
+        Ok(())
+    }
+
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let batch_size = input.dims()[0];
 
@@ -187,5 +200,35 @@ mod tests {
         let input = Tensor::<NdArray, 2>::zeros([2, 32], &device);
         let output = block.forward(input);
         assert_eq!(output.dims(), [2, 32]);
+    }
+
+    #[test]
+    fn test_save_load_round_trip_preserves_forward() {
+        let device = Default::default();
+        let input_size = 24;
+        let model: TideModel<NdArray> = TideModel::new(&device, input_size, 16, 2, 1, 5, 3, 0.0);
+
+        // A non-trivial input so a random-weight fallback would differ.
+        let input = Tensor::<NdArray, 1>::from_floats(
+            (0..(2 * input_size))
+                .map(|i| i as f32 * 0.01)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &device,
+        )
+        .reshape([2, input_size]);
+        let expected: Vec<f32> = model.forward(input.clone()).to_data().to_vec().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        model.save(dir.path()).unwrap();
+
+        let loaded =
+            TideModel::<NdArray>::load(dir.path(), input_size, 16, 2, 1, 5, 3, 0.0).unwrap();
+        let actual: Vec<f32> = loaded.forward(input).to_data().to_vec().unwrap();
+
+        assert_eq!(expected.len(), actual.len());
+        for (e, a) in expected.iter().zip(actual.iter()) {
+            assert!((e - a).abs() < 1e-6, "weights not preserved: {e} vs {a}");
+        }
     }
 }

@@ -322,7 +322,7 @@ in {
   scripts.rust-lint.exec = ''
     set -euo pipefail
     echo "Running Rust lint checks"
-    cargo clippy --workspace
+    cargo clippy --workspace --all-features --all-targets
     echo "Rust linting completed successfully"
   '';
 
@@ -330,7 +330,7 @@ in {
         set -euo pipefail
         echo "Running Rust tests"
 
-        TEST_ARGS="--workspace --verbose --lib --bins"
+        TEST_ARGS="--workspace --verbose --lib --bins --all-features"
 
         mkdir -p .coverage_output
         export LLVM_COV=$(which llvm-cov)
@@ -486,21 +486,15 @@ in {
 
     # --- Model training ---
 
-    "models:tide:register-blocks".exec = ''
+    # Rust-native TiDE training (burn). Reads bars + details from S3, trains, and
+    # uploads a model.tar.gz the ensemble inference service loads directly. The
+    # former Python/tinygrad workflow and its Prefect block registration are
+    # retired.
+    "models:tide:train".exec = ''
       set -euo pipefail
-      echo "Registering Prefect S3 blocks"
-      secretspec run -- uv run python -m tide.register_blocks
+      echo "Running tide training pipeline (Rust + burn)"
+      secretspec run -- cargo run --release --no-default-features --features train --bin tide_train
     '';
-
-    "models:tide:train" = {
-      exec = ''
-        set -euo pipefail
-        export CC=clang
-        echo "Running tide training pipeline"
-        secretspec run -- uv run python -m tide.workflow
-      '';
-      after = ["models:tide:register-blocks"];
-    };
 
     # --- Data tasks ---
 
@@ -651,15 +645,8 @@ in {
 
     scripts.train-local.exec = ''
       set -euo pipefail
-      export CC=clang
-      echo "Running local training pipeline"
-      uv run python -m tide.workflow
-    '';
-
-    scripts.deploy-training.exec = ''
-      set -euo pipefail
-      echo "Registering Prefect deployment"
-      uv run python -m tide.deploy
+      echo "Running local training pipeline (Rust + burn)"
+      cargo run --release --no-default-features --features train --bin tide_train
     '';
   };
 

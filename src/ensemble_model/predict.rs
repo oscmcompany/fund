@@ -1,7 +1,6 @@
 use std::io::Cursor;
 
 use burn::backend::NdArray;
-use burn::prelude::*;
 use chrono::{Duration, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
@@ -310,39 +309,15 @@ pub fn generate_predictions(
 
     let device = Default::default();
     let num_samples = dataset.len();
-    let n_cont = dataset.past_continuous.shape()[2];
-    let n_cat = dataset.past_categorical.shape()[2];
-    let n_static = dataset.static_categorical.shape()[2];
 
-    let flattened_input_size = dataset_input_length * n_cont
-        + dataset_input_length * n_cat
-        + output_length * n_cat
-        + n_static;
-
-    let mut input_data = Vec::with_capacity(num_samples * flattened_input_size);
-    for sample_idx in 0..num_samples {
-        for t in 0..dataset_input_length {
-            for f in 0..n_cont {
-                input_data.push(dataset.past_continuous[[sample_idx, t, f]]);
-            }
-        }
-        for t in 0..dataset_input_length {
-            for f in 0..n_cat {
-                input_data.push(dataset.past_categorical[[sample_idx, t, f]] as f32);
-            }
-        }
-        for t in 0..output_length {
-            for f in 0..n_cat {
-                input_data.push(dataset.future_categorical[[sample_idx, t, f]] as f32);
-            }
-        }
-        for f in 0..n_static {
-            input_data.push(dataset.static_categorical[[sample_idx, 0, f]] as f32);
-        }
-    }
-
-    let inputs = Tensor::<NdArray, 1>::from_floats(input_data.as_slice(), &device)
-        .reshape([num_samples, flattened_input_size]);
+    let indices: Vec<usize> = (0..num_samples).collect();
+    let inputs = crate::models::tide::batch::build_input_tensor::<NdArray>(
+        &dataset,
+        &indices,
+        dataset_input_length,
+        output_length,
+        &device,
+    );
 
     let predictions = model_state.model.forward(inputs);
     let predictions_data: Vec<f32> = predictions

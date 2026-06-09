@@ -23,6 +23,11 @@ name = "ensemble_model"
 path = "src/bin/ensemble_model.rs"
 required-features = ["ensemble_model"]
 
+[[bin]]
+name = "tide_train"
+path = "src/bin/tide_train.rs"
+required-features = ["train"]
+
 [features]
 default = ["data_manager", "ensemble_model"]
 data_manager = [
@@ -38,6 +43,10 @@ ensemble_model = [
   "dep:tar",
   "dep:tempfile",
 ]
+# Rust-native TiDE training. Reuses the ensemble_model model/data/predict code
+# and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
+# for epoch shuffling.
+train = ["ensemble_model", "dep:rand"]
 
 [dependencies]
 # Shared / base (always compiled)
@@ -91,12 +100,17 @@ tokio-tungstenite = { version = "0.26", features = [
 ], optional = true }
 futures-util = { version = "0.3", optional = true }
 
-# ensemble_model-only (optional; enabled by the `ensemble_model` feature)
-burn = { version = "0.16", features = ["ndarray"], optional = true }
+# ensemble_model-only (optional; enabled by the `ensemble_model` feature).
+# `autodiff` brings the Autodiff backend used by Rust-native training; it adds
+# no runtime cost to the NdArray inference path.
+burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
 ndarray = { version = "0.16", optional = true }
 flate2 = { version = "1.0", optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
+
+# train-only (optional; enabled by the `train` feature)
+rand = { version = "0.8", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"

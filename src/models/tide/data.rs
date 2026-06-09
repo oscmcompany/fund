@@ -106,7 +106,7 @@ impl TrainingDataset {
     }
 }
 
-const CONTINUOUS_COLUMNS: &[&str] = &[
+pub(crate) const CONTINUOUS_COLUMNS: &[&str] = &[
     "open_price",
     "high_price",
     "low_price",
@@ -116,7 +116,7 @@ const CONTINUOUS_COLUMNS: &[&str] = &[
     "daily_return",
 ];
 
-const CATEGORICAL_COLUMNS: &[&str] = &[
+pub(crate) const CATEGORICAL_COLUMNS: &[&str] = &[
     "day_of_week",
     "day_of_month",
     "day_of_year",
@@ -124,7 +124,20 @@ const CATEGORICAL_COLUMNS: &[&str] = &[
     "year",
 ];
 
-const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "industry"];
+pub(crate) const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "industry"];
+
+/// The model target is the future window of `daily_return`, which is the last
+/// continuous column. Fitting and windowing index into this position.
+pub(crate) const TARGET_COLUMN: &str = "daily_return";
+
+/// Flattened model input width for the given window lengths: past continuous +
+/// past categorical + future categorical + static features.
+pub fn input_feature_size(input_length: usize, output_length: usize) -> usize {
+    input_length * CONTINUOUS_COLUMNS.len()
+        + input_length * CATEGORICAL_COLUMNS.len()
+        + output_length * CATEGORICAL_COLUMNS.len()
+        + STATIC_CATEGORICAL_COLUMNS.len()
+}
 
 pub struct Data {
     pub data: DataFrame,
@@ -136,6 +149,22 @@ pub struct Data {
 }
 
 impl Data {
+    /// Wrap an already scaled-and-encoded DataFrame with the scaler/mappings that
+    /// produced it. Used by [`crate::models::tide::fit`] after fitting.
+    pub fn from_parts(data: DataFrame, scaler: Scaler, mappings: FeatureMappings) -> Self {
+        Self {
+            data,
+            scaler,
+            mappings,
+            continuous_columns: CONTINUOUS_COLUMNS.iter().map(|s| s.to_string()).collect(),
+            categorical_columns: CATEGORICAL_COLUMNS.iter().map(|s| s.to_string()).collect(),
+            static_categorical_columns: STATIC_CATEGORICAL_COLUMNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
     pub fn apply_existing_scaler(
         data: DataFrame,
         scaler: &Scaler,
@@ -146,151 +175,219 @@ impl Data {
         let data = apply_scaling(data, scaler)?;
         let data = encode_categoricals(data, mappings)?;
 
-        Ok(Self {
-            data,
-            scaler: scaler.clone(),
-            mappings: mappings.clone(),
-            continuous_columns: CONTINUOUS_COLUMNS.iter().map(|s| s.to_string()).collect(),
-            categorical_columns: CATEGORICAL_COLUMNS.iter().map(|s| s.to_string()).collect(),
-            static_categorical_columns: STATIC_CATEGORICAL_COLUMNS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-        })
+        Ok(Self::from_parts(data, scaler.clone(), mappings.clone()))
     }
 
+    /// Split the engineered frame into (train, validate) by a global date cutoff:
+    /// rows whose timestamp is before `min + (max - min) * validation_split` are
+    /// training, the rest are validation. Mirrors the Python trainer's date split.
+    pub fn split_by_timestamp(
+        &self,
+        validation_split: f64,
+    ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
+        let timestamps = self.data.column("timestamp").map_err(|e| e.to_string())?;
+        let timestamps = timestamps.i64().map_err(|e| e.to_string())?;
+        let min_ts = timestamps.min().unwrap_or(0);
+        let max_ts = timestamps.max().unwrap_or(0);
+        let cutoff = min_ts + (((max_ts - min_ts) as f64) * validation_split) as i64;
+
+        let train_mask = timestamps.lt(cutoff);
+        let valid_mask = timestamps.gt_eq(cutoff);
+        let train = self.data.filter(&train_mask).map_err(|e| e.to_string())?;
+        let valid = self.data.filter(&valid_mask).map_err(|e| e.to_string())?;
+        Ok((train, valid))
+    }
+
+    /// Build a windowed dataset.
+    ///
+    /// - `predict` → one window per ticker at the end of its series, no targets.
+    /// - `train` / `validate` → all sliding windows over the corresponding date
+    ///   split, with the future `daily_return` window as targets.
     pub fn get_dataset(
         &self,
         data_type: &str,
-        _validation_split: f64,
+        validation_split: f64,
         input_length: usize,
         output_length: usize,
     ) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
-        let window_size = input_length + output_length;
-        let n_cont = CONTINUOUS_COLUMNS.len();
-        let n_cat = CATEGORICAL_COLUMNS.len();
-        let n_static = STATIC_CATEGORICAL_COLUMNS.len();
-
-        let tickers: Vec<String> = self
-            .data
-            .column("ticker")
-            .map_err(|e| e.to_string())?
-            .str()
-            .map_err(|e| e.to_string())?
-            .into_no_null_iter()
-            .map(|s| s.to_string())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let mut all_past_cont: Vec<Vec<f32>> = Vec::new();
-        let mut all_past_cat: Vec<Vec<i32>> = Vec::new();
-        let mut all_future_cat: Vec<Vec<i32>> = Vec::new();
-        let mut all_static_cat: Vec<Vec<i32>> = Vec::new();
-
-        for ticker in &tickers {
-            let mask = self
-                .data
-                .column("ticker")
-                .map_err(|e| e.to_string())?
-                .str()
-                .map_err(|e| e.to_string())?
-                .equal(ticker.as_str());
-            let ticker_data = self.data.filter(&mask).map_err(|e| e.to_string())?;
-
-            if ticker_data.height() < window_size {
-                continue;
+        match data_type {
+            "predict" => window_frame(&self.data, input_length, output_length, true, false),
+            "validate" => {
+                let (_, valid) = self.split_by_timestamp(validation_split)?;
+                window_frame(&valid, input_length, output_length, false, true)
             }
-
-            let cont_arrays = get_float_columns(&ticker_data, CONTINUOUS_COLUMNS)?;
-            let cat_arrays = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
-            let static_arrays = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
-
-            let windows: Vec<usize> = if data_type == "predict" {
-                if ticker_data.height() >= window_size {
-                    vec![ticker_data.height() - window_size]
-                } else {
-                    vec![]
-                }
-            } else {
-                (0..=ticker_data.height() - window_size).collect()
-            };
-
-            for start in windows {
-                let mut past_cont = Vec::with_capacity(input_length * n_cont);
-                for t in start..start + input_length {
-                    for col in &cont_arrays {
-                        past_cont.push(col[t]);
-                    }
-                }
-
-                let mut past_cat = Vec::with_capacity(input_length * n_cat);
-                for t in start..start + input_length {
-                    for col in &cat_arrays {
-                        past_cat.push(col[t]);
-                    }
-                }
-
-                let mut future_cat = Vec::with_capacity(output_length * n_cat);
-                for t in (start + input_length)..(start + input_length + output_length) {
-                    for col in &cat_arrays {
-                        future_cat.push(col[t]);
-                    }
-                }
-
-                let mut static_cat = Vec::with_capacity(n_static);
-                for col in &static_arrays {
-                    static_cat.push(col[start]);
-                }
-
-                all_past_cont.push(past_cont);
-                all_past_cat.push(past_cat);
-                all_future_cat.push(future_cat);
-                all_static_cat.push(static_cat);
+            _ => {
+                let (train, _) = self.split_by_timestamp(validation_split)?;
+                window_frame(&train, input_length, output_length, false, true)
             }
         }
-
-        let num_samples = all_past_cont.len();
-
-        let past_continuous = if num_samples > 0 {
-            let flat: Vec<f32> = all_past_cont.into_iter().flatten().collect();
-            ndarray::Array3::from_shape_vec((num_samples, input_length, n_cont), flat)?
-        } else {
-            ndarray::Array3::zeros((0, input_length, n_cont))
-        };
-
-        let past_categorical = if num_samples > 0 {
-            let flat: Vec<i32> = all_past_cat.into_iter().flatten().collect();
-            ndarray::Array3::from_shape_vec((num_samples, input_length, n_cat), flat)?
-        } else {
-            ndarray::Array3::zeros((0, input_length, n_cat))
-        };
-
-        let future_categorical = if num_samples > 0 {
-            let flat: Vec<i32> = all_future_cat.into_iter().flatten().collect();
-            ndarray::Array3::from_shape_vec((num_samples, output_length, n_cat), flat)?
-        } else {
-            ndarray::Array3::zeros((0, output_length, n_cat))
-        };
-
-        let static_categorical = if num_samples > 0 {
-            let flat: Vec<i32> = all_static_cat.into_iter().flatten().collect();
-            ndarray::Array3::from_shape_vec((num_samples, 1, n_static), flat)?
-        } else {
-            ndarray::Array3::zeros((0, 1, n_static))
-        };
-
-        Ok(TrainingDataset {
-            past_continuous,
-            past_categorical,
-            future_categorical,
-            static_categorical,
-            targets: None,
-        })
     }
 }
 
-fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+/// Core windowing over a single (already preprocessed) frame.
+///
+/// `predict_mode` keeps only the final window per ticker; `with_targets`
+/// additionally extracts the future `daily_return` window as the target.
+fn window_frame(
+    frame: &DataFrame,
+    input_length: usize,
+    output_length: usize,
+    predict_mode: bool,
+    with_targets: bool,
+) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
+    let window_size = input_length + output_length;
+    let n_cont = CONTINUOUS_COLUMNS.len();
+    let n_cat = CATEGORICAL_COLUMNS.len();
+    let n_static = STATIC_CATEGORICAL_COLUMNS.len();
+    let target_index = CONTINUOUS_COLUMNS
+        .iter()
+        .position(|c| *c == TARGET_COLUMN)
+        .expect("daily_return must be a continuous column");
+
+    // `ticker` is integer-encoded by this point (encode_categoricals). Group by
+    // the encoded id; sorted for deterministic sample ordering.
+    let mut tickers: Vec<i32> = frame
+        .column("ticker")
+        .map_err(|e| e.to_string())?
+        .i32()
+        .map_err(|e| e.to_string())?
+        .into_no_null_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    tickers.sort_unstable();
+
+    let mut all_past_cont: Vec<Vec<f32>> = Vec::new();
+    let mut all_past_cat: Vec<Vec<i32>> = Vec::new();
+    let mut all_future_cat: Vec<Vec<i32>> = Vec::new();
+    let mut all_static_cat: Vec<Vec<i32>> = Vec::new();
+    let mut all_targets: Vec<Vec<f32>> = Vec::new();
+
+    for ticker in &tickers {
+        let mask = frame
+            .column("ticker")
+            .map_err(|e| e.to_string())?
+            .i32()
+            .map_err(|e| e.to_string())?
+            .equal(*ticker);
+        let ticker_data = frame.filter(&mask).map_err(|e| e.to_string())?;
+
+        if ticker_data.height() < window_size {
+            continue;
+        }
+
+        let cont_arrays = get_float_columns(&ticker_data, CONTINUOUS_COLUMNS)?;
+        let cat_arrays = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
+        let static_arrays = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
+
+        let windows: Vec<usize> = if predict_mode {
+            vec![ticker_data.height() - window_size]
+        } else {
+            (0..=ticker_data.height() - window_size).collect()
+        };
+
+        for start in windows {
+            let mut past_cont = Vec::with_capacity(input_length * n_cont);
+            for t in start..start + input_length {
+                for col in &cont_arrays {
+                    past_cont.push(col[t]);
+                }
+            }
+
+            let mut past_cat = Vec::with_capacity(input_length * n_cat);
+            for t in start..start + input_length {
+                for col in &cat_arrays {
+                    past_cat.push(col[t]);
+                }
+            }
+
+            let mut future_cat = Vec::with_capacity(output_length * n_cat);
+            for t in (start + input_length)..(start + input_length + output_length) {
+                for col in &cat_arrays {
+                    future_cat.push(col[t]);
+                }
+            }
+
+            let mut static_cat = Vec::with_capacity(n_static);
+            for col in &static_arrays {
+                static_cat.push(col[start]);
+            }
+
+            all_past_cont.push(past_cont);
+            all_past_cat.push(past_cat);
+            all_future_cat.push(future_cat);
+            all_static_cat.push(static_cat);
+
+            if with_targets {
+                let returns = &cont_arrays[target_index];
+                let future = (start + input_length)..(start + input_length + output_length);
+                all_targets.push(returns[future].to_vec());
+            }
+        }
+    }
+
+    let num_samples = all_past_cont.len();
+
+    let past_continuous = if num_samples > 0 {
+        let flat: Vec<f32> = all_past_cont.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec((num_samples, input_length, n_cont), flat)?
+    } else {
+        ndarray::Array3::zeros((0, input_length, n_cont))
+    };
+
+    let past_categorical = if num_samples > 0 {
+        let flat: Vec<i32> = all_past_cat.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec((num_samples, input_length, n_cat), flat)?
+    } else {
+        ndarray::Array3::zeros((0, input_length, n_cat))
+    };
+
+    let future_categorical = if num_samples > 0 {
+        let flat: Vec<i32> = all_future_cat.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec((num_samples, output_length, n_cat), flat)?
+    } else {
+        ndarray::Array3::zeros((0, output_length, n_cat))
+    };
+
+    let static_categorical = if num_samples > 0 {
+        let flat: Vec<i32> = all_static_cat.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec((num_samples, 1, n_static), flat)?
+    } else {
+        ndarray::Array3::zeros((0, 1, n_static))
+    };
+
+    let targets = if with_targets && num_samples > 0 {
+        let flat: Vec<f32> = all_targets.into_iter().flatten().collect();
+        Some(ndarray::Array3::from_shape_vec(
+            (num_samples, output_length, 1),
+            flat,
+        )?)
+    } else if with_targets {
+        Some(ndarray::Array3::zeros((0, output_length, 1)))
+    } else {
+        None
+    };
+
+    Ok(TrainingDataset {
+        past_continuous,
+        past_categorical,
+        future_categorical,
+        static_categorical,
+        targets,
+    })
+}
+
+pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    // Sort by [ticker, timestamp] so daily returns and the downstream windowing
+    // are chronological and contiguous within each ticker, independent of the
+    // order rows arrived in. Returns reset to 0 at each ticker boundary.
+    let data = data
+        .sort(
+            ["ticker", "timestamp"],
+            SortMultipleOptions::default().with_maintain_order(true),
+        )
+        .map_err(|e| e.to_string())?;
+
     let timestamps = data.column("timestamp").map_err(|e| e.to_string())?;
     let height = data.height();
 
@@ -307,6 +404,15 @@ fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::E
         .f64()
         .map_err(|e| e.to_string())?
         .into_no_null_iter()
+        .collect();
+
+    let tickers: Vec<String> = data
+        .column("ticker")
+        .map_err(|e| e.to_string())?
+        .str()
+        .map_err(|e| e.to_string())?
+        .into_no_null_iter()
+        .map(|s| s.to_string())
         .collect();
 
     let timestamp_values: Vec<i64> = timestamps
@@ -326,7 +432,8 @@ fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::E
         month.push(date.month() as i32);
         year.push(date.year());
 
-        if i > 0 && close_prices[i - 1] != 0.0 {
+        let same_ticker = i > 0 && tickers[i] == tickers[i - 1];
+        if same_ticker && close_prices[i - 1] != 0.0 {
             daily_return.push(((close_prices[i] / close_prices[i - 1]) - 1.0) as f32);
         } else {
             daily_return.push(0.0f32);
@@ -356,7 +463,7 @@ fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::E
     Ok(new_data)
 }
 
-fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
     // Uppercase ticker, sector, industry columns in-place
     let ticker_upper: Vec<String> = data
         .column("ticker")
@@ -404,7 +511,7 @@ fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Erro
     Ok(cleaned)
 }
 
-fn apply_scaling(
+pub(crate) fn apply_scaling(
     data: DataFrame,
     scaler: &Scaler,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
@@ -436,7 +543,7 @@ fn apply_scaling(
     Ok(result)
 }
 
-fn encode_categoricals(
+pub(crate) fn encode_categoricals(
     data: DataFrame,
     mappings: &FeatureMappings,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
@@ -553,5 +660,121 @@ mod tests {
         };
         assert!(dataset.is_empty());
         assert_eq!(dataset.len(), 0);
+    }
+
+    /// Build a minimal, already engineered/scaled/encoded frame (ticker and the
+    /// categorical columns are integer-encoded) for windowing tests.
+    fn make_encoded_frame(num_tickers: i32, rows_per_ticker: usize) -> DataFrame {
+        let total = num_tickers as usize * rows_per_ticker;
+        let mut ticker = Vec::with_capacity(total);
+        let mut timestamp = Vec::with_capacity(total);
+        let mut close = Vec::with_capacity(total);
+        let mut daily_return = Vec::with_capacity(total);
+        for t in 0..num_tickers {
+            for r in 0..rows_per_ticker {
+                ticker.push(t);
+                timestamp.push((r as i64) * 86_400_000);
+                close.push(100.0_f64 + r as f64);
+                daily_return.push(0.01_f32 * (r as f32 + t as f32));
+            }
+        }
+        let ones_f = vec![1.0_f64; total];
+        let ones_i = vec![1_i32; total];
+        DataFrame::new(vec![
+            Column::new("ticker".into(), ticker),
+            Column::new("timestamp".into(), timestamp),
+            Column::new("open_price".into(), ones_f.clone()),
+            Column::new("high_price".into(), ones_f.clone()),
+            Column::new("low_price".into(), ones_f.clone()),
+            Column::new("close_price".into(), close),
+            Column::new("volume".into(), ones_f.clone()),
+            Column::new("volume_weighted_average_price".into(), ones_f),
+            Column::new("daily_return".into(), daily_return),
+            Column::new("day_of_week".into(), ones_i.clone()),
+            Column::new("day_of_month".into(), ones_i.clone()),
+            Column::new("day_of_year".into(), ones_i.clone()),
+            Column::new("month".into(), ones_i.clone()),
+            Column::new("year".into(), ones_i.clone()),
+            Column::new("sector".into(), ones_i.clone()),
+            Column::new("industry".into(), ones_i),
+        ])
+        .unwrap()
+    }
+
+    fn empty_data(frame: DataFrame) -> Data {
+        Data::from_parts(
+            frame,
+            Scaler {
+                means: HashMap::new(),
+                standard_deviations: HashMap::new(),
+            },
+            FeatureMappings::new(),
+        )
+    }
+
+    #[test]
+    fn test_get_dataset_predict_one_window_per_ticker() {
+        let data = empty_data(make_encoded_frame(3, 6));
+        let dataset = data.get_dataset("predict", 0.8, 2, 1).unwrap();
+        // One prediction window per ticker, no targets.
+        assert_eq!(dataset.len(), 3);
+        assert!(dataset.targets.is_none());
+        assert_eq!(dataset.past_continuous.shape(), [3, 2, 7]);
+        assert_eq!(dataset.future_categorical.shape(), [3, 1, 5]);
+        assert_eq!(dataset.static_categorical.shape(), [3, 1, 3]);
+    }
+
+    #[test]
+    fn test_get_dataset_train_has_targets() {
+        let data = empty_data(make_encoded_frame(2, 10));
+        let dataset = data.get_dataset("train", 0.8, 3, 2).unwrap();
+        let sample_count = dataset.len();
+        assert!(sample_count > 0);
+        let targets = dataset.targets.expect("train dataset must have targets");
+        assert_eq!(targets.shape()[1], 2); // output_length
+        assert_eq!(targets.shape()[2], 1);
+        assert_eq!(targets.shape()[0], sample_count);
+    }
+
+    #[test]
+    fn test_split_by_timestamp_partitions_rows() {
+        let data = empty_data(make_encoded_frame(1, 10));
+        let (train, valid) = data.split_by_timestamp(0.8).unwrap();
+        assert_eq!(train.height() + valid.height(), 10);
+        assert!(train.height() > 0);
+        assert!(valid.height() > 0);
+    }
+
+    #[test]
+    fn test_engineer_features_resets_return_at_ticker_boundary() {
+        // Two tickers, unsorted input; engineer_features must sort and reset the
+        // first per-ticker return to 0 rather than carry across the boundary.
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["BBB", "AAA", "BBB", "AAA"]),
+            Column::new("timestamp".into(), vec![0_i64, 0, 86_400_000, 86_400_000]),
+            Column::new("open_price".into(), vec![1.0_f64; 4]),
+            Column::new("high_price".into(), vec![1.0_f64; 4]),
+            Column::new("low_price".into(), vec![1.0_f64; 4]),
+            Column::new("close_price".into(), vec![10.0_f64, 20.0, 11.0, 22.0]),
+            Column::new("volume".into(), vec![1.0_f64; 4]),
+            Column::new("volume_weighted_average_price".into(), vec![1.0_f64; 4]),
+            Column::new("sector".into(), vec!["S", "S", "S", "S"]),
+            Column::new("industry".into(), vec!["I", "I", "I", "I"]),
+        ])
+        .unwrap();
+
+        let engineered = engineer_features(frame).unwrap();
+        // Sorted by [ticker, timestamp]: AAA@0, AAA@1, BBB@0, BBB@1.
+        let returns: Vec<f32> = engineered
+            .column("daily_return")
+            .unwrap()
+            .f32()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(returns[0], 0.0); // AAA first row
+        assert!((returns[1] - 0.1).abs() < 1e-6); // 22/20 - 1
+        assert_eq!(returns[2], 0.0); // BBB first row (boundary reset, not 11/22)
+        assert!((returns[3] - 0.1).abs() < 1e-6); // 11/10 - 1
     }
 }
