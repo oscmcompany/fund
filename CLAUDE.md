@@ -84,3 +84,8 @@ This is a collection of guidelines and references.
 - `devenv tasks run` supports prefix group execution: `checks:python` runs all `checks:python:*` subtasks
 - Prefer validated constructors with private fields over public struct literals — a value in scope should be proof of its
   own validity, not a candidate for re-checking downstream
+- `schema.sql` is the single source of truth for the database schema; all DDL must use idempotent forms
+  (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`,
+  `DO` block checking `cron.job` for existence before calling `cron.schedule*(...)`, etc.)
+  so the file can be safely re-run against any populated database — never add migration-style
+  `ALTER TABLE`, `DROP TABLE`, or bare `UPDATE` blocks
