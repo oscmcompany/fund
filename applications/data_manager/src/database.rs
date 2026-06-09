@@ -1,5 +1,6 @@
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use internal::market::{EquityBar, EquityDetails, EquityQuote};
+use internal::predictions::{EquityPrediction, ModelRun};
 use internal::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
 };
@@ -351,6 +352,44 @@ pub async fn query_equity_portfolio_snapshots(
     .await
 }
 
+pub async fn query_equity_predictions_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<EquityPrediction>, sqlx::Error> {
+    let (date_start, date_end) = date_to_utc_range(date);
+
+    let predictions = sqlx::query_as::<_, EquityPrediction>(
+        "SELECT correlation_id, model_run_id, ticker, timestamp, quantile_10, quantile_50,
+         quantile_90, created_at
+         FROM equity_predictions
+         WHERE timestamp >= $1 AND timestamp < $2
+         ORDER BY ticker ASC, timestamp ASC",
+    )
+    .bind(date_start)
+    .bind(date_end)
+    .fetch_all(pool)
+    .await?;
+
+    debug!(
+        "Queried {} equity predictions for {}",
+        predictions.len(),
+        date
+    );
+    Ok(predictions)
+}
+
+pub async fn query_model_runs(pool: &PgPool) -> Result<Vec<ModelRun>, sqlx::Error> {
+    sqlx::query_as::<_, ModelRun>(
+        "SELECT id, run_id, model_name, artifact_key, training_data_key, start_date, end_date,
+         lookback_days, status, continuous_ranked_probability_score, directional_accuracy,
+         quantile_coverage, drift_status, stage_counts, started_at, completed_at
+         FROM model_runs
+         ORDER BY started_at ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn requeue_stale_claimed_jobs(
     pool: &PgPool,
     job_name: &str,
@@ -606,6 +645,36 @@ mod tests {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let result = query_equity_portfolio_snapshots(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_predictions_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = query_equity_predictions_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_model_runs_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_model_runs(&pool).await;
             assert!(result.is_err());
         });
     }
