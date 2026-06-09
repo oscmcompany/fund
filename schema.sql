@@ -322,6 +322,43 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- cron.schedule_in_timezone: schedules a named pg_cron job using a local-time cron expression.
+-- Converts the hour component of a simple 'MM HH dow dom month' expression to UTC at scheduling
+-- time using the named timezone. The UTC offset is computed from the current date, so DST
+-- transitions that occur after scheduling will shift the job by one hour until the schema is
+-- re-applied. Only handles numeric hour and minute fields; non-numeric fields are passed through
+-- unchanged to cron.schedule.
+CREATE OR REPLACE FUNCTION cron.schedule_in_timezone(
+    job_name text,
+    schedule text,
+    timezone_name text,
+    command text
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    minute_field text := split_part(schedule, ' ', 1);
+    hour_field   text := split_part(schedule, ' ', 2);
+    rest         text := split_part(schedule, ' ', 3) || ' ' ||
+                         split_part(schedule, ' ', 4) || ' ' ||
+                         split_part(schedule, ' ', 5);
+    utc_hour     integer;
+    utc_schedule text;
+BEGIN
+    IF minute_field ~ '^\d+$' AND hour_field ~ '^\d+$' THEN
+        utc_hour := EXTRACT(
+            hour FROM (
+                (current_date::text || ' ' || hour_field || ':' || minute_field)::timestamp
+                AT TIME ZONE timezone_name
+            )
+        )::integer;
+        utc_schedule := minute_field || ' ' || utc_hour::text || ' ' || rest;
+    ELSE
+        utc_schedule := schedule;
+    END IF;
+    RETURN cron.schedule(job_name, utc_schedule, command);
+END;
+$$;
+
 -- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
 -- Uses a timezone-aware schedule so DST is handled correctly year-round.
 -- Fires before the intraday-check window ends so the rebalance lockout window in portfolio-manager

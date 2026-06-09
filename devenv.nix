@@ -8,7 +8,13 @@
     else rawFundProfile;
   isProduction = fundProfile == "production";
 
-  bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
+  # Compute bucket name and secretspec profile at shell/process start time from
+  # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
+  # evaluation time because dotenv runs after Nix evaluates devenv.nix.
+  runtimeEnv = ''
+    export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
+    export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
+  '';
 
   applySchema = ''
     echo "Applying schema..."
@@ -109,12 +115,6 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # Active profile
-    FUND_PROFILE = fundProfile;
-
-    # S3 bucket name derived from FUND_PROFILE
-    AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
-
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
     PGDATABASE = "fund";
@@ -124,7 +124,6 @@ in {
 
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
-    SECRETSPEC_PROFILE = fundProfile;
 
     # Disable AWS CLI pager so secrets output is not paged
     AWS_PAGER = "";
@@ -189,19 +188,23 @@ in {
 
   scripts.database-restore.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
     echo "Downloading database backup from S3..."
     aws s3 cp "s3://$AWS_S3_BUCKET_NAME/database/backups/fund-latest.dump.gz" /tmp/fund-latest.dump.gz
     rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
+    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_pre_restore();"
     pg_restore --host 127.0.0.1 --port 5432 \
       --no-owner --no-acl \
-      --dbname fund --clean --if-exists /tmp/fund-latest.dump
+      --dbname fund --clean --if-exists /tmp/fund-latest.dump || true
+    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_post_restore();"
     rm -f /tmp/fund-latest.dump
     echo "Database restored"
   '';
 
   scripts.database-backup.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
     echo "Creating database backup..."
     pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
     gzip -f /tmp/fund-latest.dump
@@ -213,6 +216,7 @@ in {
 
   scripts.database-fetch-equity-details.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
     echo "Downloading equity details from S3..."
     aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
     echo "Loading equity details into database..."
@@ -267,6 +271,7 @@ in {
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
     echo "  Bucket: $AWS_S3_BUCKET_NAME"
@@ -630,6 +635,7 @@ in {
         if isProduction
         then ''
           set -euo pipefail
+          ${runtimeEnv}
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
@@ -637,6 +643,7 @@ in {
         ''
         else ''
           set -euo pipefail
+          ${runtimeEnv}
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
@@ -648,12 +655,14 @@ in {
       in
         if isProduction
         then ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
@@ -665,11 +674,13 @@ in {
       in
         if isProduction
         then ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
@@ -699,6 +710,7 @@ in {
   };
 
   enterShell = ''
+    ${runtimeEnv}
     mkdir -p /var/log/fund 2>/dev/null || true
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
