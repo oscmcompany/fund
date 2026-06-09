@@ -1,8 +1,4 @@
-{
-  pkgs,
-  lib,
-  ...
-}: let
+{pkgs, ...}: let
   awsRegion = "us-east-1";
 
   rawFundProfile = builtins.getEnv "FUND_PROFILE";
@@ -10,9 +6,23 @@
     if rawFundProfile == ""
     then "development"
     else rawFundProfile;
-  isDeployed = fundProfile == "production" || lib.hasPrefix "development/" fundProfile;
+  isProduction = fundProfile == "production";
 
-  bucketSlug = builtins.replaceStrings ["/" "."] ["-" "-"] fundProfile;
+  # Compute bucket name and secretspec profile at shell/process start time from
+  # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
+  # evaluation time because dotenv runs after Nix evaluates devenv.nix.
+  runtimeEnv = ''
+    export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
+    export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
+  '';
+
+  applySchema = ''
+    echo "Applying schema..."
+    psql -h localhost -p 5432 -d fund \
+      -f ${./schema.sql} \
+      --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
+    echo "Schema applied"
+  '';
 in {
   cachix.enable = false;
   dotenv.enable = true;
@@ -105,12 +115,6 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # Active profile
-    FUND_PROFILE = fundProfile;
-
-    # S3 bucket name derived from FUND_PROFILE
-    AWS_S3_BUCKET_NAME = "oscm-fund-${bucketSlug}";
-
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
     PGDATABASE = "fund";
@@ -120,7 +124,6 @@ in {
 
     # Secretspec CLI configuration
     SECRETSPEC_PROVIDER = "awssm";
-    SECRETSPEC_PROFILE = fundProfile;
 
     # Disable AWS CLI pager so secrets output is not paged
     AWS_PAGER = "";
@@ -178,20 +181,97 @@ in {
     xenon
   ];
 
-  scripts.database-seed.exec = ''
+  # database:restore — fast recovery from a nightly S3 dump when schema has not changed.
+  # database:create — first-time setup: apply schema, seed equity details, backfill bars.
+  # database:reset  — drop and recreate the empty fund database; run before database:create
+  #                   after a breaking schema change.
+
+  scripts.database-restore.exec = ''
     set -euo pipefail
-    echo "Downloading latest database snapshot..."
-    aws s3 cp s3://fund-backups/pg/fund-latest.dump.gz /tmp/fund-latest.dump.gz
+    ${runtimeEnv}
+    echo "Downloading database backup from S3..."
+    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/database/backups/fund-latest.dump.gz" /tmp/fund-latest.dump.gz
     rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
+    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_pre_restore();"
     pg_restore --host 127.0.0.1 --port 5432 \
       --no-owner --no-acl \
-      --dbname fund --clean --if-exists /tmp/fund-latest.dump
-    echo "Database seeded"
+      --dbname fund --clean --if-exists /tmp/fund-latest.dump || true
+    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_post_restore();"
+    rm -f /tmp/fund-latest.dump
+    echo "Database restored"
+  '';
+
+  scripts.database-backup.exec = ''
+    set -euo pipefail
+    ${runtimeEnv}
+    echo "Creating database backup..."
+    pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
+    gzip -f /tmp/fund-latest.dump
+    echo "Uploading backup to S3..."
+    aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/database/backups/fund-latest.dump.gz"
+    rm -f /tmp/fund-latest.dump.gz
+    echo "Database backup complete"
+  '';
+
+  scripts.database-fetch-equity-details.exec = ''
+    set -euo pipefail
+    ${runtimeEnv}
+    echo "Downloading equity details from S3..."
+    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
+    echo "Loading equity details into database..."
+    psql -h localhost -p 5432 -d fund <<'SQL'
+      CREATE TEMP TABLE tmp_equity_details (LIKE equity_details INCLUDING ALL);
+      \COPY tmp_equity_details (ticker, sector, industry) FROM '/tmp/equity_details.csv' CSV HEADER
+      INSERT INTO equity_details SELECT * FROM tmp_equity_details
+        ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
+      DROP TABLE tmp_equity_details;
+    SQL
+    rm -f /tmp/equity_details.csv
+    echo "Equity details loaded"
+  '';
+
+  scripts.database-fetch-equity-bars.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:fetch-equity-bars"
+      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+      exit 1
+    fi
+
+    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
+
+    echo "Waiting for data-manager to be healthy..."
+    attempt=0
+    max_attempts=30
+    while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
+        exit 1
+      fi
+      sleep 2
+    done
+    echo "Data-manager is healthy"
+
+    echo "Fetching equity bars from $BACKFILL_START_DATE to $END_DATE"
+    secretspec run -- uv run --package tools python -m tools.sync_equity_bars_data \
+      http://localhost:8080 \
+      "{\"start_date\": \"$BACKFILL_START_DATE\", \"end_date\": \"$END_DATE\"}"
+  '';
+
+  scripts.database-reset.exec = ''
+    set -euo pipefail
+    echo "Resetting fund database..."
+    psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
+    psql -h localhost -p 5432 -d postgres -c "CREATE DATABASE fund"
+    echo "Fund database reset"
   '';
 
   scripts.aws-buckets.exec = ''
     set -euo pipefail
+    ${runtimeEnv}
     unset AWS_ENDPOINT_URL
     echo "=== Fund S3 Buckets (profile: $FUND_PROFILE) ==="
     echo "  Bucket: $AWS_S3_BUCKET_NAME"
@@ -379,36 +459,6 @@ in {
     '{}')"
   '';
 
-  scripts.backfill-bars.exec = ''
-    set -euo pipefail
-
-    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-bars"
-      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
-      exit 1
-    fi
-
-    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
-
-    echo "Waiting for data-manager to be healthy..."
-    attempt=0
-    max_attempts=30
-    while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-      attempt=$((attempt + 1))
-      if [ "$attempt" -ge "$max_attempts" ]; then
-        echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
-        exit 1
-      fi
-      sleep 2
-    done
-    echo "Data-manager is healthy"
-
-    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
-    secretspec run -- uv run --package tools python -m tools.sync_equity_bars_data \
-      http://localhost:8080 \
-      "{\"start_date\": \"$BACKFILL_START_DATE\", \"end_date\": \"$END_DATE\"}"
-  '';
-
   tasks = {
     # --- Python checks (install first, then all others in parallel) ---
 
@@ -478,9 +528,31 @@ in {
       after = ["models:tide:register-blocks"];
     };
 
-    # --- Data tasks ---
+    # --- Database lifecycle tasks ---
+    # Create: first-time setup or post-reset recovery after a breaking schema change.
+    #   Applies schema, then seeds equity details, then backfills equity bars.
+    #   Requires BACKFILL_START_DATE=YYYY-MM-DD (and optionally BACKFILL_END_DATE).
+    # Update: automatic on each process start via applySchema in data-manager.exec.
+    #   Safe for additive changes; loud failure for breaking changes.
+    # Restore: fast recovery from a nightly S3 dump (schema must match the dump).
 
-    "data:backfill-bars".exec = "backfill-bars";
+    "database:reset".exec = "database-reset";
+    "database:restore".exec = "database-restore";
+    "database:backup".exec = "database-backup";
+    "database:fetch-equity-details".exec = "database-fetch-equity-details";
+    "database:fetch-equity-bars".exec = "database-fetch-equity-bars";
+
+    "database:create".exec = ''
+      set -euo pipefail
+      if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+        echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:create"
+        echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+        exit 1
+      fi
+      ${applySchema}
+      database-fetch-equity-details
+      database-fetch-equity-bars
+    '';
 
     "checks:base" = {
       exec = ''
@@ -558,19 +630,12 @@ in {
           sleep 2
         done
       '';
-
-      applySchema = ''
-        echo "Applying schema migrations..."
-        psql -h localhost -p 5432 -d fund \
-          -f ${./schema.sql} \
-          --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
-        echo "Schema migrations applied"
-      '';
     in {
       data-manager.exec =
-        if isDeployed
+        if isProduction
         then ''
           set -euo pipefail
+          ${runtimeEnv}
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
@@ -578,6 +643,7 @@ in {
         ''
         else ''
           set -euo pipefail
+          ${runtimeEnv}
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
@@ -587,14 +653,16 @@ in {
       ensemble-manager.exec = let
         uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
       in
-        if isDeployed
+        if isProduction
         then ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
           export CC=clang
@@ -604,13 +672,15 @@ in {
       portfolio-manager.exec = let
         uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
       in
-        if isDeployed
+        if isProduction
         then ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd}
         ''
         else ''
+          ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8081"}
           exec secretspec run -- ${uvicornCmd} --reload
@@ -640,6 +710,7 @@ in {
   };
 
   enterShell = ''
+    ${runtimeEnv}
     mkdir -p /var/log/fund 2>/dev/null || true
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
@@ -665,16 +736,21 @@ in {
       echo "    aws-secrets       List fund secrets"
       echo ""
       echo "  Tasks (devenv tasks run):"
-      echo "    checks:base         Non-language checks (nix, markdown, yaml, toml, sql)"
-      echo "    checks:python       All Python checks (parallel after install)"
-      echo "    checks:rust         All Rust checks (sequential: format, lint, test)"
-      echo "    checks:markdown     Markdown lint"
-      echo "    checks:yaml         YAML lint"
-      echo "    checks:toml         TOML format check"
-      echo "    checks:sql          SQL lint (PostgreSQL)"
-      echo "    checks:nix          Nix checks (alejandra + statix)"
-      echo "    data:backfill-bars  Backfill historical equity bar data"
-      echo "    models:tide:train   Train tide model and upload artifacts"
+      echo "    checks:base                    Non-language checks (nix, markdown, yaml, toml, sql)"
+      echo "    checks:python                  All Python checks (parallel after install)"
+      echo "    checks:rust                    All Rust checks (sequential: format, lint, test)"
+      echo "    checks:markdown                Markdown lint"
+      echo "    checks:yaml                    YAML lint"
+      echo "    checks:toml                    TOML format check"
+      echo "    checks:sql                     SQL lint (PostgreSQL)"
+      echo "    checks:nix                     Nix checks (alejandra + statix)"
+      echo "    database:create                First-time setup: apply schema + seed details + fetch bars"
+      echo "    database:reset                 Drop and recreate empty fund database"
+      echo "    database:restore               Restore from nightly S3 dump"
+      echo "    database:backup                Dump fund database and upload to S3"
+      echo "    database:fetch-equity-details  Seed equity_details from S3 CSV"
+      echo "    database:fetch-equity-bars     Backfill equity bars (requires BACKFILL_START_DATE)"
+      echo "    models:tide:train              Train tide model and upload artifacts"
       echo ""
       echo "  Utilities:"
       echo "    bump-deps           Update all dependency lockfiles"
