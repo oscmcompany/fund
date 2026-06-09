@@ -13,11 +13,7 @@ log() {
 
 cleanup() {
   log "Received shutdown signal, cleaning up"
-  if [[ -n "$DEVENV_PID" ]] && kill -0 "$DEVENV_PID" 2>/dev/null; then
-    log "Stopping devenv (PID $DEVENV_PID)"
-    kill "$DEVENV_PID" 2>/dev/null || true
-    wait "$DEVENV_PID" 2>/dev/null || true
-  fi
+  stop_devenv
   rm -f "$PID_FILE"
   log "Shutdown complete"
   exit 0

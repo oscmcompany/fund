@@ -216,8 +216,13 @@ in {
     echo "Downloading equity details from S3..."
     aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
     echo "Loading equity details into database..."
-    psql -h localhost -p 5432 -d fund \
-      -c "\COPY equity_details (ticker, sector, industry) FROM '/tmp/equity_details.csv' CSV HEADER ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry"
+    psql -h localhost -p 5432 -d fund <<'SQL'
+      CREATE TEMP TABLE tmp_equity_details (LIKE equity_details INCLUDING ALL);
+      \COPY tmp_equity_details (ticker, sector, industry) FROM '/tmp/equity_details.csv' CSV HEADER
+      INSERT INTO equity_details SELECT * FROM tmp_equity_details
+        ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
+      DROP TABLE tmp_equity_details;
+    SQL
     rm -f /tmp/equity_details.csv
     echo "Equity details loaded"
   '';
@@ -255,7 +260,7 @@ in {
   scripts.database-reset.exec = ''
     set -euo pipefail
     echo "Resetting fund database..."
-    psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund"
+    psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
     psql -h localhost -p 5432 -d postgres -c "CREATE DATABASE fund"
     echo "Fund database reset"
   '';
@@ -534,6 +539,11 @@ in {
 
     "database:create".exec = ''
       set -euo pipefail
+      if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+        echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:create"
+        echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+        exit 1
+      fi
       ${applySchema}
       database-fetch-equity-details
       database-fetch-equity-bars
