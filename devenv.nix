@@ -109,7 +109,7 @@ in {
       enable = true;
       name = "Check sqlx query metadata cache";
       entry = "sqlx-prepare-check";
-      files = "(\\.rs|Cargo\\.(toml|lock))$";
+      files = "(\\.rs|Cargo\\.(toml|lock)|schema\\.sql)$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;

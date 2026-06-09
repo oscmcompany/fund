@@ -73,10 +73,10 @@ pub async fn claim_pending_job(
     .fetch_optional(pool)
     .await?;
 
-    if let Some(ref r) = row {
-        debug!("Claimed job {} with id {}", job_name, r.id);
+    if let Some(ref claimed) = row {
+        debug!("Claimed job {} with id {}", job_name, claimed.id);
     }
-    Ok(row.map(|r| (r.id, r.scheduled_at)))
+    Ok(row.map(|claimed| (claimed.id, claimed.scheduled_at)))
 }
 
 pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<(), sqlx::Error> {
@@ -251,17 +251,20 @@ pub async fn query_equity_quotes_for_date(
 
     let quotes: Vec<EquityQuote> = rows
         .into_iter()
-        .filter_map(|row| {
-            Some(EquityQuote {
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            Ok(EquityQuote {
                 timestamp: row.timestamp,
-                ticker: Ticker::new(&row.ticker)?,
+                ticker,
                 bid_price: row.bid_price,
                 ask_price: row.ask_price,
                 bid_size: row.bid_size,
                 ask_size: row.ask_size,
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     debug!("Queried {} equity quotes for {}", quotes.len(), date);
     Ok(quotes)
@@ -309,9 +312,12 @@ pub async fn query_equity_bars_for_date(
 
     let bars: Vec<EquityBar> = rows
         .into_iter()
-        .filter_map(|row| {
-            Some(EquityBar {
-                ticker: Ticker::new(&row.ticker)?,
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            Ok(EquityBar {
+                ticker,
                 timestamp: row.timestamp,
                 open_price: row.open_price,
                 high_price: row.high_price,
@@ -323,7 +329,7 @@ pub async fn query_equity_bars_for_date(
                 inserted_at: row.inserted_at,
             })
         })
-        .collect();
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     debug!("Queried {} equity bars for {}", bars.len(), date);
     Ok(bars)
