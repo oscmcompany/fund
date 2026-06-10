@@ -18,7 +18,6 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/predictions", post(predictions))
-        .route("/metrics", get(metrics))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
@@ -38,24 +37,6 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     });
 
     (status, Json(body))
-}
-
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let guard = state.model_state().lock().await;
-
-    let load_timestamp = guard.as_ref().map(|ms| ms.load_timestamp()).unwrap_or(0);
-    let artifact_key = guard
-        .as_ref()
-        .map(|ms| ms.artifact_key().to_string())
-        .unwrap_or_default();
-
-    drop(guard);
-
-    let body = state
-        .metrics()
-        .render_prometheus(load_timestamp, &artifact_key);
-
-    (StatusCode::OK, body)
 }
 
 /// Successful outcome of a prediction run.
@@ -88,7 +69,7 @@ impl PredictionRun {
 }
 
 /// A prediction-pipeline failure, tagged with the stage that failed so callers
-/// can record metrics and emit `predictions_failed` with a reason.
+/// can log it and emit `predictions_failed` with a reason.
 pub struct PipelineError {
     stage: &'static str,
     message: String,
@@ -119,19 +100,21 @@ impl PipelineError {
 /// manager as a fallback.
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
     let start = Instant::now();
-    state.metrics().increment_requests();
 
     let correlation_id = Uuid::new_v4();
     let http_client = reqwest::Client::new();
 
     let result = run_pipeline_and_persist(state, &http_client, correlation_id).await;
 
-    state
-        .metrics()
-        .observe_duration(start.elapsed().as_secs_f64());
+    // Observability lives in structured logs: every run records its duration
+    // and outcome here, and failures additionally carry their pipeline stage.
+    info!(
+        duration_ms = start.elapsed().as_millis() as u64,
+        succeeded = result.is_ok(),
+        "Prediction run complete"
+    );
 
     if let Err(error) = &result {
-        state.metrics().increment_error(error.stage());
         error!(stage = error.stage(), error = %error.message(), "Prediction pipeline failed");
         if let Some(pool) = state.pool() {
             if let Err(emit_error) = database::emit_event(
@@ -204,8 +187,6 @@ async fn run_pipeline_and_persist(
     if let Some(prediction_array) = predictions.as_array() {
         predict::validate_predictions(prediction_array)
             .map_err(|message| PipelineError::new("validation", message))?;
-        state.metrics().set_batch_count(1);
-        state.metrics().set_row_count(prediction_array.len() as u64);
     }
 
     let row_count = predictions.as_array().map(|array| array.len()).unwrap_or(0);
@@ -411,7 +392,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_contains_all_prometheus_metrics() {
+    async fn test_metrics_endpoint_removed() {
+        // Prometheus was dropped from this service entirely; observability
+        // lives in structured logs. The route must no longer exist.
         let state = make_test_state();
         let app = create_router(state);
 
@@ -425,41 +408,18 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-
-        assert!(text.contains("ensemble_prediction_requests_total"));
-        assert!(text.contains("ensemble_prediction_errors_total"));
-        assert!(text.contains("ensemble_prediction_duration_seconds_bucket"));
-        assert!(text.contains("ensemble_prediction_batch_count"));
-        assert!(text.contains("ensemble_prediction_row_count"));
-        assert!(text.contains("ensemble_manager_load_timestamp"));
-        assert!(text.contains("ensemble_manager_artifact_info"));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn test_run_predictions_records_request_metrics() {
-        // The Python service counts every prediction run (event-triggered
-        // included) and observes its duration; the shared run_predictions must
-        // record both so the consumer path isn't blind.
+    async fn test_run_predictions_without_model_reports_stage() {
+        // The shared pipeline entrypoint surfaces the failing stage so the
+        // consumer can emit predictions_failed with a meaningful reason.
         let state = make_test_state();
 
         let result = run_predictions(&state).await;
-        assert!(result.is_err());
-
-        let rendered = state.metrics().render_prometheus(0, "");
-        assert!(
-            rendered.contains("ensemble_prediction_requests_total 1"),
-            "request counter not incremented by run_predictions"
-        );
-        assert!(
-            rendered.contains("ensemble_prediction_duration_seconds_count 1"),
-            "duration histogram not observed by run_predictions"
-        );
+        let error = result.err().expect("run must fail without a model");
+        assert_eq!(error.stage(), "model_not_loaded");
     }
 
     #[tokio::test]
