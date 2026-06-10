@@ -270,8 +270,8 @@ in {
       INSERT INTO equity_details (ticker, sector, industry)
         SELECT
           ticker,
-          COALESCE(NULLIF(sector, ''), 'NOT AVAILABLE'),
-          COALESCE(NULLIF(industry, ''), 'NOT AVAILABLE')
+          COALESCE(NULLIF(sector, '''), 'NOT AVAILABLE'),
+          COALESCE(NULLIF(industry, '''), 'NOT AVAILABLE')
         FROM tmp_equity_details
         WHERE ticker IS NOT NULL
         ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
