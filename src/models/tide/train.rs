@@ -121,14 +121,14 @@ pub fn train(
             let input = build_input_tensor::<TrainBackend>(
                 train_dataset,
                 batch_indices,
-                parameters.input_length,
-                parameters.output_length,
+                parameters.input_length(),
+                parameters.output_length(),
                 device,
             );
             let target = build_target_tensor::<TrainBackend>(
                 train_dataset,
                 batch_indices,
-                parameters.output_length,
+                parameters.output_length(),
                 device,
             );
 
@@ -136,9 +136,9 @@ pub fn train(
             let loss = quantile_loss(
                 prediction,
                 target,
-                &parameters.quantiles,
-                parameters.huber_delta,
-                parameters.output_length,
+                parameters.quantiles(),
+                parameters.huber_delta(),
+                parameters.output_length(),
             );
 
             loss_sum += loss.clone().into_scalar() as f64;
@@ -205,19 +205,19 @@ fn validation_loss(
         let input = build_input_tensor::<NdArray>(
             valid,
             chunk,
-            parameters.input_length,
-            parameters.output_length,
+            parameters.input_length(),
+            parameters.output_length(),
             &device,
         );
         let target =
-            build_target_tensor::<NdArray>(valid, chunk, parameters.output_length, &device);
+            build_target_tensor::<NdArray>(valid, chunk, parameters.output_length(), &device);
         let prediction = inner.forward(input);
         let loss = quantile_loss(
             prediction,
             target,
-            &parameters.quantiles,
-            parameters.huber_delta,
-            parameters.output_length,
+            parameters.quantiles(),
+            parameters.huber_delta(),
+            parameters.output_length(),
         );
         loss_sum += loss.into_scalar() as f64;
         batch_count += 1;
@@ -303,28 +303,28 @@ mod tests {
         let output_length = 1;
         let dataset = overfit_dataset(32, input_length, output_length);
 
-        let parameters = ModelParameters {
-            input_size: input_feature_size(input_length, output_length),
-            hidden_size: 16,
-            num_encoder_layers: 1,
-            num_decoder_layers: 1,
+        let parameters = ModelParameters::for_tests(
+            input_feature_size(input_length, output_length),
+            16,
+            1,
+            1,
             output_length,
             input_length,
-            dropout_rate: 0.0,
-            quantiles: vec![0.1, 0.5, 0.9],
-            huber_delta: 0.0,
-        };
+            0.0,
+            vec![0.1, 0.5, 0.9],
+            0.0,
+        );
 
         let device = Default::default();
         let model = TideModel::<TrainBackend>::new(
             &device,
-            parameters.input_size,
-            parameters.hidden_size,
-            parameters.num_encoder_layers,
-            parameters.num_decoder_layers,
-            parameters.output_length,
-            parameters.quantiles.len(),
-            parameters.dropout_rate,
+            parameters.input_size(),
+            parameters.hidden_size(),
+            parameters.num_encoder_layers(),
+            parameters.num_decoder_layers(),
+            parameters.output_length(),
+            parameters.quantiles().len(),
+            parameters.dropout_rate(),
         );
         let initial = model.clone();
 
@@ -353,28 +353,28 @@ mod tests {
         let output_length = 1;
         let dataset = overfit_dataset(32, input_length, output_length);
 
-        let parameters = ModelParameters {
-            input_size: input_feature_size(input_length, output_length),
-            hidden_size: 16,
-            num_encoder_layers: 1,
-            num_decoder_layers: 1,
+        let parameters = ModelParameters::for_tests(
+            input_feature_size(input_length, output_length),
+            16,
+            1,
+            1,
             output_length,
             input_length,
-            dropout_rate: 0.0,
-            quantiles: vec![0.1, 0.5, 0.9],
-            huber_delta: 0.0,
-        };
+            0.0,
+            vec![0.1, 0.5, 0.9],
+            0.0,
+        );
 
         let device = Default::default();
         let model = TideModel::<TrainBackend>::new(
             &device,
-            parameters.input_size,
-            parameters.hidden_size,
-            parameters.num_encoder_layers,
-            parameters.num_decoder_layers,
-            parameters.output_length,
-            parameters.quantiles.len(),
-            parameters.dropout_rate,
+            parameters.input_size(),
+            parameters.hidden_size(),
+            parameters.num_encoder_layers(),
+            parameters.num_decoder_layers(),
+            parameters.output_length(),
+            parameters.quantiles().len(),
+            parameters.dropout_rate(),
         );
 
         let config = TrainConfig {

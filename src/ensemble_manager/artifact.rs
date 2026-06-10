@@ -288,16 +288,16 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         serde_json::from_str(&mappings_content)
             .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
-    let num_quantiles = parameters.quantiles.len();
+    let num_quantiles = parameters.quantiles().len();
     let model = crate::models::tide::model::TideModel::load(
         dir,
-        parameters.input_size,
-        parameters.hidden_size,
-        parameters.num_encoder_layers,
-        parameters.num_decoder_layers,
-        parameters.output_length,
+        parameters.input_size(),
+        parameters.hidden_size(),
+        parameters.num_encoder_layers(),
+        parameters.num_decoder_layers(),
+        parameters.output_length(),
         num_quantiles,
-        parameters.dropout_rate,
+        parameters.dropout_rate(),
     )
     .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
@@ -305,12 +305,12 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
 
     info!(
         artifact_key = artifact_key,
-        input_size = parameters.input_size,
-        hidden_size = parameters.hidden_size,
+        input_size = parameters.input_size(),
+        hidden_size = parameters.hidden_size(),
         "Model loaded successfully"
     );
 
-    Ok(ModelState {
+    Ok(ModelState::new(
         model,
         parameters,
         scaler,
@@ -318,10 +318,10 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         continuous_columns,
         categorical_columns,
         static_categorical_columns,
-        artifact_key: artifact_key.to_string(),
-        run_id: run_id_from_artifact_key(artifact_key),
+        artifact_key.to_string(),
+        run_id_from_artifact_key(artifact_key),
         load_timestamp,
-    })
+    ))
 }
 
 #[cfg(test)]

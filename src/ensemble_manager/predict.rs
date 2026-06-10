@@ -256,7 +256,7 @@ pub fn filter_to_trained_tickers(
     model_state: &ModelState,
 ) -> Result<DataFrame, PredictionError> {
     let trained_tickers: Vec<String> = model_state
-        .mappings
+        .mappings()
         .get("ticker")
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
@@ -324,11 +324,11 @@ pub fn generate_predictions(
     data: DataFrame,
     model_state: &ModelState,
 ) -> Result<serde_json::Value, PredictionError> {
-    let tide_data = Data::apply_existing_scaler(data, &model_state.scaler, &model_state.mappings)
+    let tide_data = Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings())
         .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
 
-    let output_length = model_state.parameters.output_length;
-    let dataset_input_length = model_state.parameters.input_length;
+    let output_length = model_state.parameters().output_length();
+    let dataset_input_length = model_state.parameters().input_length();
     let dataset = tide_data
         .get_dataset("predict", 0.8, dataset_input_length, output_length)
         .map_err(|e| PredictionError::DatasetCreation(e.to_string()))?;
@@ -353,13 +353,13 @@ pub fn generate_predictions(
         &device,
     );
 
-    let predictions = model_state.model.forward(inputs);
+    let predictions = model_state.model().forward(inputs);
     let predictions_data: Vec<f32> = predictions
         .to_data()
         .to_vec()
         .map_err(|e| PredictionError::Inference(format!("{e:?}")))?;
 
-    let num_quantiles = model_state.parameters.quantiles.len();
+    let num_quantiles = model_state.parameters().quantiles().len();
     // The output schema is fixed at quantile_10/quantile_50/quantile_90, so a
     // model with any other quantile count cannot be served correctly; fail
     // loudly instead of indexing out of bounds or mislabeling values.
@@ -370,7 +370,7 @@ pub fn generate_predictions(
     }
     let mut results = Vec::new();
 
-    let ticker_mapping = &model_state.mappings["ticker"];
+    let ticker_mapping = &model_state.mappings()["ticker"];
     let reverse_ticker_map: std::collections::HashMap<i32, &String> =
         ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
 
@@ -389,7 +389,7 @@ pub fn generate_predictions(
             let scaled: Vec<f64> = (0..num_quantiles)
                 .map(|q| predictions_data[base_idx + q] as f64)
                 .collect();
-            let quantiles = unscale_and_sort_quantiles(&scaled, &model_state.scaler);
+            let quantiles = unscale_and_sort_quantiles(&scaled, model_state.scaler());
 
             results.push(serde_json::json!({
                 "ticker": ticker,

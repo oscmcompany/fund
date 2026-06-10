@@ -45,8 +45,8 @@ pub fn evaluate(
         _ => return Ok(EvalMetrics::zero()),
     };
 
-    let output_length = parameters.output_length;
-    let quantiles = &parameters.quantiles;
+    let output_length = parameters.output_length();
+    let quantiles = parameters.quantiles();
     let num_quantiles = quantiles.len();
     if num_quantiles == 0 {
         return Ok(EvalMetrics::zero());
@@ -64,7 +64,7 @@ pub fn evaluate(
         let input = build_input_tensor::<NdArray>(
             dataset,
             chunk,
-            parameters.input_length,
+            parameters.input_length(),
             output_length,
             &device,
         );

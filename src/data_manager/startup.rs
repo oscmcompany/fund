@@ -1,5 +1,5 @@
 use crate::common::server::serve;
-use crate::data_manager::database::populate_equity_details_if_empty;
+use crate::data_manager::database::seed_equity_details;
 use crate::data_manager::equity_details::read_equity_details_from_s3;
 use crate::data_manager::equity_quotes::spawn_quote_stream;
 use crate::data_manager::router::create_app_with_state;
@@ -17,7 +17,7 @@ async fn migrate_equity_details(state: &State) {
     };
 
     match read_equity_details_from_s3(state).await {
-        Ok(details) => match populate_equity_details_if_empty(pool, &details).await {
+        Ok(details) => match seed_equity_details(pool, &details).await {
             Ok(count) if count > 0 => {
                 tracing::info!("Seeded equity_details from S3 ({} rows)", count);
             }

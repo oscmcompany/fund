@@ -6,34 +6,34 @@ use polars::prelude::*;
 
 fn sample_equity_bar() -> EquityBar {
     let timestamp = chrono::DateTime::from_timestamp(1_234_567_890, 0).unwrap();
-    EquityBar {
-        ticker: Ticker::new("AAPL").unwrap(),
+    EquityBar::new(
+        Ticker::new("AAPL").unwrap(),
         timestamp,
-        open_price: 100.0,
-        high_price: 105.0,
-        low_price: 99.0,
-        close_price: 103.0,
-        volume: 1_000_000,
-        volume_weighted_average_price: Some(102.0),
-        transactions: Some(5_000),
-        inserted_at: timestamp,
-    }
+        100.0,
+        105.0,
+        99.0,
+        103.0,
+        1_000_000,
+        Some(102.0),
+        Some(5_000),
+        timestamp,
+    )
 }
 
 fn sample_equity_bar_lowercase() -> EquityBar {
     let timestamp = chrono::DateTime::from_timestamp(1_234_567_890, 0).unwrap();
-    EquityBar {
-        ticker: Ticker::new("googl").unwrap(),
+    EquityBar::new(
+        Ticker::new("googl").unwrap(),
         timestamp,
-        open_price: 2000.0,
-        high_price: 2050.0,
-        low_price: 1990.0,
-        close_price: 2030.0,
-        volume: 500_000,
-        volume_weighted_average_price: Some(2020.0),
-        transactions: Some(2_500),
-        inserted_at: timestamp,
-    }
+        2000.0,
+        2050.0,
+        1990.0,
+        2030.0,
+        500_000,
+        Some(2020.0),
+        Some(2_500),
+        timestamp,
+    )
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn test_create_equity_bar_dataframe_valid_data() {
     let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 1);
-    assert_eq!(dataframe.width(), 10);
+    assert_eq!(dataframe.width(), 9);
     assert!(dataframe.column("ticker").is_ok());
     assert!(dataframe.column("timestamp").is_ok());
     assert!(dataframe.column("open_price").is_ok());
@@ -54,7 +54,9 @@ fn test_create_equity_bar_dataframe_valid_data() {
     assert!(dataframe.column("volume").is_ok());
     assert!(dataframe.column("volume_weighted_average_price").is_ok());
     assert!(dataframe.column("transactions").is_ok());
-    assert!(dataframe.column("inserted_at").is_ok());
+    // inserted_at is deliberately absent: the S3 parquet schema is the
+    // 9-column equity_bars_schema pandera contract.
+    assert!(dataframe.column("inserted_at").is_err());
 }
 
 #[test]
@@ -79,18 +81,18 @@ fn test_create_equity_bar_dataframe_uppercase_normalization() {
 fn test_create_equity_bar_dataframe_whitespace_trimming() {
     initialize_test_tracing();
     let timestamp = chrono::DateTime::from_timestamp(1_234_567_890, 0).unwrap();
-    let bars = vec![EquityBar {
-        ticker: Ticker::new("  ECC           ").unwrap(),
+    let bars = vec![EquityBar::new(
+        Ticker::new("  ECC           ").unwrap(),
         timestamp,
-        open_price: 10.0,
-        high_price: 11.0,
-        low_price: 9.0,
-        close_price: 10.5,
-        volume: 100_000,
-        volume_weighted_average_price: Some(10.2),
-        transactions: Some(500),
-        inserted_at: timestamp,
-    }];
+        10.0,
+        11.0,
+        9.0,
+        10.5,
+        100_000,
+        Some(10.2),
+        Some(500),
+        timestamp,
+    )];
 
     let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
@@ -133,7 +135,7 @@ fn test_create_equity_bar_dataframe_empty_vec() {
     let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 0);
-    assert_eq!(dataframe.width(), 10);
+    assert_eq!(dataframe.width(), 9);
 }
 
 #[test]
@@ -148,7 +150,7 @@ fn test_create_equity_bar_dataframe_multiple_rows() {
     let dataframe = create_equity_bar_dataframe(&bars).unwrap();
 
     assert_eq!(dataframe.height(), 3);
-    assert_eq!(dataframe.width(), 10);
+    assert_eq!(dataframe.width(), 9);
 }
 
 #[test]
@@ -181,7 +183,7 @@ fn test_equity_bar_dataframe_parquet_roundtrip() {
         .column("volume_weighted_average_price")
         .is_ok());
     assert!(deserialized_df.column("transactions").is_ok());
-    assert!(deserialized_df.column("inserted_at").is_ok());
+    assert!(deserialized_df.column("inserted_at").is_err());
 
     let ticker_series = deserialized_df.column("ticker").unwrap();
     assert_eq!(ticker_series.str().unwrap().get(0).unwrap(), "AAPL");

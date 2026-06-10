@@ -38,6 +38,20 @@ impl std::fmt::Display for SharesError {
 
 impl std::error::Error for SharesError {}
 
+/// Error returned when constructing a validated amount with a negative value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NegativeAmountError {
+    pub amount: Decimal,
+}
+
+impl std::fmt::Display for NegativeAmountError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Amount {} must be non-negative.", self.amount)
+    }
+}
+
+impl std::error::Error for NegativeAmountError {}
+
 /// Whole share count (always positive).
 ///
 /// The inner field is private; use `Shares::new()` to construct and `value()` to read.
@@ -67,9 +81,36 @@ impl<'de> Deserialize<'de> for Shares {
     }
 }
 
-/// Dollar amount.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Dollars(pub Decimal);
+/// Dollar amount (non-negative).
+///
+/// Every current use is a magnitude — fill notionals and limit prices — so the
+/// constructor rejects negative values. The inner field is private; use
+/// `Dollars::new()` to construct and `value()` to read. Deserialization
+/// validates non-negativity, preventing negative amounts from serde.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Dollars(Decimal);
+
+impl Dollars {
+    /// Creates a new `Dollars`, returning an error if `amount` is negative.
+    pub fn new(amount: Decimal) -> Result<Self, NegativeAmountError> {
+        if amount < Decimal::ZERO {
+            return Err(NegativeAmountError { amount });
+        }
+        Ok(Dollars(amount))
+    }
+
+    /// Returns the inner `Decimal` value.
+    pub fn value(self) -> Decimal {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Dollars {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <Decimal as Deserialize<'de>>::deserialize(deserializer)?;
+        Dollars::new(raw).map_err(de::Error::custom)
+    }
+}
 
 /// Percentage in the range `[0.0, 1.0]`.
 ///
@@ -104,21 +145,115 @@ impl<'de> Deserialize<'de> for Percent {
     }
 }
 
-/// Long position size (always a positive magnitude).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Long(pub Decimal);
+/// Long position size (a non-negative magnitude).
+///
+/// The inner field is private; use `Long::new()` to construct and `value()` to read.
+/// Deserialization validates non-negativity, preventing negative sizes from serde.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Long(Decimal);
 
-/// Short position size (stored as a positive magnitude).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Short(pub Decimal);
+impl Long {
+    /// Creates a new `Long`, returning an error if `size` is negative.
+    pub fn new(size: Decimal) -> Result<Self, NegativeAmountError> {
+        if size < Decimal::ZERO {
+            return Err(NegativeAmountError { amount: size });
+        }
+        Ok(Long(size))
+    }
+
+    /// Returns the inner `Decimal` value.
+    pub fn value(self) -> Decimal {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Long {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <Decimal as Deserialize<'de>>::deserialize(deserializer)?;
+        Long::new(raw).map_err(de::Error::custom)
+    }
+}
+
+/// Short position size (stored as a non-negative magnitude).
+///
+/// The inner field is private; use `Short::new()` to construct and `value()` to read.
+/// Deserialization validates non-negativity, preventing negative sizes from serde.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Short(Decimal);
+
+impl Short {
+    /// Creates a new `Short`, returning an error if `size` is negative.
+    pub fn new(size: Decimal) -> Result<Self, NegativeAmountError> {
+        if size < Decimal::ZERO {
+            return Err(NegativeAmountError { amount: size });
+        }
+        Ok(Short(size))
+    }
+
+    /// Returns the inner `Decimal` value.
+    pub fn value(self) -> Decimal {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Short {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = <Decimal as Deserialize<'de>>::deserialize(deserializer)?;
+        Short::new(raw).map_err(de::Error::custom)
+    }
+}
 
 /// Notional dollar amount.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Notional(pub Dollars);
+///
+/// Wraps an already-validated [`Dollars`], so construction is infallible: the
+/// `Dollars` in hand is proof the amount is non-negative.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Notional(Dollars);
+
+impl Notional {
+    /// Creates a new `Notional` from a validated `Dollars` amount.
+    pub fn new(amount: Dollars) -> Self {
+        Notional(amount)
+    }
+
+    /// Returns the inner `Dollars` value.
+    pub fn value(self) -> Dollars {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Notional {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let amount = Dollars::deserialize(deserializer)?;
+        Ok(Notional::new(amount))
+    }
+}
 
 /// Portfolio allocation expressed as a fraction of total capital.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Allocation(pub Percent);
+///
+/// Wraps an already-validated [`Percent`], so construction is infallible: the
+/// `Percent` in hand is proof the fraction is in `[0.0, 1.0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Allocation(Percent);
+
+impl Allocation {
+    /// Creates a new `Allocation` from a validated `Percent` fraction.
+    pub fn new(fraction: Percent) -> Self {
+        Allocation(fraction)
+    }
+
+    /// Returns the inner `Percent` value.
+    pub fn value(self) -> Percent {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Allocation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fraction = Percent::deserialize(deserializer)?;
+        Ok(Allocation::new(fraction))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -133,13 +268,13 @@ mod tests {
     #[test]
     fn test_percent_new_accepts_one() {
         let percent = Percent::new(1.0).unwrap();
-        assert_eq!(percent.0, 1.0);
+        assert_eq!(percent.value(), 1.0);
     }
 
     #[test]
     fn test_percent_new_accepts_midpoint() {
         let percent = Percent::new(0.5).unwrap();
-        assert_eq!(percent.0, 0.5);
+        assert_eq!(percent.value(), 0.5);
     }
 
     #[test]
@@ -208,32 +343,84 @@ mod tests {
     }
 
     #[test]
-    fn test_dollars_construction() {
-        let dollars = Dollars(Decimal::from(5000));
-        assert_eq!(dollars.0, Decimal::from(5000));
+    fn test_dollars_new_accepts_zero() {
+        let dollars = Dollars::new(Decimal::ZERO).unwrap();
+        assert_eq!(dollars.value(), Decimal::ZERO);
     }
 
     #[test]
-    fn test_long_construction() {
-        let long = Long(Decimal::from(50));
-        assert_eq!(long.0, Decimal::from(50));
+    fn test_dollars_new_accepts_positive() {
+        let dollars = Dollars::new(Decimal::from(5000)).unwrap();
+        assert_eq!(dollars.value(), Decimal::from(5000));
     }
 
     #[test]
-    fn test_short_construction() {
-        let short = Short(Decimal::from(50));
-        assert_eq!(short.0, Decimal::from(50));
+    fn test_dollars_new_rejects_negative() {
+        let error = Dollars::new(Decimal::from(-1)).unwrap_err();
+        assert_eq!(error.amount, Decimal::from(-1));
     }
 
     #[test]
-    fn test_notional_construction() {
-        let notional = Notional(Dollars(Decimal::from(10_000)));
-        assert_eq!(notional.0 .0, Decimal::from(10_000));
+    fn test_dollars_deserialize_rejects_negative() {
+        let result: Result<Dollars, _> = serde_json::from_str("\"-5\"");
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_allocation_construction() {
-        let allocation = Allocation(Percent::new(0.25).unwrap());
-        assert_eq!(allocation.0.value(), 0.25);
+    fn test_negative_amount_error_display() {
+        let error = NegativeAmountError {
+            amount: Decimal::from(-5),
+        };
+        let message = format!("{}", error);
+        assert!(message.contains("-5"));
+        assert!(message.contains("non-negative"));
+    }
+
+    #[test]
+    fn test_long_new_accepts_non_negative() {
+        let long = Long::new(Decimal::from(50)).unwrap();
+        assert_eq!(long.value(), Decimal::from(50));
+        assert!(Long::new(Decimal::ZERO).is_ok());
+    }
+
+    #[test]
+    fn test_long_new_rejects_negative() {
+        assert!(Long::new(Decimal::from(-50)).is_err());
+    }
+
+    #[test]
+    fn test_short_new_accepts_non_negative() {
+        let short = Short::new(Decimal::from(50)).unwrap();
+        assert_eq!(short.value(), Decimal::from(50));
+        assert!(Short::new(Decimal::ZERO).is_ok());
+    }
+
+    #[test]
+    fn test_short_new_rejects_negative() {
+        assert!(Short::new(Decimal::from(-50)).is_err());
+    }
+
+    #[test]
+    fn test_notional_wraps_validated_dollars() {
+        let notional = Notional::new(Dollars::new(Decimal::from(10_000)).unwrap());
+        assert_eq!(notional.value().value(), Decimal::from(10_000));
+    }
+
+    #[test]
+    fn test_notional_deserialize_rejects_negative() {
+        let result: Result<Notional, _> = serde_json::from_str("\"-1\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_allocation_wraps_validated_percent() {
+        let allocation = Allocation::new(Percent::new(0.25).unwrap());
+        assert_eq!(allocation.value().value(), 0.25);
+    }
+
+    #[test]
+    fn test_allocation_deserialize_rejects_out_of_range() {
+        let result: Result<Allocation, _> = serde_json::from_str("1.5");
+        assert!(result.is_err());
     }
 }

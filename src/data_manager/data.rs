@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use polars::prelude::*;
 use tracing::{debug, info};
 
-pub use crate::domain::market::{EquityBar, EquityDetails, EquityQuote, Ticker};
+pub use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 
 /// A validated US market trading date (Monday through Friday).
 ///
@@ -38,15 +38,15 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<Dat
 
     // Ticker values are already normalized (trimmed and uppercased) by Ticker::new.
     let equity_bars_dataframe = df!(
-        "ticker" => equity_bars_rows.iter().map(|b| b.ticker.as_str()).collect::<Vec<_>>(),
-        "timestamp" => equity_bars_rows.iter().map(|b| b.timestamp.timestamp_millis()).collect::<Vec<_>>(),
-        "open_price" => equity_bars_rows.iter().map(|b| b.open_price).collect::<Vec<f64>>(),
-        "high_price" => equity_bars_rows.iter().map(|b| b.high_price).collect::<Vec<f64>>(),
-        "low_price" => equity_bars_rows.iter().map(|b| b.low_price).collect::<Vec<f64>>(),
-        "close_price" => equity_bars_rows.iter().map(|b| b.close_price).collect::<Vec<f64>>(),
-        "volume" => equity_bars_rows.iter().map(|b| b.volume).collect::<Vec<i64>>(),
-        "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
-        "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
+        "ticker" => equity_bars_rows.iter().map(|b| b.ticker().as_str()).collect::<Vec<_>>(),
+        "timestamp" => equity_bars_rows.iter().map(|b| b.timestamp().timestamp_millis()).collect::<Vec<_>>(),
+        "open_price" => equity_bars_rows.iter().map(|b| b.open_price()).collect::<Vec<f64>>(),
+        "high_price" => equity_bars_rows.iter().map(|b| b.high_price()).collect::<Vec<f64>>(),
+        "low_price" => equity_bars_rows.iter().map(|b| b.low_price()).collect::<Vec<f64>>(),
+        "close_price" => equity_bars_rows.iter().map(|b| b.close_price()).collect::<Vec<f64>>(),
+        "volume" => equity_bars_rows.iter().map(|b| b.volume()).collect::<Vec<i64>>(),
+        "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price()).collect::<Vec<_>>(),
+        "transactions" => equity_bars_rows.iter().map(|b| b.transactions()).collect::<Vec<_>>(),
         // `inserted_at` is deliberately excluded: the S3 parquet schema is the
         // equity_bars_schema pandera contract (9 columns, Int64 timestamp),
         // which the nightly pg_parquet export (export_equity_bars in schema.sql)
@@ -72,18 +72,18 @@ mod tests {
     use polars::prelude::DataType;
 
     fn sample_bar() -> EquityBar {
-        EquityBar {
-            ticker: Ticker::new("AAPL").unwrap(),
-            timestamp: Utc::now(),
-            open_price: 100.0,
-            high_price: 110.0,
-            low_price: 99.0,
-            close_price: 105.0,
-            volume: 2_000_000,
-            volume_weighted_average_price: Some(104.0),
-            transactions: Some(1_000),
-            inserted_at: Utc::now(),
-        }
+        EquityBar::new(
+            Ticker::new("AAPL").unwrap(),
+            Utc::now(),
+            100.0,
+            110.0,
+            99.0,
+            105.0,
+            2_000_000,
+            Some(104.0),
+            Some(1_000),
+            Utc::now(),
+        )
     }
 
     #[test]

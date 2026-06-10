@@ -313,5 +313,5 @@ async fn test_equity_details_csv_can_be_read_from_s3() {
     let result = fund::data_manager::equity_details::read_equity_details_from_s3(&state).await;
     assert!(result.is_ok());
     let details = result.unwrap();
-    assert!(details.iter().any(|d| d.ticker == "AAPL"));
+    assert!(details.iter().any(|d| d.ticker().as_str() == "AAPL"));
 }

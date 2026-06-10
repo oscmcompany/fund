@@ -141,6 +141,8 @@ pub enum PairFillError {
     LongNotFilled,
     /// The short leg did not fill.
     ShortNotFilled,
+    /// A fill reported a negative notional (negative price or quantity).
+    NegativeNotional,
 }
 
 impl std::fmt::Display for PairFillError {
@@ -148,6 +150,9 @@ impl std::fmt::Display for PairFillError {
         match self {
             PairFillError::LongNotFilled => write!(formatter, "Long order did not fill."),
             PairFillError::ShortNotFilled => write!(formatter, "Short order did not fill."),
+            PairFillError::NegativeNotional => {
+                write!(formatter, "Fill reported a negative notional.")
+            }
         }
     }
 }
@@ -192,8 +197,10 @@ impl PendingPair {
         let long_fill = long_fill.ok_or(PairFillError::LongNotFilled)?;
         let short_fill = short_fill.ok_or(PairFillError::ShortNotFilled)?;
 
-        let long_notional = Dollars(long_fill.fill_price * long_fill.filled_quantity);
-        let short_notional = Dollars(short_fill.fill_price * short_fill.filled_quantity);
+        let long_notional = Dollars::new(long_fill.fill_price * long_fill.filled_quantity)
+            .map_err(|_| PairFillError::NegativeNotional)?;
+        let short_notional = Dollars::new(short_fill.fill_price * short_fill.filled_quantity)
+            .map_err(|_| PairFillError::NegativeNotional)?;
 
         let long = Order {
             id: self.long.id,
@@ -337,8 +344,8 @@ mod tests {
         assert_eq!(filled.short.ticker, short_ticker);
         assert_eq!(filled.long.fill_price, Some(Decimal::from(100)));
         assert_eq!(filled.short.fill_price, Some(Decimal::from(100)));
-        assert_eq!(filled.long_notional.0, Decimal::from(10_000));
-        assert_eq!(filled.short_notional.0, Decimal::from(10_000));
+        assert_eq!(filled.long_notional.value(), Decimal::from(10_000));
+        assert_eq!(filled.short_notional.value(), Decimal::from(10_000));
         assert_eq!(filled.long_beta, 1.1);
         assert_eq!(filled.short_beta, 0.9);
         // Broker order ID is preserved from the submitted order, not taken from the fill payload.
@@ -376,6 +383,21 @@ mod tests {
     fn test_pair_fill_error_display() {
         assert!(format!("{}", PairFillError::LongNotFilled).contains("Long"));
         assert!(format!("{}", PairFillError::ShortNotFilled).contains("Short"));
+        assert!(format!("{}", PairFillError::NegativeNotional).contains("negative"));
+    }
+
+    #[test]
+    fn test_pending_pair_confirm_rejects_negative_notional() {
+        let pair = make_pending_pair("AAPL", "MSFT");
+        let negative_fill = FilledOrder {
+            alpaca_order_id: "fill-aapl".to_string(),
+            fill_price: Decimal::from(-100),
+            filled_quantity: Decimal::from(100),
+        };
+        let error = pair
+            .confirm(Some(negative_fill), Some(make_filled_order("MSFT")))
+            .unwrap_err();
+        assert_eq!(error, PairFillError::NegativeNotional);
     }
 
     #[test]

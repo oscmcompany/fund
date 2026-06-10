@@ -108,23 +108,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let input_size = input_feature_size(INPUT_LENGTH, OUTPUT_LENGTH);
-    let parameters = ModelParameters {
-        input_size,
-        input_length: INPUT_LENGTH,
-        output_length: OUTPUT_LENGTH,
-        ..Default::default()
-    };
+    let parameters = ModelParameters::new(input_size, INPUT_LENGTH, OUTPUT_LENGTH);
 
     let device = <TrainBackend as Backend>::Device::default();
     let model = TideModel::<TrainBackend>::new(
         &device,
         input_size,
-        parameters.hidden_size,
-        parameters.num_encoder_layers,
-        parameters.num_decoder_layers,
-        parameters.output_length,
-        parameters.quantiles.len(),
-        parameters.dropout_rate,
+        parameters.hidden_size(),
+        parameters.num_encoder_layers(),
+        parameters.num_decoder_layers(),
+        parameters.output_length(),
+        parameters.quantiles().len(),
+        parameters.dropout_rate(),
     );
 
     let mut config = TrainConfig::default();

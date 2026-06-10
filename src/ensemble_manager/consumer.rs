@@ -23,7 +23,7 @@ const PREDICTIONS_REQUESTED: &str = "predictions_requested";
 
 /// Spawn the event consumer if a database pool is configured.
 pub fn spawn_event_consumer(state: AppState) {
-    if state.pool.is_none() {
+    if state.pool().is_none() {
         info!("PostgreSQL not available, event consumer disabled");
         return;
     }
@@ -33,7 +33,7 @@ pub fn spawn_event_consumer(state: AppState) {
 /// Supervisor: restart the listener on error with a backoff (matches the
 /// data_manager listen loop).
 async fn consumer_loop(state: AppState) {
-    let pool = match &state.pool {
+    let pool = match state.pool() {
         Some(pool) => pool.clone(),
         None => return,
     };
@@ -89,9 +89,9 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
 /// so this only logs and records progress.
 async fn handle_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
     match run_predictions(state).await {
-        Ok(run) => info!(rows = run.row_count, "Predictions generated from event"),
+        Ok(run) => info!(rows = run.row_count(), "Predictions generated from event"),
         Err(error) => {
-            error!(stage = error.stage, error = %error.message, "Prediction run failed")
+            error!(stage = error.stage(), error = %error.message(), "Prediction run failed")
         }
     }
 

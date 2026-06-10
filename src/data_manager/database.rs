@@ -1,6 +1,7 @@
-use crate::domain::market::{EquityBar, EquityDetails, EquityQuote, Ticker};
+use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 use crate::domain::trading::{
-    EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
+    AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
+    EquityPortfolioSnapshot, EquityRebalanceSession, RebalanceSessionStatus, SnapshotType,
 };
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -20,16 +21,16 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
 
         query_builder.push_values(chunk, |mut builder, bar| {
             builder
-                .push_bind(&bar.ticker)
-                .push_bind(bar.timestamp)
-                .push_bind(bar.open_price)
-                .push_bind(bar.high_price)
-                .push_bind(bar.low_price)
-                .push_bind(bar.close_price)
-                .push_bind(bar.volume)
-                .push_bind(bar.volume_weighted_average_price)
-                .push_bind(bar.transactions)
-                .push_bind(bar.inserted_at);
+                .push_bind(bar.ticker())
+                .push_bind(bar.timestamp())
+                .push_bind(bar.open_price())
+                .push_bind(bar.high_price())
+                .push_bind(bar.low_price())
+                .push_bind(bar.close_price())
+                .push_bind(bar.volume())
+                .push_bind(bar.volume_weighted_average_price())
+                .push_bind(bar.transactions())
+                .push_bind(bar.inserted_at());
         });
 
         query_builder.push(
@@ -125,12 +126,12 @@ pub async fn insert_equity_quotes(
 
         query_builder.push_values(chunk, |mut builder, quote| {
             builder
-                .push_bind(quote.timestamp)
-                .push_bind(&quote.ticker)
-                .push_bind(quote.bid_price)
-                .push_bind(quote.ask_price)
-                .push_bind(quote.bid_size)
-                .push_bind(quote.ask_size);
+                .push_bind(quote.timestamp())
+                .push_bind(quote.ticker())
+                .push_bind(quote.bid_price())
+                .push_bind(quote.ask_price())
+                .push_bind(quote.bid_size())
+                .push_bind(quote.ask_size());
         });
 
         let result = query_builder.build().execute(pool).await?;
@@ -141,7 +142,7 @@ pub async fn insert_equity_quotes(
     Ok(rows_affected)
 }
 
-pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"SELECT DISTINCT ea.ticker
            FROM equity_allocations ea
@@ -152,7 +153,10 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
     .fetch_all(pool)
     .await?;
 
-    let tickers: Vec<String> = rows.into_iter().map(|row| row.ticker).collect();
+    let tickers: Vec<Ticker> = rows
+        .into_iter()
+        .filter_map(|row| Ticker::new(&row.ticker))
+        .collect();
     debug!("Queried {} active tickers from PostgreSQL", tickers.len());
     Ok(tickers)
 }
@@ -169,26 +173,13 @@ pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-pub async fn populate_equity_details_if_empty(
-    pool: &PgPool,
-    rows: &[EquityDetails],
-) -> Result<u64, sqlx::Error> {
-    let mut transaction = pool.begin().await?;
-
-    let row = sqlx::query!(r#"SELECT COUNT(*) as "count!" FROM equity_details"#)
-        .fetch_one(&mut *transaction)
-        .await?;
-
-    if row.count > 0 {
-        info!(
-            "equity_details already populated with {} rows, skipping migration",
-            row.count
-        );
-        return Ok(0);
-    }
-
+/// Seeds `equity_details` from the provided rows using an idempotent upsert.
+///
+/// Assumes a blank database on first startup. Subsequent runs are safe because
+/// `ON CONFLICT (ticker) DO NOTHING` skips rows that already exist.
+pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result<u64, sqlx::Error> {
     if rows.is_empty() {
-        warn!("equity_details is empty and no rows provided; skipping migration");
+        warn!("No equity details rows provided for seeding; skipping");
         return Ok(0);
     }
 
@@ -198,25 +189,20 @@ pub async fn populate_equity_details_if_empty(
         let mut query_builder =
             sqlx::QueryBuilder::new("INSERT INTO equity_details (ticker, sector, industry) ");
 
-        query_builder.push_values(chunk, |mut builder, details| {
+        query_builder.push_values(chunk, |mut builder, detail| {
             builder
-                .push_bind(&details.ticker)
-                .push_bind(&details.sector)
-                .push_bind(&details.industry);
+                .push_bind(detail.ticker())
+                .push_bind(detail.sector())
+                .push_bind(detail.industry());
         });
 
         query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
 
-        let result = query_builder.build().execute(&mut *transaction).await?;
+        let result = query_builder.build().execute(pool).await?;
         rows_affected += result.rows_affected();
     }
 
-    transaction.commit().await?;
-
-    info!(
-        "Populated equity_details with {} rows from S3 migration",
-        rows_affected
-    );
+    info!("Seeded equity_details with {} rows from S3", rows_affected);
     Ok(rows_affected)
 }
 
@@ -254,14 +240,14 @@ pub async fn query_equity_quotes_for_date(
             let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
                 sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
             })?;
-            Ok(EquityQuote {
-                timestamp: row.timestamp,
+            Ok(EquityQuote::new(
+                row.timestamp,
                 ticker,
-                bid_price: row.bid_price,
-                ask_price: row.ask_price,
-                bid_size: row.bid_size,
-                ask_size: row.ask_size,
-            })
+                row.bid_price,
+                row.ask_price,
+                row.bid_size,
+                row.ask_size,
+            ))
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
@@ -315,18 +301,18 @@ pub async fn query_equity_bars_for_date(
             let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
                 sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
             })?;
-            Ok(EquityBar {
+            Ok(EquityBar::new(
                 ticker,
-                timestamp: row.timestamp,
-                open_price: row.open_price,
-                high_price: row.high_price,
-                low_price: row.low_price,
-                close_price: row.close_price,
-                volume: row.volume,
-                volume_weighted_average_price: row.volume_weighted_average_price,
-                transactions: row.transactions,
-                inserted_at: row.inserted_at,
-            })
+                row.timestamp,
+                row.open_price,
+                row.high_price,
+                row.low_price,
+                row.close_price,
+                row.volume,
+                row.volume_weighted_average_price,
+                row.transactions,
+                row.inserted_at,
+            ))
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
@@ -345,17 +331,23 @@ pub async fn query_equity_rebalance_sessions(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| EquityRebalanceSession {
-            id: row.id,
-            triggered_at: row.triggered_at,
-            trigger_reason: row.trigger_reason,
-            model_run_id: row.model_run_id,
-            completed_at: row.completed_at,
-            status: row.status,
+    rows.into_iter()
+        .map(|row| {
+            let status = RebalanceSessionStatus::parse(&row.status).ok_or_else(|| {
+                sqlx::Error::Decode(
+                    format!("Invalid rebalance session status: {}", row.status).into(),
+                )
+            })?;
+            Ok(EquityRebalanceSession::new(
+                row.id,
+                row.triggered_at,
+                row.trigger_reason,
+                row.model_run_id,
+                row.completed_at,
+                status,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::Error> {
@@ -369,25 +361,35 @@ pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| EquityPair {
-            id: row.id,
-            rebalance_id: row.rebalance_id,
-            pair_id: row.pair_id,
-            long_ticker: row.long_ticker,
-            short_ticker: row.short_ticker,
-            z_score: row.z_score,
-            hedge_ratio: row.hedge_ratio,
-            signal_strength: row.signal_strength,
-            status: row.status,
-            opened_at: row.opened_at,
-            closed_at: row.closed_at,
-            realized_profit_and_loss: row.realized_profit_and_loss,
-            return_percent: row.return_percent,
-            holding_days: row.holding_days,
+    rows.into_iter()
+        .map(|row| {
+            let long_ticker = Ticker::new(&row.long_ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid long ticker: {}", row.long_ticker).into())
+            })?;
+            let short_ticker = Ticker::new(&row.short_ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid short ticker: {}", row.short_ticker).into())
+            })?;
+            let status = EquityPairStatus::parse(&row.status).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid equity pair status: {}", row.status).into())
+            })?;
+            Ok(EquityPair::new(
+                row.id,
+                row.rebalance_id,
+                row.pair_id,
+                long_ticker,
+                short_ticker,
+                row.z_score,
+                row.hedge_ratio,
+                row.signal_strength,
+                status,
+                row.opened_at,
+                row.closed_at,
+                row.realized_profit_and_loss,
+                row.return_percent,
+                row.holding_days,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 pub async fn query_equity_allocations(pool: &PgPool) -> Result<Vec<EquityAllocation>, sqlx::Error> {
@@ -400,23 +402,33 @@ pub async fn query_equity_allocations(pool: &PgPool) -> Result<Vec<EquityAllocat
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| EquityAllocation {
-            id: row.id,
-            rebalance_id: row.rebalance_id,
-            equity_pair_id: row.equity_pair_id,
-            generated_at: row.generated_at,
-            model_run_id: row.model_run_id,
-            ticker: row.ticker,
-            side: row.side,
-            action: row.action,
-            dollar_amount: row.dollar_amount,
-            entry_price: row.entry_price,
-            quantity: row.quantity,
-            notional: row.notional,
+    rows.into_iter()
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            let side = AllocationSide::parse(&row.side).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid allocation side: {}", row.side).into())
+            })?;
+            let action = AllocationAction::parse(&row.action).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid allocation action: {}", row.action).into())
+            })?;
+            Ok(EquityAllocation::new(
+                row.id,
+                row.rebalance_id,
+                row.equity_pair_id,
+                row.generated_at,
+                row.model_run_id,
+                ticker,
+                side,
+                action,
+                row.dollar_amount,
+                row.entry_price,
+                row.quantity,
+                row.notional,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 pub async fn query_equity_orders(pool: &PgPool) -> Result<Vec<EquityOrder>, sqlx::Error> {
@@ -429,20 +441,27 @@ pub async fn query_equity_orders(pool: &PgPool) -> Result<Vec<EquityOrder>, sqlx
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| EquityOrder {
-            id: row.id,
-            allocation_id: row.allocation_id,
-            submitted_at: row.submitted_at,
-            ticker: row.ticker,
-            side: row.side,
-            quantity: row.quantity,
-            order_type: row.order_type,
-            limit_price: row.limit_price,
-            alpaca_order_id: row.alpaca_order_id,
+    rows.into_iter()
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            let side = AllocationSide::parse(&row.side).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid order side: {}", row.side).into())
+            })?;
+            Ok(EquityOrder::new(
+                row.id,
+                row.allocation_id,
+                row.submitted_at,
+                ticker,
+                side,
+                row.quantity,
+                row.order_type,
+                row.limit_price,
+                row.alpaca_order_id,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 pub async fn query_equity_portfolio_snapshots(
@@ -457,19 +476,23 @@ pub async fn query_equity_portfolio_snapshots(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| EquityPortfolioSnapshot {
-            id: row.id,
-            snapshot_timestamp: row.snapshot_timestamp,
-            snapshot_type: row.snapshot_type,
-            net_asset_value: row.net_asset_value,
-            gross_return: row.gross_return,
-            net_return: row.net_return,
-            total_slippage_cost: row.total_slippage_cost,
-            created_at: row.created_at,
+    rows.into_iter()
+        .map(|row| {
+            let snapshot_type = SnapshotType::parse(&row.snapshot_type).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid snapshot type: {}", row.snapshot_type).into())
+            })?;
+            Ok(EquityPortfolioSnapshot::new(
+                row.id,
+                row.snapshot_timestamp,
+                snapshot_type,
+                row.net_asset_value,
+                row.gross_return,
+                row.net_return,
+                row.total_slippage_cost,
+                row.created_at,
+            ))
         })
-        .collect())
+        .collect()
 }
 
 pub async fn requeue_stale_claimed_jobs(
@@ -498,33 +521,38 @@ mod tests {
     use crate::domain::market::{EquityBar, Ticker};
     use chrono::Utc;
 
+    fn test_pool() -> PgPool {
+        PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+            .expect("lazy pool creation should not fail")
+    }
+
     fn sample_bars() -> Vec<EquityBar> {
         let now = Utc::now();
         vec![
-            EquityBar {
-                ticker: Ticker::new("AAPL").unwrap(),
-                timestamp: now,
-                open_price: 150.0,
-                high_price: 155.0,
-                low_price: 149.0,
-                close_price: 153.0,
-                volume: 1_000_000,
-                volume_weighted_average_price: Some(152.0),
-                transactions: Some(50_000),
-                inserted_at: now,
-            },
-            EquityBar {
-                ticker: Ticker::new("MSFT").unwrap(),
-                timestamp: now,
-                open_price: 350.0,
-                high_price: 355.0,
-                low_price: 349.0,
-                close_price: 353.0,
-                volume: 500_000,
-                volume_weighted_average_price: Some(352.0),
-                transactions: Some(25_000),
-                inserted_at: now,
-            },
+            EquityBar::new(
+                Ticker::new("AAPL").unwrap(),
+                now,
+                150.0,
+                155.0,
+                149.0,
+                153.0,
+                1_000_000,
+                Some(152.0),
+                Some(50_000),
+                now,
+            ),
+            EquityBar::new(
+                Ticker::new("MSFT").unwrap(),
+                now,
+                350.0,
+                355.0,
+                349.0,
+                353.0,
+                500_000,
+                Some(352.0),
+                Some(25_000),
+                now,
+            ),
         ]
     }
 
@@ -532,8 +560,8 @@ mod tests {
     fn test_sample_bars_are_valid() {
         let bars = sample_bars();
         assert_eq!(bars.len(), 2);
-        assert_eq!(bars[0].ticker, "AAPL");
-        assert_eq!(bars[1].ticker, "MSFT");
+        assert_eq!(bars[0].ticker(), "AAPL");
+        assert_eq!(bars[1].ticker(), "MSFT");
     }
 
     #[test]
@@ -543,8 +571,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = insert_equity_bars(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
@@ -558,8 +585,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = insert_equity_quotes(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
@@ -573,8 +599,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = get_active_tickers(&pool).await;
             assert!(result.is_err());
         });
@@ -587,8 +612,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = requeue_stale_claimed_jobs(
                 &pool,
                 "equity-bar-sync",
@@ -606,8 +630,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = emit_equity_bars_synced(&pool).await;
             assert!(result.is_err());
         });
@@ -621,8 +644,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -637,8 +659,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = delete_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -653,8 +674,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_bars_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -668,8 +688,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_rebalance_sessions(&pool).await;
             assert!(result.is_err());
         });
@@ -682,8 +701,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_pairs(&pool).await;
             assert!(result.is_err());
         });
@@ -696,8 +714,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_allocations(&pool).await;
             assert!(result.is_err());
         });
@@ -710,8 +727,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_orders(&pool).await;
             assert!(result.is_err());
         });
@@ -724,8 +740,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_portfolio_snapshots(&pool).await;
             assert!(result.is_err());
         });

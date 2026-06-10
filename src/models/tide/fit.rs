@@ -290,10 +290,7 @@ mod tests {
     #[test]
     fn test_write_artifact_json_round_trips_via_loader() {
         let result = fit(raw_frame()).unwrap();
-        let parameters = ModelParameters {
-            input_size: 448,
-            ..Default::default()
-        };
+        let parameters = ModelParameters::new(448, 35, 5);
         let dir = tempfile::tempdir().unwrap();
         write_artifact_json(dir.path(), &result.scaler, &result.mappings, &parameters).unwrap();
 
@@ -306,6 +303,6 @@ mod tests {
 
         let loaded_parameters =
             ModelParameters::load(&dir.path().join("tide_parameters.json")).unwrap();
-        assert_eq!(loaded_parameters.input_size, 448);
+        assert_eq!(loaded_parameters.input_size(), 448);
     }
 }

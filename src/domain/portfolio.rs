@@ -116,7 +116,7 @@ impl Portfolio {
         // Compute total gross notional as f64 for ratio checks.
         let total_gross_notional: f64 = pairs
             .iter()
-            .flat_map(|pair| [pair.long_notional.0, pair.short_notional.0])
+            .flat_map(|pair| [pair.long_notional.value(), pair.short_notional.value()])
             .map(|decimal| decimal.to_f64().unwrap_or(0.0))
             .sum();
 
@@ -124,8 +124,8 @@ impl Portfolio {
             // Concentration cap: no single ticker may exceed the cap fraction of total gross notional.
             let mut ticker_notionals: HashMap<String, f64> = HashMap::new();
             for pair in &pairs {
-                let long_notional = pair.long_notional.0.to_f64().unwrap_or(0.0);
-                let short_notional = pair.short_notional.0.to_f64().unwrap_or(0.0);
+                let long_notional = pair.long_notional.value().to_f64().unwrap_or(0.0);
+                let short_notional = pair.short_notional.value().to_f64().unwrap_or(0.0);
                 *ticker_notionals
                     .entry(pair.long.ticker.clone())
                     .or_insert(0.0) += long_notional;
@@ -147,8 +147,8 @@ impl Portfolio {
 
         // Dollar-neutral pairing: each pair's long and short notionals must be within tolerance.
         for (index, pair) in pairs.iter().enumerate() {
-            let long_notional = pair.long_notional.0.to_f64().unwrap_or(0.0);
-            let short_notional = pair.short_notional.0.to_f64().unwrap_or(0.0);
+            let long_notional = pair.long_notional.value().to_f64().unwrap_or(0.0);
+            let short_notional = pair.short_notional.value().to_f64().unwrap_or(0.0);
             let average = (long_notional + short_notional) / 2.0;
             if average > 0.0 {
                 let imbalance = (long_notional - short_notional).abs() / average;

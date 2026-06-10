@@ -24,7 +24,7 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let model_loaded = state.model_state.lock().await.is_some();
+    let model_loaded = state.model_state().lock().await.is_some();
 
     let status = if model_loaded {
         StatusCode::OK
@@ -41,18 +41,18 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let guard = state.model_state.lock().await;
+    let guard = state.model_state().lock().await;
 
-    let load_timestamp = guard.as_ref().map(|ms| ms.load_timestamp).unwrap_or(0);
+    let load_timestamp = guard.as_ref().map(|ms| ms.load_timestamp()).unwrap_or(0);
     let artifact_key = guard
         .as_ref()
-        .map(|ms| ms.artifact_key.clone())
+        .map(|ms| ms.artifact_key().to_string())
         .unwrap_or_default();
 
     drop(guard);
 
     let body = state
-        .metrics
+        .metrics()
         .render_prometheus(load_timestamp, &artifact_key);
 
     (StatusCode::OK, body)
@@ -60,15 +60,53 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Successful outcome of a prediction run.
 pub struct PredictionRun {
-    pub predictions: serde_json::Value,
-    pub row_count: usize,
+    predictions: serde_json::Value,
+    row_count: usize,
+}
+
+impl PredictionRun {
+    /// Constructs a `PredictionRun` from the generated predictions and their row count.
+    pub fn new(predictions: serde_json::Value, row_count: usize) -> Self {
+        Self {
+            predictions,
+            row_count,
+        }
+    }
+
+    pub fn predictions(&self) -> &serde_json::Value {
+        &self.predictions
+    }
+
+    /// Consumes the run, returning the generated predictions.
+    pub fn into_predictions(self) -> serde_json::Value {
+        self.predictions
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
 }
 
 /// A prediction-pipeline failure, tagged with the stage that failed so callers
 /// can record metrics and emit `predictions_failed` with a reason.
 pub struct PipelineError {
-    pub stage: &'static str,
-    pub message: String,
+    stage: &'static str,
+    message: String,
+}
+
+impl PipelineError {
+    /// Constructs a `PipelineError` for the given pipeline stage.
+    pub fn new(stage: &'static str, message: String) -> Self {
+        Self { stage, message }
+    }
+
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Run the full prediction pipeline once and persist the result.
@@ -81,7 +119,7 @@ pub struct PipelineError {
 /// manager as a fallback.
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
     let start = Instant::now();
-    state.metrics.increment_requests();
+    state.metrics().increment_requests();
 
     let correlation_id = Uuid::new_v4();
     let http_client = reqwest::Client::new();
@@ -89,19 +127,19 @@ pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, Pipeline
     let result = run_pipeline_and_persist(state, &http_client, correlation_id).await;
 
     state
-        .metrics
+        .metrics()
         .observe_duration(start.elapsed().as_secs_f64());
 
     if let Err(error) = &result {
-        state.metrics.increment_error(error.stage);
-        error!(stage = error.stage, error = %error.message, "Prediction pipeline failed");
-        if let Some(pool) = &state.pool {
+        state.metrics().increment_error(error.stage());
+        error!(stage = error.stage(), error = %error.message(), "Prediction pipeline failed");
+        if let Some(pool) = state.pool() {
             if let Err(emit_error) = database::emit_event(
                 pool,
                 "predictions_failed",
                 &serde_json::json!({
                     "correlation_id": correlation_id.to_string(),
-                    "reason": error.stage,
+                    "reason": error.stage(),
                 }),
             )
             .await
@@ -123,87 +161,61 @@ async fn run_pipeline_and_persist(
     // original handler. The block yields the predictions plus the run id so the
     // lock is released before persistence.
     let (predictions, model_run_id) = {
-        let guard = state.model_state.lock().await;
-        let model_state = guard.as_ref().ok_or_else(|| PipelineError {
-            stage: "model_not_loaded",
-            message: "Model not loaded".to_string(),
+        let guard = state.model_state().lock().await;
+        let model_state = guard.as_ref().ok_or_else(|| {
+            PipelineError::new("model_not_loaded", "Model not loaded".to_string())
         })?;
 
         let equity_bars = predict::fetch_equity_bars_from_pool_or_service(
-            state.pool.as_ref(),
-            &state.data_manager_base_url,
+            state.pool(),
+            state.data_manager_base_url(),
             http_client,
         )
         .await
-        .map_err(|e| PipelineError {
-            stage: "fetch_equity_bars",
-            message: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::new("fetch_equity_bars", e.to_string()))?;
 
         let equity_details = predict::fetch_equity_details_from_pool_or_service(
-            state.pool.as_ref(),
-            &state.data_manager_base_url,
+            state.pool(),
+            state.data_manager_base_url(),
             http_client,
         )
         .await
-        .map_err(|e| PipelineError {
-            stage: "fetch_equity_details",
-            message: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::new("fetch_equity_details", e.to_string()))?;
 
-        let consolidated =
-            predict::consolidate_data(equity_bars, equity_details).map_err(|e| PipelineError {
-                stage: "data_consolidation",
-                message: e.to_string(),
-            })?;
+        let consolidated = predict::consolidate_data(equity_bars, equity_details)
+            .map_err(|e| PipelineError::new("data_consolidation", e.to_string()))?;
 
         let equity_filtered = predict::filter_equity_bars(
             consolidated,
             crate::domain::market::MINIMUM_CLOSE_PRICE,
             crate::domain::market::MINIMUM_VOLUME,
         )
-        .map_err(|e| PipelineError {
-            stage: "equity_bar_filtering",
-            message: e.to_string(),
-        })?;
+        .map_err(|e| PipelineError::new("equity_bar_filtering", e.to_string()))?;
 
-        let filtered =
-            predict::filter_to_trained_tickers(equity_filtered, model_state).map_err(|e| {
-                PipelineError {
-                    stage: "ticker_filtering",
-                    message: e.to_string(),
-                }
-            })?;
+        let filtered = predict::filter_to_trained_tickers(equity_filtered, model_state)
+            .map_err(|e| PipelineError::new("ticker_filtering", e.to_string()))?;
 
-        let predictions =
-            predict::generate_predictions(filtered, model_state).map_err(|e| PipelineError {
-                stage: "prediction",
-                message: e.to_string(),
-            })?;
+        let predictions = predict::generate_predictions(filtered, model_state)
+            .map_err(|e| PipelineError::new("prediction", e.to_string()))?;
 
-        (predictions, model_state.run_id.clone())
+        (predictions, model_state.run_id().to_string())
     };
 
     if let Some(prediction_array) = predictions.as_array() {
-        predict::validate_predictions(prediction_array).map_err(|message| PipelineError {
-            stage: "validation",
-            message,
-        })?;
-        state.metrics.set_batch_count(1);
-        state.metrics.set_row_count(prediction_array.len() as u64);
+        predict::validate_predictions(prediction_array)
+            .map_err(|message| PipelineError::new("validation", message))?;
+        state.metrics().set_batch_count(1);
+        state.metrics().set_row_count(prediction_array.len() as u64);
     }
 
     let row_count = predictions.as_array().map(|array| array.len()).unwrap_or(0);
 
-    if let Some(pool) = &state.pool {
+    if let Some(pool) = state.pool() {
         if let Some(prediction_array) = predictions.as_array() {
             let rows =
                 database::insert_predictions(pool, prediction_array, correlation_id, &model_run_id)
                     .await
-                    .map_err(|e| PipelineError {
-                        stage: "insert_predictions",
-                        message: e.to_string(),
-                    })?;
+                    .map_err(|e| PipelineError::new("insert_predictions", e.to_string()))?;
             info!(rows = rows, "Predictions inserted into PostgreSQL");
             if let Err(e) = database::emit_event(
                 pool,
@@ -217,7 +229,7 @@ async fn run_pipeline_and_persist(
         }
     } else {
         let save_result = http_client
-            .post(format!("{}/predictions", state.data_manager_base_url))
+            .post(format!("{}/predictions", state.data_manager_base_url()))
             .json(&serde_json::json!({
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "data": predictions,
@@ -238,10 +250,7 @@ async fn run_pipeline_and_persist(
         }
     }
 
-    Ok(PredictionRun {
-        predictions,
-        row_count,
-    })
+    Ok(PredictionRun::new(predictions, row_count))
 }
 
 async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
@@ -249,10 +258,10 @@ async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
     info!("Prediction request received");
 
     let response = match run_predictions(&state).await {
-        Ok(run) => (StatusCode::OK, Json(run.predictions)),
+        Ok(run) => (StatusCode::OK, Json(run.into_predictions())),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": error.message})),
+            Json(serde_json::json!({"error": error.message()})),
         ),
     };
 
@@ -270,11 +279,11 @@ async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
 /// and then from the polling loop.
 pub async fn poll_artifact_once(state: &AppState) {
     let latest_key = match artifact::resolve_artifact_key(
-        &state.s3_client,
-        &state.artifact_bucket,
-        &state.artifact_prefix,
-        &state.model_version,
-        state.local_artifact_dir.as_deref(),
+        state.s3_client(),
+        state.artifact_bucket(),
+        state.artifact_prefix(),
+        state.model_version(),
+        state.local_artifact_dir(),
     )
     .await
     {
@@ -286,8 +295,8 @@ pub async fn poll_artifact_once(state: &AppState) {
     };
 
     let current_key = {
-        let guard = state.model_state.lock().await;
-        guard.as_ref().map(|ms| ms.artifact_key.clone())
+        let guard = state.model_state().lock().await;
+        guard.as_ref().map(|ms| ms.artifact_key().to_string())
     };
 
     if current_key.as_deref() == Some(&latest_key) {
@@ -301,23 +310,23 @@ pub async fn poll_artifact_once(state: &AppState) {
     );
 
     match artifact::download_and_load_model(
-        &state.s3_client,
-        &state.artifact_bucket,
+        state.s3_client(),
+        state.artifact_bucket(),
         &latest_key,
-        state.local_artifact_dir.as_deref(),
+        state.local_artifact_dir(),
     )
     .await
     {
         Ok(new_model_state) => {
             // Record training lineage in model_runs so predictions written
             // with this run_id join back to its metrics. Best-effort.
-            if let Some(pool) = &state.pool {
-                let run_id = new_model_state.run_id.clone();
+            if let Some(pool) = state.pool() {
+                let run_id = new_model_state.run_id().to_string();
                 match artifact::fetch_run_metadata(
-                    &state.s3_client,
-                    &state.artifact_bucket,
+                    state.s3_client(),
+                    state.artifact_bucket(),
                     &latest_key,
-                    state.local_artifact_dir.as_deref(),
+                    state.local_artifact_dir(),
                 )
                 .await
                 {
@@ -340,7 +349,7 @@ pub async fn poll_artifact_once(state: &AppState) {
                 }
             }
 
-            let mut guard = state.model_state.lock().await;
+            let mut guard = state.model_state().lock().await;
             *guard = Some(new_model_state);
             info!(artifact_key = latest_key, "Model hot-swapped");
         }
@@ -367,23 +376,20 @@ mod tests {
     use tower::ServiceExt;
 
     fn make_test_state() -> AppState {
-        AppState {
-            model_state: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            s3_client: {
-                let config = aws_sdk_s3::Config::builder()
-                    .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-                    .region(aws_sdk_s3::config::Region::new("us-east-1"))
-                    .build();
-                aws_sdk_s3::Client::from_conf(config)
-            },
-            artifact_bucket: "test-bucket".to_string(),
-            artifact_prefix: "artifacts/tide/".to_string(),
-            data_manager_base_url: "http://localhost:8080".to_string(),
-            model_version: "latest".to_string(),
-            metrics: std::sync::Arc::new(crate::ensemble_manager::state::Metrics::new()),
-            local_artifact_dir: None,
-            pool: None,
-        }
+        let s3_client = {
+            let config = aws_sdk_s3::Config::builder()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .build();
+            aws_sdk_s3::Client::from_conf(config)
+        };
+        AppState::for_tests(
+            s3_client,
+            "test-bucket".to_string(),
+            "artifacts/tide/".to_string(),
+            "http://localhost:8080".to_string(),
+            "latest".to_string(),
+        )
     }
 
     #[tokio::test]
@@ -445,7 +451,7 @@ mod tests {
         let result = run_predictions(&state).await;
         assert!(result.is_err());
 
-        let rendered = state.metrics.render_prometheus(0, "");
+        let rendered = state.metrics().render_prometheus(0, "");
         assert!(
             rendered.contains("ensemble_prediction_requests_total 1"),
             "request counter not incremented by run_predictions"
