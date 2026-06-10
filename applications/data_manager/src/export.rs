@@ -34,12 +34,7 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
     }
 
     let mut dataframe = create_equity_bar_export_dataframe(&bars)?;
-    let key = format!(
-        "data/equity/bars/year={}/month={:02}/day={:02}/data.parquet",
-        date.year(),
-        date.month(),
-        date.day()
-    );
+    let key = date_partitioned_key("data/equity/bars", date);
     write_dataframe_to_s3(state, &mut dataframe, &key).await?;
     info!("Exported {} equity bars to S3: {}", count, key);
 
@@ -51,7 +46,10 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
 /// Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
 /// equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs. Deletes the
 /// exported equity_quotes rows from the database after a successful S3 write.
-pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<usize, String> {
+pub async fn export_equity_trading_history(
+    state: &State,
+    date: NaiveDate,
+) -> Result<usize, String> {
     let pool = state
         .database
         .pool()
@@ -66,12 +64,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
         write_dataframe_to_s3(
             state,
             &mut quote_dataframe,
-            &format!(
-                "data/equity/quotes/year={}/month={:02}/day={:02}/data.parquet",
-                date.year(),
-                date.month(),
-                date.day()
-            ),
+            &date_partitioned_key("data/equity/quotes", date),
         )
         .await?;
         database::delete_equity_quotes_for_date(pool, date)
@@ -90,12 +83,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
         write_dataframe_to_s3(
             state,
             &mut prediction_dataframe,
-            &format!(
-                "exports/equity/predictions/year={}/month={:02}/day={:02}/data.parquet",
-                date.year(),
-                date.month(),
-                date.day()
-            ),
+            &date_partitioned_key("exports/equity/predictions", date),
         )
         .await?;
     } else {
@@ -110,12 +98,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut session_dataframe,
-        &format!(
-            "exports/equity/rebalance-sessions/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/equity/rebalance-sessions", date),
     )
     .await?;
 
@@ -127,12 +110,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut pair_dataframe,
-        &format!(
-            "exports/equity/pairs/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/equity/pairs", date),
     )
     .await?;
 
@@ -144,12 +122,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut allocation_dataframe,
-        &format!(
-            "exports/equity/allocations/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/equity/allocations", date),
     )
     .await?;
 
@@ -161,12 +134,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut order_dataframe,
-        &format!(
-            "exports/equity/orders/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/equity/orders", date),
     )
     .await?;
 
@@ -178,12 +146,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut snapshot_dataframe,
-        &format!(
-            "exports/equity/portfolio-snapshots/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/equity/portfolio-snapshots", date),
     )
     .await?;
 
@@ -195,12 +158,7 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
     write_dataframe_to_s3(
         state,
         &mut model_run_dataframe,
-        &format!(
-            "exports/model-runs/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        ),
+        &date_partitioned_key("exports/model-runs", date),
     )
     .await?;
 
@@ -217,6 +175,16 @@ pub async fn export_trading_history(state: &State, date: NaiveDate) -> Result<us
         + order_count
         + snapshot_count
         + model_run_count)
+}
+
+fn date_partitioned_key(prefix: &str, date: NaiveDate) -> String {
+    format!(
+        "{}/year={}/month={:02}/day={:02}/data.parquet",
+        prefix,
+        date.year(),
+        date.month(),
+        date.day()
+    )
 }
 
 async fn write_dataframe_to_s3(
@@ -244,28 +212,28 @@ async fn write_dataframe_to_s3(
 
 fn create_equity_quote_dataframe(quotes: &[EquityQuote]) -> Result<DataFrame, String> {
     df!(
-        "timestamp" => quotes.iter().map(|quote| quote.timestamp.timestamp_millis()).collect::<Vec<i64>>(),
-        "ticker" => quotes.iter().map(|quote| quote.ticker.as_str()).collect::<Vec<&str>>(),
-        "bid_price" => quotes.iter().map(|quote| quote.bid_price).collect::<Vec<f64>>(),
-        "ask_price" => quotes.iter().map(|quote| quote.ask_price).collect::<Vec<f64>>(),
-        "bid_size" => quotes.iter().map(|quote| quote.bid_size).collect::<Vec<i32>>(),
-        "ask_size" => quotes.iter().map(|quote| quote.ask_size).collect::<Vec<i32>>(),
+        "timestamp" => quotes.iter().map(|quote| quote.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
+        "ticker" => quotes.iter().map(|quote| quote.ticker().as_str()).collect::<Vec<&str>>(),
+        "bid_price" => quotes.iter().map(|quote| quote.bid_price()).collect::<Vec<f64>>(),
+        "ask_price" => quotes.iter().map(|quote| quote.ask_price()).collect::<Vec<f64>>(),
+        "bid_size" => quotes.iter().map(|quote| quote.bid_size()).collect::<Vec<i32>>(),
+        "ask_size" => quotes.iter().map(|quote| quote.ask_size()).collect::<Vec<i32>>(),
     )
     .map_err(|error| format!("Failed to create equity quote DataFrame: {}", error))
 }
 
 fn create_equity_bar_export_dataframe(bars: &[EquityBar]) -> Result<DataFrame, String> {
     df!(
-        "ticker" => bars.iter().map(|bar| bar.ticker.as_str()).collect::<Vec<&str>>(),
-        "timestamp" => bars.iter().map(|bar| bar.timestamp.timestamp_millis()).collect::<Vec<i64>>(),
-        "open_price" => bars.iter().map(|bar| bar.open_price).collect::<Vec<f64>>(),
-        "high_price" => bars.iter().map(|bar| bar.high_price).collect::<Vec<f64>>(),
-        "low_price" => bars.iter().map(|bar| bar.low_price).collect::<Vec<f64>>(),
-        "close_price" => bars.iter().map(|bar| bar.close_price).collect::<Vec<f64>>(),
-        "volume" => bars.iter().map(|bar| bar.volume).collect::<Vec<i64>>(),
-        "volume_weighted_average_price" => bars.iter().map(|bar| bar.volume_weighted_average_price).collect::<Vec<Option<f64>>>(),
-        "transactions" => bars.iter().map(|bar| bar.transactions).collect::<Vec<Option<i64>>>(),
-        "inserted_at" => bars.iter().map(|bar| bar.inserted_at.timestamp_millis()).collect::<Vec<i64>>(),
+        "ticker" => bars.iter().map(|bar| bar.ticker().as_str()).collect::<Vec<&str>>(),
+        "timestamp" => bars.iter().map(|bar| bar.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
+        "open_price" => bars.iter().map(|bar| bar.open_price()).collect::<Vec<f64>>(),
+        "high_price" => bars.iter().map(|bar| bar.high_price()).collect::<Vec<f64>>(),
+        "low_price" => bars.iter().map(|bar| bar.low_price()).collect::<Vec<f64>>(),
+        "close_price" => bars.iter().map(|bar| bar.close_price()).collect::<Vec<f64>>(),
+        "volume" => bars.iter().map(|bar| bar.volume()).collect::<Vec<i64>>(),
+        "volume_weighted_average_price" => bars.iter().map(|bar| bar.volume_weighted_average_price()).collect::<Vec<Option<f64>>>(),
+        "transactions" => bars.iter().map(|bar| bar.transactions()).collect::<Vec<Option<i64>>>(),
+        "inserted_at" => bars.iter().map(|bar| bar.inserted_at().timestamp_millis()).collect::<Vec<i64>>(),
     )
     .map_err(|error| format!("Failed to create equity bar export DataFrame: {}", error))
 }
@@ -274,12 +242,12 @@ fn create_equity_rebalance_session_dataframe(
     sessions: &[EquityRebalanceSession],
 ) -> Result<DataFrame, String> {
     df!(
-        "id" => sessions.iter().map(|session| session.id.to_string()).collect::<Vec<String>>(),
-        "triggered_at" => sessions.iter().map(|session| session.triggered_at.timestamp_millis()).collect::<Vec<i64>>(),
-        "trigger_reason" => sessions.iter().map(|session| session.trigger_reason.as_str()).collect::<Vec<&str>>(),
-        "model_run_id" => sessions.iter().map(|session| session.model_run_id.as_deref()).collect::<Vec<Option<&str>>>(),
-        "completed_at" => sessions.iter().map(|session| session.completed_at.map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
-        "status" => sessions.iter().map(|session| session.status.as_str()).collect::<Vec<&str>>(),
+        "id" => sessions.iter().map(|session| session.id().to_string()).collect::<Vec<String>>(),
+        "triggered_at" => sessions.iter().map(|session| session.triggered_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "trigger_reason" => sessions.iter().map(|session| session.trigger_reason()).collect::<Vec<&str>>(),
+        "model_run_id" => sessions.iter().map(|session| session.model_run_id()).collect::<Vec<Option<&str>>>(),
+        "completed_at" => sessions.iter().map(|session| session.completed_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "status" => sessions.iter().map(|session| session.status().as_str()).collect::<Vec<&str>>(),
     )
     .map_err(|error| {
         format!(
@@ -291,20 +259,20 @@ fn create_equity_rebalance_session_dataframe(
 
 fn create_equity_pair_dataframe(pairs: &[EquityPair]) -> Result<DataFrame, String> {
     df!(
-        "id" => pairs.iter().map(|pair| pair.id.to_string()).collect::<Vec<String>>(),
-        "rebalance_id" => pairs.iter().map(|pair| pair.rebalance_id.to_string()).collect::<Vec<String>>(),
-        "pair_id" => pairs.iter().map(|pair| pair.pair_id.as_str()).collect::<Vec<&str>>(),
-        "long_ticker" => pairs.iter().map(|pair| pair.long_ticker.as_str()).collect::<Vec<&str>>(),
-        "short_ticker" => pairs.iter().map(|pair| pair.short_ticker.as_str()).collect::<Vec<&str>>(),
-        "z_score" => pairs.iter().map(|pair| pair.z_score.to_string()).collect::<Vec<String>>(),
-        "hedge_ratio" => pairs.iter().map(|pair| pair.hedge_ratio.to_string()).collect::<Vec<String>>(),
-        "signal_strength" => pairs.iter().map(|pair| pair.signal_strength.to_string()).collect::<Vec<String>>(),
-        "status" => pairs.iter().map(|pair| pair.status.as_str()).collect::<Vec<&str>>(),
-        "opened_at" => pairs.iter().map(|pair| pair.opened_at.timestamp_millis()).collect::<Vec<i64>>(),
-        "closed_at" => pairs.iter().map(|pair| pair.closed_at.map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
-        "realized_profit_and_loss" => pairs.iter().map(|pair| pair.realized_profit_and_loss.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "return_percent" => pairs.iter().map(|pair| pair.return_percent.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "holding_days" => pairs.iter().map(|pair| pair.holding_days).collect::<Vec<Option<i32>>>(),
+        "id" => pairs.iter().map(|pair| pair.id().to_string()).collect::<Vec<String>>(),
+        "rebalance_id" => pairs.iter().map(|pair| pair.rebalance_id().to_string()).collect::<Vec<String>>(),
+        "pair_id" => pairs.iter().map(|pair| pair.pair_id()).collect::<Vec<&str>>(),
+        "long_ticker" => pairs.iter().map(|pair| pair.long_ticker().as_str()).collect::<Vec<&str>>(),
+        "short_ticker" => pairs.iter().map(|pair| pair.short_ticker().as_str()).collect::<Vec<&str>>(),
+        "z_score" => pairs.iter().map(|pair| pair.z_score().to_string()).collect::<Vec<String>>(),
+        "hedge_ratio" => pairs.iter().map(|pair| pair.hedge_ratio().to_string()).collect::<Vec<String>>(),
+        "signal_strength" => pairs.iter().map(|pair| pair.signal_strength().to_string()).collect::<Vec<String>>(),
+        "status" => pairs.iter().map(|pair| pair.status().as_str()).collect::<Vec<&str>>(),
+        "opened_at" => pairs.iter().map(|pair| pair.opened_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "closed_at" => pairs.iter().map(|pair| pair.closed_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+        "realized_profit_and_loss" => pairs.iter().map(|pair| pair.realized_profit_and_loss().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "return_percent" => pairs.iter().map(|pair| pair.return_percent().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "holding_days" => pairs.iter().map(|pair| pair.holding_days()).collect::<Vec<Option<i32>>>(),
     )
     .map_err(|error| format!("Failed to create equity pair DataFrame: {}", error))
 }
@@ -313,33 +281,33 @@ fn create_equity_allocation_dataframe(
     allocations: &[EquityAllocation],
 ) -> Result<DataFrame, String> {
     df!(
-        "id" => allocations.iter().map(|allocation| allocation.id.to_string()).collect::<Vec<String>>(),
-        "rebalance_id" => allocations.iter().map(|allocation| allocation.rebalance_id.to_string()).collect::<Vec<String>>(),
-        "equity_pair_id" => allocations.iter().map(|allocation| allocation.equity_pair_id.to_string()).collect::<Vec<String>>(),
-        "generated_at" => allocations.iter().map(|allocation| allocation.generated_at.timestamp_millis()).collect::<Vec<i64>>(),
-        "model_run_id" => allocations.iter().map(|allocation| allocation.model_run_id.as_deref()).collect::<Vec<Option<&str>>>(),
-        "ticker" => allocations.iter().map(|allocation| allocation.ticker.as_str()).collect::<Vec<&str>>(),
-        "side" => allocations.iter().map(|allocation| allocation.side.as_str()).collect::<Vec<&str>>(),
-        "action" => allocations.iter().map(|allocation| allocation.action.as_str()).collect::<Vec<&str>>(),
-        "dollar_amount" => allocations.iter().map(|allocation| allocation.dollar_amount.to_string()).collect::<Vec<String>>(),
-        "entry_price" => allocations.iter().map(|allocation| allocation.entry_price.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "quantity" => allocations.iter().map(|allocation| allocation.quantity.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "notional" => allocations.iter().map(|allocation| allocation.notional.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "id" => allocations.iter().map(|allocation| allocation.id().to_string()).collect::<Vec<String>>(),
+        "rebalance_id" => allocations.iter().map(|allocation| allocation.rebalance_id().to_string()).collect::<Vec<String>>(),
+        "equity_pair_id" => allocations.iter().map(|allocation| allocation.equity_pair_id().to_string()).collect::<Vec<String>>(),
+        "generated_at" => allocations.iter().map(|allocation| allocation.generated_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "model_run_id" => allocations.iter().map(|allocation| allocation.model_run_id()).collect::<Vec<Option<&str>>>(),
+        "ticker" => allocations.iter().map(|allocation| allocation.ticker().as_str()).collect::<Vec<&str>>(),
+        "side" => allocations.iter().map(|allocation| allocation.side().as_str()).collect::<Vec<&str>>(),
+        "action" => allocations.iter().map(|allocation| allocation.action().as_str()).collect::<Vec<&str>>(),
+        "dollar_amount" => allocations.iter().map(|allocation| allocation.dollar_amount().to_string()).collect::<Vec<String>>(),
+        "entry_price" => allocations.iter().map(|allocation| allocation.entry_price().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "quantity" => allocations.iter().map(|allocation| allocation.quantity().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "notional" => allocations.iter().map(|allocation| allocation.notional().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
     )
     .map_err(|error| format!("Failed to create equity allocation DataFrame: {}", error))
 }
 
 fn create_equity_order_dataframe(orders: &[EquityOrder]) -> Result<DataFrame, String> {
     df!(
-        "id" => orders.iter().map(|order| order.id.to_string()).collect::<Vec<String>>(),
-        "allocation_id" => orders.iter().map(|order| order.allocation_id.to_string()).collect::<Vec<String>>(),
-        "submitted_at" => orders.iter().map(|order| order.submitted_at.timestamp_millis()).collect::<Vec<i64>>(),
-        "ticker" => orders.iter().map(|order| order.ticker.as_str()).collect::<Vec<&str>>(),
-        "side" => orders.iter().map(|order| order.side.as_str()).collect::<Vec<&str>>(),
-        "quantity" => orders.iter().map(|order| order.quantity.to_string()).collect::<Vec<String>>(),
-        "order_type" => orders.iter().map(|order| order.order_type.as_str()).collect::<Vec<&str>>(),
-        "limit_price" => orders.iter().map(|order| order.limit_price.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "alpaca_order_id" => orders.iter().map(|order| order.alpaca_order_id.as_str()).collect::<Vec<&str>>(),
+        "id" => orders.iter().map(|order| order.id().to_string()).collect::<Vec<String>>(),
+        "allocation_id" => orders.iter().map(|order| order.allocation_id().to_string()).collect::<Vec<String>>(),
+        "submitted_at" => orders.iter().map(|order| order.submitted_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "ticker" => orders.iter().map(|order| order.ticker().as_str()).collect::<Vec<&str>>(),
+        "side" => orders.iter().map(|order| order.side().as_str()).collect::<Vec<&str>>(),
+        "quantity" => orders.iter().map(|order| order.quantity().to_string()).collect::<Vec<String>>(),
+        "order_type" => orders.iter().map(|order| order.order_type()).collect::<Vec<&str>>(),
+        "limit_price" => orders.iter().map(|order| order.limit_price().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "alpaca_order_id" => orders.iter().map(|order| order.alpaca_order_id()).collect::<Vec<&str>>(),
     )
     .map_err(|error| format!("Failed to create equity order DataFrame: {}", error))
 }
@@ -348,14 +316,14 @@ fn create_equity_portfolio_snapshot_dataframe(
     snapshots: &[EquityPortfolioSnapshot],
 ) -> Result<DataFrame, String> {
     df!(
-        "id" => snapshots.iter().map(|snapshot| snapshot.id).collect::<Vec<i64>>(),
-        "snapshot_timestamp" => snapshots.iter().map(|snapshot| snapshot.snapshot_timestamp.timestamp_millis()).collect::<Vec<i64>>(),
-        "snapshot_type" => snapshots.iter().map(|snapshot| snapshot.snapshot_type.as_str()).collect::<Vec<&str>>(),
-        "net_asset_value" => snapshots.iter().map(|snapshot| snapshot.net_asset_value.to_string()).collect::<Vec<String>>(),
-        "gross_return" => snapshots.iter().map(|snapshot| snapshot.gross_return.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "net_return" => snapshots.iter().map(|snapshot| snapshot.net_return.as_ref().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "total_slippage_cost" => snapshots.iter().map(|snapshot| snapshot.total_slippage_cost.to_string()).collect::<Vec<String>>(),
-        "created_at" => snapshots.iter().map(|snapshot| snapshot.created_at.timestamp_millis()).collect::<Vec<i64>>(),
+        "id" => snapshots.iter().map(|snapshot| snapshot.id()).collect::<Vec<i64>>(),
+        "snapshot_timestamp" => snapshots.iter().map(|snapshot| snapshot.snapshot_timestamp().timestamp_millis()).collect::<Vec<i64>>(),
+        "snapshot_type" => snapshots.iter().map(|snapshot| snapshot.snapshot_type().as_str()).collect::<Vec<&str>>(),
+        "net_asset_value" => snapshots.iter().map(|snapshot| snapshot.net_asset_value().to_string()).collect::<Vec<String>>(),
+        "gross_return" => snapshots.iter().map(|snapshot| snapshot.gross_return().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "net_return" => snapshots.iter().map(|snapshot| snapshot.net_return().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "total_slippage_cost" => snapshots.iter().map(|snapshot| snapshot.total_slippage_cost().to_string()).collect::<Vec<String>>(),
+        "created_at" => snapshots.iter().map(|snapshot| snapshot.created_at().timestamp_millis()).collect::<Vec<i64>>(),
     )
     .map_err(|error| {
         format!(
@@ -408,122 +376,107 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use internal::market::Ticker;
+    use internal::trading::{
+        AllocationAction, AllocationSide, EquityPairStatus, RebalanceSessionStatus, SnapshotType,
+    };
     use serde_json::json;
 
     fn sample_quotes() -> Vec<EquityQuote> {
         let now = Utc::now();
         vec![
-            EquityQuote {
-                timestamp: now,
-                ticker: Ticker::new("AAPL").unwrap(),
-                bid_price: 150.50,
-                ask_price: 150.55,
-                bid_size: 10,
-                ask_size: 5,
-            },
-            EquityQuote {
-                timestamp: now,
-                ticker: Ticker::new("MSFT").unwrap(),
-                bid_price: 420.10,
-                ask_price: 420.20,
-                bid_size: 2,
-                ask_size: 4,
-            },
+            EquityQuote::new(now, Ticker::new("AAPL").unwrap(), 150.50, 150.55, 10, 5),
+            EquityQuote::new(now, Ticker::new("MSFT").unwrap(), 420.10, 420.20, 2, 4),
         ]
     }
 
     fn sample_bars() -> Vec<EquityBar> {
         let now = Utc::now();
-        vec![EquityBar {
-            ticker: Ticker::new("AAPL").unwrap(),
-            timestamp: now,
-            open_price: 150.0,
-            high_price: 155.0,
-            low_price: 149.0,
-            close_price: 153.0,
-            volume: 1_000_000,
-            volume_weighted_average_price: Some(152.0),
-            transactions: Some(50_000),
-            inserted_at: now,
-        }]
+        vec![EquityBar::new(
+            Ticker::new("AAPL").unwrap(),
+            now,
+            150.0,
+            155.0,
+            149.0,
+            153.0,
+            1_000_000,
+            Some(152.0),
+            Some(50_000),
+            now,
+        )]
     }
 
-    // Construct EquityRebalanceSession without importing uuid directly;
-    // the id field type (Uuid) is inferred from the struct definition.
     fn sample_sessions() -> Vec<EquityRebalanceSession> {
-        vec![EquityRebalanceSession {
-            id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            triggered_at: Utc::now(),
-            trigger_reason: "intraday_check".to_string(),
-            model_run_id: Some("run-abc123".to_string()),
-            completed_at: None,
-            status: "completed".to_string(),
-        }]
+        vec![EquityRebalanceSession::new(
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            Utc::now(),
+            "intraday_check".to_string(),
+            Some("run-abc123".to_string()),
+            None,
+            RebalanceSessionStatus::Completed,
+        )]
     }
 
-    // Construct EquityPair without importing rust_decimal directly;
-    // Decimal fields are inferred from the struct definition.
     fn sample_pairs() -> Vec<EquityPair> {
-        vec![EquityPair {
-            id: "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
-            rebalance_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            pair_id: "AAPL-MSFT".to_string(),
-            long_ticker: "AAPL".to_string(),
-            short_ticker: "MSFT".to_string(),
-            z_score: "2".parse().unwrap(),
-            hedge_ratio: "1".parse().unwrap(),
-            signal_strength: "0.75".parse().unwrap(),
-            status: "open".to_string(),
-            opened_at: Utc::now(),
-            closed_at: None,
-            realized_profit_and_loss: None,
-            return_percent: None,
-            holding_days: None,
-        }]
+        vec![EquityPair::new(
+            "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            "AAPL-MSFT".to_string(),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
+            "2".parse().unwrap(),
+            "1".parse().unwrap(),
+            "0.75".parse().unwrap(),
+            EquityPairStatus::Open,
+            Utc::now(),
+            None,
+            None,
+            None,
+            None,
+        )]
     }
 
     fn sample_allocations() -> Vec<EquityAllocation> {
-        vec![EquityAllocation {
-            id: "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
-            rebalance_id: "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            equity_pair_id: "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
-            generated_at: Utc::now(),
-            model_run_id: None,
-            ticker: "AAPL".to_string(),
-            side: "LONG".to_string(),
-            action: "OPEN_POSITION".to_string(),
-            dollar_amount: "10000".parse().unwrap(),
-            entry_price: Some("150".parse().unwrap()),
-            quantity: None,
-            notional: Some("10000".parse().unwrap()),
-        }]
+        vec![EquityAllocation::new(
+            "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
+            Utc::now(),
+            None,
+            Ticker::new("AAPL").unwrap(),
+            AllocationSide::Long,
+            AllocationAction::OpenPosition,
+            "10000".parse().unwrap(),
+            Some("150".parse().unwrap()),
+            None,
+            Some("10000".parse().unwrap()),
+        )]
     }
 
     fn sample_orders() -> Vec<EquityOrder> {
-        vec![EquityOrder {
-            id: "550e8400-e29b-41d4-a716-446655440004".parse().unwrap(),
-            allocation_id: "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
-            submitted_at: Utc::now(),
-            ticker: "MSFT".to_string(),
-            side: "SHORT".to_string(),
-            quantity: "25".parse().unwrap(),
-            order_type: "market".to_string(),
-            limit_price: None,
-            alpaca_order_id: "alpaca-order-xyz".to_string(),
-        }]
+        vec![EquityOrder::new(
+            "550e8400-e29b-41d4-a716-446655440004".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
+            Utc::now(),
+            Ticker::new("MSFT").unwrap(),
+            AllocationSide::Short,
+            "25".parse().unwrap(),
+            "market".to_string(),
+            None,
+            "alpaca-order-xyz".to_string(),
+        )]
     }
 
     fn sample_snapshots() -> Vec<EquityPortfolioSnapshot> {
-        vec![EquityPortfolioSnapshot {
-            id: 1,
-            snapshot_timestamp: Utc::now(),
-            snapshot_type: "end_of_day".to_string(),
-            net_asset_value: "100000".parse().unwrap(),
-            gross_return: Some("0.02".parse().unwrap()),
-            net_return: Some("0.018".parse().unwrap()),
-            total_slippage_cost: "50".parse().unwrap(),
-            created_at: Utc::now(),
-        }]
+        vec![EquityPortfolioSnapshot::new(
+            1,
+            Utc::now(),
+            SnapshotType::EndOfDay,
+            "100000".parse().unwrap(),
+            Some("0.02".parse().unwrap()),
+            Some("0.018".parse().unwrap()),
+            "50".parse().unwrap(),
+            Utc::now(),
+        )]
     }
 
     #[test]
@@ -846,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_trading_history_returns_error_when_no_database() {
+    fn test_export_equity_trading_history_returns_error_when_no_database() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -881,7 +834,7 @@ mod tests {
             assert!(matches!(state.database, DatabaseState::NotConfigured));
 
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = export_trading_history(&state, date).await;
+            let result = export_equity_trading_history(&state, date).await;
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("database not connected"));
         });

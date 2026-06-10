@@ -68,7 +68,7 @@ fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Opt
             }
         })?;
 
-    Some(EquityBar {
+    Some(EquityBar::new(
         ticker,
         timestamp,
         open_price,
@@ -76,10 +76,10 @@ fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Opt
         low_price,
         close_price,
         volume,
-        volume_weighted_average_price: result.vw,
-        transactions: result.n.and_then(|n| i64::try_from(n).ok()),
+        result.vw,
+        result.n.and_then(|n| i64::try_from(n).ok()),
         inserted_at,
-    })
+    ))
 }
 
 async fn write_equity_bars_to_s3(
@@ -272,12 +272,12 @@ mod tests {
     fn test_parse_equity_bar_valid() {
         let result = make_valid_result();
         let bar = parse_equity_bar(&result, Utc::now()).unwrap();
-        assert_eq!(bar.ticker, "AAPL");
-        assert_eq!(bar.open_price, 100.0);
-        assert_eq!(bar.close_price, 105.0);
-        assert_eq!(bar.volume, 2_000_000);
+        assert_eq!(bar.ticker(), "AAPL");
+        assert_eq!(bar.open_price(), 100.0);
+        assert_eq!(bar.close_price(), 105.0);
+        assert_eq!(bar.volume(), 2_000_000);
         let expected_timestamp = DateTime::from_timestamp_millis(1_735_689_600_000).unwrap();
-        assert_eq!(bar.timestamp, expected_timestamp);
+        assert_eq!(bar.timestamp(), expected_timestamp);
     }
 
     #[test]
@@ -285,7 +285,7 @@ mod tests {
         let mut result = make_valid_result();
         result.ticker = "  aapl  ".to_string();
         let bar = parse_equity_bar(&result, Utc::now()).unwrap();
-        assert_eq!(bar.ticker, "AAPL");
+        assert_eq!(bar.ticker(), "AAPL");
     }
 
     #[test]
@@ -350,8 +350,8 @@ mod tests {
         result.vw = None;
         result.n = None;
         let bar = parse_equity_bar(&result, Utc::now()).unwrap();
-        assert!(bar.volume_weighted_average_price.is_none());
-        assert!(bar.transactions.is_none());
+        assert!(bar.volume_weighted_average_price().is_none());
+        assert!(bar.transactions().is_none());
     }
 
     #[test]
@@ -360,6 +360,6 @@ mod tests {
         let mut result = make_valid_result();
         result.ticker = "BRK.B".to_string();
         let bar = parse_equity_bar(&result, Utc::now()).unwrap();
-        assert_eq!(bar.ticker, "BRK.B");
+        assert_eq!(bar.ticker(), "BRK.B");
     }
 }

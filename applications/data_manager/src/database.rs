@@ -1,5 +1,5 @@
 use chrono::{DateTime, Days, NaiveDate, Utc};
-use internal::market::{EquityBar, EquityDetails, EquityQuote};
+use internal::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 use internal::predictions::{EquityPrediction, ModelRun};
 use internal::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
@@ -21,16 +21,16 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
 
         query_builder.push_values(chunk, |mut builder, bar| {
             builder
-                .push_bind(&bar.ticker)
-                .push_bind(bar.timestamp)
-                .push_bind(bar.open_price)
-                .push_bind(bar.high_price)
-                .push_bind(bar.low_price)
-                .push_bind(bar.close_price)
-                .push_bind(bar.volume)
-                .push_bind(bar.volume_weighted_average_price)
-                .push_bind(bar.transactions)
-                .push_bind(bar.inserted_at);
+                .push_bind(bar.ticker())
+                .push_bind(bar.timestamp())
+                .push_bind(bar.open_price())
+                .push_bind(bar.high_price())
+                .push_bind(bar.low_price())
+                .push_bind(bar.close_price())
+                .push_bind(bar.volume())
+                .push_bind(bar.volume_weighted_average_price())
+                .push_bind(bar.transactions())
+                .push_bind(bar.inserted_at());
         });
 
         query_builder.push(
@@ -126,12 +126,12 @@ pub async fn insert_equity_quotes(
 
         query_builder.push_values(chunk, |mut builder, quote| {
             builder
-                .push_bind(quote.timestamp)
-                .push_bind(&quote.ticker)
-                .push_bind(quote.bid_price)
-                .push_bind(quote.ask_price)
-                .push_bind(quote.bid_size)
-                .push_bind(quote.ask_size);
+                .push_bind(quote.timestamp())
+                .push_bind(quote.ticker())
+                .push_bind(quote.bid_price())
+                .push_bind(quote.ask_price())
+                .push_bind(quote.bid_size())
+                .push_bind(quote.ask_size());
         });
 
         let result = query_builder.build().execute(pool).await?;
@@ -142,7 +142,7 @@ pub async fn insert_equity_quotes(
     Ok(rows_affected)
 }
 
-pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Error> {
     let rows: Vec<(String,)> = sqlx::query_as(
         r#"SELECT DISTINCT ea.ticker
            FROM equity_allocations ea
@@ -153,7 +153,10 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Erro
     .fetch_all(pool)
     .await?;
 
-    let tickers: Vec<String> = rows.into_iter().map(|(ticker,)| ticker).collect();
+    let tickers: Vec<Ticker> = rows
+        .into_iter()
+        .filter_map(|(ticker,)| Ticker::new(&ticker))
+        .collect();
     debug!("Queried {} active tickers from PostgreSQL", tickers.len());
     Ok(tickers)
 }
@@ -168,26 +171,13 @@ pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-pub async fn populate_equity_details_if_empty(
-    pool: &PgPool,
-    rows: &[EquityDetails],
-) -> Result<u64, sqlx::Error> {
-    let mut transaction = pool.begin().await?;
-
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM equity_details")
-        .fetch_one(&mut *transaction)
-        .await?;
-
-    if count.0 > 0 {
-        info!(
-            "equity_details already populated with {} rows, skipping migration",
-            count.0
-        );
-        return Ok(0);
-    }
-
+/// Seeds `equity_details` from the provided rows using an idempotent upsert.
+///
+/// Assumes a blank database on first startup. Subsequent runs are safe because
+/// `ON CONFLICT (ticker) DO NOTHING` skips rows that already exist.
+pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result<u64, sqlx::Error> {
     if rows.is_empty() {
-        warn!("equity_details is empty and no rows provided; skipping migration");
+        warn!("No equity details rows provided for seeding; skipping");
         return Ok(0);
     }
 
@@ -197,25 +187,20 @@ pub async fn populate_equity_details_if_empty(
         let mut query_builder =
             sqlx::QueryBuilder::new("INSERT INTO equity_details (ticker, sector, industry) ");
 
-        query_builder.push_values(chunk, |mut builder, details| {
+        query_builder.push_values(chunk, |mut builder, detail| {
             builder
-                .push_bind(&details.ticker)
-                .push_bind(&details.sector)
-                .push_bind(&details.industry);
+                .push_bind(detail.ticker())
+                .push_bind(detail.sector())
+                .push_bind(detail.industry());
         });
 
         query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
 
-        let result = query_builder.build().execute(&mut *transaction).await?;
+        let result = query_builder.build().execute(pool).await?;
         rows_affected += result.rows_affected();
     }
 
-    transaction.commit().await?;
-
-    info!(
-        "Populated equity_details with {} rows from S3 migration",
-        rows_affected
-    );
+    info!("Seeded equity_details with {} rows from S3", rows_affected);
     Ok(rows_affected)
 }
 
@@ -416,33 +401,38 @@ mod tests {
     use chrono::Utc;
     use internal::market::{EquityBar, Ticker};
 
+    fn test_pool() -> PgPool {
+        PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+            .expect("lazy pool creation should not fail")
+    }
+
     fn sample_bars() -> Vec<EquityBar> {
         let now = Utc::now();
         vec![
-            EquityBar {
-                ticker: Ticker::new("AAPL").unwrap(),
-                timestamp: now,
-                open_price: 150.0,
-                high_price: 155.0,
-                low_price: 149.0,
-                close_price: 153.0,
-                volume: 1_000_000,
-                volume_weighted_average_price: Some(152.0),
-                transactions: Some(50_000),
-                inserted_at: now,
-            },
-            EquityBar {
-                ticker: Ticker::new("MSFT").unwrap(),
-                timestamp: now,
-                open_price: 350.0,
-                high_price: 355.0,
-                low_price: 349.0,
-                close_price: 353.0,
-                volume: 500_000,
-                volume_weighted_average_price: Some(352.0),
-                transactions: Some(25_000),
-                inserted_at: now,
-            },
+            EquityBar::new(
+                Ticker::new("AAPL").unwrap(),
+                now,
+                150.0,
+                155.0,
+                149.0,
+                153.0,
+                1_000_000,
+                Some(152.0),
+                Some(50_000),
+                now,
+            ),
+            EquityBar::new(
+                Ticker::new("MSFT").unwrap(),
+                now,
+                350.0,
+                355.0,
+                349.0,
+                353.0,
+                500_000,
+                Some(352.0),
+                Some(25_000),
+                now,
+            ),
         ]
     }
 
@@ -450,8 +440,8 @@ mod tests {
     fn test_sample_bars_are_valid() {
         let bars = sample_bars();
         assert_eq!(bars.len(), 2);
-        assert_eq!(bars[0].ticker, "AAPL");
-        assert_eq!(bars[1].ticker, "MSFT");
+        assert_eq!(bars[0].ticker(), "AAPL");
+        assert_eq!(bars[1].ticker(), "MSFT");
     }
 
     #[test]
@@ -461,8 +451,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = insert_equity_bars(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
@@ -476,8 +465,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = insert_equity_quotes(&pool, &[]).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), 0);
@@ -491,8 +479,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = get_active_tickers(&pool).await;
             assert!(result.is_err());
         });
@@ -505,8 +492,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = requeue_stale_claimed_jobs(
                 &pool,
                 "equity-bar-sync",
@@ -524,8 +510,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = emit_equity_bars_synced(&pool).await;
             assert!(result.is_err());
         });
@@ -539,8 +524,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -555,8 +539,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = delete_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -571,8 +554,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_bars_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -586,8 +568,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_rebalance_sessions(&pool).await;
             assert!(result.is_err());
         });
@@ -600,8 +581,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_pairs(&pool).await;
             assert!(result.is_err());
         });
@@ -614,8 +594,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_allocations(&pool).await;
             assert!(result.is_err());
         });
@@ -628,8 +607,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_orders(&pool).await;
             assert!(result.is_err());
         });
@@ -642,8 +620,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_equity_portfolio_snapshots(&pool).await;
             assert!(result.is_err());
         });
@@ -657,8 +634,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             use chrono::NaiveDate;
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_predictions_for_date(&pool, date).await;
             assert!(result.is_err());
@@ -672,8 +648,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
-                .expect("lazy pool creation should not fail");
+            let pool = test_pool();
             let result = query_model_runs(&pool).await;
             assert!(result.is_err());
         });

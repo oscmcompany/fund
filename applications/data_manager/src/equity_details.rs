@@ -1,6 +1,6 @@
 use crate::errors::Error;
 use crate::state::State;
-use internal::market::{EquityDetails, Ticker};
+use internal::market::{EquityDetail, Ticker};
 use tracing::{info, warn};
 
 const EQUITY_DETAILS_KEY: &str = "data/equity/details/details.csv";
@@ -35,7 +35,7 @@ async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Error>
     Ok(csv_content)
 }
 
-fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Error> {
+fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Error> {
     let mut lines = csv_content.lines();
 
     let header_line = match lines.next() {
@@ -93,11 +93,7 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Err
             industry_raw
         };
 
-        details.push(EquityDetails {
-            ticker,
-            sector,
-            industry,
-        });
+        details.push(EquityDetail::new(ticker, sector, industry));
     }
 
     if rejected_rows > 0 {
@@ -110,7 +106,7 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetails>, Err
     Ok(details)
 }
 
-pub async fn read_equity_details_from_s3(state: &State) -> Result<Vec<EquityDetails>, Error> {
+pub async fn read_equity_details_from_s3(state: &State) -> Result<Vec<EquityDetail>, Error> {
     let csv_content = read_equity_details_csv_from_s3(state).await?;
     let details = parse_equity_details_csv(&csv_content)?;
     info!("Successfully parsed {} equity details rows", details.len());
@@ -126,10 +122,10 @@ mod tests {
         let csv = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\nGOOGL,Technology,Internet Services\n";
         let details = parse_equity_details_csv(csv).unwrap();
         assert_eq!(details.len(), 2);
-        assert_eq!(details[0].ticker, "AAPL");
-        assert_eq!(details[0].sector, "TECHNOLOGY");
-        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
-        assert_eq!(details[1].ticker, "GOOGL");
+        assert_eq!(details[0].ticker(), "AAPL");
+        assert_eq!(details[0].sector(), "TECHNOLOGY");
+        assert_eq!(details[0].industry(), "CONSUMER ELECTRONICS");
+        assert_eq!(details[1].ticker(), "GOOGL");
     }
 
     #[test]
@@ -138,9 +134,9 @@ mod tests {
             "ticker,sector,industry\nECC           ,  Technology  ,  Consumer Electronics  \n";
         let details = parse_equity_details_csv(csv).unwrap();
         assert_eq!(details.len(), 1);
-        assert_eq!(details[0].ticker, "ECC");
-        assert_eq!(details[0].sector, "TECHNOLOGY");
-        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
+        assert_eq!(details[0].ticker(), "ECC");
+        assert_eq!(details[0].sector(), "TECHNOLOGY");
+        assert_eq!(details[0].industry(), "CONSUMER ELECTRONICS");
     }
 
     #[test]
@@ -148,9 +144,9 @@ mod tests {
         let csv = "ticker,sector,industry\naapl,technology,consumer electronics\n";
         let details = parse_equity_details_csv(csv).unwrap();
         assert_eq!(details.len(), 1);
-        assert_eq!(details[0].ticker, "AAPL");
-        assert_eq!(details[0].sector, "TECHNOLOGY");
-        assert_eq!(details[0].industry, "CONSUMER ELECTRONICS");
+        assert_eq!(details[0].ticker(), "AAPL");
+        assert_eq!(details[0].sector(), "TECHNOLOGY");
+        assert_eq!(details[0].industry(), "CONSUMER ELECTRONICS");
     }
 
     #[test]
@@ -158,8 +154,8 @@ mod tests {
         let csv = "ticker,sector,industry\nAAPL,,\n";
         let details = parse_equity_details_csv(csv).unwrap();
         assert_eq!(details.len(), 1);
-        assert_eq!(details[0].sector, "NOT AVAILABLE");
-        assert_eq!(details[0].industry, "NOT AVAILABLE");
+        assert_eq!(details[0].sector(), "NOT AVAILABLE");
+        assert_eq!(details[0].industry(), "NOT AVAILABLE");
     }
 
     #[test]
@@ -168,7 +164,7 @@ mod tests {
             "ticker,sector,industry,extra_column\nAAPL,Technology,Consumer Electronics,Extra\n";
         let details = parse_equity_details_csv(csv).unwrap();
         assert_eq!(details.len(), 1);
-        assert_eq!(details[0].ticker, "AAPL");
+        assert_eq!(details[0].ticker(), "AAPL");
     }
 
     #[test]

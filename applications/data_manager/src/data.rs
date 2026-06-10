@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveDate, Weekday};
 use polars::prelude::*;
 use tracing::{debug, info};
 
-pub use internal::market::{EquityBar, EquityDetails, EquityQuote, Ticker};
+pub use internal::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 
 /// A validated US market trading date (Monday through Friday).
 ///
@@ -38,16 +38,16 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<Dat
 
     // Ticker values are already normalized (trimmed and uppercased) by Ticker::new.
     let equity_bars_dataframe = df!(
-        "ticker" => equity_bars_rows.iter().map(|b| b.ticker.as_str()).collect::<Vec<_>>(),
-        "timestamp" => equity_bars_rows.iter().map(|b| b.timestamp.timestamp_millis()).collect::<Vec<_>>(),
-        "open_price" => equity_bars_rows.iter().map(|b| b.open_price).collect::<Vec<f64>>(),
-        "high_price" => equity_bars_rows.iter().map(|b| b.high_price).collect::<Vec<f64>>(),
-        "low_price" => equity_bars_rows.iter().map(|b| b.low_price).collect::<Vec<f64>>(),
-        "close_price" => equity_bars_rows.iter().map(|b| b.close_price).collect::<Vec<f64>>(),
-        "volume" => equity_bars_rows.iter().map(|b| b.volume).collect::<Vec<i64>>(),
-        "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price).collect::<Vec<_>>(),
-        "transactions" => equity_bars_rows.iter().map(|b| b.transactions).collect::<Vec<_>>(),
-        "inserted_at" => equity_bars_rows.iter().map(|b| b.inserted_at.timestamp_millis()).collect::<Vec<_>>(),
+        "ticker" => equity_bars_rows.iter().map(|b| b.ticker().as_str()).collect::<Vec<_>>(),
+        "timestamp" => equity_bars_rows.iter().map(|b| b.timestamp().timestamp_millis()).collect::<Vec<_>>(),
+        "open_price" => equity_bars_rows.iter().map(|b| b.open_price()).collect::<Vec<f64>>(),
+        "high_price" => equity_bars_rows.iter().map(|b| b.high_price()).collect::<Vec<f64>>(),
+        "low_price" => equity_bars_rows.iter().map(|b| b.low_price()).collect::<Vec<f64>>(),
+        "close_price" => equity_bars_rows.iter().map(|b| b.close_price()).collect::<Vec<f64>>(),
+        "volume" => equity_bars_rows.iter().map(|b| b.volume()).collect::<Vec<i64>>(),
+        "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price()).collect::<Vec<_>>(),
+        "transactions" => equity_bars_rows.iter().map(|b| b.transactions()).collect::<Vec<_>>(),
+        "inserted_at" => equity_bars_rows.iter().map(|b| b.inserted_at().timestamp_millis()).collect::<Vec<_>>(),
     )
     .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 

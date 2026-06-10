@@ -6,16 +6,158 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::market::Ticker;
+
+/// Status of an equity rebalance session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceSessionStatus {
+    Completed,
+    Failed,
+}
+
+impl RebalanceSessionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Open/closed status of an equity pair position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum EquityPairStatus {
+    Open,
+    Closed,
+}
+
+impl EquityPairStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Long or short side of an allocation or order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AllocationSide {
+    Long,
+    Short,
+}
+
+impl AllocationSide {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Long => "LONG",
+            Self::Short => "SHORT",
+        }
+    }
+}
+
+/// Intended action for an allocation leg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AllocationAction {
+    OpenPosition,
+    ClosePosition,
+    Unspecified,
+}
+
+impl AllocationAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenPosition => "OPEN_POSITION",
+            Self::ClosePosition => "CLOSE_POSITION",
+            Self::Unspecified => "UNSPECIFIED",
+        }
+    }
+}
+
+/// Intraday or end-of-day portfolio snapshot type.
+///
+/// The `EndOfDay` variant maps to the database value `"end_of_day"` which
+/// matches the `snapshot_type` CHECK constraint in `equity_portfolio_snapshots`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotType {
+    Intraday,
+    EndOfDay,
+}
+
+impl SnapshotType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Intraday => "intraday",
+            Self::EndOfDay => "end_of_day",
+        }
+    }
+}
+
 /// Groups one full rebalance cycle from allocation through order submission.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityRebalanceSession {
-    pub id: Uuid,
-    pub triggered_at: DateTime<Utc>,
-    pub trigger_reason: String,
+    id: Uuid,
+    triggered_at: DateTime<Utc>,
+    trigger_reason: String,
     /// References `model_runs.run_id`; nullable when the model run is unavailable.
-    pub model_run_id: Option<String>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub status: String,
+    model_run_id: Option<String>,
+    completed_at: Option<DateTime<Utc>>,
+    status: RebalanceSessionStatus,
+}
+
+impl EquityRebalanceSession {
+    /// Constructs an `EquityRebalanceSession` from validated field values.
+    pub fn new(
+        id: Uuid,
+        triggered_at: DateTime<Utc>,
+        trigger_reason: String,
+        model_run_id: Option<String>,
+        completed_at: Option<DateTime<Utc>>,
+        status: RebalanceSessionStatus,
+    ) -> Self {
+        Self {
+            id,
+            triggered_at,
+            trigger_reason,
+            model_run_id,
+            completed_at,
+            status,
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn triggered_at(&self) -> DateTime<Utc> {
+        self.triggered_at
+    }
+
+    pub fn trigger_reason(&self) -> &str {
+        &self.trigger_reason
+    }
+
+    pub fn model_run_id(&self) -> Option<&str> {
+        self.model_run_id.as_deref()
+    }
+
+    pub fn completed_at(&self) -> Option<DateTime<Utc>> {
+        self.completed_at
+    }
+
+    pub fn status(&self) -> &RebalanceSessionStatus {
+        &self.status
+    }
 }
 
 /// One cointegrated long-short pair within a rebalance session.
@@ -24,75 +166,504 @@ pub struct EquityRebalanceSession {
 /// at the time the pair is opened.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityPair {
-    pub id: Uuid,
-    pub rebalance_id: Uuid,
-    pub pair_id: String,
-    pub long_ticker: String,
-    pub short_ticker: String,
-    pub z_score: Decimal,
-    pub hedge_ratio: Decimal,
-    pub signal_strength: Decimal,
-    /// Either `"open"` or `"closed"`.
-    pub status: String,
-    pub opened_at: DateTime<Utc>,
-    pub closed_at: Option<DateTime<Utc>>,
-    pub realized_profit_and_loss: Option<Decimal>,
-    pub return_percent: Option<Decimal>,
-    pub holding_days: Option<i32>,
+    id: Uuid,
+    rebalance_id: Uuid,
+    pair_id: String,
+    long_ticker: Ticker,
+    short_ticker: Ticker,
+    z_score: Decimal,
+    hedge_ratio: Decimal,
+    signal_strength: Decimal,
+    status: EquityPairStatus,
+    opened_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+    realized_profit_and_loss: Option<Decimal>,
+    return_percent: Option<Decimal>,
+    holding_days: Option<i32>,
+}
+
+impl EquityPair {
+    /// Constructs an `EquityPair` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Uuid,
+        rebalance_id: Uuid,
+        pair_id: String,
+        long_ticker: Ticker,
+        short_ticker: Ticker,
+        z_score: Decimal,
+        hedge_ratio: Decimal,
+        signal_strength: Decimal,
+        status: EquityPairStatus,
+        opened_at: DateTime<Utc>,
+        closed_at: Option<DateTime<Utc>>,
+        realized_profit_and_loss: Option<Decimal>,
+        return_percent: Option<Decimal>,
+        holding_days: Option<i32>,
+    ) -> Self {
+        Self {
+            id,
+            rebalance_id,
+            pair_id,
+            long_ticker,
+            short_ticker,
+            z_score,
+            hedge_ratio,
+            signal_strength,
+            status,
+            opened_at,
+            closed_at,
+            realized_profit_and_loss,
+            return_percent,
+            holding_days,
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn rebalance_id(&self) -> Uuid {
+        self.rebalance_id
+    }
+
+    pub fn pair_id(&self) -> &str {
+        &self.pair_id
+    }
+
+    pub fn long_ticker(&self) -> &Ticker {
+        &self.long_ticker
+    }
+
+    pub fn short_ticker(&self) -> &Ticker {
+        &self.short_ticker
+    }
+
+    pub fn z_score(&self) -> &Decimal {
+        &self.z_score
+    }
+
+    pub fn hedge_ratio(&self) -> &Decimal {
+        &self.hedge_ratio
+    }
+
+    pub fn signal_strength(&self) -> &Decimal {
+        &self.signal_strength
+    }
+
+    pub fn status(&self) -> &EquityPairStatus {
+        &self.status
+    }
+
+    pub fn opened_at(&self) -> DateTime<Utc> {
+        self.opened_at
+    }
+
+    pub fn closed_at(&self) -> Option<DateTime<Utc>> {
+        self.closed_at
+    }
+
+    pub fn realized_profit_and_loss(&self) -> Option<&Decimal> {
+        self.realized_profit_and_loss.as_ref()
+    }
+
+    pub fn return_percent(&self) -> Option<&Decimal> {
+        self.return_percent.as_ref()
+    }
+
+    pub fn holding_days(&self) -> Option<i32> {
+        self.holding_days
+    }
 }
 
 /// One ticker leg of an allocation within a rebalance session.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityAllocation {
-    pub id: Uuid,
-    pub rebalance_id: Uuid,
-    pub equity_pair_id: Uuid,
-    pub generated_at: DateTime<Utc>,
+    id: Uuid,
+    rebalance_id: Uuid,
+    equity_pair_id: Uuid,
+    generated_at: DateTime<Utc>,
     /// References `model_runs.run_id`; nullable when unavailable.
-    pub model_run_id: Option<String>,
-    pub ticker: String,
-    /// Either `"LONG"` or `"SHORT"`.
-    pub side: String,
-    /// Either `"OPEN_POSITION"`, `"CLOSE_POSITION"`, or `"UNSPECIFIED"`.
-    pub action: String,
-    pub dollar_amount: Decimal,
-    pub entry_price: Option<Decimal>,
+    model_run_id: Option<String>,
+    ticker: Ticker,
+    side: AllocationSide,
+    action: AllocationAction,
+    dollar_amount: Decimal,
+    entry_price: Option<Decimal>,
     /// Non-null for `SHORT` legs (whole-share count for Alpaca SELL).
-    pub quantity: Option<Decimal>,
+    quantity: Option<Decimal>,
     /// Non-null for `LONG` legs (dollar amount for Alpaca BUY).
-    pub notional: Option<Decimal>,
+    notional: Option<Decimal>,
+}
+
+impl EquityAllocation {
+    /// Constructs an `EquityAllocation` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Uuid,
+        rebalance_id: Uuid,
+        equity_pair_id: Uuid,
+        generated_at: DateTime<Utc>,
+        model_run_id: Option<String>,
+        ticker: Ticker,
+        side: AllocationSide,
+        action: AllocationAction,
+        dollar_amount: Decimal,
+        entry_price: Option<Decimal>,
+        quantity: Option<Decimal>,
+        notional: Option<Decimal>,
+    ) -> Self {
+        Self {
+            id,
+            rebalance_id,
+            equity_pair_id,
+            generated_at,
+            model_run_id,
+            ticker,
+            side,
+            action,
+            dollar_amount,
+            entry_price,
+            quantity,
+            notional,
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn rebalance_id(&self) -> Uuid {
+        self.rebalance_id
+    }
+
+    pub fn equity_pair_id(&self) -> Uuid {
+        self.equity_pair_id
+    }
+
+    pub fn generated_at(&self) -> DateTime<Utc> {
+        self.generated_at
+    }
+
+    pub fn model_run_id(&self) -> Option<&str> {
+        self.model_run_id.as_deref()
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn side(&self) -> &AllocationSide {
+        &self.side
+    }
+
+    pub fn action(&self) -> &AllocationAction {
+        &self.action
+    }
+
+    pub fn dollar_amount(&self) -> &Decimal {
+        &self.dollar_amount
+    }
+
+    pub fn entry_price(&self) -> Option<&Decimal> {
+        self.entry_price.as_ref()
+    }
+
+    pub fn quantity(&self) -> Option<&Decimal> {
+        self.quantity.as_ref()
+    }
+
+    pub fn notional(&self) -> Option<&Decimal> {
+        self.notional.as_ref()
+    }
 }
 
 /// An order submitted to Alpaca, linked to an allocation.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityOrder {
-    pub id: Uuid,
-    pub allocation_id: Uuid,
-    pub submitted_at: DateTime<Utc>,
-    pub ticker: String,
-    pub side: String,
-    pub quantity: Decimal,
-    pub order_type: String,
-    pub limit_price: Option<Decimal>,
-    pub alpaca_order_id: String,
+    id: Uuid,
+    allocation_id: Uuid,
+    submitted_at: DateTime<Utc>,
+    ticker: Ticker,
+    side: AllocationSide,
+    quantity: Decimal,
+    order_type: String,
+    limit_price: Option<Decimal>,
+    alpaca_order_id: String,
+}
+
+impl EquityOrder {
+    /// Constructs an `EquityOrder` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Uuid,
+        allocation_id: Uuid,
+        submitted_at: DateTime<Utc>,
+        ticker: Ticker,
+        side: AllocationSide,
+        quantity: Decimal,
+        order_type: String,
+        limit_price: Option<Decimal>,
+        alpaca_order_id: String,
+    ) -> Self {
+        Self {
+            id,
+            allocation_id,
+            submitted_at,
+            ticker,
+            side,
+            quantity,
+            order_type,
+            limit_price,
+            alpaca_order_id,
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn allocation_id(&self) -> Uuid {
+        self.allocation_id
+    }
+
+    pub fn submitted_at(&self) -> DateTime<Utc> {
+        self.submitted_at
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn side(&self) -> &AllocationSide {
+        &self.side
+    }
+
+    pub fn quantity(&self) -> &Decimal {
+        &self.quantity
+    }
+
+    pub fn order_type(&self) -> &str {
+        &self.order_type
+    }
+
+    pub fn limit_price(&self) -> Option<&Decimal> {
+        self.limit_price.as_ref()
+    }
+
+    pub fn alpaca_order_id(&self) -> &str {
+        &self.alpaca_order_id
+    }
 }
 
 /// Per-rebalance portfolio state snapshot.
 ///
-/// `"intraday"` rows are recorded after each live rebalance; `gross_return` and
-/// `net_return` are `None`. `"eod"` rows are recorded once per trading day at
-/// market close; all columns are populated.
+/// `Intraday` rows are recorded after each live rebalance; `gross_return` and
+/// `net_return` are `None`. `EndOfDay` rows are recorded once per trading day
+/// at market close; all columns are populated.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EquityPortfolioSnapshot {
-    pub id: i64,
-    pub snapshot_timestamp: DateTime<Utc>,
-    /// Either `"intraday"` or `"eod"`.
-    pub snapshot_type: String,
-    pub net_asset_value: Decimal,
-    pub gross_return: Option<Decimal>,
-    pub net_return: Option<Decimal>,
-    pub total_slippage_cost: Decimal,
-    pub created_at: DateTime<Utc>,
+    id: i64,
+    snapshot_timestamp: DateTime<Utc>,
+    snapshot_type: SnapshotType,
+    net_asset_value: Decimal,
+    gross_return: Option<Decimal>,
+    net_return: Option<Decimal>,
+    total_slippage_cost: Decimal,
+    created_at: DateTime<Utc>,
+}
+
+impl EquityPortfolioSnapshot {
+    /// Constructs an `EquityPortfolioSnapshot` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: i64,
+        snapshot_timestamp: DateTime<Utc>,
+        snapshot_type: SnapshotType,
+        net_asset_value: Decimal,
+        gross_return: Option<Decimal>,
+        net_return: Option<Decimal>,
+        total_slippage_cost: Decimal,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            snapshot_timestamp,
+            snapshot_type,
+            net_asset_value,
+            gross_return,
+            net_return,
+            total_slippage_cost,
+            created_at,
+        }
+    }
+
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn snapshot_timestamp(&self) -> DateTime<Utc> {
+        self.snapshot_timestamp
+    }
+
+    pub fn snapshot_type(&self) -> &SnapshotType {
+        &self.snapshot_type
+    }
+
+    pub fn net_asset_value(&self) -> &Decimal {
+        &self.net_asset_value
+    }
+
+    pub fn gross_return(&self) -> Option<&Decimal> {
+        self.gross_return.as_ref()
+    }
+
+    pub fn net_return(&self) -> Option<&Decimal> {
+        self.net_return.as_ref()
+    }
+
+    pub fn total_slippage_cost(&self) -> &Decimal {
+        &self.total_slippage_cost
+    }
+
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+}
+
+/// A non-empty collection of [`EquityRebalanceSession`] records.
+#[derive(Debug, Clone)]
+pub struct RebalanceSessions(Vec<EquityRebalanceSession>);
+
+impl RebalanceSessions {
+    /// Returns `None` if `sessions` is empty.
+    pub fn new(sessions: Vec<EquityRebalanceSession>) -> Option<Self> {
+        if sessions.is_empty() {
+            None
+        } else {
+            Some(Self(sessions))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityRebalanceSession] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityPair`] records.
+#[derive(Debug, Clone)]
+pub struct EquityPairs(Vec<EquityPair>);
+
+impl EquityPairs {
+    /// Returns `None` if `pairs` is empty.
+    pub fn new(pairs: Vec<EquityPair>) -> Option<Self> {
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(Self(pairs))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityPair] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityAllocation`] records.
+#[derive(Debug, Clone)]
+pub struct EquityAllocations(Vec<EquityAllocation>);
+
+impl EquityAllocations {
+    /// Returns `None` if `allocations` is empty.
+    pub fn new(allocations: Vec<EquityAllocation>) -> Option<Self> {
+        if allocations.is_empty() {
+            None
+        } else {
+            Some(Self(allocations))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityAllocation] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityOrder`] records.
+#[derive(Debug, Clone)]
+pub struct EquityOrders(Vec<EquityOrder>);
+
+impl EquityOrders {
+    /// Returns `None` if `orders` is empty.
+    pub fn new(orders: Vec<EquityOrder>) -> Option<Self> {
+        if orders.is_empty() {
+            None
+        } else {
+            Some(Self(orders))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityOrder] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A non-empty collection of [`EquityPortfolioSnapshot`] records.
+#[derive(Debug, Clone)]
+pub struct PortfolioSnapshots(Vec<EquityPortfolioSnapshot>);
+
+impl PortfolioSnapshots {
+    /// Returns `None` if `snapshots` is empty.
+    pub fn new(snapshots: Vec<EquityPortfolioSnapshot>) -> Option<Self> {
+        if snapshots.is_empty() {
+            None
+        } else {
+            Some(Self(snapshots))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[EquityPortfolioSnapshot] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -104,125 +675,125 @@ mod tests {
 
     #[test]
     fn test_equity_rebalance_session_construction() {
-        let session = EquityRebalanceSession {
-            id: Uuid::new_v4(),
-            triggered_at: Utc::now(),
-            trigger_reason: "intraday_check".to_string(),
-            model_run_id: Some("run-abc123".to_string()),
-            completed_at: None,
-            status: "completed".to_string(),
-        };
-        assert_eq!(session.trigger_reason, "intraday_check");
-        assert_eq!(session.status, "completed");
-        assert!(session.completed_at.is_none());
+        let session = EquityRebalanceSession::new(
+            Uuid::new_v4(),
+            Utc::now(),
+            "intraday_check".to_string(),
+            Some("run-abc123".to_string()),
+            None,
+            RebalanceSessionStatus::Completed,
+        );
+        assert_eq!(session.trigger_reason(), "intraday_check");
+        assert_eq!(session.status(), &RebalanceSessionStatus::Completed);
+        assert!(session.completed_at().is_none());
     }
 
     #[test]
     fn test_equity_rebalance_session_clone() {
-        let session = EquityRebalanceSession {
-            id: Uuid::new_v4(),
-            triggered_at: Utc::now(),
-            trigger_reason: "eod_snapshot_requested".to_string(),
-            model_run_id: None,
-            completed_at: Some(Utc::now()),
-            status: "completed".to_string(),
-        };
+        let session = EquityRebalanceSession::new(
+            Uuid::new_v4(),
+            Utc::now(),
+            "eod_snapshot_requested".to_string(),
+            None,
+            Some(Utc::now()),
+            RebalanceSessionStatus::Completed,
+        );
         let cloned = session.clone();
-        assert_eq!(cloned.trigger_reason, "eod_snapshot_requested");
+        assert_eq!(cloned.trigger_reason(), "eod_snapshot_requested");
     }
 
     #[test]
     fn test_equity_pair_construction() {
-        let pair = EquityPair {
-            id: Uuid::new_v4(),
-            rebalance_id: Uuid::new_v4(),
-            pair_id: "AAPL-MSFT".to_string(),
-            long_ticker: "AAPL".to_string(),
-            short_ticker: "MSFT".to_string(),
-            z_score: Decimal::from(2),
-            hedge_ratio: Decimal::from(1),
-            signal_strength: Decimal::new(75, 2),
-            status: "open".to_string(),
-            opened_at: Utc::now(),
-            closed_at: None,
-            realized_profit_and_loss: None,
-            return_percent: None,
-            holding_days: None,
-        };
-        assert_eq!(pair.long_ticker, "AAPL");
-        assert_eq!(pair.short_ticker, "MSFT");
-        assert_eq!(pair.status, "open");
+        let pair = EquityPair::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "AAPL-MSFT".to_string(),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
+            Decimal::from(2),
+            Decimal::from(1),
+            Decimal::new(75, 2),
+            EquityPairStatus::Open,
+            Utc::now(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(pair.long_ticker().as_str(), "AAPL");
+        assert_eq!(pair.short_ticker().as_str(), "MSFT");
+        assert_eq!(pair.status(), &EquityPairStatus::Open);
     }
 
     #[test]
     fn test_equity_allocation_construction() {
-        let allocation = EquityAllocation {
-            id: Uuid::new_v4(),
-            rebalance_id: Uuid::new_v4(),
-            equity_pair_id: Uuid::new_v4(),
-            generated_at: Utc::now(),
-            model_run_id: None,
-            ticker: "AAPL".to_string(),
-            side: "LONG".to_string(),
-            action: "OPEN_POSITION".to_string(),
-            dollar_amount: Decimal::from(10_000),
-            entry_price: Some(Decimal::from(150)),
-            quantity: None,
-            notional: Some(Decimal::from(10_000)),
-        };
-        assert_eq!(allocation.ticker, "AAPL");
-        assert_eq!(allocation.side, "LONG");
-        assert_eq!(allocation.dollar_amount, Decimal::from(10_000));
+        let allocation = EquityAllocation::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            None,
+            Ticker::new("AAPL").unwrap(),
+            AllocationSide::Long,
+            AllocationAction::OpenPosition,
+            Decimal::from(10_000),
+            Some(Decimal::from(150)),
+            None,
+            Some(Decimal::from(10_000)),
+        );
+        assert_eq!(allocation.ticker().as_str(), "AAPL");
+        assert_eq!(allocation.side(), &AllocationSide::Long);
+        assert_eq!(allocation.dollar_amount(), &Decimal::from(10_000));
     }
 
     #[test]
     fn test_equity_order_construction() {
-        let order = EquityOrder {
-            id: Uuid::new_v4(),
-            allocation_id: Uuid::new_v4(),
-            submitted_at: Utc::now(),
-            ticker: "MSFT".to_string(),
-            side: "SHORT".to_string(),
-            quantity: Decimal::from(25),
-            order_type: "market".to_string(),
-            limit_price: None,
-            alpaca_order_id: "alpaca-order-xyz".to_string(),
-        };
-        assert_eq!(order.ticker, "MSFT");
-        assert_eq!(order.side, "SHORT");
-        assert_eq!(order.quantity, Decimal::from(25));
+        let order = EquityOrder::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Utc::now(),
+            Ticker::new("MSFT").unwrap(),
+            AllocationSide::Short,
+            Decimal::from(25),
+            "market".to_string(),
+            None,
+            "alpaca-order-xyz".to_string(),
+        );
+        assert_eq!(order.ticker().as_str(), "MSFT");
+        assert_eq!(order.side(), &AllocationSide::Short);
+        assert_eq!(order.quantity(), &Decimal::from(25));
     }
 
     #[test]
     fn test_equity_portfolio_snapshot_construction() {
-        let snapshot = EquityPortfolioSnapshot {
-            id: 1,
-            snapshot_timestamp: Utc::now(),
-            snapshot_type: "intraday".to_string(),
-            net_asset_value: Decimal::from(100_000),
-            gross_return: None,
-            net_return: None,
-            total_slippage_cost: Decimal::from(50),
-            created_at: Utc::now(),
-        };
-        assert_eq!(snapshot.snapshot_type, "intraday");
-        assert_eq!(snapshot.net_asset_value, Decimal::from(100_000));
-        assert!(snapshot.gross_return.is_none());
+        let snapshot = EquityPortfolioSnapshot::new(
+            1,
+            Utc::now(),
+            SnapshotType::Intraday,
+            Decimal::from(100_000),
+            None,
+            None,
+            Decimal::from(50),
+            Utc::now(),
+        );
+        assert_eq!(snapshot.snapshot_type(), &SnapshotType::Intraday);
+        assert_eq!(snapshot.net_asset_value(), &Decimal::from(100_000));
+        assert!(snapshot.gross_return().is_none());
     }
 
     #[test]
-    fn test_equity_portfolio_snapshot_eod() {
-        let snapshot = EquityPortfolioSnapshot {
-            id: 2,
-            snapshot_timestamp: Utc::now(),
-            snapshot_type: "eod".to_string(),
-            net_asset_value: Decimal::from(102_000),
-            gross_return: Some(Decimal::new(2, 2)),
-            net_return: Some(Decimal::new(18, 3)),
-            total_slippage_cost: Decimal::from(75),
-            created_at: Utc::now(),
-        };
-        assert_eq!(snapshot.snapshot_type, "eod");
-        assert!(snapshot.gross_return.is_some());
+    fn test_equity_portfolio_snapshot_end_of_day() {
+        let snapshot = EquityPortfolioSnapshot::new(
+            2,
+            Utc::now(),
+            SnapshotType::EndOfDay,
+            Decimal::from(102_000),
+            Some(Decimal::new(2, 2)),
+            Some(Decimal::new(18, 3)),
+            Decimal::from(75),
+            Utc::now(),
+        );
+        assert_eq!(snapshot.snapshot_type(), &SnapshotType::EndOfDay);
+        assert!(snapshot.gross_return().is_some());
     }
 }
