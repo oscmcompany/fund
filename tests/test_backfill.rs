@@ -99,7 +99,7 @@ async fn test_backfill_writes_s3_and_skips_weekends() {
     let object = s3
         .get_object()
         .bucket(test_bucket_name())
-        .key("data/equity/bars/daily/year=2025/month=01/day=03/data.parquet")
+        .key("data/equity/bars/year=2025/month=01/day=03/data.parquet")
         .send()
         .await
         .expect("Friday partition should exist");

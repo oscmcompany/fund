@@ -660,7 +660,7 @@ in {
 
   # --- Profiles ---
 
-  profiles.applications.module = {
+  profiles.apps.module = {
     env = {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
@@ -786,10 +786,10 @@ in {
       echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
-      echo "    devenv --profile applications up      Start application services"
+      echo "    devenv --profile apps up      Start application services"
       echo "    devenv --profile ml shell     ML training environment"
       echo ""
-      echo "  Services (applications profile):"
+      echo "  Services (apps profile):"
       echo "    Data Manager:     localhost:8080"
       echo "    Portfolio Manager: localhost:8081"
       echo "    Ensemble Manager: localhost:8082"

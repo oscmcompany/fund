@@ -360,6 +360,14 @@ pub fn generate_predictions(
         .map_err(|e| PredictionError::Inference(format!("{e:?}")))?;
 
     let num_quantiles = model_state.parameters.quantiles.len();
+    // The output schema is fixed at quantile_10/quantile_50/quantile_90, so a
+    // model with any other quantile count cannot be served correctly; fail
+    // loudly instead of indexing out of bounds or mislabeling values.
+    if num_quantiles != 3 {
+        return Err(PredictionError::Postprocessing(format!(
+            "Expected exactly 3 quantiles (10/50/90); the loaded model has {num_quantiles}"
+        )));
+    }
     let mut results = Vec::new();
 
     let ticker_mapping = &model_state.mappings["ticker"];

@@ -139,12 +139,13 @@ impl Metrics {
         );
         output.push_str("# TYPE ensemble_prediction_duration_seconds histogram\n");
         let total_count = self.histogram_count.load(Ordering::Relaxed);
-        #[allow(unused_assignments)]
-        let mut cumulative = 0u64;
+        // The per-bucket counters are already cumulative: observe_duration
+        // increments every bucket whose bound covers the observation, so the
+        // values render directly without summing again.
         for (index, bucket) in HISTOGRAM_BUCKETS.iter().enumerate() {
-            cumulative += self.histogram_counts[index].load(Ordering::Relaxed);
+            let count = self.histogram_counts[index].load(Ordering::Relaxed);
             output.push_str(&format!(
-                "ensemble_prediction_duration_seconds_bucket{{le=\"{bucket}\"}} {cumulative}\n"
+                "ensemble_prediction_duration_seconds_bucket{{le=\"{bucket}\"}} {count}\n"
             ));
         }
         output.push_str(&format!(
@@ -288,6 +289,12 @@ mod tests {
         assert!(output.contains("ensemble_prediction_requests_total 1"));
         assert!(output.contains("ensemble_prediction_errors_total{stage=\"fetch\"} 1"));
         assert!(output.contains("ensemble_prediction_duration_seconds_bucket"));
+        // A single 2.5s observation: cumulative buckets must read 0 below it
+        // and exactly 1 from the first covering bound on (no double counting).
+        assert!(output.contains("ensemble_prediction_duration_seconds_bucket{le=\"1\"} 0"));
+        assert!(output.contains("ensemble_prediction_duration_seconds_bucket{le=\"5\"} 1"));
+        assert!(output.contains("ensemble_prediction_duration_seconds_bucket{le=\"120\"} 1"));
+        assert!(output.contains("ensemble_prediction_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(output.contains("ensemble_prediction_batch_count 1"));
         assert!(output.contains("ensemble_prediction_row_count 50"));
         assert!(output.contains("ensemble_model_load_timestamp 1700000000"));

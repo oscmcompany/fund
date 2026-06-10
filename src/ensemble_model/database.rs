@@ -2,7 +2,7 @@ use chrono::{DateTime, Duration, Utc};
 use polars::prelude::*;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> {
@@ -30,7 +30,7 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
     let mut lows: Vec<f64> = Vec::with_capacity(rows.len());
     let mut closes: Vec<f64> = Vec::with_capacity(rows.len());
     let mut volumes: Vec<i64> = Vec::with_capacity(rows.len());
-    let mut vwaps: Vec<Option<f64>> = Vec::with_capacity(rows.len());
+    let mut volume_weighted_average_prices: Vec<Option<f64>> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         tickers.push(row.get("ticker"));
@@ -40,7 +40,7 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
         lows.push(row.get("low_price"));
         closes.push(row.get("close_price"));
         volumes.push(row.get("volume"));
-        vwaps.push(row.get("volume_weighted_average_price"));
+        volume_weighted_average_prices.push(row.get("volume_weighted_average_price"));
     }
 
     let dataframe = DataFrame::new(vec![
@@ -51,7 +51,10 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
         Column::new("low_price".into(), lows),
         Column::new("close_price".into(), closes),
         Column::new("volume".into(), volumes),
-        Column::new("volume_weighted_average_price".into(), vwaps),
+        Column::new(
+            "volume_weighted_average_price".into(),
+            volume_weighted_average_prices,
+        ),
     ])
     .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 
@@ -111,8 +114,20 @@ pub async fn insert_predictions(
         query_builder.push_values(chunk, |mut builder, prediction| {
             let ticker = prediction["ticker"].as_str().unwrap_or("UNKNOWN");
             let timestamp_ms = prediction["timestamp"].as_i64().unwrap_or(0);
-            let timestamp =
-                DateTime::<Utc>::from_timestamp_millis(timestamp_ms).unwrap_or_else(Utc::now);
+            let timestamp = match DateTime::<Utc>::from_timestamp_millis(timestamp_ms) {
+                Some(parsed) if timestamp_ms > 0 => parsed,
+                _ => {
+                    // Predictions come from our own pipeline, so this indicates
+                    // a real data bug upstream; surface it instead of silently
+                    // persisting a row stamped with an arbitrary time.
+                    warn!(
+                        ticker = ticker,
+                        timestamp_ms = timestamp_ms,
+                        "Prediction has a missing or invalid timestamp; substituting now()"
+                    );
+                    Utc::now()
+                }
+            };
             let quantile_10 = prediction["quantile_10"].as_f64().unwrap_or(0.0);
             let quantile_50 = prediction["quantile_50"].as_f64().unwrap_or(0.0);
             let quantile_90 = prediction["quantile_90"].as_f64().unwrap_or(0.0);

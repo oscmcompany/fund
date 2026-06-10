@@ -317,7 +317,10 @@ async fn load_equity_bars(
             let frame = ParquetReader::new(Cursor::new(bytes)).finish()?;
             frames.push(frame.lazy());
         }
-        date = date.succ_opt().unwrap();
+        date = match date.succ_opt() {
+            Some(next_date) => next_date,
+            None => break,
+        };
     }
 
     if frames.is_empty() {

@@ -321,7 +321,10 @@ pub async fn backfill(
                 }
             },
         }
-        date = date.succ_opt().unwrap();
+        date = match date.succ_opt() {
+            Some(next_date) => next_date,
+            None => break,
+        };
     }
 
     info!(

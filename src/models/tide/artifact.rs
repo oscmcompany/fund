@@ -25,11 +25,15 @@ pub fn package_dir_to_tar_gz(directory: &Path) -> Result<Vec<u8>, ArtifactWriteE
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     {
         let mut builder = tar::Builder::new(&mut encoder);
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(directory)?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| path.is_file())
-            .collect();
+        // Propagate entry errors: silently skipping an unreadable entry would
+        // package an incomplete artifact that only fails much later, at load.
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
         files.sort();
         for path in files {
             let name = path

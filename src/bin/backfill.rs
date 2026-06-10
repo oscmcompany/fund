@@ -34,6 +34,10 @@ fn parse_date(value: &str) -> Result<NaiveDate, String> {
 }
 
 fn parse_arguments(arguments: &[String]) -> Result<(NaiveDate, NaiveDate), String> {
+    if arguments.len() > 2 {
+        return Err(USAGE.to_string());
+    }
+
     let start = match arguments.first() {
         Some(value) => parse_date(value)?,
         None => return Err(USAGE.to_string()),
@@ -43,6 +47,12 @@ fn parse_arguments(arguments: &[String]) -> Result<(NaiveDate, NaiveDate), Strin
         Some(value) => parse_date(value)?,
         None => Utc::now().with_timezone(&Eastern).date_naive(),
     };
+
+    if start > end {
+        let message =
+            format!("Invalid range: start date {start} must be on or before end date {end}");
+        return Err(message);
+    }
 
     Ok((start, end))
 }
@@ -107,7 +117,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{exit_code_for, parse_arguments, parse_date};
-    use chrono::{Datelike, NaiveDate};
+    use chrono::{NaiveDate, Utc};
+    use chrono_tz::US::Eastern;
     use fund::data_manager::equity_bars::BackfillSummary;
 
     #[test]
@@ -151,12 +162,31 @@ mod tests {
         let arguments = vec!["2020-01-01".to_string()];
         let (start, end) = parse_arguments(&arguments).unwrap();
         assert_eq!(start, NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
-        assert!(end.year() >= 2026);
+        // The default end date is "today" in US/Eastern, the exchange calendar
+        // the backfill operates on.
+        assert_eq!(end, Utc::now().with_timezone(&Eastern).date_naive());
     }
 
     #[test]
     fn test_parse_arguments_missing_start() {
         let arguments: Vec<String> = Vec::new();
         assert!(parse_arguments(&arguments).is_err());
+    }
+
+    #[test]
+    fn test_parse_arguments_rejects_extra_arguments() {
+        let arguments = vec![
+            "2026-05-20".to_string(),
+            "2026-05-23".to_string(),
+            "unexpected".to_string(),
+        ];
+        assert!(parse_arguments(&arguments).is_err());
+    }
+
+    #[test]
+    fn test_parse_arguments_rejects_inverted_range() {
+        let arguments = vec!["2026-05-23".to_string(), "2026-05-20".to_string()];
+        let error = parse_arguments(&arguments).unwrap_err();
+        assert!(error.contains("Invalid range"));
     }
 }

@@ -42,13 +42,20 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
                     None => global_filter(),
                 });
 
-            tracing_subscriber::registry()
+            // Only report file logging active when this call actually installed
+            // the subscriber; a later try_init loses the race and its file layer
+            // never attaches, so handing back the guard would mislead callers.
+            let initialized = tracing_subscriber::registry()
                 .with(global_filter())
                 .with(stdout_layer)
                 .with(file_layer)
                 .try_init()
-                .ok();
-            Some(guard)
+                .is_ok();
+            if initialized {
+                Some(guard)
+            } else {
+                None
+            }
         }
         Err(error) => {
             eprintln!("File logging disabled, cannot create {log_dir:?}: {error}");
@@ -89,6 +96,7 @@ mod tests {
         // local-dev path where /var/log/fund is not writable.
         let log_dir = env::temp_dir().join("fund-observability-test");
         let _ = std::fs::remove_dir_all(&log_dir);
+        let previous_log_dir = env::var("FUND_LOG_DIR").ok();
         env::set_var("FUND_LOG_DIR", &log_dir);
 
         let guard = init_tracing("test-observability.log", None);
@@ -99,7 +107,12 @@ mod tests {
         assert!(log_dir.is_dir());
         let _ = guard;
 
-        env::remove_var("FUND_LOG_DIR");
+        // Restore the runner's value rather than unconditionally unsetting it,
+        // so later tests see the environment they started with.
+        match previous_log_dir {
+            Some(value) => env::set_var("FUND_LOG_DIR", value),
+            None => env::remove_var("FUND_LOG_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 }

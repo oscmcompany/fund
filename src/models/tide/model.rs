@@ -68,18 +68,22 @@ impl TideModel<NdArray> {
         );
 
         let record_path = directory_path.join("tide_states");
-        match model.clone().load_file(
-            record_path,
-            &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
-            &device,
-        ) {
-            Ok(loaded) => Ok(loaded),
-            Err(_) => {
-                // If burn-native format fails, return the initialized model
-                // Weights will be random but the structure is correct
-                Ok(model)
-            }
-        }
+        // A missing or corrupt record must fail loudly: silently returning the
+        // randomly initialized model would let the service report a successful
+        // load and serve arbitrary predictions.
+        model
+            .load_file(
+                record_path,
+                &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
+                &device,
+            )
+            .map_err(|error| {
+                format!(
+                    "Failed to load model weights from {}: {error}",
+                    directory_path.display()
+                )
+                .into()
+            })
     }
 }
 
@@ -202,6 +206,17 @@ mod tests {
         let input = Tensor::<NdArray, 2>::zeros([2, 32], &device);
         let output = block.forward(input);
         assert_eq!(output.dims(), [2, 32]);
+    }
+
+    #[test]
+    fn test_load_fails_loudly_when_record_is_missing() {
+        // No tide_states record in the directory: load must error rather than
+        // fall back to random weights and report success.
+        let dir = tempfile::tempdir().unwrap();
+        let result = TideModel::<NdArray>::load(dir.path(), 24, 16, 2, 1, 5, 3, 0.0);
+        assert!(result.is_err());
+        let message = result.err().unwrap().to_string();
+        assert!(message.contains("Failed to load model weights"));
     }
 
     #[test]

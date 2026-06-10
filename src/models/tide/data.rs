@@ -423,6 +423,20 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
         .into_no_null_iter()
         .collect();
 
+    // The no-null iterators above silently skip nulls, which would misalign
+    // the per-row zip below; fail fast with a clear message instead.
+    if close_prices.len() != height || tickers.len() != height || timestamp_values.len() != height {
+        let message = format!(
+            "Equity bars contain null ticker, timestamp, or close_price values \
+             ({} rows; {} tickers, {} timestamps, {} close prices)",
+            height,
+            tickers.len(),
+            timestamp_values.len(),
+            close_prices.len()
+        );
+        return Err(message.into());
+    }
+
     for (i, &ts) in timestamp_values.iter().enumerate() {
         let datetime = chrono::DateTime::from_timestamp_millis(ts)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
@@ -512,17 +526,26 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
 
     let cleaned = data.filter(&mask).map_err(|e| e.to_string())?;
 
-    // Drop rows without a finite daily return — each ticker's first observation
-    // and any division artifacts — matching the Python CleanData stage.
-    let returns = cleaned
-        .column("daily_return")
-        .map_err(|e| e.to_string())?
-        .f32()
-        .map_err(|e| e.to_string())?;
-    let finite_mask: BooleanChunked = returns
-        .into_iter()
-        .map(|value| value.is_some_and(f32::is_finite))
-        .collect();
+    // Drop rows with a null or non-finite value in any continuous column —
+    // each ticker's first observation (null return), missing vendor fields
+    // such as volume_weighted_average_price, and any division artifacts —
+    // matching the Python CleanData stage. Downstream scaling and windowing
+    // iterate these columns assuming they are dense and finite.
+    let mut keep_row = vec![true; cleaned.height()];
+    for column in CONTINUOUS_COLUMNS {
+        let values = cleaned
+            .column(column)
+            .map_err(|e| e.to_string())?
+            .cast(&DataType::Float64)
+            .map_err(|e| e.to_string())?;
+        let values = values.f64().map_err(|e| e.to_string())?;
+        for (index, value) in values.into_iter().enumerate() {
+            if !value.is_some_and(f64::is_finite) {
+                keep_row[index] = false;
+            }
+        }
+    }
+    let finite_mask: BooleanChunked = keep_row.into_iter().collect();
     let cleaned = cleaned.filter(&finite_mask).map_err(|e| e.to_string())?;
     Ok(cleaned)
 }
@@ -814,6 +837,24 @@ mod tests {
             .into_no_null_iter()
             .collect();
         assert!(returns.iter().all(|r| (r - 0.1).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_clean_data_drops_rows_with_null_continuous_values() {
+        // A null volume_weighted_average_price (nullable in the database and in
+        // vendor data) must drop the row, like the Python CleanData stage; it
+        // must never silently shorten a column during scaling or windowing.
+        let mut engineered = engineer_features(raw_two_ticker_frame()).unwrap();
+        engineered
+            .with_column(Column::new(
+                "volume_weighted_average_price".into(),
+                vec![Some(1.0_f64), None, Some(1.0), Some(1.0)],
+            ))
+            .unwrap();
+
+        let cleaned = clean_data(engineered).unwrap();
+        // Two first-rows drop for null returns, one more for the null price.
+        assert_eq!(cleaned.height(), 1);
     }
 
     #[test]
