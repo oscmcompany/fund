@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
-use chrono::{Datelike, Duration, Utc};
+use chrono::{Duration, Utc};
 use polars::prelude::*;
 use tracing::{error, info, warn};
 
@@ -301,12 +301,7 @@ async fn load_equity_bars(
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut date = start_date;
     while date <= end_date {
-        let key = format!(
-            "data/equity/bars/year={}/month={:02}/day={:02}/data.parquet",
-            date.year(),
-            date.month(),
-            date.day()
-        );
+        let key = fund::common::aws::date_partitioned_key("data/equity/bars", date);
         if let Ok(response) = s3_client.get_object().bucket(bucket).key(&key).send().await {
             let bytes = response.body.collect().await?.into_bytes();
             let frame = ParquetReader::new(Cursor::new(bytes)).finish()?;

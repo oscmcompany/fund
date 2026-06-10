@@ -4,13 +4,14 @@
 //! column lists, serializes to Parquet with deterministic column ordering,
 //! and writes to S3. Failures are surfaced as structured log entries.
 
+use crate::common::aws::date_partitioned_key;
 use crate::data_manager::{database, state::State};
 use crate::domain::market::{EquityBar, EquityQuote};
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
 };
 use aws_sdk_s3::primitives::ByteStream;
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use polars::prelude::*;
 use tracing::info;
 
@@ -147,16 +148,6 @@ pub async fn export_equity_trading_history(
     );
 
     Ok(session_count + pair_count + allocation_count + order_count + snapshot_count)
-}
-
-fn date_partitioned_key(prefix: &str, date: NaiveDate) -> String {
-    format!(
-        "{}/year={}/month={:02}/day={:02}/data.parquet",
-        prefix,
-        date.year(),
-        date.month(),
-        date.day()
-    )
 }
 
 async fn write_dataframe_to_s3(

@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::ParquetWriter;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -90,12 +90,7 @@ fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Opt
 /// stray `daily/` segment here diverged from both and hid backfilled data from
 /// training.
 fn equity_bars_key(date: NaiveDate) -> String {
-    format!(
-        "data/equity/bars/year={}/month={:02}/day={:02}/data.parquet",
-        date.year(),
-        date.month(),
-        date.day()
-    )
+    crate::common::aws::date_partitioned_key("data/equity/bars", date)
 }
 
 async fn write_equity_bars_to_s3(

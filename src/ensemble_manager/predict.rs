@@ -315,7 +315,7 @@ pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usiz
     (now + Duration::days(step as i64))
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .unwrap()
+        .expect("midnight is always a valid time")
         .and_utc()
         .timestamp_millis()
 }
