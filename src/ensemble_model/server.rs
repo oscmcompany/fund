@@ -158,11 +158,15 @@ async fn run_pipeline_and_persist(
                 message: e.to_string(),
             })?;
 
-        let equity_filtered = predict::filter_equity_bars(consolidated, 10.0, 1_000_000.0)
-            .map_err(|e| PipelineError {
-                stage: "equity_bar_filtering",
-                message: e.to_string(),
-            })?;
+        let equity_filtered = predict::filter_equity_bars(
+            consolidated,
+            crate::domain::market::MINIMUM_CLOSE_PRICE,
+            crate::domain::market::MINIMUM_VOLUME,
+        )
+        .map_err(|e| PipelineError {
+            stage: "equity_bar_filtering",
+            message: e.to_string(),
+        })?;
 
         let filtered =
             predict::filter_to_trained_tickers(equity_filtered, model_state).map_err(|e| {

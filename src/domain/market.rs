@@ -4,6 +4,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::FromRow;
 
+/// Liquidity thresholds defining the modeled and served equity universe.
+///
+/// Training applies them per row (`fit::filter_training_bars`) and inference
+/// per ticker average (`predict::filter_equity_bars`); both sides must use the
+/// same values so the model trains on the population it serves. They were
+/// historically mismatched (training at 1.0 / 100k), which trained the scaler
+/// and model on penny-stock dynamics the service never predicts.
+pub const MINIMUM_CLOSE_PRICE: f64 = 10.0;
+pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
+
 /// A normalized US equity ticker symbol.
 ///
 /// Enforces the Alpaca US equity ticker format: 1–5 uppercase ASCII letters for
@@ -132,6 +142,15 @@ pub struct EquityDetails {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn test_universe_thresholds_match_served_population() {
+        // Training and inference both consume these; the values are the served
+        // universe (close > $10, volume > 1M on average), deliberately aligned
+        // after the historical training/inference mismatch.
+        assert_eq!(MINIMUM_CLOSE_PRICE, 10.0);
+        assert_eq!(MINIMUM_VOLUME, 1_000_000.0);
+    }
 
     #[test]
     fn test_ticker_new_valid_simple() {

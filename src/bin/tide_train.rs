@@ -12,23 +12,32 @@ use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
 use chrono::{Datelike, Duration, Utc};
 use polars::prelude::*;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use fund::common::observability::init_tracing;
+use fund::domain::market::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use fund::ensemble_model::artifact::{
+    candidate_folders_descending, fetch_run_metadata, list_run_folders,
+};
 use fund::ensemble_model::predict::consolidate_data;
 use fund::models::tide::artifact::{package_dir_to_tar_gz, upload_artifact};
 use fund::models::tide::config::ModelParameters;
 use fund::models::tide::data::input_feature_size;
+use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
 use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
 use fund::models::tide::model::TideModel;
 use fund::models::tide::train::{train, TrainBackend, TrainConfig};
 
-const MINIMUM_CLOSE_PRICE: f64 = 1.0;
-const MINIMUM_VOLUME: f64 = 100_000.0;
 const INPUT_LENGTH: usize = 35;
 const OUTPUT_LENGTH: usize = 5;
 const VALIDATION_SPLIT: f64 = 0.8;
+
+// Drift baseline: mean CRPS of the most recent prior runs (the Python trainer
+// compared against 7, required at least 3, and flagged >20% degradation).
+const DRIFT_PRIOR_RUN_COUNT: usize = 7;
+const DRIFT_MINIMUM_RUNS: usize = 3;
+const DRIFT_DEGRADATION_THRESHOLD: f64 = 0.20;
 
 #[tokio::main]
 async fn main() {
@@ -171,6 +180,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     info!(key = model_key, "Uploaded model artifact");
 
+    // Compare this run's CRPS against the recent-run baseline. Drift is
+    // reported, never used to block the artifact (matching the Python trainer).
+    let current_folder = format!("{artifact_prefix}{timestamp}/");
+    let prior_crps = fetch_prior_crps(
+        &s3_client,
+        &artifact_bucket,
+        &artifact_prefix,
+        &current_folder,
+        DRIFT_PRIOR_RUN_COUNT,
+    )
+    .await;
+    let drift = check_drift(
+        metrics.crps,
+        &prior_crps,
+        DRIFT_MINIMUM_RUNS,
+        DRIFT_DEGRADATION_THRESHOLD,
+    );
+    match drift.status {
+        DriftStatus::DriftDetected => warn!(
+            current_crps = drift.current_crps,
+            baseline_crps = drift.baseline_crps,
+            "Model drift detected"
+        ),
+        _ => info!(
+            current_crps = drift.current_crps,
+            baseline_crps = drift.baseline_crps,
+            prior_runs = prior_crps.len(),
+            message = drift.message,
+            "Drift check complete"
+        ),
+    }
+
     // Date range covered by the lookback window, for model_runs lineage.
     let end_date = Utc::now().date_naive();
     let start_date = end_date - Duration::days(lookback_days);
@@ -188,6 +229,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "metrics": metrics,
         "train_samples": train_dataset.len(),
         "validation_samples": valid_dataset.len(),
+        "drift": {
+            "status": drift.status,
+            "message": drift.message,
+            "baseline_crps": drift.baseline_crps,
+            "prior_runs": prior_crps.len(),
+        },
     });
     let metadata_key = format!("{artifact_prefix}{timestamp}/run_metadata.json");
     upload_artifact(
@@ -205,6 +252,45 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics.crps, metrics.directional_accuracy, metrics.quantile_coverage
     );
     Ok(())
+}
+
+/// CRPS values from the most recent prior runs' `run_metadata.json`, newest
+/// first. The current run's folder and runs without recorded metrics (e.g.
+/// retired tinygrad-era artifacts) are skipped. Failures degrade to an empty
+/// history so training never fails because the drift baseline is unavailable.
+async fn fetch_prior_crps(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    current_folder: &str,
+    run_count: usize,
+) -> Vec<f64> {
+    let folders = match list_run_folders(s3_client, bucket, prefix).await {
+        Ok(folders) => folders,
+        Err(listing_error) => {
+            warn!("Failed to list prior runs for drift check: {listing_error}");
+            return Vec::new();
+        }
+    };
+
+    let mut prior_crps = Vec::new();
+    for folder in candidate_folders_descending(folders) {
+        if prior_crps.len() >= run_count {
+            break;
+        }
+        if folder == current_folder {
+            continue;
+        }
+        let artifact_key = format!("{folder}output/model.tar.gz");
+        let Some(metadata) = fetch_run_metadata(s3_client, bucket, &artifact_key, None).await
+        else {
+            continue;
+        };
+        if let Some(crps) = metadata["metrics"]["crps"].as_f64() {
+            prior_crps.push(crps);
+        }
+    }
+    prior_crps
 }
 
 /// Read every available daily equity-bar parquet over the lookback window and

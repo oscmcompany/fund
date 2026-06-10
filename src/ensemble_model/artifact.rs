@@ -72,11 +72,39 @@ pub async fn fetch_run_metadata(
 /// timestamped folder names sort lexicographically by recency, and callers try
 /// each candidate in turn so an incomplete newest folder (trainer crashed
 /// before uploading `output/model.tar.gz`) falls back to the previous run.
-pub(crate) fn candidate_folders_descending(prefixes: Vec<String>) -> Vec<String> {
+pub fn candidate_folders_descending(prefixes: Vec<String>) -> Vec<String> {
     let mut folders = prefixes;
     folders.sort();
     folders.reverse();
     folders
+}
+
+/// List the training-run folders (S3 common prefixes) under `prefix`, e.g.
+/// `models/tide/2026-06-10-01-00-07-377/`. Paginates so more than 1000 runs
+/// are still all visible. Used by artifact resolution and by the trainer's
+/// drift check, which compares against recent runs' metadata.
+pub async fn list_run_folders(
+    s3_client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<String>, ArtifactError> {
+    let mut folders: Vec<String> = Vec::new();
+    let mut pages = s3_client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|e| ArtifactError::S3(e.to_string()))?;
+        folders.extend(
+            page.common_prefixes()
+                .iter()
+                .filter_map(|p| p.prefix().map(String::from)),
+        );
+    }
+    Ok(folders)
 }
 
 pub async fn resolve_artifact_key(
@@ -94,22 +122,7 @@ pub async fn resolve_artifact_key(
         return Ok(format!("{prefix}{version}/output/model.tar.gz"));
     }
 
-    let mut folders: Vec<String> = Vec::new();
-    let mut pages = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .delimiter("/")
-        .into_paginator()
-        .send();
-    while let Some(page) = pages.next().await {
-        let page = page.map_err(|e| ArtifactError::S3(e.to_string()))?;
-        folders.extend(
-            page.common_prefixes()
-                .iter()
-                .filter_map(|p| p.prefix().map(String::from)),
-        );
-    }
+    let folders = list_run_folders(s3_client, bucket, prefix).await?;
 
     // Try folders newest-first and verify the model object actually exists, so
     // an incomplete run (trainer crashed before uploading) falls back to the

@@ -150,7 +150,8 @@ async fn test_upsert_model_run_inserts_then_updates() {
         "end_date": "2026-06-09",
         "train_samples": 100,
         "validation_samples": 20,
-        "metrics": {"crps": 0.0059, "directional_accuracy": 0.617, "quantile_coverage": 0.719}
+        "metrics": {"crps": 0.0059, "directional_accuracy": 0.617, "quantile_coverage": 0.719},
+        "drift": {"status": "no_drift", "message": "No drift detected", "baseline_crps": 0.0056, "prior_runs": 7}
     });
     let record = ModelRunRecord::from_metadata(
         "run-events-test",
@@ -159,17 +160,19 @@ async fn test_upsert_model_run_inserts_then_updates() {
     );
     upsert_model_run(&pool, &record).await.unwrap();
 
-    let (crps, lookback, status): (Option<f64>, Option<i32>, String) = sqlx::query_as(
-        "SELECT continuous_ranked_probability_score, lookback_days, status \
-         FROM model_runs WHERE run_id = $1",
-    )
-    .bind("run-events-test")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (crps, lookback, status, drift_status): (Option<f64>, Option<i32>, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT continuous_ranked_probability_score, lookback_days, status, drift_status \
+             FROM model_runs WHERE run_id = $1",
+        )
+        .bind("run-events-test")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(status, "completed");
     assert_eq!(lookback, Some(1200));
     assert!((crps.unwrap() - 0.0059).abs() < 1e-9);
+    assert_eq!(drift_status.as_deref(), Some("no_drift"));
 
     // Upsert again with the same run_id updates in place (no duplicate row).
     let updated = ModelRunRecord::from_metadata(

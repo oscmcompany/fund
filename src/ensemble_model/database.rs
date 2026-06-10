@@ -221,6 +221,7 @@ pub struct ModelRunRecord {
     pub end_date: Option<String>,
     pub training_data_key: Option<String>,
     pub stage_counts: serde_json::Value,
+    pub drift_status: Option<String>,
 }
 
 impl ModelRunRecord {
@@ -257,6 +258,11 @@ impl ModelRunRecord {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             stage_counts,
+            drift_status: metadata
+                .get("drift")
+                .and_then(|drift| drift.get("status"))
+                .and_then(|v| v.as_str())
+                .map(String::from),
         }
     }
 }
@@ -268,8 +274,9 @@ pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<
         "INSERT INTO model_runs ( \
              run_id, artifact_key, status, completed_at, \
              continuous_ranked_probability_score, directional_accuracy, quantile_coverage, \
-             lookback_days, start_date, end_date, training_data_key, stage_counts \
-         ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7::date, $8::date, $9, $10::jsonb) \
+             lookback_days, start_date, end_date, training_data_key, stage_counts, \
+             drift_status \
+         ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7::date, $8::date, $9, $10::jsonb, $11) \
          ON CONFLICT (run_id) DO UPDATE SET \
              artifact_key = EXCLUDED.artifact_key, \
              status = EXCLUDED.status, \
@@ -281,7 +288,8 @@ pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<
              start_date = EXCLUDED.start_date, \
              end_date = EXCLUDED.end_date, \
              training_data_key = EXCLUDED.training_data_key, \
-             stage_counts = EXCLUDED.stage_counts",
+             stage_counts = EXCLUDED.stage_counts, \
+             drift_status = EXCLUDED.drift_status",
     )
     .bind(&record.run_id)
     .bind(&record.artifact_key)
@@ -293,6 +301,7 @@ pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<
     .bind(&record.end_date)
     .bind(&record.training_data_key)
     .bind(record.stage_counts.to_string())
+    .bind(&record.drift_status)
     .execute(pool)
     .await?;
     info!(run_id = record.run_id, "Upserted model_runs lineage row");
@@ -344,6 +353,26 @@ mod tests {
             let result = query_equity_details(&pool).await;
             assert!(result.is_err());
         });
+    }
+
+    #[test]
+    fn test_model_run_record_parses_drift_status() {
+        let metadata = serde_json::json!({
+            "metrics": {"crps": 0.31},
+            "drift": {
+                "status": "drift_detected",
+                "message": "Drift detected: ...",
+                "baseline_crps": 0.25,
+                "prior_runs": 7,
+            },
+        });
+        let record = ModelRunRecord::from_metadata("run-x", "models/tide/run-x", &metadata);
+        assert_eq!(record.drift_status.as_deref(), Some("drift_detected"));
+
+        // Metadata without a drift section (older runs) yields no status.
+        let without = serde_json::json!({"metrics": {"crps": 0.31}});
+        let record = ModelRunRecord::from_metadata("run-y", "models/tide/run-y", &without);
+        assert_eq!(record.drift_status, None);
     }
 
     #[test]

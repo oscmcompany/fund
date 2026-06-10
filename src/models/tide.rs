@@ -9,6 +9,8 @@ pub mod model;
 #[cfg(feature = "train")]
 pub mod artifact;
 #[cfg(feature = "train")]
+pub mod drift;
+#[cfg(feature = "train")]
 pub mod evaluate;
 #[cfg(feature = "train")]
 pub mod fit;
