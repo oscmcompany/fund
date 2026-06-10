@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, rebalance_id, equity_pair_id, generated_at, model_run_id, ticker, side,\n         action, dollar_amount, entry_price, quantity, notional\n         FROM equity_allocations\n         ORDER BY generated_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "rebalance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "equity_pair_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "generated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "model_run_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "side",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "action",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "dollar_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 9,
+        "name": "entry_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 10,
+        "name": "quantity",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 11,
+        "name": "notional",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "53c783cda295c6d0df20e5966288e13e96b7c7aa36d22c2d881f9e8bcdb67a35"
+}

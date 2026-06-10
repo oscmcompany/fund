@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, snapshot_timestamp, snapshot_type, net_asset_value, gross_return,\n         net_return, total_slippage_cost, created_at\n         FROM equity_portfolio_snapshots\n         ORDER BY snapshot_timestamp ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "snapshot_timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "snapshot_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "net_asset_value",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "gross_return",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "net_return",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "total_slippage_cost",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f6947334983166fcbe3ac3f51d89d51e42b7e9d35e0961400426dc4466ff06c9"
+}

@@ -1,7 +1,6 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use polars::prelude::*;
-use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -9,17 +8,17 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
     let end_date = Utc::now();
     let start_date = end_date - Duration::days(70);
 
-    let rows: Vec<PgRow> = sqlx::query(
+    let rows = sqlx::query!(
         r#"SELECT ticker,
-                  EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS timestamp_ms,
+                  EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS "timestamp_ms!",
                   open_price, high_price, low_price, close_price,
                   volume, volume_weighted_average_price
            FROM equity_bars
            WHERE timestamp >= $1 AND timestamp <= $2
            ORDER BY ticker, timestamp"#,
+        start_date,
+        end_date
     )
-    .bind(start_date)
-    .bind(end_date)
     .fetch_all(pool)
     .await?;
 
@@ -32,15 +31,15 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
     let mut volumes: Vec<i64> = Vec::with_capacity(rows.len());
     let mut volume_weighted_average_prices: Vec<Option<f64>> = Vec::with_capacity(rows.len());
 
-    for row in &rows {
-        tickers.push(row.get("ticker"));
-        timestamps.push(row.get("timestamp_ms"));
-        opens.push(row.get("open_price"));
-        highs.push(row.get("high_price"));
-        lows.push(row.get("low_price"));
-        closes.push(row.get("close_price"));
-        volumes.push(row.get("volume"));
-        volume_weighted_average_prices.push(row.get("volume_weighted_average_price"));
+    for row in rows {
+        tickers.push(row.ticker);
+        timestamps.push(row.timestamp_ms);
+        opens.push(row.open_price);
+        highs.push(row.high_price);
+        lows.push(row.low_price);
+        closes.push(row.close_price);
+        volumes.push(row.volume);
+        volume_weighted_average_prices.push(row.volume_weighted_average_price);
     }
 
     let dataframe = DataFrame::new(vec![
@@ -66,7 +65,7 @@ pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> 
 }
 
 pub async fn query_equity_details(pool: &PgPool) -> Result<DataFrame, sqlx::Error> {
-    let rows: Vec<PgRow> = sqlx::query(r#"SELECT ticker, sector, industry FROM equity_details"#)
+    let rows = sqlx::query!(r#"SELECT ticker, sector, industry FROM equity_details"#)
         .fetch_all(pool)
         .await?;
 
@@ -74,10 +73,10 @@ pub async fn query_equity_details(pool: &PgPool) -> Result<DataFrame, sqlx::Erro
     let mut sectors: Vec<String> = Vec::with_capacity(rows.len());
     let mut industries: Vec<String> = Vec::with_capacity(rows.len());
 
-    for row in &rows {
-        tickers.push(row.get("ticker"));
-        sectors.push(row.get::<Option<String>, _>("sector").unwrap_or_default());
-        industries.push(row.get::<Option<String>, _>("industry").unwrap_or_default());
+    for row in rows {
+        tickers.push(row.ticker);
+        sectors.push(row.sector);
+        industries.push(row.industry);
     }
 
     let dataframe = DataFrame::new(vec![
@@ -164,10 +163,7 @@ pub async fn emit_event(
     event_type: &str,
     payload: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
-    let payload_string = payload.to_string();
-    sqlx::query("SELECT emit_event($1, $2::jsonb)")
-        .bind(event_type)
-        .bind(payload_string)
+    sqlx::query!("SELECT emit_event($1, $2::jsonb)", event_type, payload)
         .execute(pool)
         .await?;
     info!(event_type = event_type, "Emitted event");
@@ -176,12 +172,13 @@ pub async fn emit_event(
 
 /// Return the last processed event id for a consumer, or 0 if not yet recorded.
 pub async fn get_consumer_offset(pool: &PgPool, consumer_name: &str) -> Result<i64, sqlx::Error> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1")
-            .bind(consumer_name)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(id,)| id).unwrap_or(0))
+    let row = sqlx::query!(
+        "SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1",
+        consumer_name
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|record| record.last_event_id).unwrap_or(0))
 }
 
 /// Upsert the last processed event id for a consumer. `GREATEST` guards against
@@ -191,15 +188,15 @@ pub async fn update_consumer_offset(
     consumer_name: &str,
     last_event_id: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) \
          VALUES ($1, $2, now()) \
          ON CONFLICT (consumer_name) DO UPDATE SET \
            last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), \
            updated_at = EXCLUDED.updated_at",
+        consumer_name,
+        last_event_id
     )
-    .bind(consumer_name)
-    .bind(last_event_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -212,14 +209,14 @@ pub async fn latest_event_after(
     event_type: &str,
     after_id: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as(
+    let row = sqlx::query!(
         "SELECT id FROM events WHERE event_type = $1 AND id > $2 ORDER BY id DESC LIMIT 1",
+        event_type,
+        after_id
     )
-    .bind(event_type)
-    .bind(after_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id,)| id))
+    Ok(row.map(|record| record.id))
 }
 
 /// Lineage row for the `model_runs` table, extracted from a trained model's
@@ -232,8 +229,8 @@ pub struct ModelRunRecord {
     pub directional_accuracy: Option<f64>,
     pub quantile_coverage: Option<f64>,
     pub lookback_days: Option<i32>,
-    pub start_date: Option<String>,
-    pub end_date: Option<String>,
+    pub start_date: Option<NaiveDate>,
+    pub end_date: Option<NaiveDate>,
     pub training_data_key: Option<String>,
     pub stage_counts: serde_json::Value,
     pub drift_status: Option<String>,
@@ -263,11 +260,11 @@ impl ModelRunRecord {
             start_date: metadata
                 .get("start_date")
                 .and_then(|v| v.as_str())
-                .map(String::from),
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()),
             end_date: metadata
                 .get("end_date")
                 .and_then(|v| v.as_str())
-                .map(String::from),
+                .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()),
             training_data_key: metadata
                 .get("training_data_key")
                 .and_then(|v| v.as_str())
@@ -285,13 +282,13 @@ impl ModelRunRecord {
 /// Upsert a `model_runs` lineage row so `equity_predictions.model_run_id` joins
 /// back to training metadata. Mirrors the prior Python `ensemble_manager` sync.
 pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO model_runs ( \
              run_id, artifact_key, status, completed_at, \
              continuous_ranked_probability_score, directional_accuracy, quantile_coverage, \
              lookback_days, start_date, end_date, training_data_key, stage_counts, \
              drift_status \
-         ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7::date, $8::date, $9, $10::jsonb, $11) \
+         ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (run_id) DO UPDATE SET \
              artifact_key = EXCLUDED.artifact_key, \
              status = EXCLUDED.status, \
@@ -305,18 +302,18 @@ pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<
              training_data_key = EXCLUDED.training_data_key, \
              stage_counts = EXCLUDED.stage_counts, \
              drift_status = EXCLUDED.drift_status",
+        record.run_id.as_str(),
+        record.artifact_key.as_str(),
+        record.crps,
+        record.directional_accuracy,
+        record.quantile_coverage,
+        record.lookback_days,
+        record.start_date,
+        record.end_date,
+        record.training_data_key.as_deref(),
+        &record.stage_counts,
+        record.drift_status.as_deref(),
     )
-    .bind(&record.run_id)
-    .bind(&record.artifact_key)
-    .bind(record.crps)
-    .bind(record.directional_accuracy)
-    .bind(record.quantile_coverage)
-    .bind(record.lookback_days)
-    .bind(&record.start_date)
-    .bind(&record.end_date)
-    .bind(&record.training_data_key)
-    .bind(record.stage_counts.to_string())
-    .bind(&record.drift_status)
     .execute(pool)
     .await?;
     info!(run_id = record.run_id, "Upserted model_runs lineage row");
@@ -416,7 +413,7 @@ mod tests {
         assert_eq!(record.directional_accuracy, Some(0.617));
         assert_eq!(record.quantile_coverage, Some(0.719));
         assert_eq!(record.lookback_days, Some(1200));
-        assert_eq!(record.start_date.as_deref(), Some("2023-02-25"));
+        assert_eq!(record.start_date, NaiveDate::from_ymd_opt(2023, 2, 25));
         assert_eq!(record.stage_counts["train_samples"], 2529261);
     }
 

@@ -1,4 +1,4 @@
-use crate::domain::market::{EquityBar, EquityDetails, EquityQuote};
+use crate::domain::market::{EquityBar, EquityDetails, EquityQuote, Ticker};
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
 };
@@ -56,7 +56,7 @@ pub async fn claim_pending_job(
     pool: &PgPool,
     job_name: &str,
 ) -> Result<Option<(i64, DateTime<Utc>)>, sqlx::Error> {
-    let row: Option<(i64, DateTime<Utc>)> = sqlx::query_as(
+    let row = sqlx::query!(
         r#"UPDATE scheduled_jobs
            SET claimed_at = now(), status = 'claimed'
            WHERE id = (
@@ -67,25 +67,25 @@ pub async fn claim_pending_job(
                FOR UPDATE SKIP LOCKED
            )
            RETURNING id, scheduled_at"#,
+        job_name
     )
-    .bind(job_name)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((id, _)) = row {
-        debug!("Claimed job {} with id {}", job_name, id);
+    if let Some(ref claimed) = row {
+        debug!("Claimed job {} with id {}", job_name, claimed.id);
     }
-    Ok(row)
+    Ok(row.map(|claimed| (claimed.id, claimed.scheduled_at)))
 }
 
 pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         r#"UPDATE scheduled_jobs
            SET completed_at = now(), status = 'completed', result = $2
            WHERE id = $1"#,
+        job_id,
+        result
     )
-    .bind(job_id)
-    .bind(result)
     .execute(pool)
     .await?;
 
@@ -94,13 +94,13 @@ pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<()
 }
 
 pub async fn fail_job(pool: &PgPool, job_id: i64, error_message: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         r#"UPDATE scheduled_jobs
            SET completed_at = now(), status = 'failed', result = $2
            WHERE id = $1"#,
+        job_id,
+        error_message
     )
-    .bind(job_id)
-    .bind(error_message)
     .execute(pool)
     .await?;
 
@@ -142,27 +142,29 @@ pub async fn insert_equity_quotes(
 }
 
 pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
-    let rows: Vec<(String,)> = sqlx::query_as(
+    let rows = sqlx::query!(
         r#"SELECT DISTINCT ea.ticker
            FROM equity_allocations ea
            JOIN equity_pairs ep ON ea.equity_pair_id = ep.id
            WHERE ep.status = 'open'
-           ORDER BY ea.ticker"#,
+           ORDER BY ea.ticker"#
     )
     .fetch_all(pool)
     .await?;
 
-    let tickers: Vec<String> = rows.into_iter().map(|(ticker,)| ticker).collect();
+    let tickers: Vec<String> = rows.into_iter().map(|row| row.ticker).collect();
     debug!("Queried {} active tickers from PostgreSQL", tickers.len());
     Ok(tickers)
 }
 
 pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT emit_event($1, $2::jsonb)")
-        .bind("equity_bars_synced")
-        .bind("{}")
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "SELECT emit_event($1, $2::jsonb)",
+        "equity_bars_synced",
+        serde_json::Value::Object(Default::default()),
+    )
+    .execute(pool)
+    .await?;
     info!("Emitted equity_bars_synced event");
     Ok(())
 }
@@ -173,14 +175,14 @@ pub async fn populate_equity_details_if_empty(
 ) -> Result<u64, sqlx::Error> {
     let mut transaction = pool.begin().await?;
 
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM equity_details")
+    let row = sqlx::query!(r#"SELECT COUNT(*) as "count!" FROM equity_details"#)
         .fetch_one(&mut *transaction)
         .await?;
 
-    if count.0 > 0 {
+    if row.count > 0 {
         info!(
             "equity_details already populated with {} rows, skipping migration",
-            count.0
+            row.count
         );
         return Ok(0);
     }
@@ -235,16 +237,33 @@ pub async fn query_equity_quotes_for_date(
 ) -> Result<Vec<EquityQuote>, sqlx::Error> {
     let (date_start, date_end) = date_to_utc_range(date);
 
-    let quotes = sqlx::query_as::<_, EquityQuote>(
+    let rows = sqlx::query!(
         "SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size
          FROM equity_quotes
          WHERE timestamp >= $1 AND timestamp < $2
          ORDER BY timestamp ASC",
+        date_start,
+        date_end
     )
-    .bind(date_start)
-    .bind(date_end)
     .fetch_all(pool)
     .await?;
+
+    let quotes: Vec<EquityQuote> = rows
+        .into_iter()
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            Ok(EquityQuote {
+                timestamp: row.timestamp,
+                ticker,
+                bid_price: row.bid_price,
+                ask_price: row.ask_price,
+                bid_size: row.bid_size,
+                ask_size: row.ask_size,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     debug!("Queried {} equity quotes for {}", quotes.len(), date);
     Ok(quotes)
@@ -256,11 +275,13 @@ pub async fn delete_equity_quotes_for_date(
 ) -> Result<u64, sqlx::Error> {
     let (date_start, date_end) = date_to_utc_range(date);
 
-    let result = sqlx::query("DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2")
-        .bind(date_start)
-        .bind(date_end)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query!(
+        "DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2",
+        date_start,
+        date_end
+    )
+    .execute(pool)
+    .await?;
 
     let deleted = result.rows_affected();
     info!(
@@ -276,17 +297,38 @@ pub async fn query_equity_bars_for_date(
 ) -> Result<Vec<EquityBar>, sqlx::Error> {
     let (date_start, date_end) = date_to_utc_range(date);
 
-    let bars = sqlx::query_as::<_, EquityBar>(
+    let rows = sqlx::query!(
         "SELECT ticker, timestamp, open_price, high_price, low_price, close_price, volume,
          volume_weighted_average_price, transactions, inserted_at
          FROM equity_bars
          WHERE timestamp >= $1 AND timestamp < $2
          ORDER BY ticker ASC, timestamp ASC",
+        date_start,
+        date_end
     )
-    .bind(date_start)
-    .bind(date_end)
     .fetch_all(pool)
     .await?;
+
+    let bars: Vec<EquityBar> = rows
+        .into_iter()
+        .map(|row| {
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
+            })?;
+            Ok(EquityBar {
+                ticker,
+                timestamp: row.timestamp,
+                open_price: row.open_price,
+                high_price: row.high_price,
+                low_price: row.low_price,
+                close_price: row.close_price,
+                volume: row.volume,
+                volume_weighted_average_price: row.volume_weighted_average_price,
+                transactions: row.transactions,
+                inserted_at: row.inserted_at,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     debug!("Queried {} equity bars for {}", bars.len(), date);
     Ok(bars)
@@ -295,60 +337,139 @@ pub async fn query_equity_bars_for_date(
 pub async fn query_equity_rebalance_sessions(
     pool: &PgPool,
 ) -> Result<Vec<EquityRebalanceSession>, sqlx::Error> {
-    sqlx::query_as::<_, EquityRebalanceSession>(
+    let rows = sqlx::query!(
         "SELECT id, triggered_at, trigger_reason, model_run_id, completed_at, status
          FROM equity_rebalance_sessions
-         ORDER BY triggered_at ASC",
+         ORDER BY triggered_at ASC"
     )
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EquityRebalanceSession {
+            id: row.id,
+            triggered_at: row.triggered_at,
+            trigger_reason: row.trigger_reason,
+            model_run_id: row.model_run_id,
+            completed_at: row.completed_at,
+            status: row.status,
+        })
+        .collect())
 }
 
 pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::Error> {
-    sqlx::query_as::<_, EquityPair>(
+    let rows = sqlx::query!(
         "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,
          signal_strength, status, opened_at, closed_at, realized_profit_and_loss,
          return_percent, holding_days
          FROM equity_pairs
-         ORDER BY opened_at ASC",
+         ORDER BY opened_at ASC"
     )
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EquityPair {
+            id: row.id,
+            rebalance_id: row.rebalance_id,
+            pair_id: row.pair_id,
+            long_ticker: row.long_ticker,
+            short_ticker: row.short_ticker,
+            z_score: row.z_score,
+            hedge_ratio: row.hedge_ratio,
+            signal_strength: row.signal_strength,
+            status: row.status,
+            opened_at: row.opened_at,
+            closed_at: row.closed_at,
+            realized_profit_and_loss: row.realized_profit_and_loss,
+            return_percent: row.return_percent,
+            holding_days: row.holding_days,
+        })
+        .collect())
 }
 
 pub async fn query_equity_allocations(pool: &PgPool) -> Result<Vec<EquityAllocation>, sqlx::Error> {
-    sqlx::query_as::<_, EquityAllocation>(
+    let rows = sqlx::query!(
         "SELECT id, rebalance_id, equity_pair_id, generated_at, model_run_id, ticker, side,
          action, dollar_amount, entry_price, quantity, notional
          FROM equity_allocations
-         ORDER BY generated_at ASC",
+         ORDER BY generated_at ASC"
     )
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EquityAllocation {
+            id: row.id,
+            rebalance_id: row.rebalance_id,
+            equity_pair_id: row.equity_pair_id,
+            generated_at: row.generated_at,
+            model_run_id: row.model_run_id,
+            ticker: row.ticker,
+            side: row.side,
+            action: row.action,
+            dollar_amount: row.dollar_amount,
+            entry_price: row.entry_price,
+            quantity: row.quantity,
+            notional: row.notional,
+        })
+        .collect())
 }
 
 pub async fn query_equity_orders(pool: &PgPool) -> Result<Vec<EquityOrder>, sqlx::Error> {
-    sqlx::query_as::<_, EquityOrder>(
+    let rows = sqlx::query!(
         "SELECT id, allocation_id, submitted_at, ticker, side, quantity, order_type,
          limit_price, alpaca_order_id
          FROM equity_orders
-         ORDER BY submitted_at ASC",
+         ORDER BY submitted_at ASC"
     )
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EquityOrder {
+            id: row.id,
+            allocation_id: row.allocation_id,
+            submitted_at: row.submitted_at,
+            ticker: row.ticker,
+            side: row.side,
+            quantity: row.quantity,
+            order_type: row.order_type,
+            limit_price: row.limit_price,
+            alpaca_order_id: row.alpaca_order_id,
+        })
+        .collect())
 }
 
 pub async fn query_equity_portfolio_snapshots(
     pool: &PgPool,
 ) -> Result<Vec<EquityPortfolioSnapshot>, sqlx::Error> {
-    sqlx::query_as::<_, EquityPortfolioSnapshot>(
+    let rows = sqlx::query!(
         "SELECT id, snapshot_timestamp, snapshot_type, net_asset_value, gross_return,
          net_return, total_slippage_cost, created_at
          FROM equity_portfolio_snapshots
-         ORDER BY snapshot_timestamp ASC",
+         ORDER BY snapshot_timestamp ASC"
     )
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EquityPortfolioSnapshot {
+            id: row.id,
+            snapshot_timestamp: row.snapshot_timestamp,
+            snapshot_type: row.snapshot_type,
+            net_asset_value: row.net_asset_value,
+            gross_return: row.gross_return,
+            net_return: row.net_return,
+            total_slippage_cost: row.total_slippage_cost,
+            created_at: row.created_at,
+        })
+        .collect())
 }
 
 pub async fn requeue_stale_claimed_jobs(
@@ -357,15 +478,15 @@ pub async fn requeue_stale_claimed_jobs(
     stale_after: std::time::Duration,
 ) -> Result<u64, sqlx::Error> {
     let interval_secs = stale_after.as_secs() as f64;
-    let result = sqlx::query(
+    let result = sqlx::query!(
         r#"UPDATE scheduled_jobs
            SET status = 'pending', claimed_at = NULL
            WHERE job_name = $1
              AND status = 'claimed'
              AND claimed_at < now() - make_interval(secs => $2)"#,
+        job_name,
+        interval_secs
     )
-    .bind(job_name)
-    .bind(interval_secs)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
