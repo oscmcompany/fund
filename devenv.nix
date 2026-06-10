@@ -249,10 +249,31 @@ in {
     echo "Downloading equity details from S3..."
     aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
     echo "Loading equity details into database..."
-    psql -h localhost -p 5432 -d fund <<'SQL'
-      CREATE TEMP TABLE tmp_equity_details (LIKE equity_details INCLUDING ALL);
-      \COPY tmp_equity_details (ticker, sector, industry) FROM '/tmp/equity_details.csv' CSV HEADER
-      INSERT INTO equity_details SELECT * FROM tmp_equity_details
+    # The source CSV is the full listing export (11 columns); stage it verbatim
+    # and project only the columns equity_details keeps. ON_ERROR_STOP makes a
+    # malformed file fail the task instead of silently loading nothing.
+    psql -h localhost -p 5432 -d fund --set ON_ERROR_STOP=on <<'SQL'
+      CREATE TEMP TABLE tmp_equity_details (
+        ticker TEXT,
+        name TEXT,
+        last_sale TEXT,
+        net_change TEXT,
+        percent_change TEXT,
+        market_capitalization TEXT,
+        country TEXT,
+        ipo_year TEXT,
+        volume TEXT,
+        sector TEXT,
+        industry TEXT
+      );
+      \COPY tmp_equity_details FROM '/tmp/equity_details.csv' CSV HEADER
+      INSERT INTO equity_details (ticker, sector, industry)
+        SELECT
+          ticker,
+          COALESCE(NULLIF(sector, ''), 'NOT AVAILABLE'),
+          COALESCE(NULLIF(industry, ''), 'NOT AVAILABLE')
+        FROM tmp_equity_details
+        WHERE ticker IS NOT NULL
         ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
       DROP TABLE tmp_equity_details;
     SQL
