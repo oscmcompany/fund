@@ -12,7 +12,7 @@
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
   # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
   # artifacts live in the same per-profile bucket under models/tide/: the Rust
-  # trainer (tide_train) writes there and the ensemble inference service
+  # trainer (tide_model_trainer) writes there and the ensemble inference service
   # (AppState::from_env) reads there, so training and serving agree in both
   # dev and production.
   runtimeEnv = ''
@@ -590,7 +590,7 @@ in {
       set -euo pipefail
       echo "Running tide training pipeline (Rust + burn)"
       ${runtimeEnv}
-      secretspec run -- cargo run --release --no-default-features --features train --bin tide_train
+      secretspec run -- cargo run --release --no-default-features --features train --bin tide_model_trainer
     '';
 
     # --- Data tasks ---
@@ -724,7 +724,7 @@ in {
           exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
         '';
 
-      # Rust ensemble_model (Burn): serves predictions over HTTP and consumes
+      # Rust ensemble_manager (Burn): serves predictions over HTTP and consumes
       # predictions_requested from the Postgres event bus. Replaces the former
       # Python ensemble_manager (uvicorn/tinygrad).
       ensemble-manager.exec =
@@ -734,14 +734,14 @@ in {
           ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
-          exec secretspec run -- cargo run --no-default-features --features ensemble_model --bin ensemble_model --release
+          exec secretspec run -- cargo run --no-default-features --features ensemble_manager --bin ensemble_manager --release
         ''
         else ''
           set -euo pipefail
           ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
-          exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_model --bin ensemble_model'
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_manager --bin ensemble_manager'
         '';
 
       portfolio-manager.exec = let
@@ -773,7 +773,7 @@ in {
     scripts.train-local.exec = ''
       set -euo pipefail
       echo "Running local training pipeline (Rust + burn)"
-      cargo run --release --no-default-features --features train --bin tide_train
+      cargo run --release --no-default-features --features train --bin tide_model_trainer
     '';
   };
 

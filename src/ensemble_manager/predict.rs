@@ -8,8 +8,8 @@ use tracing::info;
 
 use crate::models::tide::data::Data;
 
-use crate::ensemble_model::database;
-use crate::ensemble_model::state::ModelState;
+use crate::ensemble_manager::database;
+use crate::ensemble_manager::state::ModelState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PredictionError {
@@ -97,7 +97,7 @@ pub async fn fetch_equity_details(
     Ok(data)
 }
 
-pub async fn fetch_equity_bars_auto(
+pub async fn fetch_equity_bars_from_pool_or_service(
     pool: Option<&PgPool>,
     base_url: &str,
     http_client: &reqwest::Client,
@@ -112,7 +112,7 @@ pub async fn fetch_equity_bars_auto(
     }
 }
 
-pub async fn fetch_equity_details_auto(
+pub async fn fetch_equity_details_from_pool_or_service(
     pool: Option<&PgPool>,
     base_url: &str,
     http_client: &reqwest::Client,

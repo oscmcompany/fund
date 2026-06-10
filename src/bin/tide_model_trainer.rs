@@ -16,10 +16,10 @@ use tracing::{error, info, warn};
 
 use fund::common::observability::init_tracing;
 use fund::domain::market::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use fund::ensemble_model::artifact::{
+use fund::ensemble_manager::artifact::{
     candidate_folders_descending, fetch_run_metadata, list_run_folders,
 };
-use fund::ensemble_model::predict::consolidate_data;
+use fund::ensemble_manager::predict::consolidate_data;
 use fund::models::tide::artifact::{package_dir_to_tar_gz, upload_artifact};
 use fund::models::tide::config::ModelParameters;
 use fund::models::tide::data::input_feature_size;
@@ -41,7 +41,7 @@ const DRIFT_DEGRADATION_THRESHOLD: f64 = 0.20;
 
 #[tokio::main]
 async fn main() {
-    let _tracing_guard = init_tracing("tide-train.log", Some("info"));
+    let _tracing_guard = init_tracing("tide-model-trainer.log", Some("info"));
     if let Err(error) = run().await {
         error!("Training failed: {}", error);
         eprintln!("Training failed: {}", error);

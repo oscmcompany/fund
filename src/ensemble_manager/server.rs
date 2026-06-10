@@ -9,16 +9,15 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::ensemble_model::artifact;
-use crate::ensemble_model::database;
-use crate::ensemble_model::predict;
-use crate::ensemble_model::state::AppState;
+use crate::ensemble_manager::artifact;
+use crate::ensemble_manager::database;
+use crate::ensemble_manager::predict;
+use crate::ensemble_manager::state::AppState;
 
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/predictions", post(predictions))
-        .route("/model/predictions", post(predictions))
         .route("/metrics", get(metrics))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
@@ -130,7 +129,7 @@ async fn run_pipeline_and_persist(
             message: "Model not loaded".to_string(),
         })?;
 
-        let equity_bars = predict::fetch_equity_bars_auto(
+        let equity_bars = predict::fetch_equity_bars_from_pool_or_service(
             state.pool.as_ref(),
             &state.data_manager_base_url,
             http_client,
@@ -141,7 +140,7 @@ async fn run_pipeline_and_persist(
             message: e.to_string(),
         })?;
 
-        let equity_details = predict::fetch_equity_details_auto(
+        let equity_details = predict::fetch_equity_details_from_pool_or_service(
             state.pool.as_ref(),
             &state.data_manager_base_url,
             http_client,
@@ -381,7 +380,7 @@ mod tests {
             artifact_prefix: "artifacts/tide/".to_string(),
             data_manager_base_url: "http://localhost:8080".to_string(),
             model_version: "latest".to_string(),
-            metrics: std::sync::Arc::new(crate::ensemble_model::state::Metrics::new()),
+            metrics: std::sync::Arc::new(crate::ensemble_manager::state::Metrics::new()),
             local_artifact_dir: None,
             pool: None,
         }
@@ -432,8 +431,8 @@ mod tests {
         assert!(text.contains("ensemble_prediction_duration_seconds_bucket"));
         assert!(text.contains("ensemble_prediction_batch_count"));
         assert!(text.contains("ensemble_prediction_row_count"));
-        assert!(text.contains("ensemble_model_load_timestamp"));
-        assert!(text.contains("ensemble_model_artifact_info"));
+        assert!(text.contains("ensemble_manager_load_timestamp"));
+        assert!(text.contains("ensemble_manager_artifact_info"));
     }
 
     #[tokio::test]

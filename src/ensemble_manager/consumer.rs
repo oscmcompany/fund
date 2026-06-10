@@ -12,9 +12,9 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::ensemble_model::database;
-use crate::ensemble_model::server::run_predictions;
-use crate::ensemble_model::state::AppState;
+use crate::ensemble_manager::database;
+use crate::ensemble_manager::server::run_predictions;
+use crate::ensemble_manager::state::AppState;
 
 /// Consumer name for offset tracking. Reuses the prior Python consumer's name so
 /// it continues from the same `event_consumer_offsets` position.

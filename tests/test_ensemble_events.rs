@@ -4,7 +4,7 @@
 
 mod common;
 
-use fund::ensemble_model::database::{
+use fund::ensemble_manager::database::{
     emit_event, get_consumer_offset, insert_predictions, latest_event_after,
     update_consumer_offset, upsert_model_run, ModelRunRecord,
 };

@@ -172,15 +172,17 @@ impl Metrics {
         output.push_str(&format!("ensemble_prediction_row_count {row_count}\n"));
 
         output.push_str(
-            "# HELP ensemble_model_load_timestamp Unix timestamp of last successful model load\n",
+            "# HELP ensemble_manager_load_timestamp Unix timestamp of last successful model load\n",
         );
-        output.push_str("# TYPE ensemble_model_load_timestamp gauge\n");
-        output.push_str(&format!("ensemble_model_load_timestamp {load_timestamp}\n"));
-
-        output.push_str("# HELP ensemble_model_artifact_info Current model artifact\n");
-        output.push_str("# TYPE ensemble_model_artifact_info gauge\n");
+        output.push_str("# TYPE ensemble_manager_load_timestamp gauge\n");
         output.push_str(&format!(
-            "ensemble_model_artifact_info{{key=\"{artifact_key}\"}} 1\n"
+            "ensemble_manager_load_timestamp {load_timestamp}\n"
+        ));
+
+        output.push_str("# HELP ensemble_manager_artifact_info Current model artifact\n");
+        output.push_str("# TYPE ensemble_manager_artifact_info gauge\n");
+        output.push_str(&format!(
+            "ensemble_manager_artifact_info{{key=\"{artifact_key}\"}} 1\n"
         ));
 
         output
@@ -297,7 +299,7 @@ mod tests {
         assert!(output.contains("ensemble_prediction_duration_seconds_bucket{le=\"+Inf\"} 1"));
         assert!(output.contains("ensemble_prediction_batch_count 1"));
         assert!(output.contains("ensemble_prediction_row_count 50"));
-        assert!(output.contains("ensemble_model_load_timestamp 1700000000"));
-        assert!(output.contains("ensemble_model_artifact_info"));
+        assert!(output.contains("ensemble_manager_load_timestamp 1700000000"));
+        assert!(output.contains("ensemble_manager_artifact_info"));
     }
 }

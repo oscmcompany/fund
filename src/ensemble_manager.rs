@@ -17,7 +17,7 @@ use state::AppState;
 
 /// Initialize tracing and run the prediction HTTP server, blocking until it exits.
 pub async fn run(bind_address: &str) {
-    let _tracing_guard = init_tracing("ensemble-model.log", None);
+    let _tracing_guard = init_tracing("ensemble-manager.log", None);
 
     info!("Starting ensemble model service");
 

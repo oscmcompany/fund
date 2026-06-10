@@ -19,34 +19,34 @@ path = "src/bin/backfill.rs"
 required-features = ["data_manager"]
 
 [[bin]]
-name = "ensemble_model"
-path = "src/bin/ensemble_model.rs"
-required-features = ["ensemble_model"]
+name = "ensemble_manager"
+path = "src/bin/ensemble_manager.rs"
+required-features = ["ensemble_manager"]
 
 [[bin]]
-name = "tide_train"
-path = "src/bin/tide_train.rs"
+name = "tide_model_trainer"
+path = "src/bin/tide_model_trainer.rs"
 required-features = ["train"]
 
 [features]
-default = ["data_manager", "ensemble_model"]
+default = ["data_manager", "ensemble_manager"]
 data_manager = [
   "dep:chrono-tz",
   "dep:urlencoding",
   "dep:tokio-tungstenite",
   "dep:futures-util",
 ]
-ensemble_model = [
+ensemble_manager = [
   "dep:burn",
   "dep:ndarray",
   "dep:flate2",
   "dep:tar",
   "dep:tempfile",
 ]
-# Rust-native TiDE training. Reuses the ensemble_model model/data/predict code
+# Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
 # for epoch shuffling.
-train = ["ensemble_model", "dep:rand"]
+train = ["ensemble_manager", "dep:rand"]
 
 [dependencies]
 # Shared / base (always compiled)
@@ -100,7 +100,7 @@ tokio-tungstenite = { version = "0.26", features = [
 ], optional = true }
 futures-util = { version = "0.3", optional = true }
 
-# ensemble_model-only (optional; enabled by the `ensemble_model` feature).
+# ensemble_manager-only (optional; enabled by the `ensemble_manager` feature).
 # `autodiff` brings the Autodiff backend used by Rust-native training; it adds
 # no runtime cost to the NdArray inference path.
 burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
