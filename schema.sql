@@ -397,21 +397,6 @@ BEGIN
 END;
 $do$;
 
--- Daily equity quotes export: weekdays at 21:05 UTC (after intraday-check window ends at 20:55 UTC
--- and after 4 PM Eastern market close in both EDT and EST).
--- Triggers a Rust export task in data_manager via the jobs channel.
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-quotes') THEN
-        PERFORM cron.schedule(
-            'export-equity-quotes',
-            '5 21 * * 1-5',
-            $$SELECT schedule_job('export-equity-quotes')$$
-        );
-    END IF;
-END;
-$do$;
-
 -- Nightly equity bars export: weekdays at 21:30 UTC.
 -- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
@@ -428,6 +413,8 @@ $do$;
 
 -- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15
 -- so today's snapshot is included).
+-- Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
+-- equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs; deletes exported equity_quotes rows.
 -- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
 BEGIN

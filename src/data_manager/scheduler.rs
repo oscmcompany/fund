@@ -194,11 +194,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         }
     }
 
-    for export_job in &[
-        "export-equity-quotes",
-        "export-equity-bars",
-        "export-trading-history",
-    ] {
+    for export_job in &["export-equity-bars", "export-trading-history"] {
         match database::requeue_stale_claimed_jobs(
             pool,
             export_job,
@@ -305,7 +301,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                     }
                 }
             }
-            "export-equity-quotes" | "export-equity-bars" | "export-trading-history" => {
+            "export-equity-bars" | "export-trading-history" => {
                 info!("Received NOTIFY for {}", payload);
 
                 let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
@@ -350,7 +346,6 @@ async fn run_export_job(
     export_date: NaiveDate,
 ) -> Result<usize, String> {
     match job_name {
-        "export-equity-quotes" => export::export_equity_quotes(state, export_date).await,
         "export-equity-bars" => export::export_equity_bars(state, export_date).await,
         "export-trading-history" => export::export_equity_trading_history(state, export_date).await,
         _ => {

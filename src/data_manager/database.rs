@@ -1,4 +1,5 @@
 use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
+use crate::domain::predictions::{EquityPrediction, ModelRun, ModelRunStatus};
 use crate::domain::trading::{
     AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
     EquityPortfolioSnapshot, EquityRebalanceSession, RebalanceSessionStatus, SnapshotType,
@@ -495,6 +496,86 @@ pub async fn query_equity_portfolio_snapshots(
         .collect()
 }
 
+pub async fn query_equity_predictions_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<EquityPrediction>, sqlx::Error> {
+    let (date_start, date_end) = date_to_utc_range(date);
+
+    let rows = sqlx::query!(
+        "SELECT correlation_id, model_run_id, ticker, timestamp, quantile_10, quantile_50,
+         quantile_90, created_at
+         FROM equity_predictions
+         WHERE timestamp >= $1 AND timestamp < $2
+         ORDER BY ticker ASC, timestamp ASC",
+        date_start,
+        date_end
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let predictions: Vec<EquityPrediction> = rows
+        .into_iter()
+        .map(|row| {
+            EquityPrediction::new(
+                row.correlation_id,
+                row.model_run_id,
+                row.ticker,
+                row.timestamp,
+                row.quantile_10,
+                row.quantile_50,
+                row.quantile_90,
+                row.created_at,
+            )
+        })
+        .collect();
+
+    debug!(
+        "Queried {} equity predictions for {}",
+        predictions.len(),
+        date
+    );
+    Ok(predictions)
+}
+
+pub async fn query_model_runs(pool: &PgPool) -> Result<Vec<ModelRun>, sqlx::Error> {
+    let rows = sqlx::query!(
+        "SELECT id, run_id, model_name, artifact_key, training_data_key, start_date, end_date,
+         lookback_days, status, continuous_ranked_probability_score, directional_accuracy,
+         quantile_coverage, drift_status, stage_counts, started_at, completed_at
+         FROM model_runs
+         ORDER BY started_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status = ModelRunStatus::parse(&row.status).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid model run status: {}", row.status).into())
+            })?;
+            Ok(ModelRun::new(
+                row.id,
+                row.run_id,
+                row.model_name,
+                row.artifact_key,
+                row.training_data_key,
+                row.start_date,
+                row.end_date,
+                row.lookback_days,
+                status,
+                row.continuous_ranked_probability_score,
+                row.directional_accuracy,
+                row.quantile_coverage,
+                row.drift_status,
+                row.stage_counts,
+                row.started_at,
+                row.completed_at,
+            ))
+        })
+        .collect()
+}
+
 pub async fn requeue_stale_claimed_jobs(
     pool: &PgPool,
     job_name: &str,
@@ -742,6 +823,36 @@ mod tests {
         runtime.block_on(async {
             let pool = test_pool();
             let result = query_equity_portfolio_snapshots(&pool).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_predictions_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = query_equity_predictions_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_model_runs_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let result = query_model_runs(&pool).await;
             assert!(result.is_err());
         });
     }

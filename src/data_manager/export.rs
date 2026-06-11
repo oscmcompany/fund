@@ -7,6 +7,7 @@
 use crate::common::aws::date_partitioned_key;
 use crate::data_manager::{database, state::State};
 use crate::domain::market::{EquityBar, EquityQuote};
+use crate::domain::predictions::{EquityPrediction, ModelRun};
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
 };
@@ -14,37 +15,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use chrono::NaiveDate;
 use polars::prelude::*;
 use tracing::info;
-
-/// Exports equity quotes for the given date to S3 Parquet and deletes
-/// the exported rows from the database.
-pub async fn export_equity_quotes(state: &State, date: NaiveDate) -> Result<usize, String> {
-    let pool = state
-        .database
-        .pool()
-        .ok_or_else(|| "database not connected".to_string())?;
-
-    let quotes = database::query_equity_quotes_for_date(pool, date)
-        .await
-        .map_err(|error| format!("Failed to query equity quotes: {}", error))?;
-
-    let count = quotes.len();
-
-    if count == 0 {
-        info!("No equity quotes to export for {}", date);
-        return Ok(0);
-    }
-
-    let mut dataframe = create_equity_quote_dataframe(&quotes)?;
-    let key = date_partitioned_key("data/equity/quotes", date);
-    write_dataframe_to_s3(state, &mut dataframe, &key).await?;
-    info!("Exported {} equity quotes to S3: {}", count, key);
-
-    database::delete_equity_quotes_for_date(pool, date)
-        .await
-        .map_err(|error| format!("Failed to delete equity quotes: {}", error))?;
-
-    Ok(count)
-}
 
 /// Exports equity bars for the given date to S3 Parquet.
 pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize, String> {
@@ -73,6 +43,10 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
 }
 
 /// Exports all trading history tables to S3 Parquet.
+///
+/// Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
+/// equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs. Deletes the
+/// exported equity_quotes rows from the database after a successful S3 write.
 pub async fn export_equity_trading_history(
     state: &State,
     date: NaiveDate,
@@ -81,6 +55,41 @@ pub async fn export_equity_trading_history(
         .database
         .pool()
         .ok_or_else(|| "database not connected".to_string())?;
+
+    let quotes = database::query_equity_quotes_for_date(pool, date)
+        .await
+        .map_err(|error| format!("Failed to query equity quotes: {}", error))?;
+    let quote_count = quotes.len();
+    if quote_count > 0 {
+        let mut quote_dataframe = create_equity_quote_dataframe(&quotes)?;
+        write_dataframe_to_s3(
+            state,
+            &mut quote_dataframe,
+            &date_partitioned_key("data/equity/quotes", date),
+        )
+        .await?;
+        database::delete_equity_quotes_for_date(pool, date)
+            .await
+            .map_err(|error| format!("Failed to delete equity quotes: {}", error))?;
+    } else {
+        info!("No equity quotes to export for {}", date);
+    }
+
+    let predictions = database::query_equity_predictions_for_date(pool, date)
+        .await
+        .map_err(|error| format!("Failed to query equity predictions: {}", error))?;
+    let prediction_count = predictions.len();
+    if prediction_count > 0 {
+        let mut prediction_dataframe = create_equity_prediction_dataframe(&predictions)?;
+        write_dataframe_to_s3(
+            state,
+            &mut prediction_dataframe,
+            &date_partitioned_key("exports/equity/predictions", date),
+        )
+        .await?;
+    } else {
+        info!("No equity predictions to export for {}", date);
+    }
 
     let sessions = database::query_equity_rebalance_sessions(pool)
         .await
@@ -142,12 +151,31 @@ pub async fn export_equity_trading_history(
     )
     .await?;
 
+    let model_runs = database::query_model_runs(pool)
+        .await
+        .map_err(|error| format!("Failed to query model runs: {}", error))?;
+    let model_run_count = model_runs.len();
+    let mut model_run_dataframe = create_model_run_dataframe(&model_runs)?;
+    write_dataframe_to_s3(
+        state,
+        &mut model_run_dataframe,
+        &date_partitioned_key("exports/model-runs", date),
+    )
+    .await?;
+
     info!(
-        "Exported trading history to S3: {} sessions, {} pairs, {} allocations, {} orders, {} snapshots",
-        session_count, pair_count, allocation_count, order_count, snapshot_count
+        "Exported trading history to S3: {} quotes, {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs",
+        quote_count, prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count
     );
 
-    Ok(session_count + pair_count + allocation_count + order_count + snapshot_count)
+    Ok(quote_count
+        + prediction_count
+        + session_count
+        + pair_count
+        + allocation_count
+        + order_count
+        + snapshot_count
+        + model_run_count)
 }
 
 async fn write_dataframe_to_s3(
@@ -300,14 +328,54 @@ fn create_equity_portfolio_snapshot_dataframe(
     })
 }
 
+fn create_equity_prediction_dataframe(
+    predictions: &[EquityPrediction],
+) -> Result<DataFrame, String> {
+    df!(
+        "correlation_id" => predictions.iter().map(|prediction| prediction.correlation_id().to_string()).collect::<Vec<String>>(),
+        "model_run_id" => predictions.iter().map(|prediction| prediction.model_run_id()).collect::<Vec<&str>>(),
+        "ticker" => predictions.iter().map(|prediction| prediction.ticker()).collect::<Vec<&str>>(),
+        "timestamp" => predictions.iter().map(|prediction| prediction.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
+        "quantile_10" => predictions.iter().map(|prediction| prediction.quantile_10()).collect::<Vec<f64>>(),
+        "quantile_50" => predictions.iter().map(|prediction| prediction.quantile_50()).collect::<Vec<f64>>(),
+        "quantile_90" => predictions.iter().map(|prediction| prediction.quantile_90()).collect::<Vec<f64>>(),
+        "created_at" => predictions.iter().map(|prediction| prediction.created_at().timestamp_millis()).collect::<Vec<i64>>(),
+    )
+    .map_err(|error| format!("Failed to create equity prediction DataFrame: {}", error))
+}
+
+fn create_model_run_dataframe(model_runs: &[ModelRun]) -> Result<DataFrame, String> {
+    df!(
+        "id" => model_runs.iter().map(|model_run| model_run.id()).collect::<Vec<i64>>(),
+        "run_id" => model_runs.iter().map(|model_run| model_run.run_id()).collect::<Vec<&str>>(),
+        "model_name" => model_runs.iter().map(|model_run| model_run.model_name()).collect::<Vec<&str>>(),
+        "artifact_key" => model_runs.iter().map(|model_run| model_run.artifact_key()).collect::<Vec<Option<&str>>>(),
+        "training_data_key" => model_runs.iter().map(|model_run| model_run.training_data_key()).collect::<Vec<Option<&str>>>(),
+        "start_date" => model_runs.iter().map(|model_run| model_run.start_date().map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
+        "end_date" => model_runs.iter().map(|model_run| model_run.end_date().map(|date| date.to_string())).collect::<Vec<Option<String>>>(),
+        "lookback_days" => model_runs.iter().map(|model_run| model_run.lookback_days()).collect::<Vec<Option<i32>>>(),
+        "status" => model_runs.iter().map(|model_run| model_run.status().as_str()).collect::<Vec<&str>>(),
+        "continuous_ranked_probability_score" => model_runs.iter().map(|model_run| model_run.continuous_ranked_probability_score()).collect::<Vec<Option<f64>>>(),
+        "directional_accuracy" => model_runs.iter().map(|model_run| model_run.directional_accuracy()).collect::<Vec<Option<f64>>>(),
+        "quantile_coverage" => model_runs.iter().map(|model_run| model_run.quantile_coverage()).collect::<Vec<Option<f64>>>(),
+        "drift_status" => model_runs.iter().map(|model_run| model_run.drift_status()).collect::<Vec<Option<&str>>>(),
+        "stage_counts" => model_runs.iter().map(|model_run| model_run.stage_counts().map(|value| value.to_string())).collect::<Vec<Option<String>>>(),
+        "started_at" => model_runs.iter().map(|model_run| model_run.started_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "completed_at" => model_runs.iter().map(|model_run| model_run.completed_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+    )
+    .map_err(|error| format!("Failed to create model run DataFrame: {}", error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::market::Ticker;
+    use crate::domain::predictions::ModelRunStatus;
     use crate::domain::trading::{
         AllocationAction, AllocationSide, EquityPairStatus, RebalanceSessionStatus, SnapshotType,
     };
     use chrono::Utc;
+    use serde_json::json;
 
     fn sample_quotes() -> Vec<EquityQuote> {
         let now = Utc::now();
@@ -571,46 +639,135 @@ mod tests {
         assert_eq!(amount_series.dtype(), &DataType::String);
     }
 
+    fn sample_predictions() -> Vec<EquityPrediction> {
+        let now = Utc::now();
+        vec![
+            EquityPrediction::new(
+                "550e8400-e29b-41d4-a716-446655440010".parse().unwrap(),
+                "run-tide-001".to_string(),
+                "AAPL".to_string(),
+                now,
+                -0.02,
+                0.01,
+                0.04,
+                now,
+            ),
+            EquityPrediction::new(
+                "550e8400-e29b-41d4-a716-446655440011".parse().unwrap(),
+                "run-tide-001".to_string(),
+                "MSFT".to_string(),
+                now,
+                -0.01,
+                0.005,
+                0.02,
+                now,
+            ),
+        ]
+    }
+
     #[test]
-    fn test_export_equity_quotes_returns_error_when_no_database() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data_manager::state::{DatabaseState, MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-            use chrono::NaiveDate;
+    fn test_create_equity_prediction_dataframe_columns_and_rows() {
+        let predictions = sample_predictions();
+        let dataframe = create_equity_prediction_dataframe(&predictions).unwrap();
+        assert_eq!(dataframe.height(), 2);
+        assert_eq!(dataframe.width(), 8);
+        assert!(dataframe.column("correlation_id").is_ok());
+        assert!(dataframe.column("model_run_id").is_ok());
+        assert!(dataframe.column("ticker").is_ok());
+        assert!(dataframe.column("timestamp").is_ok());
+        assert!(dataframe.column("quantile_10").is_ok());
+        assert!(dataframe.column("quantile_50").is_ok());
+        assert!(dataframe.column("quantile_90").is_ok());
+        assert!(dataframe.column("created_at").is_ok());
+    }
 
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            assert!(matches!(state.database, DatabaseState::NotConfigured));
+    #[test]
+    fn test_create_equity_prediction_dataframe_empty() {
+        let dataframe = create_equity_prediction_dataframe(&[]).unwrap();
+        assert_eq!(dataframe.height(), 0);
+        assert_eq!(dataframe.width(), 8);
+    }
 
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = export_equity_quotes(&state, date).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("database not connected"));
-        });
+    fn sample_model_runs() -> Vec<ModelRun> {
+        vec![
+            ModelRun::new(
+                1,
+                "run-tide-001".to_string(),
+                "tide".to_string(),
+                Some("artifacts/tide/run-001/weights.safetensors".to_string()),
+                Some("data/equity/bars/training.parquet".to_string()),
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                Some(chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap()),
+                Some(70),
+                ModelRunStatus::Completed,
+                Some(0.42),
+                Some(0.55),
+                Some(0.88),
+                Some("stable".to_string()),
+                Some(json!({"stage_1": 100})),
+                Utc::now(),
+                Some(Utc::now()),
+            ),
+            ModelRun::new(
+                2,
+                "run-tide-002".to_string(),
+                "tide".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ModelRunStatus::Started,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Utc::now(),
+                None,
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_columns_and_rows() {
+        let model_runs = sample_model_runs();
+        let dataframe = create_model_run_dataframe(&model_runs).unwrap();
+        assert_eq!(dataframe.height(), 2);
+        assert_eq!(dataframe.width(), 16);
+        assert!(dataframe.column("id").is_ok());
+        assert!(dataframe.column("run_id").is_ok());
+        assert!(dataframe.column("model_name").is_ok());
+        assert!(dataframe.column("artifact_key").is_ok());
+        assert!(dataframe.column("training_data_key").is_ok());
+        assert!(dataframe.column("start_date").is_ok());
+        assert!(dataframe.column("end_date").is_ok());
+        assert!(dataframe.column("lookback_days").is_ok());
+        assert!(dataframe.column("status").is_ok());
+        assert!(dataframe
+            .column("continuous_ranked_probability_score")
+            .is_ok());
+        assert!(dataframe.column("directional_accuracy").is_ok());
+        assert!(dataframe.column("quantile_coverage").is_ok());
+        assert!(dataframe.column("drift_status").is_ok());
+        assert!(dataframe.column("stage_counts").is_ok());
+        assert!(dataframe.column("started_at").is_ok());
+        assert!(dataframe.column("completed_at").is_ok());
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_empty() {
+        let dataframe = create_model_run_dataframe(&[]).unwrap();
+        assert_eq!(dataframe.height(), 0);
+        assert_eq!(dataframe.width(), 16);
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_serializes_stage_counts_as_string() {
+        let model_runs = sample_model_runs();
+        let dataframe = create_model_run_dataframe(&model_runs).unwrap();
+        let stage_counts_series = dataframe.column("stage_counts").unwrap();
+        assert_eq!(stage_counts_series.dtype(), &DataType::String);
     }
 
     #[test]
