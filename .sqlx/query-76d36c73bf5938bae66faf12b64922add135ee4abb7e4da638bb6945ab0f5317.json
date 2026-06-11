@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) VALUES ($1, $2, now()) ON CONFLICT (consumer_name) DO UPDATE SET last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), updated_at = EXCLUDED.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "76d36c73bf5938bae66faf12b64922add135ee4abb7e4da638bb6945ab0f5317"
+}

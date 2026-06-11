@@ -1,0 +1,68 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, allocation_id, submitted_at, ticker, side, quantity, order_type,\n         limit_price, alpaca_order_id\n         FROM equity_orders\n         ORDER BY submitted_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "allocation_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "submitted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "side",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "quantity",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "order_type",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "limit_price",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 8,
+        "name": "alpaca_order_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "d143bace333212cdd83bb8ccd8b4727e8d40e154394e00401b073af24ce38a1c"
+}

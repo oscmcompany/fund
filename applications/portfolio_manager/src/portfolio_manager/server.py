@@ -26,7 +26,8 @@ logging.basicConfig(
 )
 
 try:
-    _error_log_path = Path("/var/log/fund/portfolio-manager-errors.log")
+    _log_directory = os.environ.get("FUND_LOG_DIR", "/var/log/fund")
+    _error_log_path = Path(_log_directory) / "portfolio-manager-errors.log"
     _error_log_path.parent.mkdir(parents=True, exist_ok=True)
     _error_file_handler = logging.FileHandler(_error_log_path)
     _error_file_handler.setLevel(logging.ERROR)

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE scheduled_jobs\n           SET status = 'pending', claimed_at = NULL\n           WHERE job_name = $1\n             AND status = 'claimed'\n             AND claimed_at < now() - make_interval(secs => $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9c09b65380b242db70db6f30d7abd6fcba216b6e26772a863481c74b7f13d3d"
+}

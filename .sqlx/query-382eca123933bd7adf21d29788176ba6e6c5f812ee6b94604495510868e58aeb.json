@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_runs ( run_id, artifact_key, status, completed_at, continuous_ranked_probability_score, directional_accuracy, quantile_coverage, lookback_days, start_date, end_date, training_data_key, stage_counts, drift_status ) VALUES ($1, $2, 'completed', now(), $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (run_id) DO UPDATE SET artifact_key = EXCLUDED.artifact_key, status = EXCLUDED.status, completed_at = EXCLUDED.completed_at, continuous_ranked_probability_score = EXCLUDED.continuous_ranked_probability_score, directional_accuracy = EXCLUDED.directional_accuracy, quantile_coverage = EXCLUDED.quantile_coverage, lookback_days = EXCLUDED.lookback_days, start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date, training_data_key = EXCLUDED.training_data_key, stage_counts = EXCLUDED.stage_counts, drift_status = EXCLUDED.drift_status",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8",
+        "Float8",
+        "Float8",
+        "Int4",
+        "Date",
+        "Date",
+        "Text",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "382eca123933bd7adf21d29788176ba6e6c5f812ee6b94604495510868e58aeb"
+}

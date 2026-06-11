@@ -10,10 +10,16 @@
 
   # Compute bucket name and secretspec profile at shell/process start time from
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
-  # evaluation time because dotenv runs after Nix evaluates devenv.nix.
+  # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
+  # artifacts live in the same per-profile bucket under models/tide/: the Rust
+  # trainer (tide_model_trainer) writes there and the ensemble inference service
+  # (AppState::from_env) reads there, so training and serving agree in both
+  # dev and production.
   runtimeEnv = ''
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
+    export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$AWS_S3_BUCKET_NAME"
+    export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
   '';
 
   applySchema = ''
@@ -23,8 +29,28 @@
       --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
     echo "Schema applied"
   '';
+
+  # Training lookback window. Read from the environment so it can be overridden
+  # per run (e.g. FUND_LOOKBACK_DAYS=1200 devenv --profile ml ...); a hardcoded
+  # empty default would both shadow the override and break int parsing in the
+  # tide trainer, which only falls back to its own default when the var is
+  # unset, not when it is the empty string.
+  rawLookbackDays = builtins.getEnv "FUND_LOOKBACK_DAYS";
+  lookbackDays =
+    if rawLookbackDays == ""
+    then "365"
+    else rawLookbackDays;
+
+  # Log directory. Production keeps the root-owned /var/log/fund path
+  # (provisioned on the VM, where logrotate and monitoring expect it). Local
+  # development points FUND_LOG_DIR at an XDG state path so file logging works
+  # without sudo.
+  homeDirectory = builtins.getEnv "HOME";
+  fundLogDir =
+    if isProduction
+    then "/var/log/fund"
+    else "${homeDirectory}/.local/state/fund/log";
 in {
-  cachix.enable = false;
   dotenv.enable = true;
 
   languages = {
@@ -105,6 +131,15 @@ in {
       language = "system";
       fail_fast = true;
     };
+    sqlx-prepare-check = {
+      enable = true;
+      name = "Check sqlx query metadata cache";
+      entry = "sqlx-prepare-check";
+      files = "\\.rs$|schema\\.sql$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
   };
 
   env = {
@@ -115,9 +150,17 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
+    # Writable log directory for local file logging (see fundLogDir above)
+    FUND_LOG_DIR = fundLogDir;
+
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";
     PGDATABASE = "fund";
+
+    # sqlx compile-time query checking uses the committed .sqlx/ cache rather
+    # than a live database connection; run `cargo sqlx prepare -- --all-features`
+    # to regenerate the cache after changing queries.
+    SQLX_OFFLINE = "true";
 
     # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
@@ -170,6 +213,7 @@ in {
     postgresql_16
     ruff
     rustup
+    sqlx-cli
     statix
     taplo
     uv
@@ -215,10 +259,31 @@ in {
     echo "Downloading equity details from S3..."
     aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
     echo "Loading equity details into database..."
-    psql -h localhost -p 5432 -d fund <<'SQL'
-      CREATE TEMP TABLE tmp_equity_details (LIKE equity_details INCLUDING ALL);
-      \COPY tmp_equity_details (ticker, sector, industry) FROM '/tmp/equity_details.csv' CSV HEADER
-      INSERT INTO equity_details SELECT * FROM tmp_equity_details
+    # The source CSV is the full listing export (11 columns); stage it verbatim
+    # and project only the columns equity_details keeps. ON_ERROR_STOP makes a
+    # malformed file fail the task instead of silently loading nothing.
+    psql -h localhost -p 5432 -d fund --set ON_ERROR_STOP=on <<'SQL'
+      CREATE TEMP TABLE tmp_equity_details (
+        ticker TEXT,
+        name TEXT,
+        last_sale TEXT,
+        net_change TEXT,
+        percent_change TEXT,
+        market_capitalization TEXT,
+        country TEXT,
+        ipo_year TEXT,
+        volume TEXT,
+        sector TEXT,
+        industry TEXT
+      );
+      \COPY tmp_equity_details FROM '/tmp/equity_details.csv' CSV HEADER
+      INSERT INTO equity_details (ticker, sector, industry)
+        SELECT
+          ticker,
+          COALESCE(NULLIF(sector, '''), 'NOT AVAILABLE'),
+          COALESCE(NULLIF(industry, '''), 'NOT AVAILABLE')
+        FROM tmp_equity_details
+        WHERE ticker IS NOT NULL
         ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
       DROP TABLE tmp_equity_details;
     SQL
@@ -362,7 +427,7 @@ in {
   scripts.rust-lint.exec = ''
     set -euo pipefail
     echo "Running Rust lint checks"
-    cargo clippy --workspace
+    cargo clippy --workspace --all-features --all-targets
     echo "Rust linting completed successfully"
   '';
 
@@ -370,7 +435,7 @@ in {
         set -euo pipefail
         echo "Running Rust tests"
 
-        TEST_ARGS="--workspace --verbose --lib --bins"
+        TEST_ARGS="--workspace --verbose --lib --bins --all-features"
 
         mkdir -p .coverage_output
         export LLVM_COV=$(which llvm-cov)
@@ -393,6 +458,18 @@ in {
 
   scripts.rust-checks.exec = ''
     devenv tasks run checks:rust
+  '';
+
+  scripts.sqlx-prepare-check.exec = ''
+    set -euo pipefail
+    if ! pg_isready -q 2>/dev/null; then
+      echo "sqlx prepare check skipped: database not available"
+      echo "Run 'devenv --profile apps up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
+      exit 0
+    fi
+    echo "Checking sqlx query metadata cache is up to date"
+    cargo sqlx prepare --check -- --all-features
+    echo "sqlx prepare check passed"
   '';
 
   scripts.markdown-checks.exec = ''
@@ -454,6 +531,26 @@ in {
     '{}')"
   '';
 
+  scripts.backfill-bars.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-bars"
+      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+      exit 1
+    fi
+
+    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
+
+    # Fetches grouped daily bars from Massive and writes them straight to S3 as
+    # Hive-partitioned Parquet. No HTTP server or Postgres required: historical
+    # bars are consumed by model training directly from S3.
+    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
+    ${runtimeEnv}
+    secretspec run -- cargo run --no-default-features --features data_manager --bin backfill -- \
+      "$BACKFILL_START_DATE" "$END_DATE"
+  '';
+
   tasks = {
     # --- Python checks (install first, then all others in parallel) ---
 
@@ -507,21 +604,23 @@ in {
 
     # --- Model training ---
 
-    "models:tide:register-blocks".exec = ''
+    # Rust-native TiDE training (burn). Reads bars + details from S3, trains, and
+    # uploads a model.tar.gz the ensemble inference service loads directly. The
+    # former Python/tinygrad workflow and its Prefect block registration are
+    # retired.
+    "models:tide:train".exec = ''
       set -euo pipefail
-      echo "Registering Prefect S3 blocks"
-      secretspec run -- uv run python -m tide.register_blocks
+      echo "Running tide training pipeline (Rust + burn)"
+      ${runtimeEnv}
+      secretspec run -- cargo run --release --no-default-features --features train --bin tide_model_trainer
     '';
 
-    "models:tide:train" = {
-      exec = ''
-        set -euo pipefail
-        export CC=clang
-        echo "Running tide training pipeline"
-        secretspec run -- uv run python -m tide.workflow
-      '';
-      after = ["models:tide:register-blocks"];
-    };
+    # --- Data tasks ---
+
+    # Historical S3 backfill: writes Hive-partitioned parquet that model
+    # training reads directly. Distinct from database:fetch-equity-bars, which
+    # populates the PostgreSQL rolling buffer through the data-manager API.
+    "data:backfill-bars".exec = "backfill-bars";
 
     # --- Database lifecycle tasks ---
     # Create: first-time setup or post-reset recovery after a breaking schema change.
@@ -588,8 +687,10 @@ in {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
-      # Pin to last known-good tinygrad artifact (May 27 artifact is Burn binary, not safetensors)
-      MODEL_VERSION = "2026-05-22-02-34-59-139";
+      # The Rust ensemble service reads Burn-native artifacts; track the most
+      # recent training run rather than pinning (the old pin protected the
+      # retired tinygrad loader from Burn artifacts).
+      MODEL_VERSION = "latest";
     };
 
     scripts.cleanup-services.exec = ''
@@ -634,7 +735,7 @@ in {
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
-          exec secretspec run -- cargo run -p data_manager --release
+          exec secretspec run -- cargo run --no-default-features --features data_manager --bin data_manager --release
         ''
         else ''
           set -euo pipefail
@@ -642,26 +743,27 @@ in {
           ${waitForPostgres}
           ${applySchema}
           ${killPort "8080"}
-          exec secretspec run -- cargo watch -x 'run -p data_manager'
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
         '';
 
-      ensemble-manager.exec = let
-        uvicornCmd = "uv run uvicorn ensemble_manager.server:application --host 0.0.0.0 --port 8082";
-      in
+      # Rust ensemble_manager (Burn): serves predictions over HTTP and consumes
+      # predictions_requested from the Postgres event bus. Replaces the former
+      # Python ensemble_manager (uvicorn/tinygrad).
+      ensemble-manager.exec =
         if isProduction
         then ''
+          set -euo pipefail
           ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
-          export CC=clang
-          exec secretspec run -- ${uvicornCmd}
+          exec secretspec run -- cargo run --no-default-features --features ensemble_manager --bin ensemble_manager --release
         ''
         else ''
+          set -euo pipefail
           ${runtimeEnv}
           ${waitForPostgres}
           ${killPort "8082"}
-          export CC=clang
-          exec secretspec run -- ${uvicornCmd} --reload
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_manager --bin ensemble_manager'
         '';
 
       portfolio-manager.exec = let
@@ -685,28 +787,21 @@ in {
 
   profiles.ml.module = {
     env = {
-      FUND_LOOKBACK_DAYS = "";
+      FUND_LOOKBACK_DAYS = lookbackDays;
       MLFLOW_TRACKING_URI = "";
       PREFECT_API_URL = "";
     };
 
     scripts.train-local.exec = ''
       set -euo pipefail
-      export CC=clang
-      echo "Running local training pipeline"
-      uv run python -m tide.workflow
-    '';
-
-    scripts.deploy-training.exec = ''
-      set -euo pipefail
-      echo "Registering Prefect deployment"
-      uv run python -m tide.deploy
+      echo "Running local training pipeline (Rust + burn)"
+      cargo run --release --no-default-features --features train --bin tide_model_trainer
     '';
   };
 
   enterShell = ''
     ${runtimeEnv}
-    mkdir -p /var/log/fund 2>/dev/null || true
+    mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""

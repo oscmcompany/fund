@@ -1,3 +1,124 @@
-[workspace]
+[package]
+name = "fund"
+version = "0.0.1"
+edition = "2021"
 resolver = "2"
-members = ["applications/data_manager", "libraries/rust"]
+
+[lib]
+name = "fund"
+path = "src/lib.rs"
+
+[[bin]]
+name = "data_manager"
+path = "src/bin/data_manager.rs"
+required-features = ["data_manager"]
+
+[[bin]]
+name = "backfill"
+path = "src/bin/backfill.rs"
+required-features = ["data_manager"]
+
+[[bin]]
+name = "ensemble_manager"
+path = "src/bin/ensemble_manager.rs"
+required-features = ["ensemble_manager"]
+
+[[bin]]
+name = "tide_model_trainer"
+path = "src/bin/tide_model_trainer.rs"
+required-features = ["train"]
+
+[features]
+default = ["data_manager", "ensemble_manager"]
+data_manager = [
+  "dep:chrono-tz",
+  "dep:urlencoding",
+  "dep:tokio-tungstenite",
+  "dep:futures-util",
+]
+ensemble_manager = [
+  "dep:burn",
+  "dep:ndarray",
+  "dep:flate2",
+  "dep:tar",
+  "dep:tempfile",
+]
+# Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
+# and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
+# for epoch shuffling.
+train = ["ensemble_manager", "dep:rand"]
+
+[dependencies]
+# Shared / base (always compiled)
+axum = "0.8.4"
+chrono = { version = "0.4.44", features = ["serde"] }
+polars = { version = "0.51.0", features = [
+  "json",
+  "lazy",
+  "parquet",
+  "temporal",
+  "serde",
+  "strings",
+  "is_in",
+  "semi_anti_join",
+] }
+reqwest = { version = "0.13", features = ["query", "json", "native-tls"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls",
+  "postgres",
+  "chrono",
+  "uuid",
+  "macros",
+  "rust_decimal",
+  "json",
+] }
+tokio = { version = "1.51.1", features = ["full"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["trace"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.23", features = [
+  "env-filter",
+  "fmt",
+  "json",
+] }
+tracing-appender = "0.2"
+aws-config = "1.8.15"
+aws-sdk-s3 = "1.129"
+thiserror = "2.0.3"
+rust_decimal = { version = "1", features = ["serde"] }
+num-traits = "0.2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+# data_manager-only (optional; enabled by the `data_manager` feature)
+chrono-tz = { version = "0.10", optional = true }
+urlencoding = { version = "2.1.3", optional = true }
+tokio-tungstenite = { version = "0.26", features = [
+  "rustls-tls-native-roots",
+], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+# ensemble_manager-only (optional; enabled by the `ensemble_manager` feature).
+# `autodiff` brings the Autodiff backend used by Rust-native training; it adds
+# no runtime cost to the NdArray inference path.
+burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
+ndarray = { version = "0.16", optional = true }
+flate2 = { version = "1.0", optional = true }
+tar = { version = "0.4", optional = true }
+tempfile = { version = "3.27", optional = true }
+
+# train-only (optional; enabled by the `train` feature)
+rand = { version = "0.8", optional = true }
+
+[dev-dependencies]
+aws-credential-types = "1.2.14"
+tower = { version = "0.5", features = ["util"] }
+mockito = "1.7"
+serial_test = "3.4"
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = [
+  "localstack",
+  "postgres",
+] }

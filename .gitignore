@@ -15,8 +15,12 @@ data/
 **/model.tar.gz
 **/*.safetensor
 **/*.json
+!.sqlx/*.json
 .claude/tasks/
 .scratchpad/
 .devenv
 .env
 .understand-anything
+
+# LLVM coverage raw files
+*.profraw

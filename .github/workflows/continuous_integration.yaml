@@ -67,6 +67,8 @@ jobs:
           tasks run checks:base
       - name: Run Rust checks
         if: steps.changes.outputs.rust == 'true'
+        env:
+          SQLX_OFFLINE: "true"
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
           tasks run checks:rust

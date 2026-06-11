@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ea.ticker\n           FROM equity_allocations ea\n           JOIN equity_pairs ep ON ea.equity_pair_id = ep.id\n           WHERE ep.status = 'open'\n           ORDER BY ea.ticker",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "467b6bfa33e65ae0ecb3cfafe5cc62b9914e43671892befb964dc71d7e2e3b21"
+}
