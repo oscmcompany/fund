@@ -427,3 +427,17 @@ BEGIN
     END IF;
 END;
 $do$;
+
+-- Nightly database backup: weekdays at 22:00 UTC (after all nightly exports complete).
+-- Triggers a pg_dump + S3 upload task in data_manager via the jobs channel.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-database') THEN
+        PERFORM cron.schedule(
+            'backup-database',
+            '0 22 * * 1-5',
+            $$SELECT schedule_job('backup-database')$$
+        );
+    END IF;
+END;
+$do$;

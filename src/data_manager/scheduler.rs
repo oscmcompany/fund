@@ -3,6 +3,7 @@ use crate::data_manager::database;
 use crate::data_manager::equity_bars::fetch_and_store;
 use crate::data_manager::export;
 use crate::data_manager::state::State;
+use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::US::Eastern;
 use sqlx::postgres::PgListener;
@@ -194,7 +195,11 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         }
     }
 
-    for export_job in &["export-equity-bars", "export-trading-history"] {
+    for export_job in &[
+        "export-equity-bars",
+        "export-trading-history",
+        "backup-database",
+    ] {
         match database::requeue_stale_claimed_jobs(
             pool,
             export_job,
@@ -301,7 +306,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                     }
                 }
             }
-            "export-equity-bars" | "export-trading-history" => {
+            "export-equity-bars" | "export-trading-history" | "backup-database" => {
                 info!("Received NOTIFY for {}", payload);
 
                 let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
@@ -348,11 +353,77 @@ async fn run_export_job(
     match job_name {
         "export-equity-bars" => export::export_equity_bars(state, export_date).await,
         "export-trading-history" => export::export_equity_trading_history(state, export_date).await,
+        "backup-database" => run_backup_job(state).await,
         _ => {
             let message = format!("Unknown export job: {}", job_name);
             Err(message)
         }
     }
+}
+
+/// Runs a full pg_dump of the `fund` database, compresses the output with gzip,
+/// and uploads the result to S3.
+///
+/// The S3 key defaults to `database/backups/fund-latest.dump.gz` and can be
+/// overridden with the `AWS_S3_DATABASE_BACKUP_KEY` environment variable.
+/// Returns the number of bytes uploaded.
+async fn run_backup_job(state: &State) -> Result<usize, String> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set for database backup".to_string())?;
+
+    let backup_key = std::env::var("AWS_S3_DATABASE_BACKUP_KEY")
+        .unwrap_or_else(|_| "database/backups/fund-latest.dump.gz".to_string());
+
+    info!("Starting database backup to {}", backup_key);
+
+    let dump_path = "/tmp/fund-backup.dump";
+    let dump_gz_path = "/tmp/fund-backup.dump.gz";
+
+    let dump_status = tokio::process::Command::new("pg_dump")
+        .args(["--format=custom", "--file", dump_path, &database_url])
+        .status()
+        .await
+        .map_err(|error| format!("Failed to spawn pg_dump: {}", error))?;
+
+    if !dump_status.success() {
+        let message = format!("pg_dump exited with status {}", dump_status);
+        return Err(message);
+    }
+
+    let gzip_status = tokio::process::Command::new("gzip")
+        .args(["--force", dump_path])
+        .status()
+        .await
+        .map_err(|error| format!("Failed to spawn gzip: {}", error))?;
+
+    if !gzip_status.success() {
+        let message = format!("gzip exited with status {}", gzip_status);
+        return Err(message);
+    }
+
+    let compressed = tokio::fs::read(dump_gz_path)
+        .await
+        .map_err(|error| format!("Failed to read {}: {}", dump_gz_path, error))?;
+
+    let byte_count = compressed.len();
+
+    state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&backup_key)
+        .body(ByteStream::from(compressed))
+        .send()
+        .await
+        .map_err(|error| format!("Failed to upload backup to S3 {}: {}", backup_key, error))?;
+
+    let _ = tokio::fs::remove_file(dump_gz_path).await;
+
+    info!(
+        "Database backup uploaded, byte_count: {}, key: {}",
+        byte_count, backup_key
+    );
+    Ok(byte_count)
 }
 
 #[cfg(test)]
@@ -493,6 +564,60 @@ mod tests {
             sync_date.as_naive_date(),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_run_backup_job_returns_error_when_database_url_missing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use crate::data_manager::state::{MassiveSecrets, State};
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            // Ensure DATABASE_URL is unset so run_backup_job returns early with an error.
+            let original_database_url = std::env::var("DATABASE_URL").ok();
+            unsafe {
+                std::env::remove_var("DATABASE_URL");
+            }
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = run_export_job(&state, "backup-database", date).await;
+
+            unsafe {
+                match original_database_url {
+                    Some(value) => std::env::set_var("DATABASE_URL", value),
+                    None => std::env::remove_var("DATABASE_URL"),
+                }
+            }
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("DATABASE_URL not set"));
+        });
     }
 
     #[test]

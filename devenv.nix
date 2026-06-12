@@ -12,9 +12,8 @@
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
   # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
   # artifacts live in the same per-profile bucket under models/tide/: the Rust
-  # trainer (tide_model_trainer) writes there and the ensemble inference service
-  # (AppState::from_env) reads there, so training and serving agree in both
-  # dev and production.
+  # tide trainer (tide_model_trainer) writes there and the Rust ensemble service
+  # reads there, so training and serving agree in both dev and production.
   runtimeEnv = ''
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
@@ -221,7 +220,7 @@ in {
   ];
 
   # database:restore — fast recovery from a nightly S3 dump when schema has not changed.
-  # database:create — first-time setup: apply schema, seed equity details, backfill bars.
+  # database:create — first-time setup: apply schema, seed equity details, fetch equity bars.
   # database:reset  — drop and recreate the empty fund database; run before database:create
   #                   after a breaking schema change.
 
@@ -491,7 +490,7 @@ in {
     set -euo pipefail
     echo "Running TOML checks"
     find . \
-      \( -path "./.devenv" -o -path "./target" -o -path "./.venv" -o -path "./models/tide/.devenv" \) -prune \
+      \( -path "./.devenv" -o -path "./target" -o -path "./.venv" \) -prune \
       -o -name "*.toml" -print \
       | xargs taplo fmt --check --no-auto-config
     echo "TOML checks completed successfully"
@@ -507,7 +506,7 @@ in {
   scripts.nix-lint.exec = ''
     set -euo pipefail
     echo "Checking Nix code formatting"
-    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target --exclude ./models/tide/.devenv .
+    alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target .
     echo "Nix formatting check passed"
     echo "Running Nix static analysis"
     statix check -c .statix.toml .
@@ -531,11 +530,11 @@ in {
     '{}')"
   '';
 
-  scripts.backfill-bars.exec = ''
+  scripts.backfill-equity-bars.exec = ''
     set -euo pipefail
 
     if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-bars"
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-equity-bars"
       echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
       exit 1
     fi
@@ -620,22 +619,34 @@ in {
     # Historical S3 backfill: writes Hive-partitioned parquet that model
     # training reads directly. Distinct from database:fetch-equity-bars, which
     # populates the PostgreSQL rolling buffer through the data-manager API.
-    "data:backfill-bars".exec = "backfill-bars";
+    "data:backfill-equity-bars".exec = "backfill-equity-bars";
 
     # --- Database lifecycle tasks ---
-    # Create: first-time setup or post-reset recovery after a breaking schema change.
-    #   Applies schema, then seeds equity details, then backfills equity bars.
-    #   Requires BACKFILL_START_DATE=YYYY-MM-DD (and optionally BACKFILL_END_DATE).
-    # Update: automatic on each process start via applySchema in data-manager.exec.
-    #   Safe for additive changes; loud failure for breaking changes.
-    # Restore: fast recovery from a nightly S3 dump (schema must match the dump).
+    # Three lifecycle modes:
+    #   Create  — build a working database from scratch (schema change or fresh VM).
+    #   Update  — automatic on each data-manager start; safe for additive schema changes.
+    #   Restore — fast recovery from the nightly S3 dump when schema has not changed.
 
+    # Drops and recreates the empty fund database. Run before database:create when
+    # recovering from a breaking schema change.
     "database:reset".exec = "database-reset";
+
+    # Downloads the nightly pg_dump from S3 and restores the full database: equity
+    # bars, details, predictions, model runs, and all trading history. Fast, but
+    # requires the schema to match the dump exactly.
     "database:restore".exec = "database-restore";
+
+    # Dumps the live database and uploads it to S3. Also runs automatically via
+    # pg_cron at 22:00 UTC on weekdays after all nightly exports complete.
     "database:backup".exec = "database-backup";
+
     "database:fetch-equity-details".exec = "database-fetch-equity-details";
     "database:fetch-equity-bars".exec = "database-fetch-equity-bars";
 
+    # Builds an inference-ready database from scratch: applies the schema, seeds
+    # equity details, and backfills equity bars from the live API. Use after
+    # database:reset when the schema has changed or on a fresh VM. No trading
+    # history is restored. Requires BACKFILL_START_DATE=YYYY-MM-DD.
     "database:create".exec = ''
       set -euo pipefail
       if [ -z "''${BACKFILL_START_DATE:-}" ]; then
@@ -746,9 +757,8 @@ in {
           exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
         '';
 
-      # Rust ensemble_manager (Burn): serves predictions over HTTP and consumes
-      # predictions_requested from the Postgres event bus. Replaces the former
-      # Python ensemble_manager (uvicorn/tinygrad).
+      # ensemble_manager: serves predictions over HTTP and consumes
+      # predictions_requested from the Postgres event bus.
       ensemble-manager.exec =
         if isProduction
         then ''
@@ -835,11 +845,14 @@ in {
       echo "    checks:sql                     SQL lint (PostgreSQL)"
       echo "    checks:nix                     Nix checks (alejandra + statix)"
       echo "    database:create                First-time setup: apply schema + seed details + fetch bars"
-      echo "    database:reset                 Drop and recreate empty fund database"
-      echo "    database:restore               Restore from nightly S3 dump"
-      echo "    database:backup                Dump fund database and upload to S3"
+      echo "                                   (use when schema changed or starting fresh)"
+      echo "    database:reset                 Drop and recreate the empty fund database"
+      echo "                                   (run before database:create after a breaking schema change)"
+      echo "    database:restore               Restore from nightly S3 dump (fast recovery, schema must match)"
+      echo "    database:backup                Dump fund database and upload to S3 (also runs nightly at 22:00 UTC)"
       echo "    database:fetch-equity-details  Seed equity_details from S3 CSV"
-      echo "    database:fetch-equity-bars     Backfill equity bars (requires BACKFILL_START_DATE)"
+      echo "    database:fetch-equity-bars     Backfill equity bars into PostgreSQL (requires BACKFILL_START_DATE)"
+      echo "    data:backfill-equity-bars      Backfill equity bars to S3 Parquet for training (requires BACKFILL_START_DATE)"
       echo "    models:tide:train              Train tide model and upload artifacts"
       echo ""
       echo "  Utilities:"
