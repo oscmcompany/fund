@@ -371,6 +371,9 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     let database_url = std::env::var("DATABASE_URL")
         .map_err(|_| "DATABASE_URL not set for database backup".to_string())?;
 
+    let (host, username, port, dbname, password) = parse_postgres_url(&database_url)
+        .map_err(|error| format!("Failed to parse DATABASE_URL for pg_dump: {}", error))?;
+
     let backup_key = std::env::var("AWS_S3_DATABASE_BACKUP_KEY")
         .unwrap_or_else(|_| "database/backups/fund-latest.dump.gz".to_string());
 
@@ -380,12 +383,26 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     let dump_gz_path = "/tmp/fund-backup.dump.gz";
 
     let dump_status = tokio::process::Command::new("pg_dump")
-        .args(["--format=custom", "--file", dump_path, &database_url])
+        .args([
+            "--format=custom",
+            "--file",
+            dump_path,
+            "--host",
+            &host,
+            "--port",
+            &port.to_string(),
+            "--username",
+            &username,
+            "--dbname",
+            &dbname,
+        ])
+        .env("PGPASSWORD", &password)
         .status()
         .await
         .map_err(|error| format!("Failed to spawn pg_dump: {}", error))?;
 
     if !dump_status.success() {
+        let _ = tokio::fs::remove_file(dump_path).await;
         let message = format!("pg_dump exited with status {}", dump_status);
         return Err(message);
     }
@@ -394,28 +411,38 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
         .args(["--force", dump_path])
         .status()
         .await
-        .map_err(|error| format!("Failed to spawn gzip: {}", error))?;
+        .map_err(|error| {
+            let _ = std::fs::remove_file(dump_path);
+            format!("Failed to spawn gzip: {}", error)
+        })?;
 
     if !gzip_status.success() {
+        let _ = tokio::fs::remove_file(dump_path).await;
         let message = format!("gzip exited with status {}", gzip_status);
         return Err(message);
     }
 
-    let compressed = tokio::fs::read(dump_gz_path)
+    let byte_count = tokio::fs::metadata(dump_gz_path)
         .await
-        .map_err(|error| format!("Failed to read {}: {}", dump_gz_path, error))?;
+        .map_err(|error| format!("Failed to stat {}: {}", dump_gz_path, error))?
+        .len() as usize;
 
-    let byte_count = compressed.len();
+    let body = ByteStream::from_path(dump_gz_path)
+        .await
+        .map_err(|error| format!("Failed to open {} for upload: {}", dump_gz_path, error))?;
 
     state
         .s3_client
         .put_object()
         .bucket(&state.bucket_name)
         .key(&backup_key)
-        .body(ByteStream::from(compressed))
+        .body(body)
         .send()
         .await
-        .map_err(|error| format!("Failed to upload backup to S3 {}: {}", backup_key, error))?;
+        .map_err(|error| {
+            let _ = std::fs::remove_file(dump_gz_path);
+            format!("Failed to upload backup to S3 {}: {}", backup_key, error)
+        })?;
 
     let _ = tokio::fs::remove_file(dump_gz_path).await;
 
@@ -426,12 +453,86 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     Ok(byte_count)
 }
 
+/// Parses a PostgreSQL connection URL into its components.
+///
+/// Returns `(host, username, port, dbname, password)`.
+/// Supports `postgres://` and `postgresql://` schemes.
+fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String), String> {
+    let without_scheme = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .ok_or_else(|| "DATABASE_URL must start with postgres:// or postgresql://".to_string())?;
+
+    let (userinfo, rest) = without_scheme
+        .split_once('@')
+        .ok_or_else(|| "DATABASE_URL missing '@' separator".to_string())?;
+
+    let (hostinfo, dbname) = rest
+        .split_once('/')
+        .ok_or_else(|| "DATABASE_URL missing database name after '/'".to_string())?;
+
+    let (username, password) = userinfo
+        .split_once(':')
+        .ok_or_else(|| "DATABASE_URL missing ':' between username and password".to_string())?;
+
+    let (host, port_str) = hostinfo.split_once(':').unwrap_or((hostinfo, "5432"));
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("DATABASE_URL has invalid port: '{}'", port_str))?;
+
+    Ok((
+        host.to_string(),
+        username.to_string(),
+        port,
+        dbname.to_string(),
+        password.to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{duration_until_next_sync, prior_trading_day, run_export_job, sync_date_for};
+    use super::{
+        duration_until_next_sync, parse_postgres_url, prior_trading_day, run_export_job,
+        sync_date_for,
+    };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use std::time::Duration;
+
+    /// RAII guard that removes an environment variable for the duration of a test
+    /// and restores the original value (or absence) on drop.
+    ///
+    /// Tests using this guard must be marked `#[serial_test::serial]` to prevent
+    /// concurrent mutation of the process environment.
+    struct EnvironmentVariableGuard {
+        name: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvironmentVariableGuard {
+        /// Removes `name` from the environment and returns a guard that restores it on drop.
+        fn remove(name: &'static str) -> Self {
+            let original = std::env::var(name).ok();
+            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            unsafe {
+                std::env::remove_var(name);
+            }
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            unsafe {
+                match self.original.as_ref() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_duration_until_next_sync_is_positive() {
@@ -579,10 +680,8 @@ mod tests {
             use aws_sdk_s3::config::Region;
 
             // Ensure DATABASE_URL is unset so run_backup_job returns early with an error.
-            let original_database_url = std::env::var("DATABASE_URL").ok();
-            unsafe {
-                std::env::remove_var("DATABASE_URL");
-            }
+            // The guard restores the original value (or absence) when it drops.
+            let _database_url_guard = EnvironmentVariableGuard::remove("DATABASE_URL");
 
             let credentials =
                 Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
@@ -608,16 +707,55 @@ mod tests {
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = run_export_job(&state, "backup-database", date).await;
 
-            unsafe {
-                match original_database_url {
-                    Some(value) => std::env::set_var("DATABASE_URL", value),
-                    None => std::env::remove_var("DATABASE_URL"),
-                }
-            }
-
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("DATABASE_URL not set"));
         });
+    }
+
+    #[test]
+    fn test_parse_postgres_url_full_url() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://alice:s3cr3t@db.example.com:5433/mydb").unwrap();
+        assert_eq!(host, "db.example.com");
+        assert_eq!(username, "alice");
+        assert_eq!(port, 5433);
+        assert_eq!(dbname, "mydb");
+        assert_eq!(password, "s3cr3t");
+    }
+
+    #[test]
+    fn test_parse_postgres_url_defaults_port_to_5432() {
+        let (host, _, port, _, _) =
+            parse_postgres_url("postgres://user:pass@localhost/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn test_parse_postgres_url_postgresql_scheme() {
+        let result = parse_postgres_url("postgresql://user:pass@host/db");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_postgres_url_invalid_scheme_returns_error() {
+        let result = parse_postgres_url("mysql://user:pass@host/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("postgres:// or postgresql://"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_missing_at_returns_error() {
+        let result = parse_postgres_url("postgres://user:passhost/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("'@'"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_missing_dbname_returns_error() {
+        let result = parse_postgres_url("postgres://user:pass@host");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("database name"));
     }
 
     #[test]

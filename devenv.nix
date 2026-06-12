@@ -227,8 +227,9 @@ in {
   scripts.database-restore.exec = ''
     set -euo pipefail
     ${runtimeEnv}
+    BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
     echo "Downloading database backup from S3..."
-    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/database/backups/fund-latest.dump.gz" /tmp/fund-latest.dump.gz
+    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY" /tmp/fund-latest.dump.gz
     rm -f /tmp/fund-latest.dump
     gunzip /tmp/fund-latest.dump.gz
     psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_pre_restore();"
@@ -243,11 +244,12 @@ in {
   scripts.database-backup.exec = ''
     set -euo pipefail
     ${runtimeEnv}
+    BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
     echo "Creating database backup..."
     pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
     gzip -f /tmp/fund-latest.dump
     echo "Uploading backup to S3..."
-    aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/database/backups/fund-latest.dump.gz"
+    aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
     rm -f /tmp/fund-latest.dump.gz
     echo "Database backup complete"
   '';
@@ -580,7 +582,7 @@ in {
       after = ["checks:python:install"];
     };
 
-    # --- Rust checks (sequential to reuse compilation artifacts) ---
+    # --- Rust checks (lint and test run in parallel after format) ---
 
     "checks:rust:format".exec = "rust-format";
 
@@ -590,7 +592,7 @@ in {
     };
     "checks:rust:test" = {
       exec = "rust-test";
-      after = ["checks:rust:lint"];
+      after = ["checks:rust:format"];
     };
 
     # --- Standalone checks ---
