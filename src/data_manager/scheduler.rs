@@ -3,6 +3,7 @@ use crate::data_manager::database;
 use crate::data_manager::equity_bars::fetch_and_store;
 use crate::data_manager::export;
 use crate::data_manager::state::State;
+use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::US::Eastern;
 use sqlx::postgres::PgListener;
@@ -194,7 +195,11 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         }
     }
 
-    for export_job in &["export-equity-bars", "export-trading-history"] {
+    for export_job in &[
+        "export-equity-bars",
+        "export-trading-history",
+        "backup-database",
+    ] {
         match database::requeue_stale_claimed_jobs(
             pool,
             export_job,
@@ -301,7 +306,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
                     }
                 }
             }
-            "export-equity-bars" | "export-trading-history" => {
+            "export-equity-bars" | "export-trading-history" | "backup-database" => {
                 info!("Received NOTIFY for {}", payload);
 
                 let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
@@ -348,6 +353,7 @@ async fn run_export_job(
     match job_name {
         "export-equity-bars" => export::export_equity_bars(state, export_date).await,
         "export-trading-history" => export::export_equity_trading_history(state, export_date).await,
+        "backup-database" => run_backup_job(state).await,
         _ => {
             let message = format!("Unknown export job: {}", job_name);
             Err(message)
@@ -355,12 +361,178 @@ async fn run_export_job(
     }
 }
 
+/// Runs a full pg_dump of the `fund` database, compresses the output with gzip,
+/// and uploads the result to S3.
+///
+/// The S3 key defaults to `database/backups/fund-latest.dump.gz` and can be
+/// overridden with the `AWS_S3_DATABASE_BACKUP_KEY` environment variable.
+/// Returns the number of bytes uploaded.
+async fn run_backup_job(state: &State) -> Result<usize, String> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set for database backup".to_string())?;
+
+    let (host, username, port, dbname, password) = parse_postgres_url(&database_url)
+        .map_err(|error| format!("Failed to parse DATABASE_URL for pg_dump: {}", error))?;
+
+    let backup_key = std::env::var("AWS_S3_DATABASE_BACKUP_KEY")
+        .unwrap_or_else(|_| "database/backups/fund-latest.dump.gz".to_string());
+
+    info!("Starting database backup to {}", backup_key);
+
+    let dump_path = "/tmp/fund-backup.dump";
+    let dump_gz_path = "/tmp/fund-backup.dump.gz";
+
+    let dump_status = tokio::process::Command::new("pg_dump")
+        .args([
+            "--format=custom",
+            "--file",
+            dump_path,
+            "--host",
+            &host,
+            "--port",
+            &port.to_string(),
+            "--username",
+            &username,
+            "--dbname",
+            &dbname,
+        ])
+        .env("PGPASSWORD", &password)
+        .status()
+        .await
+        .map_err(|error| format!("Failed to spawn pg_dump: {}", error))?;
+
+    if !dump_status.success() {
+        let _ = tokio::fs::remove_file(dump_path).await;
+        let message = format!("pg_dump exited with status {}", dump_status);
+        return Err(message);
+    }
+
+    let gzip_status = tokio::process::Command::new("gzip")
+        .args(["--force", dump_path])
+        .status()
+        .await
+        .map_err(|error| {
+            let _ = std::fs::remove_file(dump_path);
+            format!("Failed to spawn gzip: {}", error)
+        })?;
+
+    if !gzip_status.success() {
+        let _ = tokio::fs::remove_file(dump_path).await;
+        let message = format!("gzip exited with status {}", gzip_status);
+        return Err(message);
+    }
+
+    let byte_count = tokio::fs::metadata(dump_gz_path)
+        .await
+        .map_err(|error| format!("Failed to stat {}: {}", dump_gz_path, error))?
+        .len() as usize;
+
+    let body = ByteStream::from_path(dump_gz_path)
+        .await
+        .map_err(|error| format!("Failed to open {} for upload: {}", dump_gz_path, error))?;
+
+    state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(&backup_key)
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            let _ = std::fs::remove_file(dump_gz_path);
+            format!("Failed to upload backup to S3 {}: {}", backup_key, error)
+        })?;
+
+    let _ = tokio::fs::remove_file(dump_gz_path).await;
+
+    info!(
+        "Database backup uploaded, byte_count: {}, key: {}",
+        byte_count, backup_key
+    );
+    Ok(byte_count)
+}
+
+/// Parses a PostgreSQL connection URL into its components.
+///
+/// Returns `(host, username, port, dbname, password)`.
+/// Supports `postgres://` and `postgresql://` schemes.
+fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String), String> {
+    let without_scheme = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+        .ok_or_else(|| "DATABASE_URL must start with postgres:// or postgresql://".to_string())?;
+
+    let (userinfo, rest) = without_scheme
+        .split_once('@')
+        .ok_or_else(|| "DATABASE_URL missing '@' separator".to_string())?;
+
+    let (hostinfo, dbname) = rest
+        .split_once('/')
+        .ok_or_else(|| "DATABASE_URL missing database name after '/'".to_string())?;
+
+    let (username, password) = userinfo
+        .split_once(':')
+        .ok_or_else(|| "DATABASE_URL missing ':' between username and password".to_string())?;
+
+    let (host, port_str) = hostinfo.split_once(':').unwrap_or((hostinfo, "5432"));
+
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("DATABASE_URL has invalid port: '{}'", port_str))?;
+
+    Ok((
+        host.to_string(),
+        username.to_string(),
+        port,
+        dbname.to_string(),
+        password.to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{duration_until_next_sync, prior_trading_day, run_export_job, sync_date_for};
+    use super::{
+        duration_until_next_sync, parse_postgres_url, prior_trading_day, run_export_job,
+        sync_date_for,
+    };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use std::time::Duration;
+
+    /// RAII guard that removes an environment variable for the duration of a test
+    /// and restores the original value (or absence) on drop.
+    ///
+    /// Tests using this guard must be marked `#[serial_test::serial]` to prevent
+    /// concurrent mutation of the process environment.
+    struct EnvironmentVariableGuard {
+        name: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvironmentVariableGuard {
+        /// Removes `name` from the environment and returns a guard that restores it on drop.
+        fn remove(name: &'static str) -> Self {
+            let original = std::env::var(name).ok();
+            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            unsafe {
+                std::env::remove_var(name);
+            }
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            unsafe {
+                match self.original.as_ref() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_duration_until_next_sync_is_positive() {
@@ -493,6 +665,97 @@ mod tests {
             sync_date.as_naive_date(),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_run_backup_job_returns_error_when_database_url_missing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use crate::data_manager::state::{MassiveSecrets, State};
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            // Ensure DATABASE_URL is unset so run_backup_job returns early with an error.
+            // The guard restores the original value (or absence) when it drops.
+            let _database_url_guard = EnvironmentVariableGuard::remove("DATABASE_URL");
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = run_export_job(&state, "backup-database", date).await;
+
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("DATABASE_URL not set"));
+        });
+    }
+
+    #[test]
+    fn test_parse_postgres_url_full_url() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://alice:s3cr3t@db.example.com:5433/mydb").unwrap();
+        assert_eq!(host, "db.example.com");
+        assert_eq!(username, "alice");
+        assert_eq!(port, 5433);
+        assert_eq!(dbname, "mydb");
+        assert_eq!(password, "s3cr3t");
+    }
+
+    #[test]
+    fn test_parse_postgres_url_defaults_port_to_5432() {
+        let (host, _, port, _, _) =
+            parse_postgres_url("postgres://user:pass@localhost/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn test_parse_postgres_url_postgresql_scheme() {
+        let result = parse_postgres_url("postgresql://user:pass@host/db");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_postgres_url_invalid_scheme_returns_error() {
+        let result = parse_postgres_url("mysql://user:pass@host/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("postgres:// or postgresql://"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_missing_at_returns_error() {
+        let result = parse_postgres_url("postgres://user:passhost/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("'@'"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_missing_dbname_returns_error() {
+        let result = parse_postgres_url("postgres://user:pass@host");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("database name"));
     }
 
     #[test]
