@@ -285,7 +285,18 @@ pub async fn fetch_latest_portfolio_net_asset_value(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|record| record.net_asset_value.to_f64()))
+    match row {
+        None => Ok(None),
+        Some(record) => {
+            let net_asset_value = record.net_asset_value.to_f64().ok_or_else(|| {
+                sqlx::Error::Decode(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "net_asset_value cannot be represented as f64",
+                )))
+            })?;
+            Ok(Some(net_asset_value))
+        }
+    }
 }
 
 /// Inserts a new equity rebalance session record.
@@ -318,7 +329,7 @@ pub async fn update_rebalance_session_status(
     status: &RebalanceSessionStatus,
     completed_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query!(
+    let result = sqlx::query!(
         "UPDATE equity_rebalance_sessions \
          SET status = $1, completed_at = $2 \
          WHERE id = $3",
@@ -328,6 +339,10 @@ pub async fn update_rebalance_session_status(
     )
     .execute(pool)
     .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
 
     info!(session_id = %session_id, status = status.as_str(), "Rebalance session status updated");
     Ok(())
@@ -367,7 +382,7 @@ pub async fn close_equity_pair(
     pair_id: Uuid,
     closed_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query!(
+    let result = sqlx::query!(
         "UPDATE equity_pairs \
          SET status = 'closed', closed_at = $1, close_reason = 'rebalance' \
          WHERE id = $2",
@@ -376,6 +391,10 @@ pub async fn close_equity_pair(
     )
     .execute(pool)
     .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
 
     info!(pair_id = %pair_id, "Equity pair closed in PostgreSQL");
     Ok(())

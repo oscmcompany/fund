@@ -33,8 +33,11 @@ pub fn variance(values: &[f64], ddof: usize) -> f64 {
     if values.len() <= ddof {
         return 0.0;
     }
-    let m = mean(values);
-    let sum_of_squares: f64 = values.iter().map(|value| (value - m).powi(2)).sum();
+    let mean_value = mean(values);
+    let sum_of_squares: f64 = values
+        .iter()
+        .map(|value| (value - mean_value).powi(2))
+        .sum();
     sum_of_squares / (values.len() - ddof) as f64
 }
 
@@ -98,12 +101,12 @@ pub fn z_score_last(spread: &[f64]) -> f64 {
     if spread.len() < 2 {
         return 0.0;
     }
-    let m = mean(spread);
+    let mean_value = mean(spread);
     let deviation = standard_deviation(spread, 0);
     if deviation.abs() < f64::EPSILON {
         return 0.0;
     }
-    (spread[spread.len() - 1] - m) / deviation
+    (spread[spread.len() - 1] - mean_value) / deviation
 }
 
 #[cfg(test)]

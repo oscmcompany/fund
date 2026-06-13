@@ -166,10 +166,47 @@ impl std::error::Error for PairFillError {}
 /// making a dangling long position unrepresentable.
 #[derive(Debug)]
 pub struct PendingPair {
-    pub long: Order<Pending>,
-    pub short: Order<Pending>,
-    pub long_beta: f64,
-    pub short_beta: f64,
+    long: Order<Pending>,
+    short: Order<Pending>,
+    long_beta: f64,
+    short_beta: f64,
+}
+
+impl PendingPair {
+    /// Constructs a `PendingPair` from two submitted orders and their market betas.
+    pub fn new(
+        long: Order<Pending>,
+        short: Order<Pending>,
+        long_beta: f64,
+        short_beta: f64,
+    ) -> Self {
+        Self {
+            long,
+            short,
+            long_beta,
+            short_beta,
+        }
+    }
+
+    /// Returns a reference to the long (buy) order.
+    pub fn long(&self) -> &Order<Pending> {
+        &self.long
+    }
+
+    /// Returns a reference to the short (sell) order.
+    pub fn short(&self) -> &Order<Pending> {
+        &self.short
+    }
+
+    /// Returns the market beta of the long leg.
+    pub fn long_beta(&self) -> f64 {
+        self.long_beta
+    }
+
+    /// Returns the market beta of the short leg.
+    pub fn short_beta(&self) -> f64 {
+        self.short_beta
+    }
 }
 
 /// A pair where both the long and short legs have been confirmed as filled.

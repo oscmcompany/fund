@@ -124,17 +124,14 @@ fn compute_realized_volatility(
     if closes.len() < 2 {
         return None;
     }
+    if closes.iter().any(|&close_price| close_price <= 0.0) {
+        return None;
+    }
 
     // Percentage daily returns: (price[i] - price[i-1]) / price[i-1]
     let all_returns: Vec<f64> = closes
         .windows(2)
-        .filter_map(|window| {
-            if window[0] <= 0.0 {
-                None
-            } else {
-                Some((window[1] - window[0]) / window[0])
-            }
-        })
+        .map(|window| (window[1] - window[0]) / window[0])
         .collect();
 
     if all_returns.is_empty() {
@@ -308,10 +305,8 @@ mod tests {
     fn test_compute_realized_volatility_nonpositive_price_excluded() {
         let mut closes = HashMap::new();
         closes.insert("AAPL".to_string(), vec![100.0, 0.0, 100.0]);
-        // The window containing a zero price is skipped, leaving too few
-        // valid returns; result depends on how many valid windows exist.
-        // Just verify no panic.
-        let _ = compute_realized_volatility(&closes, "AAPL");
+        // Any non-positive price causes the entire series to be rejected.
+        assert!(compute_realized_volatility(&closes, "AAPL").is_none());
     }
 
     #[test]

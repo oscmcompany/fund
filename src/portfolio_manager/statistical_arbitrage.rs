@@ -36,21 +36,91 @@ pub const TARGET_PAIR_COUNT: usize = 10;
 #[derive(Debug, Clone)]
 pub struct CandidatePair {
     /// Human-readable identifier combining both tickers, e.g. `"AAPL-MSFT"`.
-    pub pair_id: String,
+    pair_id: String,
     /// The leg to buy: the relatively cheap ticker.
-    pub long_ticker: String,
+    long_ticker: String,
     /// The leg to sell short: the relatively expensive ticker.
-    pub short_ticker: String,
+    short_ticker: String,
     /// Standard deviations the current spread has diverged from its historical mean.
-    pub z_score: f64,
+    z_score: f64,
     /// OLS regression slope: shares of the short leg per share of the long leg.
-    pub hedge_ratio: f64,
+    hedge_ratio: f64,
     /// Absolute difference in `ensemble_alpha` between the two legs.
-    pub signal_strength: f64,
+    signal_strength: f64,
     /// Realized daily return volatility of the long leg.
-    pub long_realized_volatility: f64,
+    long_realized_volatility: f64,
     /// Realized daily return volatility of the short leg.
-    pub short_realized_volatility: f64,
+    short_realized_volatility: f64,
+}
+
+impl CandidatePair {
+    /// Constructs a `CandidatePair`, validating that statistical values are finite,
+    /// volatilities are positive, and the two tickers are distinct.
+    ///
+    /// Returns `None` when any invariant is violated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pair_id: String,
+        long_ticker: String,
+        short_ticker: String,
+        z_score: f64,
+        hedge_ratio: f64,
+        signal_strength: f64,
+        long_realized_volatility: f64,
+        short_realized_volatility: f64,
+    ) -> Option<Self> {
+        if !z_score.is_finite()
+            || !hedge_ratio.is_finite()
+            || !signal_strength.is_finite()
+            || long_realized_volatility <= 0.0
+            || short_realized_volatility <= 0.0
+            || long_ticker == short_ticker
+        {
+            return None;
+        }
+        Some(Self {
+            pair_id,
+            long_ticker,
+            short_ticker,
+            z_score,
+            hedge_ratio,
+            signal_strength,
+            long_realized_volatility,
+            short_realized_volatility,
+        })
+    }
+
+    pub fn pair_id(&self) -> &str {
+        &self.pair_id
+    }
+
+    pub fn long_ticker(&self) -> &str {
+        &self.long_ticker
+    }
+
+    pub fn short_ticker(&self) -> &str {
+        &self.short_ticker
+    }
+
+    pub fn z_score(&self) -> f64 {
+        self.z_score
+    }
+
+    pub fn hedge_ratio(&self) -> f64 {
+        self.hedge_ratio
+    }
+
+    pub fn signal_strength(&self) -> f64 {
+        self.signal_strength
+    }
+
+    pub fn long_realized_volatility(&self) -> f64 {
+        self.long_realized_volatility
+    }
+
+    pub fn short_realized_volatility(&self) -> f64 {
+        self.short_realized_volatility
+    }
 }
 
 /// Selects up to `TARGET_PAIR_COUNT` statistical arbitrage pairs from the signals.
@@ -97,9 +167,9 @@ pub fn select_pairs(
             if returns.is_empty() {
                 continue;
             }
-            let return_std: f64 =
+            let mean_squared_return: f64 =
                 returns.iter().map(|r| r.powi(2)).sum::<f64>() / returns.len() as f64;
-            if return_std < f64::EPSILON {
+            if mean_squared_return < f64::EPSILON {
                 continue;
             }
             ticker_returns.push((signal.ticker.clone(), returns));
@@ -187,19 +257,18 @@ pub fn select_pairs(
             let signal_strength = (long_signal.ensemble_alpha - short_signal.ensemble_alpha).abs();
             let rank_score = current_z_score.abs() * signal_strength;
 
-            candidates.push((
-                CandidatePair {
-                    pair_id: format!("{long_ticker}-{short_ticker}"),
-                    long_ticker,
-                    short_ticker,
-                    z_score: current_z_score.abs(),
-                    hedge_ratio,
-                    signal_strength,
-                    long_realized_volatility: long_signal.realized_volatility,
-                    short_realized_volatility: short_signal.realized_volatility,
-                },
-                rank_score,
-            ));
+            if let Some(candidate) = CandidatePair::new(
+                format!("{long_ticker}-{short_ticker}"),
+                long_ticker,
+                short_ticker,
+                current_z_score.abs(),
+                hedge_ratio,
+                signal_strength,
+                long_signal.realized_volatility,
+                short_signal.realized_volatility,
+            ) {
+                candidates.push((candidate, rank_score));
+            }
         }
     }
 
@@ -219,11 +288,11 @@ pub fn select_pairs(
     let mut selected: Vec<CandidatePair> = Vec::new();
 
     for (pair, _) in candidates {
-        if used_tickers.contains(&pair.long_ticker) || used_tickers.contains(&pair.short_ticker) {
+        if used_tickers.contains(pair.long_ticker()) || used_tickers.contains(pair.short_ticker()) {
             continue;
         }
-        used_tickers.insert(pair.long_ticker.clone());
-        used_tickers.insert(pair.short_ticker.clone());
+        used_tickers.insert(pair.long_ticker().to_string());
+        used_tickers.insert(pair.short_ticker().to_string());
         selected.push(pair);
         if selected.len() >= TARGET_PAIR_COUNT {
             break;

@@ -4,6 +4,8 @@
 //! submission, position management, and shortability checks. Authentication
 //! uses the `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` headers.
 
+use std::time::Duration;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -96,7 +98,11 @@ impl AlpacaTradingClient {
             LIVE_BASE_URL.to_string()
         };
         Self {
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to build Alpaca HTTP client"),
             credentials,
             base_url,
         }
@@ -105,7 +111,11 @@ impl AlpacaTradingClient {
     /// Constructs an `AlpacaTradingClient` from a base URL (for testing).
     pub fn with_base_url(credentials: AlpacaCredentials, base_url: String) -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("failed to build Alpaca HTTP client"),
             credentials,
             base_url,
         }
@@ -140,10 +150,22 @@ impl AlpacaTradingClient {
             AlpacaError::Parse(format!("Failed to parse account response: {error}"))
         })?;
 
+        let cash_amount = account
+            .cash
+            .parse::<f64>()
+            .map_err(|error| AlpacaError::Parse(format!("Failed to parse cash amount: {error}")))?;
+        let buying_power = account.buying_power.parse::<f64>().map_err(|error| {
+            AlpacaError::Parse(format!("Failed to parse buying power: {error}"))
+        })?;
+        let equity = account
+            .equity
+            .parse::<f64>()
+            .map_err(|error| AlpacaError::Parse(format!("Failed to parse equity: {error}")))?;
+
         Ok(AccountInfo {
-            cash_amount: account.cash.parse().unwrap_or(0.0),
-            buying_power: account.buying_power.parse().unwrap_or(0.0),
-            equity: account.equity.parse().unwrap_or(0.0),
+            cash_amount,
+            buying_power,
+            equity,
         })
     }
 
@@ -433,7 +455,7 @@ mod tests {
     use mockito::Server;
 
     fn make_credentials() -> AlpacaCredentials {
-        AlpacaCredentials::new("test-key".to_string(), "test-secret".to_string())
+        AlpacaCredentials::new("test-key".to_string(), "test-secret".to_string()).unwrap()
     }
 
     #[test]

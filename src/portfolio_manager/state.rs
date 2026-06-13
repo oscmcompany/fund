@@ -107,7 +107,8 @@ impl AppState {
             message: "ALPACA_SECRET environment variable is not set".to_string(),
         })?;
 
-        let credentials = AlpacaCredentials::new(key_id, secret);
+        let credentials = AlpacaCredentials::new(key_id, secret)
+            .map_err(|error| ConfigError { message: error })?;
 
         // Default to paper trading for safety; require explicit opt-in for live.
         let is_paper = env::var("IS_PAPER")
@@ -140,16 +141,19 @@ impl AppState {
                 message: "Invalid default confidence floor".to_string(),
             })?;
 
+        let beta_tolerance = BetaTolerance::new(DEFAULT_BETA_TOLERANCE)
+            .map_err(|error| ConfigError { message: error })?;
+
         Ok(Self {
             pool,
             alpaca_client,
             confidence_floor,
-            constraints: Constraints {
+            constraints: Constraints::new(
                 drawdown_threshold,
                 concentration_cap,
                 minimum_pairs,
-                beta_tolerance: BetaTolerance(DEFAULT_BETA_TOLERANCE),
-            },
+                beta_tolerance,
+            ),
         })
     }
 }

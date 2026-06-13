@@ -98,8 +98,8 @@ pub fn annualized_volatility(spy_close_prices: &[f64]) -> Option<f64> {
     if returns.len() < MINIMUM_RETURN_COUNT {
         return None;
     }
-    let m = mean(&returns);
-    if !m.is_finite() {
+    let mean_value = mean(&returns);
+    if !mean_value.is_finite() {
         return None;
     }
     Some(standard_deviation(&returns, 1) * TRADING_DAYS_PER_YEAR.sqrt())
@@ -108,15 +108,6 @@ pub fn annualized_volatility(spy_close_prices: &[f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_spy_prices(count: usize, daily_return: f64) -> Vec<f64> {
-        let mut prices = vec![100.0];
-        for _ in 1..count {
-            let last = *prices.last().unwrap();
-            prices.push(last * (1.0 + daily_return));
-        }
-        prices
-    }
 
     #[test]
     fn test_classify_regime_empty_returns_trending() {
@@ -167,8 +158,13 @@ mod tests {
 
     #[test]
     fn test_classify_regime_high_volatility_trending() {
-        // Large monotonic returns → high volatility → trending
-        let prices = make_spy_prices(70, 0.05);
+        // Alternating large shocks → non-trivial volatility well above REGIME_VOLATILITY_THRESHOLD
+        let mut prices = vec![100.0];
+        for index in 0..70 {
+            let last = *prices.last().unwrap();
+            let shock = if index % 2 == 0 { 0.08 } else { -0.06 };
+            prices.push(last * (1.0 + shock));
+        }
         let result = classify_regime(&prices);
         assert_eq!(result.state, Regime::Trending);
     }
@@ -197,10 +193,15 @@ mod tests {
 
     #[test]
     fn test_annualized_volatility_returns_positive() {
-        let prices = make_spy_prices(70, 0.001);
+        // Alternating small shocks → non-zero variance so annualized volatility is positive
+        let mut prices = vec![100.0];
+        for index in 0..70 {
+            let last = *prices.last().unwrap();
+            let shock = if index % 2 == 0 { 0.01 } else { -0.009 };
+            prices.push(last * (1.0 + shock));
+        }
         let result = annualized_volatility(&prices);
         assert!(result.is_some());
-        // Should be very close to 0.001 * sqrt(252) ≈ 0.0159
-        assert!(result.unwrap() >= 0.0);
+        assert!(result.unwrap() > 0.0);
     }
 }

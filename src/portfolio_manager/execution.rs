@@ -6,6 +6,7 @@
 
 use chrono::Utc;
 use rust_decimal::Decimal;
+use tokio::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -70,13 +71,13 @@ pub async fn execute_open_pairs(
         // Submit the short leg first so we know it is borrowable before tying
         // up capital on the long leg.
         let short_alpaca_id = match alpaca
-            .submit_short_order(&sized_pair.short_ticker, sized_pair.short_quantity)
+            .submit_short_order(sized_pair.short_ticker(), sized_pair.short_quantity())
             .await
         {
             Ok(order_id) => order_id,
             Err(error) => {
                 warn!(
-                    ticker = sized_pair.short_ticker.as_str(),
+                    ticker = sized_pair.short_ticker(),
                     error = %error,
                     "Short order submission failed; skipping pair"
                 );
@@ -85,16 +86,24 @@ pub async fn execute_open_pairs(
         };
 
         let long_alpaca_id = match alpaca
-            .submit_long_order(&sized_pair.long_ticker, sized_pair.long_dollar_amount)
+            .submit_long_order(sized_pair.long_ticker(), sized_pair.long_dollar_amount())
             .await
         {
             Ok(order_id) => order_id,
             Err(error) => {
                 warn!(
-                    ticker = sized_pair.long_ticker.as_str(),
+                    ticker = sized_pair.long_ticker(),
                     error = %error,
                     "Long order submission failed; skipping pair"
                 );
+                // Compensate: attempt to close the short leg that already filled.
+                if let Err(close_error) = alpaca.close_position(sized_pair.short_ticker()).await {
+                    warn!(
+                        ticker = sized_pair.short_ticker(),
+                        error = %close_error,
+                        "Compensation close of orphaned short leg failed"
+                    );
+                }
                 continue;
             }
         };
@@ -102,9 +111,9 @@ pub async fn execute_open_pairs(
         let now = Utc::now();
         let short_order = Order::<crate::domain::orders::Pending>::new(
             Uuid::new_v4(),
-            sized_pair.short_ticker.clone(),
+            sized_pair.short_ticker().to_string(),
             OrderSide::Short,
-            Decimal::from(sized_pair.short_quantity),
+            Decimal::from(sized_pair.short_quantity()),
             "market".to_string(),
             None,
             short_alpaca_id,
@@ -112,7 +121,7 @@ pub async fn execute_open_pairs(
         );
         let long_order = Order::<crate::domain::orders::Pending>::new(
             Uuid::new_v4(),
-            sized_pair.long_ticker.clone(),
+            sized_pair.long_ticker().to_string(),
             OrderSide::Long,
             // Long quantity is notional; use 0 as a placeholder until fill.
             Decimal::ZERO,
@@ -122,17 +131,14 @@ pub async fn execute_open_pairs(
             now,
         );
 
-        let pending_pair = PendingPair {
-            long: long_order,
-            short: short_order,
-            long_beta: sized_pair.long_market_beta,
-            short_beta: sized_pair.short_market_beta,
-        };
-
-        info!(
-            pair_id = sized_pair.pair_id.as_str(),
-            "Orders submitted for pair"
+        let pending_pair = PendingPair::new(
+            long_order,
+            short_order,
+            sized_pair.long_market_beta(),
+            sized_pair.short_market_beta(),
         );
+
+        info!(pair_id = sized_pair.pair_id(), "Orders submitted for pair");
         results.push((pending_pair, sized_pair.clone()));
     }
 
@@ -153,20 +159,17 @@ pub async fn confirm_fills(
     let mut results = Vec::new();
 
     for (pending_pair, sized_pair) in pending_pairs {
-        let long_fill = poll_fill(alpaca, &pending_pair.long.alpaca_order_id).await;
-        let short_fill = poll_fill(alpaca, &pending_pair.short.alpaca_order_id).await;
+        let long_fill = poll_fill(alpaca, &pending_pair.long().alpaca_order_id).await;
+        let short_fill = poll_fill(alpaca, &pending_pair.short().alpaca_order_id).await;
 
         match pending_pair.confirm(long_fill, short_fill) {
             Ok(filled_pair) => {
-                info!(
-                    pair_id = sized_pair.pair_id.as_str(),
-                    "Pair fills confirmed"
-                );
+                info!(pair_id = sized_pair.pair_id(), "Pair fills confirmed");
                 results.push((filled_pair, sized_pair));
             }
             Err(error) => {
                 warn!(
-                    pair_id = sized_pair.pair_id.as_str(),
+                    pair_id = sized_pair.pair_id(),
                     error = %error,
                     "Pair fill confirmation failed; pair dropped"
                 );
@@ -225,6 +228,7 @@ async fn poll_fill(alpaca: &AlpacaTradingClient, alpaca_order_id: &str) -> Optio
                 );
             }
         }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     warn!(
@@ -244,6 +248,8 @@ pub async fn close_positions(
     alpaca: &AlpacaTradingClient,
     tickers: &[String],
 ) -> Result<(), ExecutionError> {
+    let mut first_error: Option<ExecutionError> = None;
+
     for ticker in tickers {
         match alpaca.close_position(ticker).await {
             Ok(true) => {
@@ -261,14 +267,20 @@ pub async fn close_positions(
                     error = %error,
                     "Position close failed; continuing with remaining tickers"
                 );
-                return Err(ExecutionError::PositionClose {
-                    ticker: ticker.clone(),
-                    source: error,
-                });
+                if first_error.is_none() {
+                    first_error = Some(ExecutionError::PositionClose {
+                        ticker: ticker.clone(),
+                        source: error,
+                    });
+                }
             }
         }
     }
-    Ok(())
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]

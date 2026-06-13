@@ -35,31 +35,128 @@ const OPTIMIZER_LEARNING_RATE: f64 = 0.01;
 #[derive(Debug, Clone)]
 pub struct SizedPair {
     /// Human-readable pair identifier, e.g. `"AAPL-MSFT"`.
-    pub pair_id: String,
+    pair_id: String,
     /// Ticker symbol for the long leg.
-    pub long_ticker: String,
+    long_ticker: String,
     /// Ticker symbol for the short leg.
-    pub short_ticker: String,
+    short_ticker: String,
     /// Long notional dollar amount (matched to `short_dollar_amount` for dollar neutrality).
-    pub long_dollar_amount: f64,
+    long_dollar_amount: f64,
     /// Short notional dollar amount after whole-share rounding.
-    pub short_dollar_amount: f64,
+    short_dollar_amount: f64,
     /// Whole-share count for the short leg (Alpaca SELL orders require whole shares).
-    pub short_quantity: i64,
+    short_quantity: i64,
     /// Latest close price used as the long leg entry price.
-    pub long_entry_price: f64,
+    long_entry_price: f64,
     /// Latest close price used as the short leg entry price.
-    pub short_entry_price: f64,
+    short_entry_price: f64,
     /// Z-score at pair selection time.
-    pub z_score: f64,
+    z_score: f64,
     /// OLS hedge ratio at pair selection time.
-    pub hedge_ratio: f64,
+    hedge_ratio: f64,
     /// Ensemble alpha signal strength differential.
-    pub signal_strength: f64,
+    signal_strength: f64,
     /// Market beta of the long leg.
-    pub long_market_beta: f64,
+    long_market_beta: f64,
     /// Market beta of the short leg.
-    pub short_market_beta: f64,
+    short_market_beta: f64,
+}
+
+impl SizedPair {
+    /// Constructs a `SizedPair`, validating that amounts are non-negative and
+    /// `short_quantity` is positive.
+    ///
+    /// Returns `Err(SizingError::InsufficientPairs)` when validation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        pair_id: String,
+        long_ticker: String,
+        short_ticker: String,
+        long_dollar_amount: f64,
+        short_dollar_amount: f64,
+        short_quantity: i64,
+        long_entry_price: f64,
+        short_entry_price: f64,
+        z_score: f64,
+        hedge_ratio: f64,
+        signal_strength: f64,
+        long_market_beta: f64,
+        short_market_beta: f64,
+    ) -> Result<Self, SizingError> {
+        if long_dollar_amount < 0.0 || short_dollar_amount < 0.0 || short_quantity <= 0 {
+            return Err(SizingError::InsufficientPairs {
+                found: 0,
+                required: REQUIRED_PAIRS,
+            });
+        }
+        Ok(Self {
+            pair_id,
+            long_ticker,
+            short_ticker,
+            long_dollar_amount,
+            short_dollar_amount,
+            short_quantity,
+            long_entry_price,
+            short_entry_price,
+            z_score,
+            hedge_ratio,
+            signal_strength,
+            long_market_beta,
+            short_market_beta,
+        })
+    }
+
+    pub fn pair_id(&self) -> &str {
+        &self.pair_id
+    }
+
+    pub fn long_ticker(&self) -> &str {
+        &self.long_ticker
+    }
+
+    pub fn short_ticker(&self) -> &str {
+        &self.short_ticker
+    }
+
+    pub fn long_dollar_amount(&self) -> f64 {
+        self.long_dollar_amount
+    }
+
+    pub fn short_dollar_amount(&self) -> f64 {
+        self.short_dollar_amount
+    }
+
+    pub fn short_quantity(&self) -> i64 {
+        self.short_quantity
+    }
+
+    pub fn long_entry_price(&self) -> f64 {
+        self.long_entry_price
+    }
+
+    pub fn short_entry_price(&self) -> f64 {
+        self.short_entry_price
+    }
+
+    pub fn z_score(&self) -> f64 {
+        self.z_score
+    }
+
+    pub fn hedge_ratio(&self) -> f64 {
+        self.hedge_ratio
+    }
+
+    pub fn signal_strength(&self) -> f64 {
+        self.signal_strength
+    }
+
+    pub fn long_market_beta(&self) -> f64 {
+        self.long_market_beta
+    }
+
+    pub fn short_market_beta(&self) -> f64 {
+        self.short_market_beta
+    }
 }
 
 /// Error returned when sizing cannot produce a viable portfolio.
@@ -112,8 +209,11 @@ pub fn size_pairs_with_volatility_parity(
     let feasible: Vec<&CandidatePair> = candidate_pairs
         .iter()
         .filter(|pair| {
-            let long_price = entry_prices.get(&pair.long_ticker).copied().unwrap_or(0.0);
-            let short_price = entry_prices.get(&pair.short_ticker).copied().unwrap_or(0.0);
+            let long_price = entry_prices.get(pair.long_ticker()).copied().unwrap_or(0.0);
+            let short_price = entry_prices
+                .get(pair.short_ticker())
+                .copied()
+                .unwrap_or(0.0);
             long_price > 0.0 && short_price > 0.0 && short_price <= maximum_per_pair_dollar
         })
         .collect();
@@ -125,29 +225,35 @@ pub fn size_pairs_with_volatility_parity(
         });
     }
 
-    let pairs: Vec<&CandidatePair> = feasible.into_iter().take(REQUIRED_PAIRS).collect();
+    let pairs: Vec<&CandidatePair> = feasible.into_iter().collect();
 
     // Volatility parity: inverse-volatility weights.
     let pair_volatilities: Vec<f64> = pairs
         .iter()
         .map(|pair| {
-            ((pair.long_realized_volatility + pair.short_realized_volatility) / 2.0).max(1e-8)
+            ((pair.long_realized_volatility() + pair.short_realized_volatility()) / 2.0).max(1e-8)
         })
         .collect();
 
-    let inverse_volatility_weights: Vec<f64> = pair_volatilities.iter().map(|v| 1.0 / v).collect();
+    let inverse_volatility_weights: Vec<f64> = pair_volatilities
+        .iter()
+        .map(|volatility| 1.0 / volatility)
+        .collect();
     let total_inverse_weight: f64 = inverse_volatility_weights.iter().sum();
     let parity_weights: Vec<f64> = inverse_volatility_weights
         .iter()
-        .map(|w| w / total_inverse_weight)
+        .map(|inverse_weight| inverse_weight / total_inverse_weight)
         .collect();
 
     // Beta-neutral optimization via projected gradient descent.
     let pair_net_betas: Vec<f64> = pairs
         .iter()
         .map(|pair| {
-            let long_beta = market_betas.get(&pair.long_ticker).copied().unwrap_or(0.0);
-            let short_beta = market_betas.get(&pair.short_ticker).copied().unwrap_or(0.0);
+            let long_beta = market_betas.get(pair.long_ticker()).copied().unwrap_or(0.0);
+            let short_beta = market_betas
+                .get(pair.short_ticker())
+                .copied()
+                .unwrap_or(0.0);
             long_beta - short_beta
         })
         .collect();
@@ -159,20 +265,26 @@ pub fn size_pairs_with_volatility_parity(
     let final_weights: Vec<f64> = if weight_sum.abs() < f64::EPSILON {
         parity_weights.clone()
     } else {
-        adjusted_weights.iter().map(|w| w / weight_sum).collect()
+        adjusted_weights
+            .iter()
+            .map(|weight| weight / weight_sum)
+            .collect()
     };
 
     // Compute dollar amounts.
     let raw_dollar_amounts: Vec<f64> = final_weights
         .iter()
-        .map(|w| w * capital_per_leg * exposure_scale)
+        .map(|weight| weight * capital_per_leg * exposure_scale)
         .collect();
 
     // Apply whole-share constraint to short legs and match long to short dollar amount.
     let mut sized_pairs: Vec<SizedPair> = Vec::new();
     for (index, pair) in pairs.iter().enumerate() {
-        let short_price = entry_prices.get(&pair.short_ticker).copied().unwrap_or(0.0);
-        let long_price = entry_prices.get(&pair.long_ticker).copied().unwrap_or(0.0);
+        let short_price = entry_prices
+            .get(pair.short_ticker())
+            .copied()
+            .unwrap_or(0.0);
+        let long_price = entry_prices.get(pair.long_ticker()).copied().unwrap_or(0.0);
         let dollar_amount = raw_dollar_amounts[index];
 
         let short_quantity = (dollar_amount / short_price).floor() as i64;
@@ -183,24 +295,33 @@ pub fn size_pairs_with_volatility_parity(
         let short_dollar_amount = short_quantity as f64 * short_price;
         let long_dollar_amount = short_dollar_amount; // dollar-neutral
 
-        let long_beta = market_betas.get(&pair.long_ticker).copied().unwrap_or(0.0);
-        let short_beta = market_betas.get(&pair.short_ticker).copied().unwrap_or(0.0);
+        let long_beta = market_betas.get(pair.long_ticker()).copied().unwrap_or(0.0);
+        let short_beta = market_betas
+            .get(pair.short_ticker())
+            .copied()
+            .unwrap_or(0.0);
 
-        sized_pairs.push(SizedPair {
-            pair_id: pair.pair_id.clone(),
-            long_ticker: pair.long_ticker.clone(),
-            short_ticker: pair.short_ticker.clone(),
+        // short_quantity > 0 is already verified by the guard above.
+        if let Ok(sized_pair) = SizedPair::new(
+            pair.pair_id().to_string(),
+            pair.long_ticker().to_string(),
+            pair.short_ticker().to_string(),
             long_dollar_amount,
             short_dollar_amount,
             short_quantity,
-            long_entry_price: long_price,
-            short_entry_price: short_price,
-            z_score: pair.z_score,
-            hedge_ratio: pair.hedge_ratio,
-            signal_strength: pair.signal_strength,
-            long_market_beta: long_beta,
-            short_market_beta: short_beta,
-        });
+            long_price,
+            short_price,
+            pair.z_score(),
+            pair.hedge_ratio(),
+            pair.signal_strength(),
+            long_beta,
+            short_beta,
+        ) {
+            sized_pairs.push(sized_pair);
+            if sized_pairs.len() == REQUIRED_PAIRS {
+                break;
+            }
+        }
     }
 
     if sized_pairs.len() < REQUIRED_PAIRS {
@@ -229,29 +350,31 @@ fn optimize_beta_neutral(pair_net_betas: &[f64], parity_weights: &[f64]) -> Vec<
         let net_beta: f64 = weights
             .iter()
             .zip(pair_net_betas.iter())
-            .map(|(w, b)| w * b)
+            .map(|(weight, pair_net_beta_value)| weight * pair_net_beta_value)
             .sum::<f64>()
             / current_sum;
 
         // Gradient of (net_beta)² w.r.t. each weight.
         let gradient: Vec<f64> = pair_net_betas
             .iter()
-            .map(|&b| 2.0 * net_beta * b / current_sum)
+            .map(|&pair_net_beta| 2.0 * net_beta * (pair_net_beta - net_beta) / current_sum)
             .collect();
 
         // Gradient step.
         let stepped: Vec<f64> = weights
             .iter()
             .zip(gradient.iter())
-            .map(|(w, g)| w - OPTIMIZER_LEARNING_RATE * g)
+            .map(|(weight, gradient_component)| {
+                weight - OPTIMIZER_LEARNING_RATE * gradient_component
+            })
             .collect();
 
         // Project into box constraints.
         let projected: Vec<f64> = stepped
             .iter()
             .zip(parity_weights.iter())
-            .map(|(w, &parity)| {
-                w.clamp(
+            .map(|(weight, &parity)| {
+                weight.clamp(
                     BETA_WEIGHT_LOWER_BOUND * parity,
                     BETA_WEIGHT_UPPER_BOUND * parity,
                 )
@@ -265,7 +388,7 @@ fn optimize_beta_neutral(pair_net_betas: &[f64], parity_weights: &[f64]) -> Vec<
         }
         weights = projected
             .iter()
-            .map(|w| w * total_weight / projected_sum)
+            .map(|weight| weight * total_weight / projected_sum)
             .collect();
     }
 
@@ -282,16 +405,17 @@ mod tests {
         long_volatility: f64,
         short_volatility: f64,
     ) -> CandidatePair {
-        CandidatePair {
-            pair_id: format!("{long_ticker}-{short_ticker}"),
-            long_ticker: long_ticker.to_string(),
-            short_ticker: short_ticker.to_string(),
-            z_score: 2.5,
-            hedge_ratio: 1.0,
-            signal_strength: 0.05,
-            long_realized_volatility: long_volatility,
-            short_realized_volatility: short_volatility,
-        }
+        CandidatePair::new(
+            format!("{long_ticker}-{short_ticker}"),
+            long_ticker.to_string(),
+            short_ticker.to_string(),
+            2.5,
+            1.0,
+            0.05,
+            long_volatility,
+            short_volatility,
+        )
+        .expect("test candidate pair should be valid")
     }
 
     fn make_ten_candidates(
@@ -434,8 +558,26 @@ mod tests {
         // Start with weights that produce positive net beta; optimizer should reduce it.
         let net_betas = vec![1.0; 10]; // all pairs have positive net beta
         let parity_weights: Vec<f64> = vec![0.1; 10]; // equal weights
+
+        let weight_sum: f64 = parity_weights.iter().sum();
+        let baseline_net_beta = parity_weights
+            .iter()
+            .zip(net_betas.iter())
+            .map(|(weight, net_beta)| weight * net_beta)
+            .sum::<f64>()
+            / weight_sum;
+
         let optimized = optimize_beta_neutral(&net_betas, &parity_weights);
-        // Weights should all be at the lower bound (optimizer drives weights down uniformly).
+
+        let optimized_sum: f64 = optimized.iter().sum();
+        let optimized_net_beta = optimized
+            .iter()
+            .zip(net_betas.iter())
+            .map(|(weight, net_beta)| weight * net_beta)
+            .sum::<f64>()
+            / optimized_sum;
+
+        assert!(optimized_net_beta.abs() <= baseline_net_beta.abs() + 1e-12);
         assert_eq!(optimized.len(), 10);
         for weight in &optimized {
             assert!(weight.is_finite());

@@ -65,6 +65,8 @@ pub enum RebalanceError {
     PortfolioInvalid(PortfolioError),
     /// Alpaca returned an error during position close or order submission.
     Execution(ExecutionError),
+    /// A numeric type conversion failed (e.g. f64 → Decimal or Decimal → f64).
+    Conversion(String),
 }
 
 impl std::fmt::Display for RebalanceError {
@@ -88,6 +90,9 @@ impl std::fmt::Display for RebalanceError {
                 write!(formatter, "Portfolio validation failed: {error}")
             }
             RebalanceError::Execution(error) => write!(formatter, "Execution error: {error}"),
+            RebalanceError::Conversion(message) => {
+                write!(formatter, "Numeric conversion failed: {message}")
+            }
         }
     }
 }
@@ -147,7 +152,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let (current_equity, buying_power) = check_drawdown(
         alpaca,
         pool,
-        state.constraints().drawdown_threshold.0.value(),
+        state.constraints().drawdown_threshold().0.value(),
     )
     .await?;
 
@@ -185,13 +190,19 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     let total_slippage_cost = persist_filled_pairs(pool, session_id, now, &filled).await?;
 
-    let net_asset_value_decimal = Decimal::try_from(current_equity).unwrap_or(Decimal::ZERO);
+    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
+        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
+    })?;
     insert_portfolio_snapshot(pool, now, net_asset_value_decimal, total_slippage_cost).await?;
     update_rebalance_session_status(pool, session_id, &RebalanceSessionStatus::Completed, now)
         .await?;
 
     let pairs_filled = portfolio.pairs().len();
-    let net_asset_value = net_asset_value_decimal.to_f64().unwrap_or(0.0);
+    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
+        RebalanceError::Conversion(
+            "net_asset_value_decimal cannot be represented as f64".to_string(),
+        )
+    })?;
 
     database::emit_event(
         pool,
@@ -363,7 +374,12 @@ async fn select_size_execute(
 
     let all_tickers: Vec<String> = candidate_pairs
         .iter()
-        .flat_map(|pair| [pair.long_ticker.clone(), pair.short_ticker.clone()])
+        .flat_map(|pair| {
+            [
+                pair.long_ticker().to_string(),
+                pair.short_ticker().to_string(),
+            ]
+        })
         .collect();
 
     let entry_prices = fetch_live_quote_mid_prices(pool, &all_tickers).await?;
@@ -378,7 +394,12 @@ async fn select_size_execute(
 
     let all_sized_tickers: Vec<String> = sized_pairs
         .iter()
-        .flat_map(|pair| [pair.long_ticker.clone(), pair.short_ticker.clone()])
+        .flat_map(|pair| {
+            [
+                pair.long_ticker().to_string(),
+                pair.short_ticker().to_string(),
+            ]
+        })
         .collect();
 
     let shortable = alpaca
@@ -393,7 +414,7 @@ async fn select_size_execute(
 
     let shortable_pairs: Vec<_> = sized_pairs
         .into_iter()
-        .filter(|pair| shortable.contains(&pair.short_ticker))
+        .filter(|pair| shortable.contains(pair.short_ticker()))
         .collect();
 
     let pending = execute_open_pairs(alpaca, &shortable_pairs).await;
@@ -426,11 +447,18 @@ async fn persist_filled_pairs(
     for (filled_pair, sized_pair) in filled {
         let pair_uuid = Uuid::new_v4();
 
-        let z_score_decimal = Decimal::try_from(sized_pair.z_score).unwrap_or(Decimal::ZERO);
-        let hedge_ratio_decimal =
-            Decimal::try_from(sized_pair.hedge_ratio).unwrap_or(Decimal::ZERO);
+        let z_score_decimal = Decimal::try_from(sized_pair.z_score()).map_err(|_| {
+            RebalanceError::Conversion("z_score cannot be represented as Decimal".to_string())
+        })?;
+        let hedge_ratio_decimal = Decimal::try_from(sized_pair.hedge_ratio()).map_err(|_| {
+            RebalanceError::Conversion("hedge_ratio cannot be represented as Decimal".to_string())
+        })?;
         let signal_strength_decimal =
-            Decimal::try_from(sized_pair.signal_strength).unwrap_or(Decimal::ZERO);
+            Decimal::try_from(sized_pair.signal_strength()).map_err(|_| {
+                RebalanceError::Conversion(
+                    "signal_strength cannot be represented as Decimal".to_string(),
+                )
+            })?;
 
         // Tickers in filled_pair come from orders built with validated SizedPair tickers;
         // the UNKNOWN fallback guards against any edge case where the string is malformed.
@@ -442,7 +470,7 @@ async fn persist_filled_pairs(
         let equity_pair = EquityPair::new(
             pair_uuid,
             session_id,
-            sized_pair.pair_id.clone(),
+            sized_pair.pair_id().to_string(),
             long_ticker.clone(),
             short_ticker.clone(),
             z_score_decimal,

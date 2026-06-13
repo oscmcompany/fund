@@ -47,8 +47,8 @@ pub async fn rebalance(Extension(state): Extension<AppState>) -> Response {
         Err(RebalanceError::StalePredictions) => {
             warn!("Rebalance skipped: stale or absent predictions");
             (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Predictions are absent or stale."})),
+                StatusCode::OK,
+                Json(json!({"status": "skipped", "reason": "Predictions are absent or stale."})),
             )
                 .into_response()
         }
@@ -105,6 +105,14 @@ pub async fn rebalance(Extension(state): Extension<AppState>) -> Response {
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": format!("{error}")})),
+            )
+                .into_response()
+        }
+        Err(RebalanceError::Conversion(message)) => {
+            warn!(message = %message, "Rebalance failed: numeric conversion error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Internal numeric conversion error"})),
             )
                 .into_response()
         }
