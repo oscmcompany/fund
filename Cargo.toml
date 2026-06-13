@@ -24,12 +24,17 @@ path = "src/bin/ensemble_manager.rs"
 required-features = ["ensemble_manager"]
 
 [[bin]]
+name = "portfolio_manager"
+path = "src/bin/portfolio_manager.rs"
+required-features = ["portfolio_manager"]
+
+[[bin]]
 name = "tide_model_trainer"
 path = "src/bin/tide_model_trainer.rs"
 required-features = ["train"]
 
 [features]
-default = ["data_manager", "ensemble_manager"]
+default = ["data_manager", "ensemble_manager", "portfolio_manager"]
 data_manager = [
   "dep:chrono-tz",
   "dep:urlencoding",
@@ -43,6 +48,8 @@ ensemble_manager = [
   "dep:tar",
   "dep:tempfile",
 ]
+portfolio_manager = []
+
 # Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
 # for epoch shuffling.

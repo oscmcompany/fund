@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT net_asset_value FROM equity_portfolio_snapshots ORDER BY snapshot_timestamp DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "net_asset_value",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5c401077ea3a638a94d10667003f5d76ca81116bd7cab472ff539be15b93d18b"
+}

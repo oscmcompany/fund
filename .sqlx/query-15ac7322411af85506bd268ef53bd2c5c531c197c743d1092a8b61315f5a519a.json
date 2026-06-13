@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, pair_id, long_ticker, short_ticker FROM equity_pairs WHERE status = 'open' ORDER BY opened_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pair_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "long_ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "short_ticker",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "15ac7322411af85506bd268ef53bd2c5c531c197c743d1092a8b61315f5a519a"
+}

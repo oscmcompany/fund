@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT close_price FROM equity_bars WHERE ticker = 'SPY' AND timestamp >= $1 AND timestamp <= $2 ORDER BY timestamp",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "close_price",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "118407aacb867f69722be5b93908271f4680768ae0b421616744df3790555e8c"
+}

@@ -23,10 +23,6 @@ jobs:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
-            python:
-              - '**/*.py'
-              - '**/pyproject.toml'
-              - '**/uv.lock'
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
@@ -55,13 +51,6 @@ jobs:
           key: llvm-cov-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             llvm-cov-${{ runner.os }}-
-      - name: Cache Python dependencies
-        if: steps.changes.outputs.python == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/uv
-          key: uv-${{ hashFiles('**/pyproject.toml', 'uv.lock') }}
-          restore-keys: uv-
       - name: Run base checks
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
@@ -73,14 +62,3 @@ jobs:
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
           tasks run checks:rust
-      - name: Run Python checks
-        if: steps.changes.outputs.python == 'true'
-        run: >-
-          devenv --secretspec-provider env --secretspec-profile development
-          tasks run checks:python
-      - name: Show Python coverage report
-        if: always() && steps.changes.outputs.python == 'true'
-        run: |
-          if [ -f .coverage_output/python_report.txt ]; then
-            cat .coverage_output/python_report.txt
-          fi

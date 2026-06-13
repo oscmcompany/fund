@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (ticker) ticker, (bid_price + ask_price) / 2.0 AS \"mid_price!\"\n           FROM equity_quotes\n           WHERE ticker = ANY($1::text[])\n           ORDER BY ticker, timestamp DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "mid_price!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "3a97db7051a123326fe785f94b283a9bd94d53605febf6a63be8b032c4951570"
+}
