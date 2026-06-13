@@ -54,28 +54,10 @@ in {
 
   languages = {
     rust.enable = true;
-    python.enable = true;
     nix.enable = true;
   };
 
   git-hooks.hooks = {
-    python-install = {
-      enable = true;
-      name = "Install Python dependencies";
-      entry = "python-install";
-      files = "(pyproject\\.toml|uv\\.lock)$";
-      pass_filenames = false;
-      language = "system";
-    };
-    python-checks = {
-      enable = true;
-      name = "Check all Python code";
-      entry = "python-checks";
-      files = "(\\.py|pyproject\\.toml|uv\\.lock)$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
     rust-checks = {
       enable = true;
       name = "Check all Rust code";
@@ -161,7 +143,6 @@ in {
     # to regenerate the cache after changing queries.
     SQLX_OFFLINE = "true";
 
-    # tinygrad CPU JIT requires clang (gcc rejects --target flag)
     CC = "clang";
 
     # Secretspec CLI configuration
@@ -202,7 +183,7 @@ in {
     cargo-llvm-cov
     cargo-watch
     curl
-    duckdb
+    duckdb # retained for local data exploration and experimentation
     gh
     git
     rainfrog
@@ -210,13 +191,13 @@ in {
     llvmPackages.llvm
     markdownlint-cli
     postgresql_16
-    ruff
     rustup
+    sqlfluff
     sqlx-cli
     statix
     taplo
-    uv
-    xenon
+    uv # retained for local Python experimentation; use `uv venv` + `uv pip install` for project-scoped package installs
+    yamllint
   ];
 
   # database:restore — fast recovery from a nightly S3 dump when schema has not changed.
@@ -317,9 +298,25 @@ in {
     echo "Data-manager is healthy"
 
     echo "Fetching equity bars from $BACKFILL_START_DATE to $END_DATE"
-    secretspec run -- uv run --package tools python -m tools.sync_equity_bars_data \
-      http://localhost:8080 \
-      "{\"start_date\": \"$BACKFILL_START_DATE\", \"end_date\": \"$END_DATE\"}"
+    current_date="$BACKFILL_START_DATE"
+    request_count=0
+    while [[ "$current_date" <= "$END_DATE" ]]; do
+      request_count=$((request_count + 1))
+      date_string="''${current_date}T12:00:00Z"
+      echo "Syncing equity bars for $current_date (request $request_count)"
+      status_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X POST http://localhost:8080/equity-bars \
+        -H "Content-Type: application/json" \
+        -d "{\"date\": \"''${date_string}\"}" \
+        --max-time 60)
+      echo "Status: $status_code"
+      if [ "$status_code" -ge 400 ]; then
+        echo "Warning: request for $current_date returned HTTP $status_code"
+      fi
+      current_date=$(date -d "$current_date +1 day" +%Y-%m-%d 2>/dev/null \
+        || date -jf "%Y-%m-%d" "$current_date" -v+1d +%Y-%m-%d)
+    done
+    echo "All dates processed ($request_count requests)"
   '';
 
   scripts.database-reset.exec = ''
@@ -353,71 +350,6 @@ in {
 
   # --- Development check scripts ---
 
-  scripts.python-install.exec = ''
-    set -euo pipefail
-    echo "Installing Python dependencies"
-    uv sync --all-packages --all-groups
-    echo "Python dependencies installed successfully"
-  '';
-
-  scripts.python-format.exec = ''
-    set -euo pipefail
-    echo "Checking Python code formatting"
-    ruff format --check
-    echo "Python code formatting check passed"
-  '';
-
-  scripts.python-lint = {
-    description = "Running Python lint checks";
-    exec = ''
-      set -euo pipefail
-      ruff check --output-format=github .
-      echo "Python linting completed successfully"
-    '';
-  };
-
-  scripts.python-type-check.exec = ''
-    set -euo pipefail
-    echo "Running Python type checks"
-    uvx ty check
-    echo "Python type checks completed successfully"
-  '';
-
-  scripts.python-dead-code.exec = ''
-    set -euo pipefail
-    echo "Running dead code analysis"
-    uvx vulture \
-      --min-confidence 80 \
-      --exclude '.venv,target' \
-      . tools/src/tools/vulture_whitelist.py
-    echo "Dead code check completed"
-  '';
-
-  scripts.python-complexity.exec = ''
-    set -euo pipefail
-    echo "Running Python complexity analysis"
-    xenon --max-absolute D --max-modules D --max-average A \
-      --ignore '.venv,target' .
-    echo "Python complexity analysis completed successfully"
-  '';
-
-  scripts.python-test.exec = ''
-    set -euo pipefail
-    echo "Running Python tests"
-    export CC=clang
-    mkdir -p .coverage_output
-    uv run coverage erase
-    uv run coverage run -m pytest --tb=short -q
-    uv run coverage combine 2>/dev/null || true
-    uv run coverage xml -o .coverage_output/python.xml
-    uv run coverage report --fail-under=80 | tee .coverage_output/python_report.txt
-    echo "Python tests completed successfully"
-  '';
-
-  scripts.python-checks.exec = ''
-    devenv tasks run checks:python
-  '';
-
   scripts.rust-format.exec = ''
     set -euo pipefail
     echo "Checking Rust code formatting"
@@ -433,28 +365,28 @@ in {
   '';
 
   scripts.rust-test.exec = ''
-        set -euo pipefail
-        echo "Running Rust tests"
+    set -euo pipefail
+    echo "Running Rust tests"
 
-        TEST_ARGS="--workspace --verbose --lib --bins --all-features"
+    TEST_ARGS="--lib --bins --all-features"
 
-        mkdir -p .coverage_output
-        export LLVM_COV=$(which llvm-cov)
-        export LLVM_PROFDATA=$(which llvm-profdata)
-        cargo llvm-cov $TEST_ARGS \
-          --cobertura \
-          --output-path .coverage_output/rust.xml
-        python3 -c "
-    import xml.etree.ElementTree as ET, sys
-    root = ET.parse('.coverage_output/rust.xml').getroot()
-    rate = float(root.get('line-rate', 0)) * 100
-    threshold = 10
-    print(f'Rust line coverage: {rate:.1f}%')
-    if rate < threshold:
-        print(f'Coverage failure: {rate:.1f}% is below threshold of {threshold}%')
-        sys.exit(1)
-    "
-        echo "Rust tests with coverage completed successfully"
+    mkdir -p .coverage_output
+    export LLVM_COV=$(which llvm-cov)
+    export LLVM_PROFDATA=$(which llvm-profdata)
+    cargo llvm-cov $TEST_ARGS \
+      --cobertura \
+      --output-path .coverage_output/rust.xml
+
+    rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' .coverage_output/rust.xml)
+    rate_pct=$(awk "BEGIN {printf \"%.1f\", ''${rate:-0} * 100}")
+    threshold=10
+    echo "Rust line coverage: ''${rate_pct}%"
+    if awk "BEGIN {exit !(''${rate_pct} + 0 < ''${threshold})}"; then
+      echo "Coverage failure: ''${rate_pct}% is below threshold of ''${threshold}%"
+      exit 1
+    fi
+
+    echo "Rust tests with coverage completed successfully"
   '';
 
   scripts.rust-checks.exec = ''
@@ -484,7 +416,7 @@ in {
   scripts.yaml-checks.exec = ''
     set -euo pipefail
     echo "Running YAML lint checks"
-    uvx yamllint .
+    yamllint .
     echo "YAML checks completed successfully"
   '';
 
@@ -501,7 +433,7 @@ in {
   scripts.sql-checks.exec = ''
     set -euo pipefail
     echo "Running SQL checks"
-    uvx sqlfluff lint .
+    sqlfluff lint .
     echo "SQL checks completed successfully"
   '';
 
@@ -520,11 +452,9 @@ in {
     echo "Bumping all dependencies..."
     echo "=== Rust ==="
     cargo update
-    echo "=== Python ==="
-    uv lock --upgrade
     echo ""
     echo "Dependencies bumped. Review changes:"
-    echo "  git diff Cargo.lock uv.lock"
+    echo "  git diff Cargo.lock"
   '';
 
   scripts.trigger-rebalance.exec = ''
@@ -553,35 +483,6 @@ in {
   '';
 
   tasks = {
-    # --- Python checks (install first, then all others in parallel) ---
-
-    "checks:python:install".exec = "python-install";
-
-    "checks:python:format" = {
-      exec = "python-format";
-      after = ["checks:python:install"];
-    };
-    "checks:python:lint" = {
-      exec = "python-lint";
-      after = ["checks:python:install"];
-    };
-    "checks:python:type-check" = {
-      exec = "python-type-check";
-      after = ["checks:python:install"];
-    };
-    "checks:python:dead-code" = {
-      exec = "python-dead-code";
-      after = ["checks:python:install"];
-    };
-    "checks:python:complexity" = {
-      exec = "python-complexity";
-      after = ["checks:python:install"];
-    };
-    "checks:python:test" = {
-      exec = "python-test";
-      after = ["checks:python:install"];
-    };
-
     # --- Rust checks (lint and test run in parallel after format) ---
 
     "checks:rust:format".exec = "rust-format";
@@ -680,12 +581,6 @@ in {
       '';
       after = [
         "checks:base"
-        "checks:python:format"
-        "checks:python:lint"
-        "checks:python:type-check"
-        "checks:python:dead-code"
-        "checks:python:complexity"
-        "checks:python:test"
         "checks:rust:format"
         "checks:rust:lint"
         "checks:rust:test"
@@ -707,7 +602,7 @@ in {
     };
 
     scripts.cleanup-services.exec = ''
-      for PORT in 8080 8081 8082; do
+      for PORT in 8080 8082 8083; do
         PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
         if [ -n "$PID" ]; then
           echo "Killing stale process on port $PORT (PID $PID)"
@@ -778,21 +673,21 @@ in {
           exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_manager --bin ensemble_manager'
         '';
 
-      portfolio-manager.exec = let
-        uvicornCmd = "uv run uvicorn portfolio_manager.server:application --host 0.0.0.0 --port 8081";
-      in
+      portfolio-manager.exec =
         if isProduction
         then ''
+          set -euo pipefail
           ${runtimeEnv}
           ${waitForPostgres}
-          ${killPort "8081"}
-          exec secretspec run -- ${uvicornCmd}
+          ${killPort "8083"}
+          exec secretspec run -- cargo run --no-default-features --features portfolio_manager --bin portfolio_manager --release
         ''
         else ''
+          set -euo pipefail
           ${runtimeEnv}
           ${waitForPostgres}
-          ${killPort "8081"}
-          exec secretspec run -- ${uvicornCmd} --reload
+          ${killPort "8083"}
+          exec secretspec run -- cargo watch -x 'run --no-default-features --features portfolio_manager --bin portfolio_manager'
         '';
     };
   };
@@ -824,10 +719,10 @@ in {
       echo "    devenv --profile ml shell     ML training environment"
       echo ""
       echo "  Services (apps profile):"
-      echo "    Data Manager:     localhost:8080"
-      echo "    Portfolio Manager: localhost:8081"
-      echo "    Ensemble Manager: localhost:8082"
-      echo "    PostgreSQL:       localhost:5432/fund"
+      echo "    Data Manager:      localhost:8080"
+      echo "    Ensemble Manager:  localhost:8082"
+      echo "    Portfolio Manager: localhost:8083"
+      echo "    PostgreSQL:        localhost:5432/fund"
       echo ""
       echo "  Secrets (secretspec):"
       echo "    secretspec check          Validate production secrets"
@@ -839,7 +734,6 @@ in {
       echo ""
       echo "  Tasks (devenv tasks run):"
       echo "    checks:base                    Non-language checks (nix, markdown, yaml, toml, sql)"
-      echo "    checks:python                  All Python checks (parallel after install)"
       echo "    checks:rust                    All Rust checks (sequential: format, lint, test)"
       echo "    checks:markdown                Markdown lint"
       echo "    checks:yaml                    YAML lint"
