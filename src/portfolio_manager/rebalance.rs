@@ -229,6 +229,62 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     })
 }
 
+/// Closes all open positions at end of day and emits `end_of_day_liquidation_completed`.
+///
+/// Fetches open pairs, submits close orders via Alpaca, marks each pair closed
+/// with `close_reason = 'end_of_day'`, then emits the completion event so
+/// data_manager can unsubscribe from the WebSocket quote stream.
+///
+/// Returns the number of pairs closed, or a `RebalanceError` if Alpaca or
+/// the database returns an error.
+pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, RebalanceError> {
+    let pool = state.pool();
+    let alpaca = state.alpaca_client();
+
+    let open_pairs = database::fetch_open_pairs(pool).await?;
+    if open_pairs.is_empty() {
+        info!("No open pairs to close at end of day");
+        database::emit_event(
+            pool,
+            "end_of_day_liquidation_completed",
+            &serde_json::json!({}),
+        )
+        .await?;
+        return Ok(0);
+    }
+
+    let close_tickers: Vec<String> = open_pairs
+        .iter()
+        .flat_map(|pair| {
+            [
+                pair.long_ticker().to_string(),
+                pair.short_ticker().to_string(),
+            ]
+        })
+        .collect();
+
+    close_positions(alpaca, &close_tickers)
+        .await
+        .map_err(RebalanceError::Execution)?;
+
+    let closed_at = Utc::now();
+    for open_pair in &open_pairs {
+        database::close_equity_pair_end_of_day(pool, open_pair.id(), closed_at).await?;
+    }
+
+    let pairs_closed = open_pairs.len();
+    info!(count = pairs_closed, "Open pairs closed at end of day");
+
+    database::emit_event(
+        pool,
+        "end_of_day_liquidation_completed",
+        &serde_json::json!({ "pairs_closed": pairs_closed }),
+    )
+    .await?;
+
+    Ok(pairs_closed)
+}
+
 // ---------------------------------------------------------------------------
 // Private pipeline phases
 // ---------------------------------------------------------------------------

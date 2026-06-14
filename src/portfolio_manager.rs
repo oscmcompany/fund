@@ -5,6 +5,7 @@
 pub mod alpaca;
 pub mod beta;
 pub mod consolidation;
+pub mod consumer;
 pub mod database;
 pub mod execution;
 pub mod math;
@@ -34,6 +35,8 @@ pub async fn run(bind_address: &str) {
     let state = AppState::from_env()
         .await
         .unwrap_or_else(|error| panic!("Failed to initialize app state: {error}"));
+
+    consumer::spawn_event_consumer(state.clone());
 
     let app = server::create_router(state);
 

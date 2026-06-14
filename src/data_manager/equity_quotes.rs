@@ -189,32 +189,44 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                                 Ok(value) => value,
                                 Err(_) => continue,
                             };
-                        if parsed.get("event_type").and_then(|v| v.as_str())
-                            != Some("rebalance_completed")
-                        {
-                            continue;
-                        }
-                        info!("Received rebalance_completed, refreshing quote subscriptions");
-                        refresh_active_symbols(state, pool).await;
+                        match parsed.get("event_type").and_then(|v| v.as_str()) {
+                            Some("rebalance_completed") => {
+                                info!("Received rebalance_completed, refreshing quote subscriptions");
+                                refresh_active_symbols(state, pool).await;
 
-                        // Unsubscribe from all, then resubscribe with the updated symbol set
-                        let unsubscribe_json = serde_json::json!({
-                            "action": "unsubscribe",
-                            "quotes": ["*"],
-                        })
-                        .to_string();
-                        write.send(Message::Text(unsubscribe_json.into())).await?;
+                                // Unsubscribe from all, then resubscribe with the updated symbol set
+                                let unsubscribe_json = serde_json::json!({
+                                    "action": "unsubscribe",
+                                    "quotes": ["*"],
+                                })
+                                .to_string();
+                                write.send(Message::Text(unsubscribe_json.into())).await?;
 
-                        let symbols: Vec<Ticker> =
-                            state.active_symbols.read().await.iter().cloned().collect();
-                        if !symbols.is_empty() {
-                            let subscribe_json = serde_json::json!({
-                                "action": "subscribe",
-                                "quotes": symbols,
-                            })
-                            .to_string();
-                            write.send(Message::Text(subscribe_json.into())).await?;
-                            info!("Resubscribed to {} symbol(s)", symbols.len());
+                                let symbols: Vec<Ticker> =
+                                    state.active_symbols.read().await.iter().cloned().collect();
+                                if !symbols.is_empty() {
+                                    let subscribe_json = serde_json::json!({
+                                        "action": "subscribe",
+                                        "quotes": symbols,
+                                    })
+                                    .to_string();
+                                    write.send(Message::Text(subscribe_json.into())).await?;
+                                    info!("Resubscribed to {} symbol(s)", symbols.len());
+                                }
+                            }
+                            Some("end_of_day_liquidation_completed") => {
+                                info!("Received end_of_day_liquidation_completed, unsubscribing from all symbols");
+                                let unsubscribe_json = serde_json::json!({
+                                    "action": "unsubscribe",
+                                    "quotes": ["*"],
+                                })
+                                .to_string();
+                                write.send(Message::Text(unsubscribe_json.into())).await?;
+                                let mut guard = state.active_symbols.write().await;
+                                *guard = HashSet::new();
+                                info!("Unsubscribed from all symbols for end of day");
+                            }
+                            _ => {}
                         }
                     }
                     Err(error) => {

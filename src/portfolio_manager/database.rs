@@ -400,6 +400,30 @@ pub async fn close_equity_pair(
     Ok(())
 }
 
+/// Marks an equity pair as closed with `close_reason = 'end_of_day'`.
+pub async fn close_equity_pair_end_of_day(
+    pool: &PgPool,
+    pair_id: Uuid,
+    closed_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query!(
+        "UPDATE equity_pairs \
+         SET status = 'closed', closed_at = $1, close_reason = 'end_of_day' \
+         WHERE id = $2",
+        closed_at,
+        pair_id
+    )
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    info!(pair_id = %pair_id, "Equity pair closed end-of-day in PostgreSQL");
+    Ok(())
+}
+
 /// Inserts an equity allocation record for one leg of a pair.
 pub async fn insert_equity_allocation(
     pool: &PgPool,
@@ -489,6 +513,55 @@ pub async fn emit_event(
         "Emitted event from portfolio_manager"
     );
     Ok(())
+}
+
+/// Returns the last processed event id for a consumer, or 0 if not yet recorded.
+pub async fn get_consumer_offset(pool: &PgPool, consumer_name: &str) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query!(
+        "SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1",
+        consumer_name
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|record| record.last_event_id).unwrap_or(0))
+}
+
+/// Upserts the last processed event id for a consumer. `GREATEST` guards against
+/// moving the offset backwards under concurrent updates.
+pub async fn update_consumer_offset(
+    pool: &PgPool,
+    consumer_name: &str,
+    last_event_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) \
+         VALUES ($1, $2, now()) \
+         ON CONFLICT (consumer_name) DO UPDATE SET \
+         last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), \
+         updated_at = EXCLUDED.updated_at",
+        consumer_name,
+        last_event_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Returns the id of the most recent event of `event_type` with id greater than
+/// `after_id`, used to catch up on events that arrived while the consumer was down.
+pub async fn latest_event_after(
+    pool: &PgPool,
+    event_type: &str,
+    after_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
+    let row = sqlx::query!(
+        "SELECT id FROM events WHERE event_type = $1 AND id > $2 ORDER BY id DESC LIMIT 1",
+        event_type,
+        after_id
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|record| record.id))
 }
 
 #[cfg(test)]
@@ -678,6 +751,17 @@ mod tests {
     }
 
     #[test]
+    fn test_close_equity_pair_end_of_day_compiles() {
+        make_runtime().block_on(async {
+            assert!(
+                close_equity_pair_end_of_day(&lazy_pool(), Uuid::new_v4(), Utc::now())
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
     fn test_insert_equity_allocation_compiles() {
         make_runtime().block_on(async {
             use crate::domain::market::Ticker;
@@ -750,6 +834,35 @@ mod tests {
             )
             .await
             .is_err());
+        });
+    }
+
+    #[test]
+    fn test_get_consumer_offset_compiles() {
+        make_runtime().block_on(async {
+            assert!(get_consumer_offset(&lazy_pool(), "portfolio-manager")
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn test_update_consumer_offset_compiles() {
+        make_runtime().block_on(async {
+            assert!(
+                update_consumer_offset(&lazy_pool(), "portfolio-manager", 42)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_latest_event_after_compiles() {
+        make_runtime().block_on(async {
+            assert!(latest_event_after(&lazy_pool(), "predictions_completed", 0)
+                .await
+                .is_err());
         });
     }
 }
