@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroU8;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
@@ -62,10 +62,17 @@ pub struct AppState {
     ///
     /// `None` until the first rebalance of the session fetches and populates it.
     /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
-    tradable_assets: Arc<RwLock<Option<HashSet<String>>>>,
+    /// The inner `Arc` avoids cloning the full set on every cache hit.
+    tradable_assets: Arc<RwLock<Option<Arc<HashSet<String>>>>>,
     /// Guards against concurrent rebalance cycles when the prediction pipeline
     /// takes longer than the 5-minute `market_session_check` interval.
     rebalance_cycle_in_progress: Arc<AtomicBool>,
+    /// Unix timestamp (seconds) when the current rebalance cycle started.
+    ///
+    /// `0` when no cycle is in progress. Used to detect stale flags caused by
+    /// an upstream crash that never emits `equity_predictions_completed` or
+    /// `equity_predictions_errored`.
+    rebalance_cycle_started_at: Arc<AtomicI64>,
 }
 
 impl AppState {
@@ -90,7 +97,7 @@ impl AppState {
     }
 
     /// Returns the shared tradable asset cache.
-    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<HashSet<String>>>> {
+    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<Arc<HashSet<String>>>>> {
         &self.tradable_assets
     }
 
@@ -99,10 +106,26 @@ impl AppState {
         self.rebalance_cycle_in_progress.load(Ordering::SeqCst)
     }
 
-    /// Marks a rebalance cycle as having started.
+    /// Returns the Unix timestamp (seconds) when the current rebalance cycle started,
+    /// or `0` if no cycle is in progress.
+    pub fn rebalance_cycle_started_at(&self) -> i64 {
+        self.rebalance_cycle_started_at.load(Ordering::SeqCst)
+    }
+
+    /// Sets or clears the rebalance-cycle-in-progress flag.
+    ///
+    /// When `in_progress` is `true`, also records the current time so callers
+    /// can detect stale flags after upstream crashes.
     pub fn set_rebalance_cycle_in_progress(&self, in_progress: bool) {
         self.rebalance_cycle_in_progress
             .store(in_progress, Ordering::SeqCst);
+        let timestamp = if in_progress {
+            chrono::Utc::now().timestamp()
+        } else {
+            0
+        };
+        self.rebalance_cycle_started_at
+            .store(timestamp, Ordering::SeqCst);
     }
 
     /// Constructs `AppState` by reading all required values from the environment.
@@ -184,6 +207,7 @@ impl AppState {
             ),
             tradable_assets: Arc::new(RwLock::new(None)),
             rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
+            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
         })
     }
 }

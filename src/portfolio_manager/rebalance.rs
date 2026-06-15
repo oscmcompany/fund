@@ -419,7 +419,7 @@ async fn check_drawdown(
 async fn select_size_execute(
     alpaca: &AlpacaTradingClient,
     pool: &sqlx::PgPool,
-    tradable_assets_cache: &Arc<RwLock<Option<HashSet<String>>>>,
+    tradable_assets_cache: &Arc<RwLock<Option<Arc<HashSet<String>>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<String, Vec<f64>>,
     spy_prices: &[f64],
@@ -456,21 +456,21 @@ async fn select_size_execute(
 
     // Resolve the tradable asset universe from the session cache, populating it
     // on first use. Subsequent rebalances within the same service instance reuse
-    // the cached set without a network call.
-    let tradable_assets = {
+    // the cached Arc without cloning the underlying set.
+    let tradable_assets: Arc<HashSet<String>> = {
         let read_guard = tradable_assets_cache.read().await;
-        if let Some(ref assets) = *read_guard {
-            assets.clone()
+        if let Some(assets) = read_guard.as_ref() {
+            Arc::clone(assets)
         } else {
             drop(read_guard);
-            let assets = alpaca.fetch_tradable_assets().await.map_err(|error| {
-                RebalanceError::Execution(ExecutionError::PositionClose {
-                    ticker: "tradable_assets_fetch".to_string(),
-                    source: error,
-                })
-            })?;
+            let assets = Arc::new(
+                alpaca
+                    .fetch_tradable_assets()
+                    .await
+                    .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
+            );
             let mut write_guard = tradable_assets_cache.write().await;
-            *write_guard = Some(assets.clone());
+            *write_guard = Some(Arc::clone(&assets));
             info!(count = assets.len(), "Tradable asset cache populated");
             assets
         }
