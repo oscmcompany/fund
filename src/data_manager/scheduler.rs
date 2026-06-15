@@ -1,5 +1,9 @@
+use crate::common::events::{
+    emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
+    EventType, CONSUMER_DATA_MANAGER_DATABASE_BACKUP, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT,
+    CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
+};
 use crate::data_manager::data::TradingDate;
-use crate::data_manager::database;
 use crate::data_manager::equity_bars::fetch_and_store;
 use crate::data_manager::export;
 use crate::data_manager::state::State;
@@ -57,6 +61,19 @@ fn duration_until_next_sync(now: DateTime<Utc>) -> Duration {
 fn sync_date_for(now: DateTime<Utc>) -> TradingDate {
     TradingDate::from_naive_date(prior_trading_day(now.with_timezone(&Eastern).date_naive()))
         .expect("prior_trading_day always returns a weekday")
+}
+
+/// Parses an export date from an event payload, falling back to today's UTC date.
+///
+/// pg_cron jobs include `{"date": "YYYY-MM-DD"}` in the payload so that a
+/// catch-up run can export the correct historical date rather than defaulting to
+/// the restart date.
+fn export_date_from_payload(payload: &serde_json::Value) -> NaiveDate {
+    payload
+        .get("date")
+        .and_then(|value| value.as_str())
+        .and_then(|string| NaiveDate::parse_from_str(string, "%Y-%m-%d").ok())
+        .unwrap_or_else(|| Utc::now().date_naive())
 }
 
 pub fn spawn_sync_scheduler(state: State) {
@@ -132,216 +149,313 @@ async fn listen_loop(state: State) {
 
 async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen("jobs").await?;
-    info!("LISTEN handler connected, listening on channel 'jobs'");
+    listener.listen("events").await?;
+    info!("Event consumer connected, listening on channel 'events'");
 
-    match database::requeue_stale_claimed_jobs(
+    // Catch up on any missed one-time actionable events (latest missed instance each).
+    let sync_offset = get_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::EquityBarsSyncRequested, sync_offset).await?
+    {
+        info!(event_id, "Catching up on missed equity_bars_sync_requested");
+        handle_equity_bars_sync(state, pool, event_id).await;
+    }
+
+    // Export events carry date-specific payloads, so every missed event must be
+    // replayed in order. Skipping to the latest would permanently lose export dates
+    // for any intermediate days the service was down.
+    let export_bars_offset =
+        get_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT).await?;
+    for (event_id, payload) in events_after(
         pool,
-        "equity-bar-sync",
-        std::time::Duration::from_secs(2 * 3600),
+        EventType::EquityBarsExportRequested,
+        export_bars_offset,
+    )
+    .await?
+    {
+        info!(
+            event_id,
+            "Catching up on missed equity_bars_export_requested"
+        );
+        handle_equity_bars_export(state, pool, event_id, &payload).await;
+    }
+
+    let export_history_offset =
+        get_consumer_offset(pool, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT).await?;
+    for (event_id, payload) in events_after(
+        pool,
+        EventType::TradingHistoryExportRequested,
+        export_history_offset,
+    )
+    .await?
+    {
+        info!(
+            event_id,
+            "Catching up on missed trading_history_export_requested"
+        );
+        handle_trading_history_export(state, pool, event_id, &payload).await;
+    }
+
+    let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_MANAGER_DATABASE_BACKUP).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::DatabaseBackupRequested, backup_offset).await?
+    {
+        info!(event_id, "Catching up on missed database_backup_requested");
+        handle_database_backup(state, pool, event_id).await;
+    }
+
+    // Main event loop.
+    loop {
+        let notification = listener.recv().await?;
+        let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let event_type = parsed
+            .get("event_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let event_id = parsed
+            .get("event_id")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        let empty_payload = serde_json::Value::Object(Default::default());
+        let payload = parsed.get("payload").unwrap_or(&empty_payload);
+
+        if event_type == EventType::EquityBarsSyncRequested.as_str() {
+            info!(event_id, "Received equity_bars_sync_requested");
+            handle_equity_bars_sync(state, pool, event_id).await;
+        } else if event_type == EventType::EquityBarsExportRequested.as_str() {
+            info!(event_id, "Received equity_bars_export_requested");
+            handle_equity_bars_export(state, pool, event_id, payload).await;
+        } else if event_type == EventType::TradingHistoryExportRequested.as_str() {
+            info!(event_id, "Received trading_history_export_requested");
+            handle_trading_history_export(state, pool, event_id, payload).await;
+        } else if event_type == EventType::DatabaseBackupRequested.as_str() {
+            info!(event_id, "Received database_backup_requested");
+            handle_database_backup(state, pool, event_id).await;
+        }
+    }
+}
+
+async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::EquityBarsSyncStarted,
+        &serde_json::json!({}),
     )
     .await
     {
-        Ok(count) if count > 0 => {
-            info!(
-                "Requeued {} stale claimed job(s) for equity-bar-sync",
-                count
+        warn!("Failed to emit equity_bars_sync_started: {}", error);
+    }
+
+    match run_equity_bar_sync(state).await {
+        Ok(Some(bar_count)) => {
+            info!("Equity bar sync completed, bar_count: {}", bar_count);
+            if let Err(error) = emit_event(
+                pool,
+                EventType::EquityBarsSyncCompleted,
+                &serde_json::json!({"bar_count": bar_count}),
             )
-        }
-        Ok(_) => {}
-        Err(error) => warn!("Failed to requeue stale claimed jobs: {}", error),
-    }
-
-    loop {
-        match database::claim_pending_job(pool, "equity-bar-sync").await {
-            Ok(Some((job_id, _))) => {
-                info!("Draining pending equity-bar-sync job on reconnect");
-                match run_equity_bar_sync(state).await {
-                    Ok(Some(bar_count)) => {
-                        if let Err(error) = database::complete_job(
-                            pool,
-                            job_id,
-                            &format!("bar_count: {}", bar_count),
-                        )
-                        .await
-                        {
-                            warn!("Failed to complete drained job {}: {}", job_id, error);
-                        }
-                        if let Err(error) = database::emit_equity_bars_synced(pool).await {
-                            warn!("Failed to emit equity_bars_synced: {}", error);
-                        }
-                        state.mark_synced();
-                    }
-                    Ok(None) => {
-                        if let Err(error) =
-                            database::complete_job(pool, job_id, "no data available").await
-                        {
-                            warn!("Failed to complete drained job {}: {}", job_id, error);
-                        }
-                    }
-                    Err(error) => {
-                        error!("Drained equity-bar-sync job failed: {}", error);
-                        if let Err(fail_error) = database::fail_job(pool, job_id, &error).await {
-                            warn!("Failed to fail drained job {}: {}", job_id, fail_error);
-                        }
-                    }
-                }
+            .await
+            {
+                warn!("Failed to emit equity_bars_sync_completed: {}", error);
             }
-            Ok(None) => break,
-            Err(error) => {
-                warn!("Failed to drain pending jobs: {}", error);
-                break;
+            state.mark_synced();
+        }
+        Ok(None) => {
+            info!("No equity bar data available for sync");
+            if let Err(error) = emit_event(
+                pool,
+                EventType::EquityBarsSyncCompleted,
+                &serde_json::json!({"bar_count": 0}),
+            )
+            .await
+            {
+                warn!("Failed to emit equity_bars_sync_completed: {}", error);
+            }
+        }
+        Err(ref error) => {
+            error!("Equity bar sync errored: {}", error);
+            if let Err(emit_error) = emit_event(
+                pool,
+                EventType::EquityBarsSyncErrored,
+                &serde_json::json!({"error": error}),
+            )
+            .await
+            {
+                warn!("Failed to emit equity_bars_sync_errored: {}", emit_error);
             }
         }
     }
 
-    for export_job in &[
-        "export-equity-bars",
-        "export-trading-history",
-        "backup-database",
-    ] {
-        match database::requeue_stale_claimed_jobs(
-            pool,
-            export_job,
-            std::time::Duration::from_secs(2 * 3600),
-        )
-        .await
-        {
-            Ok(count) if count > 0 => {
-                info!("Requeued {} stale claimed job(s) for {}", count, export_job)
-            }
-            Ok(_) => {}
-            Err(error) => warn!(
-                "Failed to requeue stale claimed jobs for {}: {}",
-                export_job, error
-            ),
-        }
+    if let Err(error) =
+        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, event_id).await
+    {
+        warn!(
+            "Failed to update equity-bars-sync consumer offset: {}",
+            error
+        );
+    }
+}
 
-        loop {
-            match database::claim_pending_job(pool, export_job).await {
-                Ok(Some((job_id, scheduled_at))) => {
-                    info!("Draining pending {} job on reconnect", export_job);
-                    let export_date = scheduled_at.date_naive();
-                    let result = run_export_job(state, export_job, export_date).await;
-                    match result {
-                        Ok(count) => {
-                            if let Err(error) =
-                                database::complete_job(pool, job_id, &format!("count: {}", count))
-                                    .await
-                            {
-                                warn!("Failed to complete drained job {}: {}", job_id, error);
-                            }
-                        }
-                        Err(ref error) => {
-                            error!("Drained {} failed: {}", export_job, error);
-                            if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
-                                warn!("Failed to fail drained job {}: {}", job_id, fail_error);
-                            }
-                        }
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    warn!("Failed to drain pending {} jobs: {}", export_job, error);
-                    break;
-                }
+async fn handle_equity_bars_export(
+    state: &State,
+    pool: &sqlx::PgPool,
+    event_id: i64,
+    payload: &serde_json::Value,
+) {
+    let export_date = export_date_from_payload(payload);
+    if let Err(error) = emit_event(
+        pool,
+        EventType::EquityBarsExportStarted,
+        &serde_json::json!({"date": export_date.to_string()}),
+    )
+    .await
+    {
+        warn!("Failed to emit equity_bars_export_started: {}", error);
+    }
+
+    match run_export_job(state, "export-equity-bars", export_date).await {
+        Ok(count) => {
+            info!("Equity bars export completed, count: {}", count);
+            if let Err(error) = emit_event(
+                pool,
+                EventType::EquityBarsExportCompleted,
+                &serde_json::json!({"count": count, "date": export_date.to_string()}),
+            )
+            .await
+            {
+                warn!("Failed to emit equity_bars_export_completed: {}", error);
+            }
+        }
+        Err(ref error) => {
+            error!("Equity bars export errored: {}", error);
+            if let Err(emit_error) = emit_event(
+                pool,
+                EventType::EquityBarsExportErrored,
+                &serde_json::json!({"error": error, "date": export_date.to_string()}),
+            )
+            .await
+            {
+                warn!("Failed to emit equity_bars_export_errored: {}", emit_error);
             }
         }
     }
 
-    loop {
-        let notification = listener.recv().await?;
-        let payload = notification.payload();
+    if let Err(error) =
+        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT, event_id).await
+    {
+        warn!(
+            "Failed to update equity-bars-export consumer offset: {}",
+            error
+        );
+    }
+}
 
-        match payload {
-            "equity-bar-sync" => {
-                info!("Received NOTIFY for equity-bar-sync");
+async fn handle_trading_history_export(
+    state: &State,
+    pool: &sqlx::PgPool,
+    event_id: i64,
+    payload: &serde_json::Value,
+) {
+    let export_date = export_date_from_payload(payload);
+    if let Err(error) = emit_event(
+        pool,
+        EventType::TradingHistoryExportStarted,
+        &serde_json::json!({"date": export_date.to_string()}),
+    )
+    .await
+    {
+        warn!("Failed to emit trading_history_export_started: {}", error);
+    }
 
-                let job_id = match database::claim_pending_job(pool, "equity-bar-sync").await {
-                    Ok(Some((id, _))) => id,
-                    Ok(None) => {
-                        info!("No pending equity-bar-sync job to claim");
-                        continue;
-                    }
-                    Err(error) => {
-                        warn!("Failed to claim job: {}", error);
-                        continue;
-                    }
-                };
-
-                let trading_date = sync_date_for(Utc::now());
-
-                match fetch_and_store(state, &trading_date).await {
-                    Ok(Some(bar_count)) => {
-                        info!("LISTEN-triggered sync completed, bar_count: {}", bar_count);
-                        if let Err(error) = database::complete_job(
-                            pool,
-                            job_id,
-                            &format!("bar_count: {}", bar_count),
-                        )
-                        .await
-                        {
-                            warn!("Failed to complete job {}: {}", job_id, error);
-                        }
-                        if let Err(error) = database::emit_equity_bars_synced(pool).await {
-                            warn!("Failed to emit equity_bars_synced: {}", error);
-                        }
-                        state.mark_synced();
-                    }
-                    Ok(None) => {
-                        info!("No data available for LISTEN-triggered sync");
-                        if let Err(error) =
-                            database::complete_job(pool, job_id, "no data available").await
-                        {
-                            warn!("Failed to complete job {}: {}", job_id, error);
-                        }
-                    }
-                    Err(error) => {
-                        error!("LISTEN-triggered sync failed: {}", error);
-                        if let Err(fail_error) =
-                            database::fail_job(pool, job_id, &error.to_string()).await
-                        {
-                            warn!("Failed to fail job {}: {}", job_id, fail_error);
-                        }
-                    }
-                }
+    match run_export_job(state, "export-trading-history", export_date).await {
+        Ok(count) => {
+            info!("Trading history export completed, count: {}", count);
+            if let Err(error) = emit_event(
+                pool,
+                EventType::TradingHistoryExportCompleted,
+                &serde_json::json!({"count": count, "date": export_date.to_string()}),
+            )
+            .await
+            {
+                warn!("Failed to emit trading_history_export_completed: {}", error);
             }
-            "export-equity-bars" | "export-trading-history" | "backup-database" => {
-                info!("Received NOTIFY for {}", payload);
-
-                let (job_id, scheduled_at) = match database::claim_pending_job(pool, payload).await
-                {
-                    Ok(Some(row)) => row,
-                    Ok(None) => {
-                        info!("No pending {} job to claim", payload);
-                        continue;
-                    }
-                    Err(error) => {
-                        warn!("Failed to claim {} job: {}", payload, error);
-                        continue;
-                    }
-                };
-
-                let export_date = scheduled_at.date_naive();
-                match run_export_job(state, payload, export_date).await {
-                    Ok(count) => {
-                        info!("{} completed, count: {}", payload, count);
-                        if let Err(error) =
-                            database::complete_job(pool, job_id, &format!("count: {}", count)).await
-                        {
-                            warn!("Failed to complete job {}: {}", job_id, error);
-                        }
-                    }
-                    Err(ref error) => {
-                        error!("{} failed: {}", payload, error);
-                        if let Err(fail_error) = database::fail_job(pool, job_id, error).await {
-                            warn!("Failed to fail job {}: {}", job_id, fail_error);
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
+        Err(ref error) => {
+            error!("Trading history export errored: {}", error);
+            if let Err(emit_error) = emit_event(
+                pool,
+                EventType::TradingHistoryExportErrored,
+                &serde_json::json!({"error": error, "date": export_date.to_string()}),
+            )
+            .await
+            {
+                warn!(
+                    "Failed to emit trading_history_export_errored: {}",
+                    emit_error
+                );
+            }
+        }
+    }
+
+    if let Err(error) =
+        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT, event_id).await
+    {
+        warn!(
+            "Failed to update trading-history-export consumer offset: {}",
+            error
+        );
+    }
+}
+
+async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::DatabaseBackupStarted,
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!("Failed to emit database_backup_started: {}", error);
+    }
+
+    match run_backup_job(state).await {
+        Ok(byte_count) => {
+            info!("Database backup completed, byte_count: {}", byte_count);
+            if let Err(error) = emit_event(
+                pool,
+                EventType::DatabaseBackupCompleted,
+                &serde_json::json!({"byte_count": byte_count}),
+            )
+            .await
+            {
+                warn!("Failed to emit database_backup_completed: {}", error);
+            }
+        }
+        Err(ref error) => {
+            error!("Database backup errored: {}", error);
+            if let Err(emit_error) = emit_event(
+                pool,
+                EventType::DatabaseBackupErrored,
+                &serde_json::json!({"error": error}),
+            )
+            .await
+            {
+                warn!("Failed to emit database_backup_errored: {}", emit_error);
+            }
+        }
+    }
+
+    if let Err(error) =
+        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_DATABASE_BACKUP, event_id).await
+    {
+        warn!(
+            "Failed to update database-backup consumer offset: {}",
+            error
+        );
     }
 }
 
@@ -493,8 +607,8 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
 #[cfg(test)]
 mod tests {
     use super::{
-        duration_until_next_sync, parse_postgres_url, prior_trading_day, run_export_job,
-        sync_date_for,
+        duration_until_next_sync, export_date_from_payload, parse_postgres_url, prior_trading_day,
+        run_export_job, sync_date_for,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
@@ -664,6 +778,36 @@ mod tests {
         assert_eq!(
             sync_date.as_naive_date(),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_export_date_from_payload_parses_date_field() {
+        let payload = serde_json::json!({"date": "2026-06-13"});
+        let date = export_date_from_payload(&payload);
+        assert_eq!(date, NaiveDate::from_ymd_opt(2026, 6, 13).unwrap());
+    }
+
+    #[test]
+    fn test_export_date_from_payload_falls_back_to_today_on_missing_field() {
+        let payload = serde_json::json!({});
+        let date = export_date_from_payload(&payload);
+        // Fallback is today; allow one day of slack for tests crossing midnight.
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
+    }
+
+    #[test]
+    fn test_export_date_from_payload_falls_back_on_invalid_format() {
+        let payload = serde_json::json!({"date": "not-a-date"});
+        let date = export_date_from_payload(&payload);
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
         );
     }
 

@@ -117,9 +117,9 @@ pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, Pipeline
     if let Err(error) = &result {
         error!(stage = error.stage(), error = %error.message(), "Prediction pipeline failed");
         if let Some(pool) = state.pool() {
-            if let Err(emit_error) = database::emit_event(
+            if let Err(emit_error) = crate::common::events::emit_event(
                 pool,
-                "predictions_failed",
+                crate::common::events::EventType::EquityPredictionsErrored,
                 &serde_json::json!({
                     "correlation_id": correlation_id.to_string(),
                     "reason": error.stage(),
@@ -198,9 +198,9 @@ async fn run_pipeline_and_persist(
                     .await
                     .map_err(|e| PipelineError::new("insert_predictions", e.to_string()))?;
             info!(rows = rows, "Predictions inserted into PostgreSQL");
-            if let Err(e) = database::emit_event(
+            if let Err(e) = crate::common::events::emit_event(
                 pool,
-                "predictions_completed",
+                crate::common::events::EventType::EquityPredictionsCompleted,
                 &serde_json::json!({"correlation_id": correlation_id.to_string()}),
             )
             .await

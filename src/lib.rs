@@ -17,3 +17,6 @@ pub mod data_manager;
 
 #[cfg(feature = "ensemble_manager")]
 pub mod ensemble_manager;
+
+#[cfg(feature = "portfolio_manager")]
+pub mod portfolio_manager;

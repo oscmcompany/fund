@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE equity_pairs SET status = 'closed', closed_at = $1, close_reason = 'rebalance' WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f53a194da0a332acc6de5acc58f4f3c2bbffdf7ae8ad97cca2b537c640689587"
+}

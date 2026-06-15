@@ -1,3 +1,4 @@
+use crate::common::events::EventType;
 use crate::data_manager::data::EquityQuote;
 use crate::data_manager::database;
 use crate::data_manager::state::State;
@@ -16,14 +17,14 @@ const FLUSH_INTERVAL_SECS: u64 = 5;
 const FLUSH_BATCH_SIZE: usize = 1000;
 const ALPACA_WS_BASE_URL: &str = "wss://stream.data.alpaca.markets/v2";
 
-// Intraday check interval mirrors the pg_cron schedule in schema.sql (intraday-check job).
+// Market session check interval mirrors the pg_cron schedule in schema.sql (market-session-check job).
 // 5 minutes is a conservative starting point; tighten to 60 if signal latency requires it.
 // The flush interval must never exceed this value — quotes must be committed to the database
-// before portfolio-manager queries them in response to an intraday_check event.
-const INTRADAY_CHECK_INTERVAL_SECS: u64 = 5 * 60;
+// before portfolio-manager queries them in response to a market_session_check event.
+const MARKET_SESSION_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 const _: () = assert!(
-    FLUSH_INTERVAL_SECS <= INTRADAY_CHECK_INTERVAL_SECS,
-    "FLUSH_INTERVAL_SECS must not exceed INTRADAY_CHECK_INTERVAL_SECS"
+    FLUSH_INTERVAL_SECS <= MARKET_SESSION_CHECK_INTERVAL_SECS,
+    "FLUSH_INTERVAL_SECS must not exceed MARKET_SESSION_CHECK_INTERVAL_SECS"
 );
 
 pub fn spawn_quote_stream(state: State) {
@@ -189,32 +190,52 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                                 Ok(value) => value,
                                 Err(_) => continue,
                             };
-                        if parsed.get("event_type").and_then(|v| v.as_str())
-                            != Some("rebalance_completed")
-                        {
-                            continue;
-                        }
-                        info!("Received rebalance_completed, refreshing quote subscriptions");
-                        refresh_active_symbols(state, pool).await;
+                        let portfolio_rebalance_completed =
+                            EventType::PortfolioRebalanceCompleted.as_str();
+                        let portfolio_liquidation_completed =
+                            EventType::PortfolioLiquidationCompleted.as_str();
+                        match parsed.get("event_type").and_then(|v| v.as_str()) {
+                            Some(event_type)
+                                if event_type == portfolio_rebalance_completed =>
+                            {
+                                info!("Received portfolio_rebalance_completed, refreshing quote subscriptions");
+                                refresh_active_symbols(state, pool).await;
 
-                        // Unsubscribe from all, then resubscribe with the updated symbol set
-                        let unsubscribe_json = serde_json::json!({
-                            "action": "unsubscribe",
-                            "quotes": ["*"],
-                        })
-                        .to_string();
-                        write.send(Message::Text(unsubscribe_json.into())).await?;
+                                // Unsubscribe from all, then resubscribe with the updated symbol set
+                                let unsubscribe_json = serde_json::json!({
+                                    "action": "unsubscribe",
+                                    "quotes": ["*"],
+                                })
+                                .to_string();
+                                write.send(Message::Text(unsubscribe_json.into())).await?;
 
-                        let symbols: Vec<Ticker> =
-                            state.active_symbols.read().await.iter().cloned().collect();
-                        if !symbols.is_empty() {
-                            let subscribe_json = serde_json::json!({
-                                "action": "subscribe",
-                                "quotes": symbols,
-                            })
-                            .to_string();
-                            write.send(Message::Text(subscribe_json.into())).await?;
-                            info!("Resubscribed to {} symbol(s)", symbols.len());
+                                let symbols: Vec<Ticker> =
+                                    state.active_symbols.read().await.iter().cloned().collect();
+                                if !symbols.is_empty() {
+                                    let subscribe_json = serde_json::json!({
+                                        "action": "subscribe",
+                                        "quotes": symbols,
+                                    })
+                                    .to_string();
+                                    write.send(Message::Text(subscribe_json.into())).await?;
+                                    info!("Resubscribed to {} symbol(s)", symbols.len());
+                                }
+                            }
+                            Some(event_type)
+                                if event_type == portfolio_liquidation_completed =>
+                            {
+                                info!("Received portfolio_liquidation_completed, unsubscribing from all symbols");
+                                let unsubscribe_json = serde_json::json!({
+                                    "action": "unsubscribe",
+                                    "quotes": ["*"],
+                                })
+                                .to_string();
+                                write.send(Message::Text(unsubscribe_json.into())).await?;
+                                let mut guard = state.active_symbols.write().await;
+                                *guard = HashSet::new();
+                                info!("Unsubscribed from all symbols for end of day");
+                            }
+                            _ => {}
                         }
                     }
                     Err(error) => {

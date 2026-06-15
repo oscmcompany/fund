@@ -25,7 +25,7 @@ jobs:
       - name: Check for changes
         id: changes
         run: |
-          if git diff --quiet Cargo.lock uv.lock; then
+          if git diff --quiet Cargo.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -39,6 +39,6 @@ jobs:
           title: "Bump dependency versions"
           body: |
             Automated daily dependency version bump.
-            Updates Cargo.lock and uv.lock to latest compatible versions.
+            Updates Cargo.lock to latest compatible versions.
           commit-message: "Bump dependency versions"
           labels: dependencies

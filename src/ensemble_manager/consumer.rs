@@ -1,9 +1,9 @@
 //! Postgres event consumer for the ensemble service.
 //!
-//! Listens on the `events` channel and runs the prediction pipeline whenever a
-//! `predictions_requested` event arrives, mirroring the data_manager LISTEN
-//! loop (`src/data_manager/scheduler.rs`). This is what wires the Rust ensemble
-//! service into the event system, replacing the former Python consumer.
+//! Listens on the `events` channel and runs the prediction pipeline whenever an
+//! `equity_predictions_requested` event arrives. Mirrors the data_manager LISTEN
+//! loop (`src/data_manager/scheduler.rs`). This wires the Rust ensemble service
+//! into the event system, replacing the former Python consumer.
 
 use std::time::Duration;
 
@@ -12,14 +12,12 @@ use sqlx::PgPool;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
-use crate::ensemble_manager::database;
+use crate::common::events::{
+    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
+    CONSUMER_ENSEMBLE_MANAGER,
+};
 use crate::ensemble_manager::server::run_predictions;
 use crate::ensemble_manager::state::AppState;
-
-/// Consumer name for offset tracking. Reuses the prior Python consumer's name so
-/// it continues from the same `event_consumer_offsets` position.
-const CONSUMER_NAME: &str = "ensemble-manager";
-const PREDICTIONS_REQUESTED: &str = "predictions_requested";
 
 /// Spawn the event consumer if a database pool is configured.
 pub fn spawn_event_consumer(state: AppState) {
@@ -30,8 +28,7 @@ pub fn spawn_event_consumer(state: AppState) {
     tokio::spawn(consumer_loop(state));
 }
 
-/// Supervisor: restart the listener on error with a backoff (matches the
-/// data_manager listen loop).
+/// Supervisor: restart the listener on error with a backoff.
 async fn consumer_loop(state: AppState) {
     let pool = match state.pool() {
         Some(pool) => pool.clone(),
@@ -54,13 +51,16 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
 
-    // Catch up on a predictions_requested that arrived while we were down.
-    let offset = database::get_consumer_offset(pool, CONSUMER_NAME).await?;
+    // Catch up on an equity_predictions_requested that arrived while we were down.
+    let offset = get_consumer_offset(pool, CONSUMER_ENSEMBLE_MANAGER).await?;
     if let Some(event_id) =
-        database::latest_event_after(pool, PREDICTIONS_REQUESTED, offset).await?
+        latest_event_after(pool, EventType::EquityPredictionsRequested, offset).await?
     {
-        info!(event_id, "Catching up on missed predictions_requested");
-        handle_predictions_requested(state, pool, event_id).await;
+        info!(
+            event_id,
+            "Catching up on missed equity_predictions_requested"
+        );
+        handle_equity_predictions_requested(state, pool, event_id).await;
     }
 
     loop {
@@ -70,7 +70,8 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
             Err(_) => continue,
         };
 
-        if parsed.get("event_type").and_then(|value| value.as_str()) != Some(PREDICTIONS_REQUESTED)
+        if parsed.get("event_type").and_then(|value| value.as_str())
+            != Some(EventType::EquityPredictionsRequested.as_str())
         {
             continue;
         }
@@ -79,15 +80,28 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
             .get("event_id")
             .and_then(|value| value.as_i64())
             .unwrap_or(0);
-        info!(event_id, "Received predictions_requested");
-        handle_predictions_requested(state, pool, event_id).await;
+        info!(event_id, "Received equity_predictions_requested");
+        handle_equity_predictions_requested(state, pool, event_id).await;
     }
 }
 
-/// Run a prediction pass and advance the consumer offset. `run_predictions`
-/// already persists results and emits `predictions_completed`/`predictions_failed`,
-/// so this only logs and records progress.
-async fn handle_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
+/// Run a prediction pass and advance the consumer offset.
+///
+/// Emits `equity_predictions_started` before running, then
+/// `equity_predictions_completed` on success or `equity_predictions_errored`
+/// on failure. `run_predictions` persists results and emits those terminal
+/// events, so this function only handles offset bookkeeping.
+async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::EquityPredictionsStarted,
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit equity_predictions_started");
+    }
+
     match run_predictions(state).await {
         Ok(run) => info!(rows = run.row_count(), "Predictions generated from event"),
         Err(error) => {
@@ -95,7 +109,7 @@ async fn handle_predictions_requested(state: &AppState, pool: &PgPool, event_id:
         }
     }
 
-    if let Err(error) = database::update_consumer_offset(pool, CONSUMER_NAME, event_id).await {
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_ENSEMBLE_MANAGER, event_id).await {
         warn!(error = %error, "Failed to update consumer offset");
     }
 }

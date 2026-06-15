@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO equity_portfolio_snapshots (snapshot_timestamp, snapshot_type, net_asset_value, total_slippage_cost) VALUES ($1, 'intraday', $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Numeric",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2c2e4e669c068216901e32ccd29daa544367570777958fd2e48aa5799d996832"
+}

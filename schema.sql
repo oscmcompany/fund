@@ -1,5 +1,5 @@
 -- Fund platform PostgreSQL schema
--- TimescaleDB operational data layer, model metadata, and job scheduling
+-- TimescaleDB operational data layer, model metadata, and event coordination
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
@@ -188,34 +188,14 @@ CREATE TABLE IF NOT EXISTS model_runs (
 CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status); -- noqa: PG01
 CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC); -- noqa: PG01
 
--- scheduled_jobs: Job queue for pg_cron + LISTEN/NOTIFY
-CREATE TABLE IF NOT EXISTS scheduled_jobs (
-    id           BIGSERIAL    PRIMARY KEY,
-    job_name     TEXT         NOT NULL,
-    scheduled_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    claimed_at   TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ,
-    status       TEXT         NOT NULL DEFAULT 'pending'
-                              CHECK (status IN ('pending', 'claimed', 'completed', 'failed')),
-    result       TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_pending -- noqa: PG01
-    ON scheduled_jobs (job_name, status) WHERE status = 'pending';
-
--- Notify function: insert row then send NOTIFY on channel "jobs"
-CREATE OR REPLACE FUNCTION schedule_job(name TEXT) RETURNS void AS $$
-BEGIN
-    INSERT INTO scheduled_jobs (job_name) VALUES (name);
-    PERFORM pg_notify('jobs', name);
-END;
-$$ LANGUAGE plpgsql;
-
 -- Nightly equity bar sync: weekdays at 05:00 UTC
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
-        PERFORM cron.schedule('equity-bar-sync', '0 5 * * 1-5', $$SELECT schedule_job('equity-bar-sync')$$);
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
+        PERFORM cron.unschedule('equity-bar-sync');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-sync-requested') THEN
+        PERFORM cron.schedule('equity-bars-sync-requested', '0 5 * * 1-5', $$SELECT emit_event('equity_bars_sync_requested', '{}')$$);
     END IF;
 END;
 $do$;
@@ -297,30 +277,30 @@ CREATE TABLE IF NOT EXISTS equity_predictions (
 SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exists => TRUE);
 
--- Intraday rebalance check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
+-- Market session check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
 -- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
 -- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
 -- A compile-time assertion in that file enforces the invariant — update both together.
 -- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
-        PERFORM cron.schedule(
-            'intraday-check',
-            '*/5 14-20 * * 1-5',
-            $$SELECT emit_event('intraday_check', '{}')$$
-        );
+    -- Remove old intraday-check job and always recreate market-session-check so
+    -- the schedule and WHERE clause stay current across DST and schema re-applies.
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
+        PERFORM cron.unschedule('intraday-check');
     END IF;
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-session-check') THEN
+        PERFORM cron.unschedule('market-session-check');
+    END IF;
+    PERFORM cron.schedule(
+        'market-session-check',
+        '*/5 13-20 * * 1-5',
+        $$SELECT emit_event('market_session_check', '{}')
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:00'$$
+    );
 END;
 $do$;
-
--- liquidate_end_of_day: emits an event for portfolio-manager to close all open positions
--- and mark all open pairs as closed before the market close.
-CREATE OR REPLACE FUNCTION liquidate_end_of_day() RETURNS void AS $$
-BEGIN
-    PERFORM emit_event('end_of_day_liquidation_requested', '{}');
-END;
-$$ LANGUAGE plpgsql;
 
 -- cron.schedule_in_timezone: schedules a named pg_cron job using a local-time cron expression.
 -- Converts the hour component of a simple 'MM HH dow dom month' expression to UTC at scheduling
@@ -360,83 +340,83 @@ END;
 $$;
 
 -- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
--- Uses a timezone-aware schedule so DST is handled correctly year-round.
--- Fires before the intraday-check window ends so the rebalance lockout window in portfolio-manager
+-- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
+-- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
+-- to re-apply the schema after a DST transition.
+-- Fires before the market-session-check window ends so the rebalance lockout window in portfolio-manager
 -- prevents any new pairs from being opened after this point.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
-        PERFORM cron.schedule_in_timezone(
-            'end-of-day-liquidation',
-            '45 15 * * 1-5',
-            'America/New_York',
-            $$SELECT liquidate_end_of_day()$$
-        );
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
+        PERFORM cron.unschedule('end-of-day-liquidation');
     END IF;
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
+        PERFORM cron.unschedule('portfolio-liquidation-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'portfolio-liquidation-requested',
+        '45 19-20 * * 1-5',
+        $$SELECT emit_event('portfolio_liquidation_requested', '{}')
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '15:45'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:50'$$
+    );
 END;
 $do$;
 
--- record_end_of_day_snapshot: emits an event for portfolio-manager to record the day's final NAV and compute returns.
-CREATE OR REPLACE FUNCTION record_end_of_day_snapshot() RETURNS void AS $$
-BEGIN
-    PERFORM emit_event('end_of_day_snapshot_requested', '{}');
-END;
-$$ LANGUAGE plpgsql;
-
--- Nightly EOD snapshot trigger: weekdays at 21:15 UTC (after market close, after quote archival).
--- Runs first so the snapshot is persisted before export_trading_history runs at 21:45.
+-- Unschedule removed record-end-of-day-snapshot job from existing deployments.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-end-of-day-snapshot') THEN
-        PERFORM cron.schedule(
-            'record-end-of-day-snapshot',
-            '15 21 * * 1-5',
-            $$SELECT record_end_of_day_snapshot()$$
-        );
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-end-of-day-snapshot') THEN
+        PERFORM cron.unschedule('record-end-of-day-snapshot');
     END IF;
 END;
 $do$;
 
 -- Nightly equity bars export: weekdays at 21:30 UTC.
--- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
+        PERFORM cron.unschedule('export-equity-bars');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-export-requested') THEN
         PERFORM cron.schedule(
-            'export-equity-bars',
+            'equity-bars-export-requested',
             '30 21 * * 1-5',
-            $$SELECT schedule_job('export-equity-bars')$$
+            $$SELECT emit_event('equity_bars_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
         );
     END IF;
 END;
 $do$;
 
--- Nightly trading history export: weekdays at 21:45 UTC (after record-end-of-day-snapshot at 21:15
--- so today's snapshot is included).
+-- Nightly trading history export: weekdays at 21:45 UTC.
 -- Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
 -- equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs; deletes exported equity_quotes rows.
--- Triggers a Rust export task in data_manager via the jobs channel.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
+        PERFORM cron.unschedule('export-trading-history');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'trading-history-export-requested') THEN
         PERFORM cron.schedule(
-            'export-trading-history',
+            'trading-history-export-requested',
             '45 21 * * 1-5',
-            $$SELECT schedule_job('export-trading-history')$$
+            $$SELECT emit_event('trading_history_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
         );
     END IF;
 END;
 $do$;
 
 -- Nightly database backup: weekdays at 22:00 UTC (after all nightly exports complete).
--- Triggers a pg_dump + S3 upload task in data_manager via the jobs channel.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-database') THEN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-database') THEN
+        PERFORM cron.unschedule('backup-database');
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'database-backup-requested') THEN
         PERFORM cron.schedule(
-            'backup-database',
+            'database-backup-requested',
             '0 22 * * 1-5',
-            $$SELECT schedule_job('backup-database')$$
+            $$SELECT emit_event('database_backup_requested', '{}')$$
         );
     END IF;
 END;

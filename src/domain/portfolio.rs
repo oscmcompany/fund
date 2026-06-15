@@ -32,15 +32,69 @@ pub struct MinimumPairs(pub NonZeroU8);
 
 /// Maximum allowed absolute deviation of net portfolio beta from zero.
 #[derive(Debug, Clone, Copy)]
-pub struct BetaTolerance(pub f64);
+pub struct BetaTolerance(f64);
+
+impl BetaTolerance {
+    /// Constructs a `BetaTolerance` from a positive tolerance value.
+    ///
+    /// Returns `Err` if `value` is not positive.
+    pub fn new(value: f64) -> Result<Self, String> {
+        if value <= 0.0 {
+            return Err(format!("BetaTolerance must be positive, got {value}"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the tolerance value.
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
 
 /// Portfolio construction constraints.
 #[derive(Debug, Clone)]
 pub struct Constraints {
-    pub drawdown_threshold: DrawdownThreshold,
-    pub concentration_cap: ConcentrationCap,
-    pub minimum_pairs: MinimumPairs,
-    pub beta_tolerance: BetaTolerance,
+    drawdown_threshold: DrawdownThreshold,
+    concentration_cap: ConcentrationCap,
+    minimum_pairs: MinimumPairs,
+    beta_tolerance: BetaTolerance,
+}
+
+impl Constraints {
+    /// Constructs a `Constraints` bundle from already-validated component types.
+    pub fn new(
+        drawdown_threshold: DrawdownThreshold,
+        concentration_cap: ConcentrationCap,
+        minimum_pairs: MinimumPairs,
+        beta_tolerance: BetaTolerance,
+    ) -> Self {
+        Self {
+            drawdown_threshold,
+            concentration_cap,
+            minimum_pairs,
+            beta_tolerance,
+        }
+    }
+
+    /// Returns the drawdown threshold.
+    pub fn drawdown_threshold(&self) -> DrawdownThreshold {
+        self.drawdown_threshold
+    }
+
+    /// Returns the concentration cap.
+    pub fn concentration_cap(&self) -> ConcentrationCap {
+        self.concentration_cap
+    }
+
+    /// Returns the minimum pairs requirement.
+    pub fn minimum_pairs(&self) -> MinimumPairs {
+        self.minimum_pairs
+    }
+
+    /// Returns the beta tolerance.
+    pub fn beta_tolerance(&self) -> BetaTolerance {
+        self.beta_tolerance
+    }
 }
 
 /// Error returned when `Portfolio::new()` rejects the candidate pairs.
@@ -105,7 +159,7 @@ impl Portfolio {
     ///
     /// Returns `Err` with the first violated constraint.
     pub fn new(pairs: Vec<FilledPair>, constraints: &Constraints) -> Result<Self, PortfolioError> {
-        let minimum = constraints.minimum_pairs.0.get() as usize;
+        let minimum = constraints.minimum_pairs().0.get() as usize;
         if pairs.len() < minimum {
             return Err(PortfolioError::InsufficientPairs {
                 required: minimum,
@@ -134,7 +188,7 @@ impl Portfolio {
                     .or_insert(0.0) += short_notional;
             }
 
-            let cap = constraints.concentration_cap.0.value();
+            let cap = constraints.concentration_cap().0.value();
             for (ticker, notional) in &ticker_notionals {
                 let fraction = notional / total_gross_notional;
                 if fraction > cap {
@@ -163,7 +217,7 @@ impl Portfolio {
             .iter()
             .map(|pair| pair.long_beta - pair.short_beta)
             .sum();
-        let tolerance = constraints.beta_tolerance.0;
+        let tolerance = constraints.beta_tolerance().value();
         if net_beta.abs() > tolerance {
             return Err(PortfolioError::BetaNeutralityViolation {
                 net_beta,
@@ -184,12 +238,12 @@ mod tests {
     use uuid::Uuid;
 
     fn make_constraints() -> Constraints {
-        Constraints {
-            drawdown_threshold: DrawdownThreshold(Percent::new(0.10).unwrap()),
-            concentration_cap: ConcentrationCap(Percent::new(0.20).unwrap()),
-            minimum_pairs: MinimumPairs(NonZeroU8::new(10).unwrap()),
-            beta_tolerance: BetaTolerance(0.1),
-        }
+        Constraints::new(
+            DrawdownThreshold(Percent::new(0.10).unwrap()),
+            ConcentrationCap(Percent::new(0.20).unwrap()),
+            MinimumPairs(NonZeroU8::new(10).unwrap()),
+            BetaTolerance::new(0.1).unwrap(),
+        )
     }
 
     fn make_filled_pair(
@@ -218,12 +272,7 @@ mod tests {
             format!("alpaca-short-{}", short_ticker.to_lowercase()),
             Utc::now(),
         );
-        let pending_pair = PendingPair {
-            long: long_order,
-            short: short_order,
-            long_beta,
-            short_beta,
-        };
+        let pending_pair = PendingPair::new(long_order, short_order, long_beta, short_beta);
         // price=100, qty=100 → notional=10,000 per leg
         pending_pair
             .confirm(
@@ -330,12 +379,7 @@ mod tests {
             "alpaca-short-wmt".to_string(),
             Utc::now(),
         );
-        let pending = PendingPair {
-            long: long_order,
-            short: short_order,
-            long_beta: 1.0,
-            short_beta: 1.0,
-        };
+        let pending = PendingPair::new(long_order, short_order, 1.0, 1.0);
         // long: 100*100=10,000; short: 50*100=5,000 → imbalance ≫ 5%
         let imbalanced = pending
             .confirm(
@@ -414,9 +458,21 @@ mod tests {
     #[test]
     fn test_constraints_construction() {
         let constraints = make_constraints();
-        assert_eq!(constraints.drawdown_threshold.0.value(), 0.10);
-        assert_eq!(constraints.concentration_cap.0.value(), 0.20);
-        assert_eq!(constraints.minimum_pairs.0.get(), 10);
-        assert_eq!(constraints.beta_tolerance.0, 0.1);
+        assert_eq!(constraints.drawdown_threshold().0.value(), 0.10);
+        assert_eq!(constraints.concentration_cap().0.value(), 0.20);
+        assert_eq!(constraints.minimum_pairs().0.get(), 10);
+        assert_eq!(constraints.beta_tolerance().value(), 0.1);
+    }
+
+    #[test]
+    fn test_beta_tolerance_new_rejects_nonpositive() {
+        assert!(BetaTolerance::new(0.0).is_err());
+        assert!(BetaTolerance::new(-0.1).is_err());
+    }
+
+    #[test]
+    fn test_beta_tolerance_new_accepts_positive() {
+        let tolerance = BetaTolerance::new(0.1).unwrap();
+        assert_eq!(tolerance.value(), 0.1);
     }
 }

@@ -405,7 +405,7 @@ mod tests {
         vec![EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
             Utc::now(),
-            "intraday_check".to_string(),
+            "market_session_check".to_string(),
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,

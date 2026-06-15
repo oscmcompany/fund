@@ -54,62 +54,6 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     Ok(rows_affected)
 }
 
-pub async fn claim_pending_job(
-    pool: &PgPool,
-    job_name: &str,
-) -> Result<Option<(i64, DateTime<Utc>)>, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"UPDATE scheduled_jobs
-           SET claimed_at = now(), status = 'claimed'
-           WHERE id = (
-               SELECT id FROM scheduled_jobs
-               WHERE job_name = $1 AND status = 'pending' AND scheduled_at <= now()
-               ORDER BY scheduled_at
-               LIMIT 1
-               FOR UPDATE SKIP LOCKED
-           )
-           RETURNING id, scheduled_at"#,
-        job_name
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some(ref claimed) = row {
-        debug!("Claimed job {} with id {}", job_name, claimed.id);
-    }
-    Ok(row.map(|claimed| (claimed.id, claimed.scheduled_at)))
-}
-
-pub async fn complete_job(pool: &PgPool, job_id: i64, result: &str) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        r#"UPDATE scheduled_jobs
-           SET completed_at = now(), status = 'completed', result = $2
-           WHERE id = $1"#,
-        job_id,
-        result
-    )
-    .execute(pool)
-    .await?;
-
-    debug!("Completed job {}", job_id);
-    Ok(())
-}
-
-pub async fn fail_job(pool: &PgPool, job_id: i64, error_message: &str) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        r#"UPDATE scheduled_jobs
-           SET completed_at = now(), status = 'failed', result = $2
-           WHERE id = $1"#,
-        job_id,
-        error_message
-    )
-    .execute(pool)
-    .await?;
-
-    warn!("Failed job {}: {}", job_id, error_message);
-    Ok(())
-}
-
 pub async fn insert_equity_quotes(
     pool: &PgPool,
     quotes: &[EquityQuote],
@@ -160,18 +104,6 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Erro
         .collect();
     debug!("Queried {} active tickers from PostgreSQL", tickers.len());
     Ok(tickers)
-}
-
-pub async fn emit_equity_bars_synced(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        "SELECT emit_event($1, $2::jsonb)",
-        "equity_bars_synced",
-        serde_json::Value::Object(Default::default()),
-    )
-    .execute(pool)
-    .await?;
-    info!("Emitted equity_bars_synced event");
-    Ok(())
 }
 
 /// Seeds `equity_details` from the provided rows using an idempotent upsert.
@@ -576,26 +508,6 @@ pub async fn query_model_runs(pool: &PgPool) -> Result<Vec<ModelRun>, sqlx::Erro
         .collect()
 }
 
-pub async fn requeue_stale_claimed_jobs(
-    pool: &PgPool,
-    job_name: &str,
-    stale_after: std::time::Duration,
-) -> Result<u64, sqlx::Error> {
-    let interval_secs = stale_after.as_secs() as f64;
-    let result = sqlx::query!(
-        r#"UPDATE scheduled_jobs
-           SET status = 'pending', claimed_at = NULL
-           WHERE job_name = $1
-             AND status = 'claimed'
-             AND claimed_at < now() - make_interval(secs => $2)"#,
-        job_name,
-        interval_secs
-    )
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,37 +594,6 @@ mod tests {
         runtime.block_on(async {
             let pool = test_pool();
             let result = get_active_tickers(&pool).await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_requeue_stale_claimed_jobs_compiles() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let pool = test_pool();
-            let result = requeue_stale_claimed_jobs(
-                &pool,
-                "equity-bar-sync",
-                std::time::Duration::from_secs(2 * 3600),
-            )
-            .await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_emit_equity_bars_synced_compiles() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let pool = test_pool();
-            let result = emit_equity_bars_synced(&pool).await;
             assert!(result.is_err());
         });
     }
