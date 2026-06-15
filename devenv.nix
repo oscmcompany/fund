@@ -397,7 +397,7 @@ in {
     set -euo pipefail
     if ! pg_isready -q 2>/dev/null; then
       echo "sqlx prepare check skipped: database not available"
-      echo "Run 'devenv --profile apps up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
+      echo "Run 'devenv --profile applications up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
       exit 0
     fi
     echo "Checking sqlx query metadata cache is up to date"
@@ -590,7 +590,7 @@ in {
 
   # --- Profiles ---
 
-  profiles.apps.module = {
+  profiles.applications.module = {
     env = {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
@@ -715,10 +715,10 @@ in {
       echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
-      echo "    devenv --profile apps up      Start application services"
+      echo "    devenv --profile applications up      Start application services"
       echo "    devenv --profile ml shell     ML training environment"
       echo ""
-      echo "  Services (apps profile):"
+      echo "  Services (applications profile):"
       echo "    Data Manager:      localhost:8080"
       echo "    Ensemble Manager:  localhost:8082"
       echo "    Portfolio Manager: localhost:8083"
