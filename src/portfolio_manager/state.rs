@@ -1,10 +1,14 @@
 //! Shared application state for the portfolio_manager service.
 
+use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroU8;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use tokio::sync::RwLock;
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::domain::portfolio::{
@@ -54,6 +58,14 @@ pub struct AppState {
     alpaca_client: AlpacaTradingClient,
     confidence_floor: ConfidenceFloor,
     constraints: Constraints,
+    /// Cached set of tradable+shortable+easy_to_borrow asset symbols.
+    ///
+    /// `None` until the first rebalance of the session fetches and populates it.
+    /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
+    tradable_assets: Arc<RwLock<Option<HashSet<String>>>>,
+    /// Guards against concurrent rebalance cycles when the prediction pipeline
+    /// takes longer than the 5-minute `market_session_check` interval.
+    rebalance_cycle_in_progress: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -75,6 +87,22 @@ impl AppState {
     /// Returns a reference to the portfolio constraints.
     pub fn constraints(&self) -> &Constraints {
         &self.constraints
+    }
+
+    /// Returns the shared tradable asset cache.
+    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<HashSet<String>>>> {
+        &self.tradable_assets
+    }
+
+    /// Returns `true` when a rebalance cycle is already in progress.
+    pub fn rebalance_cycle_in_progress(&self) -> bool {
+        self.rebalance_cycle_in_progress.load(Ordering::SeqCst)
+    }
+
+    /// Marks a rebalance cycle as having started.
+    pub fn set_rebalance_cycle_in_progress(&self, in_progress: bool) {
+        self.rebalance_cycle_in_progress
+            .store(in_progress, Ordering::SeqCst);
     }
 
     /// Constructs `AppState` by reading all required values from the environment.
@@ -154,6 +182,8 @@ impl AppState {
                 minimum_pairs,
                 beta_tolerance,
             ),
+            tradable_assets: Arc::new(RwLock::new(None)),
+            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
         })
     }
 }
