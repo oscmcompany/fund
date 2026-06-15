@@ -21,10 +21,10 @@ const ALPACA_WS_BASE_URL: &str = "wss://stream.data.alpaca.markets/v2";
 // 5 minutes is a conservative starting point; tighten to 60 if signal latency requires it.
 // The flush interval must never exceed this value — quotes must be committed to the database
 // before portfolio-manager queries them in response to a market_session_check event.
-const INTRADAY_CHECK_INTERVAL_SECS: u64 = 5 * 60;
+const MARKET_SESSION_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 const _: () = assert!(
-    FLUSH_INTERVAL_SECS <= INTRADAY_CHECK_INTERVAL_SECS,
-    "FLUSH_INTERVAL_SECS must not exceed INTRADAY_CHECK_INTERVAL_SECS"
+    FLUSH_INTERVAL_SECS <= MARKET_SESSION_CHECK_INTERVAL_SECS,
+    "FLUSH_INTERVAL_SECS must not exceed MARKET_SESSION_CHECK_INTERVAL_SECS"
 );
 
 pub fn spawn_quote_stream(state: State) {

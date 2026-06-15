@@ -1,8 +1,7 @@
 use crate::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, query_event_payload,
-    update_consumer_offset, EventType, CONSUMER_DATA_MANAGER_DATABASE_BACKUP,
-    CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT, CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC,
-    CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
+    emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
+    EventType, CONSUMER_DATA_MANAGER_DATABASE_BACKUP, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT,
+    CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
 };
 use crate::data_manager::data::TradingDate;
 use crate::data_manager::equity_bars::fetch_and_store;
@@ -162,9 +161,12 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         handle_equity_bars_sync(state, pool, event_id).await;
     }
 
+    // Export events carry date-specific payloads, so every missed event must be
+    // replayed in order. Skipping to the latest would permanently lose export dates
+    // for any intermediate days the service was down.
     let export_bars_offset =
         get_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT).await?;
-    if let Some(event_id) = latest_event_after(
+    for (event_id, payload) in events_after(
         pool,
         EventType::EquityBarsExportRequested,
         export_bars_offset,
@@ -175,14 +177,12 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             event_id,
             "Catching up on missed equity_bars_export_requested"
         );
-        let payload =
-            query_event_payload(pool, EventType::EquityBarsExportRequested, event_id).await?;
         handle_equity_bars_export(state, pool, event_id, &payload).await;
     }
 
     let export_history_offset =
         get_consumer_offset(pool, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT).await?;
-    if let Some(event_id) = latest_event_after(
+    for (event_id, payload) in events_after(
         pool,
         EventType::TradingHistoryExportRequested,
         export_history_offset,
@@ -193,8 +193,6 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             event_id,
             "Catching up on missed trading_history_export_requested"
         );
-        let payload =
-            query_event_payload(pool, EventType::TradingHistoryExportRequested, event_id).await?;
         handle_trading_history_export(state, pool, event_id, &payload).await;
     }
 
@@ -794,15 +792,23 @@ mod tests {
     fn test_export_date_from_payload_falls_back_to_today_on_missing_field() {
         let payload = serde_json::json!({});
         let date = export_date_from_payload(&payload);
-        // Just verify it returns something plausible (a recent date).
-        assert!(date >= NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        // Fallback is today; allow one day of slack for tests crossing midnight.
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
     }
 
     #[test]
     fn test_export_date_from_payload_falls_back_on_invalid_format() {
         let payload = serde_json::json!({"date": "not-a-date"});
         let date = export_date_from_payload(&payload);
-        assert!(date >= NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
     }
 
     #[test]

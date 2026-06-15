@@ -284,16 +284,21 @@ SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exis
 -- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
 DO $do$
 BEGIN
+    -- Remove old intraday-check job and always recreate market-session-check so
+    -- the schedule and WHERE clause stay current across DST and schema re-applies.
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
         PERFORM cron.unschedule('intraday-check');
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-session-check') THEN
-        PERFORM cron.schedule(
-            'market-session-check',
-            '*/5 14-20 * * 1-5',
-            $$SELECT emit_event('market_session_check', '{}')$$
-        );
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-session-check') THEN
+        PERFORM cron.unschedule('market-session-check');
     END IF;
+    PERFORM cron.schedule(
+        'market-session-check',
+        '*/5 13-20 * * 1-5',
+        $$SELECT emit_event('market_session_check', '{}')
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:00'$$
+    );
 END;
 $do$;
 
@@ -335,7 +340,9 @@ END;
 $$;
 
 -- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
--- Uses a timezone-aware schedule so DST is handled correctly year-round.
+-- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
+-- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
+-- to re-apply the schema after a DST transition.
 -- Fires before the market-session-check window ends so the rebalance lockout window in portfolio-manager
 -- prevents any new pairs from being opened after this point.
 DO $do$
@@ -343,14 +350,16 @@ BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
         PERFORM cron.unschedule('end-of-day-liquidation');
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
-        PERFORM cron.schedule_in_timezone(
-            'portfolio-liquidation-requested',
-            '45 15 * * 1-5',
-            'America/New_York',
-            $$SELECT emit_event('portfolio_liquidation_requested', '{}')$$
-        );
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
+        PERFORM cron.unschedule('portfolio-liquidation-requested');
     END IF;
+    PERFORM cron.schedule(
+        'portfolio-liquidation-requested',
+        '45 19-20 * * 1-5',
+        $$SELECT emit_event('portfolio_liquidation_requested', '{}')
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '15:45'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:50'$$
+    );
 END;
 $do$;
 

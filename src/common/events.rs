@@ -224,6 +224,35 @@ pub async fn latest_event_after(
     Ok(row.map(|record| record.id))
 }
 
+/// Returns all events of `event_type` with id greater than `after_id` in ascending order,
+/// paired with their JSONB payloads. Used during startup catch-up to replay every missed
+/// event when skipping intermediate occurrences would lose date-specific payload data
+/// (e.g. nightly export events where each carries a distinct export date).
+pub async fn events_after(
+    pool: &PgPool,
+    event_type: EventType,
+    after_id: i64,
+) -> Result<Vec<(i64, serde_json::Value)>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT id, payload FROM events WHERE event_type = $1 AND id > $2 ORDER BY id ASC",
+    )
+    .bind(event_type.as_str())
+    .bind(after_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let event_id: i64 = row.get("id");
+            let payload: serde_json::Value = row
+                .try_get("payload")
+                .unwrap_or_else(|_| serde_json::json!({}));
+            (event_id, payload)
+        })
+        .collect())
+}
+
 /// Returns the payload of a specific event by type and id.
 ///
 /// Used during startup catchup to retrieve the JSONB payload (e.g. export date)
@@ -242,7 +271,7 @@ pub async fn query_event_payload(
         .await?;
     Ok(row
         .and_then(|row| row.try_get::<serde_json::Value, _>("payload").ok())
-        .unwrap_or_default())
+        .unwrap_or_else(|| serde_json::json!({})))
 }
 
 #[cfg(test)]
@@ -369,6 +398,17 @@ mod tests {
         make_runtime().block_on(async {
             assert!(
                 latest_event_after(&lazy_pool(), EventType::EquityPredictionsCompleted, 0)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_events_after_compiles() {
+        make_runtime().block_on(async {
+            assert!(
+                events_after(&lazy_pool(), EventType::EquityBarsExportRequested, 0)
                     .await
                     .is_err()
             );
