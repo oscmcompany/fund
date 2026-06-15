@@ -498,72 +498,6 @@ pub async fn insert_portfolio_snapshot(
     Ok(())
 }
 
-/// Emits a named event by calling the `emit_event` PostgreSQL stored procedure.
-pub async fn emit_event(
-    pool: &PgPool,
-    event_type: &str,
-    payload: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query!("SELECT emit_event($1, $2::jsonb)", event_type, payload)
-        .execute(pool)
-        .await?;
-
-    info!(
-        event_type = event_type,
-        "Emitted event from portfolio_manager"
-    );
-    Ok(())
-}
-
-/// Returns the last processed event id for a consumer, or 0 if not yet recorded.
-pub async fn get_consumer_offset(pool: &PgPool, consumer_name: &str) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1",
-        consumer_name
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|record| record.last_event_id).unwrap_or(0))
-}
-
-/// Upserts the last processed event id for a consumer. `GREATEST` guards against
-/// moving the offset backwards under concurrent updates.
-pub async fn update_consumer_offset(
-    pool: &PgPool,
-    consumer_name: &str,
-    last_event_id: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) \
-         VALUES ($1, $2, now()) \
-         ON CONFLICT (consumer_name) DO UPDATE SET \
-         last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), \
-         updated_at = EXCLUDED.updated_at",
-        consumer_name,
-        last_event_id
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Returns the id of the most recent event of `event_type` with id greater than
-/// `after_id`, used to catch up on events that arrived while the consumer was down.
-pub async fn latest_event_after(
-    pool: &PgPool,
-    event_type: &str,
-    after_id: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT id FROM events WHERE event_type = $1 AND id > $2 ORDER BY id DESC LIMIT 1",
-        event_type,
-        after_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|record| record.id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,7 +623,7 @@ mod tests {
             let session = EquityRebalanceSession::new(
                 Uuid::new_v4(),
                 Utc::now(),
-                "intraday_check".to_string(),
+                "market_session_check".to_string(),
                 None,
                 None,
                 RebalanceSessionStatus::Completed,
@@ -821,48 +755,6 @@ mod tests {
             )
             .await
             .is_err());
-        });
-    }
-
-    #[test]
-    fn test_emit_event_compiles() {
-        make_runtime().block_on(async {
-            assert!(emit_event(
-                &lazy_pool(),
-                "test_event",
-                &serde_json::json!({"key": "value"})
-            )
-            .await
-            .is_err());
-        });
-    }
-
-    #[test]
-    fn test_get_consumer_offset_compiles() {
-        make_runtime().block_on(async {
-            assert!(get_consumer_offset(&lazy_pool(), "portfolio-manager")
-                .await
-                .is_err());
-        });
-    }
-
-    #[test]
-    fn test_update_consumer_offset_compiles() {
-        make_runtime().block_on(async {
-            assert!(
-                update_consumer_offset(&lazy_pool(), "portfolio-manager", 42)
-                    .await
-                    .is_err()
-            );
-        });
-    }
-
-    #[test]
-    fn test_latest_event_after_compiles() {
-        make_runtime().block_on(async {
-            assert!(latest_event_after(&lazy_pool(), "predictions_completed", 0)
-                .await
-                .is_err());
         });
     }
 }

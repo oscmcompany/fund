@@ -205,67 +205,6 @@ pub async fn insert_predictions(
     Ok(rows_affected)
 }
 
-pub async fn emit_event(
-    pool: &PgPool,
-    event_type: &str,
-    payload: &serde_json::Value,
-) -> Result<(), sqlx::Error> {
-    sqlx::query!("SELECT emit_event($1, $2::jsonb)", event_type, payload)
-        .execute(pool)
-        .await?;
-    info!(event_type = event_type, "Emitted event");
-    Ok(())
-}
-
-/// Return the last processed event id for a consumer, or 0 if not yet recorded.
-pub async fn get_consumer_offset(pool: &PgPool, consumer_name: &str) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT last_event_id FROM event_consumer_offsets WHERE consumer_name = $1",
-        consumer_name
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|record| record.last_event_id).unwrap_or(0))
-}
-
-/// Upsert the last processed event id for a consumer. `GREATEST` guards against
-/// moving the offset backwards under concurrent updates.
-pub async fn update_consumer_offset(
-    pool: &PgPool,
-    consumer_name: &str,
-    last_event_id: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query!(
-        "INSERT INTO event_consumer_offsets (consumer_name, last_event_id, updated_at) \
-         VALUES ($1, $2, now()) \
-         ON CONFLICT (consumer_name) DO UPDATE SET \
-           last_event_id = GREATEST(event_consumer_offsets.last_event_id, EXCLUDED.last_event_id), \
-           updated_at = EXCLUDED.updated_at",
-        consumer_name,
-        last_event_id
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Id of the most recent event of `event_type` with id greater than `after_id`,
-/// used to catch up on a request that arrived while the consumer was down.
-pub async fn latest_event_after(
-    pool: &PgPool,
-    event_type: &str,
-    after_id: i64,
-) -> Result<Option<i64>, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT id FROM events WHERE event_type = $1 AND id > $2 ORDER BY id DESC LIMIT 1",
-        event_type,
-        after_id
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|record| record.id))
-}
-
 /// Lineage row for the `model_runs` table, extracted from a trained model's
 /// `run_metadata.json`.
 #[derive(Debug, Clone)]
@@ -675,19 +614,5 @@ mod tests {
         assert_eq!(record.continuous_ranked_probability_score(), None);
         assert_eq!(record.lookback_days(), None);
         assert_eq!(record.start_date(), None);
-    }
-
-    #[test]
-    fn test_emit_event_compiles() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let pool = lazy_pool();
-            let result =
-                emit_event(&pool, "test_event", &serde_json::json!({"key": "value"})).await;
-            assert!(result.is_err());
-        });
     }
 }

@@ -380,6 +380,39 @@ impl AlpacaTradingClient {
         Ok(shortable)
     }
 
+    /// Attempts to cancel an open order by its Alpaca order ID.
+    ///
+    /// Returns `Ok(true)` when the order was cancelled, `Ok(false)` when Alpaca
+    /// returns 422 (the order is already in a terminal state and cannot be
+    /// cancelled), and `Err` for all other failures.
+    pub async fn cancel_order(&self, alpaca_order_id: &str) -> Result<bool, AlpacaError> {
+        let url = format!("{}/v2/orders/{alpaca_order_id}", self.base_url);
+        let response = self
+            .http_client
+            .delete(&url)
+            .header(HEADER_KEY_ID, self.credentials.key_id())
+            .header(HEADER_SECRET_KEY, self.credentials.secret())
+            .send()
+            .await?;
+
+        if response.status().as_u16() == 422 {
+            info!(
+                alpaca_order_id = alpaca_order_id,
+                "Order already in terminal state; cannot cancel"
+            );
+            return Ok(false);
+        }
+
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(AlpacaError::Api { status, body });
+        }
+
+        info!(alpaca_order_id = alpaca_order_id, "Order cancelled");
+        Ok(true)
+    }
+
     /// Returns whether the market is currently open.
     pub async fn is_market_open(&self) -> Result<bool, AlpacaError> {
         let url = format!("{}/v2/clock", self.base_url);
@@ -667,6 +700,57 @@ mod tests {
 
         let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
         assert!(!client.is_market_open().await.unwrap());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_success() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/orders/order-123")
+            .with_status(204)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
+        let cancelled = client.cancel_order("order-123").await.unwrap();
+
+        assert!(cancelled);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_already_terminal() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/orders/order-456")
+            .with_status(422)
+            .with_body(r#"{"message": "order is not cancellable"}"#)
+            .create_async()
+            .await;
+
+        let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
+        let cancelled = client.cancel_order("order-456").await.unwrap();
+
+        assert!(!cancelled);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_order_api_error() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/orders/order-789")
+            .with_status(403)
+            .with_body(r#"{"message": "forbidden"}"#)
+            .create_async()
+            .await;
+
+        let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
+        let result = client.cancel_order("order-789").await;
+
+        assert!(matches!(result, Err(AlpacaError::Api { status: 403, .. })));
         mock.assert_async().await;
     }
 
