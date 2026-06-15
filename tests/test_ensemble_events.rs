@@ -4,10 +4,10 @@
 
 mod common;
 
-use fund::ensemble_manager::database::{
-    emit_event, get_consumer_offset, insert_predictions, latest_event_after,
-    update_consumer_offset, upsert_model_run, ModelRunRecord,
+use fund::common::events::{
+    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
 };
+use fund::ensemble_manager::database::{insert_predictions, upsert_model_run, ModelRunRecord};
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -111,16 +111,20 @@ async fn test_consumer_offset_round_trip() {
 async fn test_latest_event_after_matches_only_requested_type() {
     let pool = get_pg_pool().await;
 
-    let before = latest_event_after(&pool, "predictions_requested", 0)
+    let before = latest_event_after(&pool, EventType::EquityPredictionsRequested, 0)
         .await
         .unwrap()
         .unwrap_or(0);
 
-    emit_event(&pool, "predictions_requested", &serde_json::json!({}))
-        .await
-        .unwrap();
+    emit_event(
+        &pool,
+        EventType::EquityPredictionsRequested,
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
 
-    let found = latest_event_after(&pool, "predictions_requested", before)
+    let found = latest_event_after(&pool, EventType::EquityPredictionsRequested, before)
         .await
         .unwrap();
     assert!(found.is_some());
@@ -128,11 +132,11 @@ async fn test_latest_event_after_matches_only_requested_type() {
     assert!(requested_id > before);
 
     // A later event of a different type must not be returned.
-    emit_event(&pool, "intraday_check", &serde_json::json!({}))
+    emit_event(&pool, EventType::MarketSessionCheck, &serde_json::json!({}))
         .await
         .unwrap();
     assert_eq!(
-        latest_event_after(&pool, "predictions_requested", requested_id)
+        latest_event_after(&pool, EventType::EquityPredictionsRequested, requested_id)
             .await
             .unwrap(),
         None
