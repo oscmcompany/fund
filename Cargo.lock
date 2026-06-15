@@ -2858,7 +2858,7 @@ dependencies = [
  "ndarray 0.16.1",
  "num-traits",
  "polars",
- "rand 0.8.6",
+ "rand 0.10.1",
  "reqwest 0.13.4",
  "rust_decimal",
  "serde",
