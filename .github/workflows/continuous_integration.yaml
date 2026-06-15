@@ -46,6 +46,7 @@ jobs:
           cache-on-failure: false
           shared-key: rust-continuous-integration
           save-if: true
+          add-rust-environment-hash-key: false
       - name: Cache llvm-cov artifacts
         if: steps.changes.outputs.rust == 'true'
         uses: actions/cache@v4
