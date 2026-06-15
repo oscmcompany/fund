@@ -111,7 +111,7 @@ futures-util = { version = "0.3", optional = true }
 # `autodiff` brings the Autodiff backend used by Rust-native training; it adds
 # no runtime cost to the NdArray inference path.
 burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
-ndarray = { version = "0.16", optional = true }
+ndarray = { version = "0.17", optional = true }
 flate2 = { version = "1.0", optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
