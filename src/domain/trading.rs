@@ -825,12 +825,12 @@ mod tests {
         let session = EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "intraday_check".to_string(),
+            "market_session_check".to_string(),
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,
         );
-        assert_eq!(session.trigger_reason(), "intraday_check");
+        assert_eq!(session.trigger_reason(), "market_session_check");
         assert_eq!(session.status(), &RebalanceSessionStatus::Completed);
         assert!(session.completed_at().is_none());
     }
@@ -948,7 +948,7 @@ mod tests {
         EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "intraday_check".to_string(),
+            "market_session_check".to_string(),
             None,
             None,
             RebalanceSessionStatus::Completed,
@@ -1024,7 +1024,10 @@ mod tests {
         let sessions = RebalanceSessions::new(vec![sample_session()]).unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(!sessions.is_empty());
-        assert_eq!(sessions.as_slice()[0].trigger_reason(), "intraday_check");
+        assert_eq!(
+            sessions.as_slice()[0].trigger_reason(),
+            "market_session_check"
+        );
     }
 
     #[test]

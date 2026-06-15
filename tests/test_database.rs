@@ -3,9 +3,8 @@ mod common;
 use chrono::{NaiveDate, Utc};
 use fund::data_manager::data::{EquityBar, Ticker};
 use fund::data_manager::database::{
-    claim_pending_job, complete_job, fail_job, insert_equity_bars, query_equity_allocations,
-    query_equity_bars_for_date, query_equity_orders, query_equity_pairs,
-    query_equity_portfolio_snapshots, query_equity_quotes_for_date,
+    insert_equity_bars, query_equity_allocations, query_equity_bars_for_date, query_equity_orders,
+    query_equity_pairs, query_equity_portfolio_snapshots, query_equity_quotes_for_date,
     query_equity_rebalance_sessions,
 };
 use serial_test::serial;
@@ -117,7 +116,7 @@ fn sample_bars() -> Vec<EquityBar> {
 }
 
 async fn clean_tables(pool: &PgPool) {
-    sqlx::raw_sql("DELETE FROM equity_bars; DELETE FROM scheduled_jobs;")
+    sqlx::raw_sql("DELETE FROM equity_bars;")
         .execute(pool)
         .await
         .unwrap();
@@ -269,82 +268,6 @@ async fn test_upsert_updates_existing_bar() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn test_claim_pending_job() {
-    let pool = get_pg_pool().await;
-    clean_tables(&pool).await;
-
-    sqlx::raw_sql(
-        "INSERT INTO scheduled_jobs (job_name, scheduled_at, status) \
-         VALUES ('equity-bar-sync', now(), 'pending')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let job_id = claim_pending_job(&pool, "equity-bar-sync").await.unwrap();
-    assert!(job_id.is_some(), "Should claim the pending job");
-
-    let second = claim_pending_job(&pool, "equity-bar-sync").await.unwrap();
-    assert!(
-        second.is_none(),
-        "No more pending jobs after first was claimed"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_claim_ignores_future_jobs() {
-    let pool = get_pg_pool().await;
-    clean_tables(&pool).await;
-
-    sqlx::raw_sql(
-        "INSERT INTO scheduled_jobs (job_name, scheduled_at, status) \
-         VALUES ('equity-bar-sync', now() + interval '1 hour', 'pending')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let job_id = claim_pending_job(&pool, "equity-bar-sync").await.unwrap();
-    assert!(
-        job_id.is_none(),
-        "Should not claim a job scheduled in the future"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_complete_job() {
-    let pool = get_pg_pool().await;
-    clean_tables(&pool).await;
-
-    sqlx::raw_sql(
-        "INSERT INTO scheduled_jobs (job_name, scheduled_at, status) \
-         VALUES ('equity-bar-sync', now(), 'pending')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
-        .await
-        .unwrap()
-        .unwrap();
-
-    complete_job(&pool, job_id, "s3_key: test/key.parquet")
-        .await
-        .unwrap();
-
-    let row: (String,) = sqlx::query_as("SELECT status FROM scheduled_jobs WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(row.0, "completed");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn test_query_equity_quotes_for_date_returns_empty() {
     let pool = get_pg_pool().await;
     clean_tables(&pool).await;
@@ -406,35 +329,4 @@ async fn test_query_equity_portfolio_snapshots_returns_empty() {
     clean_tables(&pool).await;
     let snapshots = query_equity_portfolio_snapshots(&pool).await.unwrap();
     assert!(snapshots.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_fail_job() {
-    let pool = get_pg_pool().await;
-    clean_tables(&pool).await;
-
-    sqlx::raw_sql(
-        "INSERT INTO scheduled_jobs (job_name, scheduled_at, status) \
-         VALUES ('equity-bar-sync', now(), 'pending')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let (job_id, _) = claim_pending_job(&pool, "equity-bar-sync")
-        .await
-        .unwrap()
-        .unwrap();
-
-    fail_job(&pool, job_id, "connection timeout").await.unwrap();
-
-    let row: (String, Option<String>) =
-        sqlx::query_as("SELECT status, result FROM scheduled_jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(row.0, "failed");
-    assert_eq!(row.1.as_deref(), Some("connection timeout"));
 }

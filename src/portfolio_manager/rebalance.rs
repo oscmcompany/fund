@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::common::events::{emit_event, EventType};
 use crate::domain::market::Ticker;
 use crate::domain::orders::FilledPair;
 use crate::domain::portfolio::{Portfolio, PortfolioError};
@@ -27,10 +28,11 @@ use crate::portfolio_manager::alpaca::AlpacaTradingClient;
 use crate::portfolio_manager::beta::compute_market_betas;
 use crate::portfolio_manager::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio_manager::database::{
-    self, fetch_equity_details, fetch_historical_prices, fetch_latest_portfolio_net_asset_value,
-    fetch_live_quote_mid_prices, fetch_open_pairs, fetch_predictions, fetch_spy_prices,
-    insert_equity_allocation, insert_equity_order, insert_equity_pair, insert_portfolio_snapshot,
-    insert_rebalance_session, update_rebalance_session_status,
+    close_equity_pair, close_equity_pair_end_of_day, fetch_equity_details, fetch_historical_prices,
+    fetch_latest_portfolio_net_asset_value, fetch_live_quote_mid_prices, fetch_open_pairs,
+    fetch_predictions, fetch_spy_prices, insert_equity_allocation, insert_equity_order,
+    insert_equity_pair, insert_portfolio_snapshot, insert_rebalance_session,
+    update_rebalance_session_status,
 };
 use crate::portfolio_manager::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
@@ -181,7 +183,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let session = EquityRebalanceSession::new(
         session_id,
         now,
-        "intraday_check".to_string(),
+        "market_session_check".to_string(),
         None,
         None,
         RebalanceSessionStatus::Completed,
@@ -204,9 +206,9 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         )
     })?;
 
-    database::emit_event(
+    emit_event(
         pool,
-        "rebalance_completed",
+        EventType::PortfolioRebalanceCompleted,
         &serde_json::json!({
             "session_id": session_id.to_string(),
             "pairs_filled": pairs_filled,
@@ -229,7 +231,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     })
 }
 
-/// Closes all open positions at end of day and emits `end_of_day_liquidation_completed`.
+/// Closes all open positions at end of day and emits `portfolio_liquidation_completed`.
 ///
 /// Fetches open pairs, submits close orders via Alpaca, marks each pair closed
 /// with `close_reason = 'end_of_day'`, then emits the completion event so
@@ -241,13 +243,13 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
     let pool = state.pool();
     let alpaca = state.alpaca_client();
 
-    let open_pairs = database::fetch_open_pairs(pool).await?;
+    let open_pairs = fetch_open_pairs(pool).await?;
     if open_pairs.is_empty() {
         info!("No open pairs to close at end of day");
-        database::emit_event(
+        emit_event(
             pool,
-            "end_of_day_liquidation_completed",
-            &serde_json::json!({}),
+            EventType::PortfolioLiquidationCompleted,
+            &serde_json::json!({"pairs_closed": 0}),
         )
         .await?;
         return Ok(0);
@@ -269,15 +271,15 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
 
     let closed_at = Utc::now();
     for open_pair in &open_pairs {
-        database::close_equity_pair_end_of_day(pool, open_pair.id(), closed_at).await?;
+        close_equity_pair_end_of_day(pool, open_pair.id(), closed_at).await?;
     }
 
     let pairs_closed = open_pairs.len();
     info!(count = pairs_closed, "Open pairs closed at end of day");
 
-    database::emit_event(
+    emit_event(
         pool,
-        "end_of_day_liquidation_completed",
+        EventType::PortfolioLiquidationCompleted,
         &serde_json::json!({ "pairs_closed": pairs_closed }),
     )
     .await?;
@@ -356,7 +358,7 @@ async fn close_existing_positions(
 
     let closed_at = Utc::now();
     for open_pair in &open_pairs {
-        database::close_equity_pair(pool, open_pair.id(), closed_at).await?;
+        close_equity_pair(pool, open_pair.id(), closed_at).await?;
     }
 
     info!(count = open_pairs.len(), "Open pairs closed");

@@ -55,12 +55,14 @@ impl std::fmt::Display for ExecutionError {
 
 impl std::error::Error for ExecutionError {}
 
-/// Submits long and short orders for each sized pair, returning pending pairs.
+/// Submits long and short orders concurrently for each sized pair, returning pending pairs.
 ///
-/// Pairs whose order submission fails are logged and skipped; they do not
-/// appear in the returned vec. This is a best-effort operation — partial
-/// success is expected in live trading when individual tickers have liquidity
-/// or borrowing issues.
+/// Both legs are submitted simultaneously to minimise the timing gap between
+/// executions. Pairs where either submission fails are logged and skipped; the
+/// surviving leg is cancelled (or its position closed if it already filled)
+/// before moving on. This is a best-effort operation — partial success is
+/// expected in live trading when individual tickers have liquidity or
+/// borrowing issues.
 pub async fn execute_open_pairs(
     alpaca: &AlpacaTradingClient,
     sized_pairs: &[SizedPair],
@@ -68,42 +70,39 @@ pub async fn execute_open_pairs(
     let mut results: Vec<(PendingPair, SizedPair)> = Vec::new();
 
     for sized_pair in sized_pairs {
-        // Submit the short leg first so we know it is borrowable before tying
-        // up capital on the long leg.
-        let short_alpaca_id = match alpaca
-            .submit_short_order(sized_pair.short_ticker(), sized_pair.short_quantity())
-            .await
-        {
-            Ok(order_id) => order_id,
-            Err(error) => {
+        let (short_result, long_result) = tokio::join!(
+            alpaca.submit_short_order(sized_pair.short_ticker(), sized_pair.short_quantity()),
+            alpaca.submit_long_order(sized_pair.long_ticker(), sized_pair.long_dollar_amount()),
+        );
+
+        let (short_alpaca_id, long_alpaca_id) = match (short_result, long_result) {
+            (Ok(short_id), Ok(long_id)) => (short_id, long_id),
+            (Err(error), Ok(long_id)) => {
                 warn!(
                     ticker = sized_pair.short_ticker(),
                     error = %error,
-                    "Short order submission failed; skipping pair"
+                    "Short order submission failed; cancelling orphaned long order"
                 );
+                compensate_orphaned_order(alpaca, &long_id, sized_pair.long_ticker()).await;
                 continue;
             }
-        };
-
-        let long_alpaca_id = match alpaca
-            .submit_long_order(sized_pair.long_ticker(), sized_pair.long_dollar_amount())
-            .await
-        {
-            Ok(order_id) => order_id,
-            Err(error) => {
+            (Ok(short_id), Err(error)) => {
                 warn!(
                     ticker = sized_pair.long_ticker(),
                     error = %error,
-                    "Long order submission failed; skipping pair"
+                    "Long order submission failed; cancelling orphaned short order"
                 );
-                // Compensate: attempt to close the short leg that already filled.
-                if let Err(close_error) = alpaca.close_position(sized_pair.short_ticker()).await {
-                    warn!(
-                        ticker = sized_pair.short_ticker(),
-                        error = %close_error,
-                        "Compensation close of orphaned short leg failed"
-                    );
-                }
+                compensate_orphaned_order(alpaca, &short_id, sized_pair.short_ticker()).await;
+                continue;
+            }
+            (Err(short_error), Err(long_error)) => {
+                warn!(
+                    short_ticker = sized_pair.short_ticker(),
+                    long_ticker = sized_pair.long_ticker(),
+                    short_error = %short_error,
+                    long_error = %long_error,
+                    "Both order submissions failed; skipping pair"
+                );
                 continue;
             }
         };
@@ -143,6 +142,43 @@ pub async fn execute_open_pairs(
     }
 
     results
+}
+
+/// Cancels an orphaned order, falling back to closing the resulting position
+/// if the order has already filled by the time compensation runs (Alpaca
+/// returns 422 for terminal-state orders).
+async fn compensate_orphaned_order(
+    alpaca: &AlpacaTradingClient,
+    alpaca_order_id: &str,
+    ticker: &str,
+) {
+    match alpaca.cancel_order(alpaca_order_id).await {
+        Ok(true) => {
+            info!(
+                alpaca_order_id = alpaca_order_id,
+                ticker = ticker,
+                "Orphaned order cancelled"
+            );
+        }
+        Ok(false) => {
+            // Order already in a terminal state; close the filled position.
+            if let Err(error) = alpaca.close_position(ticker).await {
+                warn!(
+                    ticker = ticker,
+                    error = %error,
+                    "Failed to close orphaned position after order already filled"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                alpaca_order_id = alpaca_order_id,
+                ticker = ticker,
+                error = %error,
+                "Failed to cancel orphaned order"
+            );
+        }
+    }
 }
 
 /// Polls fill confirmations for each pending pair.

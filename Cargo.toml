@@ -48,7 +48,7 @@ ensemble_manager = [
   "dep:tar",
   "dep:tempfile",
 ]
-portfolio_manager = []
+portfolio_manager = ["dep:chrono-tz"]
 
 # Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
