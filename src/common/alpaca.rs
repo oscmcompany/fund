@@ -26,13 +26,13 @@ impl AlpacaCredentials {
 
     /// Reads Alpaca credentials from environment variables.
     ///
-    /// Reads `ALPACA_KEY_ID` and `ALPACA_SECRET`. Returns `Err` if either
+    /// Reads `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET`. Returns `Err` if either
     /// variable is absent or set to an empty string.
     pub fn from_env() -> Result<Self, String> {
-        let key_id = std::env::var("ALPACA_KEY_ID")
-            .map_err(|_| "ALPACA_KEY_ID environment variable is not set".to_string())?;
-        let secret = std::env::var("ALPACA_SECRET")
-            .map_err(|_| "ALPACA_SECRET environment variable is not set".to_string())?;
+        let key_id = std::env::var("ALPACA_API_KEY_ID")
+            .map_err(|_| "ALPACA_API_KEY_ID environment variable is not set".to_string())?;
+        let secret = std::env::var("ALPACA_API_SECRET")
+            .map_err(|_| "ALPACA_API_SECRET environment variable is not set".to_string())?;
         Self::new(key_id, secret)
     }
 
@@ -85,13 +85,13 @@ mod tests {
     #[serial]
     fn test_from_env_returns_error_when_vars_unset() {
         // Remove both vars to test the missing-variable path.
-        let key_id_backup = std::env::var("ALPACA_KEY_ID").ok();
-        let secret_backup = std::env::var("ALPACA_SECRET").ok();
+        let key_id_backup = std::env::var("ALPACA_API_KEY_ID").ok();
+        let secret_backup = std::env::var("ALPACA_API_SECRET").ok();
 
         // SAFETY: environment mutation is safe in single-threaded test context.
         unsafe {
-            std::env::remove_var("ALPACA_KEY_ID");
-            std::env::remove_var("ALPACA_SECRET");
+            std::env::remove_var("ALPACA_API_KEY_ID");
+            std::env::remove_var("ALPACA_API_SECRET");
         }
 
         let result = AlpacaCredentials::from_env();
@@ -100,10 +100,10 @@ mod tests {
         // Restore originals.
         unsafe {
             if let Some(value) = key_id_backup {
-                std::env::set_var("ALPACA_KEY_ID", value);
+                std::env::set_var("ALPACA_API_KEY_ID", value);
             }
             if let Some(value) = secret_backup {
-                std::env::set_var("ALPACA_SECRET", value);
+                std::env::set_var("ALPACA_API_SECRET", value);
             }
         }
     }

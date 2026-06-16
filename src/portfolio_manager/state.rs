@@ -132,9 +132,9 @@ impl AppState {
     ///
     /// Required environment variables:
     /// - `DATABASE_URL`: PostgreSQL connection string
-    /// - `ALPACA_KEY_ID`: Alpaca API key identifier
-    /// - `ALPACA_SECRET`: Alpaca API secret key
-    /// - `IS_PAPER` (optional): `"true"` for paper trading; defaults to `"true"` for safety
+    /// - `ALPACA_API_KEY_ID`: Alpaca API key identifier
+    /// - `ALPACA_API_SECRET`: Alpaca API secret key
+    /// - `ALPACA_IS_PAPER` (optional): `"true"` for paper trading; defaults to `"true"` for safety
     ///
     /// Returns `Err` if any required variable is absent or the database pool
     /// cannot be created.
@@ -151,18 +151,18 @@ impl AppState {
                 message: format!("Failed to connect to PostgreSQL: {error}"),
             })?;
 
-        let key_id = env::var("ALPACA_KEY_ID").map_err(|_| ConfigError {
-            message: "ALPACA_KEY_ID environment variable is not set".to_string(),
+        let key_id = env::var("ALPACA_API_KEY_ID").map_err(|_| ConfigError {
+            message: "ALPACA_API_KEY_ID environment variable is not set".to_string(),
         })?;
-        let secret = env::var("ALPACA_SECRET").map_err(|_| ConfigError {
-            message: "ALPACA_SECRET environment variable is not set".to_string(),
+        let secret = env::var("ALPACA_API_SECRET").map_err(|_| ConfigError {
+            message: "ALPACA_API_SECRET environment variable is not set".to_string(),
         })?;
 
         let credentials = AlpacaCredentials::new(key_id, secret)
             .map_err(|error| ConfigError { message: error })?;
 
         // Default to paper trading for safety; require explicit opt-in for live.
-        let is_paper = env::var("IS_PAPER")
+        let is_paper = env::var("ALPACA_IS_PAPER")
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
@@ -252,7 +252,7 @@ mod tests {
     fn test_from_env_fails_without_alpaca_key_id() {
         unsafe {
             env::set_var("DATABASE_URL", "postgresql://localhost:5432/nonexistent");
-            env::remove_var("ALPACA_KEY_ID");
+            env::remove_var("ALPACA_API_KEY_ID");
         }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -260,7 +260,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let result = AppState::from_env().await;
-            // Fails either at DB connect or at ALPACA_KEY_ID — both are errors.
+            // Fails either at DB connect or at ALPACA_API_KEY_ID — both are errors.
             assert!(result.is_err());
         });
         unsafe {

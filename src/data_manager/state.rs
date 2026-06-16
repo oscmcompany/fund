@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 /// Alpaca API credentials.
 ///
 /// The private fields enforce that credentials are only constructed when both
-/// `ALPACA_KEY_ID` and `ALPACA_SECRET` are non-empty. An `AlpacaCredentials`
+/// `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET` are non-empty. An `AlpacaCredentials`
 /// in scope is proof that both values were present at initialization.
 #[derive(Clone)]
 pub struct AlpacaCredentials {
@@ -25,11 +25,11 @@ pub struct AlpacaCredentials {
 impl AlpacaCredentials {
     /// Reads credentials from environment variables.
     ///
-    /// Returns `None` if either `ALPACA_KEY_ID` or `ALPACA_SECRET` is absent or empty.
+    /// Returns `None` if either `ALPACA_API_KEY_ID` or `ALPACA_API_SECRET` is absent or empty.
     /// The `ALPACA_FEED` variable defaults to `"iex"` if not set.
     pub fn from_env() -> Option<Self> {
-        let key_id = std::env::var("ALPACA_KEY_ID").unwrap_or_default();
-        let secret = std::env::var("ALPACA_SECRET").unwrap_or_default();
+        let key_id = std::env::var("ALPACA_API_KEY_ID").unwrap_or_default();
+        let secret = std::env::var("ALPACA_API_SECRET").unwrap_or_default();
         if key_id.is_empty() || secret.is_empty() {
             return None;
         }
@@ -268,21 +268,21 @@ mod tests {
     fn test_alpaca_credentials_from_env_returns_none_when_key_id_missing() {
         // SAFETY: protected by serial test runner conventions; env mutation is
         // scoped to the test process.
-        let original_key = std::env::var("ALPACA_KEY_ID").ok();
-        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
         unsafe {
-            std::env::remove_var("ALPACA_KEY_ID");
-            std::env::set_var("ALPACA_SECRET", "test-secret");
+            std::env::remove_var("ALPACA_API_KEY_ID");
+            std::env::set_var("ALPACA_API_SECRET", "test-secret");
         }
         let result = AlpacaCredentials::from_env();
         unsafe {
             match original_key {
-                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
-                None => std::env::remove_var("ALPACA_KEY_ID"),
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
             }
             match original_secret {
-                Some(v) => std::env::set_var("ALPACA_SECRET", v),
-                None => std::env::remove_var("ALPACA_SECRET"),
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
             }
         }
         assert!(result.is_none());
@@ -291,21 +291,21 @@ mod tests {
     #[test]
     #[serial]
     fn test_alpaca_credentials_from_env_returns_none_when_secret_missing() {
-        let original_key = std::env::var("ALPACA_KEY_ID").ok();
-        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
         unsafe {
-            std::env::set_var("ALPACA_KEY_ID", "test-key");
-            std::env::remove_var("ALPACA_SECRET");
+            std::env::set_var("ALPACA_API_KEY_ID", "test-key");
+            std::env::remove_var("ALPACA_API_SECRET");
         }
         let result = AlpacaCredentials::from_env();
         unsafe {
             match original_key {
-                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
-                None => std::env::remove_var("ALPACA_KEY_ID"),
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
             }
             match original_secret {
-                Some(v) => std::env::set_var("ALPACA_SECRET", v),
-                None => std::env::remove_var("ALPACA_SECRET"),
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
             }
         }
         assert!(result.is_none());
@@ -314,23 +314,23 @@ mod tests {
     #[test]
     #[serial]
     fn test_alpaca_credentials_feed_defaults_to_iex() {
-        let original_key = std::env::var("ALPACA_KEY_ID").ok();
-        let original_secret = std::env::var("ALPACA_SECRET").ok();
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
         let original_feed = std::env::var("ALPACA_FEED").ok();
         unsafe {
-            std::env::set_var("ALPACA_KEY_ID", "test-key");
-            std::env::set_var("ALPACA_SECRET", "test-secret");
+            std::env::set_var("ALPACA_API_KEY_ID", "test-key");
+            std::env::set_var("ALPACA_API_SECRET", "test-secret");
             std::env::remove_var("ALPACA_FEED");
         }
         let credentials = AlpacaCredentials::from_env().unwrap();
         unsafe {
             match original_key {
-                Some(v) => std::env::set_var("ALPACA_KEY_ID", v),
-                None => std::env::remove_var("ALPACA_KEY_ID"),
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
             }
             match original_secret {
-                Some(v) => std::env::set_var("ALPACA_SECRET", v),
-                None => std::env::remove_var("ALPACA_SECRET"),
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
             }
             match original_feed {
                 Some(v) => std::env::set_var("ALPACA_FEED", v),
