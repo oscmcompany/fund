@@ -326,16 +326,15 @@ impl AlpacaTradingClient {
         Ok(true)
     }
 
-    /// Returns the set of tickers from `tickers` that are currently shortable
-    /// (active US equity assets with `shortable = true` and `easy_to_borrow = true`).
-    pub async fn get_shortable_tickers(
+    /// Returns the full set of tickers that are currently tradable and shortable
+    /// (active US equity assets with `tradable = true`, `shortable = true`, and
+    /// `easy_to_borrow = true`).
+    ///
+    /// Callers should cache this result for the duration of a trading session rather
+    /// than calling it on every rebalance cycle.
+    pub async fn fetch_tradable_assets(
         &self,
-        tickers: &[String],
     ) -> Result<std::collections::HashSet<String>, AlpacaError> {
-        if tickers.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-
         let url = format!(
             "{}/v2/assets?status=active&asset_class=us_equity",
             self.base_url
@@ -358,26 +357,19 @@ impl AlpacaTradingClient {
             AlpacaError::Parse(format!("Failed to parse assets response: {error}"))
         })?;
 
-        let ticker_set: std::collections::HashSet<&str> =
-            tickers.iter().map(String::as_str).collect();
-
-        let shortable: std::collections::HashSet<String> = assets
+        let tradable: std::collections::HashSet<String> = assets
             .into_iter()
             .filter(|asset| {
-                ticker_set.contains(asset.symbol.as_str())
+                asset.tradable.unwrap_or(false)
                     && asset.shortable.unwrap_or(false)
                     && asset.easy_to_borrow.unwrap_or(false)
             })
             .map(|asset| asset.symbol)
             .collect();
 
-        info!(
-            requested = tickers.len(),
-            shortable = shortable.len(),
-            "Shortable ticker check complete"
-        );
+        info!(tradable = tradable.len(), "Tradable asset universe fetched");
 
-        Ok(shortable)
+        Ok(tradable)
     }
 
     /// Attempts to cancel an open order by its Alpaca order ID.
@@ -473,6 +465,7 @@ struct OrderResponse {
 #[derive(Deserialize)]
 struct AssetResponse {
     symbol: String,
+    tradable: Option<bool>,
     shortable: Option<bool>,
     easy_to_borrow: Option<bool>,
 }
@@ -633,43 +626,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_shortable_tickers_empty_input() {
-        let client =
-            AlpacaTradingClient::with_base_url(make_credentials(), "http://unused".to_string());
-        let result = client.get_shortable_tickers(&[]).await.unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_shortable_tickers_filters_correctly() {
+    async fn test_fetch_tradable_assets_filters_correctly() {
         let mut server = Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/assets?status=active&asset_class=us_equity")
             .with_status(200)
             .with_body(
                 r#"[
-                {"symbol": "AAPL", "shortable": true, "easy_to_borrow": true},
-                {"symbol": "MSFT", "shortable": false, "easy_to_borrow": true},
-                {"symbol": "GOOG", "shortable": true, "easy_to_borrow": false},
-                {"symbol": "NVDA", "shortable": true, "easy_to_borrow": true}
+                {"symbol": "AAPL", "tradable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "MSFT", "tradable": true,  "shortable": false, "easy_to_borrow": true},
+                {"symbol": "GOOG", "tradable": true,  "shortable": true,  "easy_to_borrow": false},
+                {"symbol": "NVDA", "tradable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "META", "tradable": false, "shortable": true,  "easy_to_borrow": true}
             ]"#,
             )
             .create_async()
             .await;
 
         let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
-        let tickers = vec![
-            "AAPL".to_string(),
-            "MSFT".to_string(),
-            "GOOG".to_string(),
-            "NVDA".to_string(),
-        ];
-        let shortable = client.get_shortable_tickers(&tickers).await.unwrap();
+        let tradable = client.fetch_tradable_assets().await.unwrap();
 
-        assert!(shortable.contains("AAPL"));
-        assert!(!shortable.contains("MSFT")); // not shortable
-        assert!(!shortable.contains("GOOG")); // not easy_to_borrow
-        assert!(shortable.contains("NVDA"));
+        assert!(tradable.contains("AAPL"));
+        assert!(!tradable.contains("MSFT")); // not shortable
+        assert!(!tradable.contains("GOOG")); // not easy_to_borrow
+        assert!(tradable.contains("NVDA"));
+        assert!(!tradable.contains("META")); // not tradable
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_tradable_assets_api_error() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/assets?status=active&asset_class=us_equity")
+            .with_status(401)
+            .with_body(r#"{"message": "Unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
+        let result = client.fetch_tradable_assets().await;
+
+        assert!(matches!(result, Err(AlpacaError::Api { status: 401, .. })));
         mock.assert_async().await;
     }
 

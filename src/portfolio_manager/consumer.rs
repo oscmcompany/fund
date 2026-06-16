@@ -111,10 +111,16 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
             .unwrap_or(0);
 
         if event_type == EventType::MarketSessionCheck.as_str() {
-            handle_market_session_check(pool).await;
+            handle_market_session_check(state, pool).await;
         } else if event_type == EventType::EquityPredictionsCompleted.as_str() {
             info!(event_id, "Received equity_predictions_completed");
             handle_equity_predictions_completed(state, pool, event_id).await;
+        } else if event_type == EventType::EquityPredictionsErrored.as_str() {
+            info!(
+                event_id,
+                "Received equity_predictions_errored; clearing rebalance cycle flag"
+            );
+            state.set_rebalance_cycle_in_progress(false);
         } else if event_type == EventType::PortfolioLiquidationRequested.as_str() {
             info!(event_id, "Received portfolio_liquidation_requested");
             handle_portfolio_liquidation(state, pool, event_id).await;
@@ -140,10 +146,51 @@ fn is_within_trading_session_at(now: DateTime<Utc>) -> bool {
     (9 * 60 + 30..16 * 60).contains(&minutes_eastern)
 }
 
+/// Maximum duration (seconds) for a prediction-pipeline run before the in-progress
+/// flag is considered stale. Set to one hour, well past any realistic pipeline run.
+const STALE_CYCLE_SECS: i64 = 60 * 60;
+
 /// Emits `equity_predictions_requested` in response to a periodic market session check.
-/// The ensemble_manager consumer picks this up and runs the prediction pipeline.
+///
+/// Skips emission when:
+/// - A rebalance cycle is already in progress (predictions still running or rebalance
+///   executing), preventing duplicate concurrent cycles when the pipeline takes longer
+///   than the 5-minute tick interval. If the flag has been set for longer than
+///   [`STALE_CYCLE_SECS`], it is considered stale (e.g., upstream crash without an
+///   `equity_predictions_errored` event) and is automatically reset so trading can resume.
+/// - Alpaca reports the market is not open (handles holidays and early closes without
+///   requiring a hardcoded calendar). Fails open: if the clock endpoint is unreachable,
+///   the tick is skipped rather than risking a trade on degraded connectivity.
+///
 /// No consumer offset tracking because stale ticks carry no meaningful signal.
-async fn handle_market_session_check(pool: &PgPool) {
+async fn handle_market_session_check(state: &AppState, pool: &PgPool) {
+    if state.rebalance_cycle_in_progress() {
+        let elapsed = Utc::now().timestamp() - state.rebalance_cycle_started_at();
+        if elapsed < STALE_CYCLE_SECS {
+            info!("Skipping market session check: rebalance cycle already in progress");
+            return;
+        }
+        warn!(
+            elapsed_minutes = elapsed / 60,
+            "Rebalance cycle flag stale; resetting to allow new cycle"
+        );
+        state.set_rebalance_cycle_in_progress(false);
+    }
+
+    match state.alpaca_client().is_market_open().await {
+        Ok(true) => {}
+        Ok(false) => {
+            info!("Skipping market session check: market is not open");
+            return;
+        }
+        Err(error) => {
+            warn!(error = %error, "Skipping market session check: market clock check failed");
+            return;
+        }
+    }
+
+    state.set_rebalance_cycle_in_progress(true);
+
     if let Err(error) = emit_event(
         pool,
         EventType::EquityPredictionsRequested,
@@ -151,6 +198,8 @@ async fn handle_market_session_check(pool: &PgPool) {
     )
     .await
     {
+        // Emission failed; clear the flag so the next tick can retry.
+        state.set_rebalance_cycle_in_progress(false);
         warn!(error = %error, "Failed to emit equity_predictions_requested");
     }
 }
@@ -222,6 +271,8 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
     if let Err(error) = update_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER, event_id).await {
         warn!(error = %error, "Failed to update consumer offset");
     }
+
+    state.set_rebalance_cycle_in_progress(false);
 }
 
 async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id: i64) {
@@ -292,6 +343,10 @@ mod tests {
         assert_eq!(
             EventType::EquityPredictionsCompleted.as_str(),
             "equity_predictions_completed"
+        );
+        assert_eq!(
+            EventType::EquityPredictionsErrored.as_str(),
+            "equity_predictions_errored"
         );
         assert_eq!(
             EventType::PortfolioLiquidationRequested.as_str(),

@@ -7,11 +7,13 @@
 //! 4. `select_size_execute` — select pairs, size, filter shortable, trade
 //! 5. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -161,6 +163,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let filled = select_size_execute(
         alpaca,
         pool,
+        state.tradable_assets(),
         &signals,
         &historical_prices,
         &spy_prices,
@@ -416,6 +419,7 @@ async fn check_drawdown(
 async fn select_size_execute(
     alpaca: &AlpacaTradingClient,
     pool: &sqlx::PgPool,
+    tradable_assets_cache: &Arc<RwLock<Option<Arc<HashSet<String>>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<String, Vec<f64>>,
     spy_prices: &[f64],
@@ -450,29 +454,31 @@ async fn select_size_execute(
         exposure_scale,
     )?;
 
-    let all_sized_tickers: Vec<String> = sized_pairs
-        .iter()
-        .flat_map(|pair| {
-            [
-                pair.long_ticker().to_string(),
-                pair.short_ticker().to_string(),
-            ]
-        })
-        .collect();
-
-    let shortable = alpaca
-        .get_shortable_tickers(&all_sized_tickers)
-        .await
-        .map_err(|error| {
-            RebalanceError::Execution(ExecutionError::PositionClose {
-                ticker: "shortable_check".to_string(),
-                source: error,
-            })
-        })?;
+    // Resolve the tradable asset universe from the session cache, populating it
+    // on first use. Subsequent rebalances within the same service instance reuse
+    // the cached Arc without cloning the underlying set.
+    let tradable_assets: Arc<HashSet<String>> = {
+        let read_guard = tradable_assets_cache.read().await;
+        if let Some(assets) = read_guard.as_ref() {
+            Arc::clone(assets)
+        } else {
+            drop(read_guard);
+            let assets = Arc::new(
+                alpaca
+                    .fetch_tradable_assets()
+                    .await
+                    .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
+            );
+            let mut write_guard = tradable_assets_cache.write().await;
+            *write_guard = Some(Arc::clone(&assets));
+            info!(count = assets.len(), "Tradable asset cache populated");
+            assets
+        }
+    };
 
     let shortable_pairs: Vec<_> = sized_pairs
         .into_iter()
-        .filter(|pair| shortable.contains(pair.short_ticker()))
+        .filter(|pair| tradable_assets.contains(pair.short_ticker()))
         .collect();
 
     let pending = execute_open_pairs(alpaca, &shortable_pairs).await;
