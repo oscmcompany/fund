@@ -6,16 +6,13 @@
 
 This is a collection of guidelines and references.
 
-- Rust and Python are the primary project languages
+- Rust is the primary project language
 - [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
 - Services run on a single exe.dev VM via `devenv --profile applications up` in both dev and production
 - Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider
-- Python code follows [uv](https://github.com/astral-sh/uv) workspace conventions
 - Rust code follows Cargo workspace conventions
-- AWS S3 is used for blob storage (data bucket and model artifacts bucket)
+- AWS S3 is used for blob storage
 - AWS Secrets Manager stores secrets in secretspec format (`secretspec/{project}/{profile}/{key}`)
-- Models are primarily built using [tinygrad](https://docs.tinygrad.org/)
-- Use `devenv tasks run checks:python` for comprehensive Python checks
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
 - Add in-line code comments only where necessary for clarity; include language-appropriate docstrings for functions and
   modules
@@ -29,7 +26,6 @@ This is a collection of guidelines and references.
 - Keep only universally-understood acronyms as-is: formats, protocols, and identity (`csv`, `json`,
   `sql`, `http`, `url`, `uri`, `io`, `id`, `uuid`, `api`) and established domain or proper-noun terms
   (`aws`, `utc`, `etf`, `ohlcv`, `guc`); case acronyms as ordinary words per language convention
-  (Rust `HttpClient`/`Uuid`, Python `api_key`/`http_client`), not all-caps runs
 - Never rename fixed external identifiers: devenv profile names (`applications`, `ml`), the `awssm` secretspec
   provider, the `tide` model and package name, environment variables and secret keys (e.g.
   `DATABASE_URL`, `ALPACA_API_KEY_ID`), library import aliases (`np`, `pl`, `pa`), linter directives
@@ -38,34 +34,21 @@ This is a collection of guidelines and references.
 - Apply the spell-it-out rule to new code, to identifiers you touch, and to dedicated cleanup passes;
   already-shipped database and schema identifiers (index, constraint, and column names) and stored
   values are effectively fixed and change only via an explicit migration
-- Follow Rust and Python recommended casing conventions
-- Strictly use Python version 3.12.10
-- Scan and remove unused dependencies from `pyproject.toml` files; move duplicate dependencies into root workspace `pyproject.toml`
+- Follow Rust recommended casing conventions
 - Introduce new dependencies only after approval
-- Include type hints on all Python function parameters and return types
-- Use Polars for [Python](https://docs.pola.rs/api/python/stable/reference/index.html) and
-  [Rust](https://docs.rs/polars/latest/polars/) dataframes
-- Use `typing` module `cast` function for `tinygrad` method outputs when necessary with union types
-- Write `pytest` functions for Python tests using plain functions, not class-based test organization
-- Ensure Rust and Python automated test suites achieve at least 90% line or statement coverage per service or library
+- Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
+- Ensure Rust automated test suites achieve at least 70% line or statement coverage
 - Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations
-- Check that DataFrame definitions in both Python and Rust match expected schemas defined in `pandera` resources
-- When adding `ValueError` exceptions, create a separate variable called `message` to hold the error string before raising
-- When logging after an exception, use `logger.exception()` to capture stack trace with the `structlog` package
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
 - When debugging or fixing bugs, check structured logs and error log files in `/var/log/fund/` to understand what happened
-- After fixing a bug, create a git commit with a detailed summary of the root cause and fix in the commit message
+- After fixing a bug, create a Git commit with a detailed summary of the root cause and fix in the commit message
 - When creating GitHub issues or pull requests, use the templates in the `.github/` directory and follow commented instructions
 - When naming branches, use an all-lowercase, hyphenated, and concise summary of the work being done
-- `tools/` folder contains development utilities and scripts
-- `applications/` folder contains deployable services
-- `libraries/` folder contains shared code resources
-- `models/` folder contains model definitions and training code
+- `models/` folder contains model definitions and training code and `src/` contains application code
 - See `README.md` "Principles" section for developer philosophy
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
-- After user corrections, update `.claude/tasks/lessons.md` with timestamp to prevent repeating mistakes
 - Prove changes work before marking tasks complete - run `devenv tasks run` checks, compare behavior, demonstrate correctness
 - For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
 - Make every change as simple as possible and impact minimal code
@@ -81,7 +64,7 @@ This is a collection of guidelines and references.
 - Invoke skills and suggest commands based on conversational context rather than waiting for explicit slash commands
 - Guard against division by zero when computing ratios or percentages from DataFrame aggregations
 - When Polars `Series.sum()` is used on a potentially empty or all-null series, handle the `None` return case
-- `devenv tasks run` supports prefix group execution: `checks:python` runs all `checks:python:*` subtasks
+- `devenv tasks run` supports prefix group execution: `checks:rust` runs all `checks:rust:*` subtasks
 - Prefer validated constructors with private fields over public struct literals — a value in scope should be proof of its
   own validity, not a candidate for re-checking downstream
 - `schema.sql` is the single source of truth for the database schema; all DDL must use idempotent forms
@@ -89,3 +72,17 @@ This is a collection of guidelines and references.
   `DO` block checking `cron.job` for existence before calling `cron.schedule*(...)`, etc.)
   so the file can be safely re-run against any populated database — never add migration-style
   `ALTER TABLE`, `DROP TABLE`, or bare `UPDATE` blocks
+- Utilize category theory when designing data transformations and model architectures - functors, monads, and natural
+  transformations; this leads to more composable, reusable, and maintainable code
+- Only use existing repository labels for GitHub issues and pull requests
+- Prompt to run the database and run `sqlx` compile-time checks for schema or query changes
+- Encode domain constraints in the type system: use enums with per-variant data to make invalid states
+  unrepresentable at compile time rather than checking validity at runtime
+- Use `match` (not `if let` chains) when handling enum variants — exhaustive matching ensures every variant is
+  handled and the compiler flags missing cases when variants change
+- Wrap primitive types in tuple structs to enforce domain type safety (e.g., `struct Price(f64)`); never accept
+  a raw `f64` or `String` where a specific domain value is required
+- Model state machines with two enums (states and transitions) matched as a tuple:
+  `match (current_state, transition) { ... }` — keeps business logic exhaustive and legible
+- Design structs to be flat and normalized: each struct represents one concept with only its own fields;
+  avoid deep nesting or struct embedding as a substitute for inheritance
