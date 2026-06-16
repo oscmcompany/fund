@@ -21,7 +21,7 @@ jobs:
       - name: Install devenv
         run: nix profile add nixpkgs#devenv
       - name: Bump dependencies
-        run: devenv shell bump-deps
+        run: devenv --secretspec-provider env --secretspec-profile development shell bump-deps
       - name: Check for changes
         id: changes
         run: |
