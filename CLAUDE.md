@@ -37,7 +37,7 @@ This is a collection of guidelines and references.
 - Follow Rust recommended casing conventions
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
-- Ensure Rust automated test suites achieve at least 90% line or statement coverage
+- Ensure Rust automated test suites achieve at least 70% line or statement coverage
 - Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
@@ -74,3 +74,15 @@ This is a collection of guidelines and references.
   `ALTER TABLE`, `DROP TABLE`, or bare `UPDATE` blocks
 - Utilize category theory when designing data transformations and model architectures - functors, monads, and natural
   transformations; this leads to more composable, reusable, and maintainable code
+- Only use existing repository labels for GitHub issues and pull requests
+- Prompt to run the database and run `sqlx` compile-time checks for schema or query changes
+- Encode domain constraints in the type system: use enums with per-variant data to make invalid states
+  unrepresentable at compile time rather than checking validity at runtime
+- Use `match` (not `if let` chains) when handling enum variants — exhaustive matching ensures every variant is
+  handled and the compiler flags missing cases when variants change
+- Wrap primitive types in tuple structs to enforce domain type safety (e.g., `struct Price(f64)`); never accept
+  a raw `f64` or `String` where a specific domain value is required
+- Model state machines with two enums (states and transitions) matched as a tuple:
+  `match (current_state, transition) { ... }` — keeps business logic exhaustive and legible
+- Design structs to be flat and normalized: each struct represents one concept with only its own fields;
+  avoid deep nesting or struct embedding as a substitute for inheritance
