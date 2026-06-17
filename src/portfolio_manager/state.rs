@@ -17,6 +17,7 @@ use crate::domain::portfolio::{
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
 use crate::portfolio_manager::alpaca::AlpacaTradingClient;
+use crate::portfolio_manager::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
 const DEFAULT_DRAWDOWN_THRESHOLD: f64 = 0.10;
@@ -47,6 +48,40 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Reads `key` as `f64`, returning `default` when unset. A present-but-unparseable
+/// value is a hard error so a misconfigured environment fails fast at startup
+/// rather than silently falling back.
+fn env_f64(key: &str, default: f64) -> Result<f64, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse::<f64>().map_err(|_| ConfigError {
+            message: format!("{key} must be a number, got '{raw}'"),
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Reads `key` as `u8`, returning `default` when unset. Present-but-unparseable is
+/// a hard error (see [`env_f64`]).
+fn env_u8(key: &str, default: u8) -> Result<u8, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse::<u8>().map_err(|_| ConfigError {
+            message: format!("{key} must be an integer 0-255, got '{raw}'"),
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Reads `key` as `usize`, returning `default` when unset. Present-but-unparseable
+/// is a hard error (see [`env_f64`]).
+fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw.trim().parse::<usize>().map_err(|_| ConfigError {
+            message: format!("{key} must be a non-negative integer, got '{raw}'"),
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
 /// Shared state injected into every Axum handler via `axum::Extension`.
 ///
 /// Constructed once at startup via `from_env()`. A value of this type proves
@@ -73,6 +108,11 @@ pub struct AppState {
     /// an upstream crash that never emits `equity_predictions_completed` or
     /// `equity_predictions_errored`.
     rebalance_cycle_started_at: Arc<AtomicI64>,
+    /// Number of statistical-arbitrage candidate pairs to consider per rebalance.
+    /// Decoupled from the required minimum (`constraints.minimum_pairs`) so a
+    /// larger pool can absorb sizing attrition. Override per environment with
+    /// `PORTFOLIO_CANDIDATE_POOL`.
+    candidate_pool_count: usize,
 }
 
 impl AppState {
@@ -89,6 +129,11 @@ impl AppState {
     /// Returns the confidence floor used to gate signals.
     pub fn confidence_floor(&self) -> ConfidenceFloor {
         self.confidence_floor
+    }
+
+    /// Returns the candidate-pool size for statistical-arbitrage pair selection.
+    pub fn candidate_pool_count(&self) -> usize {
+        self.candidate_pool_count
     }
 
     /// Returns a reference to the portfolio constraints.
@@ -168,32 +213,51 @@ impl AppState {
 
         let alpaca_client = AlpacaTradingClient::new(credentials, is_paper);
 
-        let drawdown_threshold = Percent::new(DEFAULT_DRAWDOWN_THRESHOLD)
-            .map(DrawdownThreshold)
-            .map_err(|_| ConfigError {
-                message: "Invalid default drawdown threshold".to_string(),
-            })?;
+        // Risk and strategy parameters fall back to the safe defaults below but
+        // can be overridden per environment (keyed off FUND_PROFILE via the
+        // service's environment). A present-but-invalid value fails startup.
+        let drawdown_threshold = Percent::new(env_f64(
+            "PORTFOLIO_DRAWDOWN_THRESHOLD",
+            DEFAULT_DRAWDOWN_THRESHOLD,
+        )?)
+        .map(DrawdownThreshold)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_DRAWDOWN_THRESHOLD must be a fraction in [0, 1]".to_string(),
+        })?;
 
-        let concentration_cap = Percent::new(DEFAULT_CONCENTRATION_CAP)
-            .map(ConcentrationCap)
-            .map_err(|_| ConfigError {
-                message: "Invalid default concentration cap".to_string(),
-            })?;
+        let concentration_cap = Percent::new(env_f64(
+            "PORTFOLIO_CONCENTRATION_CAP",
+            DEFAULT_CONCENTRATION_CAP,
+        )?)
+        .map(ConcentrationCap)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_CONCENTRATION_CAP must be a fraction in [0, 1]".to_string(),
+        })?;
 
-        let minimum_pairs = NonZeroU8::new(DEFAULT_MINIMUM_PAIRS)
-            .map(MinimumPairs)
-            .ok_or_else(|| ConfigError {
-                message: "Minimum pairs must be non-zero".to_string(),
-            })?;
+        let minimum_pairs =
+            NonZeroU8::new(env_u8("PORTFOLIO_MINIMUM_PAIRS", DEFAULT_MINIMUM_PAIRS)?)
+                .map(MinimumPairs)
+                .ok_or_else(|| ConfigError {
+                    message: "PORTFOLIO_MINIMUM_PAIRS must be non-zero".to_string(),
+                })?;
 
-        let confidence_floor = Percent::new(DEFAULT_CONFIDENCE_FLOOR)
-            .map(ConfidenceFloor)
-            .map_err(|_| ConfigError {
-                message: "Invalid default confidence floor".to_string(),
-            })?;
+        let confidence_floor = Percent::new(env_f64(
+            "PORTFOLIO_CONFIDENCE_FLOOR",
+            DEFAULT_CONFIDENCE_FLOOR,
+        )?)
+        .map(ConfidenceFloor)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_CONFIDENCE_FLOOR must be a fraction in [0, 1]".to_string(),
+        })?;
 
-        let beta_tolerance = BetaTolerance::new(DEFAULT_BETA_TOLERANCE)
-            .map_err(|error| ConfigError { message: error })?;
+        let beta_tolerance =
+            BetaTolerance::new(env_f64("PORTFOLIO_BETA_TOLERANCE", DEFAULT_BETA_TOLERANCE)?)
+                .map_err(|error| ConfigError { message: error })?;
+
+        // The candidate pool must be at least the required minimum, otherwise
+        // sizing can never reach `minimum_pairs` viable pairs.
+        let candidate_pool_count = env_usize("PORTFOLIO_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL)?
+            .max(minimum_pairs.0.get() as usize);
 
         Ok(Self {
             pool,
@@ -208,6 +272,7 @@ impl AppState {
             tradable_assets: Arc::new(RwLock::new(None)),
             rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
             rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            candidate_pool_count,
         })
     }
 }
@@ -230,6 +295,37 @@ mod tests {
             message: "test".to_string(),
         };
         let _boxed: Box<dyn std::error::Error> = Box::new(error);
+    }
+
+    #[test]
+    fn test_env_f64_falls_back_to_default_when_unset() {
+        assert_eq!(env_f64("PORTFOLIO_TEST_UNSET_F64_KEY", 0.25).unwrap(), 0.25);
+    }
+
+    #[test]
+    fn test_env_f64_reads_and_parses_override() {
+        // Unique key avoids racing other tests that mutate the environment.
+        // SAFETY: edition-2021 single-process test; the key is used only here.
+        unsafe { env::set_var("PORTFOLIO_TEST_OVERRIDE_F64", "0.05") };
+        assert_eq!(env_f64("PORTFOLIO_TEST_OVERRIDE_F64", 0.10).unwrap(), 0.05);
+        unsafe { env::remove_var("PORTFOLIO_TEST_OVERRIDE_F64") };
+    }
+
+    #[test]
+    fn test_env_f64_rejects_unparseable_value() {
+        unsafe { env::set_var("PORTFOLIO_TEST_BAD_F64", "not-a-number") };
+        let result = env_f64("PORTFOLIO_TEST_BAD_F64", 0.10);
+        unsafe { env::remove_var("PORTFOLIO_TEST_BAD_F64") };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_env_u8_and_usize_defaults_and_overrides() {
+        assert_eq!(env_u8("PORTFOLIO_TEST_UNSET_U8", 10).unwrap(), 10);
+        assert_eq!(env_usize("PORTFOLIO_TEST_UNSET_USIZE", 20).unwrap(), 20);
+        unsafe { env::set_var("PORTFOLIO_TEST_OVERRIDE_USIZE", "30") };
+        assert_eq!(env_usize("PORTFOLIO_TEST_OVERRIDE_USIZE", 20).unwrap(), 30);
+        unsafe { env::remove_var("PORTFOLIO_TEST_OVERRIDE_USIZE") };
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! Builds a correlation matrix of ticker log returns over a trailing window,
 //! identifies pairs whose correlation falls in the signal band, computes the
 //! OLS spread z-score for each candidate pair, and returns the top
-//! `TARGET_PAIR_COUNT` pairs by rank score using a greedy no-duplicate-ticker
+//! `candidate_pool` pairs by rank score using a greedy no-duplicate-ticker
 //! selection.
 
 use std::collections::HashMap;
@@ -29,8 +29,12 @@ const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Minimum number of eligible tickers needed to form any pair.
 const MINIMUM_TICKER_COUNT: usize = 2;
 
-/// Target number of pairs to return.
-pub const TARGET_PAIR_COUNT: usize = 10;
+/// Default size of the candidate pool returned by `select_pairs` when not
+/// configured via `PORTFOLIO_CANDIDATE_POOL`. Decoupled from the required
+/// minimum (the `minimum_pairs` constraint) so a larger pool can absorb sizing
+/// attrition without lowering the minimum; defaults to the same value, leaving
+/// behavior unchanged unless overridden per environment.
+pub const DEFAULT_CANDIDATE_POOL: usize = 10;
 
 /// A candidate long-short pair identified by the statistical arbitrage screener.
 #[derive(Debug, Clone)]
@@ -123,7 +127,7 @@ impl CandidatePair {
     }
 }
 
-/// Selects up to `TARGET_PAIR_COUNT` statistical arbitrage pairs from the signals.
+/// Selects up to `candidate_pool` statistical arbitrage pairs from the signals.
 ///
 /// Filters signals by `ensemble_confidence >= CONFIDENCE_THRESHOLD` and
 /// `realized_volatility > 0`. Builds a Pearson correlation matrix over the last
@@ -132,11 +136,14 @@ impl CandidatePair {
 /// 2. Z-score of the OLS spread >= `Z_SCORE_ENTRY_THRESHOLD`
 ///
 /// Pairs are ranked by `|z_score| × signal_strength` and selected greedily
-/// (no ticker appears in more than one pair). Returns an empty `Vec` when
-/// insufficient data or fewer than `MINIMUM_TICKER_COUNT` eligible tickers.
+/// (no ticker appears in more than one pair), returning the top `candidate_pool`.
+/// A pool larger than the required minimum leaves spare candidates for sizing to
+/// fall back on. Returns an empty `Vec` when insufficient data or fewer than
+/// `MINIMUM_TICKER_COUNT` eligible tickers.
 pub fn select_pairs(
     signals: &[ConsolidatedSignal],
     historical_closes: &HashMap<String, Vec<f64>>,
+    candidate_pool: usize,
 ) -> Vec<CandidatePair> {
     // Filter to confident tickers with valid volatility.
     let eligible: Vec<&ConsolidatedSignal> = signals
@@ -294,7 +301,7 @@ pub fn select_pairs(
         used_tickers.insert(pair.long_ticker().to_string());
         used_tickers.insert(pair.short_ticker().to_string());
         selected.push(pair);
-        if selected.len() >= TARGET_PAIR_COUNT {
+        if selected.len() >= candidate_pool {
             break;
         }
     }
@@ -338,14 +345,14 @@ mod tests {
 
     #[test]
     fn test_select_pairs_empty_signals() {
-        assert!(select_pairs(&[], &HashMap::new()).is_empty());
+        assert!(select_pairs(&[], &HashMap::new(), DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
     #[test]
     fn test_select_pairs_insufficient_eligible_signals() {
         // Only one signal above confidence threshold
         let signals = vec![make_signal("AAPL", 0.02, 0.8, 0.01)];
-        assert!(select_pairs(&signals, &HashMap::new()).is_empty());
+        assert!(select_pairs(&signals, &HashMap::new(), DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
     #[test]
@@ -354,7 +361,7 @@ mod tests {
             make_signal("AAPL", 0.02, 0.3, 0.01), // below threshold
             make_signal("MSFT", 0.01, 0.3, 0.01), // below threshold
         ];
-        assert!(select_pairs(&signals, &HashMap::new()).is_empty());
+        assert!(select_pairs(&signals, &HashMap::new(), DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
     #[test]
@@ -364,7 +371,7 @@ mod tests {
             make_signal("MSFT", 0.01, 0.8, 0.01),
         ];
         // No closes provided → no pair selected
-        assert!(select_pairs(&signals, &HashMap::new()).is_empty());
+        assert!(select_pairs(&signals, &HashMap::new(), DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
     #[test]
@@ -387,7 +394,7 @@ mod tests {
             })
             .collect();
 
-        let pairs = select_pairs(&signals, &closes);
+        let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
         // Verify no ticker appears in more than one pair.
         let mut all_tickers = std::collections::HashSet::new();
@@ -403,6 +410,34 @@ mod tests {
             all_tickers.insert(pair.long_ticker.clone());
             all_tickers.insert(pair.short_ticker.clone());
         }
+    }
+
+    #[test]
+    fn test_select_pairs_caps_at_candidate_pool() {
+        // A smaller candidate pool never returns more pairs than a larger one and
+        // never exceeds its own cap.
+        let common_factor: Vec<f64> = (0..70).map(|i| 0.005 * ((i as f64 * 0.3).sin())).collect();
+        let mut closes = HashMap::new();
+        let tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "META", "NVDA"];
+        let signals: Vec<ConsolidatedSignal> = tickers
+            .iter()
+            .enumerate()
+            .map(|(i, &ticker)| {
+                let offset = i as f64 * 0.0001;
+                let prices =
+                    make_correlated_prices(71, 100.0 + i as f64 * 10.0, &common_factor, offset);
+                closes.insert(ticker.to_string(), prices);
+                make_signal(ticker, 0.01 * (i as f64 + 1.0), 0.9, 0.01)
+            })
+            .collect();
+
+        let large_pool = select_pairs(&signals, &closes, 10);
+        let single = select_pairs(&signals, &closes, 1);
+        assert!(single.len() <= 1, "pool of 1 must cap to at most one pair");
+        assert!(
+            single.len() <= large_pool.len(),
+            "a smaller pool never yields more pairs than a larger one"
+        );
     }
 
     #[test]
@@ -424,7 +459,7 @@ mod tests {
             })
             .collect();
 
-        let pairs = select_pairs(&signals, &closes);
+        let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
         for pair in &pairs {
             assert!(pair.z_score >= Z_SCORE_ENTRY_THRESHOLD);
             assert!(pair.hedge_ratio.is_finite());

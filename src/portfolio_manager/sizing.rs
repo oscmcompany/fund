@@ -8,16 +8,13 @@
 
 use std::collections::HashMap;
 
-use crate::portfolio_manager::statistical_arbitrage::{CandidatePair, TARGET_PAIR_COUNT};
+use crate::portfolio_manager::statistical_arbitrage::CandidatePair;
 
 /// Relative lower bound for each pair weight versus its volatility-parity share.
 const BETA_WEIGHT_LOWER_BOUND: f64 = 0.5;
 
 /// Relative upper bound for each pair weight versus its volatility-parity share.
 const BETA_WEIGHT_UPPER_BOUND: f64 = 2.0;
-
-/// Required minimum number of viable pairs to form a portfolio.
-const REQUIRED_PAIRS: usize = TARGET_PAIR_COUNT;
 
 /// Short buying power reservation factor used by Alpaca.
 const SHORT_BUYING_POWER_BUFFER: f64 = 1.03;
@@ -84,9 +81,11 @@ impl SizedPair {
         short_market_beta: f64,
     ) -> Result<Self, SizingError> {
         if long_dollar_amount < 0.0 || short_dollar_amount < 0.0 || short_quantity <= 0 {
+            // A single invalid pair; the caller discards this error and skips the
+            // pair, so the count is only informational.
             return Err(SizingError::InsufficientPairs {
                 found: 0,
-                required: REQUIRED_PAIRS,
+                required: 1,
             });
         }
         Ok(Self {
@@ -162,7 +161,7 @@ impl SizedPair {
 /// Error returned when sizing cannot produce a viable portfolio.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SizingError {
-    /// Fewer than `REQUIRED_PAIRS` candidates remained after feasibility filtering.
+    /// Fewer than `required_pairs` candidates remained after feasibility filtering.
     InsufficientPairs { found: usize, required: usize },
 }
 
@@ -179,7 +178,7 @@ impl std::fmt::Display for SizingError {
 
 impl std::error::Error for SizingError {}
 
-/// Sizes the first `REQUIRED_PAIRS` candidate pairs using volatility parity,
+/// Sizes the first `required_pairs` candidate pairs using volatility parity,
 /// then optimizes weights for beta neutrality.
 ///
 /// `maximum_capital` is the cash available in the account (Alpaca `cash` field).
@@ -187,10 +186,12 @@ impl std::error::Error for SizingError {}
 /// `entry_prices` maps ticker → latest mid or close price.
 /// `exposure_scale` is the regime-driven multiplier (1.0 for mean reversion,
 /// 0.5 for trending).
+/// `required_pairs` is the minimum (and target) number of viable pairs, sourced
+/// from the `minimum_pairs` constraint; it also sets the per-pair capital share.
 ///
 /// Pairs whose short leg price exceeds the maximum affordable per-pair allocation
 /// are discarded before sizing. Returns `Err(SizingError::InsufficientPairs)` when
-/// fewer than `REQUIRED_PAIRS` pairs remain after filtering or after the whole-share
+/// fewer than `required_pairs` pairs remain after filtering or after the whole-share
 /// constraint removes zero-quantity pairs.
 pub fn size_pairs_with_volatility_parity(
     candidate_pairs: &[CandidatePair],
@@ -198,11 +199,12 @@ pub fn size_pairs_with_volatility_parity(
     market_betas: &HashMap<String, f64>,
     entry_prices: &HashMap<String, f64>,
     exposure_scale: f64,
+    required_pairs: usize,
 ) -> Result<Vec<SizedPair>, SizingError> {
     // Maximum dollar allocation a single pair can receive at the highest weight.
     let capital_per_leg = maximum_capital / CAPITAL_DIVISOR;
     let maximum_per_pair_dollar =
-        capital_per_leg * exposure_scale * BETA_WEIGHT_UPPER_BOUND / REQUIRED_PAIRS as f64;
+        capital_per_leg * exposure_scale * BETA_WEIGHT_UPPER_BOUND / required_pairs as f64;
 
     // Discard pairs where the short leg cannot afford at least one whole share,
     // or where either entry price is unknown.
@@ -218,10 +220,10 @@ pub fn size_pairs_with_volatility_parity(
         })
         .collect();
 
-    if feasible.len() < REQUIRED_PAIRS {
+    if feasible.len() < required_pairs {
         return Err(SizingError::InsufficientPairs {
             found: feasible.len(),
-            required: REQUIRED_PAIRS,
+            required: required_pairs,
         });
     }
 
@@ -318,16 +320,16 @@ pub fn size_pairs_with_volatility_parity(
             short_beta,
         ) {
             sized_pairs.push(sized_pair);
-            if sized_pairs.len() == REQUIRED_PAIRS {
+            if sized_pairs.len() == required_pairs {
                 break;
             }
         }
     }
 
-    if sized_pairs.len() < REQUIRED_PAIRS {
+    if sized_pairs.len() < required_pairs {
         return Err(SizingError::InsufficientPairs {
             found: sized_pairs.len(),
-            required: REQUIRED_PAIRS,
+            required: required_pairs,
         });
     }
 
@@ -399,6 +401,9 @@ fn optimize_beta_neutral(pair_net_betas: &[f64], parity_weights: &[f64]) -> Vec<
 mod tests {
     use super::*;
 
+    /// Required-pairs value used across sizing tests (the historical default).
+    const REQUIRED_PAIRS: usize = 10;
+
     fn make_candidate(
         long_ticker: &str,
         short_ticker: &str,
@@ -463,6 +468,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             1.0,
+            REQUIRED_PAIRS,
         );
         assert!(matches!(
             result,
@@ -483,8 +489,27 @@ mod tests {
             &HashMap::new(),
             &entry_prices,
             1.0,
+            REQUIRED_PAIRS,
         );
         assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_size_pairs_honors_required_below_candidate_pool() {
+        // Decoupling: with more feasible candidates than required, sizing returns
+        // exactly `required_pairs`, leaving the rest as spare buffer.
+        let (candidates, entry_prices) = make_ten_candidates(100.0, 50.0);
+        let required = 3;
+        let sized = size_pairs_with_volatility_parity(
+            &candidates,
+            500_000.0,
+            &HashMap::new(),
+            &entry_prices,
+            1.0,
+            required,
+        )
+        .unwrap();
+        assert_eq!(sized.len(), required);
     }
 
     #[test]
@@ -496,6 +521,7 @@ mod tests {
             &HashMap::new(),
             &entry_prices,
             1.0,
+            REQUIRED_PAIRS,
         );
         assert!(result.is_ok());
         let sized = result.unwrap();
@@ -511,6 +537,7 @@ mod tests {
             &HashMap::new(),
             &entry_prices,
             1.0,
+            REQUIRED_PAIRS,
         )
         .unwrap();
         for pair in &sized {
@@ -528,6 +555,7 @@ mod tests {
             &HashMap::new(),
             &entry_prices,
             1.0,
+            REQUIRED_PAIRS,
         )
         .unwrap();
         for pair in &sized {
@@ -540,12 +568,24 @@ mod tests {
         let (candidates, entry_prices) = make_ten_candidates(100.0, 50.0);
         let betas = HashMap::new();
 
-        let full =
-            size_pairs_with_volatility_parity(&candidates, 500_000.0, &betas, &entry_prices, 1.0)
-                .unwrap();
-        let half =
-            size_pairs_with_volatility_parity(&candidates, 500_000.0, &betas, &entry_prices, 0.5)
-                .unwrap();
+        let full = size_pairs_with_volatility_parity(
+            &candidates,
+            500_000.0,
+            &betas,
+            &entry_prices,
+            1.0,
+            REQUIRED_PAIRS,
+        )
+        .unwrap();
+        let half = size_pairs_with_volatility_parity(
+            &candidates,
+            500_000.0,
+            &betas,
+            &entry_prices,
+            0.5,
+            REQUIRED_PAIRS,
+        )
+        .unwrap();
 
         // With half exposure, dollar amounts should be ≤ full amounts.
         for (full_pair, half_pair) in full.iter().zip(half.iter()) {
