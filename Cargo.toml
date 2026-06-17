@@ -98,6 +98,11 @@ thiserror = "2.0.3"
 rust_decimal = { version = "1", features = ["serde"] }
 num-traits = "0.2"
 uuid = { version = "1", features = ["serde", "v4"] }
+# Direct dependency solely to select a process-wide Rustls `CryptoProvider` at
+# startup. Rustls 0.23 is pulled transitively (sqlx, aws-sdk, tungstenite) with
+# both the `aws-lc-rs` and `ring` providers enabled, so it cannot choose one
+# automatically and panics on first TLS use. See `common::crypto`.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # data_manager-only (optional; enabled by the `data_manager` feature)
 chrono-tz = { version = "0.10", optional = true }

@@ -4,6 +4,7 @@
 
 pub mod alpaca;
 pub mod aws;
+pub mod crypto;
 pub mod database;
 pub mod events;
 pub mod observability;
