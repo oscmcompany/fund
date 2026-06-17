@@ -6,12 +6,37 @@ use crate::domain::trading::{
 };
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use sqlx::PgPool;
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
+
+/// Collapse bars sharing a `(ticker, timestamp)` key, keeping the last
+/// occurrence.
+///
+/// Massive's grouped-daily endpoint occasionally returns a ticker more than once
+/// for a date. A single `INSERT ... ON CONFLICT (ticker, timestamp) DO UPDATE`
+/// rejects a repeated conflict target with "ON CONFLICT DO UPDATE command cannot
+/// affect row a second time", which fails the whole 1000-row chunk and—because
+/// the chunks are not wrapped in a transaction—leaves the day's bars partially
+/// written. Keeping the last occurrence mirrors the upsert's latest-write
+/// semantics.
+fn deduplicate_equity_bars(bars: &[EquityBar]) -> Vec<EquityBar> {
+    let mut seen: HashSet<(Ticker, DateTime<Utc>)> = HashSet::with_capacity(bars.len());
+    let mut deduplicated: Vec<EquityBar> = Vec::with_capacity(bars.len());
+    for bar in bars.iter().rev() {
+        if seen.insert((bar.ticker().clone(), bar.timestamp())) {
+            deduplicated.push(bar.clone());
+        }
+    }
+    deduplicated.reverse();
+    deduplicated
+}
 
 pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64, sqlx::Error> {
     if bars.is_empty() {
         return Ok(0);
     }
+
+    let bars = deduplicate_equity_bars(bars);
 
     let mut rows_affected: u64 = 0;
 
@@ -555,6 +580,55 @@ mod tests {
         assert_eq!(bars.len(), 2);
         assert_eq!(bars[0].ticker(), "AAPL");
         assert_eq!(bars[1].ticker(), "MSFT");
+    }
+
+    #[test]
+    fn test_deduplicate_equity_bars_keeps_last_occurrence_per_key() {
+        let now = Utc::now();
+        let make = |ticker: &str, close: f64| {
+            EquityBar::new(
+                Ticker::new(ticker).unwrap(),
+                now,
+                close,
+                close,
+                close,
+                close,
+                1,
+                None,
+                None,
+                now,
+            )
+        };
+
+        // AAPL appears twice for the same timestamp, as Massive sometimes
+        // returns it. The duplicate would trip "ON CONFLICT DO UPDATE command
+        // cannot affect row a second time" if passed to the upsert unchanged.
+        let bars = vec![
+            make("AAPL", 150.0),
+            make("MSFT", 350.0),
+            make("AAPL", 151.0),
+        ];
+
+        let deduplicated = deduplicate_equity_bars(&bars);
+
+        assert_eq!(deduplicated.len(), 2, "the duplicate ticker must collapse");
+        let aapl = deduplicated
+            .iter()
+            .find(|bar| bar.ticker() == "AAPL")
+            .expect("AAPL must survive deduplication");
+        assert_eq!(
+            aapl.close_price(),
+            151.0,
+            "the last occurrence wins, matching the upsert's latest-write semantics",
+        );
+        assert!(deduplicated.iter().any(|bar| bar.ticker() == "MSFT"));
+    }
+
+    #[test]
+    fn test_deduplicate_equity_bars_distinct_keys_are_untouched() {
+        let bars = sample_bars();
+        let deduplicated = deduplicate_equity_bars(&bars);
+        assert_eq!(deduplicated.len(), bars.len());
     }
 
     #[test]
