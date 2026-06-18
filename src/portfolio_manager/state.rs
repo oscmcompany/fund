@@ -70,7 +70,10 @@ fn env_u8(key: &str, default: u8) -> Result<u8, ConfigError> {
         Ok(raw) => raw.trim().parse::<u8>().map_err(|_| ConfigError {
             message: format!("{key} must be an integer 0-255, got '{raw}'"),
         }),
-        Err(_) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError {
+            message: format!("{key} must be valid UTF-8"),
+        }),
     }
 }
 
