@@ -140,11 +140,11 @@ impl CandidatePair {
 /// A pool larger than the required minimum leaves spare candidates for sizing to
 /// fall back on. Returns an empty `Vec` when insufficient data or fewer than
 /// `MINIMUM_TICKER_COUNT` eligible tickers.
-pub fn select_pairs(
-    signals: &[ConsolidatedSignal],
-    historical_closes: &HashMap<String, Vec<f64>>,
-    candidate_pool: usize,
 ) -> Vec<CandidatePair> {
+    if candidate_pool == 0 {
+        return Vec::new();
+    }
+
     // Filter to confident tickers with valid volatility.
     let eligible: Vec<&ConsolidatedSignal> = signals
         .iter()
