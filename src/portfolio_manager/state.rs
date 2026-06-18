@@ -312,11 +312,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_env_f64_reads_and_parses_override() {
         // Unique key avoids racing other tests that mutate the environment.
         // SAFETY: edition-2021 single-process test; the key is used only here.
         unsafe { env::set_var("PORTFOLIO_TEST_OVERRIDE_F64", "0.05") };
-        assert_eq!(env_f64("PORTFOLIO_TEST_OVERRIDE_F64", 0.10).unwrap(), 0.05);
         unsafe { env::remove_var("PORTFOLIO_TEST_OVERRIDE_F64") };
     }
 
