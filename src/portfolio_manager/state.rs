@@ -329,13 +329,13 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_env_u8_and_usize_defaults_and_overrides() {
         assert_eq!(env_u8("PORTFOLIO_TEST_UNSET_U8", 10).unwrap(), 10);
         assert_eq!(env_usize("PORTFOLIO_TEST_UNSET_USIZE", 20).unwrap(), 20);
         unsafe { env::set_var("PORTFOLIO_TEST_OVERRIDE_USIZE", "30") };
         assert_eq!(env_usize("PORTFOLIO_TEST_OVERRIDE_USIZE", 20).unwrap(), 30);
         unsafe { env::remove_var("PORTFOLIO_TEST_OVERRIDE_USIZE") };
-    }
 
     #[test]
     fn test_from_env_fails_without_database_url() {
