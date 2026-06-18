@@ -42,7 +42,7 @@ use crate::portfolio_manager::execution::{
 use crate::portfolio_manager::regime::classify_regime;
 use crate::portfolio_manager::sizing::{size_pairs_with_volatility_parity, SizingError};
 use crate::portfolio_manager::state::AppState;
-use crate::portfolio_manager::statistical_arbitrage::{select_pairs, TARGET_PAIR_COUNT};
+use crate::portfolio_manager::statistical_arbitrage::select_pairs;
 
 /// Outcome of a completed rebalance cycle.
 #[derive(Debug)]
@@ -160,6 +160,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     )
     .await?;
 
+    let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
     let filled = select_size_execute(
         alpaca,
         pool,
@@ -169,6 +170,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         &spy_prices,
         buying_power,
         exposure_scale,
+        state.candidate_pool_count(),
+        required_pairs,
     )
     .await?;
 
@@ -416,6 +419,7 @@ async fn check_drawdown(
 ///
 /// Returns the filled pairs paired with their sizing metadata. Errors with
 /// `InsufficientPairs` when no fills are confirmed.
+#[allow(clippy::too_many_arguments)]
 async fn select_size_execute(
     alpaca: &AlpacaTradingClient,
     pool: &sqlx::PgPool,
@@ -425,10 +429,13 @@ async fn select_size_execute(
     spy_prices: &[f64],
     buying_power: f64,
     exposure_scale: f64,
+    candidate_pool: usize,
+    required_pairs: usize,
 ) -> Result<Vec<(FilledPair, crate::portfolio_manager::sizing::SizedPair)>, RebalanceError> {
-    let candidate_pairs = select_pairs(signals, historical_prices);
+    let candidate_pairs = select_pairs(signals, historical_prices, candidate_pool);
     info!(
         candidates = candidate_pairs.len(),
+        required = required_pairs,
         "Candidate pairs selected"
     );
 
@@ -444,7 +451,23 @@ async fn select_size_execute(
         })
         .collect();
 
-    let entry_prices = fetch_live_quote_mid_prices(pool, &all_tickers).await?;
+    let mut entry_prices = fetch_live_quote_mid_prices(pool, &all_tickers).await?;
+
+    // Cold-start fallback: the live quote stream only subscribes to tickers held
+    // in open positions, so on the first rebalance (or for any candidate without a
+    // fresh quote) `equity_quotes` has no entry price. Fall back to the most recent
+    // daily close, already loaded in `historical_prices` (ordered oldest to
+    // newest), so the pair can still be sized.
+    for ticker in &all_tickers {
+        if !entry_prices.contains_key(ticker) {
+            if let Some(latest_close) = historical_prices
+                .get(ticker)
+                .and_then(|closes| closes.last())
+            {
+                entry_prices.insert(ticker.clone(), *latest_close);
+            }
+        }
+    }
 
     let sized_pairs = size_pairs_with_volatility_parity(
         &candidate_pairs,
@@ -452,6 +475,7 @@ async fn select_size_execute(
         &market_betas,
         &entry_prices,
         exposure_scale,
+        required_pairs,
     )?;
 
     // Resolve the tradable asset universe from the session cache, populating it
@@ -489,7 +513,7 @@ async fn select_size_execute(
         return Err(RebalanceError::InsufficientPairs(
             SizingError::InsufficientPairs {
                 found: 0,
-                required: TARGET_PAIR_COUNT,
+                required: required_pairs,
             },
         ));
     }

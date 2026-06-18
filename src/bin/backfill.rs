@@ -59,6 +59,8 @@ fn parse_arguments(arguments: &[String]) -> Result<(NaiveDate, NaiveDate), Strin
 
 #[tokio::main]
 async fn main() {
+    fund::common::crypto::install_default_crypto_provider();
+
     let _tracing_guard = init_tracing("data-manager-errors.log", Some("warn"));
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
