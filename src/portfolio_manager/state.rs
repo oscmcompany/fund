@@ -56,7 +56,10 @@ fn env_f64(key: &str, default: f64) -> Result<f64, ConfigError> {
         Ok(raw) => raw.trim().parse::<f64>().map_err(|_| ConfigError {
             message: format!("{key} must be a number, got '{raw}'"),
         }),
-        Err(_) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError {
+            message: format!("{key} must be valid UTF-8"),
+        }),
     }
 }
 
