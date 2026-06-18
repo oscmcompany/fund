@@ -161,6 +161,8 @@ impl SizedPair {
 /// Error returned when sizing cannot produce a viable portfolio.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SizingError {
+    /// `required_pairs` must be greater than zero.
+    InvalidRequiredPairs { required: usize },
     /// Fewer than `required_pairs` candidates remained after feasibility filtering.
     InsufficientPairs { found: usize, required: usize },
 }
@@ -168,6 +170,9 @@ pub enum SizingError {
 impl std::fmt::Display for SizingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SizingError::InvalidRequiredPairs { required } => {
+                write!(formatter, "required_pairs must be greater than 0, got {required}.")
+            }
             SizingError::InsufficientPairs { found, required } => write!(
                 formatter,
                 "Only {found} viable pairs available, need at least {required}."
@@ -190,7 +195,8 @@ impl std::error::Error for SizingError {}
 /// from the `minimum_pairs` constraint; it also sets the per-pair capital share.
 ///
 /// Pairs whose short leg price exceeds the maximum affordable per-pair allocation
-/// are discarded before sizing. Returns `Err(SizingError::InsufficientPairs)` when
+/// are discarded before sizing. Returns `Err(SizingError::InvalidRequiredPairs)`
+/// when `required_pairs` is 0, and `Err(SizingError::InsufficientPairs)` when
 /// fewer than `required_pairs` pairs remain after filtering or after the whole-share
 /// constraint removes zero-quantity pairs.
 pub fn size_pairs_with_volatility_parity(
@@ -201,6 +207,10 @@ pub fn size_pairs_with_volatility_parity(
     exposure_scale: f64,
     required_pairs: usize,
 ) -> Result<Vec<SizedPair>, SizingError> {
+    if required_pairs == 0 {
+        return Err(SizingError::InvalidRequiredPairs { required: 0 });
+    }
+
     // Maximum dollar allocation a single pair can receive at the highest weight.
     let capital_per_leg = maximum_capital / CAPITAL_DIVISOR;
     let maximum_per_pair_dollar =
@@ -473,6 +483,22 @@ mod tests {
         assert!(matches!(
             result,
             Err(SizingError::InsufficientPairs { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn test_size_pairs_required_pairs_zero_error() {
+        let result = size_pairs_with_volatility_parity(
+            &[],
+            100_000.0,
+            &HashMap::new(),
+            &HashMap::new(),
+            1.0,
+            0,
+        );
+        assert!(matches!(
+            result,
+            Err(SizingError::InvalidRequiredPairs { required: 0 })
         ));
     }
 
