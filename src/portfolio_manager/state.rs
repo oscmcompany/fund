@@ -84,7 +84,10 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
         Ok(raw) => raw.trim().parse::<usize>().map_err(|_| ConfigError {
             message: format!("{key} must be a non-negative integer, got '{raw}'"),
         }),
-        Err(_) => Ok(default),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError {
+            message: format!("{key} must be valid UTF-8"),
+        }),
     }
 }
 
