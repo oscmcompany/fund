@@ -324,7 +324,8 @@ mod tests {
     #[serial_test::serial]
     fn test_env_f64_rejects_unparseable_value() {
         unsafe { env::set_var("PORTFOLIO_TEST_BAD_F64", "not-a-number") };
-        let _result = env_f64("PORTFOLIO_TEST_BAD_F64", 0.10);
+        let result = env_f64("PORTFOLIO_TEST_BAD_F64", 0.10);
+        assert!(result.is_err());
         unsafe { env::remove_var("PORTFOLIO_TEST_BAD_F64") };
     }
 

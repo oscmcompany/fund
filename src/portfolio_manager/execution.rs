@@ -406,6 +406,8 @@ mod tests {
         let message = format!("{error}");
         assert!(message.contains("AMZN"));
         assert!(message.contains("close"));
+        assert!(message.contains("404"));
+        assert!(message.contains("position not found"));
     }
 
     #[test]

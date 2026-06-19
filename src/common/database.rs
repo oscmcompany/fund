@@ -39,20 +39,45 @@ mod tests {
             .unwrap()
     }
 
+    /// RAII guard that restores a single environment variable on drop.
+    ///
+    /// Guarantees cleanup even when the test body panics. Tests using this guard
+    /// must be marked `#[serial_test::serial]` to prevent concurrent env access.
+    struct EnvVarRestoreGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarRestoreGuard {
+        fn save(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestoreGuard {
+        fn drop(&mut self) {
+            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_connect_optional_pool_returns_false_when_database_url_unset() {
         // Remove DATABASE_URL so the not-configured branch is exercised.
-        let previous = std::env::var("DATABASE_URL").ok();
+        let _guard = EnvVarRestoreGuard::save("DATABASE_URL");
         // SAFETY: single-process test; env mutation is serialized by #[serial].
         unsafe { std::env::remove_var("DATABASE_URL") };
 
         let (pool, configured) = make_runtime().block_on(connect_optional_pool());
-
-        // Restore whatever value existed before this test.
-        if let Some(value) = previous {
-            unsafe { std::env::set_var("DATABASE_URL", value) };
-        }
 
         assert!(pool.is_none());
         assert!(!configured);
@@ -63,7 +88,7 @@ mod tests {
     fn test_connect_optional_pool_returns_true_when_database_url_set_but_unreachable() {
         // With a syntactically valid but unreachable URL the function must return
         // (None, true): the URL was configured, but the connection failed.
-        let previous = std::env::var("DATABASE_URL").ok();
+        let _guard = EnvVarRestoreGuard::save("DATABASE_URL");
         // SAFETY: single-process test; env mutation is serialized by #[serial].
         unsafe {
             std::env::set_var(
@@ -73,12 +98,6 @@ mod tests {
         };
 
         let (pool, configured) = make_runtime().block_on(connect_optional_pool());
-
-        if let Some(value) = previous {
-            unsafe { std::env::set_var("DATABASE_URL", value) };
-        } else {
-            unsafe { std::env::remove_var("DATABASE_URL") };
-        }
 
         // The URL was present, so configured == true regardless of whether the
         // connection succeeded.

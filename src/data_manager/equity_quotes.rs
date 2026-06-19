@@ -291,8 +291,13 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
                 .and_then(Ticker::new)?;
             let bid_price = message.get("bp").and_then(|v| v.as_f64())?;
             let ask_price = message.get("ap").and_then(|v| v.as_f64())?;
-            let bid_size = i32::try_from(message.get("bs").and_then(|v| v.as_i64())?).ok()?;
-            let ask_size = i32::try_from(message.get("as").and_then(|v| v.as_i64())?).ok()?;
+            let bid_size_raw = message.get("bs").and_then(|v| v.as_i64())?;
+            let ask_size_raw = message.get("as").and_then(|v| v.as_i64())?;
+            if bid_size_raw < 0 || ask_size_raw < 0 {
+                return None;
+            }
+            let bid_size = i32::try_from(bid_size_raw).ok()?;
+            let ask_size = i32::try_from(ask_size_raw).ok()?;
             let timestamp_str = message.get("t").and_then(|v| v.as_str())?;
             let timestamp = timestamp_str.parse::<DateTime<Utc>>().ok()?;
 
@@ -526,14 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_quote_messages_bid_size_negative_value_accepted() {
-        // Negative bid_size fits in i32, so the message parses (even if
-        // semantically unusual); the parser does not impose a positivity
-        // constraint beyond the i32 range check.
+    fn test_parse_quote_messages_bid_size_negative_value_is_rejected() {
+        // Negative bid_size is invalid domain data; the parser must reject it.
         let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":-1,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
         let quotes = parse_quote_messages(text);
-        assert_eq!(quotes.len(), 1);
-        assert_eq!(quotes[0].bid_size(), -1);
+        assert!(quotes.is_empty());
     }
 
     /// Constructs a minimal `State` suitable for testing `spawn_quote_stream`.
@@ -581,14 +583,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_quote_stream_no_alpaca_credentials_returns_immediately() {
-        // When the database pool is present but Alpaca credentials are absent,
-        // spawn_quote_stream logs and returns without spawning a WebSocket task.
-        // We use ConnectFailed to simulate a configured-but-unavailable DB —
-        // pool() returns None for ConnectFailed, so the first guard triggers.
-        // To reach the Alpaca check (line 35) we need a connected pool, which
-        // requires a real PostgreSQL server. Instead verify the ConnectFailed
-        // path also exits cleanly via the first guard.
+    async fn test_spawn_quote_stream_connect_failed_returns_immediately() {
+        // When the database connection failed (pool is None), spawn_quote_stream
+        // exits at the no-pool guard without spawning a WebSocket task.
         let state = make_test_state_with_database(DatabaseState::ConnectFailed).await;
         spawn_quote_stream(state);
     }

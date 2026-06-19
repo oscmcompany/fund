@@ -78,6 +78,32 @@ mod tests {
     use serial_test::serial;
     use std::env;
 
+    /// RAII guard that restores an environment variable on drop, panic-safe.
+    ///
+    /// Tests using this must be marked `#[serial]` to prevent concurrent env access.
+    struct EnvVarRestoreGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarRestoreGuard {
+        fn save(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestoreGuard {
+        fn drop(&mut self) {
+            match self.previous.as_ref() {
+                Some(value) => env::set_var(self.key, value),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn test_init_tracing_is_idempotent() {
@@ -122,29 +148,17 @@ mod tests {
         // When FUND_PROFILE is set, init_tracing uses it without panicking.
         // Since try_init is idempotent, this mainly confirms the env-var read path
         // is exercised rather than hitting the unwrap_or_else default.
-        let previous = env::var("FUND_PROFILE").ok();
+        let _restore = EnvVarRestoreGuard::save("FUND_PROFILE");
         env::set_var("FUND_PROFILE", "test-profile");
-
-        let _guard = init_tracing("test-profile-observability.log", None);
-
-        match previous {
-            Some(value) => env::set_var("FUND_PROFILE", value),
-            None => env::remove_var("FUND_PROFILE"),
-        }
+        let _tracing_guard = init_tracing("test-profile-observability.log", None);
     }
 
     #[test]
     #[serial]
     fn test_fund_profile_env_var_absent_uses_unknown() {
         // When FUND_PROFILE is not set, init_tracing must not panic.
-        let previous = env::var("FUND_PROFILE").ok();
+        let _restore = EnvVarRestoreGuard::save("FUND_PROFILE");
         env::remove_var("FUND_PROFILE");
-
-        let _guard = init_tracing("test-no-profile-observability.log", None);
-
-        match previous {
-            Some(value) => env::set_var("FUND_PROFILE", value),
-            None => env::remove_var("FUND_PROFILE"),
-        }
+        let _tracing_guard = init_tracing("test-no-profile-observability.log", None);
     }
 }

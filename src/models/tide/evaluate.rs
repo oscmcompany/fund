@@ -444,13 +444,9 @@ mod tests {
 
     #[test]
     fn test_evaluate_larger_batch_than_eval_batch_size() {
-        // Exercises the chunked iteration path when sample_count could exceed
-        // EVAL_BATCH in a real run. Here we just confirm it does not panic with
-        // a handful of samples.
+        // Exercises multi-chunk iteration by exceeding EVAL_BATCH (4096).
         let model = make_tiny_model();
-        // Use 5 samples; EVAL_BATCH=4096 so a single chunk, but the code path
-        // (indices.chunks) is still exercised.
-        let dataset = make_tiny_dataset(5, true);
+        let dataset = make_tiny_dataset(4097, true);
         let parameters = make_tiny_parameters();
         let result = evaluate(&model, &dataset, &parameters);
         assert!(

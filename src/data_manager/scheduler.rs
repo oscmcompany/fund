@@ -594,6 +594,9 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
     let port: u16 = port_str
         .parse()
         .map_err(|_| format!("DATABASE_URL has invalid port: '{}'", port_str))?;
+    if port == 0 {
+        return Err("DATABASE_URL has invalid port: '0'".to_string());
+    }
 
     Ok((
         host.to_string(),
@@ -1093,13 +1096,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_postgres_url_port_zero_is_invalid() {
-        // Port 0 is technically parseable as u16 but unusual; the parser
-        // accepts it (no range check beyond u16 bounds) — assert it parses.
+    fn test_parse_postgres_url_port_zero_returns_error() {
+        // Port 0 is not a valid listening port; the parser must reject it.
         let result = parse_postgres_url("postgres://user:pass@host:0/db");
-        assert!(result.is_ok());
-        let (_, _, port, _, _) = result.unwrap();
-        assert_eq!(port, 0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid port"));
     }
 
     #[test]

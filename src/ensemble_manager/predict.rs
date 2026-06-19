@@ -1226,12 +1226,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_equity_details_returns_error_on_invalid_csv() {
-        // Bytes that cannot be parsed as CSV must produce a FetchEquityDetails error.
-        // Polars CsvReader can parse almost anything, so use a truly empty body or
-        // one that forces a parse failure — an empty response with no header row
-        // produces an empty DataFrame (Ok), so exercise the response-read path at
-        // minimum to confirm the function completes without panic.
+    async fn test_fetch_equity_details_returns_ok_on_valid_csv() {
+        // A minimal valid CSV response must parse successfully and return one row.
         let csv_body = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n";
 
         let mut server = mockito::Server::new_async().await;

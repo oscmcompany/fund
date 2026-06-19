@@ -808,32 +808,32 @@ mod tests {
     /// Builds price series for two tickers designed to exercise the inner pair-generation
     /// loop in `select_pairs`. The two series share a moderate common sinusoidal factor
     /// (keeping Pearson correlation in [CORRELATION_MINIMUM, CORRELATION_MAXIMUM]) and
-    /// one series includes a deterministic mean-reverting divergence that causes the OLS
-    /// spread z-score to exceed Z_SCORE_ENTRY_THRESHOLD.
+    /// ticker A includes a deterministic upward drift in the final 16 steps that drives
+    /// the OLS spread z-score above Z_SCORE_ENTRY_THRESHOLD.
     ///
-    /// The idiosyncratic amplitude of 0.15 is chosen so that the realized correlation
-    /// between A and B is well within [0.5, 0.95] rather than clustering near 1.0.
-    /// The alternating `+spread`/`-spread` divergence in ticker B ensures the spread
-    /// series has meaningful variance while driving the final value to a z-score above
-    /// the threshold.
+    /// Design:
+    /// - Shared amplitude 0.008, idiosyncratic amplitude 0.004 → theoretical Pearson
+    ///   correlation ~0.80, well within [0.5, 0.95].
+    /// - Drift applied to A's returns (not B), so Var(log_prices_B) stays small and the
+    ///   OLS hedge ratio stays near 1.0, making each unit of drift have full impact on the
+    ///   spread. Cumulative drift ~0.090 in log prices reliably produces z-score > 2.0.
     fn make_pair_prices_for_inner_loop_coverage() -> (Vec<f64>, Vec<f64>) {
         let count = CORRELATION_WINDOW_DAYS + 1; // 61 prices → 60 log returns
         let mut prices_a = vec![100.0f64];
-        let mut prices_b = vec![200.0f64];
+        let mut prices_b = vec![100.0f64];
 
         for i in 0..(count - 1) {
             let last_a = *prices_a.last().unwrap();
             let last_b = *prices_b.last().unwrap();
 
-            // Shared market factor with moderate amplitude.
+            // Shared market factor.
             let shared = 0.008 * ((i as f64 * 0.4).sin());
-
-            // Large idiosyncratic component so correlation stays below 0.95.
-            let idio_a = 0.15 * ((i as f64 * 1.7).sin()) * 0.01;
-            // Ticker B's idiosyncratic component is orthogonal to A's, plus a
-            // smooth upward drift in the final quarter that pushes the z-score up.
-            let drift = if i >= count - 16 { 0.012 } else { 0.0 };
-            let idio_b = 0.15 * ((i as f64 * 2.3).cos()) * 0.01 + drift;
+            // Idiosyncratic components at half the shared amplitude keep correlation ~0.80.
+            // Drift applied to A only, keeping Var(log_prices_B) small so the OLS hedge
+            // ratio stays near 1.0 and the drift maximally impacts the spread.
+            let drift_a = if i >= count - 16 { 0.006 } else { 0.0 };
+            let idio_a = 0.004 * ((i as f64 * 1.7).sin()) + drift_a;
+            let idio_b = 0.004 * ((i as f64 * 2.3).cos());
 
             prices_a.push(last_a * (1.0 + shared + idio_a));
             prices_b.push(last_b * (1.0 + shared + idio_b));
@@ -863,7 +863,10 @@ mod tests {
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
-        // Whether or not a pair is generated, the structural invariants must hold.
+        assert!(
+            !pairs.is_empty(),
+            "engineered fixture must generate at least one pair"
+        );
         for pair in &pairs {
             assert!(pair.z_score() >= Z_SCORE_ENTRY_THRESHOLD);
             assert!(pair.hedge_ratio().is_finite());
@@ -975,11 +978,13 @@ mod tests {
     /// - Exactly `CORRELATION_WINDOW_DAYS + 1` prices (so log returns have
     ///   exactly `CORRELATION_WINDOW_DAYS` elements — the minimum required).
     /// - Pearson correlation of their log returns in [0.5, 0.95]: achieved by
-    ///   mixing a dominant shared sinusoidal factor (amplitude 0.012) with a
-    ///   small orthogonal idiosyncratic component (amplitude 0.003), giving a
-    ///   theoretical correlation near 0.94.
-    /// - A systematic upward drift on ticker B for the final 12 steps that
+    ///   mixing a dominant shared sinusoidal factor (amplitude 0.012) with an
+    ///   orthogonal idiosyncratic component (amplitude 0.006), giving a
+    ///   theoretical correlation near 0.75.
+    /// - A systematic upward drift on ticker A for the final 13 steps that
     ///   pushes the OLS spread z-score above `Z_SCORE_ENTRY_THRESHOLD = 2.0`.
+    ///   Drift is applied to A (not B) so Var(log_prices_B) stays small and the
+    ///   OLS hedge ratio remains near 1.0, maximising the drift's spread impact.
     ///
     /// This helper exercises every branch inside `select_pairs` that is only
     /// reachable when at least one candidate pair survives all screening filters:
@@ -989,19 +994,20 @@ mod tests {
     fn make_guaranteed_pair_prices() -> (Vec<f64>, Vec<f64>) {
         let count = CORRELATION_WINDOW_DAYS + 1;
         let mut prices_a = vec![100.0_f64];
-        let mut prices_b = vec![150.0_f64];
+        let mut prices_b = vec![100.0_f64];
 
         for i in 0..(count - 1) {
             let last_a = *prices_a.last().unwrap();
             let last_b = *prices_b.last().unwrap();
 
-            // Large shared factor: keeps correlation high but below 0.95.
+            // Shared factor: amplitude 0.012, idiosyncratic amplitude 0.006 gives
+            // theoretical Pearson correlation ~0.75, safely within [0.5, 0.95].
             let shared = 0.012 * ((i as f64 * 0.5).sin());
-            // Small orthogonal idiosyncratic components.
-            let idio_a = 0.003 * ((i as f64 * 1.3).cos());
-            // Drift on B for the final 12 steps drives spread z-score above 2.0.
-            let drift_b = if i >= count - 13 { 0.015 } else { 0.0 };
-            let idio_b = 0.003 * ((i as f64 * 2.1).sin()) + drift_b;
+            // Drift applied to A only for the final 13 steps, keeping Var(log_prices_B)
+            // small so the OLS hedge ratio stays near 1.0.
+            let drift_a = if i >= count - 13 { 0.008 } else { 0.0 };
+            let idio_a = 0.006 * ((i as f64 * 1.3).cos()) + drift_a;
+            let idio_b = 0.006 * ((i as f64 * 2.1).sin());
 
             prices_a.push(last_a * (1.0 + shared + idio_a));
             prices_b.push(last_b * (1.0 + shared + idio_b));
@@ -1030,10 +1036,10 @@ mod tests {
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
-        // If the pair was produced, verify all structural invariants.
-        // If no pair was found the test still passes — the helper may
-        // occasionally not clear the threshold depending on numerical precision;
-        // what matters is that all execution paths are exercised without panic.
+        assert!(
+            !pairs.is_empty(),
+            "engineered fixture must generate at least one pair"
+        );
         for pair in &pairs {
             assert!(pair.z_score() >= Z_SCORE_ENTRY_THRESHOLD);
             assert!(pair.hedge_ratio().is_finite());
@@ -1061,6 +1067,10 @@ mod tests {
         ];
 
         let pairs = select_pairs(&signals, &closes, 1);
+        assert!(
+            !pairs.is_empty(),
+            "engineered fixture must generate at least one pair"
+        );
         assert!(pairs.len() <= 1, "pool cap of 1 must never be exceeded");
     }
 
@@ -1105,20 +1115,11 @@ mod tests {
     }
 
     #[test]
-    fn test_select_pairs_log_returns_empty_branch_single_price() {
-        // Exercises line 179: the `returns.is_empty()` continue branch.
-        // A ticker's closes slice of length exactly 1 produces an empty log-returns
-        // vec. Because we need `window_closes.len() >= CORRELATION_WINDOW_DAYS` to
-        // avoid the earlier filter (line 174), we instead supply prices of length
-        // exactly CORRELATION_WINDOW_DAYS but with the window trimmed to length 1
-        // by providing CORRELATION_WINDOW_DAYS - 1 prices that are all negative so
-        // the `any(|&p| p <= 0.0)` filter fires — actually that fires first at
-        // line 172. The only way to reach line 178 is: window has
-        // >= CORRELATION_WINDOW_DAYS elements, all positive, but `log_returns`
-        // produces no output. `log_returns` only returns empty for slices of
-        // length < 2. Since the window must be >= CORRELATION_WINDOW_DAYS (= 60),
-        // which is >= 2, this branch is unreachable in practice. The test
-        // confirms the function is robust when only one ticker has valid data.
+    fn test_select_pairs_single_valid_ticker_returns_empty() {
+        // When only one ticker has valid data (AAPL passes positivity but fails the
+        // mean-squared-return filter due to zero variance; MSFT has no closes at all),
+        // `ticker_returns.len() < MINIMUM_TICKER_COUNT` and `select_pairs` returns an
+        // empty result without panicking.
         let signals = vec![
             make_signal("AAPL", 0.02, 0.8, 0.01),
             make_signal("MSFT", 0.01, 0.8, 0.01),

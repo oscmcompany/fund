@@ -228,6 +228,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_object());
         assert_eq!(json["status"], "ok");
+        assert_eq!(json.as_object().unwrap().len(), 1);
     }
 
     #[tokio::test]
