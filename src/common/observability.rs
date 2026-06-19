@@ -115,4 +115,36 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&log_dir);
     }
+
+    #[test]
+    #[serial]
+    fn test_fund_profile_env_var_is_read() {
+        // When FUND_PROFILE is set, init_tracing uses it without panicking.
+        // Since try_init is idempotent, this mainly confirms the env-var read path
+        // is exercised rather than hitting the unwrap_or_else default.
+        let previous = env::var("FUND_PROFILE").ok();
+        env::set_var("FUND_PROFILE", "test-profile");
+
+        let _guard = init_tracing("test-profile-observability.log", None);
+
+        match previous {
+            Some(value) => env::set_var("FUND_PROFILE", value),
+            None => env::remove_var("FUND_PROFILE"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_fund_profile_env_var_absent_uses_unknown() {
+        // When FUND_PROFILE is not set, init_tracing must not panic.
+        let previous = env::var("FUND_PROFILE").ok();
+        env::remove_var("FUND_PROFILE");
+
+        let _guard = init_tracing("test-no-profile-observability.log", None);
+
+        match previous {
+            Some(value) => env::set_var("FUND_PROFILE", value),
+            None => env::remove_var("FUND_PROFILE"),
+        }
+    }
 }

@@ -171,7 +171,10 @@ impl std::fmt::Display for SizingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SizingError::InvalidRequiredPairs { required } => {
-                write!(formatter, "required_pairs must be greater than 0, got {required}.")
+                write!(
+                    formatter,
+                    "required_pairs must be greater than 0, got {required}."
+                )
             }
             SizingError::InsufficientPairs { found, required } => write!(
                 formatter,
@@ -659,5 +662,240 @@ mod tests {
         let result = optimize_beta_neutral(&net_betas, &parity_weights);
         // All projected weights will be clamped to 0; result should be all zeros.
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_sized_pair_new_rejects_negative_long_dollar_amount() {
+        let result = SizedPair::new(
+            "AAPL-MSFT".to_string(),
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            -100.0,
+            100.0,
+            1,
+            150.0,
+            100.0,
+            2.5,
+            1.0,
+            0.05,
+            1.1,
+            0.9,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_sized_pair_new_rejects_negative_short_dollar_amount() {
+        let result = SizedPair::new(
+            "AAPL-MSFT".to_string(),
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            100.0,
+            -50.0,
+            1,
+            150.0,
+            100.0,
+            2.5,
+            1.0,
+            0.05,
+            1.1,
+            0.9,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_sized_pair_new_rejects_zero_short_quantity() {
+        let result = SizedPair::new(
+            "AAPL-MSFT".to_string(),
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            100.0,
+            100.0,
+            0,
+            150.0,
+            100.0,
+            2.5,
+            1.0,
+            0.05,
+            1.1,
+            0.9,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_sized_pair_new_rejects_negative_short_quantity() {
+        let result = SizedPair::new(
+            "AAPL-MSFT".to_string(),
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            100.0,
+            100.0,
+            -1,
+            150.0,
+            100.0,
+            2.5,
+            1.0,
+            0.05,
+            1.1,
+            0.9,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_sized_pair_new_valid_all_accessors() {
+        let pair = SizedPair::new(
+            "AAPL-MSFT".to_string(),
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            5000.0,
+            4900.0,
+            49,
+            155.0,
+            100.0,
+            2.7,
+            0.8,
+            0.04,
+            1.2,
+            0.95,
+        )
+        .expect("valid sized pair");
+
+        assert_eq!(pair.pair_id(), "AAPL-MSFT");
+        assert_eq!(pair.long_ticker(), "AAPL");
+        assert_eq!(pair.short_ticker(), "MSFT");
+        assert!((pair.long_dollar_amount() - 5000.0).abs() < f64::EPSILON);
+        assert!((pair.short_dollar_amount() - 4900.0).abs() < f64::EPSILON);
+        assert_eq!(pair.short_quantity(), 49);
+        assert!((pair.long_entry_price() - 155.0).abs() < f64::EPSILON);
+        assert!((pair.short_entry_price() - 100.0).abs() < f64::EPSILON);
+        assert!((pair.z_score() - 2.7).abs() < f64::EPSILON);
+        assert!((pair.hedge_ratio() - 0.8).abs() < f64::EPSILON);
+        assert!((pair.signal_strength() - 0.04).abs() < f64::EPSILON);
+        assert!((pair.long_market_beta() - 1.2).abs() < f64::EPSILON);
+        assert!((pair.short_market_beta() - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_sizing_error_invalid_required_pairs_display() {
+        let error = SizingError::InvalidRequiredPairs { required: 0 };
+        let message = format!("{}", error);
+        assert!(message.contains("0"));
+        assert!(message.contains("greater than"));
+    }
+
+    #[test]
+    fn test_sizing_error_is_error_trait() {
+        let error = SizingError::InsufficientPairs {
+            found: 2,
+            required: 5,
+        };
+        let _boxed: Box<dyn std::error::Error> = Box::new(error);
+    }
+
+    #[test]
+    fn test_size_pairs_whole_share_constraint_drops_pair_when_quantity_zero() {
+        // With very low capital per pair a short price can yield floor(amount/price) == 0,
+        // causing the pair to be skipped, producing InsufficientPairs.
+        let (candidates, mut entry_prices) = make_ten_candidates(100.0, 100.0);
+        // Set short prices to a very high value relative to per-pair capital so
+        // floor(capital / price) == 0 for each pair.
+        for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
+            entry_prices.insert(ticker.to_string(), 999_999.0);
+        }
+        // Supply enough capital to pass the feasibility filter threshold but the
+        // per-pair dollar allocation still floor-divides to 0 shares.
+        // maximum_per_pair_dollar = (capital / CAPITAL_DIVISOR) * exposure * UPPER / required
+        // = (2_000_000 / 2.03) * 1.0 * 2.0 / 10 ≈ 197,044 < 999_999 → feasibility filter
+        // kicks in first. So use a moderate short price that passes feasibility but
+        // is high enough that the per-pair dollar amount (without the upper-bound
+        // multiplier) rounds down to 0 shares.
+        //
+        // A simpler direct path: use a single required pair and set the short price
+        // to just above the raw dollar_amount for that pair.
+        let (single_candidates, mut single_prices) = make_ten_candidates(50.0, 50.0);
+        // With capital=100, required=1:
+        // capital_per_leg = 100 / 2.03 ≈ 49.26
+        // maximum_per_pair_dollar = 49.26 * 1.0 * 2.0 / 1 ≈ 98.52 → 50 passes
+        // raw_dollar_amounts[0] = final_weight (≈0.1 for 10 equal pairs) * 49.26 * 1.0 ≈ 4.93
+        // short_quantity = floor(4.93 / 50) = 0 → pair skipped
+        for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
+            single_prices.insert(ticker.to_string(), 50.0);
+        }
+        let result = size_pairs_with_volatility_parity(
+            &single_candidates,
+            100.0,
+            &HashMap::new(),
+            &single_prices,
+            1.0,
+            1,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+
+        // The first test (all short prices at 999_999) also confirms InsufficientPairs.
+        let result2 = size_pairs_with_volatility_parity(
+            &candidates,
+            100_000.0,
+            &HashMap::new(),
+            &entry_prices,
+            1.0,
+            REQUIRED_PAIRS,
+        );
+        assert!(matches!(
+            result2,
+            Err(SizingError::InsufficientPairs { .. })
+        ));
+    }
+
+    #[test]
+    fn test_size_pairs_missing_long_price_discards_pair() {
+        // Pairs missing their long price (unwrap_or(0.0) → 0.0 → fails > 0.0 check)
+        // are dropped by the feasibility filter.
+        let (candidates, mut entry_prices) = make_ten_candidates(100.0, 50.0);
+        // Remove all long-ticker prices so feasibility fails.
+        for ticker in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
+            entry_prices.remove(ticker);
+        }
+        let result = size_pairs_with_volatility_parity(
+            &candidates,
+            500_000.0,
+            &HashMap::new(),
+            &entry_prices,
+            1.0,
+            REQUIRED_PAIRS,
+        );
+        assert!(matches!(result, Err(SizingError::InsufficientPairs { .. })));
+    }
+
+    #[test]
+    fn test_size_pairs_beta_neutral_with_mixed_betas() {
+        // Supply market betas with opposite signs on long and short legs.
+        // This exercises the beta-neutral optimization path with actual beta values.
+        let (candidates, entry_prices) = make_ten_candidates(100.0, 50.0);
+        let mut market_betas = HashMap::new();
+        for ticker in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
+            market_betas.insert(ticker.to_string(), 1.2_f64);
+        }
+        for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
+            market_betas.insert(ticker.to_string(), 0.8_f64);
+        }
+        let result = size_pairs_with_volatility_parity(
+            &candidates,
+            500_000.0,
+            &market_betas,
+            &entry_prices,
+            1.0,
+            REQUIRED_PAIRS,
+        );
+        assert!(result.is_ok());
+        let sized = result.unwrap();
+        assert_eq!(sized.len(), REQUIRED_PAIRS);
+        // Verify that betas are correctly threaded through to SizedPair.
+        for pair in &sized {
+            assert!((pair.long_market_beta() - 1.2).abs() < f64::EPSILON);
+            assert!((pair.short_market_beta() - 0.8).abs() < f64::EPSILON);
+        }
     }
 }

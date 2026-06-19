@@ -1065,4 +1065,130 @@ mod tests {
         assert!(!snapshots.is_empty());
         assert_eq!(snapshots.as_slice()[0].id(), 1);
     }
+
+    #[test]
+    fn test_equity_rebalance_session_all_accessors() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let session = EquityRebalanceSession::new(
+            id,
+            now,
+            "market_session_check".to_string(),
+            Some("run-xyz".to_string()),
+            Some(now),
+            RebalanceSessionStatus::Failed,
+        );
+        assert_eq!(session.id(), id);
+        assert_eq!(session.triggered_at(), now);
+        assert_eq!(session.model_run_id(), Some("run-xyz"));
+        assert!(session.completed_at().is_some());
+        assert_eq!(session.status(), &RebalanceSessionStatus::Failed);
+    }
+
+    #[test]
+    fn test_equity_pair_all_accessors() {
+        let id = Uuid::new_v4();
+        let rebalance_id = Uuid::new_v4();
+        let now = Utc::now();
+        let pair = EquityPair::new(
+            id,
+            rebalance_id,
+            "AAPL-MSFT".to_string(),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
+            Decimal::from(2),
+            Decimal::new(85, 2),
+            Decimal::new(75, 2),
+            EquityPairStatus::Closed,
+            now,
+            Some(now),
+            Some(Decimal::from(500)),
+            Some(Decimal::new(5, 2)),
+            Some(3),
+        );
+        assert_eq!(pair.id(), id);
+        assert_eq!(pair.rebalance_id(), rebalance_id);
+        assert_eq!(pair.z_score(), &Decimal::from(2));
+        assert_eq!(pair.hedge_ratio(), &Decimal::new(85, 2));
+        assert_eq!(pair.signal_strength(), &Decimal::new(75, 2));
+        assert!(pair.opened_at() <= Utc::now());
+        assert!(pair.closed_at().is_some());
+        assert!(pair.realized_profit_and_loss().is_some());
+        assert!(pair.return_percent().is_some());
+        assert_eq!(pair.holding_days(), Some(3));
+    }
+
+    #[test]
+    fn test_equity_allocation_all_accessors() {
+        let id = Uuid::new_v4();
+        let rebalance_id = Uuid::new_v4();
+        let pair_id = Uuid::new_v4();
+        let now = Utc::now();
+        let allocation = EquityAllocation::new(
+            id,
+            rebalance_id,
+            pair_id,
+            now,
+            Some("run-001".to_string()),
+            Ticker::new("AAPL").unwrap(),
+            AllocationSide::Short,
+            AllocationAction::ClosePosition,
+            Decimal::from(5_000),
+            Some(Decimal::from(150)),
+            Some(Decimal::from(33)),
+            None,
+        );
+        assert_eq!(allocation.id(), id);
+        assert_eq!(allocation.rebalance_id(), rebalance_id);
+        assert_eq!(allocation.equity_pair_id(), pair_id);
+        assert!(allocation.generated_at() <= Utc::now());
+        assert_eq!(allocation.model_run_id(), Some("run-001"));
+        assert_eq!(allocation.action(), &AllocationAction::ClosePosition);
+        assert!(allocation.entry_price().is_some());
+        assert!(allocation.quantity().is_some());
+        assert!(allocation.notional().is_none());
+    }
+
+    #[test]
+    fn test_equity_order_all_accessors() {
+        let id = Uuid::new_v4();
+        let allocation_id = Uuid::new_v4();
+        let now = Utc::now();
+        let order = EquityOrder::new(
+            id,
+            allocation_id,
+            now,
+            Ticker::new("AAPL").unwrap(),
+            AllocationSide::Long,
+            Decimal::from(10),
+            "limit".to_string(),
+            Some(Decimal::from(150)),
+            "alpaca-001".to_string(),
+        );
+        assert_eq!(order.id(), id);
+        assert_eq!(order.allocation_id(), allocation_id);
+        assert!(order.submitted_at() <= Utc::now());
+        assert_eq!(order.order_type(), "limit");
+        assert!(order.limit_price().is_some());
+        assert_eq!(order.alpaca_order_id(), "alpaca-001");
+    }
+
+    #[test]
+    fn test_equity_portfolio_snapshot_all_accessors() {
+        let now = Utc::now();
+        let snapshot = EquityPortfolioSnapshot::new(
+            42,
+            now,
+            SnapshotType::EndOfDay,
+            Decimal::from(105_000),
+            Some(Decimal::new(5, 2)),
+            Some(Decimal::new(45, 3)),
+            Decimal::from(100),
+            now,
+        );
+        assert!(snapshot.snapshot_timestamp() <= Utc::now());
+        assert!(snapshot.net_return().is_some());
+        assert_eq!(snapshot.total_slippage_cost(), &Decimal::from(100));
+        assert!(snapshot.created_at() <= Utc::now());
+    }
 }

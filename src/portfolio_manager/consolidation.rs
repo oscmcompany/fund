@@ -325,4 +325,15 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap() > 0.0);
     }
+
+    #[test]
+    fn test_compute_realized_volatility_short_history_uses_all_returns() {
+        // With fewer closes than VOLATILITY_WINDOW_DAYS (20), the else branch at
+        // line 145 is taken: window_returns = &all_returns (uses all available returns).
+        let mut closes = HashMap::new();
+        closes.insert("AAPL".to_string(), make_closes(5, 100.0, 0.01));
+        let result = compute_realized_volatility(&closes, "AAPL");
+        assert!(result.is_some());
+        assert!(result.unwrap() > 0.0);
+    }
 }

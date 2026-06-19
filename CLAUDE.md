@@ -37,7 +37,7 @@ This is a collection of guidelines and references.
 - Follow Rust recommended casing conventions
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
-- Ensure Rust automated test suites achieve at least 70% line or statement coverage
+- Ensure Rust automated test suites achieve at least 80% line or statement coverage
 - Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")

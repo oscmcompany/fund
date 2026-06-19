@@ -234,4 +234,71 @@ mod tests {
             .to_string()
             .contains("Malformed CSV row"));
     }
+
+    #[test]
+    fn test_parse_equity_details_csv_blank_lines_are_skipped() {
+        // Blank lines between data rows must be silently ignored.
+        let csv = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n\n\nMSFT,Technology,Software\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].ticker(), "AAPL");
+        assert_eq!(details[1].ticker(), "MSFT");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_invalid_ticker_is_skipped_not_errored() {
+        // A row whose ticker field fails Ticker::new should be silently discarded
+        // (rejected_rows counter), not cause the whole parse to fail.
+        let csv = "ticker,sector,industry\nTOOLONG_SYMBOL,Technology,Software\nMSFT,Technology,Software\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        // TOOLONG_SYMBOL is rejected; MSFT passes
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker(), "MSFT");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_columns_in_different_order() {
+        // Column position is determined by header lookup, not fixed index.
+        let csv = "industry,ticker,sector\nConsumer Electronics,AAPL,Technology\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker(), "AAPL");
+        assert_eq!(details[0].sector(), "TECHNOLOGY");
+        assert_eq!(details[0].industry(), "CONSUMER ELECTRONICS");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_multiple_invalid_tickers_counted() {
+        // Multiple rows with invalid tickers should all be skipped, leaving only
+        // valid rows in the output.
+        let csv = "ticker,sector,industry\nBADTICKER1,Tech,SW\nBADTICKER2,Tech,SW\nNVDA,Technology,Semiconductors\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].ticker(), "NVDA");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_only_invalid_tickers_returns_empty() {
+        let csv = "ticker,sector,industry\nBADTICKER1,Tech,SW\nBADTICKER2,Tech,SW\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_empty_sector_only_uses_not_available() {
+        let csv = "ticker,sector,industry\nAAPL,,Software\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].sector(), "NOT AVAILABLE");
+        assert_eq!(details[0].industry(), "SOFTWARE");
+    }
+
+    #[test]
+    fn test_parse_equity_details_csv_empty_industry_only_uses_not_available() {
+        let csv = "ticker,sector,industry\nAAPL,Technology,\n";
+        let details = parse_equity_details_csv(csv).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].sector(), "TECHNOLOGY");
+        assert_eq!(details[0].industry(), "NOT AVAILABLE");
+    }
 }

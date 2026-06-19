@@ -440,4 +440,177 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    #[test]
+    fn test_prediction_run_row_count() {
+        let predictions = serde_json::json!([
+            {"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03},
+            {"ticker": "GOOG", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03},
+        ]);
+        let run = PredictionRun::new(predictions.clone(), 2);
+        assert_eq!(run.row_count(), 2);
+        assert_eq!(run.predictions(), &predictions);
+    }
+
+    #[test]
+    fn test_prediction_run_into_predictions_consumes() {
+        let predictions = serde_json::json!({"ticker": "AAPL"});
+        let run = PredictionRun::new(predictions.clone(), 1);
+        let extracted = run.into_predictions();
+        assert_eq!(extracted, predictions);
+    }
+
+    #[test]
+    fn test_prediction_run_zero_rows() {
+        let run = PredictionRun::new(serde_json::json!([]), 0);
+        assert_eq!(run.row_count(), 0);
+    }
+
+    #[test]
+    fn test_pipeline_error_accessors() {
+        let error = PipelineError::new("fetch_equity_bars", "connection refused".to_string());
+        assert_eq!(error.stage(), "fetch_equity_bars");
+        assert_eq!(error.message(), "connection refused");
+    }
+
+    #[test]
+    fn test_pipeline_error_stage_strings_are_stable() {
+        // Stage name strings are stored in structured logs and emitted as event
+        // payloads; they must not change.
+        let stages = [
+            "model_not_loaded",
+            "fetch_equity_bars",
+            "fetch_equity_details",
+            "data_consolidation",
+            "equity_bar_filtering",
+            "ticker_filtering",
+            "prediction",
+            "validation",
+            "insert_predictions",
+        ];
+        for stage in stages {
+            let error = PipelineError::new(stage, String::new());
+            assert_eq!(error.stage(), stage);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_health_response_body_no_model() {
+        use axum::body::to_bytes;
+
+        let state = make_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["model_loaded"], false);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_404() {
+        let state = make_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_prediction_run_new_stores_predictions_and_row_count() {
+        let predictions = serde_json::json!([
+            {"ticker": "TSLA", "timestamp": 2000, "quantile_10": 0.0, "quantile_50": 0.1, "quantile_90": 0.2},
+        ]);
+        let run = PredictionRun::new(predictions.clone(), 1);
+        assert_eq!(run.row_count(), 1);
+        assert_eq!(run.predictions(), &predictions);
+        let extracted = run.into_predictions();
+        assert_eq!(extracted, predictions);
+    }
+
+    #[test]
+    fn test_prediction_run_row_count_zero_with_empty_array() {
+        let run = PredictionRun::new(serde_json::json!([]), 0);
+        assert_eq!(run.row_count(), 0);
+        assert_eq!(run.predictions().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_pipeline_error_new_stores_stage_and_message() {
+        let error = PipelineError::new("validation", "schema mismatch".to_string());
+        assert_eq!(error.stage(), "validation");
+        assert_eq!(error.message(), "schema mismatch");
+    }
+
+    #[test]
+    fn test_pipeline_error_message_can_be_empty() {
+        let error = PipelineError::new("prediction", String::new());
+        assert_eq!(error.stage(), "prediction");
+        assert_eq!(error.message(), "");
+    }
+
+    #[test]
+    fn test_pipeline_error_with_multiline_message() {
+        let message = "line one\nline two".to_string();
+        let error = PipelineError::new("insert_predictions", message.clone());
+        assert_eq!(error.message(), message);
+    }
+
+    #[tokio::test]
+    async fn test_run_predictions_error_stage_is_model_not_loaded() {
+        // Verifies that the error returned by run_predictions (with no model)
+        // carries the "model_not_loaded" stage string used in structured logs
+        // and event payloads. This exercises the error-logging block in
+        // run_predictions as well as the PipelineError accessors.
+        let state = make_test_state();
+        let error = run_predictions(&state)
+            .await
+            .err()
+            .expect("expected an error when no model is loaded");
+        assert_eq!(error.stage(), "model_not_loaded");
+        assert!(!error.message().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_predictions_endpoint_returns_json_error_body() {
+        use axum::body::to_bytes;
+
+        let state = make_test_state();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/predictions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body.get("error").is_some());
+    }
 }

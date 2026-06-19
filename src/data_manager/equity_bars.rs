@@ -502,4 +502,195 @@ mod tests {
         let bar = parse_equity_bar(&result, Utc::now()).unwrap();
         assert_eq!(bar.ticker(), "BRK.B");
     }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_infinite_volume() {
+        let mut result = make_valid_result();
+        result.v = Some(f64::INFINITY);
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_missing_volume() {
+        let mut result = make_valid_result();
+        result.v = None;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_volume_zero_is_accepted() {
+        // Zero volume is valid (e.g., a halted instrument that still reports OHLC).
+        let mut result = make_valid_result();
+        result.v = Some(0.0);
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.volume(), 0);
+    }
+
+    #[test]
+    fn test_parse_equity_bar_volume_fractional_rounds() {
+        // Fractional volumes from the API are rounded to the nearest integer.
+        let mut result = make_valid_result();
+        result.v = Some(1_000_500.7);
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.volume(), 1_000_501);
+    }
+
+    #[test]
+    fn test_parse_equity_bar_transactions_overflow_u64_becomes_none() {
+        // n values that exceed i64::MAX cannot be represented and must be discarded
+        // (the transactions field becomes None rather than corrupting the value).
+        let mut result = make_valid_result();
+        result.n = Some(u64::MAX);
+        // Transactions should become None because i64::try_from(u64::MAX) fails,
+        // but the bar itself is still valid.
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert!(bar.transactions().is_none());
+    }
+
+    #[test]
+    fn test_equity_bars_key_sunday() {
+        let date = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap(); // Sunday
+        let key = equity_bars_key(date);
+        assert_eq!(
+            key,
+            "data/equity/bars/year=2026/month=06/day=07/data.parquet"
+        );
+    }
+
+    #[test]
+    fn test_equity_bars_key_single_digit_month_and_day() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 3).unwrap();
+        let key = equity_bars_key(date);
+        assert_eq!(
+            key,
+            "data/equity/bars/year=2026/month=01/day=03/data.parquet"
+        );
+    }
+
+    #[test]
+    fn test_grouped_bars_url_multiple_trailing_slashes() {
+        // Only the trailing slash(es) on the base are stripped; the path is appended once.
+        assert_eq!(
+            grouped_bars_url("https://api.massive.com//", "2026-01-02"),
+            "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/2026-01-02"
+        );
+    }
+
+    #[test]
+    fn test_backfill_summary_default_is_all_zeros() {
+        use super::BackfillSummary;
+        let summary = BackfillSummary::default();
+        assert_eq!(summary.days_processed, 0);
+        assert_eq!(summary.days_skipped_weekend, 0);
+        assert_eq!(summary.days_failed, 0);
+        assert_eq!(summary.total_bars, 0);
+    }
+
+    #[test]
+    fn test_parse_equity_bar_rejects_negative_infinity_volume() {
+        let mut result = make_valid_result();
+        result.v = Some(f64::NEG_INFINITY);
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_volume_exactly_at_i64_max_boundary() {
+        // i64::MAX as f64 is representable (it rounds to 2^63 = 9.223372036854776e18).
+        // The guard checks `rounded <= i64::MAX as f64`, which is exactly equal,
+        // so the cast succeeds (Rust saturates the f64 cast to i64::MAX).
+        // The bar must be accepted with a saturated volume value.
+        let mut result = make_valid_result();
+        result.v = Some(i64::MAX as f64);
+        let bar = parse_equity_bar(&result, Utc::now());
+        assert!(bar.is_some());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_timestamp_overflow_u64_to_i64_fails() {
+        // A timestamp u64 value larger than i64::MAX cannot be converted
+        // via i64::try_from and must cause the bar to be dropped.
+        let mut result = make_valid_result();
+        result.t = u64::MAX;
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_timestamp_out_of_range_for_datetime() {
+        // A u64 timestamp that fits in i64 but is outside the valid DateTime
+        // range causes from_timestamp_millis to return None, rejecting the bar.
+        // (i64::MAX / 2) milliseconds is roughly 4.6 × 10^15 seconds ≈ far future
+        // beyond chrono's supported range.
+        let mut result = make_valid_result();
+        result.t = (i64::MAX as u64) / 2;
+        // from_timestamp_millis returns None for timestamps outside chrono's range
+        // so the bar must be dropped.
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_volume_small_positive_rounds_to_zero() {
+        // A very small positive volume (0 < v < 0.5) rounds to 0, which passes
+        // the >= 0 filter and should produce a bar with volume 0.
+        let mut result = make_valid_result();
+        result.v = Some(0.3);
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.volume(), 0);
+    }
+
+    #[test]
+    fn test_parse_equity_bar_transactions_zero_is_accepted() {
+        let mut result = make_valid_result();
+        result.n = Some(0);
+        let bar = parse_equity_bar(&result, Utc::now()).unwrap();
+        assert_eq!(bar.transactions(), Some(0));
+    }
+
+    #[test]
+    fn test_grouped_bars_url_empty_date_string() {
+        // Date is caller-controlled; verify the template is still applied.
+        let url = grouped_bars_url("https://api.massive.com", "");
+        assert_eq!(
+            url,
+            "https://api.massive.com/v2/aggs/grouped/locale/us/market/stocks/"
+        );
+    }
+
+    #[test]
+    fn test_equity_bars_key_year_boundary() {
+        let date = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let key = equity_bars_key(date);
+        assert_eq!(
+            key,
+            "data/equity/bars/year=2025/month=12/day=31/data.parquet"
+        );
+    }
+
+    #[test]
+    fn test_parse_equity_bar_empty_ticker_is_rejected() {
+        let mut result = make_valid_result();
+        result.ticker = String::new();
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_parse_equity_bar_whitespace_only_ticker_is_rejected() {
+        let mut result = make_valid_result();
+        result.ticker = "   ".to_string();
+        assert!(parse_equity_bar(&result, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn test_backfill_summary_debug_is_implemented() {
+        use super::BackfillSummary;
+        let summary = BackfillSummary {
+            days_processed: 5,
+            days_skipped_weekend: 2,
+            days_failed: 1,
+            total_bars: 1000,
+        };
+        let debug_str = format!("{:?}", summary);
+        assert!(debug_str.contains("BackfillSummary"));
+        assert!(debug_str.contains("days_processed"));
+        assert!(debug_str.contains("total_bars"));
+    }
 }

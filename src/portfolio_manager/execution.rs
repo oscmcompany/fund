@@ -365,4 +365,86 @@ mod tests {
         // Verify std::error::Error is implemented
         let _boxed: Box<dyn std::error::Error> = Box::new(error);
     }
+
+    #[test]
+    fn test_execution_error_order_submission_source_included_in_display() {
+        let error = ExecutionError::OrderSubmission {
+            ticker: "NVDA".to_string(),
+            source: AlpacaError::Api {
+                status: 422,
+                body: "insufficient funds".to_string(),
+            },
+        };
+        let message = format!("{error}");
+        assert!(message.contains("NVDA"));
+        assert!(message.contains("422"));
+    }
+
+    #[test]
+    fn test_execution_error_fill_poll_source_included_in_display() {
+        let error = ExecutionError::FillPoll {
+            alpaca_order_id: "abc-456".to_string(),
+            source: AlpacaError::Api {
+                status: 500,
+                body: "internal error".to_string(),
+            },
+        };
+        let message = format!("{error}");
+        assert!(message.contains("abc-456"));
+        assert!(message.contains("500"));
+    }
+
+    #[test]
+    fn test_execution_error_position_close_source_included_in_display() {
+        let error = ExecutionError::PositionClose {
+            ticker: "AMZN".to_string(),
+            source: AlpacaError::Api {
+                status: 404,
+                body: "position not found".to_string(),
+            },
+        };
+        let message = format!("{error}");
+        assert!(message.contains("AMZN"));
+        assert!(message.contains("close"));
+    }
+
+    #[test]
+    fn test_pending_pair_construction_from_execution_path() {
+        use crate::domain::orders::{Order, OrderSide, PendingPair};
+        use chrono::Utc;
+        use rust_decimal::Decimal;
+        use uuid::Uuid;
+
+        // Verify the same construction used in execute_open_pairs compiles and
+        // produces a coherent PendingPair.
+        let now = Utc::now();
+        let short_order = Order::<crate::domain::orders::Pending>::new(
+            Uuid::new_v4(),
+            "MSFT".to_string(),
+            OrderSide::Short,
+            Decimal::from(10),
+            "market".to_string(),
+            None,
+            "alpaca-short-001".to_string(),
+            now,
+        );
+        let long_order = Order::<crate::domain::orders::Pending>::new(
+            Uuid::new_v4(),
+            "AAPL".to_string(),
+            OrderSide::Long,
+            Decimal::ZERO,
+            "market".to_string(),
+            None,
+            "alpaca-long-001".to_string(),
+            now,
+        );
+        let pending_pair = PendingPair::new(long_order, short_order, 1.1, 0.9);
+
+        assert_eq!(pending_pair.long().ticker, "AAPL");
+        assert_eq!(pending_pair.short().ticker, "MSFT");
+        assert!((pending_pair.long_beta() - 1.1).abs() < f64::EPSILON);
+        assert!((pending_pair.short_beta() - 0.9).abs() < f64::EPSILON);
+        assert_eq!(pending_pair.long().alpaca_order_id, "alpaca-long-001");
+        assert_eq!(pending_pair.short().alpaca_order_id, "alpaca-short-001");
+    }
 }

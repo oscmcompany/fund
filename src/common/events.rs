@@ -425,4 +425,177 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_event_type_as_str_all_variants() {
+        // Exhaustively verify every variant maps to its expected snake_case string.
+        // This catches any future variant added without updating as_str().
+        let cases: &[(EventType, &str)] = &[
+            (
+                EventType::EquityBarsSyncRequested,
+                "equity_bars_sync_requested",
+            ),
+            (EventType::EquityBarsSyncStarted, "equity_bars_sync_started"),
+            (
+                EventType::EquityBarsSyncCompleted,
+                "equity_bars_sync_completed",
+            ),
+            (EventType::EquityBarsSyncErrored, "equity_bars_sync_errored"),
+            (
+                EventType::EquityBarsExportRequested,
+                "equity_bars_export_requested",
+            ),
+            (
+                EventType::EquityBarsExportStarted,
+                "equity_bars_export_started",
+            ),
+            (
+                EventType::EquityBarsExportCompleted,
+                "equity_bars_export_completed",
+            ),
+            (
+                EventType::EquityBarsExportErrored,
+                "equity_bars_export_errored",
+            ),
+            (
+                EventType::TradingHistoryExportRequested,
+                "trading_history_export_requested",
+            ),
+            (
+                EventType::TradingHistoryExportStarted,
+                "trading_history_export_started",
+            ),
+            (
+                EventType::TradingHistoryExportCompleted,
+                "trading_history_export_completed",
+            ),
+            (
+                EventType::TradingHistoryExportErrored,
+                "trading_history_export_errored",
+            ),
+            (
+                EventType::DatabaseBackupRequested,
+                "database_backup_requested",
+            ),
+            (EventType::DatabaseBackupStarted, "database_backup_started"),
+            (
+                EventType::DatabaseBackupCompleted,
+                "database_backup_completed",
+            ),
+            (EventType::DatabaseBackupErrored, "database_backup_errored"),
+            (EventType::MarketSessionCheck, "market_session_check"),
+            (
+                EventType::EquityPredictionsRequested,
+                "equity_predictions_requested",
+            ),
+            (
+                EventType::EquityPredictionsStarted,
+                "equity_predictions_started",
+            ),
+            (
+                EventType::EquityPredictionsCompleted,
+                "equity_predictions_completed",
+            ),
+            (
+                EventType::EquityPredictionsErrored,
+                "equity_predictions_errored",
+            ),
+            (
+                EventType::PortfolioRebalanceStarted,
+                "portfolio_rebalance_started",
+            ),
+            (
+                EventType::PortfolioRebalanceCompleted,
+                "portfolio_rebalance_completed",
+            ),
+            (
+                EventType::PortfolioRebalanceErrored,
+                "portfolio_rebalance_errored",
+            ),
+            (
+                EventType::PortfolioLiquidationRequested,
+                "portfolio_liquidation_requested",
+            ),
+            (
+                EventType::PortfolioLiquidationStarted,
+                "portfolio_liquidation_started",
+            ),
+            (
+                EventType::PortfolioLiquidationCompleted,
+                "portfolio_liquidation_completed",
+            ),
+            (
+                EventType::PortfolioLiquidationErrored,
+                "portfolio_liquidation_errored",
+            ),
+        ];
+        for (event_type, expected) in cases {
+            assert_eq!(
+                event_type.as_str(),
+                *expected,
+                "as_str mismatch for {:?}",
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_event_type_display_matches_as_str_all_variants() {
+        // Display must equal as_str() for every variant.
+        let all: &[EventType] = &[
+            EventType::EquityBarsSyncRequested,
+            EventType::EquityBarsSyncStarted,
+            EventType::EquityBarsSyncCompleted,
+            EventType::EquityBarsSyncErrored,
+            EventType::EquityBarsExportRequested,
+            EventType::EquityBarsExportStarted,
+            EventType::EquityBarsExportCompleted,
+            EventType::EquityBarsExportErrored,
+            EventType::TradingHistoryExportRequested,
+            EventType::TradingHistoryExportStarted,
+            EventType::TradingHistoryExportCompleted,
+            EventType::TradingHistoryExportErrored,
+            EventType::DatabaseBackupRequested,
+            EventType::DatabaseBackupStarted,
+            EventType::DatabaseBackupCompleted,
+            EventType::DatabaseBackupErrored,
+            EventType::MarketSessionCheck,
+            EventType::EquityPredictionsRequested,
+            EventType::EquityPredictionsStarted,
+            EventType::EquityPredictionsCompleted,
+            EventType::EquityPredictionsErrored,
+            EventType::PortfolioRebalanceStarted,
+            EventType::PortfolioRebalanceCompleted,
+            EventType::PortfolioRebalanceErrored,
+            EventType::PortfolioLiquidationRequested,
+            EventType::PortfolioLiquidationStarted,
+            EventType::PortfolioLiquidationCompleted,
+            EventType::PortfolioLiquidationErrored,
+        ];
+        for event_type in all {
+            assert_eq!(
+                event_type.to_string(),
+                event_type.as_str(),
+                "Display != as_str for {:?}",
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_event_type_equality() {
+        assert_eq!(EventType::MarketSessionCheck, EventType::MarketSessionCheck);
+        assert_ne!(
+            EventType::MarketSessionCheck,
+            EventType::EquityPredictionsStarted
+        );
+    }
+
+    #[test]
+    fn test_event_type_copy() {
+        // EventType derives Copy so it can be passed by value freely.
+        let original = EventType::PortfolioRebalanceStarted;
+        let copied = original;
+        assert_eq!(original, copied);
+    }
 }
