@@ -1,4 +1,4 @@
-use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
+use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, PairID, Ticker};
 use crate::domain::predictions::{EquityPrediction, ModelRun, ModelRunStatus};
 use crate::domain::trading::{
     AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
@@ -330,10 +330,13 @@ pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::
             let status = EquityPairStatus::parse(&row.status).ok_or_else(|| {
                 sqlx::Error::Decode(format!("Invalid equity pair status: {}", row.status).into())
             })?;
+            let pair_id = PairID::parse(&row.pair_id).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid pair id: {}", row.pair_id).into())
+            })?;
             Ok(EquityPair::new(
                 row.id,
                 row.rebalance_id,
-                row.pair_id,
+                pair_id,
                 long_ticker,
                 short_ticker,
                 row.z_score,
@@ -474,18 +477,21 @@ pub async fn query_equity_predictions_for_date(
     let predictions: Vec<EquityPrediction> = rows
         .into_iter()
         .map(|row| {
-            EquityPrediction::new(
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(format!("Invalid ticker from database: {}", row.ticker).into())
+            })?;
+            Ok(EquityPrediction::new(
                 row.correlation_id,
                 row.model_run_id,
-                row.ticker,
+                ticker,
                 row.timestamp,
                 row.quantile_10,
                 row.quantile_50,
                 row.quantile_90,
                 row.created_at,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     debug!(
         "Queried {} equity predictions for {}",

@@ -10,7 +10,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::domain::freshness::{Fresh, StalenessWindow};
-use crate::domain::market::Ticker;
+use crate::domain::market::{PairID, Ticker};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession, RebalanceSessionStatus,
@@ -35,7 +35,7 @@ const SPY_PRICE_LOOKBACK_DAYS: i64 = 90;
 #[derive(Debug, Clone)]
 pub struct OpenPair {
     id: Uuid,
-    pair_id: String,
+    pair_id: PairID,
     long_ticker: Ticker,
     short_ticker: Ticker,
 }
@@ -45,7 +45,7 @@ impl OpenPair {
         self.id
     }
 
-    pub fn pair_id(&self) -> &str {
+    pub fn pair_id(&self) -> &PairID {
         &self.pair_id
     }
 
@@ -82,18 +82,24 @@ pub async fn fetch_predictions(pool: &PgPool) -> Result<Fresh<Vec<EquityPredicti
     let predictions: Vec<EquityPrediction> = rows
         .into_iter()
         .map(|row| {
-            EquityPrediction::new(
+            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+                sqlx::Error::Decode(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid ticker from database: {}", row.ticker),
+                )))
+            })?;
+            Ok(EquityPrediction::new(
                 row.correlation_id,
                 row.model_run_id,
-                row.ticker,
+                ticker,
                 row.timestamp,
                 row.quantile_10,
                 row.quantile_50,
                 row.quantile_90,
                 row.created_at,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     info!(
         count = predictions.len(),
@@ -109,7 +115,7 @@ pub async fn fetch_predictions(pool: &PgPool) -> Result<Fresh<Vec<EquityPredicti
 /// filtering by minimum length.
 pub async fn fetch_historical_prices(
     pool: &PgPool,
-) -> Result<HashMap<String, Vec<f64>>, sqlx::Error> {
+) -> Result<HashMap<Ticker, Vec<f64>>, sqlx::Error> {
     let end_date = Utc::now();
     let start_date = end_date - Duration::days(HISTORICAL_PRICE_LOOKBACK_DAYS);
 
@@ -124,9 +130,15 @@ pub async fn fetch_historical_prices(
     .fetch_all(pool)
     .await?;
 
-    let mut closes: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut closes: HashMap<Ticker, Vec<f64>> = HashMap::new();
     for row in rows {
-        closes.entry(row.ticker).or_default().push(row.close_price);
+        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ticker from database: {}", row.ticker),
+            )))
+        })?;
+        closes.entry(ticker).or_default().push(row.close_price);
     }
 
     info!(
@@ -166,14 +178,20 @@ pub async fn fetch_spy_prices(pool: &PgPool) -> Result<Vec<f64>, sqlx::Error> {
 /// Returns a map from ticker to sector string. Tickers absent from
 /// `equity_details` will not appear in the map; callers should default to
 /// `"NOT AVAILABLE"`.
-pub async fn fetch_equity_details(pool: &PgPool) -> Result<HashMap<String, String>, sqlx::Error> {
+pub async fn fetch_equity_details(pool: &PgPool) -> Result<HashMap<Ticker, String>, sqlx::Error> {
     let rows = sqlx::query!("SELECT ticker, sector FROM equity_details")
         .fetch_all(pool)
         .await?;
 
-    let mut details: HashMap<String, String> = HashMap::new();
+    let mut details: HashMap<Ticker, String> = HashMap::new();
     for row in rows {
-        details.insert(row.ticker, row.sector);
+        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ticker from database: {}", row.ticker),
+            )))
+        })?;
+        details.insert(ticker, row.sector);
     }
 
     info!(
@@ -192,25 +210,33 @@ pub async fn fetch_equity_details(pool: &PgPool) -> Result<HashMap<String, Strin
 /// Returns an empty map immediately when `tickers` is empty.
 pub async fn fetch_live_quote_mid_prices(
     pool: &PgPool,
-    tickers: &[String],
-) -> Result<HashMap<String, f64>, sqlx::Error> {
+    tickers: &[Ticker],
+) -> Result<HashMap<Ticker, f64>, sqlx::Error> {
     if tickers.is_empty() {
         return Ok(HashMap::new());
     }
+
+    let ticker_strings: Vec<String> = tickers.iter().map(Ticker::to_string).collect();
 
     let rows = sqlx::query!(
         r#"SELECT DISTINCT ON (ticker) ticker, (bid_price + ask_price) / 2.0 AS "mid_price!"
            FROM equity_quotes
            WHERE ticker = ANY($1::text[])
            ORDER BY ticker, timestamp DESC"#,
-        tickers as &[String]
+        &ticker_strings as &[String]
     )
     .fetch_all(pool)
     .await?;
 
-    let mut prices: HashMap<String, f64> = HashMap::new();
+    let mut prices: HashMap<Ticker, f64> = HashMap::new();
     for row in rows {
-        prices.insert(row.ticker, row.mid_price);
+        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
+            sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid ticker from database: {}", row.ticker),
+            )))
+        })?;
+        prices.insert(ticker, row.mid_price);
     }
 
     info!(
@@ -238,9 +264,15 @@ pub async fn fetch_open_pairs(pool: &PgPool) -> Result<Vec<OpenPair>, sqlx::Erro
         .into_iter()
         .map(|row| {
             let id = row.id;
-            let pair_id = row.pair_id;
+            let pair_id_str = row.pair_id;
             let long_ticker_str = row.long_ticker;
             let short_ticker_str = row.short_ticker;
+            let pair_id = PairID::parse(&pair_id_str).ok_or_else(|| {
+                sqlx::Error::Decode(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid pair_id from database: {pair_id_str}"),
+                )))
+            })?;
             let long_ticker = Ticker::new(&long_ticker_str).ok_or_else(|| {
                 sqlx::Error::Decode(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -357,7 +389,7 @@ pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), 
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         pair.id(),
         pair.rebalance_id(),
-        pair.pair_id(),
+        pair.pair_id().as_str(),
         pair.long_ticker().as_str(),
         pair.short_ticker().as_str(),
         *pair.z_score(),
@@ -370,7 +402,7 @@ pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), 
     .await?;
 
     info!(
-        pair_id = pair.pair_id(),
+        pair_id = pair.pair_id().as_str(),
         "Equity pair inserted into PostgreSQL"
     );
     Ok(())
@@ -519,12 +551,12 @@ mod tests {
         let pair_id = Uuid::new_v4();
         let open_pair = OpenPair {
             id: pair_id,
-            pair_id: "AAPL-MSFT".to_string(),
+            pair_id: PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
             long_ticker: Ticker::new("AAPL").unwrap(),
             short_ticker: Ticker::new("MSFT").unwrap(),
         };
         assert_eq!(open_pair.id(), pair_id);
-        assert_eq!(open_pair.pair_id(), "AAPL-MSFT");
+        assert_eq!(open_pair.pair_id().as_str(), "AAPL-MSFT");
         assert_eq!(open_pair.long_ticker().as_str(), "AAPL");
         assert_eq!(open_pair.short_ticker().as_str(), "MSFT");
     }
@@ -533,12 +565,12 @@ mod tests {
     fn test_open_pair_clone() {
         let open_pair = OpenPair {
             id: Uuid::new_v4(),
-            pair_id: "GOOG-META".to_string(),
+            pair_id: PairID::new(Ticker::new("GOOG").unwrap(), Ticker::new("META").unwrap()),
             long_ticker: Ticker::new("GOOG").unwrap(),
             short_ticker: Ticker::new("META").unwrap(),
         };
         let cloned = open_pair.clone();
-        assert_eq!(cloned.pair_id(), open_pair.pair_id());
+        assert_eq!(cloned.pair_id().as_str(), open_pair.pair_id().as_str());
         assert_eq!(
             cloned.long_ticker().as_str(),
             open_pair.long_ticker().as_str()
@@ -557,6 +589,16 @@ mod tests {
             let result = fetch_live_quote_mid_prices(&lazy_pool(), &[]).await;
             assert!(result.is_ok());
             assert!(result.unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_fetch_live_quote_mid_prices_compiles_with_ticker_slice() {
+        make_runtime().block_on(async {
+            let tickers = vec![Ticker::new("AAPL").unwrap()];
+            assert!(fetch_live_quote_mid_prices(&lazy_pool(), &tickers)
+                .await
+                .is_err());
         });
     }
 
@@ -587,16 +629,6 @@ mod tests {
     fn test_fetch_equity_details_compiles() {
         make_runtime().block_on(async {
             assert!(fetch_equity_details(&lazy_pool()).await.is_err());
-        });
-    }
-
-    #[test]
-    fn test_fetch_live_quote_mid_prices_compiles() {
-        make_runtime().block_on(async {
-            let tickers = vec!["AAPL".to_string()];
-            assert!(fetch_live_quote_mid_prices(&lazy_pool(), &tickers)
-                .await
-                .is_err());
         });
     }
 
@@ -651,14 +683,14 @@ mod tests {
     #[test]
     fn test_insert_equity_pair_compiles() {
         make_runtime().block_on(async {
-            use crate::domain::market::Ticker;
+            use crate::domain::market::{PairID, Ticker};
             use crate::domain::trading::{EquityPair, EquityPairStatus};
             use rust_decimal::Decimal;
 
             let pair = EquityPair::new(
                 Uuid::new_v4(),
                 Uuid::new_v4(),
-                "AAPL-MSFT".to_string(),
+                PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
                 Ticker::new("AAPL").unwrap(),
                 Ticker::new("MSFT").unwrap(),
                 Decimal::from(2),

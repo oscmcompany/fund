@@ -256,7 +256,7 @@ fn create_equity_pair_dataframe(pairs: &[EquityPair]) -> Result<DataFrame, Strin
     df!(
         "id" => pairs.iter().map(|pair| pair.id().to_string()).collect::<Vec<String>>(),
         "rebalance_id" => pairs.iter().map(|pair| pair.rebalance_id().to_string()).collect::<Vec<String>>(),
-        "pair_id" => pairs.iter().map(|pair| pair.pair_id()).collect::<Vec<&str>>(),
+        "pair_id" => pairs.iter().map(|pair| pair.pair_id().as_str()).collect::<Vec<&str>>(),
         "long_ticker" => pairs.iter().map(|pair| pair.long_ticker().as_str()).collect::<Vec<&str>>(),
         "short_ticker" => pairs.iter().map(|pair| pair.short_ticker().as_str()).collect::<Vec<&str>>(),
         "z_score" => pairs.iter().map(|pair| pair.z_score().to_string()).collect::<Vec<String>>(),
@@ -334,7 +334,7 @@ fn create_equity_prediction_dataframe(
     df!(
         "correlation_id" => predictions.iter().map(|prediction| prediction.correlation_id().to_string()).collect::<Vec<String>>(),
         "model_run_id" => predictions.iter().map(|prediction| prediction.model_run_id()).collect::<Vec<&str>>(),
-        "ticker" => predictions.iter().map(|prediction| prediction.ticker()).collect::<Vec<&str>>(),
+        "ticker" => predictions.iter().map(|prediction| prediction.ticker().as_str()).collect::<Vec<&str>>(),
         "timestamp" => predictions.iter().map(|prediction| prediction.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
         "quantile_10" => predictions.iter().map(|prediction| prediction.quantile_10()).collect::<Vec<f64>>(),
         "quantile_50" => predictions.iter().map(|prediction| prediction.quantile_50()).collect::<Vec<f64>>(),
@@ -369,7 +369,7 @@ fn create_model_run_dataframe(model_runs: &[ModelRun]) -> Result<DataFrame, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::market::Ticker;
+    use crate::domain::market::{PairID, Ticker};
     use crate::domain::predictions::ModelRunStatus;
     use crate::domain::trading::{
         AllocationAction, AllocationSide, EquityPairStatus, RebalanceSessionStatus, SnapshotType,
@@ -416,7 +416,7 @@ mod tests {
         vec![EquityPair::new(
             "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            "AAPL-MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
             Ticker::new("AAPL").unwrap(),
             Ticker::new("MSFT").unwrap(),
             "2".parse().unwrap(),
@@ -645,7 +645,7 @@ mod tests {
             EquityPrediction::new(
                 "550e8400-e29b-41d4-a716-446655440010".parse().unwrap(),
                 "run-tide-001".to_string(),
-                "AAPL".to_string(),
+                Ticker::new("AAPL").unwrap(),
                 now,
                 -0.02,
                 0.01,
@@ -655,7 +655,7 @@ mod tests {
             EquityPrediction::new(
                 "550e8400-e29b-41d4-a716-446655440011".parse().unwrap(),
                 "run-tide-001".to_string(),
-                "MSFT".to_string(),
+                Ticker::new("MSFT").unwrap(),
                 now,
                 -0.01,
                 0.005,
@@ -852,7 +852,7 @@ mod tests {
         let pairs = vec![crate::domain::trading::EquityPair::new(
             "550e8400-e29b-41d4-a716-446655440020".parse().unwrap(),
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            "GOOG-META".to_string(),
+            PairID::new(Ticker::new("GOOG").unwrap(), Ticker::new("META").unwrap()),
             Ticker::new("GOOG").unwrap(),
             Ticker::new("META").unwrap(),
             "1.5".parse().unwrap(),
@@ -1306,7 +1306,7 @@ mod tests {
         let pairs = vec![EquityPair::new(
             "550e8400-e29b-41d4-a716-446655440099".parse().unwrap(),
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
-            "TSLA-NVDA".to_string(),
+            PairID::new(Ticker::new("TSLA").unwrap(), Ticker::new("NVDA").unwrap()),
             Ticker::new("TSLA").unwrap(),
             Ticker::new("NVDA").unwrap(),
             "3.5".parse().unwrap(),

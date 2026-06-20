@@ -4,6 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 use uuid::Uuid;
 
+use crate::domain::market::Ticker;
 use crate::domain::predictions::EquityPrediction;
 
 pub async fn query_equity_bars(pool: &PgPool) -> Result<DataFrame, sqlx::Error> {
@@ -143,10 +144,13 @@ fn prediction_from_json(
             })
     };
 
+    let validated_ticker = Ticker::new(ticker).ok_or_else(|| {
+        sqlx::Error::Decode(format!("Invalid ticker in prediction payload: {ticker}").into())
+    })?;
     Ok(EquityPrediction::new(
         correlation_id,
         model_run_id.to_string(),
-        ticker.to_string(),
+        validated_ticker,
         timestamp,
         quantile("quantile_10")?,
         quantile("quantile_50")?,

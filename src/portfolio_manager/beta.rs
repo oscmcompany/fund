@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::domain::market::Ticker;
 use crate::portfolio_manager::math::{log_returns, ols_slope};
 
 /// Trailing window for beta estimation (trading days).
@@ -23,9 +24,9 @@ const MINIMUM_RETURN_COUNT: usize = 2;
 /// `ticker_closes` maps ticker → ordered close prices (oldest to newest).
 /// `spy_closes` is the ordered SPY close price series.
 pub fn compute_market_betas(
-    ticker_closes: &HashMap<String, Vec<f64>>,
+    ticker_closes: &HashMap<Ticker, Vec<f64>>,
     spy_closes: &[f64],
-) -> HashMap<String, f64> {
+) -> HashMap<Ticker, f64> {
     let spy_window = &spy_closes[spy_closes.len().saturating_sub(BETA_WINDOW_DAYS + 1)..];
 
     if spy_window.iter().any(|&price| price <= 0.0) {
@@ -37,7 +38,7 @@ pub fn compute_market_betas(
         return HashMap::new();
     }
 
-    let mut betas = HashMap::new();
+    let mut betas: HashMap<Ticker, f64> = HashMap::new();
 
     for (ticker, closes) in ticker_closes {
         let ticker_window = &closes[closes.len().saturating_sub(BETA_WINDOW_DAYS + 1)..];
@@ -96,21 +97,21 @@ mod tests {
 
     #[test]
     fn test_compute_market_betas_empty_spy_returns_empty() {
-        let tickers = HashMap::new();
+        let tickers: HashMap<Ticker, Vec<f64>> = HashMap::new();
         assert!(compute_market_betas(&tickers, &[]).is_empty());
     }
 
     #[test]
     fn test_compute_market_betas_zero_spy_price_returns_empty() {
         let mut tickers = HashMap::new();
-        tickers.insert("AAPL".to_string(), make_prices(70, 150.0, 0.001));
+        tickers.insert(Ticker::new("AAPL").unwrap(), make_prices(70, 150.0, 0.001));
         assert!(compute_market_betas(&tickers, &[100.0, 0.0, 100.0]).is_empty());
     }
 
     #[test]
     fn test_compute_market_betas_insufficient_spy_returns_empty() {
         let mut tickers = HashMap::new();
-        tickers.insert("AAPL".to_string(), make_prices(70, 150.0, 0.001));
+        tickers.insert(Ticker::new("AAPL").unwrap(), make_prices(70, 150.0, 0.001));
         // Only one SPY price → zero returns
         assert!(compute_market_betas(&tickers, &[100.0]).is_empty());
     }
@@ -119,18 +120,18 @@ mod tests {
     fn test_compute_market_betas_skips_ticker_with_nonpositive_price() {
         let spy = make_prices(70, 400.0, 0.001);
         let mut tickers = HashMap::new();
-        tickers.insert("BAD".to_string(), vec![100.0, 0.0, 100.0]);
+        tickers.insert(Ticker::new("BAD").unwrap(), vec![100.0, 0.0, 100.0]);
         let result = compute_market_betas(&tickers, &spy);
-        assert!(!result.contains_key("BAD"));
+        assert!(!result.contains_key(&Ticker::new("BAD").unwrap()));
     }
 
     #[test]
     fn test_compute_market_betas_skips_ticker_with_too_few_prices() {
         let spy = make_prices(70, 400.0, 0.001);
         let mut tickers = HashMap::new();
-        tickers.insert("TINY".to_string(), vec![100.0]); // only 1 price → 0 returns
+        tickers.insert(Ticker::new("TINY").unwrap(), vec![100.0]); // only 1 price → 0 returns
         let result = compute_market_betas(&tickers, &spy);
-        assert!(!result.contains_key("TINY"));
+        assert!(!result.contains_key(&Ticker::new("TINY").unwrap()));
     }
 
     #[test]
@@ -139,10 +140,11 @@ mod tests {
         // Uses sinusoidal returns so log returns have non-zero variance.
         let spy = make_varying_prices(70, 400.0, 0.005);
         let mut tickers = HashMap::new();
-        tickers.insert("SAME".to_string(), spy.clone());
+        tickers.insert(Ticker::new("SAME").unwrap(), spy.clone());
         let result = compute_market_betas(&tickers, &spy);
-        assert!(result.contains_key("SAME"));
-        assert!((result["SAME"] - 1.0).abs() < 1e-6);
+        let same_ticker = Ticker::new("SAME").unwrap();
+        assert!(result.contains_key(&same_ticker));
+        assert!((result[&same_ticker] - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -163,21 +165,22 @@ mod tests {
         }
 
         let mut tickers = HashMap::new();
-        tickers.insert("LEVERAGED".to_string(), leveraged);
+        tickers.insert(Ticker::new("LVG").unwrap(), leveraged);
         let result = compute_market_betas(&tickers, &spy);
-        assert!(result.contains_key("LEVERAGED"));
-        assert!((result["LEVERAGED"] - 2.0).abs() < 1e-6);
+        let leveraged_ticker = Ticker::new("LVG").unwrap();
+        assert!(result.contains_key(&leveraged_ticker));
+        assert!((result[&leveraged_ticker] - 2.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_compute_market_betas_multiple_tickers() {
         let spy = make_prices(70, 400.0, 0.003);
         let mut tickers = HashMap::new();
-        tickers.insert("AAPL".to_string(), make_prices(70, 150.0, 0.004));
-        tickers.insert("MSFT".to_string(), make_prices(70, 300.0, 0.002));
+        tickers.insert(Ticker::new("AAPL").unwrap(), make_prices(70, 150.0, 0.004));
+        tickers.insert(Ticker::new("MSFT").unwrap(), make_prices(70, 300.0, 0.002));
         let result = compute_market_betas(&tickers, &spy);
-        assert!(result.contains_key("AAPL"));
-        assert!(result.contains_key("MSFT"));
+        assert!(result.contains_key(&Ticker::new("AAPL").unwrap()));
+        assert!(result.contains_key(&Ticker::new("MSFT").unwrap()));
         for beta in result.values() {
             assert!(beta.is_finite());
         }

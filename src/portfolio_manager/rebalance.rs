@@ -306,9 +306,9 @@ async fn fetch_market_data(
 ) -> Result<
     (
         Vec<EquityPrediction>,
-        HashMap<String, Vec<f64>>,
+        HashMap<Ticker, Vec<f64>>,
         Vec<f64>,
-        HashMap<String, String>,
+        HashMap<Ticker, String>,
     ),
     RebalanceError,
 > {
@@ -425,7 +425,7 @@ async fn select_size_execute(
     pool: &sqlx::PgPool,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<HashSet<String>>>>>,
     signals: &[ConsolidatedSignal],
-    historical_prices: &HashMap<String, Vec<f64>>,
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
     spy_prices: &[f64],
     buying_power: f64,
     exposure_scale: f64,
@@ -441,14 +441,9 @@ async fn select_size_execute(
 
     let market_betas = compute_market_betas(historical_prices, spy_prices);
 
-    let all_tickers: Vec<String> = candidate_pairs
+    let all_tickers: Vec<Ticker> = candidate_pairs
         .iter()
-        .flat_map(|pair| {
-            [
-                pair.long_ticker().to_string(),
-                pair.short_ticker().to_string(),
-            ]
-        })
+        .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
         .collect();
 
     let mut entry_prices = fetch_live_quote_mid_prices(pool, &all_tickers).await?;
@@ -502,7 +497,7 @@ async fn select_size_execute(
 
     let shortable_pairs: Vec<_> = sized_pairs
         .into_iter()
-        .filter(|pair| tradable_assets.contains(pair.short_ticker()))
+        .filter(|pair| tradable_assets.contains(pair.short_ticker().as_str()))
         .collect();
 
     let pending = execute_open_pairs(alpaca, &shortable_pairs).await;
@@ -558,7 +553,7 @@ async fn persist_filled_pairs(
         let equity_pair = EquityPair::new(
             pair_uuid,
             session_id,
-            sized_pair.pair_id().to_string(),
+            sized_pair.pair_id().clone(),
             long_ticker.clone(),
             short_ticker.clone(),
             z_score_decimal,
