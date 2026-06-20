@@ -333,6 +333,17 @@ pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::
             let pair_id = PairID::parse(&row.pair_id).ok_or_else(|| {
                 sqlx::Error::Decode(format!("Invalid pair id: {}", row.pair_id).into())
             })?;
+            let expected_pair_id = format!("{}-{}", long_ticker.as_str(), short_ticker.as_str());
+            if pair_id.as_str() != expected_pair_id {
+                return Err(sqlx::Error::Decode(
+                    format!(
+                        "Pair ID/ticker mismatch: pair_id={}, expected={}",
+                        pair_id.as_str(),
+                        expected_pair_id
+                    )
+                    .into(),
+                ));
+            }
             Ok(EquityPair::new(
                 row.id,
                 row.rebalance_id,

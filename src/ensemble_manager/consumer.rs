@@ -74,6 +74,10 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
         }
 
         let event_id = parse_event_id(payload);
+        if event_id == 0 {
+            warn!("Skipping equity_predictions_requested with invalid event_id");
+            continue;
+        }
         info!(event_id, "Received equity_predictions_requested");
         handle_equity_predictions_requested(state, pool, event_id).await;
     }
