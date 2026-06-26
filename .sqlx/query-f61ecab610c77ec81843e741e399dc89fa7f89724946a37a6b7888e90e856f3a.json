@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,\n         signal_strength, status, opened_at, closed_at, realized_profit_and_loss,\n         return_percent, holding_days\n         FROM equity_pairs\n         ORDER BY opened_at ASC",
+  "query": "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,\n         signal_strength, status, opened_at, closed_at, realized_profit_and_loss,\n         return_percent\n         FROM equity_pairs\n         ORDER BY opened_at ASC",
   "describe": {
     "columns": [
       {
@@ -67,11 +67,6 @@
         "ordinal": 12,
         "name": "return_percent",
         "type_info": "Numeric"
-      },
-      {
-        "ordinal": 13,
-        "name": "holding_days",
-        "type_info": "Int4"
       }
     ],
     "parameters": {
@@ -90,9 +85,8 @@
       false,
       true,
       true,
-      true,
       true
     ]
   },
-  "hash": "b7e9eac232daafced3934227d47e826aec72e4eb80c6f0d9fa45bad4c400046f"
+  "hash": "f61ecab610c77ec81843e741e399dc89fa7f89724946a37a6b7888e90e856f3a"
 }

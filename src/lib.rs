@@ -20,3 +20,6 @@ pub mod ensemble_manager;
 
 #[cfg(feature = "portfolio_manager")]
 pub mod portfolio_manager;
+
+#[cfg(feature = "dashboard_service")]
+pub mod dashboard_service;

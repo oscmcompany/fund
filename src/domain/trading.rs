@@ -224,7 +224,6 @@ pub struct EquityPair {
     closed_at: Option<DateTime<Utc>>,
     realized_profit_and_loss: Option<Decimal>,
     return_percent: Option<Decimal>,
-    holding_days: Option<i32>,
 }
 
 impl EquityPair {
@@ -244,7 +243,6 @@ impl EquityPair {
         closed_at: Option<DateTime<Utc>>,
         realized_profit_and_loss: Option<Decimal>,
         return_percent: Option<Decimal>,
-        holding_days: Option<i32>,
     ) -> Self {
         Self {
             id,
@@ -260,7 +258,6 @@ impl EquityPair {
             closed_at,
             realized_profit_and_loss,
             return_percent,
-            holding_days,
         }
     }
 
@@ -314,10 +311,6 @@ impl EquityPair {
 
     pub fn return_percent(&self) -> Option<&Decimal> {
         self.return_percent.as_ref()
-    }
-
-    pub fn holding_days(&self) -> Option<i32> {
-        self.holding_days
     }
 }
 
@@ -869,7 +862,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         assert_eq!(pair.long_ticker().as_str(), "AAPL");
         assert_eq!(pair.short_ticker().as_str(), "MSFT");
@@ -971,7 +963,6 @@ mod tests {
             Decimal::new(75, 2),
             EquityPairStatus::Open,
             Utc::now(),
-            None,
             None,
             None,
             None,
@@ -1108,7 +1099,6 @@ mod tests {
             Some(now),
             Some(Decimal::from(500)),
             Some(Decimal::new(5, 2)),
-            Some(3),
         );
         assert_eq!(pair.id(), id);
         assert_eq!(pair.rebalance_id(), rebalance_id);
@@ -1119,7 +1109,6 @@ mod tests {
         assert!(pair.closed_at().is_some());
         assert!(pair.realized_profit_and_loss().is_some());
         assert!(pair.return_percent().is_some());
-        assert_eq!(pair.holding_days(), Some(3));
     }
 
     #[test]

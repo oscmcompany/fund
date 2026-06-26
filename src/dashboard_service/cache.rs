@@ -1,0 +1,323 @@
+//! Shared in-memory cache for dashboard data.
+//!
+//! A single background task polls production Postgres every [`POLL_INTERVAL_SECS`]
+//! seconds and updates [`DashboardState`] behind a [`SharedState`] lock. All
+//! ratatui render passes read from the cache without touching the database
+//! directly, so viewer count does not affect Postgres connection load.
+//!
+//! A separate [`spawn_event_listener_task`] subscribes to the `events` NOTIFY
+//! channel and appends incoming events to the ring buffer in real time.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use sqlx::postgres::PgListener;
+use sqlx::PgPool;
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
+
+use crate::domain::market::{PairID, Ticker};
+
+/// How often the background task refreshes all static view data from Postgres.
+const POLL_INTERVAL_SECS: u64 = 30;
+
+/// Maximum number of events retained in the event ring buffer.
+const EVENT_BUFFER_CAPACITY: usize = 500;
+
+/// Data for a single open long/short pair position (Tab 1).
+#[derive(Debug, Clone)]
+pub struct OpenPosition {
+    pub pair_id: PairID,
+    pub long_ticker: Ticker,
+    pub short_ticker: Ticker,
+    pub z_score: Decimal,
+    pub hedge_ratio: Decimal,
+    pub signal_strength: Decimal,
+    pub long_dollar_amount: Decimal,
+    pub short_dollar_amount: Decimal,
+    pub opened_at: DateTime<Utc>,
+}
+
+/// A single portfolio NAV snapshot with optional SPY benchmark close (Tab 2).
+#[derive(Debug, Clone)]
+pub struct PerformanceSnapshot {
+    pub snapshot_timestamp: DateTime<Utc>,
+    pub net_asset_value: Decimal,
+    pub gross_return: Option<Decimal>,
+    pub net_return: Option<Decimal>,
+    pub total_slippage_cost: Decimal,
+    pub spy_close: Option<f64>,
+}
+
+/// Data for a single closed pair trade (Tab 3).
+#[derive(Debug, Clone)]
+pub struct ClosedTrade {
+    pub pair_id: PairID,
+    pub long_ticker: Ticker,
+    pub short_ticker: Ticker,
+    pub realized_profit_and_loss: Option<Decimal>,
+    pub return_percent: Option<Decimal>,
+    /// Seconds the position was held; computed from `opened_at`/`closed_at` timestamps.
+    pub holding_seconds: Option<i64>,
+    pub close_reason: Option<String>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+/// Aggregate statistics across all fetched closed trades (Tab 3 footer).
+#[derive(Debug, Clone, Default)]
+pub struct ClosedTradesSummary {
+    pub total_closed: usize,
+    pub win_rate: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub average_return_percent: Option<f64>,
+    /// Average holding duration in seconds across closed trades.
+    pub average_holding_seconds: Option<f64>,
+    pub total_realized_profit_and_loss: Option<Decimal>,
+}
+
+/// A single model quantile prediction row (Tab 4).
+#[derive(Debug, Clone)]
+pub struct PredictionRow {
+    pub ticker: Ticker,
+    pub quantile_10: f64,
+    pub quantile_50: f64,
+    pub quantile_90: f64,
+    pub model_run_id: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// A single event received from the Postgres `events` NOTIFY channel (Tab 5).
+#[derive(Debug, Clone)]
+pub struct EventEntry {
+    pub event_id: i64,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub received_at: DateTime<Utc>,
+}
+
+/// All data shown across the five dashboard tabs.
+///
+/// Updated atomically by the background polling task and the event listener.
+/// The ratatui render loop reads this under a shared lock without ever blocking
+/// on database I/O.
+#[derive(Debug, Default)]
+pub struct DashboardState {
+    /// Open long/short pair positions (Tab 1).
+    pub open_positions: Vec<OpenPosition>,
+    /// Sum of all long and short dollar amounts across open positions (Tab 1 footer).
+    pub gross_exposure: Decimal,
+    /// Net of long minus short dollar amounts across open positions (Tab 1 footer).
+    pub net_exposure: Decimal,
+    /// Portfolio NAV snapshots, newest first (Tab 2).
+    pub performance_history: Vec<PerformanceSnapshot>,
+    /// Closed pair trades, newest first (Tab 3).
+    pub closed_trades: Vec<ClosedTrade>,
+    /// Aggregate statistics computed from closed trades (Tab 3 footer).
+    pub closed_trades_summary: ClosedTradesSummary,
+    /// Latest model quantile predictions, sorted by ticker (Tab 4).
+    pub predictions: Vec<PredictionRow>,
+    /// Bounded event ring buffer, newest first (Tab 5).
+    pub events: VecDeque<EventEntry>,
+    /// Timestamp of the most recent successful poll. `None` until first poll completes.
+    pub last_updated: Option<DateTime<Utc>>,
+    /// Last database error message, if any. Cleared on successful poll.
+    pub database_error: Option<String>,
+}
+
+/// Thread-safe shared reference to dashboard state.
+pub type SharedState = Arc<RwLock<DashboardState>>;
+
+/// Spawns the background task that polls Postgres every [`POLL_INTERVAL_SECS`]
+/// seconds and refreshes all static view data in [`DashboardState`].
+///
+/// Errors from individual polls are recorded in `state.database_error` without
+/// terminating the task. A successful poll clears any previous error.
+pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+            match super::database::fetch_dashboard_data(&pool).await {
+                Ok(data) => {
+                    let mut guard = state.write().await;
+                    guard.open_positions = data.open_positions;
+                    guard.gross_exposure = data.gross_exposure;
+                    guard.net_exposure = data.net_exposure;
+                    guard.performance_history = data.performance_history;
+                    guard.closed_trades = data.closed_trades;
+                    guard.closed_trades_summary = data.closed_trades_summary;
+                    guard.predictions = data.predictions;
+                    guard.last_updated = Some(Utc::now());
+                    guard.database_error = None;
+                    info!("Dashboard state refreshed");
+                }
+                Err(error) => {
+                    warn!(error = %error, "Dashboard poll failed");
+                    state.write().await.database_error = Some(error.to_string());
+                }
+            }
+        }
+    });
+}
+
+/// Spawns the background task that subscribes to the Postgres `events` NOTIFY
+/// channel and appends incoming notifications to the event ring buffer.
+///
+/// The NOTIFY payload produced by the `events_notify` trigger is a JSON object
+/// with `event_id`, `event_type`, and `payload` fields. If the listener cannot
+/// connect or encounters a receive error, the task logs the error and exits;
+/// the rest of the dashboard continues to function with the polling cache.
+pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
+    tokio::spawn(async move {
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!(error = %error, "Failed to create event listener");
+                return;
+            }
+        };
+        if let Err(error) = listener.listen("events").await {
+            error!(error = %error, "Failed to subscribe to events channel");
+            return;
+        }
+        info!("Event listener subscribed to events channel");
+        loop {
+            match listener.recv().await {
+                Ok(notification) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(notification.payload()).unwrap_or_default();
+                    let entry = EventEntry {
+                        event_id: parsed["event_id"].as_i64().unwrap_or(0),
+                        event_type: parsed["event_type"]
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        payload: parsed["payload"].clone(),
+                        received_at: Utc::now(),
+                    };
+                    let mut guard = state.write().await;
+                    guard.events.push_front(entry);
+                    if guard.events.len() > EVENT_BUFFER_CAPACITY {
+                        guard.events.pop_back();
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "Event listener receive error");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dashboard_state_default_is_empty() {
+        let state = DashboardState::default();
+        assert!(state.open_positions.is_empty());
+        assert!(state.performance_history.is_empty());
+        assert!(state.closed_trades.is_empty());
+        assert!(state.predictions.is_empty());
+        assert!(state.events.is_empty());
+        assert_eq!(state.gross_exposure, Decimal::ZERO);
+        assert_eq!(state.net_exposure, Decimal::ZERO);
+        assert!(state.last_updated.is_none());
+        assert!(state.database_error.is_none());
+    }
+
+    #[test]
+    fn test_event_entry_fields() {
+        let entry = EventEntry {
+            event_id: 42,
+            event_type: "portfolio_rebalance_completed".to_string(),
+            payload: serde_json::json!({"session_id": "abc"}),
+            received_at: Utc::now(),
+        };
+        assert_eq!(entry.event_id, 42);
+        assert_eq!(entry.event_type, "portfolio_rebalance_completed");
+        assert_eq!(entry.payload["session_id"], "abc");
+    }
+
+    #[test]
+    fn test_closed_trades_summary_default() {
+        let summary = ClosedTradesSummary::default();
+        assert_eq!(summary.total_closed, 0);
+        assert!(summary.win_rate.is_none());
+        assert!(summary.profit_factor.is_none());
+        assert!(summary.average_return_percent.is_none());
+        assert!(summary.average_holding_seconds.is_none());
+        assert!(summary.total_realized_profit_and_loss.is_none());
+    }
+
+    #[test]
+    fn test_closed_trade_fields() {
+        let trade = ClosedTrade {
+            pair_id: PairID::parse("TSLA-NVDA").unwrap(),
+            long_ticker: Ticker::new("TSLA").unwrap(),
+            short_ticker: Ticker::new("NVDA").unwrap(),
+            realized_profit_and_loss: Some(rust_decimal::Decimal::new(500, 0)),
+            return_percent: Some(rust_decimal::Decimal::new(5, 2)),
+            holding_seconds: Some(3600),
+            close_reason: Some("profit_taken".to_string()),
+            closed_at: Some(Utc::now()),
+        };
+        assert_eq!(trade.pair_id.as_str(), "TSLA-NVDA");
+        assert_eq!(trade.long_ticker, "TSLA");
+        assert_eq!(trade.holding_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_prediction_row_fields() {
+        let row = PredictionRow {
+            ticker: Ticker::new("AAPL").unwrap(),
+            quantile_10: 0.1,
+            quantile_50: 0.5,
+            quantile_90: 0.9,
+            model_run_id: "run-abc".to_string(),
+            timestamp: Utc::now(),
+        };
+        assert_eq!(row.ticker, "AAPL");
+        assert!(row.quantile_10 < row.quantile_50);
+        assert!(row.quantile_50 < row.quantile_90);
+    }
+
+    #[test]
+    fn test_performance_snapshot_fields() {
+        let snapshot = PerformanceSnapshot {
+            snapshot_timestamp: Utc::now(),
+            net_asset_value: rust_decimal::Decimal::new(100000, 0),
+            gross_return: Some(rust_decimal::Decimal::new(5, 2)),
+            net_return: Some(rust_decimal::Decimal::new(4, 2)),
+            total_slippage_cost: rust_decimal::Decimal::new(50, 0),
+            spy_close: Some(450.0),
+        };
+        assert!(snapshot.gross_return.is_some());
+        assert!(snapshot.spy_close.is_some());
+    }
+
+    #[test]
+    fn test_open_position_fields() {
+        let position = OpenPosition {
+            pair_id: PairID::parse("AAPL-MSFT").unwrap(),
+            long_ticker: Ticker::new("AAPL").unwrap(),
+            short_ticker: Ticker::new("MSFT").unwrap(),
+            z_score: Decimal::new(15, 1),
+            hedge_ratio: Decimal::ONE,
+            signal_strength: Decimal::new(8, 1),
+            long_dollar_amount: Decimal::new(10000, 0),
+            short_dollar_amount: Decimal::new(9500, 0),
+            opened_at: Utc::now(),
+        };
+        assert_eq!(position.long_ticker, "AAPL");
+        assert_eq!(
+            position.long_dollar_amount + position.short_dollar_amount,
+            Decimal::new(19500, 0)
+        );
+    }
+}
