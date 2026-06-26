@@ -20,6 +20,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 /// non-blocking file writer and buffered lines would be lost. Returns `None`
 /// when file logging is disabled. Uses `try_init`, so calling this more than
 /// once (e.g. across tests) is a no-op rather than a panic.
+///
+/// Services that own stdout for terminal rendering (e.g. the dashboard TUI)
+/// should call [`init_tracing_file_only`] instead to avoid corrupting the
+/// alternate screen with JSON log output.
 pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
@@ -64,6 +68,49 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
                 .with(stdout_layer)
                 .try_init()
                 .ok();
+            None
+        }
+    };
+
+    tracing::info!(fund_profile = %fund_profile, "Tracing initialized");
+    guard
+}
+
+/// Initialize structured JSON tracing to a file only, with no stdout output.
+///
+/// Identical to [`init_tracing`] except the stdout layer is omitted. Use this
+/// for services that own stdout for terminal rendering (e.g. the dashboard TUI)
+/// where writing JSON to stdout would corrupt the alternate screen buffer.
+///
+/// When the log directory is not writable, tracing is silently disabled rather
+/// than falling back to stdout.
+pub fn init_tracing_file_only(log_file: &str) -> Option<WorkerGuard> {
+    let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
+
+    let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
+    let guard = match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => {
+            let file_appender = tracing_appender::rolling::daily(log_dir, log_file);
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(non_blocking)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                );
+            let initialized = tracing_subscriber::registry()
+                .with(file_layer)
+                .try_init()
+                .is_ok();
+            if initialized {
+                Some(guard)
+            } else {
+                None
+            }
+        }
+        Err(_) => {
+            tracing_subscriber::registry().try_init().ok();
             None
         }
     };

@@ -16,11 +16,16 @@
 pub mod application;
 pub mod cache;
 pub mod database;
+pub mod events;
+pub mod performance;
+pub mod positions;
+pub mod predictions;
+pub mod trades;
 
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 
-use crate::common::observability::init_tracing;
+use crate::common::observability::init_tracing_file_only;
 
 /// Maximum number of Postgres connections the dashboard pool may open.
 ///
@@ -33,7 +38,7 @@ const POOL_MAX_CONNECTIONS: u32 = 4;
 ///
 /// Panics on startup if `DATABASE_URL` is unset or the database is unreachable.
 pub async fn run() {
-    let _tracing_guard = init_tracing("dashboard-service.log", None);
+    let _tracing_guard = init_tracing_file_only("dashboard-service.log");
     info!("Starting dashboard service");
 
     let database_url =

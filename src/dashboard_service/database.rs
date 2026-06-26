@@ -4,13 +4,14 @@
 //! dashboard connects to production with a read-only user whose schema
 //! matches the live database, not the local `.sqlx` cache.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 
 use crate::dashboard_service::cache::{
-    ClosedTrade, ClosedTradesSummary, OpenPosition, PerformanceSnapshot, PredictionRow,
+    ClosedTrade, ClosedTradesSummary, OpenPosition, PerformanceSnapshot, PeriodReturns,
+    PredictionRow,
 };
 
 /// How many days of performance snapshot history to fetch for Tab 2.
@@ -25,6 +26,7 @@ pub struct DashboardData {
     pub gross_exposure: Decimal,
     pub net_exposure: Decimal,
     pub performance_history: Vec<PerformanceSnapshot>,
+    pub period_returns: PeriodReturns,
     pub closed_trades: Vec<ClosedTrade>,
     pub closed_trades_summary: ClosedTradesSummary,
     pub predictions: Vec<PredictionRow>,
@@ -39,6 +41,7 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     let open_positions = fetch_open_positions(pool).await?;
     let (gross_exposure, net_exposure) = compute_exposures(&open_positions);
     let performance_history = fetch_performance_history(pool).await?;
+    let period_returns = compute_period_returns(&performance_history);
     let closed_trades = fetch_closed_trades(pool).await?;
     let closed_trades_summary = compute_closed_trades_summary(&closed_trades);
     let predictions = fetch_latest_predictions(pool).await?;
@@ -48,6 +51,7 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
         gross_exposure,
         net_exposure,
         performance_history,
+        period_returns,
         closed_trades,
         closed_trades_summary,
         predictions,
@@ -306,6 +310,93 @@ async fn fetch_latest_predictions(pool: &PgPool) -> Result<Vec<PredictionRow>, s
         .collect()
 }
 
+/// Returns the first snapshot (newest-to-oldest order) whose timestamp is at or
+/// before `cutoff`, giving the most recent baseline for a return period.
+fn find_snapshot_at_or_before(
+    history: &[PerformanceSnapshot],
+    cutoff: DateTime<Utc>,
+) -> Option<&PerformanceSnapshot> {
+    history
+        .iter()
+        .find(|snapshot| snapshot.snapshot_timestamp <= cutoff)
+}
+
+/// Computes the percentage return from `baseline` NAV to `current_nav`.
+///
+/// Returns `None` when baseline NAV converts to zero (division guard).
+fn nav_period_return(current_nav: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
+    let base_nav = baseline.net_asset_value.to_f64()?;
+    if base_nav == 0.0 {
+        return None;
+    }
+    Some((current_nav - base_nav) / base_nav * 100.0)
+}
+
+/// Computes the percentage return from `baseline` SPY close to `current_spy`.
+///
+/// Returns `None` when either close price is absent or baseline is zero.
+fn spy_period_return(current_spy: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
+    let base_spy = baseline.spy_close?;
+    if base_spy == 0.0 {
+        return None;
+    }
+    Some((current_spy - base_spy) / base_spy * 100.0)
+}
+
+/// Computes period returns from the cached snapshot history.
+///
+/// `history` is expected to be sorted newest-first (matching the query
+/// `ORDER BY snapshot_timestamp DESC`). Returns are expressed as percentages.
+/// Any period for which no baseline snapshot exists returns `None`.
+pub fn compute_period_returns(history: &[PerformanceSnapshot]) -> PeriodReturns {
+    if history.is_empty() {
+        return PeriodReturns::default();
+    }
+
+    let current = &history[0];
+    let Some(current_nav) = current.net_asset_value.to_f64() else {
+        return PeriodReturns::default();
+    };
+    if current_nav == 0.0 {
+        return PeriodReturns::default();
+    }
+
+    let now = current.snapshot_timestamp;
+    let one_day_cutoff = now - Duration::days(1);
+    let one_week_cutoff = now - Duration::weeks(1);
+    let one_month_cutoff = now - Duration::days(30);
+    let year_start_cutoff = Utc
+        .with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0)
+        .single()
+        .unwrap_or(now);
+
+    let baseline_1d = find_snapshot_at_or_before(history, one_day_cutoff);
+    let baseline_1w = find_snapshot_at_or_before(history, one_week_cutoff);
+    let baseline_1m = find_snapshot_at_or_before(history, one_month_cutoff);
+    let baseline_ytd = find_snapshot_at_or_before(history, year_start_cutoff);
+    let inception = history.last();
+
+    let current_spy = current.spy_close;
+
+    PeriodReturns {
+        fund_one_day: baseline_1d.and_then(|b| nav_period_return(current_nav, b)),
+        fund_one_week: baseline_1w.and_then(|b| nav_period_return(current_nav, b)),
+        fund_one_month: baseline_1m.and_then(|b| nav_period_return(current_nav, b)),
+        fund_year_to_date: baseline_ytd.and_then(|b| nav_period_return(current_nav, b)),
+        fund_since_inception: inception.and_then(|b| nav_period_return(current_nav, b)),
+        spy_one_day: current_spy
+            .and_then(|spy| baseline_1d.and_then(|b| spy_period_return(spy, b))),
+        spy_one_week: current_spy
+            .and_then(|spy| baseline_1w.and_then(|b| spy_period_return(spy, b))),
+        spy_one_month: current_spy
+            .and_then(|spy| baseline_1m.and_then(|b| spy_period_return(spy, b))),
+        spy_year_to_date: current_spy
+            .and_then(|spy| baseline_ytd.and_then(|b| spy_period_return(spy, b))),
+        spy_since_inception: current_spy
+            .and_then(|spy| inception.and_then(|b| spy_period_return(spy, b))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,5 +566,116 @@ mod tests {
         assert_eq!(summary.total_closed, 2);
         assert!(summary.average_holding_seconds.is_none());
         assert_eq!(summary.average_return_percent, Some(0.5));
+    }
+
+    /// Builds a snapshot at an exact offset from a shared `now` so that all
+    /// timestamps in a single test are derived from the same instant. This
+    /// prevents the race where two `Utc::now()` calls return slightly different
+    /// values, causing a baseline snapshot to appear microseconds newer than
+    /// the period cutoff and therefore not be found by
+    /// `find_snapshot_at_or_before`.
+    fn make_snapshot(
+        now: DateTime<Utc>,
+        days_ago: i64,
+        nav: i64,
+        spy: Option<f64>,
+    ) -> PerformanceSnapshot {
+        PerformanceSnapshot {
+            snapshot_timestamp: now - Duration::days(days_ago),
+            net_asset_value: Decimal::new(nav, 0),
+            gross_return: None,
+            net_return: None,
+            total_slippage_cost: Decimal::ZERO,
+            spy_close: spy,
+        }
+    }
+
+    #[test]
+    fn test_compute_period_returns_empty_history() {
+        let returns = compute_period_returns(&[]);
+        assert!(returns.fund_one_day.is_none());
+        assert!(returns.fund_one_week.is_none());
+        assert!(returns.fund_since_inception.is_none());
+        assert!(returns.spy_one_day.is_none());
+    }
+
+    #[test]
+    fn test_compute_period_returns_single_snapshot() {
+        // Only one snapshot — it's both current and inception.
+        // since_inception baseline is history.last() == history[0] == current.
+        // (current - current) / current = 0%
+        let now = Utc::now();
+        let history = vec![make_snapshot(now, 0, 100_000, Some(450.0))];
+        let returns = compute_period_returns(&history);
+        assert_eq!(returns.fund_since_inception, Some(0.0));
+        // No older snapshots → other periods are None.
+        assert!(returns.fund_one_day.is_none());
+        assert!(returns.fund_one_week.is_none());
+    }
+
+    #[test]
+    fn test_compute_period_returns_one_day() {
+        // Current = 110_000, 1-day baseline = 100_000 → 10%
+        let now = Utc::now();
+        let history = vec![
+            make_snapshot(now, 0, 110_000, Some(455.0)),
+            make_snapshot(now, 1, 100_000, Some(450.0)),
+        ];
+        let returns = compute_period_returns(&history);
+        let one_day = returns.fund_one_day.expect("fund_one_day should be Some");
+        assert!((one_day - 10.0).abs() < 1e-9, "expected 10%, got {one_day}");
+    }
+
+    #[test]
+    fn test_compute_period_returns_spy_one_day() {
+        // SPY: current=455, baseline=450 → (455−450)/450×100 ≈ 1.111%
+        let now = Utc::now();
+        let history = vec![
+            make_snapshot(now, 0, 110_000, Some(455.0)),
+            make_snapshot(now, 1, 100_000, Some(450.0)),
+        ];
+        let returns = compute_period_returns(&history);
+        let spy = returns.spy_one_day.expect("spy_one_day should be Some");
+        assert!((spy - (5.0 / 450.0 * 100.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_period_returns_since_inception() {
+        // Oldest snapshot = 80_000; current = 110_000 → 37.5%
+        let now = Utc::now();
+        let history = vec![
+            make_snapshot(now, 0, 110_000, None),
+            make_snapshot(now, 7, 105_000, None),
+            make_snapshot(now, 365, 80_000, None),
+        ];
+        let returns = compute_period_returns(&history);
+        let inception = returns
+            .fund_since_inception
+            .expect("fund_since_inception should be Some");
+        assert!((inception - 37.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_period_returns_missing_spy_gives_none() {
+        let now = Utc::now();
+        let history = vec![
+            make_snapshot(now, 0, 110_000, None),
+            make_snapshot(now, 1, 100_000, None),
+        ];
+        let returns = compute_period_returns(&history);
+        assert!(returns.spy_one_day.is_none());
+        // Fund return is still computed even when SPY data is absent.
+        assert!(returns.fund_one_day.is_some());
+    }
+
+    #[test]
+    fn test_compute_period_returns_zero_baseline_nav_gives_none() {
+        let now = Utc::now();
+        let history = vec![
+            make_snapshot(now, 0, 110_000, None),
+            make_snapshot(now, 1, 0, None), // zero baseline NAV → division guard
+        ];
+        let returns = compute_period_returns(&history);
+        assert!(returns.fund_one_day.is_none());
     }
 }
