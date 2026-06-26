@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::domain::market::Ticker;
+
 /// Lifecycle status of a training run in `model_runs`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
@@ -42,7 +44,7 @@ impl ModelRunStatus {
 pub struct EquityPrediction {
     correlation_id: Uuid,
     model_run_id: String,
-    ticker: String,
+    ticker: Ticker,
     /// UTC timestamp for the day this prediction targets.
     timestamp: DateTime<Utc>,
     quantile_10: f64,
@@ -58,7 +60,7 @@ impl EquityPrediction {
     pub fn new(
         correlation_id: Uuid,
         model_run_id: String,
-        ticker: String,
+        ticker: Ticker,
         timestamp: DateTime<Utc>,
         quantile_10: f64,
         quantile_50: f64,
@@ -85,7 +87,7 @@ impl EquityPrediction {
         &self.model_run_id
     }
 
-    pub fn ticker(&self) -> &str {
+    pub fn ticker(&self) -> &Ticker {
         &self.ticker
     }
 
@@ -270,14 +272,14 @@ mod tests {
         let prediction = EquityPrediction::new(
             Uuid::new_v4(),
             "run-abc123".to_string(),
-            "AAPL".to_string(),
+            Ticker::new("AAPL").unwrap(),
             Utc::now(),
             -0.02,
             0.01,
             0.04,
             Utc::now(),
         );
-        assert_eq!(prediction.ticker(), "AAPL");
+        assert_eq!(prediction.ticker().as_str(), "AAPL");
         assert_eq!(prediction.model_run_id(), "run-abc123");
         assert!(prediction.quantile_10() < prediction.quantile_50());
         assert!(prediction.quantile_50() < prediction.quantile_90());
@@ -288,7 +290,7 @@ mod tests {
         let prediction = EquityPrediction::new(
             Uuid::new_v4(),
             "run-def456".to_string(),
-            "MSFT".to_string(),
+            Ticker::new("MSFT").unwrap(),
             Utc::now(),
             -0.01,
             0.005,
@@ -296,7 +298,7 @@ mod tests {
             Utc::now(),
         );
         let cloned = prediction.clone();
-        assert_eq!(cloned.ticker(), "MSFT");
+        assert_eq!(cloned.ticker().as_str(), "MSFT");
         assert_eq!(cloned.quantile_50(), 0.005);
     }
 

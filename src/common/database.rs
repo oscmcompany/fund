@@ -93,7 +93,7 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "DATABASE_URL",
-                "postgresql://user:pass@127.0.0.1:19999/nonexistent",
+                "postgresql://user:pass@db-host.invalid:5432/nonexistent",
             )
         };
 
@@ -102,8 +102,7 @@ mod tests {
         // The URL was present, so configured == true regardless of whether the
         // connection succeeded.
         assert!(configured);
-        // A refused connection at a local port that is almost certainly not
-        // listening returns None.
+        // An unresolvable host (.invalid TLD, RFC 2606) always fails to connect.
         assert!(pool.is_none());
     }
 }

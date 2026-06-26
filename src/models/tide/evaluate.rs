@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_crps_positive_error_branch() {
+    fn test_continuous_ranked_probability_score_positive_error_branch() {
         // target=1.0, all predictions=0.0; error=1.0 >= 0 for every quantile.
         // row_loss = 0.1*1 + 0.5*1 + 0.9*1 = 1.5; single row so crps=1.5.
         let metrics = metrics_from(&[[0.0, 0.0, 0.0]], &[1.0], &[0.1, 0.5, 0.9]);
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_crps_negative_error_branch() {
+    fn test_continuous_ranked_probability_score_negative_error_branch() {
         // target=-1.0, all predictions=0.0; error=-1.0 < 0 for every quantile.
         // pinball = (q-1)*error: (0.1-1)*(-1)=0.9, (0.5-1)*(-1)=0.5, (0.9-1)*(-1)=0.1
         // row_loss = 1.5; single row so crps=1.5.
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn test_crps_exact_prediction_is_zero() {
+    fn test_continuous_ranked_probability_score_exact_prediction_is_zero() {
         // When every prediction equals the target, error=0 so crps=0.
         let metrics = metrics_from(&[[0.3, 0.3, 0.3]], &[0.3], &[0.1, 0.5, 0.9]);
         assert!((metrics.crps).abs() < 1e-9, "crps={}", metrics.crps);

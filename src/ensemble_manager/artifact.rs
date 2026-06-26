@@ -167,20 +167,21 @@ fn resolve_local_artifact_key(
 
     entries.sort();
 
-    let latest = entries.last().ok_or(ArtifactError::NoArtifacts)?;
-
-    let model_path = latest.join("output").join("model.tar.gz");
-    if model_path.exists() {
-        Ok(model_path.to_string_lossy().to_string())
-    } else {
-        // Check for extracted files directly
-        let params_path = latest.join("tide_parameters.json");
+    // Scan newest → oldest, returning the first directory that contains a
+    // valid artifact. This ensures that a partially-uploaded newer run does
+    // not shadow an older run that is fully available.
+    for entry in entries.iter().rev() {
+        let model_path = entry.join("output").join("model.tar.gz");
+        if model_path.exists() {
+            return Ok(model_path.to_string_lossy().to_string());
+        }
+        let params_path = entry.join("tide_parameters.json");
         if params_path.exists() {
-            Ok(latest.to_string_lossy().to_string())
-        } else {
-            Err(ArtifactError::NoArtifacts)
+            return Ok(entry.to_string_lossy().to_string());
         }
     }
+
+    Err(ArtifactError::NoArtifacts)
 }
 
 pub async fn download_and_load_model(
@@ -569,9 +570,9 @@ mod tests {
 
     #[test]
     fn test_resolve_local_artifact_key_latest_older_dir_has_params_newer_has_nothing() {
-        // When only the older directory has the fallback file (tide_parameters.json)
-        // but the newest directory has neither model.tar.gz nor tide_parameters.json,
-        // the result is NoArtifacts because only the *last* sorted entry is checked.
+        // When the newest directory has no valid artifact but an older directory
+        // has tide_parameters.json, the resolver scans newest → oldest and returns
+        // the older directory rather than giving up with NoArtifacts.
         let temp_dir = tempfile::tempdir().unwrap();
 
         let older_dir = temp_dir.path().join("2026-06-08-00-00-00-000");
@@ -583,9 +584,9 @@ mod tests {
         std::fs::write(older_dir.join("tide_parameters.json"), b"{}").unwrap();
 
         let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
-        // The newest dir is checked but has no model; the function returns NoArtifacts.
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
+        // The newer dir is skipped (no artifact); the older dir is returned.
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), older_dir.to_string_lossy().to_string());
     }
 
     #[test]

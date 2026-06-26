@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::domain::market::Ticker;
 use crate::domain::predictions::EquityPrediction;
 use crate::portfolio_manager::math::standard_deviation;
 
@@ -16,7 +17,7 @@ const VOLATILITY_WINDOW_DAYS: usize = 20;
 #[derive(Debug, Clone)]
 pub struct ConsolidatedSignal {
     /// Normalized US equity ticker symbol.
-    pub ticker: String,
+    pub ticker: Ticker,
     /// Mean expected forward return across all quantile predictions (quantile_50).
     pub ensemble_alpha: f64,
     /// Confidence in this signal, normalized to the most confident ticker.
@@ -44,18 +45,18 @@ pub struct ConsolidatedSignal {
 /// `equity_details` maps ticker → sector string.
 pub fn consolidate_predictions(
     predictions: &[EquityPrediction],
-    historical_closes: &HashMap<String, Vec<f64>>,
-    equity_details: &HashMap<String, String>,
+    historical_closes: &HashMap<Ticker, Vec<f64>>,
+    equity_details: &HashMap<Ticker, String>,
 ) -> Vec<ConsolidatedSignal> {
     if predictions.is_empty() {
         return Vec::new();
     }
 
     // Keep the latest prediction per ticker (highest timestamp).
-    let mut latest_per_ticker: HashMap<String, &EquityPrediction> = HashMap::new();
+    let mut latest_per_ticker: HashMap<Ticker, &EquityPrediction> = HashMap::new();
     for prediction in predictions {
         let entry = latest_per_ticker
-            .entry(prediction.ticker().to_string())
+            .entry(prediction.ticker().clone())
             .or_insert(prediction);
         if prediction.timestamp() > entry.timestamp() {
             *entry = prediction;
@@ -63,7 +64,7 @@ pub fn consolidate_predictions(
     }
 
     // Compute raw_confidence = 1.0 / (1.0 + max(0, spread_width))
-    let mut ticker_signals: Vec<(String, f64, f64)> = latest_per_ticker
+    let mut ticker_signals: Vec<(Ticker, f64, f64)> = latest_per_ticker
         .iter()
         .map(|(ticker, prediction)| {
             let alpha = prediction.quantile_50();
@@ -117,8 +118,8 @@ pub fn consolidate_predictions(
 /// Returns `None` when fewer than two close prices are available, any close price is
 /// non-positive, or the computed std-dev is not finite.
 fn compute_realized_volatility(
-    historical_closes: &HashMap<String, Vec<f64>>,
-    ticker: &str,
+    historical_closes: &HashMap<Ticker, Vec<f64>>,
+    ticker: &Ticker,
 ) -> Option<f64> {
     let closes = historical_closes.get(ticker)?;
     if closes.len() < 2 {
@@ -168,7 +169,7 @@ mod tests {
         EquityPrediction::new(
             Uuid::new_v4(),
             "run-001".to_string(),
-            ticker.to_string(),
+            Ticker::new(ticker).unwrap(),
             Utc::now(),
             quantile_10,
             quantile_50,
@@ -205,9 +206,9 @@ mod tests {
     fn test_consolidate_predictions_single_ticker() {
         let predictions = vec![make_prediction("AAPL", -0.01, 0.02, 0.05)];
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), make_closes(25, 150.0, 0.001));
+        closes.insert(Ticker::new("AAPL").unwrap(), make_closes(25, 150.0, 0.001));
         let mut details = HashMap::new();
-        details.insert("AAPL".to_string(), "TECHNOLOGY".to_string());
+        details.insert(Ticker::new("AAPL").unwrap(), "TECHNOLOGY".to_string());
 
         let result = consolidate_predictions(&predictions, &closes, &details);
         assert_eq!(result.len(), 1);
@@ -224,7 +225,7 @@ mod tests {
     fn test_consolidate_predictions_missing_sector_defaults_to_not_available() {
         let predictions = vec![make_prediction("AAPL", -0.01, 0.02, 0.05)];
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), make_closes(25, 150.0, 0.001));
+        closes.insert(Ticker::new("AAPL").unwrap(), make_closes(25, 150.0, 0.001));
         let details = HashMap::new(); // no sector
 
         let result = consolidate_predictions(&predictions, &closes, &details);
@@ -236,8 +237,8 @@ mod tests {
     fn test_consolidate_predictions_normalizes_confidence() {
         // Two predictions: one with narrow spread (high confidence), one wide.
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), make_closes(25, 150.0, 0.001));
-        closes.insert("MSFT".to_string(), make_closes(25, 200.0, 0.001));
+        closes.insert(Ticker::new("AAPL").unwrap(), make_closes(25, 150.0, 0.001));
+        closes.insert(Ticker::new("MSFT").unwrap(), make_closes(25, 200.0, 0.001));
         let details = HashMap::new();
 
         let narrow_spread = make_prediction("AAPL", 0.019, 0.02, 0.021); // narrow → high confidence
@@ -266,7 +267,7 @@ mod tests {
         let older = EquityPrediction::new(
             Uuid::new_v4(),
             "run-001".to_string(),
-            "AAPL".to_string(),
+            Ticker::new("AAPL").unwrap(),
             Utc::now() - Duration::hours(1),
             -0.05,
             -0.01, // older has negative alpha
@@ -276,7 +277,7 @@ mod tests {
         let newer = EquityPrediction::new(
             Uuid::new_v4(),
             "run-001".to_string(),
-            "AAPL".to_string(),
+            Ticker::new("AAPL").unwrap(),
             Utc::now(),
             0.01,
             0.03, // newer has positive alpha
@@ -285,7 +286,7 @@ mod tests {
         );
 
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), make_closes(25, 150.0, 0.001));
+        closes.insert(Ticker::new("AAPL").unwrap(), make_closes(25, 150.0, 0.001));
         let details = HashMap::new();
 
         let result = consolidate_predictions(&[older, newer], &closes, &details);
@@ -297,31 +298,31 @@ mod tests {
     #[test]
     fn test_compute_realized_volatility_insufficient_closes() {
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), vec![100.0]); // only one price
-        assert!(compute_realized_volatility(&closes, "AAPL").is_none());
+        closes.insert(Ticker::new("AAPL").unwrap(), vec![100.0]); // only one price
+        assert!(compute_realized_volatility(&closes, &Ticker::new("AAPL").unwrap()).is_none());
     }
 
     #[test]
     fn test_compute_realized_volatility_nonpositive_price_excluded() {
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), vec![100.0, 0.0, 100.0]);
+        closes.insert(Ticker::new("AAPL").unwrap(), vec![100.0, 0.0, 100.0]);
         // Any non-positive price causes the entire series to be rejected.
-        assert!(compute_realized_volatility(&closes, "AAPL").is_none());
+        assert!(compute_realized_volatility(&closes, &Ticker::new("AAPL").unwrap()).is_none());
     }
 
     #[test]
     fn test_compute_realized_volatility_flat_prices_returns_none() {
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), vec![100.0; 25]);
+        closes.insert(Ticker::new("AAPL").unwrap(), vec![100.0; 25]);
         // All returns are 0 → standard_deviation = 0 → should be filtered out
-        assert!(compute_realized_volatility(&closes, "AAPL").is_none());
+        assert!(compute_realized_volatility(&closes, &Ticker::new("AAPL").unwrap()).is_none());
     }
 
     #[test]
     fn test_compute_realized_volatility_returns_positive() {
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), make_closes(30, 100.0, 0.01));
-        let result = compute_realized_volatility(&closes, "AAPL");
+        closes.insert(Ticker::new("AAPL").unwrap(), make_closes(30, 100.0, 0.01));
+        let result = compute_realized_volatility(&closes, &Ticker::new("AAPL").unwrap());
         assert!(result.is_some());
         assert!(result.unwrap() > 0.0);
     }
@@ -332,8 +333,8 @@ mod tests {
         // are used. Use a known non-constant series so the expected value is deterministic.
         let price_series = vec![100.0_f64, 103.0, 101.0, 106.0, 104.0];
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), price_series.clone());
-        let result = compute_realized_volatility(&closes, "AAPL");
+        closes.insert(Ticker::new("AAPL").unwrap(), price_series.clone());
+        let result = compute_realized_volatility(&closes, &Ticker::new("AAPL").unwrap());
         assert!(result.is_some());
         // Compute the expected standard deviation from all returns (ddof=1).
         let all_returns: Vec<f64> = price_series

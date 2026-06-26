@@ -6,8 +6,9 @@
 //! `candidate_pool` pairs by rank score using a greedy no-duplicate-ticker
 //! selection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::domain::market::{PairID, Ticker};
 use crate::portfolio_manager::consolidation::ConsolidatedSignal;
 use crate::portfolio_manager::math::{log_returns, ols_slope, pearson_correlation, z_score_last};
 
@@ -39,12 +40,12 @@ pub const DEFAULT_CANDIDATE_POOL: usize = 10;
 /// A candidate long-short pair identified by the statistical arbitrage screener.
 #[derive(Debug, Clone)]
 pub struct CandidatePair {
-    /// Human-readable identifier combining both tickers, e.g. `"AAPL-MSFT"`.
-    pair_id: String,
+    /// Canonical pair identifier combining both tickers, e.g. `"AAPL-MSFT"`.
+    pair_id: PairID,
     /// The leg to buy: the relatively cheap ticker.
-    long_ticker: String,
+    long_ticker: Ticker,
     /// The leg to sell short: the relatively expensive ticker.
-    short_ticker: String,
+    short_ticker: Ticker,
     /// Standard deviations the current spread has diverged from its historical mean.
     z_score: f64,
     /// OLS regression slope: shares of the short leg per share of the long leg.
@@ -64,9 +65,9 @@ impl CandidatePair {
     /// Returns `None` when any invariant is violated.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pair_id: String,
-        long_ticker: String,
-        short_ticker: String,
+        pair_id: PairID,
+        long_ticker: Ticker,
+        short_ticker: Ticker,
         z_score: f64,
         hedge_ratio: f64,
         signal_strength: f64,
@@ -94,15 +95,15 @@ impl CandidatePair {
         })
     }
 
-    pub fn pair_id(&self) -> &str {
+    pub fn pair_id(&self) -> &PairID {
         &self.pair_id
     }
 
-    pub fn long_ticker(&self) -> &str {
+    pub fn long_ticker(&self) -> &Ticker {
         &self.long_ticker
     }
 
-    pub fn short_ticker(&self) -> &str {
+    pub fn short_ticker(&self) -> &Ticker {
         &self.short_ticker
     }
 
@@ -142,7 +143,7 @@ impl CandidatePair {
 /// `MINIMUM_TICKER_COUNT` eligible tickers.
 pub fn select_pairs(
     signals: &[ConsolidatedSignal],
-    historical_closes: &HashMap<String, Vec<f64>>,
+    historical_closes: &HashMap<Ticker, Vec<f64>>,
     candidate_pool: usize,
 ) -> Vec<CandidatePair> {
     if candidate_pool == 0 {
@@ -160,7 +161,7 @@ pub fn select_pairs(
     }
 
     // Build per-ticker log returns over the correlation window.
-    let mut ticker_returns: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut ticker_returns: Vec<(Ticker, Vec<f64>)> = Vec::new();
     for signal in &eligible {
         if let Some(closes) = historical_closes.get(&signal.ticker) {
             let window_closes: &[f64] = if closes.len() > CORRELATION_WINDOW_DAYS {
@@ -192,8 +193,8 @@ pub fn select_pairs(
     }
 
     // Build a signals lookup for alpha and volatility access.
-    let signals_lookup: HashMap<&str, &ConsolidatedSignal> =
-        eligible.iter().map(|s| (s.ticker.as_str(), *s)).collect();
+    let signals_lookup: HashMap<Ticker, &ConsolidatedSignal> =
+        eligible.iter().map(|s| (s.ticker.clone(), *s)).collect();
 
     // Candidate pair generation with correlation and z-score screening.
     let mut candidates: Vec<(CandidatePair, f64)> = Vec::new();
@@ -256,11 +257,11 @@ pub fn select_pairs(
                 (ticker_a.clone(), ticker_b.clone())
             };
 
-            let long_signal = match signals_lookup.get(long_ticker.as_str()) {
+            let long_signal = match signals_lookup.get(&long_ticker) {
                 Some(signal) => signal,
                 None => continue,
             };
-            let short_signal = match signals_lookup.get(short_ticker.as_str()) {
+            let short_signal = match signals_lookup.get(&short_ticker) {
                 Some(signal) => signal,
                 None => continue,
             };
@@ -268,8 +269,9 @@ pub fn select_pairs(
             let signal_strength = (long_signal.ensemble_alpha - short_signal.ensemble_alpha).abs();
             let rank_score = current_z_score.abs() * signal_strength;
 
+            let pair_id = PairID::new(long_ticker.clone(), short_ticker.clone());
             if let Some(candidate) = CandidatePair::new(
-                format!("{long_ticker}-{short_ticker}"),
+                pair_id,
                 long_ticker,
                 short_ticker,
                 current_z_score.abs(),
@@ -295,15 +297,15 @@ pub fn select_pairs(
     });
 
     // Greedy selection: each ticker appears in at most one pair.
-    let mut used_tickers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut used_tickers: HashSet<Ticker> = HashSet::new();
     let mut selected: Vec<CandidatePair> = Vec::new();
 
     for (pair, _) in candidates {
         if used_tickers.contains(pair.long_ticker()) || used_tickers.contains(pair.short_ticker()) {
             continue;
         }
-        used_tickers.insert(pair.long_ticker().to_string());
-        used_tickers.insert(pair.short_ticker().to_string());
+        used_tickers.insert(pair.long_ticker().clone());
+        used_tickers.insert(pair.short_ticker().clone());
         selected.push(pair);
         if selected.len() >= candidate_pool {
             break;
@@ -324,7 +326,7 @@ mod tests {
         volatility: f64,
     ) -> ConsolidatedSignal {
         ConsolidatedSignal {
-            ticker: ticker.to_string(),
+            ticker: Ticker::new(ticker).unwrap(),
             ensemble_alpha: alpha,
             ensemble_confidence: confidence,
             realized_volatility: volatility,
@@ -345,6 +347,23 @@ mod tests {
             prices.push(last * (1.0 + market_return + noise));
         }
         prices
+    }
+
+    fn make_candidate(long_ticker: &str, short_ticker: &str) -> CandidatePair {
+        CandidatePair::new(
+            PairID::new(
+                Ticker::new(long_ticker).unwrap(),
+                Ticker::new(short_ticker).unwrap(),
+            ),
+            Ticker::new(long_ticker).unwrap(),
+            Ticker::new(short_ticker).unwrap(),
+            2.5,
+            1.0,
+            0.05,
+            0.01,
+            0.01,
+        )
+        .expect("test candidate pair should be valid")
     }
 
     #[test]
@@ -393,7 +412,7 @@ mod tests {
                 let offset = i as f64 * 0.0001;
                 let prices =
                     make_correlated_prices(71, 100.0 + i as f64 * 10.0, &common_factor, offset);
-                closes.insert(ticker.to_string(), prices);
+                closes.insert(Ticker::new(ticker).unwrap(), prices);
                 make_signal(ticker, 0.01 * (i as f64 + 1.0), 0.9, 0.01)
             })
             .collect();
@@ -401,18 +420,18 @@ mod tests {
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
         // Verify no ticker appears in more than one pair.
-        let mut all_tickers = std::collections::HashSet::new();
+        let mut all_tickers: HashSet<Ticker> = HashSet::new();
         for pair in &pairs {
             assert!(
-                !all_tickers.contains(&pair.long_ticker),
+                !all_tickers.contains(pair.long_ticker()),
                 "duplicate long ticker"
             );
             assert!(
-                !all_tickers.contains(&pair.short_ticker),
+                !all_tickers.contains(pair.short_ticker()),
                 "duplicate short ticker"
             );
-            all_tickers.insert(pair.long_ticker.clone());
-            all_tickers.insert(pair.short_ticker.clone());
+            all_tickers.insert(pair.long_ticker().clone());
+            all_tickers.insert(pair.short_ticker().clone());
         }
     }
 
@@ -430,7 +449,7 @@ mod tests {
                 let offset = i as f64 * 0.0001;
                 let prices =
                     make_correlated_prices(71, 100.0 + i as f64 * 10.0, &common_factor, offset);
-                closes.insert(ticker.to_string(), prices);
+                closes.insert(Ticker::new(ticker).unwrap(), prices);
                 make_signal(ticker, 0.01 * (i as f64 + 1.0), 0.9, 0.01)
             })
             .collect();
@@ -458,16 +477,16 @@ mod tests {
                 let offset = i as f64 * 0.0002;
                 let prices =
                     make_correlated_prices(71, 100.0 + i as f64 * 20.0, &common_factor, offset);
-                closes.insert(ticker.to_string(), prices);
+                closes.insert(Ticker::new(ticker).unwrap(), prices);
                 make_signal(ticker, 0.01 * (i as f64 + 1.0), 0.9, 0.012)
             })
             .collect();
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
         for pair in &pairs {
-            assert!(pair.z_score >= Z_SCORE_ENTRY_THRESHOLD);
-            assert!(pair.hedge_ratio.is_finite());
-            assert!(pair.signal_strength >= 0.0);
+            assert!(pair.z_score() >= Z_SCORE_ENTRY_THRESHOLD);
+            assert!(pair.hedge_ratio().is_finite());
+            assert!(pair.signal_strength() >= 0.0);
         }
     }
 
@@ -500,8 +519,8 @@ mod tests {
         ];
         let mut closes = HashMap::new();
         // Only 10 days — well below CORRELATION_WINDOW_DAYS (60).
-        closes.insert("AAPL".to_string(), vec![100.0_f64; 10]);
-        closes.insert("MSFT".to_string(), vec![200.0_f64; 10]);
+        closes.insert(Ticker::new("AAPL").unwrap(), vec![100.0_f64; 10]);
+        closes.insert(Ticker::new("MSFT").unwrap(), vec![200.0_f64; 10]);
         assert!(select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
@@ -515,8 +534,14 @@ mod tests {
         ];
         let mut closes = HashMap::new();
         // Exactly CORRELATION_WINDOW_DAYS constant prices → all log returns are 0.
-        closes.insert("AAPL".to_string(), vec![100.0_f64; CORRELATION_WINDOW_DAYS]);
-        closes.insert("MSFT".to_string(), vec![200.0_f64; CORRELATION_WINDOW_DAYS]);
+        closes.insert(
+            Ticker::new("AAPL").unwrap(),
+            vec![100.0_f64; CORRELATION_WINDOW_DAYS],
+        );
+        closes.insert(
+            Ticker::new("MSFT").unwrap(),
+            vec![200.0_f64; CORRELATION_WINDOW_DAYS],
+        );
         assert!(select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
@@ -530,17 +555,20 @@ mod tests {
         let mut closes = HashMap::new();
         let mut aapl = vec![100.0_f64; CORRELATION_WINDOW_DAYS];
         aapl[30] = 0.0; // non-positive price
-        closes.insert("AAPL".to_string(), aapl);
-        closes.insert("MSFT".to_string(), vec![200.0_f64; CORRELATION_WINDOW_DAYS]);
+        closes.insert(Ticker::new("AAPL").unwrap(), aapl);
+        closes.insert(
+            Ticker::new("MSFT").unwrap(),
+            vec![200.0_f64; CORRELATION_WINDOW_DAYS],
+        );
         assert!(select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL).is_empty());
     }
 
     #[test]
     fn test_candidate_pair_new_rejects_identical_tickers() {
         let result = CandidatePair::new(
-            "AAPL-AAPL".to_string(),
-            "AAPL".to_string(),
-            "AAPL".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("AAPL").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("AAPL").unwrap(),
             2.5,
             1.0,
             0.05,
@@ -553,9 +581,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_non_finite_z_score() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             f64::NAN,
             1.0,
             0.05,
@@ -568,9 +596,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_infinite_hedge_ratio() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             f64::INFINITY,
             0.05,
@@ -583,9 +611,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_non_finite_signal_strength() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             1.0,
             f64::NAN,
@@ -598,9 +626,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_zero_long_volatility() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             1.0,
             0.05,
@@ -613,9 +641,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_negative_short_volatility() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             1.0,
             0.05,
@@ -627,34 +655,23 @@ mod tests {
 
     #[test]
     fn test_candidate_pair_new_valid_all_accessors() {
-        let pair = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
-            3.1,
-            0.75,
-            0.08,
-            0.012,
-            0.015,
-        )
-        .expect("valid candidate pair");
-
-        assert_eq!(pair.pair_id(), "AAPL-MSFT");
-        assert_eq!(pair.long_ticker(), "AAPL");
-        assert_eq!(pair.short_ticker(), "MSFT");
-        assert!((pair.z_score() - 3.1).abs() < f64::EPSILON);
-        assert!((pair.hedge_ratio() - 0.75).abs() < f64::EPSILON);
-        assert!((pair.signal_strength() - 0.08).abs() < f64::EPSILON);
-        assert!((pair.long_realized_volatility() - 0.012).abs() < f64::EPSILON);
-        assert!((pair.short_realized_volatility() - 0.015).abs() < f64::EPSILON);
+        let pair = make_candidate("AAPL", "MSFT");
+        assert_eq!(pair.pair_id().as_str(), "AAPL-MSFT");
+        assert_eq!(pair.long_ticker().as_str(), "AAPL");
+        assert_eq!(pair.short_ticker().as_str(), "MSFT");
+        assert!((pair.z_score() - 2.5).abs() < f64::EPSILON);
+        assert!((pair.hedge_ratio() - 1.0).abs() < f64::EPSILON);
+        assert!((pair.signal_strength() - 0.05).abs() < f64::EPSILON);
+        assert!((pair.long_realized_volatility() - 0.01).abs() < f64::EPSILON);
+        assert!((pair.short_realized_volatility() - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_candidate_pair_new_rejects_nan_signal_strength() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             1.0,
             f64::NAN,
@@ -669,9 +686,9 @@ mod tests {
         // z_score is stored as abs() by the caller; a negative value passed in
         // directly is still finite so the constructor must accept it.
         let pair = CandidatePair::new(
-            "MSFT-AAPL".to_string(),
-            "MSFT".to_string(),
-            "AAPL".to_string(),
+            PairID::new(Ticker::new("MSFT").unwrap(), Ticker::new("AAPL").unwrap()),
+            Ticker::new("MSFT").unwrap(),
+            Ticker::new("AAPL").unwrap(),
             -2.5,
             0.8,
             0.03,
@@ -694,7 +711,7 @@ mod tests {
         let common_factor: Vec<f64> = (0..70).map(|i| 0.005 * ((i as f64 * 0.3).sin())).collect();
         let mut closes = HashMap::new();
         closes.insert(
-            "AAPL".to_string(),
+            Ticker::new("AAPL").unwrap(),
             make_correlated_prices(CORRELATION_WINDOW_DAYS + 1, 100.0, &common_factor, 0.001),
         );
         // MSFT has no closes at all — select_pairs must return empty.
@@ -718,27 +735,27 @@ mod tests {
                 let offset = i as f64 * 0.00005;
                 let prices =
                     make_correlated_prices(71, 50.0 + i as f64 * 5.0, &common_factor, offset);
-                closes.insert(ticker.to_string(), prices);
+                closes.insert(Ticker::new(ticker).unwrap(), prices);
                 make_signal(ticker, 0.02 * (i as f64 + 1.0), 0.9, 0.01)
             })
             .collect();
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
-        let mut all_tickers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut all_tickers: HashSet<Ticker> = HashSet::new();
         for pair in &pairs {
             assert!(
                 !all_tickers.contains(pair.long_ticker()),
-                "long ticker {} used in multiple pairs",
+                "long ticker {} appears in multiple pairs",
                 pair.long_ticker()
             );
             assert!(
                 !all_tickers.contains(pair.short_ticker()),
-                "short ticker {} used in multiple pairs",
+                "short ticker {} appears in multiple pairs",
                 pair.short_ticker()
             );
-            all_tickers.insert(pair.long_ticker().to_string());
-            all_tickers.insert(pair.short_ticker().to_string());
+            all_tickers.insert(pair.long_ticker().clone());
+            all_tickers.insert(pair.short_ticker().clone());
         }
     }
 
@@ -759,28 +776,28 @@ mod tests {
         let prices_b: Vec<f64> = (0..=CORRELATION_WINDOW_DAYS)
             .map(|i| 200.0 * (1.01_f64).powi(i as i32))
             .collect();
-        closes.insert("AAPL".to_string(), prices_a);
-        closes.insert("MSFT".to_string(), prices_b);
+        closes.insert(Ticker::new("AAPL").unwrap(), prices_a);
+        closes.insert(Ticker::new("MSFT").unwrap(), prices_b);
         // With perfectly proportional prices, z-score will not reach the threshold.
         // The exact result depends on numerics; we just ensure no panic occurs.
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
         // Either empty (z-score below threshold) or a pair (rare numeric case) —
         // the important thing is no panic and the no-ticker-reuse invariant holds.
-        let mut all_tickers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut all_tickers: HashSet<Ticker> = HashSet::new();
         for pair in &pairs {
             assert!(!all_tickers.contains(pair.long_ticker()));
             assert!(!all_tickers.contains(pair.short_ticker()));
-            all_tickers.insert(pair.long_ticker().to_string());
-            all_tickers.insert(pair.short_ticker().to_string());
+            all_tickers.insert(pair.long_ticker().clone());
+            all_tickers.insert(pair.short_ticker().clone());
         }
     }
 
     #[test]
     fn test_candidate_pair_new_rejects_infinite_signal_strength() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             2.5,
             1.0,
             f64::INFINITY,
@@ -793,9 +810,9 @@ mod tests {
     #[test]
     fn test_candidate_pair_new_rejects_nan_z_score() {
         let result = CandidatePair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             f64::NAN,
             1.0,
             0.05,
@@ -810,13 +827,6 @@ mod tests {
     /// (keeping Pearson correlation in [CORRELATION_MINIMUM, CORRELATION_MAXIMUM]) and
     /// ticker A includes a deterministic upward drift in the final 16 steps that drives
     /// the OLS spread z-score above Z_SCORE_ENTRY_THRESHOLD.
-    ///
-    /// Design:
-    /// - Shared amplitude 0.008, idiosyncratic amplitude 0.004 → theoretical Pearson
-    ///   correlation ~0.80, well within [0.5, 0.95].
-    /// - Drift applied to A's returns (not B), so Var(log_prices_B) stays small and the
-    ///   OLS hedge ratio stays near 1.0, making each unit of drift have full impact on the
-    ///   spread. Cumulative drift ~0.090 in log prices reliably produces z-score > 2.0.
     fn make_pair_prices_for_inner_loop_coverage() -> (Vec<f64>, Vec<f64>) {
         let count = CORRELATION_WINDOW_DAYS + 1; // 61 prices → 60 log returns
         let mut prices_a = vec![100.0f64];
@@ -826,11 +836,7 @@ mod tests {
             let last_a = *prices_a.last().unwrap();
             let last_b = *prices_b.last().unwrap();
 
-            // Shared market factor.
             let shared = 0.008 * ((i as f64 * 0.4).sin());
-            // Idiosyncratic components at half the shared amplitude keep correlation ~0.80.
-            // Drift applied to A only, keeping Var(log_prices_B) small so the OLS hedge
-            // ratio stays near 1.0 and the drift maximally impacts the spread.
             let drift_a = if i >= count - 16 { 0.006 } else { 0.0 };
             let idio_a = 0.004 * ((i as f64 * 1.7).sin()) + drift_a;
             let idio_b = 0.004 * ((i as f64 * 2.3).cos());
@@ -844,17 +850,11 @@ mod tests {
 
     #[test]
     fn test_select_pairs_inner_loop_pair_generated_when_correlated_and_z_score_sufficient() {
-        // Two tickers sharing a moderate common factor (correlation in [0.5, 0.95]) with
-        // one ticker drifting enough that the OLS spread z-score exceeds
-        // Z_SCORE_ENTRY_THRESHOLD. This exercises the inner pair-generation loop:
-        // correlation check pass, log prices retrieval, hedge_ratio computation, spread
-        // computation, z_score computation, long/short assignment, and CandidatePair
-        // construction (covering lines 213-282 in select_pairs).
         let (prices_a, prices_b) = make_pair_prices_for_inner_loop_coverage();
 
         let mut closes = HashMap::new();
-        closes.insert("TKRA".to_string(), prices_a);
-        closes.insert("TKRB".to_string(), prices_b);
+        closes.insert(Ticker::new("TKRA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKRB").unwrap(), prices_b);
 
         let signals = vec![
             make_signal("TKRA", 0.01, 0.9, 0.015),
@@ -882,14 +882,11 @@ mod tests {
 
     #[test]
     fn test_select_pairs_z_score_negative_assigns_long_a_short_b() {
-        // When the spread z-score is negative the code assigns long = ticker_a
-        // (index i), short = ticker_b (index j). Swapping which ticker receives the
-        // upward drift reverses the direction of the spread.
         let (prices_b, prices_a) = make_pair_prices_for_inner_loop_coverage();
 
         let mut closes = HashMap::new();
-        closes.insert("TKRA".to_string(), prices_a);
-        closes.insert("TKRB".to_string(), prices_b);
+        closes.insert(Ticker::new("TKRA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKRB").unwrap(), prices_b);
 
         let signals = vec![
             make_signal("TKRA", 0.05, 0.9, 0.015),
@@ -907,9 +904,6 @@ mod tests {
 
     #[test]
     fn test_select_pairs_closes_longer_than_window_uses_trailing_window() {
-        // When a ticker has more closes than CORRELATION_WINDOW_DAYS the code
-        // slices the trailing window (line 166-167). Supply CORRELATION_WINDOW_DAYS + 10
-        // prices to exercise that truncation branch together with the inner loop.
         let extra = 10;
         let total_count = CORRELATION_WINDOW_DAYS + extra + 1;
 
@@ -926,12 +920,9 @@ mod tests {
             prices_b.push(last_b * (1.0 + shared + idio_b));
         }
 
-        assert!(prices_a.len() > CORRELATION_WINDOW_DAYS);
-        assert!(prices_b.len() > CORRELATION_WINDOW_DAYS);
-
         let mut closes = HashMap::new();
-        closes.insert("TKRA".to_string(), prices_a);
-        closes.insert("TKRB".to_string(), prices_b);
+        closes.insert(Ticker::new("TKRA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKRB").unwrap(), prices_b);
 
         let signals = vec![
             make_signal("TKRA", 0.05, 0.9, 0.015),
@@ -940,7 +931,6 @@ mod tests {
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
-        // Structural invariants must hold whether or not a pair was produced.
         for pair in &pairs {
             assert!(pair.z_score() >= Z_SCORE_ENTRY_THRESHOLD);
             assert!(pair.hedge_ratio().is_finite());
@@ -960,7 +950,7 @@ mod tests {
                 let offset = i as f64 * 0.0001;
                 let prices =
                     make_correlated_prices(71, 100.0 + i as f64 * 50.0, &common_factor, offset);
-                closes.insert(ticker.to_string(), prices);
+                closes.insert(Ticker::new(ticker).unwrap(), prices);
                 make_signal(ticker, 0.01 * (i as f64 + 1.0), 0.9, 0.015)
             })
             .collect();
@@ -972,25 +962,6 @@ mod tests {
         );
     }
 
-    /// Builds a pair of close price series designed to reliably pass all filters
-    /// in `select_pairs`. The returned series have:
-    ///
-    /// - Exactly `CORRELATION_WINDOW_DAYS + 1` prices (so log returns have
-    ///   exactly `CORRELATION_WINDOW_DAYS` elements — the minimum required).
-    /// - Pearson correlation of their log returns in [0.5, 0.95]: achieved by
-    ///   mixing a dominant shared sinusoidal factor (amplitude 0.012) with an
-    ///   orthogonal idiosyncratic component (amplitude 0.006), giving a
-    ///   theoretical correlation near 0.75.
-    /// - A systematic upward drift on ticker A for the final 13 steps that
-    ///   pushes the OLS spread z-score above `Z_SCORE_ENTRY_THRESHOLD = 2.0`.
-    ///   Drift is applied to A (not B) so Var(log_prices_B) stays small and the
-    ///   OLS hedge ratio remains near 1.0, maximising the drift's spread impact.
-    ///
-    /// This helper exercises every branch inside `select_pairs` that is only
-    /// reachable when at least one candidate pair survives all screening filters:
-    /// the `sort_by` body (lines 292–295), the greedy-selection `push` and
-    /// potential `break` (lines 307–309), and any `for pair in &pairs` loop
-    /// bodies in tests that call this helper.
     fn make_guaranteed_pair_prices() -> (Vec<f64>, Vec<f64>) {
         let count = CORRELATION_WINDOW_DAYS + 1;
         let mut prices_a = vec![100.0_f64];
@@ -1000,11 +971,7 @@ mod tests {
             let last_a = *prices_a.last().unwrap();
             let last_b = *prices_b.last().unwrap();
 
-            // Shared factor: amplitude 0.012, idiosyncratic amplitude 0.006 gives
-            // theoretical Pearson correlation ~0.75, safely within [0.5, 0.95].
             let shared = 0.012 * ((i as f64 * 0.5).sin());
-            // Drift applied to A only for the final 13 steps, keeping Var(log_prices_B)
-            // small so the OLS hedge ratio stays near 1.0.
             let drift_a = if i >= count - 13 { 0.008 } else { 0.0 };
             let idio_a = 0.006 * ((i as f64 * 1.3).cos()) + drift_a;
             let idio_b = 0.006 * ((i as f64 * 2.1).sin());
@@ -1018,16 +985,11 @@ mod tests {
 
     #[test]
     fn test_select_pairs_guaranteed_pair_covers_inner_loop_and_sort() {
-        // Uses `make_guaranteed_pair_prices` which is engineered to pass the
-        // correlation band and z-score threshold. This guarantees:
-        // - The `sort_by` closure body (lines 291–295) executes.
-        // - The greedy-selection body including `push` (line 307) executes.
-        // - The result is non-empty so assertions are meaningful.
         let (prices_a, prices_b) = make_guaranteed_pair_prices();
 
         let mut closes = HashMap::new();
-        closes.insert("TKRA".to_string(), prices_a);
-        closes.insert("TKRB".to_string(), prices_b);
+        closes.insert(Ticker::new("TKRA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKRB").unwrap(), prices_b);
 
         let signals = vec![
             make_signal("TKRA", 0.01, 0.9, 0.015),
@@ -1052,14 +1014,11 @@ mod tests {
 
     #[test]
     fn test_select_pairs_greedy_break_on_pool_limit_with_guaranteed_pair() {
-        // Exercises the `break` at line 309 by using a pool of 1 with prices
-        // that are engineered to produce at least one candidate pair. The greedy
-        // loop must stop after the first accepted pair.
         let (prices_a, prices_b) = make_guaranteed_pair_prices();
 
         let mut closes = HashMap::new();
-        closes.insert("TKRA".to_string(), prices_a);
-        closes.insert("TKRB".to_string(), prices_b);
+        closes.insert(Ticker::new("TKRA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKRB").unwrap(), prices_b);
 
         let signals = vec![
             make_signal("TKRA", 0.02, 0.9, 0.015),
@@ -1076,17 +1035,13 @@ mod tests {
 
     #[test]
     fn test_select_pairs_greedy_ticker_reuse_skip_with_three_tickers() {
-        // Exercises line 303 (`continue` when a ticker is already in `used_tickers`).
-        // Three tickers where A-B and A-C would both be candidates but A is used
-        // after the first pair is selected, causing A-C to be skipped.
         let (prices_a, prices_b) = make_guaranteed_pair_prices();
-        // C is a copy of B with a small perturbation so A-C also passes filters.
         let prices_c: Vec<f64> = prices_b.iter().map(|p| p * 1.001).collect();
 
         let mut closes = HashMap::new();
-        closes.insert("TKA".to_string(), prices_a);
-        closes.insert("TKB".to_string(), prices_b);
-        closes.insert("TKC".to_string(), prices_c);
+        closes.insert(Ticker::new("TKA").unwrap(), prices_a);
+        closes.insert(Ticker::new("TKB").unwrap(), prices_b);
+        closes.insert(Ticker::new("TKC").unwrap(), prices_c);
 
         let signals = vec![
             make_signal("TKA", 0.01, 0.9, 0.015),
@@ -1096,8 +1051,7 @@ mod tests {
 
         let pairs = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
 
-        // Greedy constraint: no ticker may appear in more than one pair.
-        let mut seen_tickers: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_tickers: HashSet<Ticker> = HashSet::new();
         for pair in &pairs {
             assert!(
                 !seen_tickers.contains(pair.long_ticker()),
@@ -1109,27 +1063,22 @@ mod tests {
                 "short ticker {} appears in multiple pairs",
                 pair.short_ticker()
             );
-            seen_tickers.insert(pair.long_ticker().to_string());
-            seen_tickers.insert(pair.short_ticker().to_string());
+            seen_tickers.insert(pair.long_ticker().clone());
+            seen_tickers.insert(pair.short_ticker().clone());
         }
     }
 
     #[test]
     fn test_select_pairs_single_valid_ticker_returns_empty() {
-        // When only one ticker has valid data (AAPL passes positivity but fails the
-        // mean-squared-return filter due to zero variance; MSFT has no closes at all),
-        // `ticker_returns.len() < MINIMUM_TICKER_COUNT` and `select_pairs` returns an
-        // empty result without panicking.
         let signals = vec![
             make_signal("AAPL", 0.02, 0.8, 0.01),
             make_signal("MSFT", 0.01, 0.8, 0.01),
         ];
-        // AAPL has exactly CORRELATION_WINDOW_DAYS prices (all positive, no
-        // variance) → fails the mean-squared-return filter at line 183.
-        // MSFT has no closes at all.
         let mut closes = HashMap::new();
-        closes.insert("AAPL".to_string(), vec![100.0_f64; CORRELATION_WINDOW_DAYS]);
-        // Only one ticker survives → ticker_returns.len() < MINIMUM_TICKER_COUNT → empty.
+        closes.insert(
+            Ticker::new("AAPL").unwrap(),
+            vec![100.0_f64; CORRELATION_WINDOW_DAYS],
+        );
         assert!(select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL).is_empty());
     }
 }

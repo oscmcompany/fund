@@ -30,13 +30,21 @@ mod tests {
             serve(listener, app).await.ok();
         });
 
-        // Give the server a moment to start accepting connections.
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
         let url = format!("http://{address}/ping");
-        let response = reqwest::get(&url).await.expect("HTTP request failed");
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(1);
+        let response = loop {
+            match reqwest::get(&url).await {
+                Ok(response) => break response,
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    let _ = error;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("HTTP request failed: {error}"),
+            }
+        };
         assert_eq!(response.status(), 200);
 
         server_handle.abort();
+        let _ = server_handle.await;
     }
 }

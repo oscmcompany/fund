@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::market::Ticker;
+use crate::domain::market::{PairID, Ticker};
 
 /// Status of an equity rebalance session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -213,7 +213,7 @@ impl EquityRebalanceSession {
 pub struct EquityPair {
     id: Uuid,
     rebalance_id: Uuid,
-    pair_id: String,
+    pair_id: PairID,
     long_ticker: Ticker,
     short_ticker: Ticker,
     z_score: Decimal,
@@ -233,7 +233,7 @@ impl EquityPair {
     pub fn new(
         id: Uuid,
         rebalance_id: Uuid,
-        pair_id: String,
+        pair_id: PairID,
         long_ticker: Ticker,
         short_ticker: Ticker,
         z_score: Decimal,
@@ -272,7 +272,7 @@ impl EquityPair {
         self.rebalance_id
     }
 
-    pub fn pair_id(&self) -> &str {
+    pub fn pair_id(&self) -> &PairID {
         &self.pair_id
     }
 
@@ -718,6 +718,10 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
+    fn make_pair_id() -> PairID {
+        PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap())
+    }
+
     #[test]
     fn test_rebalance_session_status_round_trip() {
         for status in [
@@ -854,7 +858,7 @@ mod tests {
         let pair = EquityPair::new(
             Uuid::new_v4(),
             Uuid::new_v4(),
-            "AAPL-MSFT".to_string(),
+            make_pair_id(),
             Ticker::new("AAPL").unwrap(),
             Ticker::new("MSFT").unwrap(),
             Decimal::from(2),
@@ -959,7 +963,7 @@ mod tests {
         EquityPair::new(
             Uuid::new_v4(),
             Uuid::new_v4(),
-            "AAPL-MSFT".to_string(),
+            make_pair_id(),
             Ticker::new("AAPL").unwrap(),
             Ticker::new("MSFT").unwrap(),
             Decimal::from(2),
@@ -1036,7 +1040,7 @@ mod tests {
         let pairs = EquityPairs::new(vec![sample_pair()]).unwrap();
         assert_eq!(pairs.len(), 1);
         assert!(!pairs.is_empty());
-        assert_eq!(pairs.as_slice()[0].pair_id(), "AAPL-MSFT");
+        assert_eq!(pairs.as_slice()[0].pair_id().as_str(), "AAPL-MSFT");
     }
 
     #[test]
@@ -1093,7 +1097,7 @@ mod tests {
         let pair = EquityPair::new(
             id,
             rebalance_id,
-            "AAPL-MSFT".to_string(),
+            make_pair_id(),
             Ticker::new("AAPL").unwrap(),
             Ticker::new("MSFT").unwrap(),
             Decimal::from(2),

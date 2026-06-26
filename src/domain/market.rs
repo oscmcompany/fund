@@ -1,7 +1,7 @@
 //! Raw ingest record types from market data providers (Alpaca, Massive).
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::FromRow;
 
 /// Liquidity thresholds defining the modeled and served equity universe.
@@ -125,6 +125,121 @@ fn is_valid_base(s: &str) -> bool {
 
 fn is_valid_suffix(s: &str) -> bool {
     !s.is_empty() && s.len() <= 3 && s.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// A canonical long-short equity pair identifier.
+///
+/// Combines two validated [`Ticker`] values into a `"LONG-SHORT"` formatted
+/// string. The canonical form is stored at construction time so that [`as_str`]
+/// is a cheap borrow. A `PairID` in scope is proof that both legs passed ticker
+/// format validation.
+///
+/// Splitting on the **first** dash only (via [`str::split_once`]) means tickers
+/// with dot-suffixes such as `BRK.B` round-trip correctly: `"BRK.B-MSFT"` splits
+/// into `("BRK.B", "MSFT")`, not three fragments.
+///
+/// [`as_str`]: PairID::as_str
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PairID {
+    long: Ticker,
+    short: Ticker,
+    formatted: String,
+}
+
+impl PairID {
+    /// Constructs a `PairID` from two validated `Ticker` values.
+    ///
+    /// Stores the canonical `"LONG-SHORT"` formatted string at construction
+    /// time so that [`as_str`] is a cheap borrow.
+    ///
+    /// [`as_str`]: PairID::as_str
+    pub fn new(long: Ticker, short: Ticker) -> Self {
+        let formatted = format!("{}-{}", long.as_str(), short.as_str());
+        Self {
+            long,
+            short,
+            formatted,
+        }
+    }
+
+    /// Parses a `"LONG-SHORT"` formatted string by splitting on the first dash only.
+    ///
+    /// Returns `None` if the string cannot be split on `'-'` or if either half
+    /// fails [`Ticker::new`].
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (long_str, short_str) = raw.split_once('-')?;
+        let long = Ticker::new(long_str)?;
+        let short = Ticker::new(short_str)?;
+        Some(Self::new(long, short))
+    }
+
+    /// Returns the canonical `"LONG-SHORT"` formatted string.
+    pub fn as_str(&self) -> &str {
+        &self.formatted
+    }
+
+    /// Returns the long-leg ticker.
+    pub fn long(&self) -> &Ticker {
+        &self.long
+    }
+
+    /// Returns the short-leg ticker.
+    pub fn short(&self) -> &Ticker {
+        &self.short
+    }
+}
+
+impl std::fmt::Display for PairID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.formatted)
+    }
+}
+
+impl Serialize for PairID {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.formatted)
+    }
+}
+
+impl<'de> Deserialize<'de> for PairID {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        PairID::parse(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid pair id: {}", raw)))
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for PairID {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <String as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <String as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'q> sqlx::Encode<'q, sqlx::Postgres> for PairID {
+    fn encode_by_ref(
+        &self,
+        buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        <&str as sqlx::Encode<'q, sqlx::Postgres>>::encode_by_ref(&self.formatted.as_str(), buf)
+    }
+}
+
+/// Decoding parses the stored `"A-B"` format by splitting on the **first** dash
+/// only, consistent with [`PairID::parse`]. A malformed stored value surfaces as
+/// a decode error rather than silently constructing an invalid `PairID`.
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        let raw = <String as sqlx::Decode<'r, sqlx::Postgres>>::decode(value)?;
+        PairID::parse(&raw)
+            .ok_or_else(|| format!("invalid pair id decoded from database: {}", raw).into())
+    }
 }
 
 /// Daily OHLCV equity bar record.
@@ -685,5 +800,132 @@ mod tests {
     #[test]
     fn test_equity_details_new_returns_none_for_empty() {
         assert!(EquityDetails::new(vec![]).is_none());
+    }
+
+    // --- PairID tests ---
+
+    #[test]
+    fn test_pair_id_new_stores_canonical_format() {
+        let pair_id = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        assert_eq!(pair_id.as_str(), "AAPL-MSFT");
+    }
+
+    #[test]
+    fn test_pair_id_new_long_short_accessors() {
+        let pair_id = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        assert_eq!(pair_id.long().as_str(), "AAPL");
+        assert_eq!(pair_id.short().as_str(), "MSFT");
+    }
+
+    #[test]
+    fn test_pair_id_display_delegates_to_as_str() {
+        let pair_id = PairID::new(Ticker::new("GOOG").unwrap(), Ticker::new("META").unwrap());
+        assert_eq!(format!("{}", pair_id), "GOOG-META");
+    }
+
+    #[test]
+    fn test_pair_id_clone_equality() {
+        let pair_id = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let cloned = pair_id.clone();
+        assert_eq!(pair_id, cloned);
+    }
+
+    #[test]
+    fn test_pair_id_hash_and_eq() {
+        use std::collections::HashSet;
+        let a = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let b = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_pair_id_different_order_not_equal() {
+        let ab = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let ba = PairID::new(Ticker::new("MSFT").unwrap(), Ticker::new("AAPL").unwrap());
+        assert_ne!(ab, ba);
+    }
+
+    #[test]
+    fn test_pair_id_parse_simple_tickers() {
+        let pair_id = PairID::parse("AAPL-MSFT").unwrap();
+        assert_eq!(pair_id.long().as_str(), "AAPL");
+        assert_eq!(pair_id.short().as_str(), "MSFT");
+        assert_eq!(pair_id.as_str(), "AAPL-MSFT");
+    }
+
+    #[test]
+    fn test_pair_id_parse_dot_suffix_ticker_splits_on_first_dash_only() {
+        // BRK.B contains a dot but no dash; the only dash is the pair separator.
+        let pair_id = PairID::parse("BRK.B-MSFT").unwrap();
+        assert_eq!(pair_id.long().as_str(), "BRK.B");
+        assert_eq!(pair_id.short().as_str(), "MSFT");
+        assert_eq!(pair_id.as_str(), "BRK.B-MSFT");
+    }
+
+    #[test]
+    fn test_pair_id_parse_rejects_no_dash() {
+        assert!(PairID::parse("AAPLMSFT").is_none());
+    }
+
+    #[test]
+    fn test_pair_id_parse_rejects_invalid_long_ticker() {
+        // "TOOLONG" has six characters — invalid ticker.
+        assert!(PairID::parse("TOOLONG-MSFT").is_none());
+    }
+
+    #[test]
+    fn test_pair_id_parse_rejects_invalid_short_ticker() {
+        assert!(PairID::parse("AAPL-TOOLONG").is_none());
+    }
+
+    #[test]
+    fn test_pair_id_parse_rejects_empty_string() {
+        assert!(PairID::parse("").is_none());
+    }
+
+    #[test]
+    fn test_pair_id_parse_rejects_only_dash() {
+        assert!(PairID::parse("-").is_none());
+    }
+
+    #[test]
+    fn test_pair_id_serde_round_trip() {
+        let pair_id = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let serialized = serde_json::to_string(&pair_id).unwrap();
+        assert_eq!(serialized, "\"AAPL-MSFT\"");
+        let deserialized: PairID = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, pair_id);
+    }
+
+    #[test]
+    fn test_pair_id_deserialize_dot_suffix_round_trip() {
+        let raw = "\"BRK.B-MSFT\"";
+        let pair_id: PairID = serde_json::from_str(raw).unwrap();
+        assert_eq!(pair_id.long().as_str(), "BRK.B");
+        assert_eq!(pair_id.short().as_str(), "MSFT");
+    }
+
+    #[test]
+    fn test_pair_id_deserialize_rejects_invalid() {
+        let result: Result<PairID, _> = serde_json::from_str("\"AAPLMSFT\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pair_id_deserialize_rejects_malformed_ticker() {
+        let result: Result<PairID, _> = serde_json::from_str("\"TOOLONG-MSFT\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pair_id_as_hash_map_key() {
+        use std::collections::HashMap;
+        let key = PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap());
+        let mut map: HashMap<PairID, i32> = HashMap::new();
+        map.insert(key.clone(), 42);
+        assert_eq!(map.get(&key), Some(&42));
     }
 }

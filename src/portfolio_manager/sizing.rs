@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use crate::domain::market::{PairID, Ticker};
 use crate::portfolio_manager::statistical_arbitrage::CandidatePair;
 
 /// Relative lower bound for each pair weight versus its volatility-parity share.
@@ -31,12 +32,12 @@ const OPTIMIZER_LEARNING_RATE: f64 = 0.01;
 /// A candidate pair that has been sized with dollar amounts and share quantities.
 #[derive(Debug, Clone)]
 pub struct SizedPair {
-    /// Human-readable pair identifier, e.g. `"AAPL-MSFT"`.
-    pair_id: String,
-    /// Ticker symbol for the long leg.
-    long_ticker: String,
-    /// Ticker symbol for the short leg.
-    short_ticker: String,
+    /// Canonical pair identifier, e.g. `"AAPL-MSFT"`.
+    pair_id: PairID,
+    /// Validated ticker for the long leg.
+    long_ticker: Ticker,
+    /// Validated ticker for the short leg.
+    short_ticker: Ticker,
     /// Long notional dollar amount (matched to `short_dollar_amount` for dollar neutrality).
     long_dollar_amount: f64,
     /// Short notional dollar amount after whole-share rounding.
@@ -66,9 +67,9 @@ impl SizedPair {
     /// Returns `Err(SizingError::InsufficientPairs)` when validation fails.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pair_id: String,
-        long_ticker: String,
-        short_ticker: String,
+        pair_id: PairID,
+        long_ticker: Ticker,
+        short_ticker: Ticker,
         long_dollar_amount: f64,
         short_dollar_amount: f64,
         short_quantity: i64,
@@ -105,15 +106,15 @@ impl SizedPair {
         })
     }
 
-    pub fn pair_id(&self) -> &str {
+    pub fn pair_id(&self) -> &PairID {
         &self.pair_id
     }
 
-    pub fn long_ticker(&self) -> &str {
+    pub fn long_ticker(&self) -> &Ticker {
         &self.long_ticker
     }
 
-    pub fn short_ticker(&self) -> &str {
+    pub fn short_ticker(&self) -> &Ticker {
         &self.short_ticker
     }
 
@@ -205,8 +206,8 @@ impl std::error::Error for SizingError {}
 pub fn size_pairs_with_volatility_parity(
     candidate_pairs: &[CandidatePair],
     maximum_capital: f64,
-    market_betas: &HashMap<String, f64>,
-    entry_prices: &HashMap<String, f64>,
+    market_betas: &HashMap<Ticker, f64>,
+    entry_prices: &HashMap<Ticker, f64>,
     exposure_scale: f64,
     required_pairs: usize,
 ) -> Result<Vec<SizedPair>, SizingError> {
@@ -318,9 +319,9 @@ pub fn size_pairs_with_volatility_parity(
 
         // short_quantity > 0 is already verified by the guard above.
         if let Ok(sized_pair) = SizedPair::new(
-            pair.pair_id().to_string(),
-            pair.long_ticker().to_string(),
-            pair.short_ticker().to_string(),
+            pair.pair_id().clone(),
+            pair.long_ticker().clone(),
+            pair.short_ticker().clone(),
             long_dollar_amount,
             short_dollar_amount,
             short_quantity,
@@ -424,9 +425,12 @@ mod tests {
         short_volatility: f64,
     ) -> CandidatePair {
         CandidatePair::new(
-            format!("{long_ticker}-{short_ticker}"),
-            long_ticker.to_string(),
-            short_ticker.to_string(),
+            PairID::new(
+                Ticker::new(long_ticker).unwrap(),
+                Ticker::new(short_ticker).unwrap(),
+            ),
+            Ticker::new(long_ticker).unwrap(),
+            Ticker::new(short_ticker).unwrap(),
             2.5,
             1.0,
             0.05,
@@ -439,7 +443,7 @@ mod tests {
     fn make_ten_candidates(
         long_price: f64,
         short_price: f64,
-    ) -> (Vec<CandidatePair>, HashMap<String, f64>) {
+    ) -> (Vec<CandidatePair>, HashMap<Ticker, f64>) {
         let long_tickers = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
         let short_tickers = ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"];
 
@@ -449,14 +453,14 @@ mod tests {
             .map(|(long, short)| make_candidate(long, short, 0.01, 0.01))
             .collect();
 
-        let mut entry_prices = HashMap::new();
+        let mut entry_prices: HashMap<Ticker, f64> = HashMap::new();
         for ticker in long_tickers.iter().chain(short_tickers.iter()) {
             let price = if long_tickers.contains(ticker) {
                 long_price
             } else {
                 short_price
             };
-            entry_prices.insert(ticker.to_string(), price);
+            entry_prices.insert(Ticker::new(ticker).unwrap(), price);
         }
 
         (pairs, entry_prices)
@@ -510,7 +514,7 @@ mod tests {
         let (candidates, mut entry_prices) = make_ten_candidates(100.0, 100.0);
         // Set short prices so they exceed maximum_per_pair_dollar
         for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
-            entry_prices.insert(ticker.to_string(), 1_000_000.0);
+            entry_prices.insert(Ticker::new(ticker).unwrap(), 1_000_000.0);
         }
         let result = size_pairs_with_volatility_parity(
             &candidates,
@@ -664,12 +668,16 @@ mod tests {
         assert_eq!(result.len(), 2);
     }
 
+    fn make_pair_id(long: &str, short: &str) -> PairID {
+        PairID::new(Ticker::new(long).unwrap(), Ticker::new(short).unwrap())
+    }
+
     #[test]
     fn test_sized_pair_new_rejects_negative_long_dollar_amount() {
         let result = SizedPair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            make_pair_id("AAPL", "MSFT"),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             -100.0,
             100.0,
             1,
@@ -687,9 +695,9 @@ mod tests {
     #[test]
     fn test_sized_pair_new_rejects_negative_short_dollar_amount() {
         let result = SizedPair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            make_pair_id("AAPL", "MSFT"),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             100.0,
             -50.0,
             1,
@@ -707,9 +715,9 @@ mod tests {
     #[test]
     fn test_sized_pair_new_rejects_zero_short_quantity() {
         let result = SizedPair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            make_pair_id("AAPL", "MSFT"),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             100.0,
             100.0,
             0,
@@ -727,9 +735,9 @@ mod tests {
     #[test]
     fn test_sized_pair_new_rejects_negative_short_quantity() {
         let result = SizedPair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            make_pair_id("AAPL", "MSFT"),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             100.0,
             100.0,
             -1,
@@ -747,9 +755,9 @@ mod tests {
     #[test]
     fn test_sized_pair_new_valid_all_accessors() {
         let pair = SizedPair::new(
-            "AAPL-MSFT".to_string(),
-            "AAPL".to_string(),
-            "MSFT".to_string(),
+            make_pair_id("AAPL", "MSFT"),
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
             5000.0,
             4900.0,
             49,
@@ -763,9 +771,9 @@ mod tests {
         )
         .expect("valid sized pair");
 
-        assert_eq!(pair.pair_id(), "AAPL-MSFT");
-        assert_eq!(pair.long_ticker(), "AAPL");
-        assert_eq!(pair.short_ticker(), "MSFT");
+        assert_eq!(pair.pair_id().as_str(), "AAPL-MSFT");
+        assert_eq!(pair.long_ticker().as_str(), "AAPL");
+        assert_eq!(pair.short_ticker().as_str(), "MSFT");
         assert!((pair.long_dollar_amount() - 5000.0).abs() < f64::EPSILON);
         assert!((pair.short_dollar_amount() - 4900.0).abs() < f64::EPSILON);
         assert_eq!(pair.short_quantity(), 49);
@@ -803,7 +811,7 @@ mod tests {
         // Set short prices to a very high value relative to per-pair capital so
         // floor(capital / price) == 0 for each pair.
         for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
-            entry_prices.insert(ticker.to_string(), 999_999.0);
+            entry_prices.insert(Ticker::new(ticker).unwrap(), 999_999.0);
         }
         // Supply enough capital to pass the feasibility filter threshold but the
         // per-pair dollar allocation still floor-divides to 0 shares.
@@ -822,7 +830,7 @@ mod tests {
         // raw_dollar_amounts[0] = final_weight (≈0.1 for 10 equal pairs) * 49.26 * 1.0 ≈ 4.93
         // short_quantity = floor(4.93 / 50) = 0 → pair skipped
         for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
-            single_prices.insert(ticker.to_string(), 50.0);
+            single_prices.insert(Ticker::new(ticker).unwrap(), 50.0);
         }
         let result = size_pairs_with_volatility_parity(
             &single_candidates,
@@ -856,7 +864,7 @@ mod tests {
         let (candidates, mut entry_prices) = make_ten_candidates(100.0, 50.0);
         // Remove all long-ticker prices so feasibility fails.
         for ticker in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
-            entry_prices.remove(ticker);
+            entry_prices.remove(&Ticker::new(ticker).unwrap());
         }
         let result = size_pairs_with_volatility_parity(
             &candidates,
@@ -874,12 +882,12 @@ mod tests {
         // Supply market betas with opposite signs on long and short legs.
         // This exercises the beta-neutral optimization path with actual beta values.
         let (candidates, entry_prices) = make_ten_candidates(100.0, 50.0);
-        let mut market_betas = HashMap::new();
+        let mut market_betas: HashMap<Ticker, f64> = HashMap::new();
         for ticker in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
-            market_betas.insert(ticker.to_string(), 1.2_f64);
+            market_betas.insert(Ticker::new(ticker).unwrap(), 1.2_f64);
         }
         for ticker in ["K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"] {
-            market_betas.insert(ticker.to_string(), 0.8_f64);
+            market_betas.insert(Ticker::new(ticker).unwrap(), 0.8_f64);
         }
         let result = size_pairs_with_volatility_parity(
             &candidates,

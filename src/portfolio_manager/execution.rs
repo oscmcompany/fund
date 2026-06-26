@@ -71,34 +71,42 @@ pub async fn execute_open_pairs(
 
     for sized_pair in sized_pairs {
         let (short_result, long_result) = tokio::join!(
-            alpaca.submit_short_order(sized_pair.short_ticker(), sized_pair.short_quantity()),
-            alpaca.submit_long_order(sized_pair.long_ticker(), sized_pair.long_dollar_amount()),
+            alpaca.submit_short_order(
+                sized_pair.short_ticker().as_str(),
+                sized_pair.short_quantity()
+            ),
+            alpaca.submit_long_order(
+                sized_pair.long_ticker().as_str(),
+                sized_pair.long_dollar_amount()
+            ),
         );
 
         let (short_alpaca_id, long_alpaca_id) = match (short_result, long_result) {
             (Ok(short_id), Ok(long_id)) => (short_id, long_id),
             (Err(error), Ok(long_id)) => {
                 warn!(
-                    ticker = sized_pair.short_ticker(),
+                    ticker = sized_pair.short_ticker().as_str(),
                     error = %error,
                     "Short order submission failed; cancelling orphaned long order"
                 );
-                compensate_orphaned_order(alpaca, &long_id, sized_pair.long_ticker()).await;
+                compensate_orphaned_order(alpaca, &long_id, sized_pair.long_ticker().as_str())
+                    .await;
                 continue;
             }
             (Ok(short_id), Err(error)) => {
                 warn!(
-                    ticker = sized_pair.long_ticker(),
+                    ticker = sized_pair.long_ticker().as_str(),
                     error = %error,
                     "Long order submission failed; cancelling orphaned short order"
                 );
-                compensate_orphaned_order(alpaca, &short_id, sized_pair.short_ticker()).await;
+                compensate_orphaned_order(alpaca, &short_id, sized_pair.short_ticker().as_str())
+                    .await;
                 continue;
             }
             (Err(short_error), Err(long_error)) => {
                 warn!(
-                    short_ticker = sized_pair.short_ticker(),
-                    long_ticker = sized_pair.long_ticker(),
+                    short_ticker = sized_pair.short_ticker().as_str(),
+                    long_ticker = sized_pair.long_ticker().as_str(),
                     short_error = %short_error,
                     long_error = %long_error,
                     "Both order submissions failed; skipping pair"
@@ -137,7 +145,10 @@ pub async fn execute_open_pairs(
             sized_pair.short_market_beta(),
         );
 
-        info!(pair_id = sized_pair.pair_id(), "Orders submitted for pair");
+        info!(
+            pair_id = sized_pair.pair_id().as_str(),
+            "Orders submitted for pair"
+        );
         results.push((pending_pair, sized_pair.clone()));
     }
 
@@ -200,12 +211,15 @@ pub async fn confirm_fills(
 
         match pending_pair.confirm(long_fill, short_fill) {
             Ok(filled_pair) => {
-                info!(pair_id = sized_pair.pair_id(), "Pair fills confirmed");
+                info!(
+                    pair_id = sized_pair.pair_id().as_str(),
+                    "Pair fills confirmed"
+                );
                 results.push((filled_pair, sized_pair));
             }
             Err(error) => {
                 warn!(
-                    pair_id = sized_pair.pair_id(),
+                    pair_id = sized_pair.pair_id().as_str(),
                     error = %error,
                     "Pair fill confirmation failed; pair dropped"
                 );
