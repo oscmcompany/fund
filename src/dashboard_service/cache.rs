@@ -1,6 +1,6 @@
 //! Shared in-memory cache for dashboard data.
 //!
-//! A single background task polls production Postgres every [`POLL_INTERVAL_SECS`]
+//! A single background task polls production Postgres every [`POLL_INTERVAL_SECONDS`]
 //! seconds and updates [`DashboardState`] behind a [`SharedState`] lock. All
 //! ratatui render passes read from the cache without touching the database
 //! directly, so viewer count does not affect Postgres connection load.
@@ -22,7 +22,10 @@ use tracing::{error, info, warn};
 use crate::domain::market::{PairID, Ticker};
 
 /// How often the background task refreshes all static view data from Postgres.
-const POLL_INTERVAL_SECS: u64 = 30;
+const POLL_INTERVAL_SECONDS: u64 = 30;
+
+/// Backoff duration between event listener reconnect attempts.
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Maximum number of events retained in the event ring buffer.
 const EVENT_BUFFER_CAPACITY: usize = 500;
@@ -130,14 +133,14 @@ pub struct DashboardState {
 /// Thread-safe shared reference to dashboard state.
 pub type SharedState = Arc<RwLock<DashboardState>>;
 
-/// Spawns the background task that polls Postgres every [`POLL_INTERVAL_SECS`]
+/// Spawns the background task that polls Postgres every [`POLL_INTERVAL_SECONDS`]
 /// seconds and refreshes all static view data in [`DashboardState`].
 ///
 /// Errors from individual polls are recorded in `state.database_error` without
 /// terminating the task. A successful poll clears any previous error.
 pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECONDS));
         loop {
             interval.tick().await;
             match super::database::fetch_dashboard_data(&pool).await {
@@ -167,48 +170,74 @@ pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
 /// channel and appends incoming notifications to the event ring buffer.
 ///
 /// The NOTIFY payload produced by the `events_notify` trigger is a JSON object
-/// with `event_id`, `event_type`, and `payload` fields. If the listener cannot
-/// connect or encounters a receive error, the task logs the error and exits;
-/// the rest of the dashboard continues to function with the polling cache.
+/// with `event_id`, `event_type`, and `payload` fields. Malformed notifications
+/// are logged and skipped rather than synthesised as placeholder events.
+///
+/// On any connection or receive error the task reconnects after
+/// [`RECONNECT_BACKOFF`] so transient Postgres restarts do not permanently
+/// stop real-time event delivery.
 pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
     tokio::spawn(async move {
-        let mut listener = match PgListener::connect_with(&pool).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                error!(error = %error, "Failed to create event listener");
-                return;
-            }
-        };
-        if let Err(error) = listener.listen("events").await {
-            error!(error = %error, "Failed to subscribe to events channel");
-            return;
-        }
-        info!("Event listener subscribed to events channel");
         loop {
-            match listener.recv().await {
-                Ok(notification) => {
-                    let parsed: serde_json::Value =
-                        serde_json::from_str(notification.payload()).unwrap_or_default();
-                    let entry = EventEntry {
-                        event_id: parsed["event_id"].as_i64().unwrap_or(0),
-                        event_type: parsed["event_type"]
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        payload: parsed["payload"].clone(),
-                        received_at: Utc::now(),
-                    };
-                    let mut guard = state.write().await;
-                    guard.events.push_front(entry);
-                    if guard.events.len() > EVENT_BUFFER_CAPACITY {
-                        guard.events.pop_back();
+            let mut listener = match PgListener::connect_with(&pool).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    error!(error = %error, "Event listener connection failed, retrying");
+                    tokio::time::sleep(RECONNECT_BACKOFF).await;
+                    continue;
+                }
+            };
+            if let Err(error) = listener.listen("events").await {
+                error!(error = %error, "Event listener subscribe failed, retrying");
+                tokio::time::sleep(RECONNECT_BACKOFF).await;
+                continue;
+            }
+            info!("Event listener subscribed to events channel");
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        let parsed: serde_json::Value =
+                            match serde_json::from_str(notification.payload()) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    warn!(error = %error, "Invalid event notification payload");
+                                    continue;
+                                }
+                            };
+                        let Some(event_id) =
+                            parsed.get("event_id").and_then(serde_json::Value::as_i64)
+                        else {
+                            warn!("Event notification missing event_id field");
+                            continue;
+                        };
+                        let Some(event_type) =
+                            parsed.get("event_type").and_then(serde_json::Value::as_str)
+                        else {
+                            warn!("Event notification missing event_type field");
+                            continue;
+                        };
+                        let entry = EventEntry {
+                            event_id,
+                            event_type: event_type.to_string(),
+                            payload: parsed
+                                .get("payload")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                            received_at: Utc::now(),
+                        };
+                        let mut guard = state.write().await;
+                        guard.events.push_front(entry);
+                        if guard.events.len() > EVENT_BUFFER_CAPACITY {
+                            guard.events.pop_back();
+                        }
+                    }
+                    Err(error) => {
+                        error!(error = %error, "Event listener receive error, reconnecting");
+                        break;
                     }
                 }
-                Err(error) => {
-                    error!(error = %error, "Event listener receive error");
-                    return;
-                }
             }
+            tokio::time::sleep(RECONNECT_BACKOFF).await;
         }
     });
 }

@@ -194,8 +194,11 @@ async fn fetch_closed_trades(pool: &PgPool) -> Result<Vec<ClosedTrade>, sqlx::Er
 
 /// Computes aggregate trade statistics from the fetched closed trades.
 ///
-/// Win rate and profit factor are `None` when there is no data to divide by,
-/// guarding against division by zero.
+/// All metrics (win rate, profit factor, averages) are computed only from
+/// trades that have a non-null `realized_profit_and_loss` convertible to `f64`;
+/// `total_closed` reflects the full slice length regardless of null fields.
+/// Win rate is `None` when all trades are break-even (no winners or losers).
+/// Profit factor is `None` when there are no losing trades (gross loss is zero).
 pub fn compute_closed_trades_summary(trades: &[ClosedTrade]) -> ClosedTradesSummary {
     let total_closed = trades.len();
     if total_closed == 0 {
@@ -229,7 +232,8 @@ pub fn compute_closed_trades_summary(trades: &[ClosedTrade]) -> ClosedTradesSumm
         .filter(|&value| value < 0.0)
         .collect();
 
-    let win_rate = Some(winners.len() as f64 / profit_and_loss_values.len() as f64);
+    let decided = winners.len() + losers.len();
+    let win_rate = (decided > 0).then(|| winners.len() as f64 / decided as f64);
 
     let gross_profit: f64 = winners.iter().sum();
     let gross_loss: f64 = losers.iter().map(|value| value.abs()).sum();
@@ -431,6 +435,19 @@ mod tests {
         assert_eq!(summary.win_rate, Some(0.0));
         // No winners means gross_profit == 0 → profit_factor is Some(0.0).
         assert_eq!(summary.profit_factor, Some(0.0));
+    }
+
+    #[test]
+    fn test_compute_closed_trades_summary_break_even_trades() {
+        // All trades at exactly 0.0 PnL — no winners or losers → win_rate is None.
+        let trades = vec![
+            make_closed_trade(Some("0"), Some("0"), Some(300)),
+            make_closed_trade(Some("0"), Some("0"), Some(120)),
+        ];
+        let summary = compute_closed_trades_summary(&trades);
+        assert_eq!(summary.total_closed, 2);
+        assert!(summary.win_rate.is_none());
+        assert!(summary.profit_factor.is_none());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! exit. Actual view rendering for each tab is added in PR 2; this module
 //! provides the tab bar, header, footer, and layout scaffolding.
 
+use std::io;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -16,7 +17,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 use ratatui::Terminal;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::dashboard_service::cache::{DashboardState, SharedState};
 
@@ -97,38 +98,69 @@ impl Application {
 /// Runs the ratatui terminal event loop until the user quits.
 ///
 /// Sets up alternate screen and raw mode, loops over render-poll-input cycles,
-/// then restores the terminal. Reads dashboard data under a shared read lock
-/// on each frame without blocking the background polling task.
+/// then restores the terminal on both normal exit and error. Reads dashboard
+/// data under a shared read lock on each frame without blocking the background
+/// polling task. Blocking crossterm I/O is dispatched via
+/// [`tokio::task::spawn_blocking`] to avoid stalling Tokio worker threads.
 pub async fn run_event_loop(state: SharedState) {
-    let mut terminal = setup_terminal().expect("Failed to set up terminal");
-    let mut app = Application::new();
+    let mut terminal = match setup_terminal() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            error!(error = %error, "Failed to set up terminal");
+            return;
+        }
+    };
 
     info!("Dashboard event loop started");
 
+    let result = event_loop_inner(&mut terminal, state).await;
+
+    if let Err(error) = teardown_terminal(&mut terminal) {
+        error!(error = %error, "Failed to restore terminal");
+    }
+
+    match result {
+        Ok(()) => info!("Dashboard event loop exited"),
+        Err(error) => error!(error = %error, "Dashboard event loop error"),
+    }
+}
+
+/// Inner event loop; extracted so [`run_event_loop`] can guarantee teardown
+/// regardless of whether this returns `Ok` or `Err`.
+async fn event_loop_inner(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: SharedState,
+) -> io::Result<()> {
+    let mut app = Application::new();
     loop {
         let dashboard = state.read().await;
-        terminal
-            .draw(|frame| render(frame, &app, &*dashboard))
-            .expect("Failed to draw frame");
+        terminal.draw(|frame| render(frame, &app, &*dashboard))?;
         drop(dashboard);
 
-        if event::poll(INPUT_POLL_INTERVAL).expect("Failed to poll for events") {
-            match event::read().expect("Failed to read event") {
+        let polled = tokio::task::spawn_blocking(|| event::poll(INPUT_POLL_INTERVAL))
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+
+        if polled {
+            let input_event = tokio::task::spawn_blocking(event::read)
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+
+            match input_event {
                 Event::Key(key) => {
                     if should_quit(key) {
                         break;
                     }
-                    if let Some(tab) = key_to_tab(key) {
-                        app.current_tab = tab;
+                    match key_to_tab(key) {
+                        Some(tab) => app.current_tab = tab,
+                        None => {}
                     }
                 }
                 _ => {}
             }
         }
     }
-
-    teardown_terminal(&mut terminal).expect("Failed to restore terminal");
-    info!("Dashboard event loop exited");
+    Ok(())
 }
 
 /// Returns `true` if the key event should exit the application.
@@ -261,15 +293,28 @@ fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     frame.render_widget(footer, area);
 }
 
-fn setup_terminal() -> std::io::Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+/// Sets up raw mode and alternate screen.
+///
+/// On partial failure (e.g. `EnterAlternateScreen` fails after `enable_raw_mode`
+/// succeeds) the function undoes completed steps before returning the error,
+/// so the caller's terminal is never left in an inconsistent state.
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     terminal::enable_raw_mode()?;
-    std::io::stdout().execute(EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(std::io::stdout()))
+    if let Err(error) = io::stdout().execute(EnterAlternateScreen) {
+        let _ = terminal::disable_raw_mode();
+        return Err(error);
+    }
+    match Terminal::new(CrosstermBackend::new(io::stdout())) {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => {
+            let _ = io::stdout().execute(LeaveAlternateScreen);
+            let _ = terminal::disable_raw_mode();
+            Err(error)
+        }
+    }
 }
 
-fn teardown_terminal(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-) -> std::io::Result<()> {
+fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     terminal::disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     Ok(())
