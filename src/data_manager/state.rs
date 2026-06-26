@@ -341,4 +341,537 @@ mod tests {
         assert_eq!(credentials.key_id(), "test-key");
         assert_eq!(credentials.secret(), "test-secret");
     }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_feed_explicit_value_is_used() {
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        let original_feed = std::env::var("ALPACA_FEED").ok();
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "test-key");
+            std::env::set_var("ALPACA_API_SECRET", "test-secret");
+            std::env::set_var("ALPACA_FEED", "sip");
+        }
+        let credentials = AlpacaCredentials::from_env().unwrap();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+            match original_feed {
+                Some(v) => std::env::set_var("ALPACA_FEED", v),
+                None => std::env::remove_var("ALPACA_FEED"),
+            }
+        }
+        assert_eq!(credentials.feed(), "sip");
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_returns_none_when_key_id_empty() {
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "");
+            std::env::set_var("ALPACA_API_SECRET", "test-secret");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_returns_none_when_secret_empty() {
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "test-key");
+            std::env::set_var("ALPACA_API_SECRET", "");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_database_state_is_configured_returns_true_for_connect_failed() {
+        assert!(DatabaseState::ConnectFailed.is_configured());
+    }
+
+    #[test]
+    fn test_database_state_is_configured_returns_false_for_not_configured() {
+        assert!(!DatabaseState::NotConfigured.is_configured());
+    }
+
+    #[test]
+    fn test_s3_ok_recently_returns_false_when_never_marked() {
+        use super::{MassiveSecrets, State};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            // No mark_s3_ok call — epoch is 0.
+            assert!(!state.s3_ok_recently(60));
+        });
+    }
+
+    #[test]
+    fn test_s3_ok_recently_returns_true_after_mark_s3_ok() {
+        use super::{MassiveSecrets, State};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            state.mark_s3_ok();
+            // Should be recent within a generous 300 second window.
+            assert!(state.s3_ok_recently(300));
+        });
+    }
+
+    #[test]
+    fn test_s3_ok_recently_returns_false_after_ttl_expires() {
+        use super::{MassiveSecrets, State};
+        use std::sync::atomic::Ordering;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            // Store an epoch well in the past (Unix epoch + 1 second = 1970).
+            state.last_s3_ok_epoch.store(1, Ordering::Relaxed);
+            // ttl_secs=60 — the stored epoch is way older than 60 seconds ago.
+            assert!(!state.s3_ok_recently(60));
+        });
+    }
+
+    #[test]
+    fn test_synced_recently_returns_false_when_never_marked() {
+        use super::{MassiveSecrets, State};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            assert!(!state.synced_recently(300));
+        });
+    }
+
+    #[test]
+    fn test_synced_recently_returns_true_after_mark_synced() {
+        use super::{MassiveSecrets, State};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            state.mark_synced();
+            assert!(state.synced_recently(300));
+        });
+    }
+
+    #[test]
+    fn test_synced_recently_returns_false_after_ttl_expires() {
+        use super::{MassiveSecrets, State};
+        use std::sync::atomic::Ordering;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            // Store epoch in the distant past.
+            state.last_sync_epoch.store(1, Ordering::Relaxed);
+            assert!(!state.synced_recently(60));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_restores_previously_set_key_id() {
+        // Sets ALPACA_API_KEY_ID before capturing the original so the
+        // restoration `Some(v) =>` branch (line 280) is guaranteed to execute.
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "pre-existing-key");
+            std::env::set_var("ALPACA_API_SECRET", "pre-existing-secret");
+        }
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        let original_feed = std::env::var("ALPACA_FEED").ok();
+        // Both must be Some(v) now.
+        assert!(original_key.is_some());
+        assert!(original_secret.is_some());
+        unsafe {
+            std::env::remove_var("ALPACA_API_KEY_ID");
+            std::env::set_var("ALPACA_API_SECRET", "another-secret");
+        }
+        let result = AlpacaCredentials::from_env();
+        // Restore — exercises the Some(v) branches.
+        unsafe {
+            match original_key {
+                Some(ref v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(ref v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+            match original_feed {
+                Some(ref v) => std::env::set_var("ALPACA_FEED", v),
+                None => std::env::remove_var("ALPACA_FEED"),
+            }
+        }
+        // Key was removed → should return None.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_restores_previously_set_secret() {
+        // Sets ALPACA_API_SECRET before capturing so the restoration
+        // `Some(v) =>` branch executes for both key and secret (lines 284, 303).
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "pre-set-key");
+            std::env::set_var("ALPACA_API_SECRET", "pre-set-secret");
+        }
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        assert!(original_key.is_some());
+        assert!(original_secret.is_some());
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "temp-key");
+            std::env::remove_var("ALPACA_API_SECRET");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(ref v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(ref v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+        }
+        // Secret was removed → should return None.
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_restores_feed_when_previously_set() {
+        // Guarantees the `Some(v) =>` branch for ALPACA_FEED restoration
+        // (lines 328, 332, 336, 363, 367) by pre-setting all three vars.
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "key-feed-test");
+            std::env::set_var("ALPACA_API_SECRET", "secret-feed-test");
+            std::env::set_var("ALPACA_FEED", "sip");
+        }
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        let original_feed = std::env::var("ALPACA_FEED").ok();
+        assert!(original_key.is_some());
+        assert!(original_secret.is_some());
+        assert!(original_feed.is_some());
+        // Now change feed and call from_env.
+        unsafe {
+            std::env::set_var("ALPACA_FEED", "iex");
+        }
+        let credentials = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(ref v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(ref v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+            match original_feed {
+                Some(ref v) => std::env::set_var("ALPACA_FEED", v),
+                None => std::env::remove_var("ALPACA_FEED"),
+            }
+        }
+        assert!(credentials.is_some());
+        assert_eq!(credentials.unwrap().feed(), "iex");
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_restores_empty_key_id_original() {
+        // Exercises the Some(v) restoration branches (lines 386, 390) for tests
+        // that check empty key_id/secret behavior. Pre-sets vars to empty strings
+        // before capture so originals are Some("").
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "existing-key-for-empty-test");
+            std::env::set_var("ALPACA_API_SECRET", "existing-secret-for-empty-test");
+        }
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        assert!(original_key.is_some());
+        assert!(original_secret.is_some());
+        unsafe {
+            // Now set key to empty to test the empty-key branch.
+            std::env::set_var("ALPACA_API_KEY_ID", "");
+            std::env::set_var("ALPACA_API_SECRET", "non-empty-secret");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(ref v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(ref v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_alpaca_credentials_from_env_restores_empty_secret_original() {
+        // Exercises the Some(v) restoration branches (lines 409, 413) for
+        // tests that check empty secret behavior.
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "key-for-empty-secret-test");
+            std::env::set_var("ALPACA_API_SECRET", "secret-for-empty-secret-test");
+        }
+        let original_key = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_secret = std::env::var("ALPACA_API_SECRET").ok();
+        assert!(original_key.is_some());
+        assert!(original_secret.is_some());
+        unsafe {
+            std::env::set_var("ALPACA_API_KEY_ID", "non-empty-key");
+            std::env::set_var("ALPACA_API_SECRET", "");
+        }
+        let result = AlpacaCredentials::from_env();
+        unsafe {
+            match original_key {
+                Some(ref v) => std::env::set_var("ALPACA_API_KEY_ID", v),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_secret {
+                Some(ref v) => std::env::set_var("ALPACA_API_SECRET", v),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
+        }
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_state_new_has_not_configured_database_and_no_alpaca_credentials() {
+        use super::{DatabaseState, MassiveSecrets, State};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            assert!(matches!(state.database, DatabaseState::NotConfigured));
+            assert!(state.alpaca_credentials.is_none());
+            assert_eq!(state.bucket_name, "test-bucket");
+            assert_eq!(state.massive.base, "http://127.0.0.1:1");
+            assert_eq!(state.massive.key, "test-api-key");
+        });
+    }
 }

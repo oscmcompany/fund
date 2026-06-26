@@ -375,4 +375,365 @@ mod tests {
             "artifacts/tide/2024-01-01/output/model.tar.gz"
         );
     }
+
+    #[test]
+    fn test_run_id_from_artifact_key_empty_string() {
+        // An empty input should not panic; it falls back to the full string.
+        let result = run_id_from_artifact_key("");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_trailing_slash() {
+        // A plain directory name with a trailing slash must trim the slash.
+        let result = run_id_from_artifact_key("some/run-folder/");
+        assert_eq!(result, "run-folder");
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_no_slash() {
+        // A bare filename with no slashes must return the whole string.
+        let result = run_id_from_artifact_key("run-2026-01-01");
+        assert_eq!(result, "run-2026-01-01");
+    }
+
+    #[test]
+    fn test_candidate_folders_descending_single_element() {
+        let folders = candidate_folders_descending(vec!["models/tide/2026-06-01/".to_string()]);
+        assert_eq!(folders, vec!["models/tide/2026-06-01/"]);
+    }
+
+    #[test]
+    fn test_candidate_folders_descending_empty() {
+        let folders = candidate_folders_descending(vec![]);
+        assert!(folders.is_empty());
+    }
+
+    #[test]
+    fn test_candidate_folders_descending_already_sorted_descending() {
+        // Providing folders newest-first must not change the order.
+        let input = vec![
+            "models/tide/2026-06-09/".to_string(),
+            "models/tide/2026-06-05/".to_string(),
+            "models/tide/2026-06-01/".to_string(),
+        ];
+        let result = candidate_folders_descending(input.clone());
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_explicit_version_ignores_dir_contents() {
+        // With an explicit version the directory is not even opened.
+        let result = resolve_local_artifact_key(
+            Path::new("/nonexistent"),
+            "models/tide/",
+            "2026-06-10-01-00-07",
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            "models/tide/2026-06-10-01-00-07/output/model.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_with_empty_dir() {
+        // A temporary directory with no subdirectories must return NoArtifacts.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_with_dir_but_no_model() {
+        // A subdirectory that has no model.tar.gz and no tide_parameters.json
+        // must return NoArtifacts.
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join("2026-06-01-00-00-00-000")).unwrap();
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_prefers_most_recent_run_with_params() {
+        // If the newest subdirectory contains tide_parameters.json the path to
+        // that directory is returned (the extracted-files fallback branch).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let run_dir = temp_dir.path().join("2026-06-10-00-00-00-000");
+        std::fs::create_dir(&run_dir).unwrap();
+        std::fs::write(run_dir.join("tide_parameters.json"), b"{}").unwrap();
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), run_dir.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_prefers_model_tar_gz() {
+        // When output/model.tar.gz exists it takes precedence over the
+        // tide_parameters.json fallback.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let run_dir = temp_dir.path().join("2026-06-10-00-00-00-000");
+        let output_dir = run_dir.join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("model.tar.gz"), b"fake").unwrap();
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            output_dir
+                .join("model.tar.gz")
+                .to_string_lossy()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn test_artifact_error_display() {
+        // Verify the Display impl for each variant so the error messages are
+        // stable and the thiserror derive is wired up correctly.
+        assert_eq!(ArtifactError::NoArtifacts.to_string(), "No artifacts found");
+        assert_eq!(
+            ArtifactError::S3("timeout".to_string()).to_string(),
+            "S3 error: timeout"
+        );
+        assert_eq!(
+            ArtifactError::ModelLoad("bad file".to_string()).to_string(),
+            "Model load error: bad file"
+        );
+    }
+
+    #[test]
+    fn test_artifact_error_io_variant_display() {
+        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let artifact_error = ArtifactError::Io(io_error);
+        let display = artifact_error.to_string();
+        assert!(display.contains("IO error"));
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_only_slash() {
+        // A single slash with nothing after it: trim gives empty, last segment is "".
+        let result = run_id_from_artifact_key("/");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_double_trailing_slash() {
+        // Trailing slashes are stripped one at a time; the last non-empty segment
+        // should be returned.
+        let result = run_id_from_artifact_key("models/tide/run-2026//");
+        // trim_end_matches('/') strips all trailing slashes then rsplit gives "run-2026"
+        assert_eq!(result, "run-2026");
+    }
+
+    #[test]
+    fn test_run_id_from_artifact_key_exactly_output_suffix_prefix() {
+        // A key whose entire suffix matches the canonical form but has no leading
+        // prefix — i.e., "2026-06-09/output/model.tar.gz".
+        let result = run_id_from_artifact_key("2026-06-09/output/model.tar.gz");
+        assert_eq!(result, "2026-06-09");
+    }
+
+    #[test]
+    fn test_candidate_folders_descending_duplicates_preserve_all() {
+        // Duplicate entries are not deduplicated — the caller is responsible for
+        // deduplication; the sort+reverse must still work correctly.
+        let folders = candidate_folders_descending(vec![
+            "models/tide/2026-06-05/".to_string(),
+            "models/tide/2026-06-05/".to_string(),
+        ]);
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0], "models/tide/2026-06-05/");
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_with_multiple_dirs_picks_lexicographically_last() {
+        // When multiple subdirectories exist the lexicographically last one
+        // (i.e., the newest timestamped run) must be selected.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let older_dir = temp_dir.path().join("2026-06-08-00-00-00-000");
+        let newer_dir = temp_dir.path().join("2026-06-10-00-00-00-000");
+        std::fs::create_dir(&older_dir).unwrap();
+        std::fs::create_dir(&newer_dir).unwrap();
+
+        // Only the newer directory has a tide_parameters.json.
+        std::fs::write(newer_dir.join("tide_parameters.json"), b"{}").unwrap();
+
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), newer_dir.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_latest_older_dir_has_params_newer_has_nothing() {
+        // When only the older directory has the fallback file (tide_parameters.json)
+        // but the newest directory has neither model.tar.gz nor tide_parameters.json,
+        // the result is NoArtifacts because only the *last* sorted entry is checked.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let older_dir = temp_dir.path().join("2026-06-08-00-00-00-000");
+        let newer_dir = temp_dir.path().join("2026-06-10-00-00-00-000");
+        std::fs::create_dir(&older_dir).unwrap();
+        std::fs::create_dir(&newer_dir).unwrap();
+
+        // Only the older directory has a parameters file.
+        std::fs::write(older_dir.join("tide_parameters.json"), b"{}").unwrap();
+
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        // The newest dir is checked but has no model; the function returns NoArtifacts.
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
+    }
+
+    #[test]
+    fn test_resolve_local_artifact_key_only_files_no_subdirs() {
+        // If the local directory contains only files (not subdirectories) the
+        // directory list after filtering by is_dir() is empty → NoArtifacts.
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join("some_file.txt"), b"data").unwrap();
+
+        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_run_metadata_local_dir_canonical_key_returns_metadata() {
+        // With local_dir set and a canonical artifact key
+        // (<prefix>/<run_id>/output/model.tar.gz), the function derives the
+        // sibling metadata key (<prefix>/<run_id>/run_metadata.json) and reads
+        // it from the local filesystem.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let run_dir = temp_dir.path().join("2026-06-10-00-00-00-000");
+        let output_dir = run_dir.join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        let metadata = serde_json::json!({"run_id": "2026-06-10-00-00-00-000", "epochs": 50});
+        let metadata_path = run_dir.join("run_metadata.json");
+        std::fs::write(&metadata_path, metadata.to_string().as_bytes()).unwrap();
+
+        // Build a dummy S3 client — it will not be called because local_dir is set.
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        // The artifact key uses the canonical layout so the metadata path is
+        // derived by stripping "output/model.tar.gz" and appending "run_metadata.json".
+        let artifact_key = format!("{}/output/model.tar.gz", run_dir.to_string_lossy());
+
+        let result = fetch_run_metadata(
+            &s3_client,
+            "test-bucket",
+            &artifact_key,
+            Some(temp_dir.path()),
+        )
+        .await;
+
+        assert!(result.is_some(), "expected metadata to be returned");
+        let value = result.unwrap();
+        assert_eq!(value["run_id"], "2026-06-10-00-00-00-000");
+        assert_eq!(value["epochs"], 50);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_run_metadata_local_dir_non_canonical_key_joins_run_metadata() {
+        // With a non-canonical artifact key (no output/model.tar.gz suffix) the
+        // function falls back to joining artifact_key with "run_metadata.json".
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Write the metadata file at <temp_dir>/run_metadata.json.
+        let metadata = serde_json::json!({"status": "ok"});
+        std::fs::write(
+            temp_dir.path().join("run_metadata.json"),
+            metadata.to_string().as_bytes(),
+        )
+        .unwrap();
+
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        // Use the temp directory path itself as the artifact key (non-canonical).
+        let artifact_key = temp_dir.path().to_string_lossy().to_string();
+
+        let result = fetch_run_metadata(
+            &s3_client,
+            "test-bucket",
+            &artifact_key,
+            Some(temp_dir.path()),
+        )
+        .await;
+
+        assert!(
+            result.is_some(),
+            "expected metadata from non-canonical key path"
+        );
+        assert_eq!(result.unwrap()["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_run_metadata_local_dir_file_missing_returns_none() {
+        // When the metadata file does not exist on disk the function must return
+        // None rather than propagating an error.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        let artifact_key = format!(
+            "{}/2026-06-10/output/model.tar.gz",
+            temp_dir.path().to_string_lossy()
+        );
+
+        let result = fetch_run_metadata(
+            &s3_client,
+            "test-bucket",
+            &artifact_key,
+            Some(temp_dir.path()),
+        )
+        .await;
+
+        assert!(result.is_none(), "missing metadata file must return None");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_run_metadata_local_dir_invalid_json_returns_none() {
+        // A metadata file that contains invalid JSON must cause the function to
+        // return None rather than panicking or propagating a parse error.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let run_dir = temp_dir.path().join("2026-06-11-00-00-00-000");
+        let output_dir = run_dir.join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+
+        // Write invalid JSON to the metadata file.
+        std::fs::write(run_dir.join("run_metadata.json"), b"not valid json { }]").unwrap();
+
+        let s3_config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        let artifact_key = format!("{}/output/model.tar.gz", run_dir.to_string_lossy());
+
+        let result = fetch_run_metadata(
+            &s3_client,
+            "test-bucket",
+            &artifact_key,
+            Some(temp_dir.path()),
+        )
+        .await;
+
+        assert!(result.is_none(), "invalid JSON metadata must return None");
+    }
 }

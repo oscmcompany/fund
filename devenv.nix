@@ -379,7 +379,7 @@ in {
 
     rate=$(awk 'match($0, /line-rate="([^"]*)"/, a) {print a[1]; exit}' .coverage_output/rust.xml)
     rate_pct=$(awk "BEGIN {printf \"%.1f\", ''${rate:-0} * 100}")
-    threshold=65
+    threshold=80
     echo "Rust line coverage: ''${rate_pct}%"
     if awk "BEGIN {exit !(''${rate_pct} + 0 < ''${threshold})}"; then
       echo "Coverage failure: ''${rate_pct}% is below threshold of ''${threshold}%"

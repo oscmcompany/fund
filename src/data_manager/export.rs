@@ -771,6 +771,281 @@ mod tests {
     }
 
     #[test]
+    fn test_create_equity_bar_export_dataframe_optional_fields_can_be_none() {
+        let now = chrono::Utc::now();
+        let bars = vec![crate::domain::market::EquityBar::new(
+            Ticker::new("TSLA").unwrap(),
+            now,
+            200.0,
+            210.0,
+            198.0,
+            205.0,
+            500_000,
+            None,
+            None,
+            now,
+        )];
+        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        // volume_weighted_average_price and transactions are optional — confirm columns exist
+        assert!(dataframe.column("volume_weighted_average_price").is_ok());
+        assert!(dataframe.column("transactions").is_ok());
+    }
+
+    #[test]
+    fn test_create_equity_quote_dataframe_values_are_correct() {
+        let now = chrono::Utc::now();
+        let quotes = vec![crate::domain::market::EquityQuote::new(
+            now,
+            Ticker::new("GOOG").unwrap(),
+            180.10,
+            180.20,
+            3,
+            7,
+        )];
+        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        // Confirm bid and ask price columns carry Float64 values
+        assert_eq!(
+            dataframe.column("bid_price").unwrap().dtype(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            dataframe.column("ask_price").unwrap().dtype(),
+            &DataType::Float64
+        );
+        // bid_size and ask_size are Int32
+        assert_eq!(
+            dataframe.column("bid_size").unwrap().dtype(),
+            &DataType::Int32
+        );
+        assert_eq!(
+            dataframe.column("ask_size").unwrap().dtype(),
+            &DataType::Int32
+        );
+    }
+
+    #[test]
+    fn test_create_equity_rebalance_session_dataframe_null_optional_fields() {
+        // completed_at and model_run_id are Optional — test the None path
+        let sessions = vec![crate::domain::trading::EquityRebalanceSession::new(
+            "550e8400-e29b-41d4-a716-446655440099".parse().unwrap(),
+            chrono::Utc::now(),
+            "market_session_check".to_string(),
+            None,
+            None,
+            crate::domain::trading::RebalanceSessionStatus::Completed,
+        )];
+        let dataframe = create_equity_rebalance_session_dataframe(&sessions).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        // model_run_id column must exist and contain a null
+        let model_run_id_series = dataframe.column("model_run_id").unwrap();
+        assert!(model_run_id_series.null_count() == 1);
+        // completed_at column must exist and contain a null
+        let completed_at_series = dataframe.column("completed_at").unwrap();
+        assert!(completed_at_series.null_count() == 1);
+    }
+
+    #[test]
+    fn test_create_equity_pair_dataframe_null_optional_fields() {
+        // closed_at, realized_profit_and_loss, return_percent, holding_days are Optional
+        let pairs = vec![crate::domain::trading::EquityPair::new(
+            "550e8400-e29b-41d4-a716-446655440020".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            "GOOG-META".to_string(),
+            Ticker::new("GOOG").unwrap(),
+            Ticker::new("META").unwrap(),
+            "1.5".parse().unwrap(),
+            "0.9".parse().unwrap(),
+            "0.8".parse().unwrap(),
+            crate::domain::trading::EquityPairStatus::Closed,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+            None,
+        )];
+        let dataframe = create_equity_pair_dataframe(&pairs).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("closed_at").unwrap().null_count(), 1);
+        assert_eq!(
+            dataframe
+                .column("realized_profit_and_loss")
+                .unwrap()
+                .null_count(),
+            1
+        );
+        assert_eq!(dataframe.column("return_percent").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("holding_days").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn test_create_equity_allocation_dataframe_null_optional_fields() {
+        // entry_price, quantity, notional are Optional; model_run_id is Optional
+        let allocations = vec![crate::domain::trading::EquityAllocation::new(
+            "550e8400-e29b-41d4-a716-446655440030".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440002".parse().unwrap(),
+            chrono::Utc::now(),
+            None,
+            Ticker::new("NVDA").unwrap(),
+            crate::domain::trading::AllocationSide::Short,
+            crate::domain::trading::AllocationAction::ClosePosition,
+            "5000".parse().unwrap(),
+            None,
+            None,
+            None,
+        )];
+        let dataframe = create_equity_allocation_dataframe(&allocations).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("model_run_id").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("entry_price").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("quantity").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("notional").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn test_create_equity_order_dataframe_null_limit_price() {
+        // limit_price is Optional — test the None (market order) path
+        let orders = vec![crate::domain::trading::EquityOrder::new(
+            "550e8400-e29b-41d4-a716-446655440040".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
+            chrono::Utc::now(),
+            Ticker::new("TSLA").unwrap(),
+            crate::domain::trading::AllocationSide::Long,
+            "10".parse().unwrap(),
+            "market".to_string(),
+            None,
+            "alpaca-order-market-001".to_string(),
+        )];
+        let dataframe = create_equity_order_dataframe(&orders).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("limit_price").unwrap().null_count(), 1);
+        // order_type column is a String
+        assert_eq!(
+            dataframe.column("order_type").unwrap().dtype(),
+            &DataType::String
+        );
+    }
+
+    #[test]
+    fn test_create_equity_portfolio_snapshot_dataframe_null_optional_fields() {
+        // gross_return and net_return are Optional
+        let snapshots = vec![crate::domain::trading::EquityPortfolioSnapshot::new(
+            2,
+            chrono::Utc::now(),
+            crate::domain::trading::SnapshotType::Intraday,
+            "50000".parse().unwrap(),
+            None,
+            None,
+            "0".parse().unwrap(),
+            chrono::Utc::now(),
+        )];
+        let dataframe = create_equity_portfolio_snapshot_dataframe(&snapshots).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("gross_return").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("net_return").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_null_optional_fields() {
+        // artifact_key, training_data_key, start_date, end_date, lookback_days,
+        // crps, directional_accuracy, quantile_coverage, drift_status, stage_counts,
+        // completed_at are all Optional — test the all-None path
+        let model_runs = vec![crate::domain::predictions::ModelRun::new(
+            3,
+            "run-tide-003".to_string(),
+            "tide".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::domain::predictions::ModelRunStatus::Failed,
+            None,
+            None,
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+            None,
+        )];
+        let dataframe = create_model_run_dataframe(&model_runs).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("artifact_key").unwrap().null_count(), 1);
+        assert_eq!(
+            dataframe.column("training_data_key").unwrap().null_count(),
+            1
+        );
+        assert_eq!(dataframe.column("start_date").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("end_date").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("lookback_days").unwrap().null_count(), 1);
+        assert_eq!(
+            dataframe
+                .column("continuous_ranked_probability_score")
+                .unwrap()
+                .null_count(),
+            1
+        );
+        assert_eq!(
+            dataframe
+                .column("directional_accuracy")
+                .unwrap()
+                .null_count(),
+            1
+        );
+        assert_eq!(
+            dataframe.column("quantile_coverage").unwrap().null_count(),
+            1
+        );
+        assert_eq!(dataframe.column("drift_status").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("stage_counts").unwrap().null_count(), 1);
+        assert_eq!(dataframe.column("completed_at").unwrap().null_count(), 1);
+    }
+
+    #[test]
+    fn test_create_equity_prediction_dataframe_timestamp_is_int64() {
+        let predictions = sample_predictions();
+        let dataframe = create_equity_prediction_dataframe(&predictions).unwrap();
+        assert_eq!(
+            dataframe.column("timestamp").unwrap().dtype(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            dataframe.column("created_at").unwrap().dtype(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_create_equity_rebalance_session_dataframe_timestamp_is_int64() {
+        let sessions = sample_sessions();
+        let dataframe = create_equity_rebalance_session_dataframe(&sessions).unwrap();
+        assert_eq!(
+            dataframe.column("triggered_at").unwrap().dtype(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_create_equity_order_dataframe_quantity_is_string() {
+        let orders = sample_orders();
+        let dataframe = create_equity_order_dataframe(&orders).unwrap();
+        // quantity is a Decimal serialized to String
+        assert_eq!(
+            dataframe.column("quantity").unwrap().dtype(),
+            &DataType::String
+        );
+    }
+
+    #[test]
+    fn test_create_equity_portfolio_snapshot_dataframe_id_is_int64() {
+        let snapshots = sample_snapshots();
+        let dataframe = create_equity_portfolio_snapshot_dataframe(&snapshots).unwrap();
+        assert_eq!(dataframe.column("id").unwrap().dtype(), &DataType::Int64);
+    }
+
+    #[test]
     fn test_export_equity_bars_returns_error_when_no_database() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -852,5 +1127,234 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("database not connected"));
         });
+    }
+
+    #[test]
+    fn test_create_equity_quote_dataframe_timestamp_is_int64() {
+        let quotes = sample_quotes();
+        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
+        assert_eq!(
+            dataframe.column("timestamp").unwrap().dtype(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_create_equity_quote_dataframe_ticker_is_string() {
+        let quotes = sample_quotes();
+        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
+        assert_eq!(
+            dataframe.column("ticker").unwrap().dtype(),
+            &DataType::String
+        );
+    }
+
+    #[test]
+    fn test_create_equity_bar_export_dataframe_volume_is_int64() {
+        let bars = sample_bars();
+        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
+        assert_eq!(
+            dataframe.column("volume").unwrap().dtype(),
+            &DataType::Int64
+        );
+    }
+
+    #[test]
+    fn test_create_equity_bar_export_dataframe_price_columns_are_float64() {
+        let bars = sample_bars();
+        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
+        for column_name in &["open_price", "high_price", "low_price", "close_price"] {
+            assert_eq!(
+                dataframe.column(column_name).unwrap().dtype(),
+                &DataType::Float64,
+                "column {} should be Float64",
+                column_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_equity_rebalance_session_dataframe_status_values() {
+        let sessions = sample_sessions();
+        let dataframe = create_equity_rebalance_session_dataframe(&sessions).unwrap();
+        let status_series = dataframe.column("status").unwrap();
+        let status_values: Vec<&str> = status_series.str().unwrap().into_no_null_iter().collect();
+        assert_eq!(status_values, vec!["completed"]);
+    }
+
+    #[test]
+    fn test_create_equity_pair_dataframe_status_values() {
+        let pairs = sample_pairs();
+        let dataframe = create_equity_pair_dataframe(&pairs).unwrap();
+        let status_series = dataframe.column("status").unwrap();
+        let status_values: Vec<&str> = status_series.str().unwrap().into_no_null_iter().collect();
+        assert_eq!(status_values, vec!["open"]);
+    }
+
+    #[test]
+    fn test_create_equity_allocation_dataframe_side_and_action_columns() {
+        let allocations = sample_allocations();
+        let dataframe = create_equity_allocation_dataframe(&allocations).unwrap();
+        let side_values: Vec<&str> = dataframe
+            .column("side")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        let action_values: Vec<&str> = dataframe
+            .column("action")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(side_values, vec!["LONG"]);
+        assert_eq!(action_values, vec!["OPEN_POSITION"]);
+    }
+
+    #[test]
+    fn test_create_equity_order_dataframe_side_values() {
+        let orders = sample_orders();
+        let dataframe = create_equity_order_dataframe(&orders).unwrap();
+        let side_values: Vec<&str> = dataframe
+            .column("side")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(side_values, vec!["SHORT"]);
+    }
+
+    #[test]
+    fn test_create_equity_portfolio_snapshot_dataframe_net_asset_value_is_string() {
+        let snapshots = sample_snapshots();
+        let dataframe = create_equity_portfolio_snapshot_dataframe(&snapshots).unwrap();
+        assert_eq!(
+            dataframe.column("net_asset_value").unwrap().dtype(),
+            &DataType::String
+        );
+    }
+
+    #[test]
+    fn test_create_equity_portfolio_snapshot_dataframe_snapshot_type_values() {
+        let snapshots = sample_snapshots();
+        let dataframe = create_equity_portfolio_snapshot_dataframe(&snapshots).unwrap();
+        let type_values: Vec<&str> = dataframe
+            .column("snapshot_type")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(type_values, vec!["end_of_day"]);
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_status_values() {
+        let model_runs = sample_model_runs();
+        let dataframe = create_model_run_dataframe(&model_runs).unwrap();
+        let status_values: Vec<&str> = dataframe
+            .column("status")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(status_values, vec!["completed", "started"]);
+    }
+
+    #[test]
+    fn test_create_equity_prediction_dataframe_quantile_values() {
+        let predictions = sample_predictions();
+        let dataframe = create_equity_prediction_dataframe(&predictions).unwrap();
+        let q10: Vec<f64> = dataframe
+            .column("quantile_10")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert!((q10[0] - (-0.02)).abs() < f64::EPSILON);
+        assert!((q10[1] - (-0.01)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_create_equity_rebalance_session_dataframe_with_failed_status() {
+        let sessions = vec![EquityRebalanceSession::new(
+            "550e8400-e29b-41d4-a716-446655440088".parse().unwrap(),
+            Utc::now(),
+            "manual".to_string(),
+            None,
+            None,
+            RebalanceSessionStatus::Failed,
+        )];
+        let dataframe = create_equity_rebalance_session_dataframe(&sessions).unwrap();
+        let status_values: Vec<&str> = dataframe
+            .column("status")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(status_values, vec!["failed"]);
+    }
+
+    #[test]
+    fn test_create_equity_pair_dataframe_closed_status() {
+        let pairs = vec![EquityPair::new(
+            "550e8400-e29b-41d4-a716-446655440099".parse().unwrap(),
+            "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
+            "TSLA-NVDA".to_string(),
+            Ticker::new("TSLA").unwrap(),
+            Ticker::new("NVDA").unwrap(),
+            "3.5".parse().unwrap(),
+            "1.2".parse().unwrap(),
+            "0.5".parse().unwrap(),
+            EquityPairStatus::Closed,
+            Utc::now(),
+            Some(Utc::now()),
+            Some("500".parse().unwrap()),
+            Some("0.05".parse().unwrap()),
+            Some(7),
+        )];
+        let dataframe = create_equity_pair_dataframe(&pairs).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        let status_values: Vec<&str> = dataframe
+            .column("status")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(status_values, vec!["closed"]);
+        // closed_at, realized_profit_and_loss, return_percent, holding_days all non-null
+        assert_eq!(dataframe.column("closed_at").unwrap().null_count(), 0);
+        assert_eq!(
+            dataframe
+                .column("realized_profit_and_loss")
+                .unwrap()
+                .null_count(),
+            0
+        );
+        assert_eq!(dataframe.column("holding_days").unwrap().null_count(), 0);
+    }
+
+    #[test]
+    fn test_create_model_run_dataframe_id_is_int64() {
+        let model_runs = sample_model_runs();
+        let dataframe = create_model_run_dataframe(&model_runs).unwrap();
+        assert_eq!(dataframe.column("id").unwrap().dtype(), &DataType::Int64);
+    }
+
+    #[test]
+    fn test_create_equity_prediction_dataframe_model_run_id_is_string() {
+        let predictions = sample_predictions();
+        let dataframe = create_equity_prediction_dataframe(&predictions).unwrap();
+        assert_eq!(
+            dataframe.column("model_run_id").unwrap().dtype(),
+            &DataType::String
+        );
     }
 }

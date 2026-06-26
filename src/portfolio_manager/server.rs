@@ -169,4 +169,99 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
     }
+
+    #[tokio::test]
+    async fn test_health_endpoint_returns_json_content_type() {
+        let app = Router::new().route("/health", get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("application/json"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_404() {
+        let app = Router::new().route("/health", get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/unknown-route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_health_returns_only_status_field() {
+        // Verifies that the health response body contains exactly the "status"
+        // key with value "ok" and no other top-level fields are expected absent.
+        let app = Router::new().route("/health", get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_object());
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json.as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_health_allows_get_method() {
+        let app = Router::new().route("/health", get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_post_returns_method_not_allowed() {
+        let app = Router::new().route("/health", get(health));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
 }

@@ -594,6 +594,9 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
     let port: u16 = port_str
         .parse()
         .map_err(|_| format!("DATABASE_URL has invalid port: '{}'", port_str))?;
+    if port == 0 {
+        return Err("DATABASE_URL has invalid port: '0'".to_string());
+    }
 
     Ok((
         host.to_string(),
@@ -607,8 +610,8 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
 #[cfg(test)]
 mod tests {
     use super::{
-        duration_until_next_sync, export_date_from_payload, parse_postgres_url, prior_trading_day,
-        run_export_job, sync_date_for,
+        duration_until_next_sync, export_date_from_payload, listen_loop, parse_postgres_url,
+        prior_trading_day, run_export_job, spawn_sync_scheduler, sync_date_for,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
@@ -938,6 +941,320 @@ mod tests {
             let result = run_export_job(&state, "unknown-job", date).await;
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("Unknown export job"));
+        });
+    }
+
+    // --- Additional pure-logic tests ---
+
+    #[test]
+    fn test_prior_trading_day_thursday_returns_wednesday() {
+        let thursday = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let prior = prior_trading_day(thursday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 4, 29).unwrap());
+    }
+
+    #[test]
+    fn test_prior_trading_day_friday_returns_thursday() {
+        let friday = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let prior = prior_trading_day(friday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 4, 30).unwrap());
+    }
+
+    #[test]
+    fn test_prior_trading_day_sunday_returns_friday() {
+        // Sunday's prior trading day should skip Saturday and land on Friday.
+        let sunday = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
+        let prior = prior_trading_day(sunday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn test_prior_trading_day_saturday_returns_friday() {
+        let saturday = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
+        let prior = prior_trading_day(saturday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn test_parse_postgres_url_missing_password_separator_returns_error() {
+        // No ':' between username and password — should surface a clear error.
+        let result = parse_postgres_url("postgres://useronly@host/db");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("':'"),
+            "Expected error about missing ':' between username and password"
+        );
+    }
+
+    #[test]
+    fn test_parse_postgres_url_invalid_port_returns_error() {
+        let result = parse_postgres_url("postgres://user:pass@host:notaport/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid port"));
+    }
+
+    #[test]
+    fn test_export_date_from_payload_parses_various_valid_dates() {
+        let cases = [
+            ("2026-01-01", (2026, 1, 1)),
+            ("2025-12-31", (2025, 12, 31)),
+            ("2026-06-18", (2026, 6, 18)),
+        ];
+        for (date_str, (year, month, day)) in cases {
+            let payload = serde_json::json!({"date": date_str});
+            let date = export_date_from_payload(&payload);
+            assert_eq!(
+                date,
+                chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap(),
+                "Failed for date string: {}",
+                date_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_export_date_from_payload_falls_back_on_non_string_date_value() {
+        // A numeric "date" field is not a valid date string; must fall back to today.
+        let payload = serde_json::json!({"date": 20260618});
+        let date = export_date_from_payload(&payload);
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_listen_loop_exits_immediately_when_no_pool() {
+        // listen_loop returns immediately when the database state has no pool.
+        // This covers the early-return path at the top of listen_loop.
+        use crate::data_manager::state::{MassiveSecrets, State};
+        use aws_credential_types::Credentials;
+        use aws_sdk_s3::config::Region;
+
+        let credentials =
+            Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(credentials)
+            .endpoint_url("http://127.0.0.1:9")
+            .load()
+            .await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+            .force_path_style(true)
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+        let state = State::new(
+            reqwest::Client::new(),
+            MassiveSecrets {
+                base: "http://127.0.0.1:1".to_string(),
+                key: "test-api-key".to_string(),
+            },
+            s3_client,
+            "test-bucket".to_string(),
+        );
+        // listen_loop must return immediately (no pool configured).
+        listen_loop(state).await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_sync_scheduler_does_not_panic_without_database() {
+        // spawn_sync_scheduler must not panic when called with a state that has
+        // no database pool. It spawns background tasks that terminate immediately
+        // once the runtime drops.
+        use crate::data_manager::state::{MassiveSecrets, State};
+        use aws_credential_types::Credentials;
+        use aws_sdk_s3::config::Region;
+
+        let credentials =
+            Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(credentials)
+            .endpoint_url("http://127.0.0.1:9")
+            .load()
+            .await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+            .force_path_style(true)
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+        let state = State::new(
+            reqwest::Client::new(),
+            MassiveSecrets {
+                base: "http://127.0.0.1:1".to_string(),
+                key: "test-api-key".to_string(),
+            },
+            s3_client,
+            "test-bucket".to_string(),
+        );
+        // DatabaseState::NotConfigured so is_configured() == false, which
+        // causes both the sync_loop and listen_loop tasks to be spawned.
+        // listen_loop returns immediately without a pool.
+        spawn_sync_scheduler(state);
+        // Yield once so the spawned listen_loop task can run to completion.
+        tokio::task::yield_now().await;
+    }
+
+    #[test]
+    fn test_parse_postgres_url_port_zero_returns_error() {
+        // Port 0 is not a valid listening port; the parser must reject it.
+        let result = parse_postgres_url("postgres://user:pass@host:0/db");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid port"));
+    }
+
+    #[test]
+    fn test_parse_postgres_url_max_port_is_valid() {
+        let result = parse_postgres_url("postgres://user:pass@host:65535/db");
+        assert!(result.is_ok());
+        let (_, _, port, _, _) = result.unwrap();
+        assert_eq!(port, 65535);
+    }
+
+    #[test]
+    fn test_export_date_from_payload_non_string_date_falls_back_to_today() {
+        // A numeric value under "date" is not a string — must fall back to today.
+        let payload = serde_json::json!({"date": 20260613});
+        let date = export_date_from_payload(&payload);
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
+    }
+
+    #[test]
+    fn test_export_date_from_payload_null_date_falls_back_to_today() {
+        let payload = serde_json::json!({"date": null});
+        let date = export_date_from_payload(&payload);
+        let today = chrono::Utc::now().date_naive();
+        assert!(
+            date >= today - chrono::Duration::days(1) && date <= today,
+            "Expected date near today ({today}), got {date}"
+        );
+    }
+
+    #[test]
+    fn test_duration_until_next_sync_exactly_at_1am_advances_to_next_weekday() {
+        // Monday 2026-04-27 at exactly 01:00 ET — target has already been reached,
+        // so the next sync should be on Tuesday 2026-04-28 at 01:00 ET (~24h away).
+        let now = chrono_tz::US::Eastern
+            .with_ymd_and_hms(2026, 4, 27, 1, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let duration = duration_until_next_sync(now);
+        let twenty_three_hours = Duration::from_secs(23 * 3600);
+        let twenty_five_hours = Duration::from_secs(25 * 3600);
+        assert!(
+            duration > twenty_three_hours && duration < twenty_five_hours,
+            "Expected ~24h, got {:?}",
+            duration
+        );
+    }
+
+    #[test]
+    fn test_sync_date_for_thursday_fire_is_wednesday() {
+        // Thursday 2026-04-30 at 01:00 ET — should sync Wednesday 2026-04-29
+        let now = chrono_tz::US::Eastern
+            .with_ymd_and_hms(2026, 4, 30, 1, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let sync_date = sync_date_for(now);
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 4, 29).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_sync_date_for_friday_fire_is_thursday() {
+        // Friday 2026-05-01 at 01:00 ET — should sync Thursday 2026-04-30
+        let now = chrono_tz::US::Eastern
+            .with_ymd_and_hms(2026, 5, 1, 1, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let sync_date = sync_date_for(now);
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 4, 30).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_run_export_job_export_equity_bars_returns_error_when_no_database() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use crate::data_manager::state::{MassiveSecrets, State};
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = run_export_job(&state, "export-equity-bars", date).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("database not connected"));
+        });
+    }
+
+    #[test]
+    fn test_run_export_job_export_trading_history_returns_error_when_no_database() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use crate::data_manager::state::{MassiveSecrets, State};
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+            let state = State::new(
+                reqwest::Client::new(),
+                MassiveSecrets {
+                    base: "http://127.0.0.1:1".to_string(),
+                    key: "test-api-key".to_string(),
+                },
+                s3_client,
+                "test-bucket".to_string(),
+            );
+            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let result = run_export_job(&state, "export-trading-history", date).await;
+            assert!(result.is_err());
+            assert!(result.unwrap_err().contains("database not connected"));
         });
     }
 }

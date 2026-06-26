@@ -98,6 +98,139 @@ impl ModelState {
 unsafe impl Send for ModelState {}
 unsafe impl Sync for ModelState {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_s3_client() -> aws_sdk_s3::Client {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    #[test]
+    fn test_app_state_for_tests_accessors() {
+        let state = AppState::for_tests(
+            make_s3_client(),
+            "test-bucket".to_string(),
+            "models/tide/".to_string(),
+            "http://data-manager:8080".to_string(),
+            "latest".to_string(),
+        );
+
+        assert_eq!(state.artifact_bucket(), "test-bucket");
+        assert_eq!(state.artifact_prefix(), "models/tide/");
+        assert_eq!(state.data_manager_base_url(), "http://data-manager:8080");
+        assert_eq!(state.model_version(), "latest");
+        assert!(state.pool().is_none());
+        assert!(state.local_artifact_dir().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_app_state_model_state_starts_empty() {
+        let state = AppState::for_tests(
+            make_s3_client(),
+            "bucket".to_string(),
+            "prefix/".to_string(),
+            "http://localhost".to_string(),
+            "1.0".to_string(),
+        );
+
+        let guard = state.model_state().lock().await;
+        assert!(guard.is_none());
+    }
+
+    #[test]
+    fn test_app_state_clone_shares_model_state_arc() {
+        let state = AppState::for_tests(
+            make_s3_client(),
+            "bucket".to_string(),
+            "prefix/".to_string(),
+            "http://localhost".to_string(),
+            "latest".to_string(),
+        );
+        let cloned = state.clone();
+        // Both clones must point to the same Arc (same pointer address).
+        assert!(std::ptr::eq(
+            Arc::as_ptr(state.model_state()),
+            Arc::as_ptr(cloned.model_state()),
+        ));
+    }
+
+    #[test]
+    fn test_app_state_s3_client_accessible() {
+        let state = AppState::for_tests(
+            make_s3_client(),
+            "bucket".to_string(),
+            "prefix/".to_string(),
+            "http://localhost".to_string(),
+            "latest".to_string(),
+        );
+        // Accessor must compile and return a reference without panicking.
+        let _client = state.s3_client();
+    }
+
+    #[test]
+    fn test_model_state_new_and_all_accessors() {
+        use crate::models::tide::model::TideModel;
+        use burn::backend::NdArray;
+        use std::collections::HashMap;
+
+        let device = Default::default();
+        // input_size=32: matches make_tiny_dataset in evaluate tests (2*7+2*5+1*5+3=32).
+        let model = TideModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0);
+        let parameters = crate::models::tide::config::ModelParameters::for_tests(
+            32,
+            8,
+            1,
+            1,
+            1,
+            2,
+            0.0,
+            vec![0.1, 0.5, 0.9],
+            0.5,
+        );
+        let scaler = Scaler {
+            means: HashMap::new(),
+            standard_deviations: HashMap::new(),
+        };
+        let mappings = FeatureMappings::new();
+        let continuous_columns = vec!["close".to_string()];
+        let categorical_columns = vec!["sector".to_string()];
+        let static_categorical_columns = vec!["ticker".to_string()];
+        let artifact_key = "models/tide/run-2026/output/model.tar.gz".to_string();
+        let run_id = "run-2026".to_string();
+        let load_timestamp = 1_000_000_i64;
+
+        let state = ModelState::new(
+            model,
+            parameters,
+            scaler,
+            mappings,
+            continuous_columns,
+            categorical_columns,
+            static_categorical_columns,
+            artifact_key.clone(),
+            run_id.clone(),
+            load_timestamp,
+        );
+
+        // Verify all accessors return the values passed to new().
+        let _model_ref = state.model();
+        let _params_ref = state.parameters();
+        let _scaler_ref = state.scaler();
+        let _mappings_ref = state.mappings();
+        assert_eq!(state.continuous_columns(), &["close"]);
+        assert_eq!(state.categorical_columns(), &["sector"]);
+        assert_eq!(state.static_categorical_columns(), &["ticker"]);
+        assert_eq!(state.artifact_key(), artifact_key);
+        assert_eq!(state.run_id(), run_id);
+        assert_eq!(state.load_timestamp(), load_timestamp);
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     model_state: Arc<Mutex<Option<ModelState>>>,

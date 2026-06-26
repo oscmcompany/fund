@@ -158,11 +158,86 @@ fn closest_to(values: &[f64], target: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::tide::config::ModelParameters;
     use crate::models::tide::data::TrainingDataset;
+    use crate::models::tide::model::TideModel;
 
-    /// Build a model that ignores its input and emits fixed quantile predictions
-    /// is hard; instead we test the metric arithmetic directly via a tiny helper
-    /// that mirrors `evaluate`'s row math.
+    // ---------------------------------------------------------------------------
+    // argmin / argmax / closest_to
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_argmin_returns_index_of_smallest_value() {
+        assert_eq!(argmin(&[0.9, 0.1, 0.5]), 1);
+    }
+
+    #[test]
+    fn test_argmin_single_element_returns_zero() {
+        assert_eq!(argmin(&[1.23]), 0);
+    }
+
+    #[test]
+    fn test_argmin_empty_returns_zero_fallback() {
+        assert_eq!(argmin(&[]), 0);
+    }
+
+    #[test]
+    fn test_argmax_returns_index_of_largest_value() {
+        assert_eq!(argmax(&[0.1, 0.9, 0.5]), 1);
+    }
+
+    #[test]
+    fn test_argmax_single_element_returns_zero() {
+        assert_eq!(argmax(&[2.0]), 0);
+    }
+
+    #[test]
+    fn test_argmax_empty_returns_zero_fallback() {
+        assert_eq!(argmax(&[]), 0);
+    }
+
+    #[test]
+    fn test_closest_to_returns_nearest_index() {
+        // 0.5 is closer to index 1 (0.5) than to 0 (0.1) or 2 (0.9).
+        assert_eq!(closest_to(&[0.1, 0.5, 0.9], 0.5), 1);
+    }
+
+    #[test]
+    fn test_closest_to_breaks_tie_toward_first() {
+        // Two values equidistant from target: min_by picks the first encountered.
+        assert_eq!(closest_to(&[0.4, 0.6], 0.5), 0);
+    }
+
+    #[test]
+    fn test_closest_to_single_element_returns_zero() {
+        assert_eq!(closest_to(&[0.9], 0.5), 0);
+    }
+
+    #[test]
+    fn test_closest_to_empty_returns_zero_fallback() {
+        assert_eq!(closest_to(&[], 0.5), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // EvalMetrics::zero
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_eval_metrics_zero_fields_are_zero() {
+        let metrics = EvalMetrics::zero();
+        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.directional_accuracy, 0.0);
+        assert_eq!(metrics.quantile_coverage, 0.0);
+    }
+
+    // ---------------------------------------------------------------------------
+    // metrics_from: helper that mirrors evaluate()'s row-level arithmetic so we
+    // can verify the math without running the neural network.
+    // ---------------------------------------------------------------------------
+
+    /// Replicates the per-row accumulation in `evaluate` for a fixed prediction
+    /// table where each row has exactly `quantiles.len()` predictions ordered
+    /// lowest to highest quantile.
     fn metrics_from(predictions: &[[f64; 3]], targets: &[f64], quantiles: &[f64]) -> EvalMetrics {
         let mut crps_sum = 0.0;
         let mut directional = 0;
@@ -194,38 +269,190 @@ mod tests {
     }
 
     #[test]
-    fn test_crps_sum_over_quantiles() {
-        // target=1.0, preds all 0 -> errors 1.0 >=0 -> sum(0.1+0.5+0.9)*1 = 1.5
+    fn test_crps_positive_error_branch() {
+        // target=1.0, all predictions=0.0; error=1.0 >= 0 for every quantile.
+        // row_loss = 0.1*1 + 0.5*1 + 0.9*1 = 1.5; single row so crps=1.5.
         let metrics = metrics_from(&[[0.0, 0.0, 0.0]], &[1.0], &[0.1, 0.5, 0.9]);
-        assert!((metrics.crps - 1.5).abs() < 1e-9, "got {}", metrics.crps);
+        assert!((metrics.crps - 1.5).abs() < 1e-9, "crps={}", metrics.crps);
     }
 
     #[test]
-    fn test_directional_and_coverage() {
-        // q50=0.2>=0 and target=0.3>=0 -> match; target within [q10,q90].
+    fn test_crps_negative_error_branch() {
+        // target=-1.0, all predictions=0.0; error=-1.0 < 0 for every quantile.
+        // pinball = (q-1)*error: (0.1-1)*(-1)=0.9, (0.5-1)*(-1)=0.5, (0.9-1)*(-1)=0.1
+        // row_loss = 1.5; single row so crps=1.5.
+        let metrics = metrics_from(&[[0.0, 0.0, 0.0]], &[-1.0], &[0.1, 0.5, 0.9]);
+        assert!((metrics.crps - 1.5).abs() < 1e-9, "crps={}", metrics.crps);
+    }
+
+    #[test]
+    fn test_crps_exact_prediction_is_zero() {
+        // When every prediction equals the target, error=0 so crps=0.
+        let metrics = metrics_from(&[[0.3, 0.3, 0.3]], &[0.3], &[0.1, 0.5, 0.9]);
+        assert!((metrics.crps).abs() < 1e-9, "crps={}", metrics.crps);
+    }
+
+    #[test]
+    fn test_directional_accuracy_both_positive() {
+        // q50=0.2>=0 and target=0.3>=0 -> directional match; target within [-0.1,0.5].
         let metrics = metrics_from(&[[-0.1, 0.2, 0.5]], &[0.3], &[0.1, 0.5, 0.9]);
         assert_eq!(metrics.directional_accuracy, 1.0);
         assert_eq!(metrics.quantile_coverage, 1.0);
+    }
 
-        // target negative but q50 positive -> no directional match; outside interval.
+    #[test]
+    fn test_directional_accuracy_mismatch_positive_median_negative_target() {
+        // q50 positive but target negative -> no directional match; target outside [0.1,0.5].
         let metrics = metrics_from(&[[0.1, 0.2, 0.5]], &[-0.3], &[0.1, 0.5, 0.9]);
         assert_eq!(metrics.directional_accuracy, 0.0);
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
 
     #[test]
-    fn test_evaluate_empty_dataset_is_zero() {
+    fn test_directional_accuracy_both_negative() {
+        // q50 < 0 and target < 0 -> directional match.
+        let metrics = metrics_from(&[[-0.5, -0.2, -0.1]], &[-0.3], &[0.1, 0.5, 0.9]);
+        assert_eq!(metrics.directional_accuracy, 1.0);
+    }
+
+    #[test]
+    fn test_coverage_target_exactly_at_lower_bound() {
+        // target == q_lower (lower bound is inclusive).
+        let metrics = metrics_from(&[[-0.3, 0.0, 0.3]], &[-0.3], &[0.1, 0.5, 0.9]);
+        assert_eq!(metrics.quantile_coverage, 1.0);
+    }
+
+    #[test]
+    fn test_coverage_target_exactly_at_upper_bound() {
+        // target == q_upper (upper bound is inclusive).
+        let metrics = metrics_from(&[[-0.3, 0.0, 0.3]], &[0.3], &[0.1, 0.5, 0.9]);
+        assert_eq!(metrics.quantile_coverage, 1.0);
+    }
+
+    #[test]
+    fn test_multiple_rows_partial_coverage() {
+        // Three rows: first two covered, last not.
+        let predictions = [[-0.5, 0.0, 0.5], [-0.5, 0.0, 0.5], [-0.5, 0.0, 0.5]];
+        let targets = [0.0_f64, 0.3, 1.0];
+        let metrics = metrics_from(&predictions, &targets, &[0.1, 0.5, 0.9]);
+        let expected_coverage = 2.0 / 3.0;
+        assert!(
+            (metrics.quantile_coverage - expected_coverage).abs() < 1e-9,
+            "coverage={}",
+            metrics.quantile_coverage
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // evaluate() — early-return paths that do not require model inference
+    // ---------------------------------------------------------------------------
+
+    /// Construct a minimal dataset with the array shapes expected for
+    /// `input_length` and `output_length` so `build_input_tensor` does not
+    /// panic, using the tiny 32-input-feature model defined below.
+    ///
+    /// input_size = input_length*n_cont + input_length*n_cat + output_length*n_cat + n_static
+    ///            = 2*7 + 2*5 + 1*5 + 3 = 32
+    fn make_tiny_dataset(num_samples: usize, with_targets: bool) -> TrainingDataset {
+        let input_length = 2_usize;
+        let output_length = 1_usize;
+        TrainingDataset {
+            past_continuous: ndarray::Array3::zeros((num_samples, input_length, 7)),
+            past_categorical: ndarray::Array3::zeros((num_samples, input_length, 5)),
+            future_categorical: ndarray::Array3::zeros((num_samples, output_length, 5)),
+            static_categorical: ndarray::Array3::zeros((num_samples, 1, 3)),
+            targets: if with_targets {
+                Some(ndarray::Array3::zeros((num_samples, output_length, 1)))
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Build a TideModel that matches `make_tiny_dataset`: input_size=32,
+    /// output_length=1, num_quantiles=3.
+    fn make_tiny_model() -> TideModel<NdArray> {
         let device = Default::default();
-        let model = TideModel::<NdArray>::new(&device, 24, 16, 1, 1, 5, 3, 0.0);
-        let dataset = TrainingDataset {
-            past_continuous: ndarray::Array3::zeros((0, 2, 7)),
-            past_categorical: ndarray::Array3::zeros((0, 2, 5)),
-            future_categorical: ndarray::Array3::zeros((0, 1, 5)),
-            static_categorical: ndarray::Array3::zeros((0, 1, 3)),
-            targets: Some(ndarray::Array3::zeros((0, 1, 1))),
-        };
-        let parameters = ModelParameters::default();
+        TideModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0)
+    }
+
+    /// Build ModelParameters aligned with `make_tiny_dataset` and
+    /// `make_tiny_model`.
+    fn make_tiny_parameters() -> ModelParameters {
+        ModelParameters::for_tests(32, 8, 1, 1, 1, 2, 0.0, vec![0.1, 0.5, 0.9], 0.5)
+    }
+
+    #[test]
+    fn test_evaluate_empty_dataset_returns_zero() {
+        let model = make_tiny_model();
+        let dataset = make_tiny_dataset(0, true);
+        let parameters = make_tiny_parameters();
         let metrics = evaluate(&model, &dataset, &parameters).unwrap();
         assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.directional_accuracy, 0.0);
+        assert_eq!(metrics.quantile_coverage, 0.0);
+    }
+
+    #[test]
+    fn test_evaluate_no_targets_returns_zero() {
+        // sample_count > 0 but targets is None -> early return zeros.
+        let model = make_tiny_model();
+        let dataset = make_tiny_dataset(4, false);
+        let parameters = make_tiny_parameters();
+        let metrics = evaluate(&model, &dataset, &parameters).unwrap();
+        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.directional_accuracy, 0.0);
+        assert_eq!(metrics.quantile_coverage, 0.0);
+    }
+
+    #[test]
+    fn test_evaluate_empty_quantiles_returns_zero() {
+        // num_quantiles == 0 triggers the early return after argmin/argmax/closest_to.
+        let model = make_tiny_model();
+        let dataset = make_tiny_dataset(4, true);
+        // Use a model whose quantile list is empty.
+        let parameters = ModelParameters::for_tests(32, 8, 1, 1, 1, 2, 0.0, vec![], 0.5);
+        let metrics = evaluate(&model, &dataset, &parameters).unwrap();
+        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.directional_accuracy, 0.0);
+        assert_eq!(metrics.quantile_coverage, 0.0);
+    }
+
+    #[test]
+    fn test_evaluate_with_samples_returns_valid_metrics() {
+        // Run the full inference path: sample_count > 0, targets present, quantiles non-empty.
+        // The model is randomly initialised so we only assert the metric ranges, not values.
+        let model = make_tiny_model();
+        let dataset = make_tiny_dataset(3, true);
+        let parameters = make_tiny_parameters();
+        let metrics = evaluate(&model, &dataset, &parameters).unwrap();
+        // crps is a sum of non-negative pinball losses so it must be >= 0.
+        assert!(metrics.crps >= 0.0, "crps={}", metrics.crps);
+        // directional_accuracy is a fraction in [0,1].
+        assert!(
+            (0.0..=1.0).contains(&metrics.directional_accuracy),
+            "directional_accuracy={}",
+            metrics.directional_accuracy
+        );
+        // quantile_coverage is a fraction in [0,1].
+        assert!(
+            (0.0..=1.0).contains(&metrics.quantile_coverage),
+            "quantile_coverage={}",
+            metrics.quantile_coverage
+        );
+    }
+
+    #[test]
+    fn test_evaluate_larger_batch_than_eval_batch_size() {
+        // Exercises multi-chunk iteration by exceeding EVAL_BATCH (4096).
+        let model = make_tiny_model();
+        let dataset = make_tiny_dataset(4097, true);
+        let parameters = make_tiny_parameters();
+        let result = evaluate(&model, &dataset, &parameters);
+        assert!(
+            result.is_ok(),
+            "evaluate returned an error: {:?}",
+            result.err()
+        );
     }
 }

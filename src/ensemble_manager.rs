@@ -41,3 +41,46 @@ pub async fn run(bind_address: &str) {
     info!("Listening on {bind_address}");
     serve(listener, app).await.expect("Server failed");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_s3_client() -> aws_sdk_s3::Client {
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
+    #[tokio::test]
+    async fn test_create_router_health_route_exists() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let state = AppState::for_tests(
+            make_s3_client(),
+            "test-bucket".to_string(),
+            "artifacts/tide/".to_string(),
+            "http://localhost:8080".to_string(),
+            "latest".to_string(),
+        );
+        let app = server::create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Without a loaded model the health check returns SERVICE_UNAVAILABLE,
+        // confirming the route is registered and reachable.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

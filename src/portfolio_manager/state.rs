@@ -325,6 +325,7 @@ mod tests {
     fn test_env_f64_rejects_unparseable_value() {
         unsafe { env::set_var("PORTFOLIO_TEST_BAD_F64", "not-a-number") };
         let result = env_f64("PORTFOLIO_TEST_BAD_F64", 0.10);
+        assert!(result.is_err());
         unsafe { env::remove_var("PORTFOLIO_TEST_BAD_F64") };
     }
 
@@ -336,6 +337,7 @@ mod tests {
         unsafe { env::set_var("PORTFOLIO_TEST_OVERRIDE_USIZE", "30") };
         assert_eq!(env_usize("PORTFOLIO_TEST_OVERRIDE_USIZE", 20).unwrap(), 30);
         unsafe { env::remove_var("PORTFOLIO_TEST_OVERRIDE_USIZE") };
+    }
 
     #[test]
     fn test_from_env_fails_without_database_url() {
@@ -371,5 +373,110 @@ mod tests {
         unsafe {
             env::remove_var("DATABASE_URL");
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_f64_parses_valid_override() {
+        unsafe { env::set_var("PORTFOLIO_TEST_VALID_F64", "0.42") };
+        let result = env_f64("PORTFOLIO_TEST_VALID_F64", 0.0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_VALID_F64") };
+        assert!((result - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_f64_error_message_contains_key_and_value() {
+        unsafe { env::set_var("PORTFOLIO_TEST_BAD_F64_MSG", "xyz") };
+        let error = env_f64("PORTFOLIO_TEST_BAD_F64_MSG", 0.0).unwrap_err();
+        unsafe { env::remove_var("PORTFOLIO_TEST_BAD_F64_MSG") };
+        let message = error.to_string();
+        assert!(message.contains("PORTFOLIO_TEST_BAD_F64_MSG"));
+        assert!(message.contains("xyz"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_u8_parses_valid_override() {
+        unsafe { env::set_var("PORTFOLIO_TEST_VALID_U8", "15") };
+        let result = env_u8("PORTFOLIO_TEST_VALID_U8", 0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_VALID_U8") };
+        assert_eq!(result, 15);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_u8_error_on_unparseable_value() {
+        unsafe { env::set_var("PORTFOLIO_TEST_BAD_U8", "not-a-byte") };
+        let error = env_u8("PORTFOLIO_TEST_BAD_U8", 0).unwrap_err();
+        unsafe { env::remove_var("PORTFOLIO_TEST_BAD_U8") };
+        let message = error.to_string();
+        assert!(message.contains("PORTFOLIO_TEST_BAD_U8"));
+        assert!(message.contains("not-a-byte"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_u8_error_on_value_exceeding_255() {
+        unsafe { env::set_var("PORTFOLIO_TEST_OVERFLOW_U8", "256") };
+        let result = env_u8("PORTFOLIO_TEST_OVERFLOW_U8", 0);
+        unsafe { env::remove_var("PORTFOLIO_TEST_OVERFLOW_U8") };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_usize_parses_valid_override() {
+        unsafe { env::set_var("PORTFOLIO_TEST_VALID_USIZE2", "99") };
+        let result = env_usize("PORTFOLIO_TEST_VALID_USIZE2", 0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_VALID_USIZE2") };
+        assert_eq!(result, 99);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_usize_error_on_unparseable_value() {
+        unsafe { env::set_var("PORTFOLIO_TEST_BAD_USIZE", "not-a-number") };
+        let error = env_usize("PORTFOLIO_TEST_BAD_USIZE", 0).unwrap_err();
+        unsafe { env::remove_var("PORTFOLIO_TEST_BAD_USIZE") };
+        let message = error.to_string();
+        assert!(message.contains("PORTFOLIO_TEST_BAD_USIZE"));
+        assert!(message.contains("not-a-number"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_usize_error_on_negative_value() {
+        unsafe { env::set_var("PORTFOLIO_TEST_NEG_USIZE", "-1") };
+        let result = env_usize("PORTFOLIO_TEST_NEG_USIZE", 0);
+        unsafe { env::remove_var("PORTFOLIO_TEST_NEG_USIZE") };
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_f64_trims_whitespace_before_parsing() {
+        unsafe { env::set_var("PORTFOLIO_TEST_WHITESPACE_F64", "  0.33  ") };
+        let result = env_f64("PORTFOLIO_TEST_WHITESPACE_F64", 0.0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_WHITESPACE_F64") };
+        assert!((result - 0.33).abs() < 1e-10);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_u8_trims_whitespace_before_parsing() {
+        unsafe { env::set_var("PORTFOLIO_TEST_WHITESPACE_U8", "  7  ") };
+        let result = env_u8("PORTFOLIO_TEST_WHITESPACE_U8", 0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_WHITESPACE_U8") };
+        assert_eq!(result, 7);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_env_usize_trims_whitespace_before_parsing() {
+        unsafe { env::set_var("PORTFOLIO_TEST_WHITESPACE_USIZE", "  42  ") };
+        let result = env_usize("PORTFOLIO_TEST_WHITESPACE_USIZE", 0).unwrap();
+        unsafe { env::remove_var("PORTFOLIO_TEST_WHITESPACE_USIZE") };
+        assert_eq!(result, 42);
     }
 }

@@ -291,8 +291,13 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
                 .and_then(Ticker::new)?;
             let bid_price = message.get("bp").and_then(|v| v.as_f64())?;
             let ask_price = message.get("ap").and_then(|v| v.as_f64())?;
-            let bid_size = i32::try_from(message.get("bs").and_then(|v| v.as_i64())?).ok()?;
-            let ask_size = i32::try_from(message.get("as").and_then(|v| v.as_i64())?).ok()?;
+            let bid_size_raw = message.get("bs").and_then(|v| v.as_i64())?;
+            let ask_size_raw = message.get("as").and_then(|v| v.as_i64())?;
+            if bid_size_raw < 0 || ask_size_raw < 0 {
+                return None;
+            }
+            let bid_size = i32::try_from(bid_size_raw).ok()?;
+            let ask_size = i32::try_from(ask_size_raw).ok()?;
             let timestamp_str = message.get("t").and_then(|v| v.as_str())?;
             let timestamp = timestamp_str.parse::<DateTime<Utc>>().ok()?;
 
@@ -305,7 +310,8 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_quote_messages;
+    use super::{parse_quote_messages, spawn_quote_stream};
+    use crate::data_manager::state::{DatabaseState, MassiveSecrets, State};
 
     #[test]
     fn test_parse_quote_messages_returns_quotes() {
@@ -364,5 +370,223 @@ mod tests {
             r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"not-a-timestamp"}]"#;
         let quotes = parse_quote_messages(text);
         assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_invalid_ticker() {
+        // Ticker with more than 5 base characters is rejected by Ticker::new.
+        let text = r#"[{"T":"q","S":"TOOLONG","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_ticker_field() {
+        let text =
+            r#"[{"T":"q","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_bid_price() {
+        let text =
+            r#"[{"T":"q","S":"AAPL","ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_bid_size_overflow() {
+        // bid_size values that exceed i32::MAX cannot be represented and must be dropped.
+        let oversized: i64 = i64::from(i32::MAX) + 1;
+        let text = format!(
+            r#"[{{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":{},"as":3,"t":"2026-05-23T14:30:00.000Z"}}]"#,
+            oversized
+        );
+        let quotes = parse_quote_messages(&text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_ask_size_overflow() {
+        let oversized: i64 = i64::from(i32::MAX) + 1;
+        let text = format!(
+            r#"[{{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":{},"t":"2026-05-23T14:30:00.000Z"}}]"#,
+            oversized
+        );
+        let quotes = parse_quote_messages(&text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_accepts_class_share_ticker() {
+        // BRK.B is a valid Alpaca ticker and must be accepted.
+        let text = r#"[{"T":"q","S":"BRK.B","bp":300.00,"ap":300.10,"bs":2,"as":2,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].ticker(), "BRK.B");
+    }
+
+    #[test]
+    fn test_parse_quote_messages_mixed_valid_and_invalid() {
+        // Only the valid quote (AAPL) should be returned; the invalid one (TOOLONG) is dropped.
+        let text = r#"[
+            {"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"},
+            {"T":"q","S":"TOOLONG","bp":200.00,"ap":200.10,"bs":1,"as":1,"t":"2026-05-23T14:30:01.000Z"}
+        ]"#;
+        let quotes = parse_quote_messages(text);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].ticker(), "AAPL");
+    }
+
+    #[test]
+    fn test_parse_quote_messages_timestamp_preserves_value() {
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert_eq!(quotes.len(), 1);
+        let expected = "2026-05-23T14:30:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert_eq!(quotes[0].timestamp(), expected);
+    }
+
+    #[test]
+    fn test_parse_quote_messages_non_array_json_returns_empty() {
+        // The Alpaca stream always sends arrays; a non-array object must be ignored.
+        let text = r#"{"T":"q","S":"AAPL","bp":150.50}"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_ask_price() {
+        let text =
+            r#"[{"T":"q","S":"AAPL","bp":150.50,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_bid_size() {
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_ask_size() {
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_skips_missing_timestamp_field() {
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":3}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_single_element_array() {
+        let text = r#"[{"T":"q","S":"NVDA","bp":800.00,"ap":800.10,"bs":1,"as":2,"t":"2026-05-23T09:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].ticker(), "NVDA");
+        assert_eq!(quotes[0].bid_price(), 800.00);
+        assert_eq!(quotes[0].ask_price(), 800.10);
+        assert_eq!(quotes[0].bid_size(), 1);
+        assert_eq!(quotes[0].ask_size(), 2);
+    }
+
+    #[test]
+    fn test_parse_quote_messages_ticker_field_is_not_string() {
+        // If the "S" field is not a string the message is skipped.
+        let text = r#"[{"T":"q","S":12345,"bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_empty_ticker_string_skipped() {
+        let text = r#"[{"T":"q","S":"","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_type_field_missing_is_filtered() {
+        // A message without a "T" field is treated as a non-quote message type.
+        let text = r#"[{"S":"AAPL","bp":150.50,"ap":150.55,"bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_ask_price_is_not_number() {
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":"not-a-number","bs":5,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_quote_messages_bid_size_negative_value_is_rejected() {
+        // Negative bid_size is invalid domain data; the parser must reject it.
+        let text = r#"[{"T":"q","S":"AAPL","bp":150.50,"ap":150.55,"bs":-1,"as":3,"t":"2026-05-23T14:30:00.000Z"}]"#;
+        let quotes = parse_quote_messages(text);
+        assert!(quotes.is_empty());
+    }
+
+    /// Constructs a minimal `State` suitable for testing `spawn_quote_stream`.
+    /// Uses a stub S3 endpoint that refuses connections so no real AWS call occurs.
+    async fn make_test_state_with_database(database: DatabaseState) -> State {
+        use aws_credential_types::Credentials;
+        use aws_sdk_s3::config::Region;
+
+        let credentials = Credentials::new("test-key", "test-secret", None, None, "tests");
+        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(credentials)
+            .endpoint_url("http://127.0.0.1:9")
+            .load()
+            .await;
+        let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+            .force_path_style(true)
+            .build();
+        let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+        let mut state = State::new(
+            reqwest::Client::new(),
+            MassiveSecrets {
+                base: "http://127.0.0.1:1".to_string(),
+                key: "test-api-key".to_string(),
+            },
+            s3_client,
+            "test-bucket".to_string(),
+        );
+        // Override the database field via a reconstructed state with the given
+        // database variant. State::new always sets NotConfigured, so we reach
+        // into the public field directly.
+        state.database = database;
+        state
+    }
+
+    #[tokio::test]
+    async fn test_spawn_quote_stream_no_database_returns_immediately() {
+        // When the database pool is None, spawn_quote_stream logs and returns
+        // without spawning a task. The function must complete without panic.
+        let state = make_test_state_with_database(DatabaseState::NotConfigured).await;
+        // spawn_quote_stream is synchronous and returns immediately when no pool
+        // is present. Calling it inside a tokio runtime must not panic.
+        spawn_quote_stream(state);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_quote_stream_connect_failed_returns_immediately() {
+        // When the database connection failed (pool is None), spawn_quote_stream
+        // exits at the no-pool guard without spawning a WebSocket task.
+        let state = make_test_state_with_database(DatabaseState::ConnectFailed).await;
+        spawn_quote_stream(state);
     }
 }

@@ -325,4 +325,22 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap() > 0.0);
     }
+
+    #[test]
+    fn test_compute_realized_volatility_short_history_uses_all_returns() {
+        // With fewer closes than VOLATILITY_WINDOW_DAYS (20), all available returns
+        // are used. Use a known non-constant series so the expected value is deterministic.
+        let price_series = vec![100.0_f64, 103.0, 101.0, 106.0, 104.0];
+        let mut closes = HashMap::new();
+        closes.insert("AAPL".to_string(), price_series.clone());
+        let result = compute_realized_volatility(&closes, "AAPL");
+        assert!(result.is_some());
+        // Compute the expected standard deviation from all returns (ddof=1).
+        let all_returns: Vec<f64> = price_series
+            .windows(2)
+            .map(|window| (window[1] - window[0]) / window[0])
+            .collect();
+        let expected = standard_deviation(&all_returns, 1);
+        assert!((result.unwrap() - expected).abs() < 1e-12);
+    }
 }
