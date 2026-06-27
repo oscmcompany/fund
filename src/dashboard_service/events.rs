@@ -196,10 +196,14 @@ fn event_type_style(event_type: &str) -> Style {
 }
 
 /// Truncates a JSON payload to a short summary string.
+///
+/// Truncation is performed on Unicode codepoint boundaries (not byte boundaries)
+/// to avoid panicking on multibyte characters such as CJK, emoji, or accented text.
 fn truncate_payload(payload: &serde_json::Value) -> String {
     let serialized = payload.to_string();
-    if serialized.len() > 58 {
-        format!("{}…", &serialized[..57])
+    if serialized.chars().count() > 58 {
+        let truncated: String = serialized.chars().take(57).collect();
+        format!("{truncated}…")
     } else {
         serialized
     }
@@ -353,6 +357,19 @@ mod tests {
         assert!(result.contains('…'));
         // Displayed portion is 57 visible chars + ellipsis.
         assert!(result.len() <= 61); // 57 chars + "…" (multi-byte)
+    }
+
+    #[test]
+    fn test_truncate_payload_multibyte_does_not_panic() {
+        // JSON value with CJK characters (3 bytes each in UTF-8).
+        // 60 repetitions produces a serialized string well over 58 chars,
+        // so truncation is triggered. A byte-index slice would panic here
+        // if the cut landed mid-codepoint.
+        let long_cjk = "日".repeat(60);
+        let payload = serde_json::json!({"key": long_cjk});
+        let result = truncate_payload(&payload);
+        assert!(result.contains('…'));
+        assert!(result.is_char_boundary(result.len()));
     }
 
     #[test]

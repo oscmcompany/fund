@@ -1,6 +1,5 @@
 //! Tab 3: closed pair trades table with aggregate statistics footer.
 
-use num_traits::ToPrimitive;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
@@ -22,6 +21,7 @@ pub fn render_trades(
     render_trades_footer(frame, chunks[1], &state.closed_trades_summary);
 }
 
+/// Renders the closed-trades table showing pair P&L, return, holding time, and close reason.
 fn render_trades_table(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -57,29 +57,25 @@ fn render_trades_table(
         .map(|trade| {
             let profit_and_loss_str = trade
                 .realized_profit_and_loss
-                .map(|value| format!("${:.2}", value.to_f64().unwrap_or(0.0)))
+                .map(|value| format!("${:.2}", value))
                 .unwrap_or_else(|| "—".to_string());
             let profit_and_loss_style = match trade.realized_profit_and_loss {
-                Some(value) if value.to_f64().unwrap_or(0.0) > 0.0 => {
+                Some(value) if value.is_sign_positive() && !value.is_zero() => {
                     Style::default().fg(Color::Green)
                 }
-                Some(value) if value.to_f64().unwrap_or(0.0) < 0.0 => {
-                    Style::default().fg(Color::Red)
-                }
+                Some(value) if value.is_sign_negative() => Style::default().fg(Color::Red),
                 _ => Style::default(),
             };
 
             let return_str = trade
                 .return_percent
-                .map(|value| format!("{:+.2}%", value.to_f64().unwrap_or(0.0)))
+                .map(|value| format!("{:+.2}%", value))
                 .unwrap_or_else(|| "—".to_string());
             let return_style = match trade.return_percent {
-                Some(value) if value.to_f64().unwrap_or(0.0) > 0.0 => {
+                Some(value) if value.is_sign_positive() && !value.is_zero() => {
                     Style::default().fg(Color::Green)
                 }
-                Some(value) if value.to_f64().unwrap_or(0.0) < 0.0 => {
-                    Style::default().fg(Color::Red)
-                }
+                Some(value) if value.is_sign_negative() => Style::default().fg(Color::Red),
                 _ => Style::default(),
             };
 
@@ -121,6 +117,7 @@ fn render_trades_table(
     frame.render_widget(table, area);
 }
 
+/// Renders the one-line aggregate statistics footer below the trades table.
 fn render_trades_footer(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -144,7 +141,7 @@ fn render_trades_footer(
         .unwrap_or_else(|| "—".to_string());
     let total_profit_and_loss = summary
         .total_realized_profit_and_loss
-        .map(|value| format!("${:.2}", value.to_f64().unwrap_or(0.0)))
+        .map(|value| format!("${:.2}", value))
         .unwrap_or_else(|| "—".to_string());
 
     let text = format!(

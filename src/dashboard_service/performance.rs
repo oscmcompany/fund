@@ -114,7 +114,7 @@ pub fn nav_sparkline_data(
 
     nav_values
         .iter()
-        .map(|&nav| ((nav - min_nav) / range * 100.0) as u64)
+        .map(|&nav| ((nav - min_nav) / range * 100.0).clamp(0.0, 100.0) as u64)
         .collect()
 }
 

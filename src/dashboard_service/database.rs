@@ -321,15 +321,15 @@ fn find_snapshot_at_or_before(
         .find(|snapshot| snapshot.snapshot_timestamp <= cutoff)
 }
 
-/// Computes the percentage return from `baseline` NAV to `current_nav`.
+/// Computes the percentage return from `baseline` NAV to `current_net_asset_value`.
 ///
 /// Returns `None` when baseline NAV converts to zero (division guard).
-fn nav_period_return(current_nav: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
-    let base_nav = baseline.net_asset_value.to_f64()?;
-    if base_nav == 0.0 {
+fn nav_period_return(current_net_asset_value: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
+    let baseline_net_asset_value = baseline.net_asset_value.to_f64()?;
+    if baseline_net_asset_value == 0.0 {
         return None;
     }
-    Some((current_nav - base_nav) / base_nav * 100.0)
+    Some((current_net_asset_value - baseline_net_asset_value) / baseline_net_asset_value * 100.0)
 }
 
 /// Computes the percentage return from `baseline` SPY close to `current_spy`.
@@ -354,10 +354,10 @@ pub fn compute_period_returns(history: &[PerformanceSnapshot]) -> PeriodReturns 
     }
 
     let current = &history[0];
-    let Some(current_nav) = current.net_asset_value.to_f64() else {
+    let Some(current_net_asset_value) = current.net_asset_value.to_f64() else {
         return PeriodReturns::default();
     };
-    if current_nav == 0.0 {
+    if current_net_asset_value == 0.0 {
         return PeriodReturns::default();
     }
 
@@ -370,28 +370,31 @@ pub fn compute_period_returns(history: &[PerformanceSnapshot]) -> PeriodReturns 
         .single()
         .unwrap_or(now);
 
-    let baseline_1d = find_snapshot_at_or_before(history, one_day_cutoff);
-    let baseline_1w = find_snapshot_at_or_before(history, one_week_cutoff);
-    let baseline_1m = find_snapshot_at_or_before(history, one_month_cutoff);
-    let baseline_ytd = find_snapshot_at_or_before(history, year_start_cutoff);
+    let baseline_one_day = find_snapshot_at_or_before(history, one_day_cutoff);
+    let baseline_one_week = find_snapshot_at_or_before(history, one_week_cutoff);
+    let baseline_one_month = find_snapshot_at_or_before(history, one_month_cutoff);
+    let baseline_year_to_date = find_snapshot_at_or_before(history, year_start_cutoff);
     let inception = history.last();
 
     let current_spy = current.spy_close;
 
     PeriodReturns {
-        fund_one_day: baseline_1d.and_then(|b| nav_period_return(current_nav, b)),
-        fund_one_week: baseline_1w.and_then(|b| nav_period_return(current_nav, b)),
-        fund_one_month: baseline_1m.and_then(|b| nav_period_return(current_nav, b)),
-        fund_year_to_date: baseline_ytd.and_then(|b| nav_period_return(current_nav, b)),
-        fund_since_inception: inception.and_then(|b| nav_period_return(current_nav, b)),
+        fund_one_day: baseline_one_day.and_then(|b| nav_period_return(current_net_asset_value, b)),
+        fund_one_week: baseline_one_week
+            .and_then(|b| nav_period_return(current_net_asset_value, b)),
+        fund_one_month: baseline_one_month
+            .and_then(|b| nav_period_return(current_net_asset_value, b)),
+        fund_year_to_date: baseline_year_to_date
+            .and_then(|b| nav_period_return(current_net_asset_value, b)),
+        fund_since_inception: inception.and_then(|b| nav_period_return(current_net_asset_value, b)),
         spy_one_day: current_spy
-            .and_then(|spy| baseline_1d.and_then(|b| spy_period_return(spy, b))),
+            .and_then(|spy| baseline_one_day.and_then(|b| spy_period_return(spy, b))),
         spy_one_week: current_spy
-            .and_then(|spy| baseline_1w.and_then(|b| spy_period_return(spy, b))),
+            .and_then(|spy| baseline_one_week.and_then(|b| spy_period_return(spy, b))),
         spy_one_month: current_spy
-            .and_then(|spy| baseline_1m.and_then(|b| spy_period_return(spy, b))),
+            .and_then(|spy| baseline_one_month.and_then(|b| spy_period_return(spy, b))),
         spy_year_to_date: current_spy
-            .and_then(|spy| baseline_ytd.and_then(|b| spy_period_return(spy, b))),
+            .and_then(|spy| baseline_year_to_date.and_then(|b| spy_period_return(spy, b))),
         spy_since_inception: current_spy
             .and_then(|spy| inception.and_then(|b| spy_period_return(spy, b))),
     }

@@ -72,8 +72,14 @@ pub fn render_predictions(
 }
 
 /// Formats the age of a prediction timestamp as a human-readable string.
+///
+/// Returns `"0m"` when the timestamp is in the future (e.g. due to clock skew
+/// between the database host and the TUI host) to avoid rendering negative ages.
 pub fn format_age(timestamp: chrono::DateTime<Utc>) -> String {
     let age = Utc::now() - timestamp;
+    if age < chrono::Duration::zero() {
+        return "0m".to_string();
+    }
     if age.num_days() > 0 {
         format!("{}d {}h", age.num_days(), age.num_hours() % 24)
     } else if age.num_hours() > 0 {
@@ -193,5 +199,12 @@ mod tests {
             result.starts_with("2d"),
             "expected '2d ...', got '{result}'"
         );
+    }
+
+    #[test]
+    fn test_format_age_future_timestamp_returns_zero() {
+        // Timestamp in the future (e.g. DB clock ahead of TUI host).
+        let timestamp = Utc::now() + Duration::minutes(5);
+        assert_eq!(format_age(timestamp), "0m");
     }
 }

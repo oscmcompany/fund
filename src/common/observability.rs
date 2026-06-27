@@ -2,6 +2,7 @@
 
 use std::env;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 /// Initialize structured JSON tracing for a service.
@@ -34,9 +35,14 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
     };
 
     let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
-    let guard = match std::fs::create_dir_all(&log_dir) {
-        Ok(()) => {
-            let file_appender = tracing_appender::rolling::daily(log_dir, log_file);
+    let guard = match std::fs::create_dir_all(&log_dir).and_then(|()| {
+        RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_suffix(log_file)
+            .build(&log_dir)
+            .map_err(std::io::Error::other)
+    }) {
+        Ok(file_appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = tracing_subscriber::fmt::layer()
                 .json()
@@ -62,7 +68,7 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
             }
         }
         Err(error) => {
-            eprintln!("File logging disabled, cannot create {log_dir:?}: {error}");
+            eprintln!("File logging disabled: {error}");
             tracing_subscriber::registry()
                 .with(global_filter())
                 .with(stdout_layer)
@@ -88,9 +94,14 @@ pub fn init_tracing_file_only(log_file: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
     let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
-    let guard = match std::fs::create_dir_all(&log_dir) {
-        Ok(()) => {
-            let file_appender = tracing_appender::rolling::daily(log_dir, log_file);
+    let guard = match std::fs::create_dir_all(&log_dir).and_then(|()| {
+        RollingFileAppender::builder()
+            .rotation(Rotation::DAILY)
+            .filename_suffix(log_file)
+            .build(&log_dir)
+            .map_err(std::io::Error::other)
+    }) {
+        Ok(file_appender) => {
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             let file_layer = tracing_subscriber::fmt::layer()
                 .json()

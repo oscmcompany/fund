@@ -22,6 +22,7 @@ pub fn render_positions(
     render_positions_footer(frame, chunks[1], state);
 }
 
+/// Renders the open-pairs table showing tickers, z-score, signal, and dollar amounts.
 fn render_positions_table(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -86,6 +87,7 @@ fn render_positions_table(
     frame.render_widget(table, area);
 }
 
+/// Renders the one-line exposure summary footer below the positions table.
 fn render_positions_footer(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
@@ -107,8 +109,12 @@ fn render_positions_footer(
     frame.render_widget(footer, area);
 }
 
+/// Formats a `Decimal` value as a dollar string with two decimal places (e.g. `"$1000.50"`).
+///
+/// Formats directly in decimal space to preserve cent-level precision without
+/// converting through floating point.
 fn format_dollars(decimal: rust_decimal::Decimal) -> String {
-    format!("${:.2}", decimal.to_f64().unwrap_or(0.0))
+    format!("${:.2}", decimal)
 }
 
 #[cfg(test)]
