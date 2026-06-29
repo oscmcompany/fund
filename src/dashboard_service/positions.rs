@@ -1,11 +1,20 @@
 //! Tab 1: open long/short pair positions and exposure summary.
 
+use chrono::Utc;
 use num_traits::ToPrimitive;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::dashboard_service::cache::DashboardState;
+use crate::dashboard_service::predictions::format_age;
+
+/// Age threshold in minutes above which no rebalance is flagged as stale (red).
+const REBALANCE_STALE_MINUTES: i64 = 30;
+
+/// Age threshold in minutes above which no rebalance triggers a warning (yellow).
+const REBALANCE_WARNING_MINUTES: i64 = 10;
 
 /// Renders Tab 1: an open-pairs table above an exposure summary footer row.
 pub fn render_positions(
@@ -28,9 +37,8 @@ fn render_positions_table(
     area: ratatui::layout::Rect,
     state: &DashboardState,
 ) {
-    let block = Block::default()
-        .title("Open Positions")
-        .borders(Borders::ALL);
+    let title = build_positions_title(state);
+    let block = Block::default().title(title).borders(Borders::ALL);
 
     if state.open_positions.is_empty() {
         let placeholder = Paragraph::new("No open positions")
@@ -107,6 +115,39 @@ fn render_positions_footer(
     );
     let footer = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
+}
+
+/// Builds the positions table block title, appending last rebalance age when available.
+///
+/// The rebalance age is colored green when fresh, yellow when approaching the
+/// [`REBALANCE_WARNING_MINUTES`] threshold, and red when past the
+/// [`REBALANCE_STALE_MINUTES`] threshold.
+fn build_positions_title(state: &DashboardState) -> Line<'static> {
+    match state.last_rebalance_completed_at {
+        None => Line::from("Open Positions"),
+        Some(completed_at) => {
+            let style = rebalance_age_style(completed_at);
+            Line::from(vec![
+                Span::raw("Open Positions"),
+                Span::styled(format!(" | Rebalance: {}", format_age(completed_at)), style),
+            ])
+        }
+    }
+}
+
+/// Returns the style for a rebalance age based on staleness thresholds.
+///
+/// Red when older than [`REBALANCE_STALE_MINUTES`], yellow when older than
+/// [`REBALANCE_WARNING_MINUTES`], green otherwise.
+fn rebalance_age_style(completed_at: chrono::DateTime<Utc>) -> Style {
+    let minutes = (Utc::now() - completed_at).num_minutes();
+    if minutes > REBALANCE_STALE_MINUTES {
+        Style::default().fg(Color::Red)
+    } else if minutes > REBALANCE_WARNING_MINUTES {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    }
 }
 
 /// Formats a `Decimal` value as a dollar string with two decimal places (e.g. `"$1000.50"`).
@@ -229,5 +270,45 @@ mod tests {
     #[test]
     fn test_format_dollars_fractional() {
         assert_eq!(format_dollars(Decimal::new(10050, 2)), "$100.50");
+    }
+
+    #[test]
+    fn test_render_positions_shows_rebalance_age_when_present() {
+        use chrono::Duration;
+        let mut state = DashboardState::default();
+        state.last_rebalance_completed_at = Some(Utc::now() - Duration::minutes(5));
+        let output = render_to_string(120, 40, &state);
+        assert!(output.contains("Rebalance:"));
+    }
+
+    #[test]
+    fn test_render_positions_no_rebalance_info_when_none() {
+        let state = DashboardState::default(); // last_rebalance_completed_at is None
+        let output = render_to_string(120, 40, &state);
+        assert!(!output.contains("Rebalance:"));
+    }
+
+    #[test]
+    fn test_rebalance_age_style_green_when_fresh() {
+        use chrono::Duration;
+        let completed_at = Utc::now() - Duration::minutes(3);
+        let style = rebalance_age_style(completed_at);
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn test_rebalance_age_style_yellow_when_warning() {
+        use chrono::Duration;
+        let completed_at = Utc::now() - Duration::minutes(20);
+        let style = rebalance_age_style(completed_at);
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn test_rebalance_age_style_red_when_stale() {
+        use chrono::Duration;
+        let completed_at = Utc::now() - Duration::minutes(45);
+        let style = rebalance_age_style(completed_at);
+        assert_eq!(style.fg, Some(Color::Red));
     }
 }

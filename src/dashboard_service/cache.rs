@@ -110,6 +110,16 @@ pub struct PeriodReturns {
     pub spy_since_inception: Option<f64>,
 }
 
+/// Metadata from the most recently completed model run (Tab 4 header).
+#[derive(Debug, Clone)]
+pub struct ModelRunInformation {
+    pub completed_at: DateTime<Utc>,
+    pub start_date: chrono::NaiveDate,
+    pub end_date: chrono::NaiveDate,
+    pub continuous_ranked_probability_score: Option<f64>,
+    pub directional_accuracy: Option<f64>,
+}
+
 /// A single event received from the Postgres `events` NOTIFY channel (Tab 5).
 #[derive(Debug, Clone)]
 pub struct EventEntry {
@@ -144,6 +154,14 @@ pub struct DashboardState {
     pub period_returns: PeriodReturns,
     /// Bounded event ring buffer, newest first (Tab 5).
     pub events: VecDeque<EventEntry>,
+    /// Metadata from the most recently completed model run (Tab 4 header). `None` until first poll.
+    pub model_run_information: Option<ModelRunInformation>,
+    /// Timestamp of the most recently inserted equity bar row (Tab 4 header freshness).
+    /// `None` until first poll or when the table is empty.
+    pub latest_bars_inserted_at: Option<DateTime<Utc>>,
+    /// Completion time of the most recent rebalance session (Tab 1 header freshness).
+    /// `None` until first poll or when no sessions have completed.
+    pub last_rebalance_completed_at: Option<DateTime<Utc>>,
     /// Timestamp of the most recent successful poll. `None` until first poll completes.
     pub last_updated: Option<DateTime<Utc>>,
     /// Last database error message, if any. Cleared on successful poll.
@@ -174,6 +192,9 @@ pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
                     guard.closed_trades = data.closed_trades;
                     guard.closed_trades_summary = data.closed_trades_summary;
                     guard.predictions = data.predictions;
+                    guard.model_run_information = data.model_run_information;
+                    guard.latest_bars_inserted_at = data.latest_bars_inserted_at;
+                    guard.last_rebalance_completed_at = data.last_rebalance_completed_at;
                     guard.last_updated = Some(Utc::now());
                     guard.database_error = None;
                     info!("Dashboard state refreshed");
@@ -279,6 +300,24 @@ mod tests {
         assert_eq!(state.net_exposure, Decimal::ZERO);
         assert!(state.last_updated.is_none());
         assert!(state.database_error.is_none());
+        assert!(state.model_run_information.is_none());
+        assert!(state.latest_bars_inserted_at.is_none());
+        assert!(state.last_rebalance_completed_at.is_none());
+    }
+
+    #[test]
+    fn test_model_run_information_fields() {
+        use chrono::NaiveDate;
+        let info = ModelRunInformation {
+            completed_at: Utc::now(),
+            start_date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            end_date: NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
+            continuous_ranked_probability_score: Some(0.123),
+            directional_accuracy: Some(0.725),
+        };
+        assert!(info.continuous_ranked_probability_score.is_some());
+        assert!(info.directional_accuracy.is_some());
+        assert!(info.start_date < info.end_date);
     }
 
     #[test]

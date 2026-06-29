@@ -10,8 +10,8 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 
 use crate::dashboard_service::cache::{
-    ClosedTrade, ClosedTradesSummary, OpenPosition, PerformanceSnapshot, PeriodReturns,
-    PredictionRow,
+    ClosedTrade, ClosedTradesSummary, ModelRunInformation, OpenPosition, PerformanceSnapshot,
+    PeriodReturns, PredictionRow,
 };
 
 /// How many days of performance snapshot history to fetch for Tab 2.
@@ -30,6 +30,9 @@ pub struct DashboardData {
     pub closed_trades: Vec<ClosedTrade>,
     pub closed_trades_summary: ClosedTradesSummary,
     pub predictions: Vec<PredictionRow>,
+    pub model_run_information: Option<ModelRunInformation>,
+    pub latest_bars_inserted_at: Option<DateTime<Utc>>,
+    pub last_rebalance_completed_at: Option<DateTime<Utc>>,
 }
 
 /// Fetches all data needed for a full dashboard state refresh.
@@ -45,6 +48,9 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     let closed_trades = fetch_closed_trades(pool).await?;
     let closed_trades_summary = compute_closed_trades_summary(&closed_trades);
     let predictions = fetch_latest_predictions(pool).await?;
+    let model_run_information = fetch_latest_model_run_information(pool).await?;
+    let latest_bars_inserted_at = fetch_latest_bars_inserted_at(pool).await?;
+    let last_rebalance_completed_at = fetch_last_rebalance_completed_at(pool).await?;
 
     Ok(DashboardData {
         open_positions,
@@ -55,6 +61,9 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
         closed_trades,
         closed_trades_summary,
         predictions,
+        model_run_information,
+        latest_bars_inserted_at,
+        last_rebalance_completed_at,
     })
 }
 
@@ -308,6 +317,64 @@ async fn fetch_latest_predictions(pool: &PgPool) -> Result<Vec<PredictionRow>, s
             })
         })
         .collect()
+}
+
+/// Fetches metadata for the most recently completed model run.
+///
+/// Returns `None` when no run has completed yet. Used by Tab 4 to display
+/// training recency alongside the prediction table.
+async fn fetch_latest_model_run_information(
+    pool: &PgPool,
+) -> Result<Option<ModelRunInformation>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT completed_at, start_date, end_date,
+                continuous_ranked_probability_score, directional_accuracy
+         FROM model_runs
+         WHERE status = 'completed' AND completed_at IS NOT NULL
+         ORDER BY completed_at DESC
+         LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        None => Ok(None),
+        Some(row) => Ok(Some(ModelRunInformation {
+            completed_at: row.try_get("completed_at")?,
+            start_date: row.try_get("start_date")?,
+            end_date: row.try_get("end_date")?,
+            continuous_ranked_probability_score: row
+                .try_get("continuous_ranked_probability_score")?,
+            directional_accuracy: row.try_get("directional_accuracy")?,
+        })),
+    }
+}
+
+/// Returns the maximum `inserted_at` timestamp across all equity bars rows.
+///
+/// Used by Tab 4 to indicate how recently market data was ingested. Returns
+/// `None` when the table is empty (e.g. before the first nightly ingest).
+async fn fetch_latest_bars_inserted_at(
+    pool: &PgPool,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let row = sqlx::query("SELECT MAX(inserted_at) AS max_inserted_at FROM equity_bars")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.try_get("max_inserted_at")?)
+}
+
+/// Returns the most recent `completed_at` across all rebalance sessions.
+///
+/// Used by Tab 1 to indicate how recently the portfolio was rebalanced. Returns
+/// `None` when no session has completed yet.
+async fn fetch_last_rebalance_completed_at(
+    pool: &PgPool,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT MAX(completed_at) AS max_completed_at FROM equity_rebalance_sessions")
+            .fetch_one(pool)
+            .await?;
+    Ok(row.try_get("max_completed_at")?)
 }
 
 /// Returns the first snapshot (newest-to-oldest order) whose timestamp is at or
