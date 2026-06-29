@@ -701,7 +701,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             );
             assert!(insert_equity_pair(&lazy_pool(), &pair).await.is_err());
         });

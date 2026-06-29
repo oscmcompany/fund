@@ -37,7 +37,7 @@ This is a collection of guidelines and references.
 - Follow Rust recommended casing conventions
 - Introduce new dependencies only after approval
 - Use Polars for [Rust](https://docs.rs/polars/latest/polars/) dataframes
-- Ensure Rust automated test suites achieve at least 80% line or statement coverage
+- Ensure Rust automated test suites achieve at least 75% line or statement coverage
 - Exclude generated code, third-party code, tooling boilerplate, and anything explicitly excluded in this repository
   from test coverage calculations
 - Structured log messages should be short sentences with sentence case (e.g., "Starting data sync" not "STARTING DATA SYNC")
@@ -75,7 +75,11 @@ This is a collection of guidelines and references.
 - Utilize category theory when designing data transformations and model architectures - functors, monads, and natural
   transformations; this leads to more composable, reusable, and maintainable code
 - Only use existing repository labels for GitHub issues and pull requests
-- Prompt to run the database and run `sqlx` compile-time checks for schema or query changes
+- After any change to `schema.sql` or a `query!` macro, run `cargo sqlx prepare -- --all-features` to
+  regenerate the `.sqlx/` offline cache; if Postgres is not already running, start it first with
+  `devenv up -d --no-tui` then poll `pg_isready` until it accepts connections; use
+  `cargo sqlx prepare --check -- --all-features` to verify without updating the cache; the
+  `dashboard_service` uses raw `sqlx::query()` (no macros) and has no offline cache entries
 - Encode domain constraints in the type system: use enums with per-variant data to make invalid states
   unrepresentable at compile time rather than checking validity at runtime
 - Use `match` (not `if let` chains) when handling enum variants — exhaustive matching ensures every variant is

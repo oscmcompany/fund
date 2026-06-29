@@ -564,7 +564,6 @@ async fn persist_filled_pairs(
             None,
             None,
             None,
-            None,
         );
         insert_equity_pair(pool, &equity_pair).await?;
 
