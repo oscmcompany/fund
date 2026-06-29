@@ -20,6 +20,11 @@ use ratatui::Terminal;
 use tracing::{error, info};
 
 use crate::dashboard_service::cache::{DashboardState, SharedState};
+use crate::dashboard_service::events::{render_events, EventsViewState};
+use crate::dashboard_service::performance::render_performance;
+use crate::dashboard_service::positions::render_positions;
+use crate::dashboard_service::predictions::render_predictions;
+use crate::dashboard_service::trades::render_trades;
 
 /// Minimum terminal width required to render the dashboard layout.
 const MINIMUM_TERMINAL_WIDTH: u16 = 80;
@@ -81,9 +86,10 @@ impl Tab {
     }
 }
 
-/// Top-level application state: the currently selected tab.
+/// Top-level application state: the currently selected tab and per-tab view state.
 pub struct Application {
     pub current_tab: Tab,
+    pub events_state: EventsViewState,
 }
 
 impl Application {
@@ -91,7 +97,14 @@ impl Application {
     pub fn new() -> Self {
         Self {
             current_tab: Tab::Positions,
+            events_state: EventsViewState::new(),
         }
+    }
+}
+
+impl Default for Application {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -134,26 +147,31 @@ async fn event_loop_inner(
     let mut app = Application::new();
     loop {
         let dashboard = state.read().await;
-        terminal.draw(|frame| render(frame, &app, &*dashboard))?;
+        terminal.draw(|frame| render(frame, &app, &dashboard))?;
         drop(dashboard);
 
         let polled = tokio::task::spawn_blocking(|| event::poll(INPUT_POLL_INTERVAL))
             .await
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+            .map_err(io::Error::other)??;
 
         if polled {
             let input_event = tokio::task::spawn_blocking(event::read)
                 .await
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))??;
+                .map_err(io::Error::other)??;
 
+            #[allow(clippy::single_match)]
             match input_event {
                 Event::Key(key) => {
                     if should_quit(key) {
                         break;
                     }
-                    match key_to_tab(key) {
-                        Some(tab) => app.current_tab = tab,
-                        None => {}
+                    match (app.current_tab, key.code) {
+                        (Tab::Events, KeyCode::Char('f')) => app.events_state.cycle_filter(),
+                        #[allow(clippy::single_match)]
+                        _ => match key_to_tab(key) {
+                            Some(tab) => app.current_tab = tab,
+                            None => {}
+                        },
                     }
                 }
                 _ => {}
@@ -195,7 +213,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &Application, state: &DashboardSt
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
-            Constraint::Length(3), // tab bar
+            Constraint::Length(2), // tab bar (labels + bottom border)
             Constraint::Min(0),    // content area
             Constraint::Length(1), // footer
         ])
@@ -204,7 +222,7 @@ pub fn render(frame: &mut ratatui::Frame, app: &Application, state: &DashboardSt
     render_header(frame, chunks[0], state);
     render_tab_bar(frame, chunks[1], app);
     render_content(frame, chunks[2], app, state);
-    render_footer(frame, chunks[3]);
+    render_footer(frame, chunks[3], app);
 }
 
 /// Renders the single-line header: fund name and last-updated timestamp.
@@ -238,58 +256,51 @@ fn render_tab_bar(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: 
     frame.render_widget(tab_bar, area);
 }
 
-/// Renders a placeholder content area for the currently selected tab.
+/// Renders the content area for the currently selected tab.
 ///
-/// Full per-tab rendering is implemented in PR 2. Until then, the content
-/// area shows either a database error or a "loading" / placeholder message.
+/// Shows a loading or error overlay until the first successful poll. Once data
+/// is available, dispatches to the appropriate view renderer. Stale data is
+/// shown normally; the header timestamp communicates freshness.
 fn render_content(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     app: &Application,
     state: &DashboardState,
 ) {
-    let text = match &state.database_error {
-        Some(error) => format!(
-            "Data unavailable — database error: {}\n\nLast successful update: {}",
-            error,
-            state
-                .last_updated
-                .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| "never".to_string()),
-        ),
-        None => {
-            if state.last_updated.is_none() {
-                "Loading data...".to_string()
-            } else {
-                let tab_name = match app.current_tab {
-                    Tab::Positions => "Positions",
-                    Tab::Performance => "Performance",
-                    Tab::Trades => "Trades",
-                    Tab::Predictions => "Predictions",
-                    Tab::Events => "Events",
-                };
-                format!("{tab_name} — rendering coming in PR 2")
-            }
-        }
-    };
+    if state.last_updated.is_none() {
+        let text = match &state.database_error {
+            Some(error) => format!("Data unavailable — database error: {error}"),
+            None => "Loading data...".to_string(),
+        };
+        let overlay = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL))
+            .style(Style::default().fg(Color::Gray));
+        frame.render_widget(overlay, area);
+        return;
+    }
 
-    let content = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Gray));
-    frame.render_widget(content, area);
+    match app.current_tab {
+        Tab::Positions => render_positions(frame, area, state),
+        Tab::Performance => render_performance(frame, area, state),
+        Tab::Trades => render_trades(frame, area, state),
+        Tab::Predictions => render_predictions(frame, area, state),
+        Tab::Events => render_events(frame, area, state, &app.events_state),
+    }
 }
 
 /// Renders the single-line footer with keybind hints.
-fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    let footer = Paragraph::new(Line::from(vec![
-        Span::raw("1-5 switch tabs  "),
-        Span::raw("q quit  "),
-        Span::styled(
-            "ssh dashboard.oscm.company",
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
-    .style(Style::default().fg(Color::DarkGray));
+///
+/// Shows an additional `f filter` hint when the Events tab is active.
+fn render_footer(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, app: &Application) {
+    let mut spans = vec![Span::raw("1-5 switch tabs  "), Span::raw("q quit  ")];
+    if app.current_tab == Tab::Events {
+        spans.push(Span::raw("f filter  "));
+    }
+    spans.push(Span::styled(
+        "ssh dashboard.oscm.company",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let footer = Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
@@ -441,13 +452,32 @@ mod tests {
     }
 
     #[test]
-    fn test_render_shows_database_error() {
+    fn test_render_shows_database_error_before_first_poll() {
         let app = Application::new();
         let mut state = DashboardState::default();
         state.database_error = Some("connection refused".to_string());
+        // last_updated is still None → overlay shown
         let output = render_to_string(120, 40, &app, &state);
         assert!(output.contains("database error"));
         assert!(output.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_render_footer_shows_filter_hint_on_events_tab() {
+        let mut app = Application::new();
+        app.current_tab = Tab::Events;
+        let state = DashboardState::default();
+        let output = render_to_string(120, 40, &app, &state);
+        assert!(output.contains("filter"));
+    }
+
+    #[test]
+    fn test_render_footer_no_filter_hint_on_positions_tab() {
+        let app = Application::new(); // Positions tab
+        let state = DashboardState::default();
+        let output = render_to_string(120, 40, &app, &state);
+        // "filter" should not appear in footer on non-Events tabs
+        assert!(!output.contains("filter"));
     }
 
     #[test]
