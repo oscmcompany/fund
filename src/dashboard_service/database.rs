@@ -339,14 +339,17 @@ async fn fetch_latest_model_run_information(
 
     match row {
         None => Ok(None),
-        Some(row) => Ok(Some(ModelRunInformation {
-            completed_at: row.try_get("completed_at")?,
-            start_date: row.try_get("start_date")?,
-            end_date: row.try_get("end_date")?,
-            continuous_ranked_probability_score: row
-                .try_get("continuous_ranked_probability_score")?,
-            directional_accuracy: row.try_get("directional_accuracy")?,
-        })),
+        Some(row) => {
+            let model_run_information = ModelRunInformation::new(
+                row.try_get("completed_at")?,
+                row.try_get("start_date")?,
+                row.try_get("end_date")?,
+                row.try_get("continuous_ranked_probability_score")?,
+                row.try_get("directional_accuracy")?,
+            )
+            .map_err(|message| sqlx::Error::Protocol(message.to_string()))?;
+            Ok(Some(model_run_information))
+        }
     }
 }
 

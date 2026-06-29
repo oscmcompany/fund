@@ -113,11 +113,56 @@ pub struct PeriodReturns {
 /// Metadata from the most recently completed model run (Tab 4 header).
 #[derive(Debug, Clone)]
 pub struct ModelRunInformation {
-    pub completed_at: DateTime<Utc>,
-    pub start_date: chrono::NaiveDate,
-    pub end_date: chrono::NaiveDate,
-    pub continuous_ranked_probability_score: Option<f64>,
-    pub directional_accuracy: Option<f64>,
+    completed_at: DateTime<Utc>,
+    start_date: Option<chrono::NaiveDate>,
+    end_date: Option<chrono::NaiveDate>,
+    continuous_ranked_probability_score: Option<f64>,
+    directional_accuracy: Option<f64>,
+}
+
+impl ModelRunInformation {
+    /// Constructs a `ModelRunInformation`, validating that `start_date < end_date` when both are
+    /// provided. Returns an error if the date range is invalid.
+    pub fn new(
+        completed_at: DateTime<Utc>,
+        start_date: Option<chrono::NaiveDate>,
+        end_date: Option<chrono::NaiveDate>,
+        continuous_ranked_probability_score: Option<f64>,
+        directional_accuracy: Option<f64>,
+    ) -> Result<Self, &'static str> {
+        if let (Some(start), Some(end)) = (start_date, end_date) {
+            if start >= end {
+                return Err("start_date must be before end_date");
+            }
+        }
+        Ok(Self {
+            completed_at,
+            start_date,
+            end_date,
+            continuous_ranked_probability_score,
+            directional_accuracy,
+        })
+    }
+
+    pub fn completed_at(&self) -> DateTime<Utc> {
+        self.completed_at
+    }
+
+    pub fn start_date(&self) -> Option<chrono::NaiveDate> {
+        self.start_date
+    }
+
+    pub fn end_date(&self) -> Option<chrono::NaiveDate> {
+        self.end_date
+    }
+
+    pub fn continuous_ranked_probability_score(&self) -> Option<f64> {
+        self.continuous_ranked_probability_score
+    }
+
+    pub fn directional_accuracy(&self) -> Option<f64> {
+        self.directional_accuracy
+    }
 }
 
 /// A single event received from the Postgres `events` NOTIFY channel (Tab 5).
@@ -308,16 +353,36 @@ mod tests {
     #[test]
     fn test_model_run_information_fields() {
         use chrono::NaiveDate;
-        let info = ModelRunInformation {
-            completed_at: Utc::now(),
-            start_date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-            end_date: NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
-            continuous_ranked_probability_score: Some(0.123),
-            directional_accuracy: Some(0.725),
-        };
-        assert!(info.continuous_ranked_probability_score.is_some());
-        assert!(info.directional_accuracy.is_some());
-        assert!(info.start_date < info.end_date);
+        let info = ModelRunInformation::new(
+            Utc::now(),
+            Some(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+            Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
+            Some(0.123),
+            Some(0.725),
+        )
+        .unwrap();
+        assert!(info.continuous_ranked_probability_score().is_some());
+        assert!(info.directional_accuracy().is_some());
+        assert!(info.start_date().unwrap() < info.end_date().unwrap());
+    }
+
+    #[test]
+    fn test_model_run_information_rejects_invalid_date_range() {
+        use chrono::NaiveDate;
+        let result = ModelRunInformation::new(
+            Utc::now(),
+            Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
+            Some(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_model_run_information_allows_null_dates() {
+        let result = ModelRunInformation::new(Utc::now(), None, None, None, None);
+        assert!(result.is_ok());
     }
 
     #[test]

@@ -140,10 +140,10 @@ fn build_positions_title(state: &DashboardState) -> Line<'static> {
 /// Red when older than [`REBALANCE_STALE_MINUTES`], yellow when older than
 /// [`REBALANCE_WARNING_MINUTES`], green otherwise.
 fn rebalance_age_style(completed_at: chrono::DateTime<Utc>) -> Style {
-    let minutes = (Utc::now() - completed_at).num_minutes();
-    if minutes > REBALANCE_STALE_MINUTES {
+    let age = Utc::now() - completed_at;
+    if age > chrono::Duration::minutes(REBALANCE_STALE_MINUTES) {
         Style::default().fg(Color::Red)
-    } else if minutes > REBALANCE_WARNING_MINUTES {
+    } else if age > chrono::Duration::minutes(REBALANCE_WARNING_MINUTES) {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Green)
