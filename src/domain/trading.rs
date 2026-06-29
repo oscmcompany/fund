@@ -163,6 +163,7 @@ pub enum CloseReason {
 }
 
 impl CloseReason {
+    /// Returns the database string identifier for this close reason.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ProfitTaken => "profit_taken",

@@ -185,7 +185,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, &predicted_return)| {
-                let letter = (b'A' + (index as u8 % 26)) as char;
+                let letter = (b'A' + (index % 26) as u8) as char;
                 Signal {
                     ticker: Ticker::new(&format!("TST{letter}")).unwrap(),
                     confidence: Percent::new(0.8).unwrap(),
