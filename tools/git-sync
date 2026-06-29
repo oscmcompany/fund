@@ -92,7 +92,7 @@ build_and_install_dashboard_service() {
   log "Building dashboard_service binary"
   cd "$REPO_ROOT"
   local build_log="/tmp/dashboard_service_build.log"
-  if devenv shell -- cargo build --release --bin dashboard_service > "$build_log" 2>&1; then
+  if devenv shell -- cargo build --release --features dashboard_service --bin dashboard_service > "$build_log" 2>&1; then
     mkdir -p "$HOME/.local/bin"
     install -m 755 "$REPO_ROOT/target/release/dashboard_service" "$HOME/.local/bin/dashboard_service"
     log "Installed dashboard_service to $HOME/.local/bin/dashboard_service"
