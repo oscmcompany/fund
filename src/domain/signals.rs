@@ -1,5 +1,6 @@
 //! Regime classification and signal gating types.
 
+use crate::domain::market::Ticker;
 use crate::domain::primitives::Percent;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +41,7 @@ pub struct ConfidenceFloor(pub Percent);
 /// A single equity signal from the ensemble model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
-    pub ticker: String,
+    pub ticker: Ticker,
     /// Ensemble confidence in this signal, in `[0.0, 1.0]`.
     pub confidence: Percent,
     /// Predicted price return for the next period.
@@ -183,10 +184,13 @@ mod tests {
         returns
             .iter()
             .enumerate()
-            .map(|(index, &predicted_return)| Signal {
-                ticker: format!("TICK{}", index),
-                confidence: Percent::new(0.8).unwrap(),
-                predicted_return,
+            .map(|(index, &predicted_return)| {
+                let letter = (b'A' + (index % 26) as u8) as char;
+                Signal {
+                    ticker: Ticker::new(&format!("TST{letter}")).unwrap(),
+                    confidence: Percent::new(0.8).unwrap(),
+                    predicted_return,
+                }
             })
             .collect()
     }

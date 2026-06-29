@@ -91,7 +91,14 @@ fn render_trades_table(
                         .map(format_holding_duration)
                         .unwrap_or_else(|| "—".to_string()),
                 ),
-                Cell::from(trade.close_reason.as_deref().unwrap_or("—").to_string()),
+                Cell::from(
+                    trade
+                        .close_reason
+                        .as_ref()
+                        .map(|reason| reason.as_str())
+                        .unwrap_or("—")
+                        .to_string(),
+                ),
                 Cell::from(
                     trade
                         .closed_at
@@ -178,6 +185,7 @@ mod tests {
 
     use crate::dashboard_service::cache::{ClosedTrade, DashboardState};
     use crate::domain::market::{PairID, Ticker};
+    use crate::domain::trading::CloseReason;
 
     fn render_to_string(width: u16, height: u16, state: &DashboardState) -> String {
         let backend = TestBackend::new(width, height);
@@ -209,7 +217,7 @@ mod tests {
             realized_profit_and_loss: profit_and_loss.map(|v| Decimal::new(v, 0)),
             return_percent: return_percent.map(|s| s.parse::<Decimal>().expect("valid decimal")),
             holding_seconds,
-            close_reason: Some("profit_taken".to_string()),
+            close_reason: Some(CloseReason::ProfitTaken),
             closed_at: Some(Utc::now()),
         }
     }

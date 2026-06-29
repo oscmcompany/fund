@@ -19,7 +19,9 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use crate::common::events::EventType;
 use crate::domain::market::{PairID, Ticker};
+use crate::domain::trading::CloseReason;
 
 /// How often the background task refreshes all static view data from Postgres.
 const POLL_INTERVAL_SECONDS: u64 = 30;
@@ -65,7 +67,7 @@ pub struct ClosedTrade {
     pub return_percent: Option<Decimal>,
     /// Seconds the position was held; computed from `opened_at`/`closed_at` timestamps.
     pub holding_seconds: Option<i64>,
-    pub close_reason: Option<String>,
+    pub close_reason: Option<CloseReason>,
     pub closed_at: Option<DateTime<Utc>>,
 }
 
@@ -169,7 +171,7 @@ impl ModelRunInformation {
 #[derive(Debug, Clone)]
 pub struct EventEntry {
     pub event_id: i64,
-    pub event_type: String,
+    pub event_type: EventType,
     pub payload: serde_json::Value,
     pub received_at: DateTime<Utc>,
 }
@@ -297,15 +299,22 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
                             warn!("Event notification missing event_id field");
                             continue;
                         };
-                        let Some(event_type) =
+                        let Some(event_type_str) =
                             parsed.get("event_type").and_then(serde_json::Value::as_str)
                         else {
                             warn!("Event notification missing event_type field");
                             continue;
                         };
+                        let Some(event_type) = EventType::parse(event_type_str) else {
+                            warn!(
+                                event_type = event_type_str,
+                                "Unknown event type in notification, skipping"
+                            );
+                            continue;
+                        };
                         let entry = EventEntry {
                             event_id,
-                            event_type: event_type.to_string(),
+                            event_type,
                             payload: parsed
                                 .get("payload")
                                 .cloned()
@@ -389,12 +398,12 @@ mod tests {
     fn test_event_entry_fields() {
         let entry = EventEntry {
             event_id: 42,
-            event_type: "portfolio_rebalance_completed".to_string(),
+            event_type: EventType::PortfolioRebalanceCompleted,
             payload: serde_json::json!({"session_id": "abc"}),
             received_at: Utc::now(),
         };
         assert_eq!(entry.event_id, 42);
-        assert_eq!(entry.event_type, "portfolio_rebalance_completed");
+        assert_eq!(entry.event_type, EventType::PortfolioRebalanceCompleted);
         assert_eq!(entry.payload["session_id"], "abc");
     }
 
@@ -418,7 +427,7 @@ mod tests {
             realized_profit_and_loss: Some(rust_decimal::Decimal::new(500, 0)),
             return_percent: Some(rust_decimal::Decimal::new(5, 2)),
             holding_seconds: Some(3600),
-            close_reason: Some("profit_taken".to_string()),
+            close_reason: Some(CloseReason::ProfitTaken),
             closed_at: Some(Utc::now()),
         };
         assert_eq!(trade.pair_id.as_str(), "TSLA-NVDA");
