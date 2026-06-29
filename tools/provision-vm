@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # --------------------------------------------------------------------------- #
-# install.sh -- Provision a fund VM on exe.dev from a local machine
+# provision-vm -- Provision a fund VM on exe.dev from a local machine
 #
-# Run locally:  bash tools/install.sh
+# Run locally:  bash tools/provision-vm
 # --------------------------------------------------------------------------- #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

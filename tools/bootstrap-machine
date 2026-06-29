@@ -12,7 +12,7 @@ OS="$(uname -s)"
 usage() {
   echo "Usage: $(basename "$0") --profile <name> [--production] [--noninteractive]"
   echo ""
-  echo "Bootstrap a fresh machine for the fund development environment."
+  echo "Bootstrap a fresh machine for the fund environment."
   echo ""
   echo "Options:"
   echo "  --profile <name>    Fund profile (e.g., development/chris.addy, production) [required]"
