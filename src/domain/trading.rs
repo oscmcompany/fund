@@ -148,6 +148,48 @@ impl SnapshotType {
     }
 }
 
+/// Reason a long-short pair position was closed.
+///
+/// Mirrors the `CHECK` constraint on `equity_pairs.close_reason`:
+/// `('profit_taken', 'stop_loss', 'rebalance', 'end_of_day')`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    ProfitTaken,
+    StopLoss,
+    Rebalance,
+    EndOfDay,
+}
+
+impl CloseReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProfitTaken => "profit_taken",
+            Self::StopLoss => "stop_loss",
+            Self::Rebalance => "rebalance",
+            Self::EndOfDay => "end_of_day",
+        }
+    }
+
+    /// Parses a stored database value. Returns `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "profit_taken" => Some(Self::ProfitTaken),
+            "stop_loss" => Some(Self::StopLoss),
+            "rebalance" => Some(Self::Rebalance),
+            "end_of_day" => Some(Self::EndOfDay),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Groups one full rebalance cycle from allocation through order submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityRebalanceSession {
@@ -713,6 +755,45 @@ mod tests {
 
     fn make_pair_id() -> PairID {
         PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap())
+    }
+
+    #[test]
+    fn test_close_reason_round_trip() {
+        for reason in [
+            CloseReason::ProfitTaken,
+            CloseReason::StopLoss,
+            CloseReason::Rebalance,
+            CloseReason::EndOfDay,
+        ] {
+            assert_eq!(CloseReason::parse(reason.as_str()), Some(reason.clone()));
+            let serialized = serde_json::to_string(&reason).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", reason.as_str()));
+            let deserialized: CloseReason = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, reason);
+        }
+    }
+
+    #[test]
+    fn test_close_reason_parse_rejects_unknown() {
+        assert_eq!(CloseReason::parse("expired"), None);
+        assert_eq!(CloseReason::parse("PROFIT_TAKEN"), None);
+    }
+
+    #[test]
+    fn test_close_reason_display() {
+        assert_eq!(CloseReason::ProfitTaken.to_string(), "profit_taken");
+        assert_eq!(CloseReason::StopLoss.to_string(), "stop_loss");
+        assert_eq!(CloseReason::Rebalance.to_string(), "rebalance");
+        assert_eq!(CloseReason::EndOfDay.to_string(), "end_of_day");
+    }
+
+    #[test]
+    fn test_close_reason_matches_schema_check_constraint() {
+        // Values must exactly match the CHECK constraint in schema.sql.
+        assert_eq!(CloseReason::ProfitTaken.as_str(), "profit_taken");
+        assert_eq!(CloseReason::StopLoss.as_str(), "stop_loss");
+        assert_eq!(CloseReason::Rebalance.as_str(), "rebalance");
+        assert_eq!(CloseReason::EndOfDay.as_str(), "end_of_day");
     }
 
     #[test]

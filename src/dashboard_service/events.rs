@@ -151,7 +151,7 @@ fn render_event_list(
     let items: Vec<ListItem> = state
         .events
         .iter()
-        .filter(|entry| events_state.filter.matches(&entry.event_type))
+        .filter(|entry| events_state.filter.matches(entry.event_type.as_str()))
         .map(|entry| {
             let time = entry.received_at.format("%H:%M:%S").to_string();
             let payload_summary = truncate_payload(&entry.payload);
@@ -159,7 +159,7 @@ fn render_event_list(
                 Span::styled(format!("{time}  "), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:<42}", entry.event_type),
-                    event_type_style(&entry.event_type),
+                    event_type_style(entry.event_type.as_str()),
                 ),
                 Span::styled(payload_summary, Style::default().fg(Color::DarkGray)),
             ]))
@@ -216,6 +216,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    use crate::common::events::EventType;
     use crate::dashboard_service::cache::{DashboardState, EventEntry};
 
     fn render_to_string(
@@ -242,7 +243,8 @@ mod tests {
     fn make_event(event_type: &str) -> EventEntry {
         EventEntry {
             event_id: 1,
-            event_type: event_type.to_string(),
+            event_type: EventType::parse(event_type)
+                .unwrap_or_else(|| panic!("unknown test event type: {event_type}")),
             payload: serde_json::json!({"session_id": "abc"}),
             received_at: Utc::now(),
         }
