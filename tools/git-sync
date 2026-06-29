@@ -72,6 +72,14 @@ stop_devenv() {
   if [[ -n "$DEVENV_PID" ]] && kill -0 "$DEVENV_PID" 2>/dev/null; then
     log "Stopping devenv (PID $DEVENV_PID)"
     kill "$DEVENV_PID" 2>/dev/null || true
+    local deadline=$((SECONDS + 15))
+    while kill -0 "$DEVENV_PID" 2>/dev/null && [[ $SECONDS -lt $deadline ]]; do
+      sleep 1
+    done
+    if kill -0 "$DEVENV_PID" 2>/dev/null; then
+      log "devenv did not exit after 15s, sending SIGKILL"
+      kill -9 "$DEVENV_PID" 2>/dev/null || true
+    fi
     wait "$DEVENV_PID" 2>/dev/null || true
     DEVENV_PID=""
   fi
@@ -84,8 +92,10 @@ cd "$REPO_ROOT"
 
 # Source .env so FUND_PROFILE is set during Nix evaluation
 if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
   # shellcheck disable=SC1091
   source "$REPO_ROOT/.env"
+  set +a
   log "Loaded .env (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
 else
   log "WARNING: no .env found, FUND_PROFILE will be empty"

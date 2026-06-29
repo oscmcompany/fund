@@ -72,7 +72,7 @@ ensure_nix_trusted_user() {
 
   # Check whether the user is already trusted in either config file
   for conf in "$custom_conf" "$nix_conf"; do
-    if [[ -f "$conf" ]] && grep -qE "^trusted-users\s*=.*\b${user}\b" "$conf"; then
+    if [[ -f "$conf" ]] && grep -qE "^trusted-users[[:space:]]*=.*\b${user}\b" "$conf"; then
       return 0
     fi
   done
@@ -85,8 +85,12 @@ ensure_nix_trusted_user() {
     target="$custom_conf"
   fi
 
-  if [[ -f "$target" ]] && grep -qE "^trusted-users\s*=" "$target"; then
-    sudo sed -i "s/^trusted-users\s*=.*/& $user/" "$target"
+  if [[ -f "$target" ]] && grep -qE "^trusted-users[[:space:]]*=" "$target"; then
+    if [[ "$OS" == "Darwin" ]]; then
+      sudo sed -i '' -E "s/^trusted-users[[:space:]]*=.*/& $user/" "$target"
+    else
+      sudo sed -i -E "s/^trusted-users[[:space:]]*=.*/& $user/" "$target"
+    fi
   else
     echo "trusted-users = root $user" | sudo tee -a "$target" >/dev/null
   fi
@@ -197,6 +201,9 @@ else
   echo "Installing AWS CLI (required for secretspec)..."
   case "$OS" in
     Linux)
+      if ! command -v unzip &>/dev/null; then
+        sudo apt-get install -y -qq unzip 2>/dev/null || nix profile add nixpkgs#unzip
+      fi
       curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
       unzip -qo /tmp/awscliv2.zip -d /tmp
       sudo /tmp/aws/install
@@ -247,7 +254,8 @@ fi
 # 6b. Validate secretspec profile is defined
 # --------------------------------------------------------------------------- #
 if [[ "$PROFILE" != "production" ]]; then
-  if ! grep -qF "[profiles.\"${PROFILE}\"]" "$REPO_ROOT/secretspec.toml"; then
+  if ! grep -qF "[profiles.\"${PROFILE}\"]" "$REPO_ROOT/secretspec.toml" && \
+     ! grep -qF "[profiles.${PROFILE}]" "$REPO_ROOT/secretspec.toml"; then
     echo "Error: Profile '${PROFILE}' is not defined in secretspec.toml."
     echo "  Add a [profiles.\"${PROFILE}\"] section to secretspec.toml, commit it,"
     echo "  then re-run bootstrap."
@@ -323,7 +331,11 @@ devenv shell -- echo "devenv environment built successfully"
 # --------------------------------------------------------------------------- #
 if [[ "$PRODUCTION" == true ]]; then
   echo "Validating secrets via secretspec..."
-  devenv shell -- secretspec check || echo "Run 'secretspec set <KEY>' to populate missing secrets"
+  if ! devenv shell -- secretspec check; then
+    echo "Error: Production secrets are missing or invalid."
+    echo "Run 'devenv shell -- secretspec set <KEY>' to populate missing secrets."
+    exit 1
+  fi
 fi
 
 # --------------------------------------------------------------------------- #

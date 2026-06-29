@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VM_NAME=""
 MODE=""
-DEV_NAME=""
+DEV_PROFILE=""
 AWS_ACCESS_KEY=""
 AWS_SECRET_KEY=""
 AWS_REGION=""
@@ -127,11 +127,11 @@ phase_collect() {
     *) fail "Invalid mode selection: $mode_choice" ;;
   esac
 
-  # Developer name (dev mode only)
+  # Developer profile (dev mode only)
   if [[ "$MODE" == "dev" ]]; then
     echo ""
-    echo "Known developer profiles: chris, john"
-    DEV_NAME="$(prompt "Developer name" "chris")"
+    echo "Known developer profiles: development/chris.addy, development/john.forstmeier"
+    DEV_PROFILE="$(prompt "Developer profile" "development/chris.addy")"
   fi
 
   # Tags
@@ -165,11 +165,10 @@ phase_collect() {
   echo "  VM name:    $VM_NAME"
   echo "  Mode:       $MODE"
   echo "  AWS key:    ${AWS_ACCESS_KEY:0:8}..."
-  echo "  AWS secret: ${AWS_SECRET_KEY:0:4}********************"
+  echo "  AWS secret: ********************"
   echo "  AWS region: $AWS_REGION"
   if [[ "$MODE" == "dev" ]]; then
-    echo "  Developer:  $DEV_NAME"
-    echo "  Profile:    dev/$DEV_NAME"
+    echo "  Profile:    $DEV_PROFILE"
   else
     echo "  Profile:    production"
   fi
@@ -302,11 +301,9 @@ phase_bootstrap() {
     fail "Repository clone verification failed"
   fi
 
-  # Checkout branch
-  if [[ "$VM_BRANCH" != "master" ]]; then
-    echo "Checking out branch $VM_BRANCH..."
-    remote "cd ~/fund && git checkout $VM_BRANCH"
-  fi
+  # Checkout the requested branch
+  echo "Checking out branch $VM_BRANCH..."
+  remote "cd ~/fund && git checkout $VM_BRANCH"
   echo "Repository ready (branch: $VM_BRANCH)"
 
   # --- 3d: Run bootstrap-machine ---
@@ -314,9 +311,9 @@ phase_bootstrap() {
 
   local bootstrap_args="--noninteractive"
   if [[ "$MODE" == "prod" ]]; then
-    bootstrap_args="--profile production --prod $bootstrap_args"
+    bootstrap_args="--profile production --production $bootstrap_args"
   else
-    bootstrap_args="--profile dev/$DEV_NAME $bootstrap_args"
+    bootstrap_args="--profile $DEV_PROFILE $bootstrap_args"
   fi
 
   # shellcheck disable=SC2086
@@ -375,7 +372,7 @@ phase_dropin() {
     echo "  Profile:  production"
     echo "  Services: running in tmux session 'fund'"
   else
-    echo "  Profile:  dev/$DEV_NAME"
+    echo "  Profile:  $DEV_PROFILE"
   fi
   echo "  Tags:     ${VM_TAGS[*]}"
   echo ""
