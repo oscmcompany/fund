@@ -177,6 +177,12 @@ else
   echo "devenv hook already in ~/.bashrc"
 fi
 
+if ! grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+  echo "Added \$HOME/.local/bin to PATH in ~/.bashrc"
+fi
+mkdir -p "$HOME/.local/bin"
+
 # --------------------------------------------------------------------------- #
 # 4. Install secretspec (secrets management for devenv services)
 # --------------------------------------------------------------------------- #
@@ -336,6 +342,18 @@ if [[ "$PRODUCTION" == true ]]; then
     echo "Run 'devenv shell -- secretspec set <KEY>' to populate missing secrets."
     exit 1
   fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 11. Build and install dashboard_service (production only)
+# --------------------------------------------------------------------------- #
+if [[ "$PRODUCTION" == true ]]; then
+  step "Building and installing dashboard_service binary"
+  cd "$REPO_ROOT"
+  mkdir -p "$HOME/.local/bin"
+  devenv shell -- cargo build --release --features dashboard_service --bin dashboard_service
+  install -m 755 "$REPO_ROOT/target/release/dashboard_service" "$HOME/.local/bin/dashboard_service"
+  echo "dashboard_service installed to $HOME/.local/bin/dashboard_service"
 fi
 
 # --------------------------------------------------------------------------- #
