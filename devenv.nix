@@ -703,12 +703,6 @@ in {
       MLFLOW_TRACKING_URI = "";
       PREFECT_API_URL = "";
     };
-
-    scripts.train-tide-model-local.exec = ''
-      set -euo pipefail
-      echo "Running local training pipeline (Rust + burn)"
-      cargo run --release --no-default-features --features train --bin tide_model_trainer
-    '';
   };
 
   enterShell = ''
