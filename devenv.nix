@@ -58,64 +58,64 @@ in {
   };
 
   git-hooks.hooks = {
-    rust-checks = {
+    check-rust = {
       enable = true;
       name = "Check all Rust code";
-      entry = "rust-checks";
+      entry = "check-rust";
       files = "(\\.rs|Cargo\\.(toml|lock))$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    markdown-checks = {
+    check-markdown = {
       enable = true;
       name = "Check all Markdown code";
-      entry = "markdown-checks";
+      entry = "check-markdown";
       files = "\\.md$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    yaml-checks = {
+    check-yaml = {
       enable = true;
       name = "Check all YAML code";
-      entry = "yaml-checks";
+      entry = "check-yaml";
       files = "\\.(yaml|yml)$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    toml-checks = {
+    check-toml = {
       enable = true;
       name = "Check all TOML code";
-      entry = "toml-checks";
+      entry = "check-toml";
       files = "\\.toml$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    sql-checks = {
+    check-sql = {
       enable = true;
       name = "Check all SQL code";
-      entry = "sql-checks";
+      entry = "check-sql";
       files = "\\.sql$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    nix-lint = {
+    check-nix = {
       enable = true;
       name = "Check all Nix code";
-      entry = "nix-lint";
+      entry = "check-nix";
       files = "\\.nix$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
     };
-    sqlx-prepare-check = {
+    check-sqlx = {
       enable = true;
       name = "Check sqlx query metadata cache";
-      entry = "sqlx-prepare-check";
+      entry = "check-sqlx";
       files = "\\.rs$|schema\\.sql$";
       pass_filenames = false;
       language = "system";
@@ -205,7 +205,7 @@ in {
   # database:reset  — drop and recreate the empty fund database; run before database:create
   #                   after a breaking schema change.
 
-  scripts.database-restore.exec = ''
+  scripts.restore-database.exec = ''
     set -euo pipefail
     ${runtimeEnv}
     BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
@@ -222,7 +222,7 @@ in {
     echo "Database restored"
   '';
 
-  scripts.database-backup.exec = ''
+  scripts.backup-database.exec = ''
     set -euo pipefail
     ${runtimeEnv}
     BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
@@ -235,7 +235,7 @@ in {
     echo "Database backup complete"
   '';
 
-  scripts.database-fetch-equity-details.exec = ''
+  scripts.fetch-database-equity-details.exec = ''
     set -euo pipefail
     ${runtimeEnv}
     echo "Downloading equity details from S3..."
@@ -273,7 +273,7 @@ in {
     echo "Equity details loaded"
   '';
 
-  scripts.database-fetch-equity-bars.exec = ''
+  scripts.fetch-database-equity-bars.exec = ''
     set -euo pipefail
 
     if [ -z "''${BACKFILL_START_DATE:-}" ]; then
@@ -319,7 +319,7 @@ in {
     echo "All dates processed ($request_count requests)"
   '';
 
-  scripts.database-reset.exec = ''
+  scripts.reset-database.exec = ''
     set -euo pipefail
     echo "Resetting fund database..."
     psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
@@ -327,7 +327,7 @@ in {
     echo "Fund database reset"
   '';
 
-  scripts.aws-buckets.exec = ''
+  scripts.list-aws-buckets.exec = ''
     set -euo pipefail
     ${runtimeEnv}
     unset AWS_ENDPOINT_URL
@@ -338,7 +338,7 @@ in {
     printf '%s\n' "$buckets" | grep fund || echo "No fund buckets found"
   '';
 
-  scripts.aws-secrets.exec = ''
+  scripts.list-aws-secrets.exec = ''
     set -euo pipefail
     unset AWS_ENDPOINT_URL
     echo "=== Fund Secrets ==="
@@ -350,21 +350,21 @@ in {
 
   # --- Development check scripts ---
 
-  scripts.rust-format.exec = ''
+  scripts.format-rust.exec = ''
     set -euo pipefail
     echo "Checking Rust code formatting"
     cargo fmt --all -- --check
     echo "Rust code formatting check passed"
   '';
 
-  scripts.rust-lint.exec = ''
+  scripts.lint-rust.exec = ''
     set -euo pipefail
     echo "Running Rust lint checks"
     cargo clippy --workspace --all-features --all-targets
     echo "Rust linting completed successfully"
   '';
 
-  scripts.rust-test.exec = ''
+  scripts.test-rust.exec = ''
     set -euo pipefail
     echo "Running Rust tests"
 
@@ -389,15 +389,15 @@ in {
     echo "Rust tests with coverage completed successfully"
   '';
 
-  scripts.rust-checks.exec = ''
+  scripts.check-rust.exec = ''
     devenv tasks run checks:rust
   '';
 
-  scripts.sqlx-prepare-check.exec = ''
+  scripts.check-sqlx.exec = ''
     set -euo pipefail
     if ! pg_isready -q 2>/dev/null; then
       echo "sqlx prepare check skipped: database not available"
-      echo "Run 'devenv --profile applications up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
+      echo "Run 'devenv --profile application up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
       exit 0
     fi
     echo "Checking sqlx query metadata cache is up to date"
@@ -405,7 +405,7 @@ in {
     echo "sqlx prepare check passed"
   '';
 
-  scripts.markdown-checks.exec = ''
+  scripts.check-markdown.exec = ''
     set -euo pipefail
     echo "Running Markdown lint checks"
     markdownlint "**/*.md" --ignore ".venv" \
@@ -413,14 +413,14 @@ in {
     echo "Markdown checks completed successfully"
   '';
 
-  scripts.yaml-checks.exec = ''
+  scripts.check-yaml.exec = ''
     set -euo pipefail
     echo "Running YAML lint checks"
     yamllint .
     echo "YAML checks completed successfully"
   '';
 
-  scripts.toml-checks.exec = ''
+  scripts.check-toml.exec = ''
     set -euo pipefail
     echo "Running TOML checks"
     find . \
@@ -430,14 +430,14 @@ in {
     echo "TOML checks completed successfully"
   '';
 
-  scripts.sql-checks.exec = ''
+  scripts.check-sql.exec = ''
     set -euo pipefail
     echo "Running SQL checks"
     sqlfluff lint .
     echo "SQL checks completed successfully"
   '';
 
-  scripts.nix-lint.exec = ''
+  scripts.check-nix.exec = ''
     set -euo pipefail
     echo "Checking Nix code formatting"
     alejandra --check --exclude ./.devenv --exclude ./.venv --exclude ./target .
@@ -447,7 +447,7 @@ in {
     echo "Nix checks completed successfully"
   '';
 
-  scripts.bump-deps.exec = ''
+  scripts.bump-rust-dependencies.exec = ''
     set -euo pipefail
     echo "Bumping all dependencies..."
     echo "=== Rust ==="
@@ -462,11 +462,16 @@ in {
     '{}')"
   '';
 
-  scripts.backfill-equity-bars.exec = ''
+  scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm";
+  scripts.provision-production-application-vm.exec = "bash tools/provision-application-vm --production";
+  scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm";
+  scripts.provision-production-trainer-vm.exec = "bash tools/provision-trainer-vm --production";
+
+  scripts.backfill-s3-equity-bars.exec = ''
     set -euo pipefail
 
     if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-equity-bars"
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-s3-equity-bars"
       echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
       exit 1
     fi
@@ -485,24 +490,24 @@ in {
   tasks = {
     # --- Rust checks (lint and test run in parallel after format) ---
 
-    "checks:rust:format".exec = "rust-format";
+    "checks:rust:format".exec = "format-rust";
 
     "checks:rust:lint" = {
-      exec = "rust-lint";
+      exec = "lint-rust";
       after = ["checks:rust:format"];
     };
     "checks:rust:test" = {
-      exec = "rust-test";
+      exec = "test-rust";
       after = ["checks:rust:format"];
     };
 
     # --- Standalone checks ---
 
-    "checks:markdown".exec = "markdown-checks";
-    "checks:yaml".exec = "yaml-checks";
-    "checks:toml".exec = "toml-checks";
-    "checks:sql".exec = "sql-checks";
-    "checks:nix".exec = "nix-lint";
+    "checks:markdown".exec = "check-markdown";
+    "checks:yaml".exec = "check-yaml";
+    "checks:toml".exec = "check-toml";
+    "checks:sql".exec = "check-sql";
+    "checks:nix".exec = "check-nix";
 
     # --- Model training ---
 
@@ -522,7 +527,7 @@ in {
     # Historical S3 backfill: writes Hive-partitioned parquet that model
     # training reads directly. Distinct from database:fetch-equity-bars, which
     # populates the PostgreSQL rolling buffer through the data-manager API.
-    "data:backfill-equity-bars".exec = "backfill-equity-bars";
+    "data:backfill-s3-equity-bars".exec = "backfill-s3-equity-bars";
 
     # --- Database lifecycle tasks ---
     # Three lifecycle modes:
@@ -532,19 +537,19 @@ in {
 
     # Drops and recreates the empty fund database. Run before database:create when
     # recovering from a breaking schema change.
-    "database:reset".exec = "database-reset";
+    "database:reset".exec = "reset-database";
 
     # Downloads the nightly pg_dump from S3 and restores the full database: equity
     # bars, details, predictions, model runs, and all trading history. Fast, but
     # requires the schema to match the dump exactly.
-    "database:restore".exec = "database-restore";
+    "database:restore".exec = "restore-database";
 
     # Dumps the live database and uploads it to S3. Also runs automatically via
     # pg_cron at 22:00 UTC on weekdays after all nightly exports complete.
-    "database:backup".exec = "database-backup";
+    "database:backup".exec = "backup-database";
 
-    "database:fetch-equity-details".exec = "database-fetch-equity-details";
-    "database:fetch-equity-bars".exec = "database-fetch-equity-bars";
+    "database:fetch-equity-details".exec = "fetch-database-equity-details";
+    "database:fetch-equity-bars".exec = "fetch-database-equity-bars";
 
     # Builds an inference-ready database from scratch: applies the schema, seeds
     # equity details, and backfills equity bars from the live API. Use after
@@ -558,8 +563,8 @@ in {
         exit 1
       fi
       ${applySchema}
-      database-fetch-equity-details
-      database-fetch-equity-bars
+      fetch-database-equity-details
+      fetch-database-equity-bars
     '';
 
     "checks:base" = {
@@ -590,7 +595,7 @@ in {
 
   # --- Profiles ---
 
-  profiles.applications.module = {
+  profiles.application.module = {
     env = {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
@@ -601,7 +606,7 @@ in {
       MODEL_VERSION = "latest";
     };
 
-    scripts.cleanup-services.exec = ''
+    scripts.cleanup-application-services.exec = ''
       for PORT in 8080 8082 8083; do
         PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
         if [ -n "$PID" ]; then
@@ -699,7 +704,7 @@ in {
       PREFECT_API_URL = "";
     };
 
-    scripts.train-local.exec = ''
+    scripts.train-tide-model-local.exec = ''
       set -euo pipefail
       echo "Running local training pipeline (Rust + burn)"
       cargo run --release --no-default-features --features train --bin tide_model_trainer
@@ -715,10 +720,10 @@ in {
       echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
-      echo "    devenv --profile applications up      Start application services"
+      echo "    devenv --profile application up      Start application services"
       echo "    devenv --profile ml shell     ML training environment"
       echo ""
-      echo "  Services (applications profile):"
+      echo "  Services (application profile):"
       echo "    Data Manager:      localhost:8080"
       echo "    Ensemble Manager:  localhost:8082"
       echo "    Portfolio Manager: localhost:8083"
@@ -729,8 +734,8 @@ in {
       echo "    secretspec set <KEY>      Set a secret value"
       echo ""
       echo "  AWS:"
-      echo "    aws-buckets       List fund S3 buckets"
-      echo "    aws-secrets       List fund secrets"
+      echo "    list-aws-buckets       List fund S3 buckets"
+      echo "    list-aws-secrets       List fund secrets"
       echo ""
       echo "  Tasks (devenv tasks run):"
       echo "    checks:base                    Non-language checks (nix, markdown, yaml, toml, sql)"
@@ -748,11 +753,17 @@ in {
       echo "    database:backup                Dump fund database and upload to S3 (also runs nightly at 22:00 UTC)"
       echo "    database:fetch-equity-details  Seed equity_details from S3 CSV"
       echo "    database:fetch-equity-bars     Backfill equity bars into PostgreSQL (requires BACKFILL_START_DATE)"
-      echo "    data:backfill-equity-bars      Backfill equity bars to S3 Parquet for training (requires BACKFILL_START_DATE)"
-      echo "    models:tide:train              Train tide model and upload artifacts"
+      echo "    data:backfill-s3-equity-bars         Backfill equity bars to S3 Parquet for training (requires BACKFILL_START_DATE)"
+      echo "    models:tide:train                    Train tide model and upload artifacts"
+      echo ""
+      echo "  VM provisioning:"
+      echo "    provision-development-application-vm  Provision a development application VM"
+      echo "    provision-production-application-vm   Provision a production application VM"
+      echo "    provision-development-trainer-vm      Provision a development trainer VM"
+      echo "    provision-production-trainer-vm       Provision a production trainer VM"
       echo ""
       echo "  Utilities:"
-      echo "    bump-deps           Update all dependency lockfiles"
+      echo "    bump-rust-dependencies           Update all dependency lockfiles"
     } >&2
   '';
 

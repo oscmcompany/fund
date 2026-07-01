@@ -365,11 +365,11 @@ echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  tmux new-session -d -s fund 'devenv --profile applications up'"
+  echo "  tmux new-session -d -s fund 'devenv --profile application up'"
   echo "  tmux attach -t fund        # attach to services session"
 else
   echo "  devenv shell        # enter the development environment"
-  echo "  devenv --profile applications up  # start application services"
+  echo "  devenv --profile application up  # start application services"
   echo ""
   echo "For production setup, re-run with:"
   echo "  $(basename "$0") --profile production --production"
