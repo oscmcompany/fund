@@ -80,9 +80,12 @@ import os, urllib.parse, subprocess
 url = urllib.parse.urlparse(os.environ["DATABASE_URL"])
 password = url.password or ""
 if password:
+    escaped_password = password.replace("'", "''")
     subprocess.run(
         ["psql", "-v", "ON_ERROR_STOP=1", "-h", "localhost", "-p", "5432",
-         "-d", "fund", "-c", f"ALTER ROLE dashboard_reader PASSWORD '{password}'"],
+         "-d", "fund"],
+        input=f"ALTER ROLE dashboard_reader PASSWORD '{escaped_password}';\n",
+        text=True,
         check=True,
     )
     print("Password set on dashboard_reader role")
@@ -106,7 +109,11 @@ step "Setup complete"
 echo ""
 echo "--- VM Ready ---"
 echo "  VM:       $VM_NAME.exe.xyz"
-echo "  Tag:      #${VM_TAG}"
+if [[ -n "$VM_EXTRA_TAG" ]]; then
+  echo "  Tags:     #${VM_TAG} #${VM_EXTRA_TAG}"
+else
+  echo "  Tag:      #${VM_TAG}"
+fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
 if [[ "$PRODUCTION" == true ]]; then
   echo "  Services: running in tmux session 'fund'"

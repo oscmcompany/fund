@@ -75,6 +75,8 @@ TRAINEOF
 remote "chmod +x ~/fund-train.sh"
 echo "Training wrapper written to ~/fund-train.sh"
 
+remote 'sudo mkdir -p /var/log/fund && sudo touch /var/log/fund/trainer.log && sudo chown "$(id -un):$(id -gn)" /var/log/fund /var/log/fund/trainer.log'
+
 # Install crontab entry. Preserve any existing entries unrelated to fund training.
 remote "(crontab -l 2>/dev/null | grep -v 'fund-train'; echo '0 6 * * 1-5 bash ~/fund-train.sh >> /var/log/fund/trainer.log 2>&1') | crontab -"
 echo "Cron job installed: weekdays at 06:00 UTC"
@@ -90,7 +92,11 @@ step "Setup complete"
 echo ""
 echo "--- VM Ready ---"
 echo "  VM:       $VM_NAME.exe.xyz"
-echo "  Tag:      #${VM_TAG}"
+if [[ -n "$VM_EXTRA_TAG" ]]; then
+  echo "  Tags:     #${VM_TAG} #${VM_EXTRA_TAG}"
+else
+  echo "  Tag:      #${VM_TAG}"
+fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
 echo "  Training: daily weekdays at 06:00 UTC"
 echo "  Log:      /var/log/fund/trainer.log"

@@ -247,12 +247,14 @@ phase_bootstrap() {
   step "Cloning repository on VM"
   if remote "test -d ~/fund/.git" 2>/dev/null; then
     echo "Repository already cloned, fetching latest..."
-    remote "cd ~/fund && git fetch --all"
+    remote "cd ~/fund && git fetch --all --prune"
   else
     echo "Cloning oscmcompany/fund..."
     remote "git clone https://github.com/oscmcompany/fund.git ~/fund"
   fi
-  remote "cd ~/fund && git checkout $VM_BRANCH"
+  local quoted_branch
+  printf -v quoted_branch '%q' "$VM_BRANCH"
+  remote "cd ~/fund && git checkout -B $quoted_branch origin/$quoted_branch"
   echo "Repository ready (branch: $VM_BRANCH)"
 
   step "Running bootstrap-machine on VM (this will take a while)"
@@ -272,13 +274,18 @@ phase_bootstrap() {
 
 phase_reboot() {
   step "Rebooting VM"
+  local old_boot_id
+  old_boot_id="$(remote "cat /proc/sys/kernel/random/boot_id" 2>/dev/null || true)"
   remote "sudo reboot" || true
   sleep 5
 
   local reboot_elapsed=0
   local reboot_timeout=60
   while [[ $reboot_elapsed -lt $reboot_timeout ]]; do
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$VM_NAME.exe.xyz" true 2>/dev/null; then
+    local new_boot_id
+    if new_boot_id="$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$VM_NAME.exe.xyz" \
+      "cat /proc/sys/kernel/random/boot_id" 2>/dev/null)" \
+      && [[ -z "$old_boot_id" || "$new_boot_id" != "$old_boot_id" ]]; then
       echo "VM back up after reboot"
       return 0
     fi
