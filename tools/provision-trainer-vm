@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# provision-trainer-vm -- Provision a fund model trainer VM on exe.dev
+#
+# Run locally: bash tools/provision-trainer-vm [--production]
+#
+# The trainer VM runs no persistent services. It bootstraps the devenv
+# environment and installs a cron job that runs model training daily at
+# 06:00 UTC on weekdays (one hour after equity bars are synced at 05:00 UTC).
+# --------------------------------------------------------------------------- #
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VM_ROLE="trainer"
+PRODUCTION=false
+
+usage() {
+  echo "Usage: $(basename "$0") [--production]"
+  echo ""
+  echo "Provision an oscm-fund trainer VM on exe.dev."
+  echo "Installs a daily training cron job (weekdays 06:00 UTC)."
+  echo ""
+  echo "Options:"
+  echo "  --production    Provision as a production VM (default: development)"
+  echo "  -h, --help      Show this help message"
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --production) PRODUCTION=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
+  esac
+done
+
+# shellcheck source=provision-common-vm
+source "$SCRIPT_DIR/provision-common-vm"
+
+echo "fund trainer VM provisioning"
+echo "============================="
+
+phase_collect
+phase_create_vm
+phase_bootstrap
+phase_reboot
+
+# --------------------------------------------------------------------------- #
+# Trainer-specific: install daily training cron job
+# --------------------------------------------------------------------------- #
+
+step "Installing training cron job"
+
+# Write a wrapper script that sources Nix before invoking devenv,
+# since cron runs with a minimal environment where Nix is not on PATH.
+cat << 'TRAINEOF' | remote "cat > ~/fund-train.sh"
+#!/usr/bin/env bash
+# Fund model training job - invoked by cron daily at 06:00 UTC on weekdays.
+# Equity bars are synced at 05:00 UTC, so training runs on fresh data.
+for p in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh /etc/profile.d/nix.sh; do
+  [ -f "$p" ] && . "$p" && break
+done
+cd ~/fund
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source .env
+  set +a
+fi
+devenv tasks run models:tide:train
+TRAINEOF
+
+remote "chmod +x ~/fund-train.sh"
+echo "Training wrapper written to ~/fund-train.sh"
+
+remote 'sudo mkdir -p /var/log/fund && sudo touch /var/log/fund/trainer.log && sudo chown "$(id -un):$(id -gn)" /var/log/fund /var/log/fund/trainer.log'
+
+# Install crontab entry. Preserve any existing entries unrelated to fund training.
+remote "(crontab -l 2>/dev/null | grep -v 'fund-train'; echo '0 6 * * 1-5 bash ~/fund-train.sh >> /var/log/fund/trainer.log 2>&1') | crontab -"
+echo "Cron job installed: weekdays at 06:00 UTC"
+
+phase_share_vm
+
+# --------------------------------------------------------------------------- #
+# Summary
+# --------------------------------------------------------------------------- #
+
+step "Setup complete"
+
+echo ""
+echo "--- VM Ready ---"
+echo "  VM:       $VM_NAME.exe.xyz"
+if [[ -n "$VM_EXTRA_TAG" ]]; then
+  echo "  Tags:     #${VM_TAG} #${VM_EXTRA_TAG}"
+else
+  echo "  Tag:      #${VM_TAG}"
+fi
+echo "  Profile:  $SECRETSPEC_PROFILE"
+echo "  Training: daily weekdays at 06:00 UTC"
+echo "  Log:      /var/log/fund/trainer.log"
+echo ""
+echo "Next steps:"
+echo "  ssh $VM_NAME.exe.xyz"
+echo "  devenv tasks run models:tide:train    # run training manually"
+echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+echo "-----------------"
+echo ""
+
+if confirm "Drop into VM now?"; then
+  exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
+fi
