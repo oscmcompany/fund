@@ -119,6 +119,41 @@ impl EventType {
             Self::PortfolioLiquidationErrored => "portfolio_liquidation_errored",
         }
     }
+
+    /// Parses a stored event type string. Returns `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "equity_bars_sync_requested" => Some(Self::EquityBarsSyncRequested),
+            "equity_bars_sync_started" => Some(Self::EquityBarsSyncStarted),
+            "equity_bars_sync_completed" => Some(Self::EquityBarsSyncCompleted),
+            "equity_bars_sync_errored" => Some(Self::EquityBarsSyncErrored),
+            "equity_bars_export_requested" => Some(Self::EquityBarsExportRequested),
+            "equity_bars_export_started" => Some(Self::EquityBarsExportStarted),
+            "equity_bars_export_completed" => Some(Self::EquityBarsExportCompleted),
+            "equity_bars_export_errored" => Some(Self::EquityBarsExportErrored),
+            "trading_history_export_requested" => Some(Self::TradingHistoryExportRequested),
+            "trading_history_export_started" => Some(Self::TradingHistoryExportStarted),
+            "trading_history_export_completed" => Some(Self::TradingHistoryExportCompleted),
+            "trading_history_export_errored" => Some(Self::TradingHistoryExportErrored),
+            "database_backup_requested" => Some(Self::DatabaseBackupRequested),
+            "database_backup_started" => Some(Self::DatabaseBackupStarted),
+            "database_backup_completed" => Some(Self::DatabaseBackupCompleted),
+            "database_backup_errored" => Some(Self::DatabaseBackupErrored),
+            "market_session_check" => Some(Self::MarketSessionCheck),
+            "equity_predictions_requested" => Some(Self::EquityPredictionsRequested),
+            "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
+            "equity_predictions_completed" => Some(Self::EquityPredictionsCompleted),
+            "equity_predictions_errored" => Some(Self::EquityPredictionsErrored),
+            "portfolio_rebalance_started" => Some(Self::PortfolioRebalanceStarted),
+            "portfolio_rebalance_completed" => Some(Self::PortfolioRebalanceCompleted),
+            "portfolio_rebalance_errored" => Some(Self::PortfolioRebalanceErrored),
+            "portfolio_liquidation_requested" => Some(Self::PortfolioLiquidationRequested),
+            "portfolio_liquidation_started" => Some(Self::PortfolioLiquidationStarted),
+            "portfolio_liquidation_completed" => Some(Self::PortfolioLiquidationCompleted),
+            "portfolio_liquidation_errored" => Some(Self::PortfolioLiquidationErrored),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for EventType {
@@ -288,6 +323,56 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_event_type_parse_round_trips_all_variants() {
+        // Every as_str() output must parse back to the same variant.
+        let all: &[EventType] = &[
+            EventType::EquityBarsSyncRequested,
+            EventType::EquityBarsSyncStarted,
+            EventType::EquityBarsSyncCompleted,
+            EventType::EquityBarsSyncErrored,
+            EventType::EquityBarsExportRequested,
+            EventType::EquityBarsExportStarted,
+            EventType::EquityBarsExportCompleted,
+            EventType::EquityBarsExportErrored,
+            EventType::TradingHistoryExportRequested,
+            EventType::TradingHistoryExportStarted,
+            EventType::TradingHistoryExportCompleted,
+            EventType::TradingHistoryExportErrored,
+            EventType::DatabaseBackupRequested,
+            EventType::DatabaseBackupStarted,
+            EventType::DatabaseBackupCompleted,
+            EventType::DatabaseBackupErrored,
+            EventType::MarketSessionCheck,
+            EventType::EquityPredictionsRequested,
+            EventType::EquityPredictionsStarted,
+            EventType::EquityPredictionsCompleted,
+            EventType::EquityPredictionsErrored,
+            EventType::PortfolioRebalanceStarted,
+            EventType::PortfolioRebalanceCompleted,
+            EventType::PortfolioRebalanceErrored,
+            EventType::PortfolioLiquidationRequested,
+            EventType::PortfolioLiquidationStarted,
+            EventType::PortfolioLiquidationCompleted,
+            EventType::PortfolioLiquidationErrored,
+        ];
+        for &event_type in all {
+            assert_eq!(
+                EventType::parse(event_type.as_str()),
+                Some(event_type),
+                "parse round-trip failed for {:?}",
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_event_type_parse_rejects_unknown() {
+        assert_eq!(EventType::parse("unknown_event"), None);
+        assert_eq!(EventType::parse(""), None);
+        assert_eq!(EventType::parse("EQUITY_BARS_SYNC_COMPLETED"), None);
     }
 
     #[test]
