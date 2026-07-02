@@ -92,6 +92,24 @@ pub struct PredictionRow {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Pre-computed period returns for the Performance view (Tab 2).
+///
+/// All values are percentages (e.g. `5.0` means +5%). `None` indicates
+/// insufficient snapshot history for that horizon.
+#[derive(Debug, Clone, Default)]
+pub struct PeriodReturns {
+    pub fund_one_day: Option<f64>,
+    pub fund_one_week: Option<f64>,
+    pub fund_one_month: Option<f64>,
+    pub fund_year_to_date: Option<f64>,
+    pub fund_since_inception: Option<f64>,
+    pub spy_one_day: Option<f64>,
+    pub spy_one_week: Option<f64>,
+    pub spy_one_month: Option<f64>,
+    pub spy_year_to_date: Option<f64>,
+    pub spy_since_inception: Option<f64>,
+}
+
 /// A single event received from the Postgres `events` NOTIFY channel (Tab 5).
 #[derive(Debug, Clone)]
 pub struct EventEntry {
@@ -122,6 +140,8 @@ pub struct DashboardState {
     pub closed_trades_summary: ClosedTradesSummary,
     /// Latest model quantile predictions, sorted by ticker (Tab 4).
     pub predictions: Vec<PredictionRow>,
+    /// Pre-computed period returns for the Performance view (Tab 2).
+    pub period_returns: PeriodReturns,
     /// Bounded event ring buffer, newest first (Tab 5).
     pub events: VecDeque<EventEntry>,
     /// Timestamp of the most recent successful poll. `None` until first poll completes.
@@ -150,6 +170,7 @@ pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
                     guard.gross_exposure = data.gross_exposure;
                     guard.net_exposure = data.net_exposure;
                     guard.performance_history = data.performance_history;
+                    guard.period_returns = data.period_returns;
                     guard.closed_trades = data.closed_trades;
                     guard.closed_trades_summary = data.closed_trades_summary;
                     guard.predictions = data.predictions;
