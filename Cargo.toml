@@ -33,6 +33,11 @@ name = "tide_model_trainer"
 path = "src/bin/tide_model_trainer.rs"
 required-features = ["train"]
 
+[[bin]]
+name = "dashboard_service"
+path = "src/bin/dashboard_service.rs"
+required-features = ["dashboard_service"]
+
 [features]
 default = ["data_manager", "ensemble_manager", "portfolio_manager"]
 data_manager = [
@@ -49,6 +54,7 @@ ensemble_manager = [
   "dep:tempfile",
 ]
 portfolio_manager = ["dep:chrono-tz"]
+dashboard_service = ["dep:ratatui", "dep:crossterm"]
 
 # Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
@@ -123,6 +129,10 @@ tempfile = { version = "3.27", optional = true }
 
 # train-only (optional; enabled by the `train` feature)
 rand = { version = "0.8", optional = true }
+
+# dashboard_service-only (optional; enabled by the `dashboard_service` feature)
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"

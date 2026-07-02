@@ -66,7 +66,6 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     closed_at                  TIMESTAMPTZ,
     realized_profit_and_loss   NUMERIC,
     return_percent             NUMERIC,
-    holding_days               INTEGER,
     close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'rebalance', 'end_of_day')),
     UNIQUE (pair_id, opened_at)
 );

@@ -267,7 +267,6 @@ fn create_equity_pair_dataframe(pairs: &[EquityPair]) -> Result<DataFrame, Strin
         "closed_at" => pairs.iter().map(|pair| pair.closed_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
         "realized_profit_and_loss" => pairs.iter().map(|pair| pair.realized_profit_and_loss().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
         "return_percent" => pairs.iter().map(|pair| pair.return_percent().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
-        "holding_days" => pairs.iter().map(|pair| pair.holding_days()).collect::<Vec<Option<i32>>>(),
     )
     .map_err(|error| format!("Failed to create equity pair DataFrame: {}", error))
 }
@@ -427,7 +426,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )]
     }
 
@@ -556,17 +554,17 @@ mod tests {
         let pairs = sample_pairs();
         let dataframe = create_equity_pair_dataframe(&pairs).unwrap();
         assert_eq!(dataframe.height(), 1);
-        assert_eq!(dataframe.width(), 14);
+        assert_eq!(dataframe.width(), 13);
         assert!(dataframe.column("id").is_ok());
         assert!(dataframe.column("z_score").is_ok());
-        assert!(dataframe.column("holding_days").is_ok());
+        assert!(dataframe.column("return_percent").is_ok());
     }
 
     #[test]
     fn test_create_equity_pair_dataframe_empty() {
         let dataframe = create_equity_pair_dataframe(&[]).unwrap();
         assert_eq!(dataframe.height(), 0);
-        assert_eq!(dataframe.width(), 14);
+        assert_eq!(dataframe.width(), 13);
     }
 
     #[test]
@@ -848,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_create_equity_pair_dataframe_null_optional_fields() {
-        // closed_at, realized_profit_and_loss, return_percent, holding_days are Optional
+        // closed_at, realized_profit_and_loss, return_percent are Optional
         let pairs = vec![crate::domain::trading::EquityPair::new(
             "550e8400-e29b-41d4-a716-446655440020".parse().unwrap(),
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
@@ -860,7 +858,6 @@ mod tests {
             "0.8".parse().unwrap(),
             crate::domain::trading::EquityPairStatus::Closed,
             chrono::Utc::now(),
-            None,
             None,
             None,
             None,
@@ -876,7 +873,6 @@ mod tests {
             1
         );
         assert_eq!(dataframe.column("return_percent").unwrap().null_count(), 1);
-        assert_eq!(dataframe.column("holding_days").unwrap().null_count(), 1);
     }
 
     #[test]
@@ -1317,7 +1313,6 @@ mod tests {
             Some(Utc::now()),
             Some("500".parse().unwrap()),
             Some("0.05".parse().unwrap()),
-            Some(7),
         )];
         let dataframe = create_equity_pair_dataframe(&pairs).unwrap();
         assert_eq!(dataframe.height(), 1);
@@ -1329,7 +1324,7 @@ mod tests {
             .into_no_null_iter()
             .collect();
         assert_eq!(status_values, vec!["closed"]);
-        // closed_at, realized_profit_and_loss, return_percent, holding_days all non-null
+        // closed_at, realized_profit_and_loss, return_percent all non-null
         assert_eq!(dataframe.column("closed_at").unwrap().null_count(), 0);
         assert_eq!(
             dataframe
@@ -1338,7 +1333,6 @@ mod tests {
                 .null_count(),
             0
         );
-        assert_eq!(dataframe.column("holding_days").unwrap().null_count(), 0);
     }
 
     #[test]

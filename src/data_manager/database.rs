@@ -312,7 +312,7 @@ pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::
     let rows = sqlx::query!(
         "SELECT id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio,
          signal_strength, status, opened_at, closed_at, realized_profit_and_loss,
-         return_percent, holding_days
+         return_percent
          FROM equity_pairs
          ORDER BY opened_at ASC"
     )
@@ -358,7 +358,6 @@ pub async fn query_equity_pairs(pool: &PgPool) -> Result<Vec<EquityPair>, sqlx::
                 row.closed_at,
                 row.realized_profit_and_loss,
                 row.return_percent,
-                row.holding_days,
             ))
         })
         .collect()
