@@ -352,6 +352,46 @@ phase_dropin() {
     step "Starting services in tmux session"
     remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'devenv --profile applications up'"
     echo "Services started in tmux session 'fund'"
+
+    step "Applying dashboard reader database setup"
+    local pg_elapsed=0
+    local pg_timeout=120
+    while [[ $pg_elapsed -lt $pg_timeout ]]; do
+      if remote "$NIX_SOURCE && pg_isready -h localhost -p 5432 -d fund" 2>/dev/null; then
+        echo "PostgreSQL is ready"
+        break
+      fi
+      sleep 3
+      pg_elapsed=$((pg_elapsed + 3))
+    done
+    if [[ $pg_elapsed -ge $pg_timeout ]]; then
+      echo "WARNING: PostgreSQL did not become ready after ${pg_timeout}s"
+      echo "  Apply manually: psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -d fund -f ~/fund/tools/dashboard_reader_setup.sql"
+    else
+      remote "$NIX_SOURCE && psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -d fund -f ~/fund/tools/dashboard_reader_setup.sql"
+      echo "Dashboard reader role and grants applied"
+
+      # Set the dashboard_reader password from the DATABASE_URL secret so the
+      # role can authenticate via TCP. A Python script is piped to the remote
+      # to avoid shell quoting issues when handling the password value.
+      cat << 'PYEOF' | remote "cat > /tmp/set_dashboard_reader_password.py"
+import os, urllib.parse, subprocess
+url = urllib.parse.urlparse(os.environ["DATABASE_URL"])
+password = url.password or ""
+if password:
+    subprocess.run(
+        ["psql", "-v", "ON_ERROR_STOP=1", "-h", "localhost", "-p", "5432",
+         "-d", "fund", "-c", f"ALTER ROLE dashboard_reader PASSWORD '{password}'"],
+        check=True,
+    )
+    print("Password set on dashboard_reader role")
+else:
+    print("WARNING: DATABASE_URL has no password; dashboard_reader role has no password set")
+PYEOF
+      remote "$NIX_SOURCE && cd ~/fund && devenv shell -- secretspec run --profile dashboard -- python3 /tmp/set_dashboard_reader_password.py"
+      remote "rm -f /tmp/set_dashboard_reader_password.py"
+      echo "dashboard_reader password configured"
+    fi
   fi
 
   # --- Share VM with team ---
