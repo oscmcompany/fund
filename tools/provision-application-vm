@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# provision-application-vm -- Provision a fund application VM on exe.dev
+#
+# Run locally: bash tools/provision-application-vm [--production]
+# --------------------------------------------------------------------------- #
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VM_ROLE="application"
+PRODUCTION=false
+
+usage() {
+  echo "Usage: $(basename "$0") [--production]"
+  echo ""
+  echo "Provision an oscm-fund application VM on exe.dev."
+  echo "Runs data-manager, ensemble-manager, and portfolio-manager"
+  echo "under devenv --profile application."
+  echo ""
+  echo "Options:"
+  echo "  --production    Provision as a production VM (default: development)"
+  echo "  -h, --help      Show this help message"
+  exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --production) PRODUCTION=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
+  esac
+done
+
+# shellcheck source=provision-common-vm
+source "$SCRIPT_DIR/provision-common-vm"
+
+echo "fund application VM provisioning"
+echo "================================="
+
+phase_collect
+phase_create_vm
+phase_bootstrap
+phase_reboot
+
+# --------------------------------------------------------------------------- #
+# Application-specific: start services and configure dashboard reader
+# --------------------------------------------------------------------------- #
+
+if [[ "$PRODUCTION" == true ]]; then
+  step "Starting services in tmux session"
+  remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'devenv --profile application up'"
+  echo "Services started in tmux session 'fund'"
+
+  step "Applying dashboard reader database setup"
+  local_pg_elapsed=0
+  local_pg_timeout=120
+  while [[ $local_pg_elapsed -lt $local_pg_timeout ]]; do
+    if remote "$NIX_SOURCE && pg_isready -h localhost -p 5432 -d fund" 2>/dev/null; then
+      echo "PostgreSQL is ready"
+      break
+    fi
+    sleep 3
+    local_pg_elapsed=$((local_pg_elapsed + 3))
+  done
+
+  if [[ $local_pg_elapsed -ge $local_pg_timeout ]]; then
+    echo "WARNING: PostgreSQL did not become ready after ${local_pg_timeout}s"
+    echo "  Apply manually: psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -d fund -f ~/fund/tools/dashboard_reader_setup.sql"
+  else
+    remote "$NIX_SOURCE && psql -v ON_ERROR_STOP=1 -h localhost -p 5432 -d fund -f ~/fund/tools/dashboard_reader_setup.sql"
+    echo "Dashboard reader role and grants applied"
+
+    # Set the dashboard_reader password from the DATABASE_URL secret so the
+    # role can authenticate via TCP. A Python script is piped to the remote
+    # to avoid shell quoting issues when handling the password value.
+    cat << 'PYEOF' | remote "cat > /tmp/set_dashboard_reader_password.py"
+import os, urllib.parse, subprocess
+url = urllib.parse.urlparse(os.environ["DATABASE_URL"])
+password = url.password or ""
+if password:
+    escaped_password = password.replace("'", "''")
+    subprocess.run(
+        ["psql", "-v", "ON_ERROR_STOP=1", "-h", "localhost", "-p", "5432",
+         "-d", "fund"],
+        input=f"ALTER ROLE dashboard_reader PASSWORD '{escaped_password}';\n",
+        text=True,
+        check=True,
+    )
+    print("Password set on dashboard_reader role")
+else:
+    print("WARNING: DATABASE_URL has no password; dashboard_reader role has no password set")
+PYEOF
+    remote "$NIX_SOURCE && cd ~/fund && devenv shell -- secretspec run --profile dashboard -- python3 /tmp/set_dashboard_reader_password.py"
+    remote "rm -f /tmp/set_dashboard_reader_password.py"
+    echo "dashboard_reader password configured"
+  fi
+fi
+
+phase_share_vm
+
+# --------------------------------------------------------------------------- #
+# Summary
+# --------------------------------------------------------------------------- #
+
+step "Setup complete"
+
+echo ""
+echo "--- VM Ready ---"
+echo "  VM:       $VM_NAME.exe.xyz"
+if [[ -n "$VM_EXTRA_TAG" ]]; then
+  echo "  Tags:     #${VM_TAG} #${VM_EXTRA_TAG}"
+else
+  echo "  Tag:      #${VM_TAG}"
+fi
+echo "  Profile:  $SECRETSPEC_PROFILE"
+if [[ "$PRODUCTION" == true ]]; then
+  echo "  Services: running in tmux session 'fund'"
+fi
+echo ""
+echo "Next steps:"
+echo "  ssh $VM_NAME.exe.xyz"
+if [[ "$PRODUCTION" == true ]]; then
+  echo "  tmux attach -t fund        # attach to services session"
+else
+  echo "  cd ~/fund"
+  echo "  devenv --profile application up    # start application services"
+fi
+echo "-----------------"
+echo ""
+
+if confirm "Drop into VM now?"; then
+  if [[ "$PRODUCTION" == true ]]; then
+    exec ssh -t "$VM_NAME.exe.xyz" "tmux attach -t fund"
+  else
+    exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
+  fi
+fi

@@ -25,7 +25,7 @@ devenv.nix
 │   ├── languages (Rust, Python, Nix)
 │   ├── packages (clang, uv, ruff, cargo-watch, etc.)
 │   ├── env (AWS_REGION, CC=clang, S3 bucket names, LIBRARY_PATH)
-│   ├── scripts (check scripts, aws utilities, bump-deps)
+│   ├── scripts (check scripts, aws utilities, bump-rust-dependencies)
 │   ├── tasks (checks:python, checks:rust, checks:ci)
 │   └── git-hooks (all 6 hooks)
 ├── profiles.apps (devenv --profile apps up)
@@ -34,10 +34,10 @@ devenv.nix
 │   ├── processes.portfolio-manager (Python/FastAPI, port 8081)
 │   ├── processes.artifact-watcher (polls S3)
 │   ├── env (service URLs, MASSIVE_BASE_URL, DISABLE_DISK_CACHE, BACKFILL_LOOKBACK_DAYS)
-│   └── scripts.cleanup-services
+│   └── scripts.cleanup-application-services
 └── profiles.ml (devenv --profile ml shell)
     ├── env (FUND_LOOKBACK_DAYS, MLFLOW_TRACKING_URI, PREFECT_API_URL)
-    └── scripts (train-local, deploy-training)
+    └── scripts (train-tide-model-local, deploy-training)
 
 AWS (retained services)
 ├── S3: fund-production-data (equity bars, predictions, portfolios)
@@ -121,7 +121,7 @@ MASSIVE_BASE_URL=https://api.massive.com
 
 ## Common Issues
 
-- **Service won't start**: check `cleanup-services` to kill stale processes
+- **Service won't start**: run `cleanup-application-services` to kill stale processes
 - **Secrets missing**: run `secretspec check` to validate, `secretspec set <KEY>` to fix
 - **Model not loading**: check S3 artifacts path and ensemble-manager logs
 - **Artifact watcher not restarting**: verify S3 credentials and bucket name

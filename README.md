@@ -49,11 +49,11 @@ Once bootstrapped:
 ```sh
 # Environment auto-activates on cd with devenv hook configured
 devenv shell                    # or: enter manually without hook
-devenv --profile applications up        # start application services
+devenv --profile application up        # start application services
 devenv --profile ml shell       # machine learning training environment
 ```
 
-Production runs on a VM with `devenv --profile applications up` and secretspec for secret injection.
+Production runs on a VM with `devenv --profile application up` and secretspec for secret injection.
 
 ### Principles
 

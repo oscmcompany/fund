@@ -8,7 +8,7 @@ This is a collection of guidelines and references.
 
 - Rust is the primary project language
 - [devenv](https://devenv.sh/) manages the development environment, tasks, and local services
-- Services run on a single exe.dev VM via `devenv --profile applications up` in both dev and production
+- Services run on a single exe.dev VM via `devenv --profile application up` in both dev and production
 - Secrets are managed via [secretspec](https://secretspec.dev/) with the `awssm` provider
 - Rust code follows Cargo workspace conventions
 - AWS S3 is used for blob storage
@@ -26,7 +26,7 @@ This is a collection of guidelines and references.
 - Keep only universally-understood acronyms as-is: formats, protocols, and identity (`csv`, `json`,
   `sql`, `http`, `url`, `uri`, `io`, `id`, `uuid`, `api`) and established domain or proper-noun terms
   (`aws`, `utc`, `etf`, `ohlcv`, `guc`); case acronyms as ordinary words per language convention
-- Never rename fixed external identifiers: devenv profile names (`applications`, `ml`), the `awssm` secretspec
+- Never rename fixed external identifiers: devenv profile names (`application`, `ml`), the `awssm` secretspec
   provider, the `tide` model and package name, environment variables and secret keys (e.g.
   `DATABASE_URL`, `ALPACA_API_KEY_ID`), library import aliases (`np`, `pl`, `pa`), linter directives
   (`noqa`), and external library fields and parameters (e.g. the Alpaca/Massive `vw` deserialization
