@@ -32,6 +32,7 @@ jobs:
             git checkout -B automated-dependency-bump
             git add Cargo.lock
             git commit --no-verify -m 'Bump dependency versions'
+            git fetch origin automated-dependency-bump || true
             git push --force-with-lease origin automated-dependency-bump
             gh pr list --head automated-dependency-bump --json number --jq '.[0].number' \
               | grep -q . \
