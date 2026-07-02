@@ -21,6 +21,7 @@ data/
 .devenv
 .env
 .understand-anything
+.pre-commit-config.yaml
 
 # LLVM coverage raw files
 *.profraw
