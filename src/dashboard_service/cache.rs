@@ -110,6 +110,61 @@ pub struct PeriodReturns {
     pub spy_since_inception: Option<f64>,
 }
 
+/// Metadata from the most recently completed model run (Tab 4 header).
+#[derive(Debug, Clone)]
+pub struct ModelRunInformation {
+    completed_at: DateTime<Utc>,
+    start_date: Option<chrono::NaiveDate>,
+    end_date: Option<chrono::NaiveDate>,
+    continuous_ranked_probability_score: Option<f64>,
+    directional_accuracy: Option<f64>,
+}
+
+impl ModelRunInformation {
+    /// Constructs a `ModelRunInformation`, validating that `start_date < end_date` when both are
+    /// provided. Returns an error if the date range is invalid.
+    pub fn new(
+        completed_at: DateTime<Utc>,
+        start_date: Option<chrono::NaiveDate>,
+        end_date: Option<chrono::NaiveDate>,
+        continuous_ranked_probability_score: Option<f64>,
+        directional_accuracy: Option<f64>,
+    ) -> Result<Self, &'static str> {
+        if let (Some(start), Some(end)) = (start_date, end_date) {
+            if start >= end {
+                return Err("start_date must be before end_date");
+            }
+        }
+        Ok(Self {
+            completed_at,
+            start_date,
+            end_date,
+            continuous_ranked_probability_score,
+            directional_accuracy,
+        })
+    }
+
+    pub fn completed_at(&self) -> DateTime<Utc> {
+        self.completed_at
+    }
+
+    pub fn start_date(&self) -> Option<chrono::NaiveDate> {
+        self.start_date
+    }
+
+    pub fn end_date(&self) -> Option<chrono::NaiveDate> {
+        self.end_date
+    }
+
+    pub fn continuous_ranked_probability_score(&self) -> Option<f64> {
+        self.continuous_ranked_probability_score
+    }
+
+    pub fn directional_accuracy(&self) -> Option<f64> {
+        self.directional_accuracy
+    }
+}
+
 /// A single event received from the Postgres `events` NOTIFY channel (Tab 5).
 #[derive(Debug, Clone)]
 pub struct EventEntry {
@@ -144,6 +199,14 @@ pub struct DashboardState {
     pub period_returns: PeriodReturns,
     /// Bounded event ring buffer, newest first (Tab 5).
     pub events: VecDeque<EventEntry>,
+    /// Metadata from the most recently completed model run (Tab 4 header). `None` until first poll.
+    pub model_run_information: Option<ModelRunInformation>,
+    /// Timestamp of the most recently inserted equity bar row (Tab 4 header freshness).
+    /// `None` until first poll or when the table is empty.
+    pub latest_bars_inserted_at: Option<DateTime<Utc>>,
+    /// Completion time of the most recent rebalance session (Tab 1 header freshness).
+    /// `None` until first poll or when no sessions have completed.
+    pub last_rebalance_completed_at: Option<DateTime<Utc>>,
     /// Timestamp of the most recent successful poll. `None` until first poll completes.
     pub last_updated: Option<DateTime<Utc>>,
     /// Last database error message, if any. Cleared on successful poll.
@@ -174,6 +237,9 @@ pub fn spawn_polling_task(state: SharedState, pool: PgPool) {
                     guard.closed_trades = data.closed_trades;
                     guard.closed_trades_summary = data.closed_trades_summary;
                     guard.predictions = data.predictions;
+                    guard.model_run_information = data.model_run_information;
+                    guard.latest_bars_inserted_at = data.latest_bars_inserted_at;
+                    guard.last_rebalance_completed_at = data.last_rebalance_completed_at;
                     guard.last_updated = Some(Utc::now());
                     guard.database_error = None;
                     info!("Dashboard state refreshed");
@@ -279,6 +345,44 @@ mod tests {
         assert_eq!(state.net_exposure, Decimal::ZERO);
         assert!(state.last_updated.is_none());
         assert!(state.database_error.is_none());
+        assert!(state.model_run_information.is_none());
+        assert!(state.latest_bars_inserted_at.is_none());
+        assert!(state.last_rebalance_completed_at.is_none());
+    }
+
+    #[test]
+    fn test_model_run_information_fields() {
+        use chrono::NaiveDate;
+        let info = ModelRunInformation::new(
+            Utc::now(),
+            Some(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+            Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
+            Some(0.123),
+            Some(0.725),
+        )
+        .unwrap();
+        assert!(info.continuous_ranked_probability_score().is_some());
+        assert!(info.directional_accuracy().is_some());
+        assert!(info.start_date().unwrap() < info.end_date().unwrap());
+    }
+
+    #[test]
+    fn test_model_run_information_rejects_invalid_date_range() {
+        use chrono::NaiveDate;
+        let result = ModelRunInformation::new(
+            Utc::now(),
+            Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
+            Some(NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_model_run_information_allows_null_dates() {
+        let result = ModelRunInformation::new(Utc::now(), None, None, None, None);
+        assert!(result.is_ok());
     }
 
     #[test]
