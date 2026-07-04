@@ -38,7 +38,6 @@ jobs:
         if: steps.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: .
           cache-on-failure: false
           shared-key: rust-continuous-integration
           save-if: true
@@ -59,6 +58,7 @@ jobs:
         if: steps.changes.outputs.rust == 'true'
         env:
           SQLX_OFFLINE: "true"
+          CARGO_INCREMENTAL: "0"
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
           tasks run checks:rust

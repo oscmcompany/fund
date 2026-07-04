@@ -192,7 +192,13 @@ in {
     markdownlint-cli
     postgresql_16
     rustup
-    sqlfluff
+    (sqlfluff.overridePythonAttrs (_: {
+      # The aarch64-darwin binary is not cached on cache.nixos.org for this
+      # nixpkgs revision; building from source runs the full pytest suite which
+      # exceeds available memory (OOM kill). Tests are validated by Hydra when
+      # producing the Linux binary cache entry.
+      doCheck = false;
+    }))
     sqlx-cli
     statix
     taplo
