@@ -4,6 +4,14 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: cron
-      cronjob: 0 8 * * MON
+      interval: weekly
+      day: monday
       timezone: America/New_York
+    groups:
+      all-dependencies:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["patch", "minor"]
+      all-security:
+        applies-to: security-updates
+        patterns: ["*"]
