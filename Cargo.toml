@@ -131,7 +131,7 @@ tempfile = { version = "3.27", optional = true }
 rand = { version = "0.8", optional = true }
 
 # dashboard_service-only (optional; enabled by the `dashboard_service` feature)
-ratatui = { version = "0.29", optional = true }
+ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
 
 [dev-dependencies]
