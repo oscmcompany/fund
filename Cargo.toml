@@ -128,7 +128,7 @@ tar = { version = "0.4", optional = true }
 tempfile = { version = "3.27", optional = true }
 
 # train-only (optional; enabled by the `train` feature)
-rand = { version = "0.8", optional = true }
+rand = { version = "0.10", optional = true }
 
 # dashboard_service-only (optional; enabled by the `dashboard_service` feature)
 ratatui = { version = "0.29", optional = true }

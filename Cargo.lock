@@ -2873,7 +2873,7 @@ dependencies = [
  "ndarray 0.16.1",
  "num-traits",
  "polars",
- "rand 0.8.6",
+ "rand 0.10.2",
  "ratatui",
  "reqwest 0.13.4",
  "rust_decimal",
