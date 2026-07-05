@@ -132,7 +132,7 @@ rand = { version = "0.8", optional = true }
 
 # dashboard_service-only (optional; enabled by the `dashboard_service` feature)
 ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+crossterm = { version = "0.29", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"
