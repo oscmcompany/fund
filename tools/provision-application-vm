@@ -50,7 +50,7 @@ phase_reboot
 
 if [[ "$PRODUCTION" == true ]]; then
   step "Starting git-sync in tmux session"
-  remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'bash tools/git-sync'"
+  remote "$NIX_SOURCE && cd ~/fund && tmux kill-session -t fund 2>/dev/null || true && tmux new-session -d -s fund 'bash tools/git-sync'"
   echo "Services started via git-sync in tmux session 'fund'"
 
   step "Applying dashboard reader database setup"

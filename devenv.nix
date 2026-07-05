@@ -14,6 +14,8 @@
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
     if [[ ! -w "''${FUND_LOG_DIR:-/var/log/fund}" ]]; then
       export FUND_LOG_DIR="$HOME/.local/state/fund/log"
+    else
+      export FUND_LOG_DIR="''${FUND_LOG_DIR:-/var/log/fund}"
     fi
     mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
   '';
