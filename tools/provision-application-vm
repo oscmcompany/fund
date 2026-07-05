@@ -49,9 +49,9 @@ phase_reboot
 # --------------------------------------------------------------------------- #
 
 if [[ "$PRODUCTION" == true ]]; then
-  step "Starting services in tmux session"
-  remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'devenv --profile application up'"
-  echo "Services started in tmux session 'fund'"
+  step "Starting git-sync in tmux session"
+  remote "$NIX_SOURCE && cd ~/fund && tmux new-session -d -s fund 'bash tools/git-sync'"
+  echo "Services started via git-sync in tmux session 'fund'"
 
   step "Applying dashboard reader database setup"
   local_pg_elapsed=0
@@ -116,7 +116,7 @@ else
 fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  Services: running in tmux session 'fund'"
+  echo "  Services: running via git-sync in tmux session 'fund'"
 fi
 echo ""
 echo "Next steps:"

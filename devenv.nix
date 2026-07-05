@@ -1,13 +1,6 @@
 {pkgs, ...}: let
   awsRegion = "us-east-1";
 
-  rawFundProfile = builtins.getEnv "FUND_PROFILE";
-  fundProfile =
-    if rawFundProfile == ""
-    then "development"
-    else rawFundProfile;
-  isProduction = fundProfile == "production";
-
   # Compute bucket name and secretspec profile at shell/process start time from
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
   # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
@@ -19,6 +12,10 @@
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
     export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$AWS_S3_BUCKET_NAME"
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
+    if [[ ! -w "''${FUND_LOG_DIR:-/var/log/fund}" ]]; then
+      export FUND_LOG_DIR="$HOME/.local/state/fund/log"
+    fi
+    mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
   '';
 
   applySchema = ''
@@ -40,15 +37,10 @@
     then "365"
     else rawLookbackDays;
 
-  # Log directory. Production keeps the root-owned /var/log/fund path
-  # (provisioned on the VM, where logrotate and monitoring expect it). Local
-  # development points FUND_LOG_DIR at an XDG state path so file logging works
-  # without sudo.
-  homeDirectory = builtins.getEnv "HOME";
-  fundLogDir =
-    if isProduction
-    then "/var/log/fund"
-    else "${homeDirectory}/.local/state/fund/log";
+  # Log directory. VMs use /var/log/fund (provisioned by bootstrap-machine).
+  # The runtimeEnv block above detects when that path is not writable (e.g.
+  # local laptop without bootstrap) and falls back to an XDG state path.
+  fundLogDir = "/var/log/fund";
 in {
   dotenv.enable = true;
 
@@ -646,60 +638,32 @@ in {
         done
       '';
     in {
-      data-manager.exec =
-        if isProduction
-        then ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${applySchema}
-          ${killPort "8080"}
-          exec secretspec run -- cargo run --no-default-features --features data_manager --bin data_manager --release
-        ''
-        else ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${applySchema}
-          ${killPort "8080"}
-          exec secretspec run -- cargo watch -x 'run --no-default-features --features data_manager --bin data_manager'
-        '';
+      data-manager.exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        ${waitForPostgres}
+        ${applySchema}
+        ${killPort "8080"}
+        exec secretspec run -- cargo run --release --bin data_manager
+      '';
 
       # ensemble_manager: serves predictions over HTTP and consumes
       # predictions_requested from the Postgres event bus.
-      ensemble-manager.exec =
-        if isProduction
-        then ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${killPort "8082"}
-          exec secretspec run -- cargo run --no-default-features --features ensemble_manager --bin ensemble_manager --release
-        ''
-        else ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${killPort "8082"}
-          exec secretspec run -- cargo watch -x 'run --no-default-features --features ensemble_manager --bin ensemble_manager'
-        '';
+      ensemble-manager.exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        ${waitForPostgres}
+        ${killPort "8082"}
+        exec secretspec run -- cargo run --release --bin ensemble_manager
+      '';
 
-      portfolio-manager.exec =
-        if isProduction
-        then ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${killPort "8083"}
-          exec secretspec run -- cargo run --no-default-features --features portfolio_manager --bin portfolio_manager --release
-        ''
-        else ''
-          set -euo pipefail
-          ${runtimeEnv}
-          ${waitForPostgres}
-          ${killPort "8083"}
-          exec secretspec run -- cargo watch -x 'run --no-default-features --features portfolio_manager --bin portfolio_manager'
-        '';
+      portfolio-manager.exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        ${waitForPostgres}
+        ${killPort "8083"}
+        exec secretspec run -- cargo run --release --bin portfolio_manager
+      '';
     };
   };
 
@@ -713,7 +677,6 @@ in {
 
   enterShell = ''
     ${runtimeEnv}
-    mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
     {
       echo "Fund development environment (profile: $FUND_PROFILE)"
       echo ""

@@ -147,6 +147,7 @@ while true; do
     stop_devenv
     log "Resetting to origin/master"
     git reset --hard origin/master
+    devenv allow 2>/dev/null || true
     log "Now at $(git rev-parse --short HEAD)"
     build_and_install_dashboard_service
     start_devenv
