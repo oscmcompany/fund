@@ -300,7 +300,7 @@ in {
     echo "Fetching equity bars from $BACKFILL_START_DATE to $END_DATE"
     current_date="$BACKFILL_START_DATE"
     request_count=0
-    while [[ "$current_date" <= "$END_DATE" ]]; do
+    while [ "$(echo "$current_date" | tr -d '-')" -le "$(echo "$END_DATE" | tr -d '-')" ]; do
       request_count=$((request_count + 1))
       date_string="''${current_date}T12:00:00Z"
       echo "Syncing equity bars for $current_date (request $request_count)"
