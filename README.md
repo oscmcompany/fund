@@ -60,7 +60,7 @@ Production runs on a VM with `devenv --profile application up` and secretspec fo
 Connect to the live fund dashboard over SSH:
 
 ```sh
-ssh dashboard@<vm-hostname>.exe.xyz
+ssh -p 2222 dashboard@<vm-hostname>.exe.xyz
 ```
 
 No account required. The dashboard is a read-only TUI showing positions, performance, trades,
