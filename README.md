@@ -55,6 +55,17 @@ devenv --profile ml shell       # machine learning training environment
 
 Production runs on a VM with `devenv --profile application up` and secretspec for secret injection.
 
+### Dashboard
+
+Connect to the live fund dashboard over SSH:
+
+```sh
+ssh dashboard@<vm-hostname>.exe.xyz
+```
+
+No account required. The dashboard is a read-only TUI showing positions, performance, trades,
+predictions, and live pipeline events.
+
 ### Principles
 
 An unordered and non-exhaustive list we work towards:
