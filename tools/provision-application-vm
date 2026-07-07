@@ -96,6 +96,10 @@ PYEOF
     remote "rm -f /tmp/set_dashboard_reader_password.py"
     echo "dashboard_reader password configured"
   fi
+
+  step "Configuring dashboard SSH access"
+  remote "$NIX_SOURCE && cd ~/fund && bash tools/setup-dashboard-ssh"
+  echo "Dashboard SSH access configured"
 fi
 
 phase_share_vm

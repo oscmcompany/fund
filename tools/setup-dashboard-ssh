@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --------------------------------------------------------------------------- #
+# setup-dashboard-ssh -- Configure SSH access for the dashboard_service TUI
+#
+# Creates a dedicated 'dashboard' OS user with ForceCommand so that external
+# users can run: ssh dashboard@<vm>.exe.xyz
+# and be dropped directly into the read-only TUI with no shell access.
+#
+# Run on the application VM after bootstrap and dashboard_service binary
+# installation are complete:
+#
+#   bash tools/setup-dashboard-ssh
+#
+# Idempotent: safe to re-run.
+# --------------------------------------------------------------------------- #
+
+DASHBOARD_USER="dashboard"
+DASHBOARD_BINARY="$HOME/.local/bin/dashboard_service"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+step() {
+  echo ""
+  echo "==> $1"
+}
+
+# --------------------------------------------------------------------------- #
+# 1. Verify dashboard_service binary exists
+# --------------------------------------------------------------------------- #
+step "Checking dashboard_service binary"
+
+if [[ ! -x "$DASHBOARD_BINARY" ]]; then
+  echo "Error: $DASHBOARD_BINARY not found or not executable."
+  echo "Run bootstrap-machine with --production first."
+  exit 1
+fi
+echo "Found $DASHBOARD_BINARY"
+
+# --------------------------------------------------------------------------- #
+# 2. Create the dashboard OS user
+# --------------------------------------------------------------------------- #
+step "Creating '$DASHBOARD_USER' OS user"
+
+if id "$DASHBOARD_USER" &>/dev/null; then
+  echo "User '$DASHBOARD_USER' already exists"
+else
+  sudo useradd \
+    --system \
+    --shell /usr/sbin/nologin \
+    --create-home \
+    --home-dir "/home/$DASHBOARD_USER" \
+    "$DASHBOARD_USER"
+  echo "Created user '$DASHBOARD_USER'"
+fi
+
+# --------------------------------------------------------------------------- #
+# 3. Install the accept-all-keys script
+# --------------------------------------------------------------------------- #
+step "Installing AuthorizedKeysCommand script"
+
+ACCEPT_ALL_KEYS="/usr/local/bin/dashboard-accept-all-keys"
+
+sudo tee "$ACCEPT_ALL_KEYS" > /dev/null << 'SCRIPT'
+#!/bin/sh
+# Accept any SSH public key presented for the dashboard user.
+# The key is passed as argument 2 by sshd's AuthorizedKeysCommand.
+printf '%s\n' "$2"
+SCRIPT
+sudo chmod 755 "$ACCEPT_ALL_KEYS"
+echo "Installed $ACCEPT_ALL_KEYS"
+
+# --------------------------------------------------------------------------- #
+# 4. Write the dashboard .env with DATABASE_URL from secretspec
+# --------------------------------------------------------------------------- #
+step "Writing /home/$DASHBOARD_USER/.env"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Source Nix so devenv and secretspec are on PATH
+for profile in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh \
+               /etc/profile.d/nix.sh; do
+  if [[ -f "$profile" ]]; then
+    # shellcheck disable=SC1090
+    . "$profile"
+    break
+  fi
+done
+
+DATABASE_URL="$(cd "$REPO_ROOT" && devenv shell -- secretspec run --profile dashboard -- printenv DATABASE_URL 2>/dev/null)" \
+  || true
+
+if [[ -z "$DATABASE_URL" ]]; then
+  echo "WARNING: Could not retrieve DATABASE_URL from secretspec (profile: dashboard)."
+  echo "  Set it manually: sudo tee /home/$DASHBOARD_USER/.env <<< 'DATABASE_URL=...'"
+  echo "  Then: sudo chown root:$DASHBOARD_USER /home/$DASHBOARD_USER/.env"
+  echo "  Then: sudo chmod 640 /home/$DASHBOARD_USER/.env"
+else
+  printf 'DATABASE_URL=%s\n' "$DATABASE_URL" | sudo tee "/home/$DASHBOARD_USER/.env" > /dev/null
+  sudo chown "root:$DASHBOARD_USER" "/home/$DASHBOARD_USER/.env"
+  sudo chmod 640 "/home/$DASHBOARD_USER/.env"
+  echo "Wrote DATABASE_URL to /home/$DASHBOARD_USER/.env"
+fi
+
+# --------------------------------------------------------------------------- #
+# 5. Create a wrapper that loads .env and runs dashboard_service
+# --------------------------------------------------------------------------- #
+step "Installing dashboard launcher"
+
+LAUNCHER="/usr/local/bin/dashboard-launcher"
+
+sudo tee "$LAUNCHER" > /dev/null << EOF
+#!/bin/sh
+set -e
+if [ -f /home/$DASHBOARD_USER/.env ]; then
+  set -a
+  . /home/$DASHBOARD_USER/.env
+  set +a
+fi
+exec $DASHBOARD_BINARY
+EOF
+sudo chmod 755 "$LAUNCHER"
+echo "Installed $LAUNCHER"
+
+# --------------------------------------------------------------------------- #
+# 6. Configure sshd for the dashboard user
+# --------------------------------------------------------------------------- #
+step "Configuring sshd"
+
+SSHD_MARKER="# --- dashboard_service SSH access ---"
+
+if grep -qF "$SSHD_MARKER" "$SSHD_CONFIG"; then
+  echo "sshd_config already contains dashboard configuration, skipping"
+else
+  sudo tee -a "$SSHD_CONFIG" > /dev/null << EOF
+
+$SSHD_MARKER
+Match User $DASHBOARD_USER
+    ForceCommand $LAUNCHER
+    AuthorizedKeysCommand $ACCEPT_ALL_KEYS %u %k
+    AuthorizedKeysCommandUser root
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    AllowAgentForwarding no
+    PermitUserEnvironment no
+    ClientAliveInterval 30
+    ClientAliveCountMax 3
+    PasswordAuthentication no
+EOF
+  echo "Added Match User block to $SSHD_CONFIG"
+fi
+
+# Ensure the dashboard user is in AllowUsers (if AllowUsers is used)
+if grep -qE "^AllowUsers" "$SSHD_CONFIG"; then
+  if ! grep -qE "^AllowUsers.*\b${DASHBOARD_USER}\b" "$SSHD_CONFIG"; then
+    sudo sed -i "s/^AllowUsers.*/& $DASHBOARD_USER/" "$SSHD_CONFIG"
+    echo "Added '$DASHBOARD_USER' to AllowUsers"
+  fi
+fi
+
+# --------------------------------------------------------------------------- #
+# 7. Validate and restart sshd
+# --------------------------------------------------------------------------- #
+step "Restarting sshd"
+
+if sudo sshd -t 2>/dev/null; then
+  sudo systemctl restart sshd
+  echo "sshd restarted successfully"
+else
+  echo "ERROR: sshd configuration test failed. Review $SSHD_CONFIG"
+  echo "  Run: sudo sshd -t"
+  exit 1
+fi
+
+# --------------------------------------------------------------------------- #
+# Done
+# --------------------------------------------------------------------------- #
+step "Dashboard SSH access configured"
+
+echo ""
+echo "External users can now connect with:"
+echo "  ssh dashboard@$(hostname).exe.xyz"
+echo ""
+echo "To test locally:"
+echo "  ssh dashboard@localhost"
+echo ""
