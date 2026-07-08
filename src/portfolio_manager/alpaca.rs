@@ -326,15 +326,19 @@ impl AlpacaTradingClient {
         Ok(true)
     }
 
-    /// Returns the full set of tickers that are currently tradable and shortable
-    /// (active US equity assets with `tradable = true`, `shortable = true`, and
-    /// `easy_to_borrow = true`).
+    /// Fetches all active US equity assets and partitions them into tradable and
+    /// shortable sets.
     ///
-    /// Callers should cache this result for the duration of a trading session rather
-    /// than calling it on every rebalance cycle.
-    pub async fn fetch_tradable_assets(
-        &self,
-    ) -> Result<std::collections::HashSet<String>, AlpacaError> {
+    /// The **tradable** set contains every active asset with `tradable = true`
+    /// (eligible for buy orders on the long leg). The **shortable** subset further
+    /// requires `shortable = true` and `easy_to_borrow = true` (eligible for
+    /// sell-short orders on the short leg).
+    ///
+    /// Alpaca asset reference: <https://docs.alpaca.markets/us/reference/get-v2-assets-1>
+    ///
+    /// Callers should cache the result for the duration of a trading session
+    /// rather than calling it on every rebalance cycle.
+    pub async fn fetch_tradable_assets(&self) -> Result<TradableAssets, AlpacaError> {
         let url = format!(
             "{}/v2/assets?status=active&asset_class=us_equity",
             self.base_url
@@ -357,19 +361,28 @@ impl AlpacaTradingClient {
             AlpacaError::Parse(format!("Failed to parse assets response: {error}"))
         })?;
 
-        let tradable: std::collections::HashSet<String> = assets
-            .into_iter()
-            .filter(|asset| {
-                asset.tradable.unwrap_or(false)
-                    && asset.shortable.unwrap_or(false)
-                    && asset.easy_to_borrow.unwrap_or(false)
-            })
-            .map(|asset| asset.symbol)
-            .collect();
+        let mut tradable = std::collections::HashSet::new();
+        let mut shortable = std::collections::HashSet::new();
 
-        info!(tradable = tradable.len(), "Tradable asset universe fetched");
+        for asset in assets {
+            if asset.tradable.unwrap_or(false) {
+                tradable.insert(asset.symbol.clone());
+                if asset.shortable.unwrap_or(false) && asset.easy_to_borrow.unwrap_or(false) {
+                    shortable.insert(asset.symbol);
+                }
+            }
+        }
 
-        Ok(tradable)
+        info!(
+            tradable = tradable.len(),
+            shortable = shortable.len(),
+            "Tradable asset universe fetched"
+        );
+
+        Ok(TradableAssets {
+            tradable,
+            shortable,
+        })
     }
 
     /// Attempts to cancel an open order by its Alpaca order ID.
@@ -427,6 +440,39 @@ impl AlpacaTradingClient {
         })?;
 
         Ok(clock.is_open)
+    }
+}
+
+/// Partitioned view of the Alpaca active asset universe.
+///
+/// `tradable` contains all active US equities that accept buy orders.
+/// `shortable` is a subset that also accepts sell-short orders
+/// (`shortable = true`, `easy_to_borrow = true`).
+#[derive(Debug, Clone)]
+pub struct TradableAssets {
+    tradable: std::collections::HashSet<String>,
+    shortable: std::collections::HashSet<String>,
+}
+
+impl TradableAssets {
+    /// Returns `true` when the symbol can be bought (long leg eligibility).
+    pub fn is_tradable(&self, symbol: &str) -> bool {
+        self.tradable.contains(symbol)
+    }
+
+    /// Returns `true` when the symbol can be sold short (short leg eligibility).
+    pub fn is_shortable(&self, symbol: &str) -> bool {
+        self.shortable.contains(symbol)
+    }
+
+    /// Number of tradable symbols.
+    pub fn tradable_count(&self) -> usize {
+        self.tradable.len()
+    }
+
+    /// Number of shortable symbols.
+    pub fn shortable_count(&self) -> usize {
+        self.shortable.len()
     }
 }
 
@@ -626,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_tradable_assets_filters_correctly() {
+    async fn test_fetch_tradable_assets_partitions_correctly() {
         let mut server = Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/assets?status=active&asset_class=us_equity")
@@ -644,13 +690,24 @@ mod tests {
             .await;
 
         let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
-        let tradable = client.fetch_tradable_assets().await.unwrap();
+        let assets = client.fetch_tradable_assets().await.unwrap();
 
-        assert!(tradable.contains("AAPL"));
-        assert!(!tradable.contains("MSFT")); // not shortable
-        assert!(!tradable.contains("GOOG")); // not easy_to_borrow
-        assert!(tradable.contains("NVDA"));
-        assert!(!tradable.contains("META")); // not tradable
+        // Tradable set: all assets with tradable=true (long leg eligibility).
+        assert!(assets.is_tradable("AAPL"));
+        assert!(assets.is_tradable("MSFT"));
+        assert!(assets.is_tradable("GOOG"));
+        assert!(assets.is_tradable("NVDA"));
+        assert!(!assets.is_tradable("META")); // tradable=false
+
+        // Shortable set: tradable + shortable + easy_to_borrow (short leg eligibility).
+        assert!(assets.is_shortable("AAPL"));
+        assert!(!assets.is_shortable("MSFT")); // not shortable
+        assert!(!assets.is_shortable("GOOG")); // not easy_to_borrow
+        assert!(assets.is_shortable("NVDA"));
+        assert!(!assets.is_shortable("META")); // not tradable
+
+        assert_eq!(assets.tradable_count(), 4);
+        assert_eq!(assets.shortable_count(), 2);
         mock.assert_async().await;
     }
 

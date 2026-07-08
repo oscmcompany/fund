@@ -31,14 +31,18 @@ pub async fn rebalance(Extension(state): Extension<AppState>) -> Response {
         Ok(outcome) => {
             info!(
                 session_id = %outcome.session_id,
-                pairs_filled = outcome.pairs_filled,
+                pairs_opened = outcome.pairs_opened,
+                pairs_closed = outcome.pairs_closed,
+                pairs_kept = outcome.pairs_kept,
                 "Rebalance handler completed successfully"
             );
             (
                 StatusCode::OK,
                 Json(json!({
                     "session_id": outcome.session_id.to_string(),
-                    "pairs_filled": outcome.pairs_filled,
+                    "pairs_opened": outcome.pairs_opened,
+                    "pairs_closed": outcome.pairs_closed,
+                    "pairs_kept": outcome.pairs_kept,
                     "net_asset_value": outcome.net_asset_value,
                 })),
             )

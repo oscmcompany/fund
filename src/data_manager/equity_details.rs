@@ -1,39 +1,13 @@
 use crate::data_manager::errors::Error;
-use crate::data_manager::state::State;
 use crate::domain::market::{EquityDetail, Ticker};
 use tracing::{info, warn};
 
-const EQUITY_DETAILS_KEY: &str = "data/equity/details/details.csv";
-
-async fn read_equity_details_csv_from_s3(state: &State) -> Result<String, Error> {
-    info!("Reading equity details CSV from S3");
-
-    let response = state
-        .s3_client
-        .get_object()
-        .bucket(&state.bucket_name)
-        .key(EQUITY_DETAILS_KEY)
-        .send()
-        .await
-        .map_err(|e| Error::Other(format!("Failed to get object from S3: {}", e)))?;
-
-    let bytes = response
-        .body
-        .collect()
-        .await
-        .map_err(|e| Error::Other(format!("Failed to read response body: {}", e)))?
-        .into_bytes();
-
-    let csv_content = String::from_utf8(bytes.to_vec())
-        .map_err(|e| Error::Other(format!("Failed to convert bytes to UTF-8: {}", e)))?;
-
-    info!(
-        "Successfully read CSV from S3, size: {} bytes",
-        csv_content.len()
-    );
-
-    Ok(csv_content)
-}
+/// Equity details CSV embedded at compile time.
+///
+/// The source file lives at `src/data_manager/equity_details.csv` in the
+/// repository and is checked into version control. Changes require a rebuild
+/// and redeploy.
+const EQUITY_DETAILS_CSV: &str = include_str!("equity_details.csv");
 
 fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Error> {
     let mut lines = csv_content.lines();
@@ -106,10 +80,10 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Erro
     Ok(details)
 }
 
-pub async fn read_equity_details_from_s3(state: &State) -> Result<Vec<EquityDetail>, Error> {
-    let csv_content = read_equity_details_csv_from_s3(state).await?;
-    let details = parse_equity_details_csv(&csv_content)?;
-    info!("Successfully parsed {} equity details rows", details.len());
+/// Parses the compile-time-embedded equity details CSV.
+pub fn parse_embedded_equity_details() -> Result<Vec<EquityDetail>, Error> {
+    let details = parse_equity_details_csv(EQUITY_DETAILS_CSV)?;
+    info!("Parsed {} equity details from embedded CSV", details.len());
     Ok(details)
 }
 

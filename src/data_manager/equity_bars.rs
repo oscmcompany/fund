@@ -225,7 +225,7 @@ async fn fetch_equity_bars_for_date(
 
 /// Fetch a day's grouped-daily bars and persist them to PostgreSQL (when a pool
 /// is configured) and S3. Used by the on-demand `sync` handler.
-pub async fn fetch_and_store(
+pub async fn fetch_and_store_equity_bars(
     state: &State,
     trading_date: &TradingDate,
 ) -> Result<Option<usize>, String> {
@@ -348,7 +348,7 @@ pub async fn sync(
             .into_response();
     };
 
-    match fetch_and_store(&state, &trading_date).await {
+    match fetch_and_store_equity_bars(&state, &trading_date).await {
         Ok(Some(bar_count)) => {
             let response_message = format!("Data synced: {} bars stored", bar_count);
             (StatusCode::OK, response_message).into_response()

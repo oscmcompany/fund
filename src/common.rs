@@ -7,5 +7,6 @@ pub mod aws;
 pub mod crypto;
 pub mod database;
 pub mod events;
+pub mod market_hours;
 pub mod observability;
 pub mod server;

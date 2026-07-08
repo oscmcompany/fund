@@ -287,31 +287,11 @@ async fn test_equity_bars_sync_writes_parquet_to_s3() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
-async fn test_equity_details_csv_can_be_read_from_s3() {
-    let (endpoint, s3) = setup_test_bucket().await;
-
-    put_test_object(
-        &s3,
-        "data/equity/details/details.csv",
-        b"ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n".to_vec(),
-    )
-    .await;
-
-    let s3_client = create_test_s3_client(&endpoint).await;
-    let state = fund::data_manager::state::State::new(
-        reqwest::Client::new(),
-        fund::data_manager::state::MassiveSecrets {
-            base: "http://127.0.0.1:1".to_string(),
-            key: "test-api-key".to_string(),
-        },
-        s3_client,
-        test_bucket_name(),
-    );
-
-    let result = fund::data_manager::equity_details::read_equity_details_from_s3(&state).await;
+#[test]
+fn test_embedded_equity_details_csv_parses_successfully() {
+    let result = fund::data_manager::equity_details::parse_embedded_equity_details();
     assert!(result.is_ok());
     let details = result.unwrap();
+    assert!(!details.is_empty());
     assert!(details.iter().any(|d| d.ticker().as_str() == "AAPL"));
 }

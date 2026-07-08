@@ -151,14 +151,16 @@ impl SnapshotType {
 /// Reason a long-short pair position was closed.
 ///
 /// Mirrors the `CHECK` constraint on `equity_pairs.close_reason`:
-/// `('profit_taken', 'stop_loss', 'rebalance', 'end_of_day')`.
+/// `('profit_taken', 'stop_loss', 'end_of_day')`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum CloseReason {
+    /// The pair spread converged back through zero; the trade thesis played out.
     ProfitTaken,
+    /// The pair spread diverged further against the position past the stop-loss threshold.
     StopLoss,
-    Rebalance,
+    /// All positions closed before market close (go to cash).
     EndOfDay,
 }
 
@@ -168,7 +170,6 @@ impl CloseReason {
         match self {
             Self::ProfitTaken => "profit_taken",
             Self::StopLoss => "stop_loss",
-            Self::Rebalance => "rebalance",
             Self::EndOfDay => "end_of_day",
         }
     }
@@ -178,7 +179,6 @@ impl CloseReason {
         match value {
             "profit_taken" => Some(Self::ProfitTaken),
             "stop_loss" => Some(Self::StopLoss),
-            "rebalance" => Some(Self::Rebalance),
             "end_of_day" => Some(Self::EndOfDay),
             _ => None,
         }
@@ -763,7 +763,6 @@ mod tests {
         for reason in [
             CloseReason::ProfitTaken,
             CloseReason::StopLoss,
-            CloseReason::Rebalance,
             CloseReason::EndOfDay,
         ] {
             assert_eq!(CloseReason::parse(reason.as_str()), Some(reason.clone()));
@@ -778,13 +777,13 @@ mod tests {
     fn test_close_reason_parse_rejects_unknown() {
         assert_eq!(CloseReason::parse("expired"), None);
         assert_eq!(CloseReason::parse("PROFIT_TAKEN"), None);
+        assert_eq!(CloseReason::parse("rebalance"), None);
     }
 
     #[test]
     fn test_close_reason_display() {
         assert_eq!(CloseReason::ProfitTaken.to_string(), "profit_taken");
         assert_eq!(CloseReason::StopLoss.to_string(), "stop_loss");
-        assert_eq!(CloseReason::Rebalance.to_string(), "rebalance");
         assert_eq!(CloseReason::EndOfDay.to_string(), "end_of_day");
     }
 
@@ -793,7 +792,6 @@ mod tests {
         // Values must exactly match the CHECK constraint in schema.sql.
         assert_eq!(CloseReason::ProfitTaken.as_str(), "profit_taken");
         assert_eq!(CloseReason::StopLoss.as_str(), "stop_loss");
-        assert_eq!(CloseReason::Rebalance.as_str(), "rebalance");
         assert_eq!(CloseReason::EndOfDay.as_str(), "end_of_day");
     }
 

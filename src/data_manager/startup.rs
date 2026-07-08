@@ -1,6 +1,6 @@
 use crate::common::server::serve;
 use crate::data_manager::database::seed_equity_details;
-use crate::data_manager::equity_details::read_equity_details_from_s3;
+use crate::data_manager::equity_details::parse_embedded_equity_details;
 use crate::data_manager::equity_quotes::spawn_quote_stream;
 use crate::data_manager::router::create_app_with_state;
 use crate::data_manager::scheduler::spawn_sync_scheduler;
@@ -16,10 +16,10 @@ async fn migrate_equity_details(state: &State) {
         }
     };
 
-    match read_equity_details_from_s3(state).await {
+    match parse_embedded_equity_details() {
         Ok(details) => match seed_equity_details(pool, &details).await {
             Ok(count) if count > 0 => {
-                tracing::info!("Seeded equity_details from S3 ({} rows)", count);
+                tracing::info!("Seeded equity_details ({} rows)", count);
             }
             Ok(_) => {}
             Err(err) => {
@@ -27,10 +27,7 @@ async fn migrate_equity_details(state: &State) {
             }
         },
         Err(err) => {
-            tracing::warn!(
-                "Could not read equity details from S3 for migration: {}",
-                err
-            );
+            tracing::warn!("Could not parse embedded equity details: {}", err);
         }
     }
 }

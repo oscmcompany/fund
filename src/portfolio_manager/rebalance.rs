@@ -1,14 +1,22 @@
 //! Main rebalance orchestration pipeline.
 //!
-//! `run_rebalance` drives the full lifecycle across four private phases:
+//! `run_rebalance` drives a per-pair evaluation lifecycle:
 //! 1. `fetch_market_data` — load predictions and price history from the database
-//! 2. `close_existing_positions` — close open Alpaca positions and mark them done
-//! 3. `check_drawdown` — gate on account equity vs previous NAV
-//! 4. `select_size_execute` — select pairs, size, filter shortable, trade
-//! 5. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
+//! 2. `evaluate_open_pairs` — check each open pair for close signals (convergence, stop-loss)
+//! 3. `close_triggered_pairs` — close only pairs that hit a signal on Alpaca and in the DB
+//! 4. `check_drawdown` — gate on account equity vs previous NAV
+//! 5. `select_size_execute` — fill vacant slots with new pairs
+//! 6. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Z-score magnitude that triggers a stop-loss close.
+///
+/// Entry is at |z| >= 2.0. A threshold of 4.0 means the spread has doubled
+/// against the position relative to entry, indicating the mean-reversion
+/// thesis has failed.
+const STOP_LOSS_Z_SCORE_THRESHOLD: f64 = 4.0;
 
 use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
@@ -23,22 +31,23 @@ use crate::domain::orders::FilledPair;
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
-    AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
-    EquityRebalanceSession, RebalanceSessionStatus,
+    AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
+    EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio_manager::alpaca::AlpacaTradingClient;
+use crate::portfolio_manager::alpaca::{AlpacaTradingClient, TradableAssets};
 use crate::portfolio_manager::beta::compute_market_betas;
 use crate::portfolio_manager::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio_manager::database::{
-    close_equity_pair, close_equity_pair_end_of_day, fetch_equity_details, fetch_historical_prices,
-    fetch_latest_portfolio_net_asset_value, fetch_live_quote_mid_prices, fetch_open_pairs,
-    fetch_predictions, fetch_spy_prices, insert_equity_allocation, insert_equity_order,
-    insert_equity_pair, insert_portfolio_snapshot, insert_rebalance_session,
-    update_rebalance_session_status,
+    close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
+    fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value,
+    fetch_live_quote_mid_prices, fetch_open_pairs, fetch_spy_equity_prices,
+    insert_equity_allocation, insert_equity_order, insert_equity_pair, insert_portfolio_snapshot,
+    insert_rebalance_session, update_rebalance_session_status, OpenPair,
 };
 use crate::portfolio_manager::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
 };
+use crate::portfolio_manager::math::z_score_last;
 use crate::portfolio_manager::regime::classify_regime;
 use crate::portfolio_manager::sizing::{size_pairs_with_volatility_parity, SizingError};
 use crate::portfolio_manager::state::AppState;
@@ -48,7 +57,9 @@ use crate::portfolio_manager::statistical_arbitrage::select_pairs;
 #[derive(Debug)]
 pub struct RebalanceOutcome {
     pub session_id: Uuid,
-    pub pairs_filled: usize,
+    pub pairs_opened: usize,
+    pub pairs_closed: usize,
+    pub pairs_kept: usize,
     pub net_asset_value: f64,
 }
 
@@ -121,12 +132,15 @@ impl From<PortfolioError> for RebalanceError {
     }
 }
 
-/// Runs one complete rebalance cycle.
+/// Runs one rebalance cycle with per-pair evaluation.
+///
+/// Open pairs are evaluated individually for close signals (convergence → profit
+/// taken, divergence → stop loss). Only triggered pairs are closed, freeing
+/// capital for replacement pairs. New pairs fill the vacant slots up to the
+/// configured `minimum_pairs` target.
 ///
 /// Returns `RebalanceOutcome` on success or a `RebalanceError` describing
-/// why the cycle was skipped or failed. All database writes are committed
-/// individually (no wrapping transaction) so partial progress is visible
-/// in structured logs.
+/// why the cycle was skipped or failed.
 pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, RebalanceError> {
     let pool = state.pool();
     let alpaca = state.alpaca_client();
@@ -151,8 +165,13 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let signals = consolidate_predictions(&predictions, &historical_prices, &equity_details);
     info!(tickers = signals.len(), "Signals consolidated");
 
-    // Phase 4: close old positions, check drawdown, then select/size/execute.
-    close_existing_positions(alpaca, pool).await?;
+    // Phase 4: evaluate open pairs and close only those that hit a signal.
+    let open_pairs = fetch_open_pairs(pool).await?;
+    let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices);
+    let pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
+    let pairs_kept = open_pairs.len() - pairs_closed;
+
+    // Phase 5: check drawdown.
     let (current_equity, buying_power) = check_drawdown(
         alpaca,
         pool,
@@ -160,29 +179,53 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     )
     .await?;
 
+    // Phase 6: fill vacant slots with new pairs.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
-    let filled = select_size_execute(
-        alpaca,
-        pool,
-        state.tradable_assets(),
-        &signals,
-        &historical_prices,
-        &spy_prices,
-        buying_power,
-        exposure_scale,
-        state.candidate_pool_count(),
-        required_pairs,
-    )
-    .await?;
+    let vacant_slots = required_pairs.saturating_sub(pairs_kept);
 
-    // Phase 5: validate portfolio invariants.
-    let filled_pairs_only: Vec<FilledPair> = filled
-        .iter()
-        .map(|(filled_pair, _)| filled_pair.clone())
-        .collect();
-    let portfolio = Portfolio::new(filled_pairs_only, state.constraints())?;
+    let filled = if vacant_slots > 0 {
+        match select_size_execute(
+            alpaca,
+            pool,
+            state.tradable_assets(),
+            &signals,
+            &historical_prices,
+            &spy_prices,
+            buying_power,
+            exposure_scale,
+            state.candidate_pool_count(),
+            vacant_slots,
+        )
+        .await
+        {
+            Ok(fills) => fills,
+            Err(RebalanceError::InsufficientPairs(ref sizing_error)) if pairs_kept > 0 => {
+                info!(
+                    vacant_slots = vacant_slots,
+                    error = %sizing_error,
+                    "Could not fill all vacant slots; continuing with existing pairs"
+                );
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        info!("No vacant slots; all pairs retained");
+        Vec::new()
+    };
 
-    // Phase 6: persist session, pairs, allocations, orders, and snapshot.
+    let pairs_opened = filled.len();
+
+    // Phase 7: validate portfolio invariants for full opens (no kept pairs).
+    if pairs_kept == 0 && !filled.is_empty() {
+        let filled_pairs_only: Vec<FilledPair> = filled
+            .iter()
+            .map(|(filled_pair, _)| filled_pair.clone())
+            .collect();
+        Portfolio::new(filled_pairs_only, state.constraints())?;
+    }
+
+    // Phase 8: persist session, new pairs, allocations, orders, and snapshot.
     let session_id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -196,7 +239,11 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     );
     insert_rebalance_session(pool, &session).await?;
 
-    let total_slippage_cost = persist_filled_pairs(pool, session_id, now, &filled).await?;
+    let total_slippage_cost = if filled.is_empty() {
+        Decimal::ZERO
+    } else {
+        persist_filled_pairs(pool, session_id, now, &filled).await?
+    };
 
     let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
         RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
@@ -205,7 +252,6 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     update_rebalance_session_status(pool, session_id, &RebalanceSessionStatus::Completed, now)
         .await?;
 
-    let pairs_filled = portfolio.pairs().len();
     let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
         RebalanceError::Conversion(
             "net_asset_value_decimal cannot be represented as f64".to_string(),
@@ -217,7 +263,9 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         EventType::PortfolioRebalanceCompleted,
         &serde_json::json!({
             "session_id": session_id.to_string(),
-            "pairs_filled": pairs_filled,
+            "pairs_opened": pairs_opened,
+            "pairs_closed": pairs_closed,
+            "pairs_kept": pairs_kept,
             "net_asset_value": net_asset_value,
         }),
     )
@@ -225,14 +273,18 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     info!(
         session_id = %session_id,
-        pairs_filled = pairs_filled,
+        pairs_opened = pairs_opened,
+        pairs_closed = pairs_closed,
+        pairs_kept = pairs_kept,
         net_asset_value = net_asset_value,
         "Rebalance completed"
     );
 
     Ok(RebalanceOutcome {
         session_id,
-        pairs_filled,
+        pairs_opened,
+        pairs_closed,
+        pairs_kept,
         net_asset_value,
     })
 }
@@ -277,7 +329,8 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
 
     let closed_at = Utc::now();
     for open_pair in &open_pairs {
-        close_equity_pair_end_of_day(pool, open_pair.id(), closed_at).await?;
+        close_equity_pair_with_reason(pool, open_pair.id(), closed_at, &CloseReason::EndOfDay)
+            .await?;
     }
 
     let pairs_closed = open_pairs.len();
@@ -312,7 +365,7 @@ async fn fetch_market_data(
     ),
     RebalanceError,
 > {
-    let fresh_predictions = fetch_predictions(pool).await?;
+    let fresh_predictions = fetch_equity_predictions(pool).await?;
     let predictions = fresh_predictions
         .get()
         .ok_or(RebalanceError::StalePredictions)?;
@@ -325,8 +378,8 @@ async fn fetch_market_data(
     let predictions = predictions.to_vec();
 
     let (historical_prices_result, spy_prices_result, equity_details_result) = tokio::join!(
-        fetch_historical_prices(pool),
-        fetch_spy_prices(pool),
+        fetch_historical_equity_prices(pool),
+        fetch_spy_equity_prices(pool),
         fetch_equity_details(pool),
     );
 
@@ -338,22 +391,127 @@ async fn fetch_market_data(
     ))
 }
 
-/// Closes all currently open pair positions in Alpaca and marks them closed in the DB.
-async fn close_existing_positions(
-    alpaca: &AlpacaTradingClient,
-    pool: &sqlx::PgPool,
-) -> Result<(), RebalanceError> {
-    let open_pairs = fetch_open_pairs(pool).await?;
-    if open_pairs.is_empty() {
-        return Ok(());
+/// A close signal produced by per-pair evaluation.
+struct PairCloseSignal {
+    open_pair: OpenPair,
+    reason: CloseReason,
+}
+
+/// Evaluates each open pair for close signals using the current spread z-score.
+///
+/// The spread for each pair is `long_price - hedge_ratio * short_price`, computed
+/// over the historical price window. The z-score of the latest spread value
+/// determines the signal:
+///
+/// - **Profit taken**: the z-score has crossed back through zero relative to the
+///   entry z-score sign, meaning the spread has converged (trade thesis played out).
+/// - **Stop loss**: the z-score magnitude exceeds [`STOP_LOSS_Z_SCORE_THRESHOLD`]
+///   and the sign matches the entry direction, meaning the spread has diverged
+///   further against the position.
+///
+/// Pairs where either leg lacks historical price data are silently skipped (kept open).
+fn evaluate_open_pairs(
+    open_pairs: &[OpenPair],
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
+) -> Vec<PairCloseSignal> {
+    let mut signals = Vec::new();
+
+    for pair in open_pairs {
+        let long_prices = match historical_prices.get(pair.long_ticker()) {
+            Some(prices) if prices.len() >= 2 => prices,
+            _ => {
+                warn!(
+                    pair_id = pair.pair_id().as_str(),
+                    "Insufficient long-leg price history for evaluation; keeping pair"
+                );
+                continue;
+            }
+        };
+        let short_prices = match historical_prices.get(pair.short_ticker()) {
+            Some(prices) if prices.len() >= 2 => prices,
+            _ => {
+                warn!(
+                    pair_id = pair.pair_id().as_str(),
+                    "Insufficient short-leg price history for evaluation; keeping pair"
+                );
+                continue;
+            }
+        };
+
+        let common_length = long_prices.len().min(short_prices.len());
+        let long_slice = &long_prices[long_prices.len() - common_length..];
+        let short_slice = &short_prices[short_prices.len() - common_length..];
+
+        let spread: Vec<f64> = long_slice
+            .iter()
+            .zip(short_slice.iter())
+            .map(|(long, short)| long - pair.hedge_ratio() * short)
+            .collect();
+
+        let current_z = z_score_last(&spread);
+
+        // Convergence: z-score crossed back through zero relative to entry direction.
+        let converged = (pair.entry_z_score() > 0.0 && current_z <= 0.0)
+            || (pair.entry_z_score() < 0.0 && current_z >= 0.0);
+
+        // Stop loss: z-score diverged further against the position past the threshold.
+        let stopped_out = current_z.abs() >= STOP_LOSS_Z_SCORE_THRESHOLD
+            && current_z.signum() == pair.entry_z_score().signum();
+
+        if converged {
+            info!(
+                pair_id = pair.pair_id().as_str(),
+                entry_z = pair.entry_z_score(),
+                current_z = current_z,
+                "Pair converged; closing with profit taken"
+            );
+            signals.push(PairCloseSignal {
+                open_pair: pair.clone(),
+                reason: CloseReason::ProfitTaken,
+            });
+        } else if stopped_out {
+            info!(
+                pair_id = pair.pair_id().as_str(),
+                entry_z = pair.entry_z_score(),
+                current_z = current_z,
+                threshold = STOP_LOSS_Z_SCORE_THRESHOLD,
+                "Pair diverged past stop-loss threshold; closing"
+            );
+            signals.push(PairCloseSignal {
+                open_pair: pair.clone(),
+                reason: CloseReason::StopLoss,
+            });
+        } else {
+            info!(
+                pair_id = pair.pair_id().as_str(),
+                entry_z = pair.entry_z_score(),
+                current_z = current_z,
+                "Pair within range; keeping open"
+            );
+        }
     }
 
-    let close_tickers: Vec<String> = open_pairs
+    signals
+}
+
+/// Closes the given pairs on Alpaca and marks them closed in the database.
+///
+/// Returns the number of pairs successfully closed.
+async fn close_triggered_pairs(
+    alpaca: &AlpacaTradingClient,
+    pool: &sqlx::PgPool,
+    signals: &[PairCloseSignal],
+) -> Result<usize, RebalanceError> {
+    if signals.is_empty() {
+        return Ok(0);
+    }
+
+    let close_tickers: Vec<String> = signals
         .iter()
-        .flat_map(|pair| {
+        .flat_map(|signal| {
             [
-                pair.long_ticker().to_string(),
-                pair.short_ticker().to_string(),
+                signal.open_pair.long_ticker().to_string(),
+                signal.open_pair.short_ticker().to_string(),
             ]
         })
         .collect();
@@ -363,12 +521,13 @@ async fn close_existing_positions(
         .map_err(RebalanceError::Execution)?;
 
     let closed_at = Utc::now();
-    for open_pair in &open_pairs {
-        close_equity_pair(pool, open_pair.id(), closed_at).await?;
+    for signal in signals {
+        close_equity_pair_with_reason(pool, signal.open_pair.id(), closed_at, &signal.reason)
+            .await?;
     }
 
-    info!(count = open_pairs.len(), "Open pairs closed");
-    Ok(())
+    info!(count = signals.len(), "Triggered pairs closed");
+    Ok(signals.len())
 }
 
 /// Fetches current account equity and checks the drawdown guard.
@@ -423,7 +582,7 @@ async fn check_drawdown(
 async fn select_size_execute(
     alpaca: &AlpacaTradingClient,
     pool: &sqlx::PgPool,
-    tradable_assets_cache: &Arc<RwLock<Option<Arc<HashSet<String>>>>>,
+    tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
     spy_prices: &[f64],
@@ -475,8 +634,8 @@ async fn select_size_execute(
 
     // Resolve the tradable asset universe from the session cache, populating it
     // on first use. Subsequent rebalances within the same service instance reuse
-    // the cached Arc without cloning the underlying set.
-    let tradable_assets: Arc<HashSet<String>> = {
+    // the cached Arc without cloning the underlying struct.
+    let tradable_assets: Arc<TradableAssets> = {
         let read_guard = tradable_assets_cache.read().await;
         if let Some(assets) = read_guard.as_ref() {
             Arc::clone(assets)
@@ -490,17 +649,39 @@ async fn select_size_execute(
             );
             let mut write_guard = tradable_assets_cache.write().await;
             *write_guard = Some(Arc::clone(&assets));
-            info!(count = assets.len(), "Tradable asset cache populated");
+            info!(
+                tradable = assets.tradable_count(),
+                shortable = assets.shortable_count(),
+                "Tradable asset cache populated"
+            );
             assets
         }
     };
 
-    let shortable_pairs: Vec<_> = sized_pairs
+    // Filter pairs to those where the long leg is tradable on Alpaca and the
+    // short leg is both tradable and shortable (easy to borrow).
+    let eligible_pairs: Vec<_> = sized_pairs
         .into_iter()
-        .filter(|pair| tradable_assets.contains(pair.short_ticker().as_str()))
+        .filter(|pair| {
+            let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
+            let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str());
+            if !long_ok {
+                info!(
+                    ticker = pair.long_ticker().as_str(),
+                    "Long leg not tradable on Alpaca; dropping pair"
+                );
+            }
+            if !short_ok {
+                info!(
+                    ticker = pair.short_ticker().as_str(),
+                    "Short leg not shortable on Alpaca; dropping pair"
+                );
+            }
+            long_ok && short_ok
+        })
         .collect();
 
-    let pending = execute_open_pairs(alpaca, &shortable_pairs).await;
+    let pending = execute_open_pairs(alpaca, &eligible_pairs).await;
     let filled = confirm_fills(alpaca, pending).await;
 
     if filled.is_empty() {
@@ -741,10 +922,148 @@ mod tests {
     fn test_rebalance_outcome_fields() {
         let outcome = RebalanceOutcome {
             session_id: Uuid::new_v4(),
-            pairs_filled: 10,
+            pairs_opened: 3,
+            pairs_closed: 2,
+            pairs_kept: 8,
             net_asset_value: 500_000.0,
         };
-        assert_eq!(outcome.pairs_filled, 10);
+        assert_eq!(outcome.pairs_opened, 3);
+        assert_eq!(outcome.pairs_closed, 2);
+        assert_eq!(outcome.pairs_kept, 8);
         assert_eq!(outcome.net_asset_value, 500_000.0);
+    }
+
+    // --- evaluate_open_pairs tests ---
+
+    use crate::domain::market::PairID;
+    use crate::portfolio_manager::database::OpenPair;
+
+    fn make_open_pair(long: &str, short: &str, entry_z: f64, hedge_ratio: f64) -> OpenPair {
+        OpenPair::new_for_test(
+            Uuid::new_v4(),
+            PairID::new(Ticker::new(long).unwrap(), Ticker::new(short).unwrap()),
+            Ticker::new(long).unwrap(),
+            Ticker::new(short).unwrap(),
+            entry_z,
+            hedge_ratio,
+        )
+    }
+
+    /// Builds a synthetic price series with a linear trend.
+    fn make_prices(length: usize, start: f64, step: f64) -> Vec<f64> {
+        (0..length)
+            .map(|index| start + step * index as f64)
+            .collect()
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_convergence_positive_entry() {
+        // Entry z > 0 (spread was wide), and current spread has collapsed below mean → converged.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        // Long prices decrease, short prices increase → spread goes negative → z crosses zero.
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, -1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.0));
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_convergence_negative_entry() {
+        // Entry z < 0 (spread was narrow), and current spread has widened above mean → converged.
+        let pair = make_open_pair("AAPL", "MSFT", -2.5, 1.0);
+        // Long prices increase, short prices decrease → spread goes positive → z crosses zero.
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 100.0, 1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 150.0, -1.0));
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_stop_loss() {
+        // Entry z > 0 and spread spikes at the end → z exceeds threshold → stop loss.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        // Build prices where the spread is stable at ~50 for most of the window,
+        // then spikes dramatically at the end to produce z > 4.0.
+        let mut long_prices = vec![150.0; 58];
+        long_prices.push(400.0);
+        long_prices.push(450.0);
+        let short_prices = vec![100.0; 60];
+
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
+        prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::StopLoss);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_kept_within_range() {
+        // Spread is gently increasing → z is positive but moderate → pair kept open.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        // Long increases faster than short → spread grows linearly → z_score_last ≈ 1.73.
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 0.5));
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_missing_prices_skips_pair() {
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let prices = HashMap::new(); // No price data at all.
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert!(signals.is_empty()); // Pair kept open due to missing data.
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_multiple_mixed_signals() {
+        let converging = make_open_pair("A", "B", 2.5, 1.0);
+        let stable = make_open_pair("C", "D", 2.5, 1.0);
+        let diverging = make_open_pair("E", "F", 2.5, 1.0);
+
+        let mut prices = HashMap::new();
+        // A-B: spread collapses → converged.
+        prices.insert(Ticker::new("A").unwrap(), make_prices(60, 150.0, -1.0));
+        prices.insert(Ticker::new("B").unwrap(), make_prices(60, 100.0, 1.0));
+        // C-D: spread gently increasing → kept.
+        prices.insert(Ticker::new("C").unwrap(), make_prices(60, 150.0, 1.0));
+        prices.insert(Ticker::new("D").unwrap(), make_prices(60, 100.0, 0.5));
+        // E-F: spread spikes at the end → stop loss.
+        let mut long_e = vec![150.0; 58];
+        long_e.push(400.0);
+        long_e.push(450.0);
+        prices.insert(Ticker::new("E").unwrap(), long_e);
+        prices.insert(Ticker::new("F").unwrap(), vec![100.0; 60]);
+
+        let signals = evaluate_open_pairs(&[converging, stable, diverging], &prices);
+        assert_eq!(signals.len(), 2);
+
+        let reasons: Vec<&CloseReason> = signals.iter().map(|signal| &signal.reason).collect();
+        assert!(reasons.contains(&&CloseReason::ProfitTaken));
+        assert!(reasons.contains(&&CloseReason::StopLoss));
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_empty_input() {
+        let signals = evaluate_open_pairs(&[], &HashMap::new());
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_stop_loss_threshold_is_documented() {
+        // Verify the threshold constant is the expected value (guards against
+        // accidental changes without updating documentation).
+        assert!((STOP_LOSS_Z_SCORE_THRESHOLD - 4.0).abs() < f64::EPSILON);
     }
 }
