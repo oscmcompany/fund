@@ -48,39 +48,45 @@ fn is_weekday_minutes_in_range(now: DateTime<Utc>, start_minutes: u32, end_minut
 /// Returns the duration from `now` until the next quote-stream window opens
 /// (09:25 Eastern on the next weekday). Returns `Duration::ZERO` if the window
 /// is already open.
+///
+/// Advances the naive date rather than adding 24-hour durations to a zoned
+/// `DateTime`, which would drift across DST transitions.
 pub fn duration_until_quote_stream_window(now: DateTime<Utc>) -> std::time::Duration {
-    use chrono::Duration as ChronoDuration;
+    use chrono::NaiveTime;
 
     if is_within_quote_stream_window_at(now) {
         return std::time::Duration::ZERO;
     }
 
     let eastern = now.with_timezone(&Eastern);
+    let window_open = NaiveTime::from_hms_opt(9, 25, 0).expect("09:25:00 is a valid time");
 
-    // Target: 09:25 Eastern today or the next weekday.
-    let target_today = eastern
-        .date_naive()
-        .and_hms_opt(9, 25, 0)
-        .expect("09:25:00 is a valid time");
-    let target_today = Eastern
-        .from_local_datetime(&target_today)
+    let mut target_date = eastern.date_naive();
+
+    // If 09:25 today has already passed (we're past the window), advance to tomorrow.
+    let today_target = target_date.and_time(window_open);
+    let today_target_eastern = Eastern
+        .from_local_datetime(&today_target)
+        .single()
+        .expect("09:25 Eastern is unambiguous");
+    if eastern >= today_target_eastern && !is_within_quote_stream_window_at(now) {
+        target_date = target_date.succ_opt().expect("date has a successor");
+    }
+
+    // Skip weekends by advancing the naive date.
+    while matches!(target_date.weekday(), Weekday::Sat | Weekday::Sun) {
+        target_date = target_date.succ_opt().expect("date has a successor");
+    }
+
+    // Localize the final naive date + time once, producing the correct instant
+    // regardless of whether the target day is in EDT or EST.
+    let target = Eastern
+        .from_local_datetime(&target_date.and_time(window_open))
         .single()
         .expect("09:25 Eastern is unambiguous");
 
-    let mut target = target_today;
-
-    // If we're past the window close today (or it's a weekend), advance to next weekday.
-    if eastern >= target_today && !is_within_quote_stream_window_at(now) {
-        target += ChronoDuration::days(1);
-    }
-
-    // Skip weekends.
-    while matches!(target.weekday(), Weekday::Sat | Weekday::Sun) {
-        target += ChronoDuration::days(1);
-    }
-
     let delta = target.signed_duration_since(eastern);
-    if delta <= ChronoDuration::zero() {
+    if delta.num_seconds() <= 0 {
         std::time::Duration::ZERO
     } else {
         delta.to_std().unwrap_or(std::time::Duration::ZERO)
@@ -226,6 +232,30 @@ mod tests {
         let duration = duration_until_quote_stream_window(now);
         // Mon 2024-07-15 09:25 EDT = 13:25 UTC. From Sat 15:00 UTC = 1d22h25m.
         let expected = 24 * 3600 + 22 * 3600 + 25 * 60;
+        assert_eq!(duration.as_secs(), expected);
+    }
+
+    #[test]
+    fn test_duration_friday_evening_across_dst_fall_back() {
+        // 2024-11-01 21:00 UTC = Friday 17:00 EDT (UTC-4).
+        // DST ends 2024-11-03 02:00 → clocks fall back to EST (UTC-5).
+        // Target: Mon 2024-11-04 09:25 EST = 14:25 UTC.
+        // From Fri 21:00 UTC to Mon 14:25 UTC = 2d17h25m.
+        let now = utc("2024-11-01T21:00:00Z");
+        let duration = duration_until_quote_stream_window(now);
+        let expected = 2 * 24 * 3600 + 17 * 3600 + 25 * 60;
+        assert_eq!(duration.as_secs(), expected);
+    }
+
+    #[test]
+    fn test_duration_friday_evening_across_dst_spring_forward() {
+        // 2025-03-07 22:00 UTC = Friday 17:00 EST (UTC-5).
+        // DST starts 2025-03-09 02:00 → clocks spring forward to EDT (UTC-4).
+        // Target: Mon 2025-03-10 09:25 EDT = 13:25 UTC.
+        // From Fri 22:00 UTC to Mon 13:25 UTC = 2d15h25m.
+        let now = utc("2025-03-07T22:00:00Z");
+        let duration = duration_until_quote_stream_window(now);
+        let expected = 2 * 24 * 3600 + 15 * 3600 + 25 * 60;
         assert_eq!(duration.as_secs(), expected);
     }
 }

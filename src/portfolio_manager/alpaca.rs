@@ -365,7 +365,7 @@ impl AlpacaTradingClient {
         let mut shortable = std::collections::HashSet::new();
 
         for asset in assets {
-            if asset.tradable.unwrap_or(false) {
+            if asset.tradable.unwrap_or(false) && asset.fractionable.unwrap_or(false) {
                 tradable.insert(asset.symbol.clone());
                 if asset.shortable.unwrap_or(false) && asset.easy_to_borrow.unwrap_or(false) {
                     shortable.insert(asset.symbol);
@@ -512,6 +512,7 @@ struct OrderResponse {
 struct AssetResponse {
     symbol: String,
     tradable: Option<bool>,
+    fractionable: Option<bool>,
     shortable: Option<bool>,
     easy_to_borrow: Option<bool>,
 }
@@ -679,11 +680,12 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"[
-                {"symbol": "AAPL", "tradable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "MSFT", "tradable": true,  "shortable": false, "easy_to_borrow": true},
-                {"symbol": "GOOG", "tradable": true,  "shortable": true,  "easy_to_borrow": false},
-                {"symbol": "NVDA", "tradable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "META", "tradable": false, "shortable": true,  "easy_to_borrow": true}
+                {"symbol": "AAPL", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "MSFT", "tradable": true,  "fractionable": true,  "shortable": false, "easy_to_borrow": true},
+                {"symbol": "GOOG", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": false},
+                {"symbol": "NVDA", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "AMZN", "tradable": true,  "fractionable": false, "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "META", "tradable": false, "fractionable": true,  "shortable": true,  "easy_to_borrow": true}
             ]"#,
             )
             .create_async()
@@ -692,18 +694,20 @@ mod tests {
         let client = AlpacaTradingClient::with_base_url(make_credentials(), server.url());
         let assets = client.fetch_tradable_assets().await.unwrap();
 
-        // Tradable set: all assets with tradable=true (long leg eligibility).
+        // Tradable set: tradable + fractionable (long leg eligibility via notional orders).
         assert!(assets.is_tradable("AAPL"));
         assert!(assets.is_tradable("MSFT"));
         assert!(assets.is_tradable("GOOG"));
         assert!(assets.is_tradable("NVDA"));
-        assert!(!assets.is_tradable("META")); // tradable=false
+        assert!(!assets.is_tradable("AMZN")); // not fractionable
+        assert!(!assets.is_tradable("META")); // not tradable
 
-        // Shortable set: tradable + shortable + easy_to_borrow (short leg eligibility).
+        // Shortable set: tradable + fractionable + shortable + easy_to_borrow (short leg eligibility).
         assert!(assets.is_shortable("AAPL"));
         assert!(!assets.is_shortable("MSFT")); // not shortable
         assert!(!assets.is_shortable("GOOG")); // not easy_to_borrow
         assert!(assets.is_shortable("NVDA"));
+        assert!(!assets.is_shortable("AMZN")); // not fractionable
         assert!(!assets.is_shortable("META")); // not tradable
 
         assert_eq!(assets.tradable_count(), 4);

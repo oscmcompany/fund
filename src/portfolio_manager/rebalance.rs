@@ -1,11 +1,16 @@
 //! Main rebalance orchestration pipeline.
 //!
-//! `run_rebalance` drives a per-pair evaluation lifecycle:
+//! `run_rebalance` follows a build-then-monitor model:
+//! - **Build** (no open pairs): full portfolio construction with invariant validation
+//! - **Monitor** (open pairs exist): evaluate each pair for close signals, close triggered
+//!   ones, leave vacant slots unfilled
+//!
+//! Key functions:
 //! 1. `fetch_market_data` — load predictions and price history from the database
 //! 2. `evaluate_open_pairs` — check each open pair for close signals (convergence, stop-loss)
 //! 3. `close_triggered_pairs` — close only pairs that hit a signal on Alpaca and in the DB
 //! 4. `check_drawdown` — gate on account equity vs previous NAV
-//! 5. `select_size_execute` — fill vacant slots with new pairs
+//! 5. `select_size_execute` — select, size, and execute new pairs (build path only)
 //! 6. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
 
 use std::collections::HashMap;
@@ -132,12 +137,19 @@ impl From<PortfolioError> for RebalanceError {
     }
 }
 
-/// Runs one rebalance cycle with per-pair evaluation.
+/// Runs one rebalance cycle.
 ///
-/// Open pairs are evaluated individually for close signals (convergence → profit
-/// taken, divergence → stop loss). Only triggered pairs are closed, freeing
-/// capital for replacement pairs. New pairs fill the vacant slots up to the
-/// configured `minimum_pairs` target.
+/// The portfolio lifecycle follows a build-then-monitor model:
+/// - **No open pairs**: build a fresh portfolio from scratch with full invariant
+///   validation (minimum pairs, concentration cap, beta neutrality, dollar neutrality).
+/// - **Open pairs exist**: evaluate each pair for close signals (convergence → profit
+///   taken, divergence → stop loss) and close only those that trigger. Closed slots
+///   are **not** refilled; capital sits idle until end-of-day liquidation or until
+///   all pairs close, which triggers a fresh portfolio build.
+///
+/// This avoids the complexity of partial portfolio construction (mixed kept/new pairs,
+/// ticker overlap, drifting concentration and beta). If idle capital from closed pairs
+/// becomes a recurring issue, the approach can be revisited.
 ///
 /// Returns `RebalanceOutcome` on success or a `RebalanceError` describing
 /// why the cycle was skipped or failed.
@@ -165,11 +177,16 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let signals = consolidate_predictions(&predictions, &historical_prices, &equity_details);
     info!(tickers = signals.len(), "Signals consolidated");
 
-    // Phase 4: evaluate open pairs and close only those that hit a signal.
+    // Phase 4: evaluate open pairs and close triggered ones.
     let open_pairs = fetch_open_pairs(pool).await?;
-    let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices);
-    let pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
-    let pairs_kept = open_pairs.len() - pairs_closed;
+
+    if !open_pairs.is_empty() {
+        // Monitor path: evaluate existing pairs, close triggered ones, persist snapshot.
+        return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
+    }
+
+    // Build path: no open pairs — construct a fresh portfolio with full validation.
+    info!("No open pairs; building fresh portfolio");
 
     // Phase 5: check drawdown.
     let (current_equity, buying_power) = check_drawdown(
@@ -179,53 +196,32 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     )
     .await?;
 
-    // Phase 6: fill vacant slots with new pairs.
+    // Phase 6: select, size, and execute new pairs.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
-    let vacant_slots = required_pairs.saturating_sub(pairs_kept);
-
-    let filled = if vacant_slots > 0 {
-        match select_size_execute(
-            alpaca,
-            pool,
-            state.tradable_assets(),
-            &signals,
-            &historical_prices,
-            &spy_prices,
-            buying_power,
-            exposure_scale,
-            state.candidate_pool_count(),
-            vacant_slots,
-        )
-        .await
-        {
-            Ok(fills) => fills,
-            Err(RebalanceError::InsufficientPairs(ref sizing_error)) if pairs_kept > 0 => {
-                info!(
-                    vacant_slots = vacant_slots,
-                    error = %sizing_error,
-                    "Could not fill all vacant slots; continuing with existing pairs"
-                );
-                Vec::new()
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        info!("No vacant slots; all pairs retained");
-        Vec::new()
-    };
+    let filled = select_size_execute(
+        alpaca,
+        pool,
+        state.tradable_assets(),
+        &signals,
+        &historical_prices,
+        &spy_prices,
+        buying_power,
+        exposure_scale,
+        state.candidate_pool_count(),
+        required_pairs,
+    )
+    .await?;
 
     let pairs_opened = filled.len();
 
-    // Phase 7: validate portfolio invariants for full opens (no kept pairs).
-    if pairs_kept == 0 && !filled.is_empty() {
-        let filled_pairs_only: Vec<FilledPair> = filled
-            .iter()
-            .map(|(filled_pair, _)| filled_pair.clone())
-            .collect();
-        Portfolio::new(filled_pairs_only, state.constraints())?;
-    }
+    // Phase 7: validate portfolio invariants on the fresh set.
+    let filled_pairs_only: Vec<FilledPair> = filled
+        .iter()
+        .map(|(filled_pair, _)| filled_pair.clone())
+        .collect();
+    Portfolio::new(filled_pairs_only, state.constraints())?;
 
-    // Phase 8: persist session, new pairs, allocations, orders, and snapshot.
+    // Phase 8: persist session, pairs, allocations, orders, and snapshot.
     let session_id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -239,11 +235,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     );
     insert_rebalance_session(pool, &session).await?;
 
-    let total_slippage_cost = if filled.is_empty() {
-        Decimal::ZERO
-    } else {
-        persist_filled_pairs(pool, session_id, now, &filled).await?
-    };
+    let total_slippage_cost = persist_filled_pairs(pool, session_id, now, &filled).await?;
 
     let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
         RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
@@ -264,8 +256,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         &serde_json::json!({
             "session_id": session_id.to_string(),
             "pairs_opened": pairs_opened,
-            "pairs_closed": pairs_closed,
-            "pairs_kept": pairs_kept,
+            "pairs_closed": 0,
+            "pairs_kept": 0,
             "net_asset_value": net_asset_value,
         }),
     )
@@ -274,15 +266,90 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     info!(
         session_id = %session_id,
         pairs_opened = pairs_opened,
-        pairs_closed = pairs_closed,
-        pairs_kept = pairs_kept,
         net_asset_value = net_asset_value,
-        "Rebalance completed"
+        "Fresh portfolio built"
     );
 
     Ok(RebalanceOutcome {
         session_id,
         pairs_opened,
+        pairs_closed: 0,
+        pairs_kept: 0,
+        net_asset_value,
+    })
+}
+
+/// Monitor path: evaluate existing open pairs for close signals and persist a snapshot.
+///
+/// Closed pair slots are intentionally left vacant. If all pairs close during
+/// evaluation, the next rebalance tick will trigger a fresh portfolio build.
+async fn run_monitor_cycle(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    alpaca: &AlpacaTradingClient,
+    open_pairs: &[OpenPair],
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
+) -> Result<RebalanceOutcome, RebalanceError> {
+    let close_signals = evaluate_open_pairs(open_pairs, historical_prices);
+    let pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
+    let pairs_kept = open_pairs.len() - pairs_closed;
+
+    info!(
+        pairs_kept = pairs_kept,
+        pairs_closed = pairs_closed,
+        "Monitor cycle: evaluated open pairs"
+    );
+
+    // Persist a snapshot even when no pairs were opened.
+    let (current_equity, _buying_power) = check_drawdown(
+        alpaca,
+        pool,
+        state.constraints().drawdown_threshold().0.value(),
+    )
+    .await?;
+
+    let session_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    let session = EquityRebalanceSession::new(
+        session_id,
+        now,
+        "market_session_check".to_string(),
+        None,
+        None,
+        RebalanceSessionStatus::Completed,
+    );
+    insert_rebalance_session(pool, &session).await?;
+
+    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
+        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
+    })?;
+    insert_portfolio_snapshot(pool, now, net_asset_value_decimal, Decimal::ZERO).await?;
+    update_rebalance_session_status(pool, session_id, &RebalanceSessionStatus::Completed, now)
+        .await?;
+
+    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
+        RebalanceError::Conversion(
+            "net_asset_value_decimal cannot be represented as f64".to_string(),
+        )
+    })?;
+
+    emit_event(
+        pool,
+        EventType::PortfolioRebalanceCompleted,
+        &serde_json::json!({
+            "session_id": session_id.to_string(),
+            "pairs_opened": 0,
+            "pairs_closed": pairs_closed,
+            "pairs_kept": pairs_kept,
+            "net_asset_value": net_asset_value,
+        }),
+    )
+    .await?;
+
+    Ok(RebalanceOutcome {
+        session_id,
+        pairs_opened: 0,
         pairs_closed,
         pairs_kept,
         net_asset_value,
@@ -450,6 +517,17 @@ fn evaluate_open_pairs(
 
         let current_z = z_score_last(&spread);
 
+        // z_score_last returns 0.0 when the spread has near-zero standard deviation
+        // (degenerate/halted). Treating this as a real z-score would falsely trigger
+        // convergence. Skip evaluation and keep the pair open.
+        if current_z == 0.0 {
+            info!(
+                pair_id = pair.pair_id().as_str(),
+                "Spread has zero variance; skipping evaluation and keeping pair"
+            );
+            continue;
+        }
+
         // Convergence: z-score crossed back through zero relative to entry direction.
         let converged = (pair.entry_z_score() > 0.0 && current_z <= 0.0)
             || (pair.entry_z_score() < 0.0 && current_z >= 0.0);
@@ -514,6 +592,8 @@ async fn close_triggered_pairs(
                 signal.open_pair.short_ticker().to_string(),
             ]
         })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
         .collect();
 
     close_positions(alpaca, &close_tickers)
@@ -1052,6 +1132,20 @@ mod tests {
         let reasons: Vec<&CloseReason> = signals.iter().map(|signal| &signal.reason).collect();
         assert!(reasons.contains(&&CloseReason::ProfitTaken));
         assert!(reasons.contains(&&CloseReason::StopLoss));
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_zero_variance_keeps_pair() {
+        // When both legs have constant prices, the spread has zero variance and
+        // z_score_last returns 0.0. The pair should be kept open, not falsely
+        // closed as converged.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0; 60]);
+        prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0; 60]);
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert!(signals.is_empty());
     }
 
     #[test]
