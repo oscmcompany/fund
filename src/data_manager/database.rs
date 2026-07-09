@@ -160,7 +160,7 @@ pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result
         rows_affected += result.rows_affected();
     }
 
-    info!("Seeded equity_details with {} rows from S3", rows_affected);
+    info!("Seeded equity_details with {} rows", rows_affected);
     Ok(rows_affected)
 }
 

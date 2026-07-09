@@ -1,4 +1,7 @@
 use crate::common::events::EventType;
+use crate::common::market_hours::{
+    duration_until_quote_stream_window, is_within_quote_stream_window,
+};
 use crate::data_manager::data::EquityQuote;
 use crate::data_manager::database;
 use crate::data_manager::state::State;
@@ -9,7 +12,7 @@ use futures_util::{SinkExt, StreamExt};
 use sqlx::postgres::PgListener;
 use std::collections::HashSet;
 use std::time::Duration;
-use tokio::time::{interval, sleep};
+use tokio::time::{interval, sleep, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
@@ -27,6 +30,10 @@ const _: () = assert!(
     "FLUSH_INTERVAL_SECS must not exceed MARKET_SESSION_CHECK_INTERVAL_SECS"
 );
 
+/// Maximum seconds of silence (no WebSocket message of any kind) before the
+/// connection is considered stale and forcibly reconnected.
+const WATCHDOG_TIMEOUT_SECS: u64 = 60;
+
 pub fn spawn_quote_stream(state: State) {
     if state.database.pool().is_none() {
         info!("PostgreSQL not available, quote stream disabled");
@@ -39,18 +46,40 @@ pub fn spawn_quote_stream(state: State) {
     tokio::spawn(quote_stream_supervisor(state));
 }
 
+/// Supervisor loop that connects the quote stream only during market hours.
+///
+/// Outside the quote-stream window (09:25–16:05 Eastern, weekdays) the
+/// supervisor sleeps until the next window opens. Inside the window it
+/// maintains a WebSocket connection with automatic reconnection on error
+/// and a watchdog that forces reconnection after [`WATCHDOG_TIMEOUT_SECS`]
+/// of silence.
 async fn quote_stream_supervisor(state: State) {
     loop {
-        match run_quote_stream(&state).await {
-            Ok(()) => {
-                info!("Quote stream exited cleanly, reconnecting in 5s");
-                sleep(Duration::from_secs(5)).await;
-            }
-            Err(error) => {
-                warn!("Quote stream error: {}, restarting in 30s", error);
-                sleep(Duration::from_secs(30)).await;
+        // Sleep until the quote-stream window is open.
+        let wait = duration_until_quote_stream_window(Utc::now());
+        if !wait.is_zero() {
+            info!(
+                seconds = wait.as_secs(),
+                "Quote stream sleeping until next market session"
+            );
+            sleep(wait).await;
+        }
+
+        // Run the stream as long as we're within the window.
+        while is_within_quote_stream_window() {
+            match run_quote_stream(&state).await {
+                Ok(()) => {
+                    info!("Quote stream exited cleanly, reconnecting in 5s");
+                    sleep(Duration::from_secs(5)).await;
+                }
+                Err(error) => {
+                    warn!("Quote stream error: {}, restarting in 30s", error);
+                    sleep(Duration::from_secs(30)).await;
+                }
             }
         }
+
+        info!("Quote stream window closed, disconnecting until next session");
     }
 }
 
@@ -87,11 +116,14 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
     let (ws_stream, _) = connect_async(&url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    // Wait for the initial "connected" control message
+    // Wait for the initial connected control message.
+    // Alpaca sends [{"T":"success","msg":"connected"}] immediately on connect.
     if let Some(Ok(Message::Text(text))) = read.next().await {
         let messages: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
         for message in &messages {
-            if message.get("T").and_then(|t| t.as_str()) == Some("connected") {
+            if message.get("T").and_then(|t| t.as_str()) == Some("success")
+                && message.get("msg").and_then(|m| m.as_str()) == Some("connected")
+            {
                 info!("Alpaca WebSocket connected");
             }
         }
@@ -156,9 +188,28 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
     let mut flush_timer = interval(Duration::from_secs(FLUSH_INTERVAL_SECS));
     flush_timer.tick().await; // consume first immediate tick
 
+    let watchdog_duration = Duration::from_secs(WATCHDOG_TIMEOUT_SECS);
+    let mut last_message_at = Instant::now();
+
     loop {
+        // Exit cleanly when the quote-stream window closes.
+        if !is_within_quote_stream_window() {
+            info!("Quote stream window closed, disconnecting");
+            break;
+        }
+
+        // Watchdog: force reconnect if no WebSocket message has arrived recently.
+        if last_message_at.elapsed() > watchdog_duration {
+            warn!(
+                timeout_seconds = WATCHDOG_TIMEOUT_SECS,
+                "Watchdog timeout: no WebSocket message received, forcing reconnect"
+            );
+            break;
+        }
+
         tokio::select! {
             message = read.next() => {
+                last_message_at = Instant::now();
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         let parsed = parse_quote_messages(&text);

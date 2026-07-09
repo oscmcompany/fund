@@ -7,8 +7,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, Timelike, Utc, Weekday};
-use chrono_tz::US::Eastern;
+use chrono::Utc;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::time::sleep;
@@ -18,6 +17,7 @@ use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
     CONSUMER_PORTFOLIO_MANAGER, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION,
 };
+use crate::common::market_hours::is_within_trading_session;
 use crate::portfolio_manager::rebalance::{
     run_end_of_day_liquidation, run_rebalance, RebalanceError,
 };
@@ -128,24 +128,6 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     }
 }
 
-/// Returns true when the current time falls within US equity market hours
-/// (09:30–16:00 Eastern, weekdays). Used to guard against replaying a missed
-/// end-of-day liquidation event after the market has already closed.
-fn is_within_trading_session() -> bool {
-    is_within_trading_session_at(Utc::now())
-}
-
-/// Testable variant of [`is_within_trading_session`] that accepts an explicit UTC instant.
-fn is_within_trading_session_at(now: DateTime<Utc>) -> bool {
-    let now_eastern = now.with_timezone(&Eastern);
-    if matches!(now_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
-        return false;
-    }
-    let minutes_eastern = now_eastern.hour() * 60 + now_eastern.minute();
-    // US equity market: 09:30–16:00 Eastern Time, DST-safe.
-    (9 * 60 + 30..16 * 60).contains(&minutes_eastern)
-}
-
 /// Maximum duration (seconds) for a prediction-pipeline run before the in-progress
 /// flag is considered stale. Set to one hour, well past any realistic pipeline run.
 const STALE_CYCLE_SECS: i64 = 60 * 60;
@@ -219,7 +201,9 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
         Ok(outcome) => {
             info!(
                 session_id = %outcome.session_id,
-                pairs_filled = outcome.pairs_filled,
+                pairs_opened = outcome.pairs_opened,
+                pairs_closed = outcome.pairs_closed,
+                pairs_kept = outcome.pairs_kept,
                 "Rebalance completed from event"
             );
         }
@@ -323,10 +307,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_within_trading_session_at, CONSUMER_PORTFOLIO_MANAGER,
-        CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION,
-    };
+    use super::{CONSUMER_PORTFOLIO_MANAGER, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION};
     use crate::common::events::EventType;
 
     #[test]
@@ -356,32 +337,5 @@ mod tests {
             EventType::MarketSessionCheck.as_str(),
             "market_session_check"
         );
-    }
-
-    #[test]
-    fn test_is_within_trading_session_true_during_edt() {
-        // 2024-07-15 14:00 UTC = 10:00 EDT (UTC-4): market is open.
-        let now = chrono::DateTime::parse_from_rfc3339("2024-07-15T14:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert!(is_within_trading_session_at(now));
-    }
-
-    #[test]
-    fn test_is_within_trading_session_false_after_close_during_est() {
-        // 2024-01-15 21:30 UTC = 16:30 EST (UTC-5): market is closed.
-        let now = chrono::DateTime::parse_from_rfc3339("2024-01-15T21:30:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert!(!is_within_trading_session_at(now));
-    }
-
-    #[test]
-    fn test_is_within_trading_session_false_on_weekend() {
-        // 2024-07-13 15:00 UTC = Saturday 11:00 EDT: closed.
-        let now = chrono::DateTime::parse_from_rfc3339("2024-07-13T15:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert!(!is_within_trading_session_at(now));
     }
 }

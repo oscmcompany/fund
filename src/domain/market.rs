@@ -20,6 +20,14 @@ pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
 /// the base symbol, with an optional dot-separated suffix of 1–3 uppercase ASCII
 /// letters for share class or warrant notation (e.g. `BRK.B`, `BRK.WS`).
 ///
+/// Both Alpaca and Massive use dot-separated suffixes for class shares and other
+/// security subtypes, though their conventions diverge for preferred shares
+/// (Alpaca: `BAC.PRL`, Massive: `BACpL`). Common stocks and class shares use
+/// identical formats across both platforms.
+///
+/// Alpaca asset reference: <https://docs.alpaca.markets/us/reference/get-v2-assets-1>
+/// Massive ticker reference: <https://massive.com/docs/rest/stocks/tickers/all-tickers>
+///
 /// The private field prevents construction without going through [`Ticker::new`],
 /// which trims, uppercases, and validates the raw input. A `Ticker` in scope is
 /// proof that the symbol passed format validation.

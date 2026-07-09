@@ -4,7 +4,7 @@ use crate::common::events::{
     CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
 };
 use crate::data_manager::data::TradingDate;
-use crate::data_manager::equity_bars::fetch_and_store;
+use crate::data_manager::equity_bars::fetch_and_store_equity_bars;
 use crate::data_manager::export;
 use crate::data_manager::state::State;
 use aws_sdk_s3::primitives::ByteStream;
@@ -93,7 +93,7 @@ async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
         "Starting equity bar sync for {}",
         trading_date.as_naive_date().format("%Y-%m-%d")
     );
-    fetch_and_store(state, &trading_date).await
+    fetch_and_store_equity_bars(state, &trading_date).await
 }
 
 async fn sync_loop(state: State) {

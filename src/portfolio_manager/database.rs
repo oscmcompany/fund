@@ -6,14 +6,15 @@ use chrono::{DateTime, Duration, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::domain::freshness::{Fresh, StalenessWindow};
 use crate::domain::market::{PairID, Ticker};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
-    EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession, RebalanceSessionStatus,
+    CloseReason, EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession,
+    RebalanceSessionStatus,
 };
 
 /// Lookback window for historical close prices (calendar days).
@@ -27,17 +28,24 @@ const SPY_PRICE_LOOKBACK_DAYS: i64 = 90;
 
 /// An open equity pair position fetched from the database.
 ///
-/// Returned by [`fetch_open_pairs`] and consumed by the execution layer to close
-/// positions before starting a new rebalance cycle.
+/// Returned by [`fetch_open_pairs`] and consumed by the per-pair evaluation
+/// logic to decide whether to close (profit taken, stop loss) or keep each pair.
 ///
 /// The ticker fields are validated `Ticker` values: a value in scope is proof
 /// that the symbol passed format validation when it was read from the database.
+/// The `entry_z_score` and `hedge_ratio` fields are carried from the original
+/// pair opening and used to recompute the current z-score for close signal
+/// evaluation.
 #[derive(Debug, Clone)]
 pub struct OpenPair {
     id: Uuid,
     pair_id: PairID,
     long_ticker: Ticker,
     short_ticker: Ticker,
+    /// Z-score at the time the pair was opened; sign indicates trade direction.
+    entry_z_score: f64,
+    /// OLS hedge ratio at pair opening; used to compute the current spread.
+    hedge_ratio: f64,
 }
 
 impl OpenPair {
@@ -56,6 +64,34 @@ impl OpenPair {
     pub fn short_ticker(&self) -> &Ticker {
         &self.short_ticker
     }
+
+    pub fn entry_z_score(&self) -> f64 {
+        self.entry_z_score
+    }
+
+    pub fn hedge_ratio(&self) -> f64 {
+        self.hedge_ratio
+    }
+
+    /// Test-only constructor for building `OpenPair` values without a database.
+    #[cfg(test)]
+    pub fn new_for_test(
+        id: Uuid,
+        pair_id: PairID,
+        long_ticker: Ticker,
+        short_ticker: Ticker,
+        entry_z_score: f64,
+        hedge_ratio: f64,
+    ) -> Self {
+        Self {
+            id,
+            pair_id,
+            long_ticker,
+            short_ticker,
+            entry_z_score,
+            hedge_ratio,
+        }
+    }
 }
 
 /// Fetches today's latest equity predictions from PostgreSQL.
@@ -64,7 +100,9 @@ impl OpenPair {
 /// where `created_at::date = CURRENT_DATE`. Returns an empty `Vec` wrapped in
 /// `Fresh` when no predictions exist for today. The `Fresh` wrapper enforces
 /// the 20-hour staleness window from `StalenessWindow::predictions()`.
-pub async fn fetch_predictions(pool: &PgPool) -> Result<Fresh<Vec<EquityPrediction>>, sqlx::Error> {
+pub async fn fetch_equity_predictions(
+    pool: &PgPool,
+) -> Result<Fresh<Vec<EquityPrediction>>, sqlx::Error> {
     let rows = sqlx::query!(
         "SELECT correlation_id, model_run_id, ticker, timestamp, \
                 quantile_10, quantile_50, quantile_90, created_at \
@@ -113,7 +151,7 @@ pub async fn fetch_predictions(pool: &PgPool) -> Result<Fresh<Vec<EquityPredicti
 /// Returns a map from ticker symbol to ordered close prices (oldest to newest).
 /// Tickers with partial data are included as-is; callers are responsible for
 /// filtering by minimum length.
-pub async fn fetch_historical_prices(
+pub async fn fetch_historical_equity_prices(
     pool: &PgPool,
 ) -> Result<HashMap<Ticker, Vec<f64>>, sqlx::Error> {
     let end_date = Utc::now();
@@ -132,12 +170,10 @@ pub async fn fetch_historical_prices(
 
     let mut closes: HashMap<Ticker, Vec<f64>> = HashMap::new();
     for row in rows {
-        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
-            sqlx::Error::Decode(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid ticker from database: {}", row.ticker),
-            )))
-        })?;
+        let Some(ticker) = Ticker::new(&row.ticker) else {
+            warn!(ticker = %row.ticker, "Skipping invalid ticker in equity_bars");
+            continue;
+        };
         closes.entry(ticker).or_default().push(row.close_price);
     }
 
@@ -152,7 +188,7 @@ pub async fn fetch_historical_prices(
 ///
 /// Returns prices ordered oldest to newest. Returns an empty `Vec` when no SPY
 /// bars exist in the retention window.
-pub async fn fetch_spy_prices(pool: &PgPool) -> Result<Vec<f64>, sqlx::Error> {
+pub async fn fetch_spy_equity_prices(pool: &PgPool) -> Result<Vec<f64>, sqlx::Error> {
     let end_date = Utc::now();
     let start_date = end_date - Duration::days(SPY_PRICE_LOOKBACK_DAYS);
 
@@ -185,12 +221,10 @@ pub async fn fetch_equity_details(pool: &PgPool) -> Result<HashMap<Ticker, Strin
 
     let mut details: HashMap<Ticker, String> = HashMap::new();
     for row in rows {
-        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
-            sqlx::Error::Decode(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid ticker from database: {}", row.ticker),
-            )))
-        })?;
+        let Some(ticker) = Ticker::new(&row.ticker) else {
+            warn!(ticker = %row.ticker, "Skipping invalid ticker in equity_details");
+            continue;
+        };
         details.insert(ticker, row.sector);
     }
 
@@ -248,11 +282,11 @@ pub async fn fetch_live_quote_mid_prices(
 
 /// Fetches all currently open equity pair positions, ordered by `opened_at` ascending.
 ///
-/// The ordering ensures oldest positions are closed first during rebalance teardown,
-/// giving the most-recently-opened pairs the best chance of exit at a favorable price.
+/// Includes `z_score` and `hedge_ratio` from the pair opening so the per-pair
+/// evaluation can recompute the current spread z-score and determine close signals.
 pub async fn fetch_open_pairs(pool: &PgPool) -> Result<Vec<OpenPair>, sqlx::Error> {
     let rows = sqlx::query!(
-        "SELECT id, pair_id, long_ticker, short_ticker \
+        "SELECT id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio \
          FROM equity_pairs \
          WHERE status = 'open' \
          ORDER BY opened_at ASC"
@@ -285,11 +319,25 @@ pub async fn fetch_open_pairs(pool: &PgPool) -> Result<Vec<OpenPair>, sqlx::Erro
                     format!("invalid short_ticker from database: {short_ticker_str}"),
                 )))
             })?;
+            let entry_z_score = row.z_score.to_f64().ok_or_else(|| {
+                sqlx::Error::Decode(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "z_score cannot be represented as f64",
+                )))
+            })?;
+            let hedge_ratio = row.hedge_ratio.to_f64().ok_or_else(|| {
+                sqlx::Error::Decode(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hedge_ratio cannot be represented as f64",
+                )))
+            })?;
             Ok(OpenPair {
                 id,
                 pair_id,
                 long_ticker,
                 short_ticker,
+                entry_z_score,
+                hedge_ratio,
             })
         })
         .collect::<Result<_, sqlx::Error>>()?;
@@ -408,17 +456,22 @@ pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), 
     Ok(())
 }
 
-/// Marks an equity pair as closed with `close_reason = 'rebalance'`.
-pub async fn close_equity_pair(
+/// Marks an equity pair as closed with the given close reason.
+///
+/// Used by per-pair evaluation (`ProfitTaken`, `StopLoss`), and end-of-day
+/// liquidation (`EndOfDay`).
+pub async fn close_equity_pair_with_reason(
     pool: &PgPool,
     pair_id: Uuid,
     closed_at: DateTime<Utc>,
+    reason: &CloseReason,
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query!(
         "UPDATE equity_pairs \
-         SET status = 'closed', closed_at = $1, close_reason = 'rebalance' \
-         WHERE id = $2",
+         SET status = 'closed', closed_at = $1, close_reason = $2 \
+         WHERE id = $3",
         closed_at,
+        reason.as_str(),
         pair_id
     )
     .execute(pool)
@@ -428,31 +481,11 @@ pub async fn close_equity_pair(
         return Err(sqlx::Error::RowNotFound);
     }
 
-    info!(pair_id = %pair_id, "Equity pair closed in PostgreSQL");
-    Ok(())
-}
-
-/// Marks an equity pair as closed with `close_reason = 'end_of_day'`.
-pub async fn close_equity_pair_end_of_day(
-    pool: &PgPool,
-    pair_id: Uuid,
-    closed_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    let result = sqlx::query!(
-        "UPDATE equity_pairs \
-         SET status = 'closed', closed_at = $1, close_reason = 'end_of_day' \
-         WHERE id = $2",
-        closed_at,
-        pair_id
-    )
-    .execute(pool)
-    .await?;
-
-    if result.rows_affected() != 1 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-
-    info!(pair_id = %pair_id, "Equity pair closed end-of-day in PostgreSQL");
+    info!(
+        pair_id = %pair_id,
+        close_reason = reason.as_str(),
+        "Equity pair closed in PostgreSQL"
+    );
     Ok(())
 }
 
@@ -554,11 +587,15 @@ mod tests {
             pair_id: PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap()),
             long_ticker: Ticker::new("AAPL").unwrap(),
             short_ticker: Ticker::new("MSFT").unwrap(),
+            entry_z_score: 2.5,
+            hedge_ratio: 0.85,
         };
         assert_eq!(open_pair.id(), pair_id);
         assert_eq!(open_pair.pair_id().as_str(), "AAPL-MSFT");
         assert_eq!(open_pair.long_ticker().as_str(), "AAPL");
         assert_eq!(open_pair.short_ticker().as_str(), "MSFT");
+        assert!((open_pair.entry_z_score() - 2.5).abs() < f64::EPSILON);
+        assert!((open_pair.hedge_ratio() - 0.85).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -568,6 +605,8 @@ mod tests {
             pair_id: PairID::new(Ticker::new("GOOG").unwrap(), Ticker::new("META").unwrap()),
             long_ticker: Ticker::new("GOOG").unwrap(),
             short_ticker: Ticker::new("META").unwrap(),
+            entry_z_score: -3.0,
+            hedge_ratio: 1.2,
         };
         let cloned = open_pair.clone();
         assert_eq!(cloned.pair_id().as_str(), open_pair.pair_id().as_str());
@@ -579,6 +618,8 @@ mod tests {
             cloned.short_ticker().as_str(),
             open_pair.short_ticker().as_str()
         );
+        assert!((cloned.entry_z_score() - open_pair.entry_z_score()).abs() < f64::EPSILON);
+        assert!((cloned.hedge_ratio() - open_pair.hedge_ratio()).abs() < f64::EPSILON);
     }
 
     // --- fetch_live_quote_mid_prices empty-tickers fast path ---
@@ -605,23 +646,23 @@ mod tests {
     // --- compile / connection-error coverage for all DB functions ---
 
     #[test]
-    fn test_fetch_predictions_compiles() {
+    fn test_fetch_equity_predictions_compiles() {
         make_runtime().block_on(async {
-            assert!(fetch_predictions(&lazy_pool()).await.is_err());
+            assert!(fetch_equity_predictions(&lazy_pool()).await.is_err());
         });
     }
 
     #[test]
-    fn test_fetch_historical_prices_compiles() {
+    fn test_fetch_historical_equity_prices_compiles() {
         make_runtime().block_on(async {
-            assert!(fetch_historical_prices(&lazy_pool()).await.is_err());
+            assert!(fetch_historical_equity_prices(&lazy_pool()).await.is_err());
         });
     }
 
     #[test]
-    fn test_fetch_spy_prices_compiles() {
+    fn test_fetch_spy_equity_prices_compiles() {
         make_runtime().block_on(async {
-            assert!(fetch_spy_prices(&lazy_pool()).await.is_err());
+            assert!(fetch_spy_equity_prices(&lazy_pool()).await.is_err());
         });
     }
 
@@ -707,22 +748,22 @@ mod tests {
     }
 
     #[test]
-    fn test_close_equity_pair_compiles() {
+    fn test_close_equity_pair_with_reason_compiles() {
         make_runtime().block_on(async {
-            assert!(close_equity_pair(&lazy_pool(), Uuid::new_v4(), Utc::now())
+            for reason in [
+                CloseReason::ProfitTaken,
+                CloseReason::StopLoss,
+                CloseReason::EndOfDay,
+            ] {
+                assert!(close_equity_pair_with_reason(
+                    &lazy_pool(),
+                    Uuid::new_v4(),
+                    Utc::now(),
+                    &reason
+                )
                 .await
                 .is_err());
-        });
-    }
-
-    #[test]
-    fn test_close_equity_pair_end_of_day_compiles() {
-        make_runtime().block_on(async {
-            assert!(
-                close_equity_pair_end_of_day(&lazy_pool(), Uuid::new_v4(), Utc::now())
-                    .await
-                    .is_err()
-            );
+            }
         });
     }
 

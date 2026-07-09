@@ -1,6 +1,5 @@
 //! Shared application state for the portfolio_manager service.
 
-use std::collections::HashSet;
 use std::env;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -16,7 +15,7 @@ use crate::domain::portfolio::{
 };
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
-use crate::portfolio_manager::alpaca::AlpacaTradingClient;
+use crate::portfolio_manager::alpaca::{AlpacaTradingClient, TradableAssets};
 use crate::portfolio_manager::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
@@ -102,12 +101,12 @@ pub struct AppState {
     alpaca_client: AlpacaTradingClient,
     confidence_floor: ConfidenceFloor,
     constraints: Constraints,
-    /// Cached set of tradable+shortable+easy_to_borrow asset symbols.
+    /// Cached partitioned view of the Alpaca active asset universe.
     ///
     /// `None` until the first rebalance of the session fetches and populates it.
     /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
-    /// The inner `Arc` avoids cloning the full set on every cache hit.
-    tradable_assets: Arc<RwLock<Option<Arc<HashSet<String>>>>>,
+    /// The inner `Arc` avoids cloning the full struct on every cache hit.
+    tradable_assets: Arc<RwLock<Option<Arc<TradableAssets>>>>,
     /// Guards against concurrent rebalance cycles when the prediction pipeline
     /// takes longer than the 5-minute `market_session_check` interval.
     rebalance_cycle_in_progress: Arc<AtomicBool>,
@@ -151,7 +150,7 @@ impl AppState {
     }
 
     /// Returns the shared tradable asset cache.
-    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<Arc<HashSet<String>>>>> {
+    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<Arc<TradableAssets>>>> {
         &self.tradable_assets
     }
 
