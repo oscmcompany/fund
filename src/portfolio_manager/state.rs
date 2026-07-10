@@ -368,6 +368,16 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_with_pool_reads_env_and_uses_default_constraints() {
+        let original_alpaca_key_id = env::var("ALPACA_API_KEY_ID").ok();
+        let original_alpaca_secret = env::var("ALPACA_API_SECRET").ok();
+        let original_alpaca_is_paper = env::var("ALPACA_IS_PAPER").ok();
+        let original_drawdown = env::var("PORTFOLIO_DRAWDOWN_THRESHOLD").ok();
+        let original_concentration = env::var("PORTFOLIO_CONCENTRATION_CAP").ok();
+        let original_minimum_pairs = env::var("PORTFOLIO_MINIMUM_PAIRS").ok();
+        let original_confidence = env::var("PORTFOLIO_CONFIDENCE_FLOOR").ok();
+        let original_beta = env::var("PORTFOLIO_BETA_TOLERANCE").ok();
+        let original_candidate_pool = env::var("PORTFOLIO_CANDIDATE_POOL").ok();
+
         unsafe {
             env::set_var("ALPACA_API_KEY_ID", "test-key");
             env::set_var("ALPACA_API_SECRET", "test-secret");
@@ -390,8 +400,42 @@ mod tests {
         assert_eq!(state.rebalance_cycle_started_at(), 0);
 
         unsafe {
-            env::remove_var("ALPACA_API_KEY_ID");
-            env::remove_var("ALPACA_API_SECRET");
+            match original_alpaca_key_id {
+                Some(value) => env::set_var("ALPACA_API_KEY_ID", value),
+                None => env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_alpaca_secret {
+                Some(value) => env::set_var("ALPACA_API_SECRET", value),
+                None => env::remove_var("ALPACA_API_SECRET"),
+            }
+            match original_alpaca_is_paper {
+                Some(value) => env::set_var("ALPACA_IS_PAPER", value),
+                None => env::remove_var("ALPACA_IS_PAPER"),
+            }
+            match original_drawdown {
+                Some(value) => env::set_var("PORTFOLIO_DRAWDOWN_THRESHOLD", value),
+                None => env::remove_var("PORTFOLIO_DRAWDOWN_THRESHOLD"),
+            }
+            match original_concentration {
+                Some(value) => env::set_var("PORTFOLIO_CONCENTRATION_CAP", value),
+                None => env::remove_var("PORTFOLIO_CONCENTRATION_CAP"),
+            }
+            match original_minimum_pairs {
+                Some(value) => env::set_var("PORTFOLIO_MINIMUM_PAIRS", value),
+                None => env::remove_var("PORTFOLIO_MINIMUM_PAIRS"),
+            }
+            match original_confidence {
+                Some(value) => env::set_var("PORTFOLIO_CONFIDENCE_FLOOR", value),
+                None => env::remove_var("PORTFOLIO_CONFIDENCE_FLOOR"),
+            }
+            match original_beta {
+                Some(value) => env::set_var("PORTFOLIO_BETA_TOLERANCE", value),
+                None => env::remove_var("PORTFOLIO_BETA_TOLERANCE"),
+            }
+            match original_candidate_pool {
+                Some(value) => env::set_var("PORTFOLIO_CANDIDATE_POOL", value),
+                None => env::remove_var("PORTFOLIO_CANDIDATE_POOL"),
+            }
         }
     }
 

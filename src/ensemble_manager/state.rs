@@ -113,6 +113,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_with_pool_reads_env_and_sets_pool() {
+        let original_bucket_name = std::env::var("AWS_S3_BUCKET_NAME").ok();
+        let original_artifact_path = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").ok();
+        let original_model_version = std::env::var("MODEL_VERSION").ok();
+        let original_local_artifact_dir = std::env::var("FUND_LOCAL_ARTIFACT_DIR").ok();
+
         unsafe {
             std::env::set_var("AWS_S3_BUCKET_NAME", "test-bucket");
             std::env::remove_var("AWS_S3_MODEL_ARTIFACT_PATH");
@@ -134,7 +139,22 @@ mod tests {
         assert!(guard.is_none());
 
         unsafe {
-            std::env::remove_var("AWS_S3_BUCKET_NAME");
+            match original_bucket_name {
+                Some(value) => std::env::set_var("AWS_S3_BUCKET_NAME", value),
+                None => std::env::remove_var("AWS_S3_BUCKET_NAME"),
+            }
+            match original_artifact_path {
+                Some(value) => std::env::set_var("AWS_S3_MODEL_ARTIFACT_PATH", value),
+                None => std::env::remove_var("AWS_S3_MODEL_ARTIFACT_PATH"),
+            }
+            match original_model_version {
+                Some(value) => std::env::set_var("MODEL_VERSION", value),
+                None => std::env::remove_var("MODEL_VERSION"),
+            }
+            match original_local_artifact_dir {
+                Some(value) => std::env::set_var("FUND_LOCAL_ARTIFACT_DIR", value),
+                None => std::env::remove_var("FUND_LOCAL_ARTIFACT_DIR"),
+            }
         }
     }
 
@@ -357,7 +377,7 @@ impl AppState {
         let artifact_bucket =
             std::env::var("AWS_S3_BUCKET_NAME").unwrap_or_else(|_| "fund-artifacts".to_string());
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
-            .unwrap_or_else(|_| "artifacts/tide/".to_string());
+            .unwrap_or_else(|_| "models/tide/".to_string());
         let data_manager_base_url = std::env::var("FUND_DATA_MANAGER_BASE_URL")
             .unwrap_or_else(|_| "http://data-manager:8080".to_string());
         let model_version = std::env::var("MODEL_VERSION").unwrap_or_else(|_| "latest".to_string());

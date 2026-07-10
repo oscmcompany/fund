@@ -874,6 +874,12 @@ mod tests {
     fn test_with_pool_reads_env_and_sets_connected_state() {
         use super::State;
 
+        let original_massive_base_url = std::env::var("MASSIVE_BASE_URL").ok();
+        let original_massive_api_key = std::env::var("MASSIVE_API_KEY").ok();
+        let original_bucket_name = std::env::var("AWS_S3_BUCKET_NAME").ok();
+        let original_alpaca_key_id = std::env::var("ALPACA_API_KEY_ID").ok();
+        let original_alpaca_secret = std::env::var("ALPACA_API_SECRET").ok();
+
         unsafe {
             std::env::set_var("MASSIVE_BASE_URL", "http://test-massive");
             std::env::set_var("MASSIVE_API_KEY", "test-massive-key");
@@ -918,9 +924,26 @@ mod tests {
         });
 
         unsafe {
-            std::env::remove_var("MASSIVE_BASE_URL");
-            std::env::remove_var("MASSIVE_API_KEY");
-            std::env::remove_var("AWS_S3_BUCKET_NAME");
+            match original_massive_base_url {
+                Some(value) => std::env::set_var("MASSIVE_BASE_URL", value),
+                None => std::env::remove_var("MASSIVE_BASE_URL"),
+            }
+            match original_massive_api_key {
+                Some(value) => std::env::set_var("MASSIVE_API_KEY", value),
+                None => std::env::remove_var("MASSIVE_API_KEY"),
+            }
+            match original_bucket_name {
+                Some(value) => std::env::set_var("AWS_S3_BUCKET_NAME", value),
+                None => std::env::remove_var("AWS_S3_BUCKET_NAME"),
+            }
+            match original_alpaca_key_id {
+                Some(value) => std::env::set_var("ALPACA_API_KEY_ID", value),
+                None => std::env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_alpaca_secret {
+                Some(value) => std::env::set_var("ALPACA_API_SECRET", value),
+                None => std::env::remove_var("ALPACA_API_SECRET"),
+            }
         }
     }
 
