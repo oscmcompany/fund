@@ -428,24 +428,17 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
     let closed_at = Utc::now();
     let pairs_closed = open_pairs.len();
 
-    let mut transaction = pool.begin().await?;
     for open_pair in &open_pairs {
-        close_equity_pair_with_reason(
-            &mut *transaction,
-            open_pair.id(),
-            closed_at,
-            &CloseReason::EndOfDay,
-        )
-        .await?;
+        close_equity_pair_with_reason(pool, open_pair.id(), closed_at, &CloseReason::EndOfDay)
+            .await?;
     }
 
     emit_event(
-        &mut *transaction,
+        pool,
         EventType::PortfolioLiquidationCompleted,
         &serde_json::json!({ "pairs_closed": pairs_closed }),
     )
     .await?;
-    transaction.commit().await?;
 
     info!(count = pairs_closed, "Open pairs closed at end of day");
 
@@ -640,17 +633,10 @@ async fn close_triggered_pairs(
         .map_err(RebalanceError::Execution)?;
 
     let closed_at = Utc::now();
-    let mut transaction = pool.begin().await?;
     for signal in signals {
-        close_equity_pair_with_reason(
-            &mut *transaction,
-            signal.open_pair.id(),
-            closed_at,
-            &signal.reason,
-        )
-        .await?;
+        close_equity_pair_with_reason(pool, signal.open_pair.id(), closed_at, &signal.reason)
+            .await?;
     }
-    transaction.commit().await?;
 
     info!(count = signals.len(), "Triggered pairs closed");
     Ok(signals.len())
