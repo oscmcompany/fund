@@ -380,8 +380,8 @@ pub async fn fetch_latest_portfolio_net_asset_value(
 }
 
 /// Inserts a new equity rebalance session record.
-pub async fn insert_rebalance_session(
-    pool: &PgPool,
+pub async fn insert_rebalance_session<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     session: &EquityRebalanceSession,
 ) -> Result<(), sqlx::Error> {
     sqlx::query!(
@@ -395,7 +395,7 @@ pub async fn insert_rebalance_session(
         session.completed_at(),
         session.status().as_str()
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     info!(session_id = %session.id(), "Rebalance session inserted into PostgreSQL");
@@ -403,8 +403,8 @@ pub async fn insert_rebalance_session(
 }
 
 /// Updates the `status` and `completed_at` of a rebalance session.
-pub async fn update_rebalance_session_status(
-    pool: &PgPool,
+pub async fn update_rebalance_session_status<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     session_id: Uuid,
     status: &RebalanceSessionStatus,
     completed_at: DateTime<Utc>,
@@ -417,7 +417,7 @@ pub async fn update_rebalance_session_status(
         completed_at,
         session_id
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     if result.rows_affected() != 1 {
@@ -429,7 +429,10 @@ pub async fn update_rebalance_session_status(
 }
 
 /// Inserts an equity pair record with status `open`.
-pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), sqlx::Error> {
+pub async fn insert_equity_pair<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    pair: &EquityPair,
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         "INSERT INTO equity_pairs \
          (id, rebalance_id, pair_id, long_ticker, short_ticker, z_score, hedge_ratio, \
@@ -446,7 +449,7 @@ pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), 
         pair.status().as_str(),
         pair.opened_at()
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     info!(
@@ -460,8 +463,8 @@ pub async fn insert_equity_pair(pool: &PgPool, pair: &EquityPair) -> Result<(), 
 ///
 /// Used by per-pair evaluation (`ProfitTaken`, `StopLoss`), and end-of-day
 /// liquidation (`EndOfDay`).
-pub async fn close_equity_pair_with_reason(
-    pool: &PgPool,
+pub async fn close_equity_pair_with_reason<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     pair_id: Uuid,
     closed_at: DateTime<Utc>,
     reason: &CloseReason,
@@ -474,7 +477,7 @@ pub async fn close_equity_pair_with_reason(
         reason.as_str(),
         pair_id
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     if result.rows_affected() != 1 {
@@ -490,8 +493,8 @@ pub async fn close_equity_pair_with_reason(
 }
 
 /// Inserts an equity allocation record for one leg of a pair.
-pub async fn insert_equity_allocation(
-    pool: &PgPool,
+pub async fn insert_equity_allocation<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     allocation: &EquityAllocation,
 ) -> Result<(), sqlx::Error> {
     sqlx::query!(
@@ -512,14 +515,17 @@ pub async fn insert_equity_allocation(
         allocation.quantity().copied(),
         allocation.notional().copied()
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
 /// Inserts an equity order record linking a filled order to its allocation.
-pub async fn insert_equity_order(pool: &PgPool, order: &EquityOrder) -> Result<(), sqlx::Error> {
+pub async fn insert_equity_order<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    order: &EquityOrder,
+) -> Result<(), sqlx::Error> {
     sqlx::query!(
         "INSERT INTO equity_orders \
          (id, allocation_id, submitted_at, ticker, side, quantity, order_type, limit_price, \
@@ -535,15 +541,15 @@ pub async fn insert_equity_order(pool: &PgPool, order: &EquityOrder) -> Result<(
         order.limit_price().copied(),
         order.alpaca_order_id()
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
 /// Inserts an intraday portfolio snapshot recording the post-rebalance net asset value.
-pub async fn insert_portfolio_snapshot(
-    pool: &PgPool,
+pub async fn insert_portfolio_snapshot<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     snapshot_timestamp: DateTime<Utc>,
     net_asset_value: Decimal,
     total_slippage_cost: Decimal,
@@ -556,7 +562,7 @@ pub async fn insert_portfolio_snapshot(
         net_asset_value,
         total_slippage_cost
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     info!(net_asset_value = %net_asset_value, "Portfolio snapshot inserted into PostgreSQL");

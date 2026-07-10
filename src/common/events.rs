@@ -193,8 +193,11 @@ pub const CONSUMER_DATA_MANAGER_DATABASE_BACKUP: &str = "data-manager-database-b
 
 /// Inserts an event row by calling the `emit_event` PostgreSQL stored procedure.
 /// The `events_notify` trigger fires `pg_notify` on the `events` channel automatically.
-pub async fn emit_event(
-    pool: &PgPool,
+///
+/// Accepts any sqlx executor (`&PgPool`, `&mut Transaction`, etc.) so callers
+/// can include event emission inside a transaction when atomicity is needed.
+pub async fn emit_event<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     event_type: EventType,
     payload: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
@@ -203,7 +206,7 @@ pub async fn emit_event(
         event_type.as_str(),
         payload
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     info!(event_type = event_type.as_str(), "Emitted event");
     Ok(())

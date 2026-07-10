@@ -175,6 +175,7 @@ pub async fn insert_predictions(
         .collect::<Result<_, _>>()?;
 
     let mut rows_affected: u64 = 0;
+    let mut transaction = pool.begin().await?;
 
     for chunk in validated.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
@@ -201,10 +202,11 @@ pub async fn insert_predictions(
              quantile_90 = EXCLUDED.quantile_90",
         );
 
-        let result = query_builder.build().execute(pool).await?;
+        let result = query_builder.build().execute(&mut *transaction).await?;
         rows_affected += result.rows_affected();
     }
 
+    transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
     Ok(rows_affected)
 }
