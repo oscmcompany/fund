@@ -298,7 +298,9 @@ set -a
 # shellcheck disable=SC1090
 source "$DOTENV"
 set +a
-"$REPO_ROOT/tools/create-bucket" "${FUND_PROFILE:-$PROFILE}"
+if ! "$REPO_ROOT/tools/create-bucket" "${FUND_PROFILE:-$PROFILE}"; then
+  echo "WARNING: Bucket creation failed (may already exist or require elevated permissions). Continuing..."
+fi
 
 # Patch devenv.yaml secretspec profile to match this environment
 if [[ "$OS" == "Darwin" ]]; then
@@ -328,7 +330,7 @@ echo "Running devenv shell to trigger Nix build (this may take a while)..."
 devenv shell -- echo "devenv environment built successfully"
 
 # --------------------------------------------------------------------------- #
-# 10. Prod mode: validate secrets
+# 10. Validate secrets
 # --------------------------------------------------------------------------- #
 echo "Validating secrets via secretspec..."
 if ! devenv shell -- secretspec check; then

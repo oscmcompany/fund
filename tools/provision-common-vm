@@ -131,6 +131,9 @@ phase_collect() {
     echo "Known profiles: development/john.forstmeier, development/chris.addy"
     SECRETSPEC_PROFILE="$(prompt "Secretspec profile")"
     [[ -z "$SECRETSPEC_PROFILE" ]] && fail "Secretspec profile is required"
+    if [[ "$SECRETSPEC_PROFILE" != development/* ]]; then
+      fail "Development secretspec profile must start with 'development/' (e.g. development/john.forstmeier), got: ${SECRETSPEC_PROFILE}"
+    fi
     local developer
     developer="${SECRETSPEC_PROFILE##*/}"
     if [[ -z "$developer" || "$developer" == "$SECRETSPEC_PROFILE" || "$developer" == "development" ]]; then

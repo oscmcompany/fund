@@ -12,11 +12,14 @@ fi
 SLUG="${PROFILE//[\/.]/-}"
 BUCKET="oscm-fund-${SLUG}"
 
-if aws s3api head-bucket --bucket "$BUCKET" &>/dev/null; then
+echo "Ensuring bucket $BUCKET exists"
+if output=$(aws s3api create-bucket --bucket "$BUCKET" --region us-east-1 2>&1); then
+  echo "Created bucket $BUCKET"
+elif echo "$output" | grep -q "BucketAlreadyOwnedByYou"; then
   echo "Bucket $BUCKET already exists, skipping"
 else
-  echo "Creating bucket $BUCKET"
-  aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
+  echo "Error creating bucket $BUCKET: $output" >&2
+  exit 1
 fi
 
 echo "S3 bucket ready: $BUCKET"

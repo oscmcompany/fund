@@ -239,7 +239,7 @@ in {
     set -euo pipefail
 
     if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:fetch-equity-bars"
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill"
       echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
       exit 1
     fi
@@ -671,7 +671,7 @@ in {
       echo "    checks:nix                     Nix checks (alejandra + statix)"
       echo "    database:connect               Open interactive psql session"
       echo "    database:create                Apply schema (idempotent, safe to re-run)"
-      echo "    database:backfill              Backfill equity bars into PostgreSQL (requires BACKFILL_START_DATE)"
+      echo "    database:backfill              Backfill equity bars into PostgreSQL (requires data-manager running, BACKFILL_START_DATE)"
       echo "    database:reset                 Drop and recreate the empty fund database"
       echo "                                   (run before database:create after a breaking schema change)"
       echo "    database:restore               Restore from nightly S3 dump (fast recovery, schema must match)"

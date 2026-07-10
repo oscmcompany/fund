@@ -45,7 +45,7 @@ phase_bootstrap
 phase_reboot
 
 # --------------------------------------------------------------------------- #
-# Application-specific: start services and configure dashboard reader
+# Application-specific: start services
 # --------------------------------------------------------------------------- #
 
 if [[ "$PRODUCTION" == true ]]; then
