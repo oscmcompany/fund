@@ -51,7 +51,7 @@ phase_reboot
 # Trainer-specific: install daily training cron job
 # --------------------------------------------------------------------------- #
 
-step "Installing training cron job"
+step "Installing training script"
 
 # Write a wrapper script that sources Nix before invoking devenv,
 # since cron runs with a minimal environment where Nix is not on PATH.
@@ -59,16 +59,27 @@ cat << 'TRAINEOF' | remote "cat > ~/fund-train.sh"
 #!/usr/bin/env bash
 # Fund model training job - invoked by cron daily at 06:00 UTC on weekdays.
 # Equity bars are synced at 05:00 UTC, so training runs on fresh data.
+set -euo pipefail
+
 for p in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh /etc/profile.d/nix.sh; do
   [ -f "$p" ] && . "$p" && break
 done
+
 cd ~/fund
+
 if [[ -f .env ]]; then
   set -a
   # shellcheck source=/dev/null
   source .env
   set +a
 fi
+
+# Pull latest code before training
+echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") Syncing to latest origin/master"
+git fetch origin master
+git reset --hard origin/master
+devenv allow 2>/dev/null || echo "WARNING: devenv allow failed"
+
 devenv tasks run models:tide:train
 TRAINEOF
 
@@ -77,9 +88,13 @@ echo "Training wrapper written to ~/fund-train.sh"
 
 remote 'sudo mkdir -p /var/log/fund && sudo touch /var/log/fund/trainer.log && sudo chown "$(id -un):$(id -gn)" /var/log/fund /var/log/fund/trainer.log'
 
-# Install crontab entry. Preserve any existing entries unrelated to fund training.
-remote "(crontab -l 2>/dev/null | grep -v 'fund-train'; echo '0 6 * * 1-5 bash ~/fund-train.sh >> /var/log/fund/trainer.log 2>&1') | crontab -"
-echo "Cron job installed: weekdays at 06:00 UTC"
+if [[ "$PRODUCTION" == true ]]; then
+  # Install crontab entry. Preserve any existing entries unrelated to fund training.
+  remote "(crontab -l 2>/dev/null | grep -v 'fund-train'; echo '0 6 * * 1-5 bash ~/fund-train.sh >> /var/log/fund/trainer.log 2>&1') | crontab -"
+  echo "Cron job installed: weekdays at 06:00 UTC"
+else
+  echo "Skipping cron job (development mode). Run manually: bash ~/fund-train.sh"
+fi
 
 phase_share_vm
 
@@ -98,13 +113,19 @@ else
   echo "  Tag:      #${VM_TAG}"
 fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
-echo "  Training: daily weekdays at 06:00 UTC"
+if [[ "$PRODUCTION" == true ]]; then
+  echo "  Training: daily weekdays at 06:00 UTC"
+fi
 echo "  Log:      /var/log/fund/trainer.log"
 echo ""
 echo "Next steps:"
 echo "  ssh $VM_NAME.exe.xyz"
-echo "  devenv tasks run models:tide:train    # run training manually"
-echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+if [[ "$PRODUCTION" == true ]]; then
+  echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+else
+  echo "  bash ~/fund-train.sh                  # run training manually"
+  echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+fi
 echo "-----------------"
 echo ""
 

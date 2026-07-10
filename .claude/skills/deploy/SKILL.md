@@ -15,7 +15,7 @@ description: >
 
 `devenv.nix` drives both local development and production. Services run
 via `devenv --profile apps up` on a single exe.dev VM. ML training uses
-`devenv --profile ml shell`. Secrets are injected via `secretspec run --`.
+`devenv --profile trainer shell`. Secrets are injected via `secretspec run --`.
 
 ## Architecture
 
@@ -35,7 +35,7 @@ devenv.nix
 │   ├── processes.artifact-watcher (polls S3)
 │   ├── env (service URLs, MASSIVE_BASE_URL, DISABLE_DISK_CACHE, BACKFILL_LOOKBACK_DAYS)
 │   └── scripts.cleanup-application-services
-└── profiles.ml (devenv --profile ml shell)
+└── profiles.trainer (devenv --profile trainer shell)
     ├── env (FUND_LOOKBACK_DAYS, MLFLOW_TRACKING_URI, PREFECT_API_URL)
     └── scripts (train-tide-model-local, deploy-training)
 
@@ -79,7 +79,7 @@ Required production secrets:
 ```bash
 devenv shell                    # enter the development environment
 devenv --profile apps up        # start application services with hot-reload
-devenv --profile ml shell       # ML training environment
+devenv --profile trainer shell  # model training environment
 ```
 
 ### Production (exe.dev VM)
