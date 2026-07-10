@@ -3,7 +3,8 @@
 ## Core Concept
 
 Autonomous model optimization loop inspired by Karpathy's autoresearch. An LLM agent
-iteratively modifies model architecture code, runs training via the existing Prefect pipeline,
+iteratively modifies model architecture code, runs training via
+`cargo run --release --features train --bin tide_model_trainer`,
 evaluates a target metric, and keeps or reverts changes based on improvement.
 
 ## Loop Steps
@@ -12,8 +13,8 @@ evaluates a target metric, and keeps or reverts changes based on improvement.
 2. **Hypothesize** a change (architecture, hyperparameters, loss function, etc.)
 3. **Modify** the model code in a focused, single-variable way
 4. **Commit** the change to a dated branch
-5. **Run** training via Docker Compose Prefect pipeline
-6. **Extract** the target metric from training logs
+5. **Run** training via `secretspec run -- cargo run --release --features train --bin tide_model_trainer`
+6. **Extract** the target metric from training logs (tracing structured output)
 7. **Decide**: if metric improved, KEEP; otherwise REVERT via `git reset`
 8. **Log** result to `experiments.jsonl`
 9. **Repeat**
@@ -22,7 +23,7 @@ evaluates a target metric, and keeps or reverts changes based on improvement.
 
 - **KEEP**: Target metric improved (lower loss, higher accuracy, etc. depending on direction)
 - **DISCARD**: Target metric did not improve - revert to last known good state
-- **CRASH**: Training failed - debug and fix pipeline errors, then retry
+- **CRASH**: Training failed - debug and fix compilation or runtime errors, then retry
 - Never accumulate failed changes; always revert to last good state before trying next idea
 
 ## Change Categories (ordered by typical impact)
@@ -38,9 +39,9 @@ evaluates a target metric, and keeps or reverts changes based on improvement.
 Log to `autotrain/<model-name>/experiments.jsonl` (one JSON object per line):
 
 ```jsonl
-{"commit": "abc1234", "metric_value": 0.0342, "status": "KEEP", "change": "Increased hidden_size from 64 to 128", "hypothesis": "Larger hidden dim captures more complex feature interactions", "rationale": "Loss improved 3.2% -- wider layers help at this data scale"}
-{"commit": "def5678", "metric_value": 0.0351, "status": "DISCARD", "change": "Added third encoder layer", "hypothesis": "Deeper encoder extracts richer temporal representations", "rationale": "Loss regressed 2.6% -- model likely overfitting with added depth at current data size"}
-{"commit": "ghi9012", "metric_value": null, "status": "CRASH", "change": "Switched to GeLU activation", "hypothesis": "Smoother gradient flow improves convergence", "rationale": "TypeError in forward pass -- tinygrad GeLU not compatible with cast pattern, fixed"}
+{"commit": "abc1234", "metric_value": 0.0342, "status": "KEEP", "change": "Increased hidden_size from 64 to 128", "hypothesis": "Larger hidden dim captures more complex feature interactions", "rationale": "CRPS improved 3.2% -- wider layers help at this data scale"}
+{"commit": "def5678", "metric_value": 0.0351, "status": "DISCARD", "change": "Added third encoder layer", "hypothesis": "Deeper encoder extracts richer temporal representations", "rationale": "CRPS regressed 2.6% -- model likely overfitting with added depth at current data size"}
+{"commit": "ghi9012", "metric_value": null, "status": "CRASH", "change": "Switched to GeLU activation", "hypothesis": "Smoother gradient flow improves convergence", "rationale": "Compilation error in forward pass -- Burn GeLU API differs, fixed"}
 ```
 
 Fields:
@@ -61,5 +62,5 @@ Fields:
 
 ## Metric Direction
 
-- **Minimize**: loss, quantile_loss, mse, mae, bpb
-- **Maximize**: accuracy, r2, sharpe, precision, recall
+- **Minimize**: crps (continuous_ranked_probability_score), quantile_loss
+- **Maximize**: directional_accuracy, quantile_coverage

@@ -9,16 +9,38 @@ description: >
 
 # Daily Fund Briefing
 
-Produce a single morning report covering platform health and Alpaca trading
-activity. Uses the OSCM AWS account (`--profile oscm --region us-east-1`) and
-the Alpaca REST API. All tools (`aws`, `curl`, `jq`) are available in the
-devenv shell.
+Produce a single morning report covering platform health and trading activity.
+Data comes from the PostgreSQL database on the production VM and the Alpaca REST API.
+
+## Connection
+
+Default to the production application VM: `oscm-fund-production-application.exe.xyz`.
+Connect to PostgreSQL via SSH tunnel:
+
+```bash
+ssh -L 15432:localhost:5432 oscm-fund-production-application.exe.xyz -N &
+```
+
+Wait for the tunnel to be ready before querying:
+
+```bash
+for i in $(seq 1 15); do pg_isready -h localhost -p 15432 -q && break; sleep 1; done
+pg_isready -h localhost -p 15432 || { echo "SSH tunnel failed"; exit 1; }
+```
+
+Then query with:
+
+```bash
+psql -h localhost -p 15432 -d fund -c "<QUERY>"
+```
+
+If the SSH connection fails, ask the user which VM to target.
 
 ## Execution order
 
-1. **Phase 1 -- Credential retrieval** (must complete before Phase 2)
+1. **Phase 1 -- Credential retrieval** (must complete before Phase 2 Group B)
 2. **Phase 2 -- Data collection** (two parallel groups)
-   - Group A: Platform health checks (all independent, run in parallel)
+   - Group A: Database queries (all independent, run in parallel)
    - Group B: Alpaca API calls (all independent, run in parallel)
 3. **Phase 3 -- Render report** (after all data collected)
 
@@ -26,27 +48,13 @@ devenv shell.
 
 ## Phase 1: Credential retrieval
 
-### 1a. Discover portfolio manager secret name
-
-The secret uses a path-based naming convention (`fund/production/portfolio-manager/all`).
-The `--filter Key=name` does a **prefix** match, so use the full path prefix:
+Retrieve Alpaca credentials from AWS Secrets Manager for direct API calls:
 
 ```bash
-aws secretsmanager list-secrets --profile oscm --region us-east-1 \
-  --filter Key=name,Values=fund/production/portfolio-manager \
-  --query 'SecretList[0].Name' --output text
-```
-
-Store the result as `SECRET_NAME`. If this returns `None` or fails, skip all
-Alpaca sections and suggest the user run `aws sso login --profile oscm`.
-
-### 1b. Retrieve and parse credentials
-
-```bash
-bash -c "aws secretsmanager get-secret-value --profile oscm --region us-east-1 \
-  --secret-id '<SECRET_NAME>' \
+aws secretsmanager get-secret-value --profile oscm --region us-east-1 \
+  --secret-id 'fund/production/portfolio-manager/all' \
   --query 'SecretString' --output text \
-  | jq -r '{key: .ALPACA_API_KEY_ID, secret: .ALPACA_API_SECRET, paper: .ALPACA_IS_PAPER}'"
+  | jq -r '{key: .ALPACA_API_KEY_ID, secret: .ALPACA_API_SECRET, paper: .ALPACA_IS_PAPER}'
 ```
 
 Extract:
@@ -58,81 +66,92 @@ Determine the base URL:
 - If `IS_PAPER` is `"true"`: `https://paper-api.alpaca.markets`
 - Otherwise: `https://api.alpaca.markets`
 
-All subsequent Alpaca curl calls use these headers:
-```
-APCA-API-KEY-ID: <ALPACA_KEY>
-APCA-API-SECRET-KEY: <ALPACA_SECRET>
-```
+If credential retrieval fails, skip Group B and suggest `aws sso login --profile oscm`.
 
 ---
 
-## Phase 2, Group A: Platform health checks
+## Phase 2, Group A: Database queries
 
-Run all of these in parallel.
+Run all of these in parallel via the SSH tunnel.
 
-### A1. Service health endpoints
+### A1. Latest portfolio snapshot
 
-Check all three services in parallel:
-
-```bash
-curl -sf http://localhost:8080/health | jq .
-curl -sf http://localhost:8081/health | jq .
-curl -sf http://localhost:8082/health | jq .
+```sql
+SELECT snapshot_timestamp, snapshot_type, net_asset_value, gross_return, net_return, total_slippage_cost
+FROM equity_portfolio_snapshots
+ORDER BY snapshot_timestamp DESC
+LIMIT 5;
 ```
 
-Flag any service that doesn't return HTTP 200 with `"status": "ok"`.
+### A2. Active pairs
 
-### A2. Model artifact freshness
-
-Discover bucket:
-
-```bash
-aws s3api list-buckets --profile oscm --region us-east-1 \
-  --query 'Buckets[?starts_with(Name, `fund-model-artifacts`)].Name' --output text
+```sql
+SELECT p.pair_id, p.long_ticker, p.short_ticker, p.z_score, p.hedge_ratio,
+       p.signal_strength, p.opened_at
+FROM equity_pairs p
+WHERE p.status = 'open'
+ORDER BY p.opened_at DESC;
 ```
 
-List recent artifacts:
+### A3. Recent rebalance sessions
 
-```bash
-bash -c "aws s3 ls s3://<MODEL_ARTIFACTS_BUCKET>/artifacts/tide/ \
-  --profile oscm --region us-east-1 --recursive | sort | tail -3"
+```sql
+SELECT id, triggered_at, trigger_reason, model_run_id, status, completed_at
+FROM equity_rebalance_sessions
+ORDER BY triggered_at DESC
+LIMIT 5;
 ```
 
-Weekday-aware staleness:
-- Mon: allow up to ~3 days (since Friday night).
-- Tue-Fri: flag if older than ~1.5 days.
-- Sat-Sun: allow since Friday night.
+### A4. Recent orders
 
-### A3. S3 data freshness
-
-Discover bucket:
-
-```bash
-aws s3api list-buckets --profile oscm --region us-east-1 \
-  --query 'Buckets[?starts_with(Name, `fund-data-`)].Name' --output text
+```sql
+SELECT o.submitted_at, o.ticker, o.side, o.quantity, o.order_type, o.limit_price, o.alpaca_order_id
+FROM equity_orders o
+ORDER BY o.submitted_at DESC
+LIMIT 20;
 ```
 
-List recent data (path is `equity/bars/`, not `equity_bars/`):
+### A5. Latest model run
 
-```bash
-bash -c "aws s3 ls s3://<DATA_BUCKET>/equity/bars/ \
-  --profile oscm --region us-east-1 --recursive | sort | tail -5"
+```sql
+SELECT run_id, model_name, status, continuous_ranked_probability_score,
+       directional_accuracy, quantile_coverage, drift_status, started_at, completed_at
+FROM model_runs
+ORDER BY started_at DESC
+LIMIT 3;
 ```
 
-Same weekday-aware staleness logic (data syncs at 6 PM ET weekdays).
+### A6. Recent closed pairs (last 5 days)
+
+```sql
+SELECT pair_id, long_ticker, short_ticker, realized_profit_and_loss, return_percent,
+       close_reason, opened_at, closed_at
+FROM equity_pairs
+WHERE status = 'closed' AND closed_at >= now() - interval '5 days'
+ORDER BY closed_at DESC;
+```
+
+### A7. Event bus health
+
+```sql
+SELECT event_type, count(*) as event_count,
+       max(created_at) as latest_event
+FROM events
+WHERE created_at >= now() - interval '24 hours'
+GROUP BY event_type
+ORDER BY latest_event DESC;
+```
 
 ---
 
 ## Phase 2, Group B: Alpaca API calls
 
-Run all of these in parallel. Skip this entire group if credential retrieval
-failed. For each call, if the HTTP status is 401 or 403, mark the section as
-ERROR and suggest checking the secret values in AWS Secrets Manager.
+Run all of these in parallel. Skip this group if credential retrieval failed.
 
 ### B1. Market clock
 
 ```bash
-curl -s -w '\n%{http_code}' \
+curl -sSf -w '\n%{http_code}' \
   -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/clock'
@@ -143,7 +162,7 @@ Extract: `is_open`, `next_open`, `next_close`.
 ### B2. Account info
 
 ```bash
-curl -s -w '\n%{http_code}' \
+curl -sSf -w '\n%{http_code}' \
   -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/account'
@@ -154,10 +173,10 @@ Extract: `equity`, `cash`, `buying_power`, `portfolio_value`, `status`,
 
 Day change = `equity - last_equity`. Day change % = `(equity - last_equity) / last_equity * 100`.
 
-### B3. Current positions
+### B3. Current positions (Alpaca)
 
 ```bash
-curl -s -w '\n%{http_code}' \
+curl -sSf -w '\n%{http_code}' \
   -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/positions'
@@ -165,38 +184,6 @@ curl -s -w '\n%{http_code}' \
 
 For each position extract: `symbol`, `side`, `market_value`, `cost_basis`,
 `unrealized_pl`, `unrealized_plpc`.
-
-If the array is empty, display "No open positions".
-
-### B4. Recent orders (last 2 days)
-
-```bash
-curl -s -w '\n%{http_code}' \
-  -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
-  -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
-  '<BASE_URL>/v2/orders?status=all&after=<2_DAYS_AGO_ISO8601>&limit=50&direction=desc'
-```
-
-Compute `<2_DAYS_AGO_ISO8601>` as `$(date -u -v-2d +%Y-%m-%dT00:00:00Z)` (macOS)
-or `$(date -u -d "2 days ago" +%Y-%m-%dT00:00:00Z)` (Linux).
-
-For each order extract: `submitted_at` (format as `MM/DD HH:MM AM/PM` ET),
-`symbol`, `side`, `notional` or `qty`, `status`, `filled_avg_price`.
-
-If the array is empty, display "No orders in the last 2 days".
-
-### B5. Weekly portfolio history
-
-```bash
-curl -s -w '\n%{http_code}' \
-  -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
-  -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
-  '<BASE_URL>/v2/account/portfolio/history?period=1W&timeframe=1D'
-```
-
-Extract the `timestamp` and `equity` arrays. Calculate daily P&L as the
-difference between consecutive equity values. Compute week-to-date return
-as `(last_equity - first_equity) / first_equity * 100`.
 
 ---
 
@@ -214,16 +201,6 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
   Market: OPEN / CLOSED (next open/close: <time>)
   Account mode: PAPER / LIVE
 
---- PLATFORM HEALTH ---
-
-  Component             Status    Details
-  --------------------  --------  ----------------------------------------
-  data-manager          OK        HTTP 200, status: ok
-  portfolio-manager     OK        HTTP 200, status: ok
-  ensemble-manager      OK        HTTP 200, model loaded
-  Model artifacts       OK        Latest: <timestamp>
-  Data freshness        OK        Latest bars: <timestamp>
-
 --- ACCOUNT ---
 
   Equity:          $XX,XXX.XX
@@ -231,7 +208,7 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
   Buying power:    $XX,XXX.XX
   Day change:      +$XXX.XX (+X.XX%)
 
---- POSITIONS ---
+--- POSITIONS (Alpaca) ---
 
   Ticker  Side   Mkt Value    Cost Basis   Unrealized P&L
   ------  -----  ----------   ----------   ---------------
@@ -240,24 +217,63 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 
   (or "No open positions" if empty)
 
---- RECENT ORDERS (last 2 days) ---
+--- ACTIVE PAIRS ---
 
-  Time             Symbol  Side   Notional     Status   Fill Price
-  ---------------  ------  -----  ----------   -------  ----------
-  05/03 10:02 AM   AAPL    buy    $2,300.00    filled   $186.45
+  Pair ID     Long    Short   Z-Score  Signal   Opened
+  ----------  ------  ------  -------  -------  ----------------
+  AAPL-MSFT   AAPL    MSFT    -2.13    0.85     07/09 09:32 AM
   ...
 
-  (or "No orders in the last 2 days" if empty)
+  (or "No active pairs" if empty)
 
---- WEEKLY PERFORMANCE ---
+--- RECENT CLOSED PAIRS (last 5 days) ---
 
-  Date        Equity        Daily P&L
-  ----------  -----------   ----------
-  2026-04-28  $XX,XXX.XX    --
-  2026-04-29  $XX,XXX.XX    +$XX.XX
+  Pair         P&L          Return    Reason       Closed
+  ----------   ----------   -------   ----------   ----------------
+  AAPL-MSFT    +$123.45     +1.23%    profit_taken 07/08 03:55 PM
   ...
 
-  Week-to-date: +X.XX%
+  (or "No recently closed pairs" if empty)
+
+--- RECENT ORDERS (last 20) ---
+
+  Time             Symbol  Side   Qty      Type     Limit
+  ---------------  ------  -----  -------  -------  ----------
+  07/09 10:02 AM   AAPL    LONG   50       limit    $186.45
+  ...
+
+  (or "No recent orders" if empty)
+
+--- PORTFOLIO SNAPSHOTS ---
+
+  Timestamp            Type       NAV           Gross     Net       Slippage
+  -------------------  ---------  -----------   -------   -------   --------
+  2026-07-09 20:00     end_of_day $XX,XXX.XX    +0.45%    +0.42%    $12.34
+  ...
+
+--- MODEL STATUS ---
+
+  Latest run:    <run_id>
+  Status:        completed
+  CRPS:          0.0342
+  Dir. Accuracy: 0.5812
+  Drift:         none
+  Started:       2026-07-09 22:00 UTC
+
+--- EVENT BUS (24h) ---
+
+  Event Type                        Count   Latest
+  --------------------------------  ------  -------------------
+  market_session_check              48      2026-07-10 13:00
+  equity_bars_sync_requested        1       2026-07-10 05:00
+  ...
+
+--- REBALANCE SESSIONS ---
+
+  Triggered            Reason              Status     Model Run
+  -------------------  ------------------  ---------  ----------
+  2026-07-09 09:31     market_session       completed  tide-2026-...
+  ...
 ```
 
 ---
@@ -266,14 +282,14 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 
 | Failure | Behavior |
 |---------|----------|
-| AWS CLI / SSO not authenticated | Report error, suggest `aws sso login --profile oscm` |
-| Secret not found | Skip all Alpaca sections, show platform health only |
+| SSH tunnel fails | Ask user which VM to target |
+| AWS CLI / SSO not authenticated | Skip Alpaca sections, suggest `aws sso login --profile oscm` |
 | Alpaca 401/403 | Mark trading sections as ERROR, suggest checking secret values |
-| Individual platform check fails | Mark that row DEGRADED, continue with remaining checks |
+| Database query fails | Mark that section DEGRADED, continue with remaining queries |
 | No positions | Display "No open positions" |
-| No recent orders | Display "No orders in the last 2 days" |
-| Portfolio history empty | Display "No history available" |
+| No recent orders | Display "No recent orders" |
+| No active pairs | Display "No active pairs" |
 
-If platform health is fully healthy but Alpaca sections have errors (or vice
-versa), still render the sections that succeeded. Never let one section's failure
-prevent the rest of the report from rendering.
+If database sections succeed but Alpaca sections fail (or vice versa), still render
+the sections that succeeded. Never let one section's failure prevent the rest of the
+report from rendering.
