@@ -197,6 +197,41 @@ impl State {
         }
     }
 
+    /// Constructs a `State` with a pre-existing database pool and S3 client.
+    ///
+    /// Used by the consolidated `fund` binary where a single `PgPool` and
+    /// `S3Client` are shared across all modules. Module-specific
+    /// configuration (Massive secrets, Alpaca credentials, bucket name) is
+    /// read from the environment.
+    pub fn with_pool(pool: PgPool, s3_client: S3Client) -> Self {
+        let http_client = HTTPClient::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        let massive_base_url = std::env::var("MASSIVE_BASE_URL")
+            .expect("MASSIVE_BASE_URL environment variable must be set");
+        let massive_api_key = std::env::var("MASSIVE_API_KEY")
+            .expect("MASSIVE_API_KEY environment variable must be set");
+        let bucket_name = std::env::var("AWS_S3_BUCKET_NAME")
+            .expect("AWS_S3_BUCKET_NAME environment variable must be set");
+
+        Self {
+            http_client,
+            massive: MassiveSecrets {
+                base: massive_base_url,
+                key: massive_api_key,
+            },
+            s3_client,
+            bucket_name,
+            last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
+            last_sync_epoch: Arc::new(AtomicU64::new(0)),
+            database: DatabaseState::Connected(pool),
+            alpaca_credentials: AlpacaCredentials::from_env(),
+            active_symbols: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
     pub fn s3_ok_recently(&self, ttl_secs: u64) -> bool {
         let last = self.last_s3_ok_epoch.load(Ordering::Relaxed);
         if last == 0 {
@@ -832,6 +867,61 @@ mod tests {
             }
         }
         assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_with_pool_reads_env_and_sets_connected_state() {
+        use super::State;
+
+        unsafe {
+            std::env::set_var("MASSIVE_BASE_URL", "http://test-massive");
+            std::env::set_var("MASSIVE_API_KEY", "test-massive-key");
+            std::env::set_var("AWS_S3_BUCKET_NAME", "test-bucket");
+            std::env::remove_var("ALPACA_API_KEY_ID");
+            std::env::remove_var("ALPACA_API_SECRET");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use aws_credential_types::Credentials;
+            use aws_sdk_s3::config::Region;
+
+            let credentials =
+                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
+            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(credentials)
+                .endpoint_url("http://127.0.0.1:9")
+                .load()
+                .await;
+            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+                .force_path_style(true)
+                .build();
+            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
+
+            let pool =
+                sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/test").unwrap();
+
+            let state = State::with_pool(pool, s3_client);
+
+            assert!(matches!(state.database, super::DatabaseState::Connected(_)));
+            assert!(state.database.pool().is_some());
+            assert_eq!(state.bucket_name, "test-bucket");
+            assert_eq!(state.massive.base, "http://test-massive");
+            assert_eq!(state.massive.key, "test-massive-key");
+            // Alpaca credentials absent because env vars were removed.
+            assert!(state.alpaca_credentials.is_none());
+        });
+
+        unsafe {
+            std::env::remove_var("MASSIVE_BASE_URL");
+            std::env::remove_var("MASSIVE_API_KEY");
+            std::env::remove_var("AWS_S3_BUCKET_NAME");
+        }
     }
 
     #[test]

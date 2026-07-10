@@ -27,8 +27,8 @@ Autonomous model optimization via iterative architecture search. See
 ## Training Infrastructure
 
 Training runs **locally** via `cargo run --release --bin tide_model_trainer`. S3 data
-is accessed via AWS SDK using the `AWS_S3_BUCKET_NAME` and
-`AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME` environment variables.
+and model artifacts are accessed via AWS SDK using the `AWS_S3_BUCKET_NAME`
+environment variable.
 
 ### Local Training
 

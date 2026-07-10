@@ -52,11 +52,8 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data_bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
-    // Write artifacts where the inference service reads them. In production these
-    // env vars are set explicitly; in dev they fall back to the data bucket under
-    // the models/tide/ prefix (where the prior pipeline wrote).
-    let artifact_bucket =
-        std::env::var("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME").unwrap_or_else(|_| data_bucket.clone());
+    // Artifacts live in the same bucket under models/tide/.
+    let artifact_bucket = data_bucket.clone();
     let artifact_prefix =
         std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").unwrap_or_else(|_| "models/tide/".to_string());
     let lookback_days: i64 = std::env::var("FUND_LOOKBACK_DAYS")

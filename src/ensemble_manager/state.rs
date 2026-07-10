@@ -110,6 +110,34 @@ mod tests {
         aws_sdk_s3::Client::from_conf(config)
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_with_pool_reads_env_and_sets_pool() {
+        unsafe {
+            std::env::set_var("AWS_S3_BUCKET_NAME", "test-bucket");
+            std::env::remove_var("AWS_S3_MODEL_ARTIFACT_PATH");
+            std::env::remove_var("MODEL_VERSION");
+            std::env::remove_var("FUND_LOCAL_ARTIFACT_DIR");
+        }
+
+        let pool = sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/test").unwrap();
+        let state = AppState::with_pool(pool, make_s3_client());
+
+        assert!(state.pool().is_some());
+        assert_eq!(state.artifact_bucket(), "test-bucket");
+        assert_eq!(state.artifact_prefix(), "models/tide/");
+        assert_eq!(state.model_version(), "latest");
+        assert!(state.data_manager_base_url().is_empty());
+        assert!(state.local_artifact_dir().is_none());
+
+        let guard = state.model_state().lock().await;
+        assert!(guard.is_none());
+
+        unsafe {
+            std::env::remove_var("AWS_S3_BUCKET_NAME");
+        }
+    }
+
     #[test]
     fn test_app_state_for_tests_accessors() {
         let state = AppState::for_tests(
@@ -297,9 +325,37 @@ impl AppState {
         }
     }
 
+    /// Constructs an `AppState` with a pre-existing database pool and S3 client.
+    ///
+    /// Used by the consolidated `fund` binary where a single `PgPool` and
+    /// `S3Client` are shared across all modules. Module-specific
+    /// configuration (artifact bucket, path, model version) is read from
+    /// the environment.
+    pub fn with_pool(pool: PgPool, s3_client: aws_sdk_s3::Client) -> Self {
+        let artifact_bucket = std::env::var("AWS_S3_BUCKET_NAME")
+            .expect("AWS_S3_BUCKET_NAME environment variable must be set");
+        let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
+            .unwrap_or_else(|_| "models/tide/".to_string());
+        let model_version = std::env::var("MODEL_VERSION").unwrap_or_else(|_| "latest".to_string());
+        let local_artifact_dir = std::env::var("FUND_LOCAL_ARTIFACT_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+
+        AppState {
+            model_state: Arc::new(Mutex::new(None)),
+            s3_client,
+            artifact_bucket,
+            artifact_prefix,
+            data_manager_base_url: String::new(),
+            model_version,
+            local_artifact_dir,
+            pool: Some(pool),
+        }
+    }
+
     pub async fn from_env() -> Self {
-        let artifact_bucket = std::env::var("AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME")
-            .unwrap_or_else(|_| "fund-artifacts".to_string());
+        let artifact_bucket =
+            std::env::var("AWS_S3_BUCKET_NAME").unwrap_or_else(|_| "fund-artifacts".to_string());
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
             .unwrap_or_else(|_| "artifacts/tide/".to_string());
         let data_manager_base_url = std::env::var("FUND_DATA_MANAGER_BASE_URL")
