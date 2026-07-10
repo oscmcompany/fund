@@ -15,10 +15,8 @@ use tracing::{debug, info, warn};
 /// Massive's grouped-daily endpoint occasionally returns a ticker more than once
 /// for a date. A single `INSERT ... ON CONFLICT (ticker, timestamp) DO UPDATE`
 /// rejects a repeated conflict target with "ON CONFLICT DO UPDATE command cannot
-/// affect row a second time", which fails the whole 1000-row chunk and—because
-/// the chunks are not wrapped in a transaction—leaves the day's bars partially
-/// written. Keeping the last occurrence mirrors the upsert's latest-write
-/// semantics.
+/// affect row a second time", which fails the whole 1000-row chunk. Keeping the
+/// last occurrence mirrors the upsert's latest-write semantics.
 fn deduplicate_equity_bars(bars: &[EquityBar]) -> Vec<EquityBar> {
     let mut seen: HashSet<(Ticker, DateTime<Utc>)> = HashSet::with_capacity(bars.len());
     let mut deduplicated: Vec<EquityBar> = Vec::with_capacity(bars.len());
@@ -39,6 +37,7 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     let bars = deduplicate_equity_bars(bars);
 
     let mut rows_affected: u64 = 0;
+    let mut transaction = pool.begin().await?;
 
     for chunk in bars.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
@@ -71,10 +70,11 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
              inserted_at = EXCLUDED.inserted_at",
         );
 
-        let result = query_builder.build().execute(pool).await?;
+        let result = query_builder.build().execute(&mut *transaction).await?;
         rows_affected += result.rows_affected();
     }
 
+    transaction.commit().await?;
     info!("Inserted {} equity bars into PostgreSQL", rows_affected);
     Ok(rows_affected)
 }
@@ -88,6 +88,7 @@ pub async fn insert_equity_quotes(
     }
 
     let mut rows_affected: u64 = 0;
+    let mut transaction = pool.begin().await?;
 
     for chunk in quotes.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
@@ -104,10 +105,11 @@ pub async fn insert_equity_quotes(
                 .push_bind(quote.ask_size());
         });
 
-        let result = query_builder.build().execute(pool).await?;
+        let result = query_builder.build().execute(&mut *transaction).await?;
         rows_affected += result.rows_affected();
     }
 
+    transaction.commit().await?;
     debug!("Inserted {} equity quotes into PostgreSQL", rows_affected);
     Ok(rows_affected)
 }

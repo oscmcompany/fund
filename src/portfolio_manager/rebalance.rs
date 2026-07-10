@@ -221,9 +221,21 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         .collect();
     Portfolio::new(filled_pairs_only, state.constraints())?;
 
-    // Phase 8: persist session, pairs, allocations, orders, and snapshot.
+    // Phase 8: persist session, pairs, allocations, orders, and snapshot
+    // inside a single transaction so a mid-cycle failure rolls back all writes.
     let session_id = Uuid::new_v4();
     let now = Utc::now();
+
+    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
+        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
+    })?;
+    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
+        RebalanceError::Conversion(
+            "net_asset_value_decimal cannot be represented as f64".to_string(),
+        )
+    })?;
+
+    let mut transaction = pool.begin().await?;
 
     let session = EquityRebalanceSession::new(
         session_id,
@@ -233,25 +245,28 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         None,
         RebalanceSessionStatus::Completed,
     );
-    insert_rebalance_session(pool, &session).await?;
+    insert_rebalance_session(&mut *transaction, &session).await?;
 
-    let total_slippage_cost = persist_filled_pairs(pool, session_id, now, &filled).await?;
+    let total_slippage_cost =
+        persist_filled_pairs(&mut transaction, session_id, now, &filled).await?;
 
-    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
-        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
-    })?;
-    insert_portfolio_snapshot(pool, now, net_asset_value_decimal, total_slippage_cost).await?;
-    update_rebalance_session_status(pool, session_id, &RebalanceSessionStatus::Completed, now)
-        .await?;
-
-    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
-        RebalanceError::Conversion(
-            "net_asset_value_decimal cannot be represented as f64".to_string(),
-        )
-    })?;
+    insert_portfolio_snapshot(
+        &mut *transaction,
+        now,
+        net_asset_value_decimal,
+        total_slippage_cost,
+    )
+    .await?;
+    update_rebalance_session_status(
+        &mut *transaction,
+        session_id,
+        &RebalanceSessionStatus::Completed,
+        now,
+    )
+    .await?;
 
     emit_event(
-        pool,
+        &mut *transaction,
         EventType::PortfolioRebalanceCompleted,
         &serde_json::json!({
             "session_id": session_id.to_string(),
@@ -262,6 +277,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         }),
     )
     .await?;
+
+    transaction.commit().await?;
 
     info!(
         session_id = %session_id,
@@ -311,6 +328,17 @@ async fn run_monitor_cycle(
     let session_id = Uuid::new_v4();
     let now = Utc::now();
 
+    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
+        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
+    })?;
+    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
+        RebalanceError::Conversion(
+            "net_asset_value_decimal cannot be represented as f64".to_string(),
+        )
+    })?;
+
+    let mut transaction = pool.begin().await?;
+
     let session = EquityRebalanceSession::new(
         session_id,
         now,
@@ -319,23 +347,24 @@ async fn run_monitor_cycle(
         None,
         RebalanceSessionStatus::Completed,
     );
-    insert_rebalance_session(pool, &session).await?;
-
-    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
-        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
-    })?;
-    insert_portfolio_snapshot(pool, now, net_asset_value_decimal, Decimal::ZERO).await?;
-    update_rebalance_session_status(pool, session_id, &RebalanceSessionStatus::Completed, now)
-        .await?;
-
-    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
-        RebalanceError::Conversion(
-            "net_asset_value_decimal cannot be represented as f64".to_string(),
-        )
-    })?;
+    insert_rebalance_session(&mut *transaction, &session).await?;
+    insert_portfolio_snapshot(
+        &mut *transaction,
+        now,
+        net_asset_value_decimal,
+        Decimal::ZERO,
+    )
+    .await?;
+    update_rebalance_session_status(
+        &mut *transaction,
+        session_id,
+        &RebalanceSessionStatus::Completed,
+        now,
+    )
+    .await?;
 
     emit_event(
-        pool,
+        &mut *transaction,
         EventType::PortfolioRebalanceCompleted,
         &serde_json::json!({
             "session_id": session_id.to_string(),
@@ -346,6 +375,8 @@ async fn run_monitor_cycle(
         }),
     )
     .await?;
+
+    transaction.commit().await?;
 
     Ok(RebalanceOutcome {
         session_id,
@@ -395,13 +426,12 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
         .map_err(RebalanceError::Execution)?;
 
     let closed_at = Utc::now();
+    let pairs_closed = open_pairs.len();
+
     for open_pair in &open_pairs {
         close_equity_pair_with_reason(pool, open_pair.id(), closed_at, &CloseReason::EndOfDay)
             .await?;
     }
-
-    let pairs_closed = open_pairs.len();
-    info!(count = pairs_closed, "Open pairs closed at end of day");
 
     emit_event(
         pool,
@@ -409,6 +439,8 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
         &serde_json::json!({ "pairs_closed": pairs_closed }),
     )
     .await?;
+
+    info!(count = pairs_closed, "Open pairs closed at end of day");
 
     Ok(pairs_closed)
 }
@@ -779,9 +811,11 @@ async fn select_size_execute(
 
 /// Persists pairs, allocations, and orders for a completed rebalance cycle.
 ///
-/// Returns the total estimated slippage cost across all pairs (1 bp per leg).
+/// Accepts a mutable transaction reference so all writes participate in the
+/// caller's transaction. Returns the total estimated slippage cost across all
+/// pairs (1 bp per leg).
 async fn persist_filled_pairs(
-    pool: &sqlx::PgPool,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
     now: DateTime<Utc>,
     filled: &[(FilledPair, crate::portfolio_manager::sizing::SizedPair)],
@@ -826,7 +860,7 @@ async fn persist_filled_pairs(
             None,
             None,
         );
-        insert_equity_pair(pool, &equity_pair).await?;
+        insert_equity_pair(&mut **transaction, &equity_pair).await?;
 
         let long_notional_decimal = filled_pair.long_notional.value();
         let long_entry_price_decimal = filled_pair.long.fill_price.unwrap_or(Decimal::ZERO);
@@ -845,7 +879,7 @@ async fn persist_filled_pairs(
             None,
             Some(long_notional_decimal),
         );
-        insert_equity_allocation(pool, &long_allocation).await?;
+        insert_equity_allocation(&mut **transaction, &long_allocation).await?;
 
         let short_notional_decimal = filled_pair.short_notional.value();
         let short_entry_price_decimal = filled_pair.short.fill_price.unwrap_or(Decimal::ZERO);
@@ -865,7 +899,7 @@ async fn persist_filled_pairs(
             Some(short_quantity_decimal),
             None,
         );
-        insert_equity_allocation(pool, &short_allocation).await?;
+        insert_equity_allocation(&mut **transaction, &short_allocation).await?;
 
         let long_order_ticker = Ticker::new(&filled_pair.long.ticker)
             .unwrap_or_else(|| Ticker::new("UNKNOWN").expect("UNKNOWN is a valid ticker"));
@@ -880,7 +914,7 @@ async fn persist_filled_pairs(
             filled_pair.long.limit_price,
             filled_pair.long.alpaca_order_id.clone(),
         );
-        insert_equity_order(pool, &long_order).await?;
+        insert_equity_order(&mut **transaction, &long_order).await?;
 
         let short_order_ticker = Ticker::new(&filled_pair.short.ticker)
             .unwrap_or_else(|| Ticker::new("UNKNOWN").expect("UNKNOWN is a valid ticker"));
@@ -895,7 +929,7 @@ async fn persist_filled_pairs(
             filled_pair.short.limit_price,
             filled_pair.short.alpaca_order_id.clone(),
         );
-        insert_equity_order(pool, &short_order).await?;
+        insert_equity_order(&mut **transaction, &short_order).await?;
 
         // Slippage estimate: 1 bp per leg (0.01% of notional).
         let pair_notional = long_notional_decimal + short_notional_decimal;
