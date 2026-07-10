@@ -278,13 +278,10 @@ if [[ ! -f "$DOTENV" ]]; then
   step "Creating .env (profile: $PROFILE)"
   sed "s|development/your.name|$PROFILE|g" "$REPO_ROOT/.env.example" > "$DOTENV"
 
-  # Production needs extra vars
-  if [[ "$PRODUCTION" == true ]]; then
-    cat >> "$DOTENV" << 'EOF'
+  cat >> "$DOTENV" << 'EOF'
 AWS_S3_MODEL_ARTIFACT_PATH=models/tide/
 MASSIVE_BASE_URL=https://api.massive.com
 EOF
-  fi
 
   echo "Created $DOTENV"
 else
@@ -296,14 +293,12 @@ else
   echo ".env already exists, skipping creation"
 fi
 
-if [[ "$PRODUCTION" != true && "$PROFILE" != "production" ]]; then
-  step "Ensuring dev S3 buckets exist"
-  set -a
-  # shellcheck disable=SC1090
-  source "$DOTENV"
-  set +a
-  "$REPO_ROOT/tools/create-development-buckets" "${FUND_PROFILE:-$PROFILE}"
-fi
+step "Ensuring S3 bucket exists"
+set -a
+# shellcheck disable=SC1090
+source "$DOTENV"
+set +a
+"$REPO_ROOT/tools/create-bucket" "${FUND_PROFILE:-$PROFILE}"
 
 # Patch devenv.yaml secretspec profile to match this environment
 if [[ "$OS" == "Darwin" ]]; then
@@ -335,25 +330,11 @@ devenv shell -- echo "devenv environment built successfully"
 # --------------------------------------------------------------------------- #
 # 10. Prod mode: validate secrets
 # --------------------------------------------------------------------------- #
-if [[ "$PRODUCTION" == true ]]; then
-  echo "Validating secrets via secretspec..."
-  if ! devenv shell -- secretspec check; then
-    echo "Error: Production secrets are missing or invalid."
-    echo "Run 'devenv shell -- secretspec set <KEY>' to populate missing secrets."
-    exit 1
-  fi
-fi
-
-# --------------------------------------------------------------------------- #
-# 11. Build and install dashboard_service (production only)
-# --------------------------------------------------------------------------- #
-if [[ "$PRODUCTION" == true ]]; then
-  step "Building and installing dashboard_service binary"
-  cd "$REPO_ROOT"
-  mkdir -p "$HOME/.local/bin"
-  devenv shell -- cargo build --release --features dashboard_service --bin dashboard_service
-  install -m 755 "$REPO_ROOT/target/release/dashboard_service" "$HOME/.local/bin/dashboard_service"
-  echo "dashboard_service installed to $HOME/.local/bin/dashboard_service"
+echo "Validating secrets via secretspec..."
+if ! devenv shell -- secretspec check; then
+  echo "Error: Secrets are missing or invalid."
+  echo "Run 'devenv shell -- secretspec set <KEY>' to populate missing secrets."
+  exit 1
 fi
 
 # --------------------------------------------------------------------------- #

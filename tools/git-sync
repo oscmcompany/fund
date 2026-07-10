@@ -54,9 +54,9 @@ kill_port_holders() {
 # ------------------------------------------------------------------ #
 start_devenv() {
   kill_port_holders
-  log "Starting devenv --profile application up --no-tui"
+  log "Starting devenv --profile application up"
   cd "$REPO_ROOT"
-  devenv --profile application up --no-tui &
+  devenv --profile application up &
   DEVENV_PID=$!
   log "devenv started (PID $DEVENV_PID)"
 }
@@ -86,22 +86,6 @@ stop_devenv() {
 }
 
 # ------------------------------------------------------------------ #
-# Build and install the dashboard_service binary
-# ------------------------------------------------------------------ #
-build_and_install_dashboard_service() {
-  log "Building dashboard_service binary"
-  cd "$REPO_ROOT"
-  local build_log="/tmp/dashboard_service_build.log"
-  if devenv shell -- cargo build --release --features dashboard_service --bin dashboard_service > "$build_log" 2>&1; then
-    mkdir -p "$HOME/.local/bin"
-    install -m 755 "$REPO_ROOT/target/release/dashboard_service" "$HOME/.local/bin/dashboard_service"
-    log "Installed dashboard_service to $HOME/.local/bin/dashboard_service"
-  else
-    log "WARNING: dashboard_service build failed; see $build_log for details"
-  fi
-}
-
-# ------------------------------------------------------------------ #
 # Main loop
 # ------------------------------------------------------------------ #
 cd "$REPO_ROOT"
@@ -119,7 +103,6 @@ fi
 
 log "git-sync starting in $REPO_ROOT"
 
-build_and_install_dashboard_service
 start_devenv
 
 while true; do
@@ -149,7 +132,6 @@ while true; do
     git reset --hard origin/master
     devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
     log "Now at $(git rev-parse --short HEAD)"
-    build_and_install_dashboard_service
     start_devenv
   fi
 done

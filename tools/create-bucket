@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE="${1:-}"
+if [[ -z "$PROFILE" ]]; then
+  echo "Usage: $(basename "$0") <profile>"
+  echo "  e.g. $(basename "$0") development/chris.addy"
+  echo "  e.g. $(basename "$0") production"
+  exit 1
+fi
+
+SLUG="${PROFILE//[\/.]/-}"
+BUCKET="oscm-fund-${SLUG}"
+
+if aws s3api head-bucket --bucket "$BUCKET" &>/dev/null; then
+  echo "Bucket $BUCKET already exists, skipping"
+else
+  echo "Creating bucket $BUCKET"
+  aws s3api create-bucket --bucket "$BUCKET" --region us-east-1
+fi
+
+echo "S3 bucket ready: $BUCKET"

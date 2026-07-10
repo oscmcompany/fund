@@ -14,57 +14,38 @@ Below are resources for the project and repository.
 
 ### Setup
 
-On a fresh machine with the repository cloned, run the bootstrap script:
+#### Local
+
+For local development, you can use the `devenv` tool to spin up a local environment with all dependencies.
 
 ```sh
-./tools/bootstrap-machine --profile dev/yourname
-./tools/bootstrap-machine --profile production --prod  # production with secret validation
+git clone https://github.com/oscmcompany/fund.git && cd fund
+bash tools/bootstrap-machine --profile development/first_name.last_name
+devenv --profile application up
 ```
 
-Add the `devenv shell` hook to auto-activate the environment on `cd`:
+#### Remote
+
+For remote development or production instances, you can provision VMs on `exe.dev`.
 
 ```sh
-# zsh (~/.zshrc)
-eval "$(devenv hook zsh)"
-
-# bash (~/.bashrc)
-eval "$(devenv hook bash)"
-
-# fish (~/.config/fish/config.fish)
-devenv hook fish | source
-
-# nushell (config.nu)
-devenv hook nu | save --force ~/.cache/devenv/hook.nu
-source ~/.cache/devenv/hook.nu
+# Include the --production flag for production instances
+bash tools/provision-application-vm
+bash tools/provision-trainer-vm
 ```
 
-Then trust the project directory:
+#### Data
+
+After launching, the database has the schema applied and equity details inserted but historical data must
+be manually populated. Run the following commands locally or SSH into the application VM to backfill data.
 
 ```sh
-devenv allow
+# Backfill equity bars into PostgreSQL (requires data-manager running)
+BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill
+
+# Backfill equity bars to S3 Parquet for training (no PostgreSQL needed)
+BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-s3-equity-bars
 ```
-
-Once bootstrapped:
-
-```sh
-# Environment auto-activates on cd with devenv hook configured
-devenv shell                    # or: enter manually without hook
-devenv --profile application up        # start application services
-devenv --profile ml shell       # machine learning training environment
-```
-
-Production runs on a VM with `devenv --profile application up` and secretspec for secret injection.
-
-### Dashboard
-
-Connect to the live fund dashboard over SSH:
-
-```sh
-ssh -p 2222 dashboard@<vm-hostname>.exe.xyz
-```
-
-No account required. The dashboard is a read-only TUI showing positions, performance, trades,
-predictions, and live pipeline events.
 
 ### Principles
 

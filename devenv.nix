@@ -29,7 +29,7 @@
   '';
 
   # Training lookback window. Read from the environment so it can be overridden
-  # per run (e.g. FUND_LOOKBACK_DAYS=1200 devenv --profile ml ...); a hardcoded
+  # per run (e.g. FUND_LOOKBACK_DAYS=1200 devenv --profile trainer ...); a hardcoded
   # empty default would both shadow the override and break int parsing in the
   # tide trainer, which only falls back to its own default when the var is
   # unset, not when it is the empty string.
@@ -159,7 +159,6 @@ in {
     initialDatabases = [
       {
         name = "fund";
-        schema = ./schema.sql;
       }
     ];
     settings = {
@@ -200,10 +199,11 @@ in {
     yamllint
   ];
 
-  # database:restore — fast recovery from a nightly S3 dump when schema has not changed.
-  # database:create — first-time setup: apply schema, seed equity details, fetch equity bars.
-  # database:reset  — drop and recreate the empty fund database; run before database:create
-  #                   after a breaking schema change.
+  # database:create   — apply the schema (idempotent DDL).
+  # database:backfill — populate equity bars via data-manager API.
+  # database:restore  — fast recovery from a nightly S3 dump when schema has not changed.
+  # database:reset    — drop and recreate the empty fund database; run before database:create
+  #                     after a breaking schema change.
 
   scripts.restore-database.exec = ''
     set -euo pipefail
@@ -233,44 +233,6 @@ in {
     aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
     rm -f /tmp/fund-latest.dump.gz
     echo "Database backup complete"
-  '';
-
-  scripts.fetch-database-equity-details.exec = ''
-    set -euo pipefail
-    ${runtimeEnv}
-    echo "Downloading equity details from S3..."
-    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/data/equity/details/details.csv" /tmp/equity_details.csv
-    echo "Loading equity details into database..."
-    # The source CSV is the full listing export (11 columns); stage it verbatim
-    # and project only the columns equity_details keeps. ON_ERROR_STOP makes a
-    # malformed file fail the task instead of silently loading nothing.
-    psql -h localhost -p 5432 -d fund --set ON_ERROR_STOP=on <<'SQL'
-      CREATE TEMP TABLE tmp_equity_details (
-        ticker TEXT,
-        name TEXT,
-        last_sale TEXT,
-        net_change TEXT,
-        percent_change TEXT,
-        market_capitalization TEXT,
-        country TEXT,
-        ipo_year TEXT,
-        volume TEXT,
-        sector TEXT,
-        industry TEXT
-      );
-      \COPY tmp_equity_details FROM '/tmp/equity_details.csv' CSV HEADER
-      INSERT INTO equity_details (ticker, sector, industry)
-        SELECT
-          ticker,
-          COALESCE(NULLIF(sector, '''), 'NOT AVAILABLE'),
-          COALESCE(NULLIF(industry, '''), 'NOT AVAILABLE')
-        FROM tmp_equity_details
-        WHERE ticker IS NOT NULL
-        ON CONFLICT (ticker) DO UPDATE SET sector = EXCLUDED.sector, industry = EXCLUDED.industry;
-      DROP TABLE tmp_equity_details;
-    SQL
-    rm -f /tmp/equity_details.csv
-    echo "Equity details loaded"
   '';
 
   scripts.fetch-database-equity-bars.exec = ''
@@ -531,10 +493,14 @@ in {
     "data:backfill-s3-equity-bars".exec = "backfill-s3-equity-bars";
 
     # --- Database lifecycle tasks ---
-    # Three lifecycle modes:
-    #   Create  — build a working database from scratch (schema change or fresh VM).
-    #   Update  — automatic on each data-manager start; safe for additive schema changes.
-    #   Restore — fast recovery from the nightly S3 dump when schema has not changed.
+    # Four lifecycle modes:
+    #   Create   — apply the schema (idempotent DDL). Use on a fresh VM or after schema changes.
+    #   Backfill — populate equity bars via the data-manager API. Run after create on a fresh VM.
+    #   Restore  — fast recovery from the nightly S3 dump when schema has not changed.
+    #   Reset    — drop and recreate the empty database. Run before create after breaking changes.
+
+    # Opens an interactive psql session against the local fund database.
+    "database:connect".exec = "psql -h localhost -p 5432 -d fund";
 
     # Drops and recreates the empty fund database. Run before database:create when
     # recovering from a breaking schema change.
@@ -549,24 +515,16 @@ in {
     # pg_cron at 22:00 UTC on weekdays after all nightly exports complete.
     "database:backup".exec = "backup-database";
 
-    "database:fetch-equity-details".exec = "fetch-database-equity-details";
-    "database:fetch-equity-bars".exec = "fetch-database-equity-bars";
-
-    # Builds an inference-ready database from scratch: applies the schema, seeds
-    # equity details, and backfills equity bars from the live API. Use after
-    # database:reset when the schema has changed or on a fresh VM. No trading
-    # history is restored. Requires BACKFILL_START_DATE=YYYY-MM-DD.
+    # Applies the schema to the fund database. Safe to re-run (all DDL is
+    # idempotent). Use after database:reset or on a fresh VM.
     "database:create".exec = ''
       set -euo pipefail
-      if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-        echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:create"
-        echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
-        exit 1
-      fi
       ${applySchema}
-      fetch-database-equity-details
-      fetch-database-equity-bars
     '';
+
+    # Backfills equity bars into PostgreSQL via the data-manager API. Requires
+    # data-manager to be running. Use after database:create on a fresh VM.
+    "database:backfill".exec = "fetch-database-equity-bars";
 
     "checks:base" = {
       exec = ''
@@ -670,7 +628,7 @@ in {
     };
   };
 
-  profiles.ml.module = {
+  profiles.trainer.module = {
     env = {
       FUND_LOOKBACK_DAYS = lookbackDays;
       MLFLOW_TRACKING_URI = "";
@@ -687,7 +645,7 @@ in {
       echo ""
       echo "  Profiles:"
       echo "    devenv --profile application up      Start application services"
-      echo "    devenv --profile ml shell     ML training environment"
+      echo "    devenv --profile trainer shell     Model training environment"
       echo ""
       echo "  Services (application profile):"
       echo "    Data Manager:      localhost:8080"
@@ -711,14 +669,13 @@ in {
       echo "    checks:toml                    TOML format check"
       echo "    checks:sql                     SQL lint (PostgreSQL)"
       echo "    checks:nix                     Nix checks (alejandra + statix)"
-      echo "    database:create                First-time setup: apply schema + seed details + fetch bars"
-      echo "                                   (use when schema changed or starting fresh)"
+      echo "    database:connect               Open interactive psql session"
+      echo "    database:create                Apply schema (idempotent, safe to re-run)"
+      echo "    database:backfill              Backfill equity bars into PostgreSQL (requires BACKFILL_START_DATE)"
       echo "    database:reset                 Drop and recreate the empty fund database"
       echo "                                   (run before database:create after a breaking schema change)"
       echo "    database:restore               Restore from nightly S3 dump (fast recovery, schema must match)"
       echo "    database:backup                Dump fund database and upload to S3 (also runs nightly at 22:00 UTC)"
-      echo "    database:fetch-equity-details  Seed equity_details from S3 CSV"
-      echo "    database:fetch-equity-bars     Backfill equity bars into PostgreSQL (requires BACKFILL_START_DATE)"
       echo "    data:backfill-s3-equity-bars         Backfill equity bars to S3 Parquet for training (requires BACKFILL_START_DATE)"
       echo "    models:tide:train                    Train tide model and upload artifacts"
       echo ""
