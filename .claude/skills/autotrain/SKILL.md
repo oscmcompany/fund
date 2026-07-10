@@ -26,49 +26,40 @@ Autonomous model optimization via iterative architecture search. See
 
 ## Training Infrastructure
 
-Training runs **locally** via `uv run` for fast iteration. S3 data is accessed via
-Prefect Cloud S3Bucket blocks (`data-bucket` and `artifact-bucket`).
+Training runs **locally** via `cargo run --release --bin tide_model_trainer`. S3 data
+is accessed via AWS SDK using the `AWS_S3_BUCKET_NAME` and
+`AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME` environment variables.
 
 ### Local Training
 
 ```bash
-# Run training locally (uses Prefect blocks for S3 access)
-devenv tasks run models:tide:train:local
+# Run training locally (uses secretspec for AWS/Alpaca credentials)
+secretspec run -- cargo run --release --bin tide_model_trainer
 
-# Or directly
-uv run python models/tide/src/tide/workflow.py
-```
-
-### Production Training
-
-```bash
-# Deploy to Prefect Cloud ECS work pool
-devenv tasks run models:tide:deploy
-
-# Trigger a run on ECS
-devenv tasks run models:tide:train
+# Override epoch count or lookback window
+FUND_EPOCHS=50 FUND_LOOKBACK_DAYS=730 secretspec run -- cargo run --release --bin tide_model_trainer
 ```
 
 ## Startup Procedure
 
-1. Parse `<model-name>` from args. Resolve the model directory under `models/`.
+1. Parse `<model-name>` from args. Resolve the model source under `src/models/`.
    Known mappings:
-   - `tide` -> `models/tide/`
+   - `tide` -> `src/models/tide/` (source modules) + `src/bin/tide_model_trainer.rs` (entrypoint)
 
 2. **Run preflight checks (fail fast):**
    ```bash
-   # Model directory exists
-   ls models/<model-name>/src/
+   # Model source exists
+   ls src/models/<model-name>/
 
-   # Prefect Cloud connection works
-   uv run prefect config view
+   # Binary compiles
+   cargo build --release --bin tide_model_trainer
 
-   # Quick smoke test (1 epoch) -- override epoch_count in trainer.py DEFAULT_CONFIGURATION
-   uv run python -c "from tide.trainer import train_model; ..."
+   # Quick smoke test (1 epoch)
+   FUND_EPOCHS=1 FUND_LOOKBACK_DAYS=30 secretspec run -- cargo run --release --bin tide_model_trainer
    ```
 
-3. If `--metric` not provided, read the model's training code to infer available metrics.
-   Default: `quantile_loss` (minimize).
+3. If `--metric` not provided, read the model's evaluation code to infer available metrics.
+   Default: `crps` (continuous ranked probability score, minimize).
 
 4. Create a dated branch: `autoresearch/<model-name>/<YYYY-MM-DD>`
 
@@ -91,14 +82,19 @@ run **multiple experiments in parallel** using Bash background jobs.
 2. **Spawn parallel training runs** using the Bash tool with `run_in_background: true`:
 
    ```bash
-   uv run python models/tide/src/tide/workflow.py
+   secretspec run -- cargo run --release --bin tide_model_trainer
    ```
+
+   Override hyperparameters by modifying `ModelParameters::default()` in
+   `src/models/tide/config.rs` or `TrainConfig::default()` in `src/models/tide/train.rs`
+   before each run.
 
 3. **Collect results** using `TaskOutput` with `block: true` on each task ID.
 
 4. **Identify the best performer**.
 
-5. **Apply the winning config** to `DEFAULT_CONFIGURATION` in `models/tide/src/tide/trainer.py`
+5. **Apply the winning config** to the `Default` impl in `src/models/tide/config.rs`
+   (for `ModelParameters`) or `src/models/tide/train.rs` (for `TrainConfig`)
    if it beat the previous best. Commit with description.
 
 6. **Log result** to `autotrain/<model-name>/experiments.jsonl` with fields:
@@ -112,13 +108,13 @@ For code changes (model architecture, loss function, layer structure), run
 **one experiment at a time**:
 
 1. **Hypothesize** a single architecture change
-2. **Modify** the model code (model.py or data.py)
+2. **Modify** the model code (model.rs, data.rs, or loss.rs)
 3. **Commit**: `git add -A && git commit -m "autoresearch: <description>"`
 4. **Run training**:
    ```bash
-   uv run python models/tide/src/tide/workflow.py
+   secretspec run -- cargo run --release --bin tide_model_trainer
    ```
-5. **Parse output** for `quantile_loss`
+5. **Parse output** for `crps` (logged by tracing as `crps = <value>`)
 6. **Decide**: KEEP (new baseline) or DISCARD (`git reset --hard HEAD~1`)
 7. **Log result** to `autotrain/<model-name>/experiments.jsonl` with fields:
    `commit`, `metric_value`, `status`, `change`, `hypothesis`, `rationale`
@@ -128,7 +124,8 @@ For code changes (model architecture, loss function, layer structure), run
 When improvements plateau at the current epoch count, **escalate training depth**:
 
 1. **Detect plateau**: 2+ consecutive batches with no KEEP.
-2. **Sweep epochs**: Run parallel experiments at 2x, 3x, 5x, 10x current epochs.
+2. **Sweep epochs**: Run parallel experiments at 2x, 3x, 5x, 10x current epochs
+   (override via `FUND_EPOCHS` environment variable).
 3. **Re-tune hyperparameters**: LR decreases and dropout increases with more epochs.
 4. **Repeat**: Continue Mode A -> B -> C cycle.
 
@@ -147,22 +144,28 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 **Fail fast**: Surface errors immediately.
 
 - **Training crash**: Log as CRASH, fix the bug, commit fix, retry.
-- **Import errors**: Run `uv sync` for the workspace.
-- **tinygrad CPU codegen bug**: Ensure all Linear layers operate on 2D tensors only.
+- **Compilation errors**: Fix the Rust code, ensure `cargo build --release` passes.
+- **Missing data**: Check `AWS_S3_BUCKET_NAME` and S3 connectivity via `secretspec run -- aws s3 ls`.
 
 ## Files Modified During Loop
 
 Primarily:
-- `models/tide/src/tide/model.py` (model architecture)
-- `models/tide/src/tide/data.py` (data processing)
-- `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION, training hyperparameters)
+- `src/models/tide/model.rs` (model architecture — TideModel, encoder/decoder layers)
+- `src/models/tide/data.rs` (data processing — feature engineering, dataset construction)
+- `src/models/tide/config.rs` (ModelParameters — architecture hyperparameters)
+- `src/models/tide/train.rs` (TrainConfig — learning rate, epochs, batch size, early stopping)
+- `src/models/tide/loss.rs` (loss function — quantile loss, huber delta)
 
 ## Key Files
 
-- **Trainer**: `models/tide/src/tide/trainer.py` (DEFAULT_CONFIGURATION lives here)
-- **Workflow**: `models/tide/src/tide/workflow.py`
-- **Model**: `models/tide/src/tide/model.py`
-- **Data**: `models/tide/src/tide/data.py`
+- **Entrypoint**: `src/bin/tide_model_trainer.rs` (loads data, trains, evaluates, uploads artifact)
+- **Model**: `src/models/tide/model.rs` (Burn TideModel with encoder/decoder)
+- **Config**: `src/models/tide/config.rs` (ModelParameters with Default impl)
+- **Training**: `src/models/tide/train.rs` (TrainConfig, train loop, early stopping)
+- **Data**: `src/models/tide/data.rs` (TrainingDataset, feature engineering)
+- **Loss**: `src/models/tide/loss.rs` (quantile loss with huber delta)
+- **Evaluation**: `src/models/tide/evaluate.rs` (CRPS, directional accuracy, quantile coverage)
+- **Drift**: `src/models/tide/drift.rs` (drift detection against prior runs)
+- **Artifacts**: `src/models/tide/artifact.rs` (tar.gz packaging, S3 upload)
 - **Experiment log**: `autotrain/<model-name>/experiments.jsonl`
-- **Prefect config**: `prefect.yaml`
-- **devenv tasks**: `devenv.nix`
+- **devenv config**: `devenv.nix`
