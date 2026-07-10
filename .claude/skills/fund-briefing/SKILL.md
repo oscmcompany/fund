@@ -21,6 +21,13 @@ Connect to PostgreSQL via SSH tunnel:
 ssh -L 15432:localhost:5432 oscm-fund-production-application.exe.xyz -N &
 ```
 
+Wait for the tunnel to be ready before querying:
+
+```bash
+for i in $(seq 1 15); do pg_isready -h localhost -p 15432 -q && break; sleep 1; done
+pg_isready -h localhost -p 15432 || { echo "SSH tunnel failed"; exit 1; }
+```
+
 Then query with:
 
 ```bash
@@ -114,7 +121,7 @@ ORDER BY started_at DESC
 LIMIT 3;
 ```
 
-### A6. Recent closed pairs (last 5 trading days)
+### A6. Recent closed pairs (last 5 days)
 
 ```sql
 SELECT pair_id, long_ticker, short_ticker, realized_profit_and_loss, return_percent,
@@ -144,7 +151,8 @@ Run all of these in parallel. Skip this group if credential retrieval failed.
 ### B1. Market clock
 
 ```bash
-curl -s -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
+curl -sSf -w '\n%{http_code}' \
+  -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/clock'
 ```
@@ -154,7 +162,8 @@ Extract: `is_open`, `next_open`, `next_close`.
 ### B2. Account info
 
 ```bash
-curl -s -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
+curl -sSf -w '\n%{http_code}' \
+  -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/account'
 ```
@@ -167,7 +176,8 @@ Day change = `equity - last_equity`. Day change % = `(equity - last_equity) / la
 ### B3. Current positions (Alpaca)
 
 ```bash
-curl -s -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
+curl -sSf -w '\n%{http_code}' \
+  -H 'APCA-API-KEY-ID: <ALPACA_KEY>' \
   -H 'APCA-API-SECRET-KEY: <ALPACA_SECRET>' \
   '<BASE_URL>/v2/positions'
 ```
@@ -216,7 +226,7 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 
   (or "No active pairs" if empty)
 
---- RECENT CLOSED PAIRS (5 days) ---
+--- RECENT CLOSED PAIRS (last 5 days) ---
 
   Pair         P&L          Return    Reason       Closed
   ----------   ----------   -------   ----------   ----------------

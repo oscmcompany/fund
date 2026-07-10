@@ -3,9 +3,9 @@
 ## Core Concept
 
 Autonomous model optimization loop inspired by Karpathy's autoresearch. An LLM agent
-iteratively modifies model architecture code, runs training via `cargo run --release
---bin tide_model_trainer`, evaluates a target metric, and keeps or reverts changes
-based on improvement.
+iteratively modifies model architecture code, runs training via
+`cargo run --release --features train --bin tide_model_trainer`,
+evaluates a target metric, and keeps or reverts changes based on improvement.
 
 ## Loop Steps
 
@@ -13,7 +13,7 @@ based on improvement.
 2. **Hypothesize** a change (architecture, hyperparameters, loss function, etc.)
 3. **Modify** the model code in a focused, single-variable way
 4. **Commit** the change to a dated branch
-5. **Run** training via `secretspec run -- cargo run --release --bin tide_model_trainer`
+5. **Run** training via `secretspec run -- cargo run --release --features train --bin tide_model_trainer`
 6. **Extract** the target metric from training logs (tracing structured output)
 7. **Decide**: if metric improved, KEEP; otherwise REVERT via `git reset`
 8. **Log** result to `experiments.jsonl`

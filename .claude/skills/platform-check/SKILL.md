@@ -23,6 +23,14 @@ Establish an SSH tunnel for database access and use SSH for health endpoint chec
 ssh -L 15432:localhost:5432 oscm-fund-production-application.exe.xyz -N &
 ```
 
+Wait for the tunnel to be ready, then query with:
+
+```bash
+for i in $(seq 1 15); do pg_isready -h localhost -p 15432 -q && break; sleep 1; done
+pg_isready -h localhost -p 15432 || { echo "SSH tunnel failed"; exit 1; }
+psql -h localhost -p 15432 -d fund -c "<QUERY>"
+```
+
 If the SSH connection fails, ask the user which VM to target.
 
 ## Check sequence

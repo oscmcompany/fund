@@ -34,10 +34,10 @@ is accessed via AWS SDK using the `AWS_S3_BUCKET_NAME` and
 
 ```bash
 # Run training locally (uses secretspec for AWS/Alpaca credentials)
-secretspec run -- cargo run --release --bin tide_model_trainer
+secretspec run -- cargo run --release --features train --bin tide_model_trainer
 
 # Override epoch count or lookback window
-FUND_EPOCHS=50 FUND_LOOKBACK_DAYS=730 secretspec run -- cargo run --release --bin tide_model_trainer
+FUND_EPOCHS=50 FUND_LOOKBACK_DAYS=730 secretspec run -- cargo run --release --features train --bin tide_model_trainer
 ```
 
 ## Startup Procedure
@@ -52,10 +52,10 @@ FUND_EPOCHS=50 FUND_LOOKBACK_DAYS=730 secretspec run -- cargo run --release --bi
    ls src/models/<model-name>/
 
    # Binary compiles
-   cargo build --release --bin tide_model_trainer
+   cargo build --release --features train --bin tide_model_trainer
 
    # Quick smoke test (1 epoch)
-   FUND_EPOCHS=1 FUND_LOOKBACK_DAYS=30 secretspec run -- cargo run --release --bin tide_model_trainer
+   FUND_EPOCHS=1 FUND_LOOKBACK_DAYS=30 secretspec run -- cargo run --release --features train --bin tide_model_trainer
    ```
 
 3. If `--metric` not provided, read the model's evaluation code to infer available metrics.
@@ -79,15 +79,19 @@ run **multiple experiments in parallel** using Bash background jobs.
 1. **Design a batch** of 3-4 config variants to test, each exploring a different
    hypothesis. Include the reasoning for each.
 
-2. **Spawn parallel training runs** using the Bash tool with `run_in_background: true`:
+2. **Spawn parallel training runs** using the Bash tool with `run_in_background: true`.
+   Each variant needs its own working copy to avoid conflicting source edits:
+
+   - For **config-only sweeps** that can be expressed as environment variables
+     (`FUND_EPOCHS`, `FUND_LOOKBACK_DAYS`), run directly — no source edits needed.
+   - For **source-level sweeps** (hidden size, dropout, layer counts), create a
+     `git worktree` per variant so each build is isolated:
 
    ```bash
-   secretspec run -- cargo run --release --bin tide_model_trainer
+   git worktree add /tmp/autotrain-variant-1 HEAD
+   # edit config.rs in /tmp/autotrain-variant-1, then:
+   cd /tmp/autotrain-variant-1 && secretspec run -- cargo run --release --features train --bin tide_model_trainer
    ```
-
-   Override hyperparameters by modifying `ModelParameters::default()` in
-   `src/models/tide/config.rs` or `TrainConfig::default()` in `src/models/tide/train.rs`
-   before each run.
 
 3. **Collect results** using `TaskOutput` with `block: true` on each task ID.
 
@@ -112,7 +116,7 @@ For code changes (model architecture, loss function, layer structure), run
 3. **Commit**: `git add -A && git commit -m "autoresearch: <description>"`
 4. **Run training**:
    ```bash
-   secretspec run -- cargo run --release --bin tide_model_trainer
+   secretspec run -- cargo run --release --features train --bin tide_model_trainer
    ```
 5. **Parse output** for `crps` (logged by tracing as `crps = <value>`)
 6. **Decide**: KEEP (new baseline) or DISCARD (`git reset --hard HEAD~1`)
@@ -144,7 +148,7 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 **Fail fast**: Surface errors immediately.
 
 - **Training crash**: Log as CRASH, fix the bug, commit fix, retry.
-- **Compilation errors**: Fix the Rust code, ensure `cargo build --release` passes.
+- **Compilation errors**: Fix the Rust code, ensure `cargo build --release --features train` passes.
 - **Missing data**: Check `AWS_S3_BUCKET_NAME` and S3 connectivity via `secretspec run -- aws s3 ls`.
 
 ## Files Modified During Loop
