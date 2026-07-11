@@ -221,7 +221,6 @@ mod tests {
             s3_client,
             "bucket".to_string(),
             "prefix/".to_string(),
-            "http://localhost".to_string(),
             "latest".to_string(),
         );
         // No pool configured; the function must log and return without spawning.
