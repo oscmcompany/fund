@@ -7,7 +7,7 @@ use crate::data_manager::scheduler::spawn_sync_scheduler;
 use crate::data_manager::state::State;
 use tokio::net::TcpListener;
 
-async fn migrate_equity_details(state: &State) {
+pub async fn migrate_equity_details(state: &State) {
     let pool = match state.database.pool() {
         Some(pool) => pool,
         None => {
