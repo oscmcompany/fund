@@ -99,9 +99,20 @@ impl PipelineError {
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
     let start = Instant::now();
 
-    let pool = state
-        .pool()
-        .ok_or_else(|| PipelineError::new("no_pool", "Database pool required".to_string()))?;
+    let pool = match state.pool() {
+        Some(pool) => pool,
+        None => {
+            let pipeline_error =
+                PipelineError::new("no_pool", "Database pool required".to_string());
+            error!(
+                stage = pipeline_error.stage(),
+                error = %pipeline_error.message(),
+                duration_ms = start.elapsed().as_millis() as u64,
+                "Prediction pipeline failed"
+            );
+            return Err(pipeline_error);
+        }
+    };
 
     let correlation_id = Uuid::new_v4();
 

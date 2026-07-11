@@ -1,4 +1,5 @@
-//! Ensemble model service: loads trained TiDE artifacts from S3 and consumes
+//! Ensemble model service: loads trained TiDE artifacts from S3, serves
+//! predictions over HTTP (standalone mode), and consumes
 //! `predictions_requested` events from the Postgres event bus.
 
 pub mod artifact;
