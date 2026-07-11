@@ -19,69 +19,69 @@ pub enum EventType {
     // --- Market data sync ---
     /// pg_cron trigger: nightly equity bar sync requested.
     EquityBarsSyncRequested,
-    /// data_manager: equity bar sync has started.
+    /// data: equity bar sync has started.
     EquityBarsSyncStarted,
-    /// data_manager: equity bar sync completed successfully.
+    /// data: equity bar sync completed successfully.
     EquityBarsSyncCompleted,
-    /// data_manager: equity bar sync encountered an error.
+    /// data: equity bar sync encountered an error.
     EquityBarsSyncErrored,
 
     // --- Nightly exports ---
     /// pg_cron trigger: equity bars S3 export requested.
     EquityBarsExportRequested,
-    /// data_manager: equity bars export has started.
+    /// data: equity bars export has started.
     EquityBarsExportStarted,
-    /// data_manager: equity bars export completed successfully.
+    /// data: equity bars export completed successfully.
     EquityBarsExportCompleted,
-    /// data_manager: equity bars export encountered an error.
+    /// data: equity bars export encountered an error.
     EquityBarsExportErrored,
 
     /// pg_cron trigger: trading history S3 export requested.
     TradingHistoryExportRequested,
-    /// data_manager: trading history export has started.
+    /// data: trading history export has started.
     TradingHistoryExportStarted,
-    /// data_manager: trading history export completed successfully.
+    /// data: trading history export completed successfully.
     TradingHistoryExportCompleted,
-    /// data_manager: trading history export encountered an error.
+    /// data: trading history export encountered an error.
     TradingHistoryExportErrored,
 
     /// pg_cron trigger: database backup requested.
     DatabaseBackupRequested,
-    /// data_manager: database backup has started.
+    /// data: database backup has started.
     DatabaseBackupStarted,
-    /// data_manager: database backup completed successfully.
+    /// data: database backup completed successfully.
     DatabaseBackupCompleted,
-    /// data_manager: database backup encountered an error.
+    /// data: database backup encountered an error.
     DatabaseBackupErrored,
 
     // --- Prediction pipeline ---
     /// pg_cron periodic trigger: intraday market session check.
     MarketSessionCheck,
-    /// portfolio_manager: equity prediction run requested in response to a market session check.
+    /// portfolio: equity prediction run requested in response to a market session check.
     EquityPredictionsRequested,
-    /// ensemble_manager: equity prediction run has started.
+    /// inference: equity prediction run has started.
     EquityPredictionsStarted,
-    /// ensemble_manager: equity prediction run completed successfully.
+    /// inference: equity prediction run completed successfully.
     EquityPredictionsCompleted,
-    /// ensemble_manager: equity prediction run encountered an error.
+    /// inference: equity prediction run encountered an error.
     EquityPredictionsErrored,
 
     // --- Portfolio rebalance ---
-    /// portfolio_manager: rebalance has started.
+    /// portfolio: rebalance has started.
     PortfolioRebalanceStarted,
-    /// portfolio_manager: rebalance completed successfully.
+    /// portfolio: rebalance completed successfully.
     PortfolioRebalanceCompleted,
-    /// portfolio_manager: rebalance encountered an error.
+    /// portfolio: rebalance encountered an error.
     PortfolioRebalanceErrored,
 
     // --- End-of-day liquidation ---
     /// pg_cron trigger: close all open positions before market close.
     PortfolioLiquidationRequested,
-    /// portfolio_manager: liquidation has started.
+    /// portfolio: liquidation has started.
     PortfolioLiquidationStarted,
-    /// portfolio_manager: liquidation completed successfully.
+    /// portfolio: liquidation completed successfully.
     PortfolioLiquidationCompleted,
-    /// portfolio_manager: liquidation encountered an error.
+    /// portfolio: liquidation encountered an error.
     PortfolioLiquidationErrored,
 }
 
@@ -164,30 +164,29 @@ impl fmt::Display for EventType {
 
 // --- Consumer name constants ---
 
-/// Consumer name for the ensemble_manager event consumer.
-pub const CONSUMER_ENSEMBLE_MANAGER: &str = "ensemble-manager";
+/// Consumer name for the inference event consumer.
+pub const CONSUMER_INFERENCE: &str = "inference";
 
-/// Consumer name for the portfolio_manager predictions consumer.
+/// Consumer name for the portfolio predictions consumer.
 /// Tracks the last processed `equity_predictions_completed` event.
-pub const CONSUMER_PORTFOLIO_MANAGER: &str = "portfolio-manager";
+pub const CONSUMER_PORTFOLIO: &str = "portfolio";
 
-/// Consumer name for the portfolio_manager liquidation consumer.
+/// Consumer name for the portfolio liquidation consumer.
 /// Tracks the last processed `portfolio_liquidation_requested` event separately
 /// so the predictions offset cannot mask a missed end-of-day liquidation.
-pub const CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION: &str = "portfolio-manager-liquidation";
+pub const CONSUMER_PORTFOLIO_LIQUIDATION: &str = "portfolio-liquidation";
 
-/// Consumer name for the data_manager equity bars sync consumer.
-pub const CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC: &str = "data-manager-equity-bars-sync";
+/// Consumer name for the data equity bars sync consumer.
+pub const CONSUMER_DATA_EQUITY_BARS_SYNC: &str = "data-equity-bars-sync";
 
-/// Consumer name for the data_manager equity bars export consumer.
-pub const CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT: &str = "data-manager-equity-bars-export";
+/// Consumer name for the data equity bars export consumer.
+pub const CONSUMER_DATA_EQUITY_BARS_EXPORT: &str = "data-equity-bars-export";
 
-/// Consumer name for the data_manager trading history export consumer.
-pub const CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT: &str =
-    "data-manager-trading-history-export";
+/// Consumer name for the data trading history export consumer.
+pub const CONSUMER_DATA_TRADING_HISTORY_EXPORT: &str = "data-trading-history-export";
 
-/// Consumer name for the data_manager database backup consumer.
-pub const CONSUMER_DATA_MANAGER_DATABASE_BACKUP: &str = "data-manager-database-backup";
+/// Consumer name for the data database backup consumer.
+pub const CONSUMER_DATA_DATABASE_BACKUP: &str = "data-database-backup";
 
 // --- Database helpers ---
 
@@ -424,28 +423,16 @@ mod tests {
 
     #[test]
     fn test_consumer_name_constants_are_stable() {
-        assert_eq!(CONSUMER_ENSEMBLE_MANAGER, "ensemble-manager");
-        assert_eq!(CONSUMER_PORTFOLIO_MANAGER, "portfolio-manager");
+        assert_eq!(CONSUMER_INFERENCE, "inference");
+        assert_eq!(CONSUMER_PORTFOLIO, "portfolio");
+        assert_eq!(CONSUMER_PORTFOLIO_LIQUIDATION, "portfolio-liquidation");
+        assert_eq!(CONSUMER_DATA_EQUITY_BARS_SYNC, "data-equity-bars-sync");
+        assert_eq!(CONSUMER_DATA_EQUITY_BARS_EXPORT, "data-equity-bars-export");
         assert_eq!(
-            CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION,
-            "portfolio-manager-liquidation"
+            CONSUMER_DATA_TRADING_HISTORY_EXPORT,
+            "data-trading-history-export"
         );
-        assert_eq!(
-            CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC,
-            "data-manager-equity-bars-sync"
-        );
-        assert_eq!(
-            CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT,
-            "data-manager-equity-bars-export"
-        );
-        assert_eq!(
-            CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
-            "data-manager-trading-history-export"
-        );
-        assert_eq!(
-            CONSUMER_DATA_MANAGER_DATABASE_BACKUP,
-            "data-manager-database-backup"
-        );
+        assert_eq!(CONSUMER_DATA_DATABASE_BACKUP, "data-database-backup");
     }
 
     #[test]
@@ -464,7 +451,7 @@ mod tests {
     #[test]
     fn test_get_consumer_offset_compiles() {
         make_runtime().block_on(async {
-            assert!(get_consumer_offset(&lazy_pool(), CONSUMER_ENSEMBLE_MANAGER)
+            assert!(get_consumer_offset(&lazy_pool(), CONSUMER_INFERENCE)
                 .await
                 .is_err());
         });
@@ -473,11 +460,9 @@ mod tests {
     #[test]
     fn test_update_consumer_offset_compiles() {
         make_runtime().block_on(async {
-            assert!(
-                update_consumer_offset(&lazy_pool(), CONSUMER_PORTFOLIO_MANAGER, 42)
-                    .await
-                    .is_err()
-            );
+            assert!(update_consumer_offset(&lazy_pool(), CONSUMER_PORTFOLIO, 42)
+                .await
+                .is_err());
         });
     }
 

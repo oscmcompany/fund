@@ -1,4 +1,4 @@
-//! Database access layer for the portfolio_manager service.
+//! Database access layer for the portfolio service.
 
 use std::collections::HashMap;
 

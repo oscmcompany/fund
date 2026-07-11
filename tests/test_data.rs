@@ -1,7 +1,7 @@
 mod common;
 
 use common::initialize_test_tracing;
-use fund::data_manager::data::{create_equity_bar_dataframe, EquityBar, Ticker};
+use fund::data::types::{create_equity_bar_dataframe, EquityBar, Ticker};
 use polars::prelude::*;
 
 fn sample_equity_bar() -> EquityBar {

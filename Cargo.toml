@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "backfill"
 path = "src/bin/backfill.rs"
-required-features = ["data_manager"]
+required-features = ["data"]
 
 [[bin]]
 name = "tide_model_trainer"
@@ -26,30 +26,24 @@ required-features = ["dashboard_service"]
 [[bin]]
 name = "fund"
 path = "src/bin/fund.rs"
-required-features = ["data_manager", "ensemble_manager", "portfolio_manager"]
+required-features = ["data", "inference", "portfolio"]
 
 [features]
-default = ["data_manager", "ensemble_manager", "portfolio_manager"]
-data_manager = [
+default = ["data", "inference", "portfolio"]
+data = [
   "dep:chrono-tz",
   "dep:urlencoding",
   "dep:tokio-tungstenite",
   "dep:futures-util",
 ]
-ensemble_manager = [
-  "dep:burn",
-  "dep:ndarray",
-  "dep:flate2",
-  "dep:tar",
-  "dep:tempfile",
-]
-portfolio_manager = ["dep:chrono-tz"]
+inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
+portfolio = ["dep:chrono-tz"]
 dashboard_service = ["dep:ratatui", "dep:crossterm"]
 
-# Rust-native TiDE training. Reuses the ensemble_manager model/data/predict code
+# Rust-native TiDE training. Reuses the inference model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
 # for epoch shuffling.
-train = ["ensemble_manager", "dep:rand"]
+train = ["inference", "dep:rand"]
 
 [dependencies]
 # Shared / base (always compiled)
@@ -97,7 +91,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 # automatically and panics on first TLS use. See `common::crypto`.
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
-# data_manager-only (optional; enabled by the `data_manager` feature)
+# data-only (optional; enabled by the `data` feature)
 chrono-tz = { version = "0.10", optional = true }
 urlencoding = { version = "2.1.3", optional = true }
 tokio-tungstenite = { version = "0.26", features = [
@@ -105,7 +99,7 @@ tokio-tungstenite = { version = "0.26", features = [
 ], optional = true }
 futures-util = { version = "0.3", optional = true }
 
-# ensemble_manager-only (optional; enabled by the `ensemble_manager` feature).
+# inference-only (optional; enabled by the `inference` feature).
 # `autodiff` brings the Autodiff backend used by Rust-native training; it adds
 # no runtime cost to the NdArray inference path.
 burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }

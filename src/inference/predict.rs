@@ -6,8 +6,8 @@ use tracing::info;
 
 use crate::models::tide::data::Data;
 
-use crate::ensemble_manager::database;
-use crate::ensemble_manager::state::ModelState;
+use crate::inference::database;
+use crate::inference::state::ModelState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PredictionError {

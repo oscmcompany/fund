@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use crate::domain::market::{PairID, Ticker};
-use crate::portfolio_manager::statistical_arbitrage::CandidatePair;
+use crate::portfolio::statistical_arbitrage::CandidatePair;
 
 /// Relative lower bound for each pair weight versus its volatility-parity share.
 const BETA_WEIGHT_LOWER_BOUND: f64 = 0.5;

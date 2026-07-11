@@ -2,7 +2,7 @@
 //! a gzipped tar and upload it (plus run metadata) to S3.
 //!
 //! The tar is flat (one entry per file, no directory prefix) so it matches the
-//! extraction the inference loader performs in `ensemble_manager::artifact`.
+//! extraction the inference loader performs in `inference::artifact`.
 
 use std::path::Path;
 

@@ -1,6 +1,6 @@
-use crate::data_manager::data::{create_equity_bar_dataframe, EquityBar, TradingDate};
-use crate::data_manager::database;
-use crate::data_manager::state::State;
+use crate::data::database;
+use crate::data::state::State;
+use crate::data::types::{create_equity_bar_dataframe, EquityBar, TradingDate};
 use crate::domain::market::Ticker;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, NaiveDate, Utc};

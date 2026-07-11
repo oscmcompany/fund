@@ -7,7 +7,7 @@
 
 use crate::domain::primitives::Percent;
 use crate::domain::signals::{Regime, RegimeResult};
-use crate::portfolio_manager::math::{log_returns, mean, pearson_correlation, standard_deviation};
+use crate::portfolio::math::{log_returns, mean, pearson_correlation, standard_deviation};
 
 /// Trailing window for regime classification (trading days).
 pub const REGIME_WINDOW_DAYS: usize = 60;

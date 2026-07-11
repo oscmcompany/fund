@@ -1,12 +1,12 @@
 mod common;
 
 use chrono::{NaiveDate, Utc};
-use fund::data_manager::data::{EquityBar, Ticker};
-use fund::data_manager::database::{
+use fund::data::database::{
     insert_equity_bars, query_equity_allocations, query_equity_bars_for_date, query_equity_orders,
     query_equity_pairs, query_equity_portfolio_snapshots, query_equity_quotes_for_date,
     query_equity_rebalance_sessions,
 };
+use fund::data::types::{EquityBar, Ticker};
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::OnceLock;

@@ -1,4 +1,4 @@
-//! PostgreSQL event consumer for the portfolio_manager service.
+//! PostgreSQL event consumer for the portfolio service.
 //!
 //! Listens on the `events` channel and:
 //! - Emits `equity_predictions_requested` on each `market_session_check` tick.
@@ -15,13 +15,11 @@ use tracing::{error, info, warn};
 
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_PORTFOLIO_MANAGER, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION,
+    CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION,
 };
 use crate::common::market_hours::is_within_trading_session;
-use crate::portfolio_manager::rebalance::{
-    run_end_of_day_liquidation, run_rebalance, RebalanceError,
-};
-use crate::portfolio_manager::state::AppState;
+use crate::portfolio::rebalance::{run_end_of_day_liquidation, run_rebalance, RebalanceError};
+use crate::portfolio::state::AppState;
 
 /// Spawns the event consumer as a background task.
 pub fn spawn_event_consumer(state: AppState) {
@@ -49,7 +47,7 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     // Catch up on equity_predictions_completed that arrived while we were down.
     // Periodic market_session_check ticks are intentionally not caught up because
     // stale ticks carry no meaningful signal.
-    let predictions_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER).await?;
+    let predictions_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO).await?;
     if let Some(event_id) = latest_event_after(
         pool,
         EventType::EquityPredictionsCompleted,
@@ -66,8 +64,7 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
 
     // Catch up on portfolio_liquidation_requested if we missed it while the
     // market was still open. Guarded by a trading-session window check.
-    let liquidation_offset =
-        get_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION).await?;
+    let liquidation_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO_LIQUIDATION).await?;
     if let Some(event_id) = latest_event_after(
         pool,
         EventType::PortfolioLiquidationRequested,
@@ -87,7 +84,7 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
                 "Skipping missed portfolio_liquidation_requested: market session has ended"
             );
             if let Err(error) =
-                update_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION, event_id).await
+                update_consumer_offset(pool, CONSUMER_PORTFOLIO_LIQUIDATION, event_id).await
             {
                 warn!(error = %error, "Failed to update liquidation consumer offset");
             }
@@ -252,7 +249,7 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
         }
     }
 
-    if let Err(error) = update_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER, event_id).await {
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_PORTFOLIO, event_id).await {
         warn!(error = %error, "Failed to update consumer offset");
     }
 
@@ -298,8 +295,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
         }
     }
 
-    if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION, event_id).await
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_PORTFOLIO_LIQUIDATION, event_id).await
     {
         warn!(error = %error, "Failed to update liquidation consumer offset");
     }
@@ -307,16 +303,13 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
 
 #[cfg(test)]
 mod tests {
-    use super::{CONSUMER_PORTFOLIO_MANAGER, CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION};
+    use super::{CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION};
     use crate::common::events::EventType;
 
     #[test]
     fn test_consumer_names_are_stable() {
-        assert_eq!(CONSUMER_PORTFOLIO_MANAGER, "portfolio-manager");
-        assert_eq!(
-            CONSUMER_PORTFOLIO_MANAGER_LIQUIDATION,
-            "portfolio-manager-liquidation"
-        );
+        assert_eq!(CONSUMER_PORTFOLIO, "portfolio");
+        assert_eq!(CONSUMER_PORTFOLIO_LIQUIDATION, "portfolio-liquidation");
     }
 
     #[test]

@@ -1,7 +1,6 @@
-//! Data manager: syncs equity data from the Massive API, backed by S3 and
+//! Data: syncs equity data from the Massive API, backed by S3 and
 //! PostgreSQL. Driven by the Postgres event bus and a sync scheduler.
 
-pub mod data;
 pub mod database;
 pub mod equity_bars;
 pub mod equity_details;
@@ -11,3 +10,4 @@ pub mod export;
 pub mod scheduler;
 pub mod startup;
 pub mod state;
+pub mod types;

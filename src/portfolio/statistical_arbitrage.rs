@@ -9,8 +9,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::domain::market::{PairID, Ticker};
-use crate::portfolio_manager::consolidation::ConsolidatedSignal;
-use crate::portfolio_manager::math::{log_returns, ols_slope, pearson_correlation, z_score_last};
+use crate::portfolio::consolidation::ConsolidatedSignal;
+use crate::portfolio::math::{log_returns, ols_slope, pearson_correlation, z_score_last};
 
 /// Trailing window for correlation and z-score computation (trading days).
 pub const CORRELATION_WINDOW_DAYS: usize = 60;

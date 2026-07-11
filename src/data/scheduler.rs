@@ -1,12 +1,12 @@
 use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
-    EventType, CONSUMER_DATA_MANAGER_DATABASE_BACKUP, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT,
-    CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT,
+    EventType, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_EQUITY_BARS_EXPORT,
+    CONSUMER_DATA_EQUITY_BARS_SYNC, CONSUMER_DATA_TRADING_HISTORY_EXPORT,
 };
-use crate::data_manager::data::TradingDate;
-use crate::data_manager::equity_bars::fetch_and_store_equity_bars;
-use crate::data_manager::export;
-use crate::data_manager::state::State;
+use crate::data::equity_bars::fetch_and_store_equity_bars;
+use crate::data::export;
+use crate::data::state::State;
+use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::US::Eastern;
@@ -153,7 +153,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     info!("Event consumer connected, listening on channel 'events'");
 
     // Catch up on any missed one-time actionable events (latest missed instance each).
-    let sync_offset = get_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC).await?;
+    let sync_offset = get_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC).await?;
     if let Some(event_id) =
         latest_event_after(pool, EventType::EquityBarsSyncRequested, sync_offset).await?
     {
@@ -164,8 +164,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     // Export events carry date-specific payloads, so every missed event must be
     // replayed in order. Skipping to the latest would permanently lose export dates
     // for any intermediate days the service was down.
-    let export_bars_offset =
-        get_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT).await?;
+    let export_bars_offset = get_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_EXPORT).await?;
     for (event_id, payload) in events_after(
         pool,
         EventType::EquityBarsExportRequested,
@@ -181,7 +180,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
     }
 
     let export_history_offset =
-        get_consumer_offset(pool, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT).await?;
+        get_consumer_offset(pool, CONSUMER_DATA_TRADING_HISTORY_EXPORT).await?;
     for (event_id, payload) in events_after(
         pool,
         EventType::TradingHistoryExportRequested,
@@ -196,7 +195,7 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
         handle_trading_history_export(state, pool, event_id, &payload).await;
     }
 
-    let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_MANAGER_DATABASE_BACKUP).await?;
+    let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP).await?;
     if let Some(event_id) =
         latest_event_after(pool, EventType::DatabaseBackupRequested, backup_offset).await?
     {
@@ -290,8 +289,7 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
         }
     }
 
-    if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_SYNC, event_id).await
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC, event_id).await
     {
         warn!(
             "Failed to update equity-bars-sync consumer offset: {}",
@@ -345,7 +343,7 @@ async fn handle_equity_bars_export(
     }
 
     if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_EQUITY_BARS_EXPORT, event_id).await
+        update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_EXPORT, event_id).await
     {
         warn!(
             "Failed to update equity-bars-export consumer offset: {}",
@@ -402,7 +400,7 @@ async fn handle_trading_history_export(
     }
 
     if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_TRADING_HISTORY_EXPORT, event_id).await
+        update_consumer_offset(pool, CONSUMER_DATA_TRADING_HISTORY_EXPORT, event_id).await
     {
         warn!(
             "Failed to update trading-history-export consumer offset: {}",
@@ -449,8 +447,7 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
         }
     }
 
-    if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_MANAGER_DATABASE_BACKUP, event_id).await
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP, event_id).await
     {
         warn!(
             "Failed to update database-backup consumer offset: {}",
@@ -822,7 +819,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{MassiveSecrets, State};
+            use crate::data::state::{MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
 
@@ -912,7 +909,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{MassiveSecrets, State};
+            use crate::data::state::{MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
 
@@ -1028,7 +1025,7 @@ mod tests {
     async fn test_listen_loop_exits_immediately_when_no_pool() {
         // listen_loop returns immediately when the database state has no pool.
         // This covers the early-return path at the top of listen_loop.
-        use crate::data_manager::state::{MassiveSecrets, State};
+        use crate::data::state::{MassiveSecrets, State};
         use aws_credential_types::Credentials;
         use aws_sdk_s3::config::Region;
 
@@ -1062,7 +1059,7 @@ mod tests {
         // spawn_sync_scheduler must not panic when called with a state that has
         // no database pool. It spawns background tasks that terminate immediately
         // once the runtime drops.
-        use crate::data_manager::state::{MassiveSecrets, State};
+        use crate::data::state::{MassiveSecrets, State};
         use aws_credential_types::Credentials;
         use aws_sdk_s3::config::Region;
 
@@ -1187,7 +1184,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{MassiveSecrets, State};
+            use crate::data::state::{MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
 
@@ -1226,7 +1223,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{MassiveSecrets, State};
+            use crate::data::state::{MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
 

@@ -1,4 +1,4 @@
-//! Shared application state for the portfolio_manager service.
+//! Shared application state for the portfolio service.
 
 use std::env;
 use std::num::NonZeroU8;
@@ -15,8 +15,8 @@ use crate::domain::portfolio::{
 };
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
-use crate::portfolio_manager::alpaca::{AlpacaTradingClient, TradableAssets};
-use crate::portfolio_manager::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
+use crate::portfolio::alpaca::{AlpacaTradingClient, TradableAssets};
+use crate::portfolio::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
 const DEFAULT_DRAWDOWN_THRESHOLD: f64 = 0.10;
@@ -90,7 +90,7 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
     }
 }
 
-/// Shared application state for the portfolio manager module.
+/// Shared application state for the portfolio module.
 ///
 /// Constructed once at startup via `from_env()`. A value of this type proves
 /// that the database pool, Alpaca credentials, and portfolio constraints are

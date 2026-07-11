@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::domain::market::Ticker;
-use crate::portfolio_manager::math::{log_returns, ols_slope};
+use crate::portfolio::math::{log_returns, ols_slope};
 
 /// Trailing window for beta estimation (trading days).
 pub const BETA_WINDOW_DAYS: usize = 60;

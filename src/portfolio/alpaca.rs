@@ -1,4 +1,4 @@
-//! Alpaca trading REST API client for the portfolio manager.
+//! Alpaca trading REST API client for the portfolio module.
 //!
 //! Uses `reqwest` for HTTP and the Alpaca v2 API endpoints for order
 //! submission, position management, and shortability checks. Authentication

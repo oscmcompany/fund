@@ -12,8 +12,8 @@
 use chrono::{NaiveDate, Utc};
 use chrono_tz::US::Eastern;
 use fund::common::observability::init_tracing;
-use fund::data_manager::equity_bars::{backfill, BackfillSummary};
-use fund::data_manager::state::State;
+use fund::data::equity_bars::{backfill, BackfillSummary};
+use fund::data::state::State;
 
 const USAGE: &str = "Usage: backfill <start YYYY-MM-DD> [end YYYY-MM-DD]";
 
@@ -61,7 +61,7 @@ fn parse_arguments(arguments: &[String]) -> Result<(NaiveDate, NaiveDate), Strin
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
 
-    let _tracing_guard = init_tracing("data-manager-errors.log", Some("warn"));
+    let _tracing_guard = init_tracing("backfill-errors.log", Some("warn"));
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let (start, end) = match parse_arguments(&arguments) {
@@ -102,7 +102,7 @@ async fn main() {
                 let log_directory =
                     std::env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
                 eprintln!(
-                    "{} day(s) failed to backfill; see {}/data-manager-errors.log* for details.",
+                    "{} day(s) failed to backfill; see {}/backfill-errors.log* for details.",
                     summary.days_failed, log_directory
                 );
                 std::process::exit(exit_code);
@@ -121,7 +121,7 @@ mod tests {
     use super::{exit_code_for, parse_arguments, parse_date};
     use chrono::{NaiveDate, Utc};
     use chrono_tz::US::Eastern;
-    use fund::data_manager::equity_bars::BackfillSummary;
+    use fund::data::equity_bars::BackfillSummary;
 
     #[test]
     fn test_exit_code_for_reflects_failures() {

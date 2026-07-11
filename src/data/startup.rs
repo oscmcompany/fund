@@ -1,6 +1,6 @@
-use crate::data_manager::database::seed_equity_details;
-use crate::data_manager::equity_details::parse_embedded_equity_details;
-use crate::data_manager::state::State;
+use crate::data::database::seed_equity_details;
+use crate::data::equity_details::parse_embedded_equity_details;
+use crate::data::state::State;
 
 pub async fn migrate_equity_details(state: &State) {
     let pool = match state.database.pool() {

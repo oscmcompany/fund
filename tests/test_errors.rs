@@ -1,4 +1,4 @@
-use fund::data_manager::errors::Error;
+use fund::data::errors::Error;
 
 #[test]
 fn test_error_display_other_variant() {

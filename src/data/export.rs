@@ -5,7 +5,7 @@
 //! and writes to S3. Failures are surfaced as structured log entries.
 
 use crate::common::aws::date_partitioned_key;
-use crate::data_manager::{database, state::State};
+use crate::data::{database, state::State};
 use crate::domain::market::{EquityBar, EquityQuote};
 use crate::domain::predictions::{EquityPrediction, ModelRun};
 use crate::domain::trading::{
@@ -1048,7 +1048,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{DatabaseState, MassiveSecrets, State};
+            use crate::data::state::{DatabaseState, MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
             use chrono::NaiveDate;
@@ -1090,7 +1090,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            use crate::data_manager::state::{DatabaseState, MassiveSecrets, State};
+            use crate::data::state::{DatabaseState, MassiveSecrets, State};
             use aws_credential_types::Credentials;
             use aws_sdk_s3::config::Region;
             use chrono::NaiveDate;

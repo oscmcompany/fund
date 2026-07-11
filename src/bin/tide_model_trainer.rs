@@ -16,10 +16,10 @@ use tracing::{error, info, warn};
 
 use fund::common::observability::init_tracing;
 use fund::domain::market::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use fund::ensemble_manager::artifact::{
+use fund::inference::artifact::{
     candidate_folders_descending, fetch_run_metadata, list_run_folders,
 };
-use fund::ensemble_manager::predict::consolidate_data;
+use fund::inference::predict::consolidate_data;
 use fund::models::tide::artifact::{package_dir_to_tar_gz, upload_artifact};
 use fund::models::tide::config::ModelParameters;
 use fund::models::tide::data::input_feature_size;

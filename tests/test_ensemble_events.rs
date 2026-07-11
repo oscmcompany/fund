@@ -7,7 +7,7 @@ mod common;
 use fund::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
 };
-use fund::ensemble_manager::database::{insert_predictions, upsert_model_run, ModelRunRecord};
+use fund::inference::database::{insert_predictions, upsert_model_run, ModelRunRecord};
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::OnceLock;

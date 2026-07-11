@@ -1,8 +1,8 @@
-//! Postgres event consumer for the ensemble service.
+//! Postgres event consumer for the inference service.
 //!
 //! Listens on the `events` channel and runs the prediction pipeline whenever an
-//! `equity_predictions_requested` event arrives. Mirrors the data_manager LISTEN
-//! loop (`src/data_manager/scheduler.rs`). This wires the Rust ensemble service
+//! `equity_predictions_requested` event arrives. Mirrors the data LISTEN
+//! loop (`src/data/scheduler.rs`). This wires the Rust inference service
 //! into the event system, replacing the former Python consumer.
 
 use std::time::Duration;
@@ -14,10 +14,10 @@ use tracing::{error, info, warn};
 
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_ENSEMBLE_MANAGER,
+    CONSUMER_INFERENCE,
 };
-use crate::ensemble_manager::pipeline::run_predictions;
-use crate::ensemble_manager::state::AppState;
+use crate::inference::pipeline::run_predictions;
+use crate::inference::state::AppState;
 
 /// Spawn the event consumer if a database pool is configured.
 pub fn spawn_event_consumer(state: AppState) {
@@ -52,7 +52,7 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     info!("Event consumer connected, listening on channel 'events'");
 
     // Catch up on an equity_predictions_requested that arrived while we were down.
-    let offset = get_consumer_offset(pool, CONSUMER_ENSEMBLE_MANAGER).await?;
+    let offset = get_consumer_offset(pool, CONSUMER_INFERENCE).await?;
     if let Some(event_id) =
         latest_event_after(pool, EventType::EquityPredictionsRequested, offset).await?
     {
@@ -127,7 +127,7 @@ async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, ev
         }
     }
 
-    if let Err(error) = update_consumer_offset(pool, CONSUMER_ENSEMBLE_MANAGER, event_id).await {
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_INFERENCE, event_id).await {
         warn!(error = %error, "Failed to update consumer offset");
     }
 }

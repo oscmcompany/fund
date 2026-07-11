@@ -39,24 +39,24 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio_manager::alpaca::{AlpacaTradingClient, TradableAssets};
-use crate::portfolio_manager::beta::compute_market_betas;
-use crate::portfolio_manager::consolidation::{consolidate_predictions, ConsolidatedSignal};
-use crate::portfolio_manager::database::{
+use crate::portfolio::alpaca::{AlpacaTradingClient, TradableAssets};
+use crate::portfolio::beta::compute_market_betas;
+use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
+use crate::portfolio::database::{
     close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
     fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value,
     fetch_live_quote_mid_prices, fetch_open_pairs, fetch_spy_equity_prices,
     insert_equity_allocation, insert_equity_order, insert_equity_pair, insert_portfolio_snapshot,
     insert_rebalance_session, update_rebalance_session_status, OpenPair,
 };
-use crate::portfolio_manager::execution::{
+use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
 };
-use crate::portfolio_manager::math::z_score_last;
-use crate::portfolio_manager::regime::classify_regime;
-use crate::portfolio_manager::sizing::{size_pairs_with_volatility_parity, SizingError};
-use crate::portfolio_manager::state::AppState;
-use crate::portfolio_manager::statistical_arbitrage::select_pairs;
+use crate::portfolio::math::z_score_last;
+use crate::portfolio::regime::classify_regime;
+use crate::portfolio::sizing::{size_pairs_with_volatility_parity, SizingError};
+use crate::portfolio::state::AppState;
+use crate::portfolio::statistical_arbitrage::select_pairs;
 
 /// Outcome of a completed rebalance cycle.
 #[derive(Debug)]
@@ -391,7 +391,7 @@ async fn run_monitor_cycle(
 ///
 /// Fetches open pairs, submits close orders via Alpaca, marks each pair closed
 /// with `close_reason = 'end_of_day'`, then emits the completion event so
-/// data_manager can unsubscribe from the WebSocket quote stream.
+/// the data service can unsubscribe from the WebSocket quote stream.
 ///
 /// Returns the number of pairs closed, or a `RebalanceError` if Alpaca or
 /// the database returns an error.
@@ -702,7 +702,7 @@ async fn select_size_execute(
     exposure_scale: f64,
     candidate_pool: usize,
     required_pairs: usize,
-) -> Result<Vec<(FilledPair, crate::portfolio_manager::sizing::SizedPair)>, RebalanceError> {
+) -> Result<Vec<(FilledPair, crate::portfolio::sizing::SizedPair)>, RebalanceError> {
     let candidate_pairs = select_pairs(signals, historical_prices, candidate_pool);
     info!(
         candidates = candidate_pairs.len(),
@@ -818,7 +818,7 @@ async fn persist_filled_pairs(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     session_id: Uuid,
     now: DateTime<Utc>,
-    filled: &[(FilledPair, crate::portfolio_manager::sizing::SizedPair)],
+    filled: &[(FilledPair, crate::portfolio::sizing::SizedPair)],
 ) -> Result<Decimal, RebalanceError> {
     let mut total_slippage_cost = Decimal::ZERO;
 
@@ -1050,7 +1050,7 @@ mod tests {
     // --- evaluate_open_pairs tests ---
 
     use crate::domain::market::PairID;
-    use crate::portfolio_manager::database::OpenPair;
+    use crate::portfolio::database::OpenPair;
 
     fn make_open_pair(long: &str, short: &str, entry_z: f64, hedge_ratio: f64) -> OpenPair {
         OpenPair::new_for_test(

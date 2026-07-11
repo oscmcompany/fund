@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
 
 -- equity_pairs: one row per cointegrated pair per rebalance cycle
 -- Entry signals (z_score, hedge_ratio, signal_strength) are recorded at the time of opening.
--- Matches the pairs_schema pandera definition and ClosedPair struct in data_manager/src/data.rs.
+-- Matches the pairs_schema pandera definition and ClosedPair struct in src/data/types.rs.
 CREATE TABLE IF NOT EXISTS equity_pairs (
     id                         UUID        PRIMARY KEY,
     rebalance_id               UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS equity_trades (
 );
 
 -- equity_details: Ticker metadata (sector, industry) seeded from S3 on first startup.
--- Ongoing updates are owned by data-manager when equity details are refreshed.
+-- Ongoing updates are owned by the data service when equity details are refreshed.
 -- Source: data/equity/details/details.csv in the S3 bucket.
 CREATE TABLE IF NOT EXISTS equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,
@@ -257,8 +257,8 @@ CREATE TABLE IF NOT EXISTS event_consumer_offsets (
 );
 
 -- equity_predictions: model output quantiles (7-day rolling buffer)
--- Columns match the Prediction struct in data_manager/src/data.rs and
--- the predictions_schema pandera definition in ensemble_manager.
+-- Columns match the Prediction struct in src/data/types.rs and
+-- the predictions_schema pandera definition in the inference module.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
 -- Identity is (ticker, timestamp) — the TimescaleDB primary key; no surrogate id column.
 CREATE TABLE IF NOT EXISTS equity_predictions (
@@ -280,7 +280,7 @@ SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exis
 -- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
 -- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
 -- A compile-time assertion in that file enforces the invariant — update both together.
--- Consumers (e.g., portfolio-manager) listen on the 'events' channel and query equity_quotes directly.
+-- Consumers (e.g., the portfolio service) listen on the 'events' channel and query equity_quotes directly.
 DO $do$
 BEGIN
     -- Remove old intraday-check job and always recreate market-session-check so
@@ -342,7 +342,7 @@ $$;
 -- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
 -- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
 -- to re-apply the schema after a DST transition.
--- Fires before the market-session-check window ends so the rebalance lockout window in portfolio-manager
+-- Fires before the market-session-check window ends so the rebalance lockout window in the portfolio service
 -- prevents any new pairs from being opened after this point.
 DO $do$
 BEGIN

@@ -4,7 +4,7 @@ use aws_sdk_s3::Client as S3Client;
 use chrono::Utc;
 use tracing::{debug, info};
 
-use crate::ensemble_manager::state::ModelState;
+use crate::inference::state::ModelState;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {

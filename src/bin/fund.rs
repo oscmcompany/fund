@@ -1,8 +1,8 @@
 //! Consolidated fund binary.
 //!
-//! Runs all three services (data_manager, ensemble_manager, portfolio_manager)
-//! in a single process, sharing a single `PgPool` and `S3Client`. All work is
-//! driven by PostgreSQL LISTEN/NOTIFY events — no HTTP servers are started.
+//! Runs the data, inference, and portfolio services in a single process,
+//! sharing a single `PgPool` and `S3Client`. All work is driven by PostgreSQL
+//! LISTEN/NOTIFY events — no HTTP servers are started.
 
 use tracing::{error, info};
 
@@ -30,35 +30,34 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
-    // --- data_manager ---
+    // --- data ---
     {
-        let _span = tracing::info_span!("data_manager").entered();
-        let state = fund::data_manager::state::State::with_pool(pool.clone(), s3_client.clone());
-        fund::data_manager::startup::migrate_equity_details(&state).await;
-        fund::data_manager::scheduler::spawn_sync_scheduler(state.clone());
-        fund::data_manager::equity_quotes::spawn_quote_stream(state.clone());
-        info!("Data manager started");
+        let _span = tracing::info_span!("data").entered();
+        let state = fund::data::state::State::with_pool(pool.clone(), s3_client.clone());
+        fund::data::startup::migrate_equity_details(&state).await;
+        fund::data::scheduler::spawn_sync_scheduler(state.clone());
+        fund::data::equity_quotes::spawn_quote_stream(state.clone());
+        info!("Data service started");
     }
 
-    // --- ensemble_manager ---
+    // --- inference ---
     {
-        let _span = tracing::info_span!("ensemble_manager").entered();
-        let state =
-            fund::ensemble_manager::state::AppState::with_pool(pool.clone(), s3_client.clone());
-        fund::ensemble_manager::pipeline::poll_artifact_once(&state).await;
-        tokio::spawn(fund::ensemble_manager::pipeline::start_artifact_polling(
+        let _span = tracing::info_span!("inference").entered();
+        let state = fund::inference::state::AppState::with_pool(pool.clone(), s3_client.clone());
+        fund::inference::pipeline::poll_artifact_once(&state).await;
+        tokio::spawn(fund::inference::pipeline::start_artifact_polling(
             state.clone(),
         ));
-        fund::ensemble_manager::consumer::spawn_event_consumer(state);
-        info!("Ensemble manager started");
+        fund::inference::consumer::spawn_event_consumer(state);
+        info!("Inference service started");
     }
 
-    // --- portfolio_manager ---
+    // --- portfolio ---
     {
-        let _span = tracing::info_span!("portfolio_manager").entered();
-        let state = fund::portfolio_manager::state::AppState::with_pool(pool)?;
-        fund::portfolio_manager::consumer::spawn_event_consumer(state);
-        info!("Portfolio manager started");
+        let _span = tracing::info_span!("portfolio").entered();
+        let state = fund::portfolio::state::AppState::with_pool(pool)?;
+        fund::portfolio::consumer::spawn_event_consumer(state);
+        info!("Portfolio service started");
     }
 
     info!("All modules running, waiting for events");
