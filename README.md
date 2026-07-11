@@ -40,7 +40,7 @@ After launching, the database has the schema applied and equity details inserted
 be manually populated. Run the following commands locally or SSH into the application VM to backfill data.
 
 ```sh
-# Backfill equity bars into PostgreSQL (requires data-manager running)
+# Backfill equity bars to S3 Parquet for model training
 BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill
 
 # Backfill equity bars to S3 Parquet for training (no PostgreSQL needed)

@@ -16,7 +16,7 @@ usage() {
   echo "Usage: $(basename "$0") [--production]"
   echo ""
   echo "Provision an oscm-fund application VM on exe.dev."
-  echo "Runs data-manager, ensemble-manager, and portfolio-manager"
+  echo "Runs the consolidated fund binary (data, inference, and portfolio services)"
   echo "under devenv --profile application."
   echo ""
   echo "Options:"

@@ -11,8 +11,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::domain::orders::{FilledOrder, Order, OrderSide, PendingPair};
-use crate::portfolio_manager::alpaca::{AlpacaError, AlpacaTradingClient};
-use crate::portfolio_manager::sizing::SizedPair;
+use crate::portfolio::alpaca::{AlpacaError, AlpacaTradingClient};
+use crate::portfolio::sizing::SizedPair;
 
 /// Maximum number of fill-poll attempts per order before giving up.
 const FILL_POLL_ATTEMPTS: usize = 5;

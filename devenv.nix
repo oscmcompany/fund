@@ -5,7 +5,7 @@
   # $FUND_PROFILE, which dotenv sets from .env. These cannot be baked in at Nix
   # evaluation time because dotenv runs after Nix evaluates devenv.nix. Model
   # artifacts live in the same per-profile bucket under models/tide/: the Rust
-  # tide trainer (tide_model_trainer) writes there and the Rust ensemble service
+  # tide trainer (tide_model_trainer) writes there and the inference service
   # reads there, so training and serving agree in both dev and production.
   runtimeEnv = ''
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
@@ -250,7 +250,7 @@ in {
     # PostgreSQL rolling buffer automatically on startup.
     echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
     ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data_manager --bin backfill -- \
+    secretspec run -- cargo run --no-default-features --features data --bin backfill -- \
       "$BACKFILL_START_DATE" "$END_DATE"
   '';
 
@@ -418,7 +418,7 @@ in {
     # bars are consumed by model training directly from S3.
     echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
     ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data_manager --bin backfill -- \
+    secretspec run -- cargo run --no-default-features --features data --bin backfill -- \
       "$BACKFILL_START_DATE" "$END_DATE"
   '';
 
@@ -447,7 +447,7 @@ in {
     # --- Model training ---
 
     # Rust-native TiDE training (burn). Reads bars + details from S3, trains, and
-    # uploads a model.tar.gz the ensemble inference service loads directly. The
+    # uploads a model.tar.gz the inference service loads directly. The
     # former Python/tinygrad workflow and its Prefect block registration are
     # retired.
     "models:tide:train".exec = ''
@@ -461,13 +461,13 @@ in {
 
     # Historical S3 backfill: writes Hive-partitioned parquet that model
     # training reads directly. Distinct from database:fetch-equity-bars, which
-    # populates the PostgreSQL rolling buffer through the data-manager API.
+    # populates the PostgreSQL rolling buffer through the data service.
     "data:backfill-s3-equity-bars".exec = "backfill-s3-equity-bars";
 
     # --- Database lifecycle tasks ---
     # Four lifecycle modes:
     #   Create   — apply the schema (idempotent DDL). Use on a fresh VM or after schema changes.
-    #   Backfill — populate equity bars via the data-manager API. Run after create on a fresh VM.
+    #   Backfill — populate equity bars via the backfill binary. Run after create on a fresh VM.
     #   Restore  — fast recovery from the nightly S3 dump when schema has not changed.
     #   Reset    — drop and recreate the empty database. Run before create after breaking changes.
 
@@ -531,7 +531,7 @@ in {
       DISABLE_DISK_CACHE = "1";
       BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
-      # The Rust ensemble service reads Burn-native artifacts; track the most
+      # The inference service reads Burn-native artifacts; track the most
       # recent training run rather than pinning (the old pin protected the
       # retired tinygrad loader from Burn artifacts).
       MODEL_VERSION = "latest";

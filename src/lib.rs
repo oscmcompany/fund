@@ -1,25 +1,25 @@
 //! Fund platform: a single crate hosting the platform's Rust services as
-//! feature-gated modules, each exposed as a thin binary under `src/bin/`.
+//! feature-gated modules, driven by the consolidated `fund` binary.
 //!
 //! - `domain`: schema authority for records shared across services (always built).
-//! - `models`: model definitions and inference (TiDE), used by `ensemble_manager`.
-//! - `data_manager` / `ensemble_manager`: the HTTP services, gated by features of
-//!   the same name so a slim build links only the deps it needs.
+//! - `models`: model definitions and inference (TiDE), used by `inference`.
+//! - `data` / `inference` / `portfolio`: event-driven services, gated by features
+//!   of the same name so a slim build links only the deps it needs.
 
 pub mod common;
 pub mod domain;
 
-#[cfg(feature = "ensemble_manager")]
+#[cfg(feature = "inference")]
 pub mod models;
 
-#[cfg(feature = "data_manager")]
-pub mod data_manager;
+#[cfg(feature = "data")]
+pub mod data;
 
-#[cfg(feature = "ensemble_manager")]
-pub mod ensemble_manager;
+#[cfg(feature = "inference")]
+pub mod inference;
 
-#[cfg(feature = "portfolio_manager")]
-pub mod portfolio_manager;
+#[cfg(feature = "portfolio")]
+pub mod portfolio;
 
 #[cfg(feature = "dashboard_service")]
 pub mod dashboard_service;

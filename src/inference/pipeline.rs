@@ -3,10 +3,10 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::ensemble_manager::artifact;
-use crate::ensemble_manager::database;
-use crate::ensemble_manager::predict;
-use crate::ensemble_manager::state::AppState;
+use crate::inference::artifact;
+use crate::inference::database;
+use crate::inference::predict;
+use crate::inference::state::AppState;
 
 /// Successful outcome of a prediction run.
 pub struct PredictionRun {

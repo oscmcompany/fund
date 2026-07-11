@@ -1,7 +1,7 @@
 mod common;
 
 use chrono::NaiveDate;
-use fund::data_manager::{
+use fund::data::{
     equity_bars::backfill,
     state::{MassiveSecrets, State},
 };

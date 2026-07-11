@@ -65,7 +65,7 @@ start_devenv() {
 # Stop devenv
 # ------------------------------------------------------------------ #
 stop_devenv() {
-  # Graceful position close: call portfolio-manager before stopping devenv.
+  # Graceful position close: call the portfolio service before stopping devenv.
   # TODO(#920): replace stub with real close-all-positions call once endpoint is available.
   log "Graceful position close not yet implemented; stopping immediately"
 

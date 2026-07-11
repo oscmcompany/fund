@@ -316,7 +316,7 @@ impl ModelRunRecord {
 }
 
 /// Upsert a `model_runs` lineage row so `equity_predictions.model_run_id` joins
-/// back to training metadata. Mirrors the prior Python `ensemble_manager` sync.
+/// back to training metadata. Mirrors the prior Python `inference` sync.
 pub async fn upsert_model_run(pool: &PgPool, record: &ModelRunRecord) -> Result<(), sqlx::Error> {
     sqlx::query!(
         "INSERT INTO model_runs ( \

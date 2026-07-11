@@ -2,9 +2,9 @@ use crate::common::events::EventType;
 use crate::common::market_hours::{
     duration_until_quote_stream_window, is_within_quote_stream_window,
 };
-use crate::data_manager::data::EquityQuote;
-use crate::data_manager::database;
-use crate::data_manager::state::State;
+use crate::data::database;
+use crate::data::state::State;
+use crate::data::types::EquityQuote;
 use crate::domain::market::Ticker;
 use chrono::DateTime;
 use chrono::Utc;
@@ -23,7 +23,7 @@ const ALPACA_WS_BASE_URL: &str = "wss://stream.data.alpaca.markets/v2";
 // Market session check interval mirrors the pg_cron schedule in schema.sql (market-session-check job).
 // 5 minutes is a conservative starting point; tighten to 60 if signal latency requires it.
 // The flush interval must never exceed this value — quotes must be committed to the database
-// before portfolio-manager queries them in response to a market_session_check event.
+// before the portfolio service queries them in response to a market_session_check event.
 const MARKET_SESSION_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 const _: () = assert!(
     FLUSH_INTERVAL_SECS <= MARKET_SESSION_CHECK_INTERVAL_SECS,
@@ -362,7 +362,7 @@ pub fn parse_quote_messages(text: &str) -> Vec<EquityQuote> {
 #[cfg(test)]
 mod tests {
     use super::{parse_quote_messages, spawn_quote_stream};
-    use crate::data_manager::state::{DatabaseState, MassiveSecrets, State};
+    use crate::data::state::{DatabaseState, MassiveSecrets, State};
 
     #[test]
     fn test_parse_quote_messages_returns_quotes() {

@@ -1,10 +1,10 @@
-use crate::data_manager::errors::Error;
+use crate::data::errors::Error;
 use crate::domain::market::{EquityDetail, Ticker};
 use tracing::{info, warn};
 
 /// Equity details CSV embedded at compile time.
 ///
-/// The source file lives at `src/data_manager/equity_details.csv` in the
+/// The source file lives at `src/data/equity_details.csv` in the
 /// repository and is checked into version control. Changes require a rebuild
 /// and redeploy.
 const EQUITY_DETAILS_CSV: &str = include_str!("equity_details.csv");

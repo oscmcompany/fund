@@ -9,15 +9,15 @@ description: >
 
 # Platform Health Check
 
-Run a comprehensive health check of all fund platform components. Services run
-on a single exe.dev VM via `devenv --profile application up`. Data is checked
-via the PostgreSQL database and service health endpoints.
+Run a comprehensive health check of all fund platform components. The fund
+binary runs as a single consolidated process on an exe.dev VM via
+`devenv --profile application up`. Data is checked via the PostgreSQL database.
 
 ## Connection
 
 Default to the production application VM: `oscm-fund-production-application.exe.xyz`.
 
-Establish an SSH tunnel for database access and use SSH for health endpoint checks:
+Establish an SSH tunnel for database access:
 
 ```bash
 ssh -L 15432:localhost:5432 oscm-fund-production-application.exe.xyz -N &
@@ -37,21 +37,15 @@ If the SSH connection fails, ask the user which VM to target.
 
 Run checks 1 through 5 in parallel. Collect all results before reporting.
 
-### 1. Service health endpoints
+### 1. Fund process health
 
-Check all three services via SSH:
+Check that the consolidated fund binary is running via SSH:
 
 ```bash
-ssh oscm-fund-production-application.exe.xyz 'curl -sf http://localhost:8080/health'
-ssh oscm-fund-production-application.exe.xyz 'curl -sf http://localhost:8082/health'
-ssh oscm-fund-production-application.exe.xyz 'curl -sf http://localhost:8083/health'
+ssh oscm-fund-production-application.exe.xyz 'pgrep -f "cargo run.*--bin fund" || pgrep -f "target/release/fund"'
 ```
 
-Flag any service that doesn't return HTTP 200 with `"status": "ok"`.
-
-- Port 8080: data-manager
-- Port 8082: ensemble-manager
-- Port 8083: portfolio-manager
+Flag if no fund process is found.
 
 ### 2. Event bus health
 
@@ -145,9 +139,7 @@ Present a summary table:
 ```text
 Component             Status    Details
 --------------------  --------  ----------------------------------------
-data-manager          OK        HTTP 200, port 8080
-ensemble-manager      OK        HTTP 200, port 8082
-portfolio-manager     OK        HTTP 200, port 8083
+Fund process          OK        Running (PID 12345)
 PostgreSQL            OK        Connected, latest event 2m ago
 Event bus             OK        All consumers current, cron jobs firing
 Model training        OK        Latest: tide-2026-07-09, CRPS=0.034, no drift
@@ -162,9 +154,9 @@ Use DEGRADED or ERROR for any failing checks and include the reason.
 If everything is healthy, conclude with: "All platform components are healthy."
 
 If any component is unhealthy, list specific remediation steps:
-- Service not responding: "SSH to VM and check `devenv --profile application up` process output"
+- Process not running: "SSH to VM and check `devenv --profile application up` process output"
 - Events not firing: "Check pg_cron extension and cron.job table on the VM"
 - Consumer stuck: "Check service logs in `/var/log/fund/` for the stuck consumer"
 - Model stale: "Check training pipeline on the trainer VM"
-- Data stale: "Check data-manager logs and Massive API connectivity"
+- Data stale: "Check fund process logs and Massive API connectivity"
 - S3 mismatch: "Compare S3 artifact timestamps with model_runs table"

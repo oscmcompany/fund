@@ -1,4 +1,4 @@
-use crate::data_manager::errors::Error;
+use crate::data::errors::Error;
 use chrono::{Datelike, NaiveDate, Weekday};
 use polars::prelude::*;
 use tracing::{debug, info};

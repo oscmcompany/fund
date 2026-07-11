@@ -2,7 +2,7 @@
 //!
 //! Provides timezone-aware checks for whether the current time falls within
 //! the regular US equity trading session (09:30–16:00 Eastern) or the wider
-//! quote-stream window used by `data_manager` to capture quotes around open
+//! quote-stream window used by `data` to capture quotes around open
 //! and close.
 
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};

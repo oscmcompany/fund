@@ -47,7 +47,7 @@ command = [
   "cargo",
   "run",
   "--bin",
-  "data_manager",
+  "fund",
   # put launch parameters for your program behind a `--` separator
 ]
 need_stdout = true

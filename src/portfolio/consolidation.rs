@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::domain::market::Ticker;
 use crate::domain::predictions::EquityPrediction;
-use crate::portfolio_manager::math::standard_deviation;
+use crate::portfolio::math::standard_deviation;
 
 /// Trailing window for realized volatility (trading days of percentage returns).
 const VOLATILITY_WINDOW_DAYS: usize = 20;

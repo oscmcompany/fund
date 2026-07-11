@@ -1,4 +1,4 @@
-//! Portfolio manager service: selects statistical arbitrage pairs from ensemble
+//! Portfolio service: selects statistical arbitrage pairs from ensemble
 //! predictions, sizes positions with volatility parity, and executes rebalance
 //! cycles against the Alpaca trading API. Driven by the Postgres event bus.
 
