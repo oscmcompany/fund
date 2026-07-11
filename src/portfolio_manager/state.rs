@@ -181,6 +181,82 @@ impl AppState {
             .store(timestamp, Ordering::SeqCst);
     }
 
+    /// Constructs an `AppState` with a pre-existing database pool.
+    ///
+    /// Used by the consolidated `fund` binary where a single `PgPool` is
+    /// shared across all modules. Module-specific configuration (Alpaca
+    /// credentials, portfolio constraints) is read from the environment.
+    pub fn with_pool(pool: PgPool) -> Result<Self, ConfigError> {
+        let key_id = env::var("ALPACA_API_KEY_ID").map_err(|_| ConfigError {
+            message: "ALPACA_API_KEY_ID environment variable is not set".to_string(),
+        })?;
+        let secret = env::var("ALPACA_API_SECRET").map_err(|_| ConfigError {
+            message: "ALPACA_API_SECRET environment variable is not set".to_string(),
+        })?;
+        let credentials = AlpacaCredentials::new(key_id, secret)
+            .map_err(|error| ConfigError { message: error })?;
+        let is_paper = env::var("ALPACA_IS_PAPER")
+            .map(|value| !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let alpaca_client = AlpacaTradingClient::new(credentials, is_paper);
+        let drawdown_threshold = Percent::new(env_f64(
+            "PORTFOLIO_DRAWDOWN_THRESHOLD",
+            DEFAULT_DRAWDOWN_THRESHOLD,
+        )?)
+        .map(DrawdownThreshold)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_DRAWDOWN_THRESHOLD must be a fraction in [0, 1]".to_string(),
+        })?;
+
+        let concentration_cap = Percent::new(env_f64(
+            "PORTFOLIO_CONCENTRATION_CAP",
+            DEFAULT_CONCENTRATION_CAP,
+        )?)
+        .map(ConcentrationCap)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_CONCENTRATION_CAP must be a fraction in [0, 1]".to_string(),
+        })?;
+
+        let minimum_pairs =
+            NonZeroU8::new(env_u8("PORTFOLIO_MINIMUM_PAIRS", DEFAULT_MINIMUM_PAIRS)?)
+                .map(MinimumPairs)
+                .ok_or_else(|| ConfigError {
+                    message: "PORTFOLIO_MINIMUM_PAIRS must be non-zero".to_string(),
+                })?;
+
+        let confidence_floor = Percent::new(env_f64(
+            "PORTFOLIO_CONFIDENCE_FLOOR",
+            DEFAULT_CONFIDENCE_FLOOR,
+        )?)
+        .map(ConfidenceFloor)
+        .map_err(|_| ConfigError {
+            message: "PORTFOLIO_CONFIDENCE_FLOOR must be a fraction in [0, 1]".to_string(),
+        })?;
+
+        let beta_tolerance =
+            BetaTolerance::new(env_f64("PORTFOLIO_BETA_TOLERANCE", DEFAULT_BETA_TOLERANCE)?)
+                .map_err(|error| ConfigError { message: error })?;
+
+        let candidate_pool_count = env_usize("PORTFOLIO_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL)?
+            .max(minimum_pairs.0.get() as usize);
+
+        Ok(Self {
+            pool,
+            alpaca_client,
+            confidence_floor,
+            constraints: Constraints::new(
+                drawdown_threshold,
+                concentration_cap,
+                minimum_pairs,
+                beta_tolerance,
+            ),
+            tradable_assets: Arc::new(RwLock::new(None)),
+            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
+            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            candidate_pool_count,
+        })
+    }
+
     /// Constructs `AppState` by reading all required values from the environment.
     ///
     /// Required environment variables:
@@ -289,6 +365,80 @@ impl AppState {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_with_pool_reads_env_and_uses_default_constraints() {
+        let original_alpaca_key_id = env::var("ALPACA_API_KEY_ID").ok();
+        let original_alpaca_secret = env::var("ALPACA_API_SECRET").ok();
+        let original_alpaca_is_paper = env::var("ALPACA_IS_PAPER").ok();
+        let original_drawdown = env::var("PORTFOLIO_DRAWDOWN_THRESHOLD").ok();
+        let original_concentration = env::var("PORTFOLIO_CONCENTRATION_CAP").ok();
+        let original_minimum_pairs = env::var("PORTFOLIO_MINIMUM_PAIRS").ok();
+        let original_confidence = env::var("PORTFOLIO_CONFIDENCE_FLOOR").ok();
+        let original_beta = env::var("PORTFOLIO_BETA_TOLERANCE").ok();
+        let original_candidate_pool = env::var("PORTFOLIO_CANDIDATE_POOL").ok();
+
+        unsafe {
+            env::set_var("ALPACA_API_KEY_ID", "test-key");
+            env::set_var("ALPACA_API_SECRET", "test-secret");
+            env::remove_var("ALPACA_IS_PAPER");
+            env::remove_var("PORTFOLIO_DRAWDOWN_THRESHOLD");
+            env::remove_var("PORTFOLIO_CONCENTRATION_CAP");
+            env::remove_var("PORTFOLIO_MINIMUM_PAIRS");
+            env::remove_var("PORTFOLIO_CONFIDENCE_FLOOR");
+            env::remove_var("PORTFOLIO_BETA_TOLERANCE");
+            env::remove_var("PORTFOLIO_CANDIDATE_POOL");
+        }
+
+        let pool = sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/test").unwrap();
+        let state = AppState::with_pool(pool).unwrap();
+
+        assert!(
+            (state.confidence_floor().0.value() - DEFAULT_CONFIDENCE_FLOOR).abs() < f64::EPSILON
+        );
+        assert!(!state.rebalance_cycle_in_progress());
+        assert_eq!(state.rebalance_cycle_started_at(), 0);
+
+        unsafe {
+            match original_alpaca_key_id {
+                Some(value) => env::set_var("ALPACA_API_KEY_ID", value),
+                None => env::remove_var("ALPACA_API_KEY_ID"),
+            }
+            match original_alpaca_secret {
+                Some(value) => env::set_var("ALPACA_API_SECRET", value),
+                None => env::remove_var("ALPACA_API_SECRET"),
+            }
+            match original_alpaca_is_paper {
+                Some(value) => env::set_var("ALPACA_IS_PAPER", value),
+                None => env::remove_var("ALPACA_IS_PAPER"),
+            }
+            match original_drawdown {
+                Some(value) => env::set_var("PORTFOLIO_DRAWDOWN_THRESHOLD", value),
+                None => env::remove_var("PORTFOLIO_DRAWDOWN_THRESHOLD"),
+            }
+            match original_concentration {
+                Some(value) => env::set_var("PORTFOLIO_CONCENTRATION_CAP", value),
+                None => env::remove_var("PORTFOLIO_CONCENTRATION_CAP"),
+            }
+            match original_minimum_pairs {
+                Some(value) => env::set_var("PORTFOLIO_MINIMUM_PAIRS", value),
+                None => env::remove_var("PORTFOLIO_MINIMUM_PAIRS"),
+            }
+            match original_confidence {
+                Some(value) => env::set_var("PORTFOLIO_CONFIDENCE_FLOOR", value),
+                None => env::remove_var("PORTFOLIO_CONFIDENCE_FLOOR"),
+            }
+            match original_beta {
+                Some(value) => env::set_var("PORTFOLIO_BETA_TOLERANCE", value),
+                None => env::remove_var("PORTFOLIO_BETA_TOLERANCE"),
+            }
+            match original_candidate_pool {
+                Some(value) => env::set_var("PORTFOLIO_CANDIDATE_POOL", value),
+                None => env::remove_var("PORTFOLIO_CANDIDATE_POOL"),
+            }
+        }
+    }
+
     #[test]
     fn test_config_error_display() {
         let error = ConfigError {
@@ -339,9 +489,9 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_from_env_fails_without_database_url() {
-        // Remove DATABASE_URL from environment to trigger the expected error.
-        // SAFETY: single-threaded test; env mutations don't race.
+        let original_database_url = env::var("DATABASE_URL").ok();
         unsafe { env::remove_var("DATABASE_URL") };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -352,10 +502,19 @@ mod tests {
             assert!(result.is_err());
             assert!(result.err().unwrap().to_string().contains("DATABASE_URL"));
         });
+        unsafe {
+            match original_database_url {
+                Some(value) => env::set_var("DATABASE_URL", value),
+                None => env::remove_var("DATABASE_URL"),
+            }
+        }
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_from_env_fails_without_alpaca_key_id() {
+        let original_database_url = env::var("DATABASE_URL").ok();
+        let original_alpaca_key = env::var("ALPACA_API_KEY_ID").ok();
         unsafe {
             env::set_var("DATABASE_URL", "postgresql://localhost:5432/nonexistent");
             env::remove_var("ALPACA_API_KEY_ID");
@@ -370,7 +529,14 @@ mod tests {
             assert!(result.is_err());
         });
         unsafe {
-            env::remove_var("DATABASE_URL");
+            match original_database_url {
+                Some(value) => env::set_var("DATABASE_URL", value),
+                None => env::remove_var("DATABASE_URL"),
+            }
+            match original_alpaca_key {
+                Some(value) => env::set_var("ALPACA_API_KEY_ID", value),
+                None => env::remove_var("ALPACA_API_KEY_ID"),
+            }
         }
     }
 

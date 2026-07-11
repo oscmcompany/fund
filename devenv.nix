@@ -10,7 +10,6 @@
   runtimeEnv = ''
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
-    export AWS_S3_MODEL_ARTIFACTS_BUCKET_NAME="$AWS_S3_BUCKET_NAME"
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
     if [[ ! -w "''${FUND_LOG_DIR:-/var/log/fund}" ]]; then
       export FUND_LOG_DIR="$HOME/.local/state/fund/log"
