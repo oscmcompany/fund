@@ -92,22 +92,21 @@ impl PipelineError {
 
 /// Run the full prediction pipeline once and persist the result.
 ///
-/// Shared by the HTTP handler and the Postgres event consumer. When a pool is
-/// configured, predictions are inserted into `equity_predictions` and a
-/// `predictions_completed` event is emitted on success; any stage failure emits
-/// `predictions_failed` (with the stage as the reason) so downstream consumers
-/// aren't left waiting. Without a pool, predictions are POSTed to the data
-/// manager as a fallback.
+/// Shared by the HTTP handler and the Postgres event consumer. Predictions are
+/// inserted into `equity_predictions` and a `predictions_completed` event is
+/// emitted on success; any stage failure emits `predictions_errored` (with the
+/// stage as the reason) so downstream consumers aren't left waiting.
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
     let start = Instant::now();
 
+    let pool = state
+        .pool()
+        .ok_or_else(|| PipelineError::new("no_pool", "Database pool required".to_string()))?;
+
     let correlation_id = Uuid::new_v4();
-    let http_client = reqwest::Client::new();
 
-    let result = run_pipeline_and_persist(state, &http_client, correlation_id).await;
+    let result = run_pipeline_and_persist(state, pool, correlation_id).await;
 
-    // Observability lives in structured logs: every run records its duration
-    // and outcome here, and failures additionally carry their pipeline stage.
     info!(
         duration_ms = start.elapsed().as_millis() as u64,
         succeeded = result.is_ok(),
@@ -116,19 +115,17 @@ pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, Pipeline
 
     if let Err(error) = &result {
         error!(stage = error.stage(), error = %error.message(), "Prediction pipeline failed");
-        if let Some(pool) = state.pool() {
-            if let Err(emit_error) = crate::common::events::emit_event(
-                pool,
-                crate::common::events::EventType::EquityPredictionsErrored,
-                &serde_json::json!({
-                    "correlation_id": correlation_id.to_string(),
-                    "reason": error.stage(),
-                }),
-            )
-            .await
-            {
-                warn!(error = %emit_error, "Failed to emit predictions_failed event");
-            }
+        if let Err(emit_error) = crate::common::events::emit_event(
+            pool,
+            crate::common::events::EventType::EquityPredictionsErrored,
+            &serde_json::json!({
+                "correlation_id": correlation_id.to_string(),
+                "reason": error.stage(),
+            }),
+        )
+        .await
+        {
+            warn!(error = %emit_error, "Failed to emit predictions_errored event");
         }
     }
 
@@ -137,33 +134,22 @@ pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, Pipeline
 
 async fn run_pipeline_and_persist(
     state: &AppState,
-    http_client: &reqwest::Client,
+    pool: &sqlx::PgPool,
     correlation_id: Uuid,
 ) -> Result<PredictionRun, PipelineError> {
-    // Inference holds the model lock across the data-fetch awaits, matching the
-    // original handler. The block yields the predictions plus the run id so the
-    // lock is released before persistence.
     let (predictions, model_run_id) = {
         let guard = state.model_state().lock().await;
         let model_state = guard.as_ref().ok_or_else(|| {
             PipelineError::new("model_not_loaded", "Model not loaded".to_string())
         })?;
 
-        let equity_bars = predict::fetch_equity_bars_from_pool_or_service(
-            state.pool(),
-            state.data_manager_base_url(),
-            http_client,
-        )
-        .await
-        .map_err(|e| PipelineError::new("fetch_equity_bars", e.to_string()))?;
+        let equity_bars = predict::fetch_equity_bars(pool)
+            .await
+            .map_err(|e| PipelineError::new("fetch_equity_bars", e.to_string()))?;
 
-        let equity_details = predict::fetch_equity_details_from_pool_or_service(
-            state.pool(),
-            state.data_manager_base_url(),
-            http_client,
-        )
-        .await
-        .map_err(|e| PipelineError::new("fetch_equity_details", e.to_string()))?;
+        let equity_details = predict::fetch_equity_details(pool)
+            .await
+            .map_err(|e| PipelineError::new("fetch_equity_details", e.to_string()))?;
 
         let consolidated = predict::consolidate_data(equity_bars, equity_details)
             .map_err(|e| PipelineError::new("data_consolidation", e.to_string()))?;
@@ -191,43 +177,20 @@ async fn run_pipeline_and_persist(
 
     let row_count = predictions.as_array().map(|array| array.len()).unwrap_or(0);
 
-    if let Some(pool) = state.pool() {
-        if let Some(prediction_array) = predictions.as_array() {
-            let rows =
-                database::insert_predictions(pool, prediction_array, correlation_id, &model_run_id)
-                    .await
-                    .map_err(|e| PipelineError::new("insert_predictions", e.to_string()))?;
-            info!(rows = rows, "Predictions inserted into PostgreSQL");
-            if let Err(e) = crate::common::events::emit_event(
-                pool,
-                crate::common::events::EventType::EquityPredictionsCompleted,
-                &serde_json::json!({"correlation_id": correlation_id.to_string()}),
-            )
-            .await
-            {
-                warn!(error = %e, "Failed to emit predictions_completed event");
-            }
-        }
-    } else {
-        let save_result = http_client
-            .post(format!("{}/predictions", state.data_manager_base_url()))
-            .json(&serde_json::json!({
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-                "data": predictions,
-            }))
-            .send()
-            .await;
-
-        match save_result {
-            Ok(resp) if resp.status().is_success() => {
-                info!("Predictions saved to data manager");
-            }
-            Ok(resp) => {
-                warn!(status = %resp.status(), "Failed to save predictions to data manager");
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to save predictions to data manager");
-            }
+    if let Some(prediction_array) = predictions.as_array() {
+        let rows =
+            database::insert_predictions(pool, prediction_array, correlation_id, &model_run_id)
+                .await
+                .map_err(|e| PipelineError::new("insert_predictions", e.to_string()))?;
+        info!(rows = rows, "Predictions inserted into PostgreSQL");
+        if let Err(e) = crate::common::events::emit_event(
+            pool,
+            crate::common::events::EventType::EquityPredictionsCompleted,
+            &serde_json::json!({"correlation_id": correlation_id.to_string()}),
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to emit predictions_completed event");
         }
     }
 
@@ -368,7 +331,6 @@ mod tests {
             s3_client,
             "test-bucket".to_string(),
             "artifacts/tide/".to_string(),
-            "http://localhost:8080".to_string(),
             "latest".to_string(),
         )
     }
@@ -412,14 +374,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_predictions_without_model_reports_stage() {
+    async fn test_run_predictions_without_pool_reports_stage() {
         // The shared pipeline entrypoint surfaces the failing stage so the
-        // consumer can emit predictions_failed with a meaningful reason.
+        // consumer can emit predictions_errored with a meaningful reason.
         let state = make_test_state();
 
         let result = run_predictions(&state).await;
-        let error = result.err().expect("run must fail without a model");
-        assert_eq!(error.stage(), "model_not_loaded");
+        let error = result.err().expect("run must fail without a pool");
+        assert_eq!(error.stage(), "no_pool");
     }
 
     #[tokio::test]
@@ -478,6 +440,7 @@ mod tests {
         // Stage name strings are stored in structured logs and emitted as event
         // payloads; they must not change.
         let stages = [
+            "no_pool",
             "model_not_loaded",
             "fetch_equity_bars",
             "fetch_equity_details",
@@ -576,17 +539,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_predictions_error_stage_is_model_not_loaded() {
-        // Verifies that the error returned by run_predictions (with no model)
-        // carries the "model_not_loaded" stage string used in structured logs
-        // and event payloads. This exercises the error-logging block in
-        // run_predictions as well as the PipelineError accessors.
+    async fn test_run_predictions_error_stage_is_no_pool() {
+        // Verifies that the error returned by run_predictions (with no pool)
+        // carries the "no_pool" stage string used in structured logs and event
+        // payloads.
         let state = make_test_state();
         let error = run_predictions(&state)
             .await
             .err()
-            .expect("expected an error when no model is loaded");
-        assert_eq!(error.stage(), "model_not_loaded");
+            .expect("expected an error when no pool is configured");
+        assert_eq!(error.stage(), "no_pool");
         assert!(!error.message().is_empty());
     }
 

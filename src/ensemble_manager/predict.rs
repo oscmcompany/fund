@@ -1,5 +1,3 @@
-use std::io::Cursor;
-
 use burn::backend::NdArray;
 use chrono::{Duration, Utc};
 use polars::prelude::*;
@@ -33,98 +31,18 @@ pub enum PredictionError {
     Postprocessing(String),
 }
 
-pub async fn fetch_equity_bars(
-    base_url: &str,
-    http_client: &reqwest::Client,
-) -> Result<DataFrame, PredictionError> {
-    let end_date = Utc::now();
-    let start_date = end_date - Duration::days(70);
-
-    let start_timestamp = start_date.timestamp_millis();
-    let end_timestamp = end_date.timestamp_millis();
-
-    let url = format!(
-        "{base_url}/equity-bars?start_timestamp={start_timestamp}&end_timestamp={end_timestamp}"
-    );
-
-    info!(url = url, "Fetching equity bars");
-
-    let response = http_client
-        .get(&url)
-        .send()
+pub async fn fetch_equity_bars(pool: &PgPool) -> Result<DataFrame, PredictionError> {
+    info!("Fetching equity bars from PostgreSQL");
+    database::query_equity_bars(pool)
         .await
-        .map_err(|e| PredictionError::FetchEquityBars(e.to_string()))?;
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| PredictionError::FetchEquityBars(e.to_string()))?;
-
-    let cursor = Cursor::new(bytes);
-    let data = ParquetReader::new(cursor)
-        .finish()
-        .map_err(|e| PredictionError::FetchEquityBars(e.to_string()))?;
-
-    info!(rows = data.height(), "Equity bars fetched");
-    Ok(data)
+        .map_err(|e| PredictionError::FetchEquityBars(e.to_string()))
 }
 
-pub async fn fetch_equity_details(
-    base_url: &str,
-    http_client: &reqwest::Client,
-) -> Result<DataFrame, PredictionError> {
-    let url = format!("{base_url}/equity-details");
-
-    info!(url = url, "Fetching equity details");
-
-    let response = http_client
-        .get(&url)
-        .send()
+pub async fn fetch_equity_details(pool: &PgPool) -> Result<DataFrame, PredictionError> {
+    info!("Fetching equity details from PostgreSQL");
+    database::query_equity_details(pool)
         .await
-        .map_err(|e| PredictionError::FetchEquityDetails(e.to_string()))?;
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| PredictionError::FetchEquityDetails(e.to_string()))?;
-
-    let cursor = Cursor::new(bytes);
-    let data = CsvReader::new(cursor)
-        .finish()
-        .map_err(|e| PredictionError::FetchEquityDetails(e.to_string()))?;
-
-    info!(rows = data.height(), "Equity details fetched");
-    Ok(data)
-}
-
-pub async fn fetch_equity_bars_from_pool_or_service(
-    pool: Option<&PgPool>,
-    base_url: &str,
-    http_client: &reqwest::Client,
-) -> Result<DataFrame, PredictionError> {
-    if let Some(pool) = pool {
-        info!("Fetching equity bars from PostgreSQL");
-        database::query_equity_bars(pool)
-            .await
-            .map_err(|e| PredictionError::FetchEquityBars(e.to_string()))
-    } else {
-        fetch_equity_bars(base_url, http_client).await
-    }
-}
-
-pub async fn fetch_equity_details_from_pool_or_service(
-    pool: Option<&PgPool>,
-    base_url: &str,
-    http_client: &reqwest::Client,
-) -> Result<DataFrame, PredictionError> {
-    if let Some(pool) = pool {
-        info!("Fetching equity details from PostgreSQL");
-        database::query_equity_details(pool)
-            .await
-            .map_err(|e| PredictionError::FetchEquityDetails(e.to_string()))
-    } else {
-        fetch_equity_details(base_url, http_client).await
-    }
+        .map_err(|e| PredictionError::FetchEquityDetails(e.to_string()))
 }
 
 pub fn consolidate_data(
@@ -1129,121 +1047,5 @@ mod tests {
 
         let result = unscale_and_sort_quantiles(&[], &scaler);
         assert!(result.is_empty());
-    }
-
-    /// Serializes a Polars DataFrame to Parquet bytes in memory.
-    fn dataframe_to_parquet_bytes(mut dataframe: DataFrame) -> Vec<u8> {
-        let mut buffer = Vec::new();
-        polars::prelude::ParquetWriter::new(&mut buffer)
-            .finish(&mut dataframe)
-            .expect("parquet serialization must succeed");
-        buffer
-    }
-
-    #[tokio::test]
-    async fn test_fetch_equity_bars_returns_dataframe_on_valid_parquet_response() {
-        // Build a Parquet payload from a minimal equity bars DataFrame and serve
-        // it from a mock HTTP server. The function must parse it and return a
-        // non-error result.
-        let bars_dataframe = DataFrame::new(vec![
-            Column::new("ticker".into(), vec!["AAPL"]),
-            Column::new("timestamp".into(), vec![1_748_908_800_000i64]),
-            Column::new("open_price".into(), vec![150.0f64]),
-            Column::new("high_price".into(), vec![155.0f64]),
-            Column::new("low_price".into(), vec![149.0f64]),
-            Column::new("close_price".into(), vec![153.0f64]),
-            Column::new("volume".into(), vec![1_000_000i64]),
-            Column::new("volume_weighted_average_price".into(), vec![Some(152.0f64)]),
-            Column::new("sector".into(), vec!["Technology"]),
-            Column::new("industry".into(), vec!["Consumer Electronics"]),
-        ])
-        .unwrap();
-        let parquet_bytes = dataframe_to_parquet_bytes(bars_dataframe);
-
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/octet-stream")
-            .with_body(parquet_bytes)
-            .create_async()
-            .await;
-
-        let http_client = reqwest::Client::new();
-        let result = fetch_equity_bars(&server.url(), &http_client).await;
-
-        mock.assert_async().await;
-        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
-        let dataframe = result.unwrap();
-        assert_eq!(dataframe.height(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_fetch_equity_bars_returns_error_on_invalid_parquet() {
-        // When the server returns bytes that are not valid Parquet, the function
-        // must return a FetchEquityBars error rather than panicking.
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(b"not parquet data".as_ref())
-            .create_async()
-            .await;
-
-        let http_client = reqwest::Client::new();
-        let result = fetch_equity_bars(&server.url(), &http_client).await;
-
-        mock.assert_async().await;
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            PredictionError::FetchEquityBars(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_fetch_equity_details_returns_dataframe_on_valid_csv() {
-        // A minimal CSV payload must be parsed into a DataFrame successfully.
-        let csv_body = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\nGOOG,Technology,Internet\n";
-
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/equity-details")
-            .with_status(200)
-            .with_header("content-type", "text/csv")
-            .with_body(csv_body)
-            .create_async()
-            .await;
-
-        let http_client = reqwest::Client::new();
-        let result = fetch_equity_details(&server.url(), &http_client).await;
-
-        mock.assert_async().await;
-        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
-        let dataframe = result.unwrap();
-        assert_eq!(dataframe.height(), 2);
-        assert!(dataframe.column("ticker").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_fetch_equity_details_returns_ok_on_valid_csv() {
-        // A minimal valid CSV response must parse successfully and return one row.
-        let csv_body = "ticker,sector,industry\nAAPL,Technology,Consumer Electronics\n";
-
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/equity-details")
-            .with_status(200)
-            .with_body(csv_body)
-            .create_async()
-            .await;
-
-        let http_client = reqwest::Client::new();
-        let result = fetch_equity_details(&server.url(), &http_client).await;
-
-        mock.assert_async().await;
-        // A valid CSV response must return Ok.
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().height(), 1);
     }
 }

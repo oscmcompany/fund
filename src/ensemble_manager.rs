@@ -1,6 +1,5 @@
-//! Ensemble model service: loads trained TiDE artifacts from S3, serves
-//! predictions over HTTP, and consumes `predictions_requested` events from the
-//! Postgres event bus.
+//! Ensemble model service: loads trained TiDE artifacts from S3 and consumes
+//! `predictions_requested` events from the Postgres event bus.
 
 pub mod artifact;
 pub mod consumer;
@@ -64,7 +63,6 @@ mod tests {
             make_s3_client(),
             "test-bucket".to_string(),
             "artifacts/tide/".to_string(),
-            "http://localhost:8080".to_string(),
             "latest".to_string(),
         );
         let app = server::create_router(state);

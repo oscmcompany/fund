@@ -132,7 +132,6 @@ mod tests {
         assert_eq!(state.artifact_bucket(), "test-bucket");
         assert_eq!(state.artifact_prefix(), "models/tide/");
         assert_eq!(state.model_version(), "latest");
-        assert!(state.data_manager_base_url().is_empty());
         assert!(state.local_artifact_dir().is_none());
 
         let guard = state.model_state().lock().await;
@@ -164,13 +163,11 @@ mod tests {
             make_s3_client(),
             "test-bucket".to_string(),
             "models/tide/".to_string(),
-            "http://data-manager:8080".to_string(),
             "latest".to_string(),
         );
 
         assert_eq!(state.artifact_bucket(), "test-bucket");
         assert_eq!(state.artifact_prefix(), "models/tide/");
-        assert_eq!(state.data_manager_base_url(), "http://data-manager:8080");
         assert_eq!(state.model_version(), "latest");
         assert!(state.pool().is_none());
         assert!(state.local_artifact_dir().is_none());
@@ -182,7 +179,6 @@ mod tests {
             make_s3_client(),
             "bucket".to_string(),
             "prefix/".to_string(),
-            "http://localhost".to_string(),
             "1.0".to_string(),
         );
 
@@ -196,7 +192,6 @@ mod tests {
             make_s3_client(),
             "bucket".to_string(),
             "prefix/".to_string(),
-            "http://localhost".to_string(),
             "latest".to_string(),
         );
         let cloned = state.clone();
@@ -213,7 +208,6 @@ mod tests {
             make_s3_client(),
             "bucket".to_string(),
             "prefix/".to_string(),
-            "http://localhost".to_string(),
             "latest".to_string(),
         );
         // Accessor must compile and return a reference without panicking.
@@ -285,7 +279,6 @@ pub struct AppState {
     s3_client: aws_sdk_s3::Client,
     artifact_bucket: String,
     artifact_prefix: String,
-    data_manager_base_url: String,
     model_version: String,
     local_artifact_dir: Option<std::path::PathBuf>,
     pool: Option<PgPool>,
@@ -308,10 +301,6 @@ impl AppState {
         &self.artifact_prefix
     }
 
-    pub fn data_manager_base_url(&self) -> &str {
-        &self.data_manager_base_url
-    }
-
     pub fn model_version(&self) -> &str {
         &self.model_version
     }
@@ -330,7 +319,6 @@ impl AppState {
         s3_client: aws_sdk_s3::Client,
         artifact_bucket: String,
         artifact_prefix: String,
-        data_manager_base_url: String,
         model_version: String,
     ) -> Self {
         AppState {
@@ -338,7 +326,6 @@ impl AppState {
             s3_client,
             artifact_bucket,
             artifact_prefix,
-            data_manager_base_url,
             model_version,
             local_artifact_dir: None,
             pool: None,
@@ -366,7 +353,6 @@ impl AppState {
             s3_client,
             artifact_bucket,
             artifact_prefix,
-            data_manager_base_url: String::new(),
             model_version,
             local_artifact_dir,
             pool: Some(pool),
@@ -378,8 +364,6 @@ impl AppState {
             std::env::var("AWS_S3_BUCKET_NAME").unwrap_or_else(|_| "fund-artifacts".to_string());
         let artifact_prefix = std::env::var("AWS_S3_MODEL_ARTIFACT_PATH")
             .unwrap_or_else(|_| "models/tide/".to_string());
-        let data_manager_base_url = std::env::var("FUND_DATA_MANAGER_BASE_URL")
-            .unwrap_or_else(|_| "http://data-manager:8080".to_string());
         let model_version = std::env::var("MODEL_VERSION").unwrap_or_else(|_| "latest".to_string());
         let local_artifact_dir = std::env::var("FUND_LOCAL_ARTIFACT_DIR")
             .ok()
@@ -394,7 +378,6 @@ impl AppState {
             s3_client,
             artifact_bucket,
             artifact_prefix,
-            data_manager_base_url,
             model_version,
             local_artifact_dir,
             pool,
