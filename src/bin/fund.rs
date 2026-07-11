@@ -45,8 +45,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _span = tracing::info_span!("ensemble_manager").entered();
         let state =
             fund::ensemble_manager::state::AppState::with_pool(pool.clone(), s3_client.clone());
-        fund::ensemble_manager::server::poll_artifact_once(&state).await;
-        tokio::spawn(fund::ensemble_manager::server::start_artifact_polling(
+        fund::ensemble_manager::pipeline::poll_artifact_once(&state).await;
+        tokio::spawn(fund::ensemble_manager::pipeline::start_artifact_polling(
             state.clone(),
         ));
         fund::ensemble_manager::consumer::spawn_event_consumer(state);

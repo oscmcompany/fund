@@ -3,11 +3,6 @@ use crate::data_manager::database;
 use crate::data_manager::state::State;
 use crate::domain::market::Ticker;
 use aws_sdk_s3::primitives::ByteStream;
-use axum::{
-    extract::{Json, State as AxumState},
-    http::StatusCode,
-    response::IntoResponse,
-};
 use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::ParquetWriter;
 use serde::Deserialize;
@@ -331,35 +326,6 @@ pub async fn backfill(
     );
 
     Ok(summary)
-}
-
-pub async fn sync(
-    AxumState(state): AxumState<State>,
-    Json(payload): Json<DailySync>,
-) -> impl IntoResponse {
-    info!("Sync date: {}", payload.date);
-
-    let Some(trading_date) = TradingDate::from_naive_date(payload.date.date_naive()) else {
-        info!("Skipping weekend date: {}", payload.date.format("%Y-%m-%d"));
-        return (
-            StatusCode::OK,
-            "Skipping weekend, no trading data available",
-        )
-            .into_response();
-    };
-
-    match fetch_and_store_equity_bars(&state, &trading_date).await {
-        Ok(Some(bar_count)) => {
-            let response_message = format!("Data synced: {} bars stored", bar_count);
-            (StatusCode::OK, response_message).into_response()
-        }
-        Ok(None) => (
-            StatusCode::NO_CONTENT,
-            "No market data available for this date",
-        )
-            .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-    }
 }
 
 #[cfg(test)]
