@@ -16,7 +16,7 @@ use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
     CONSUMER_ENSEMBLE_MANAGER,
 };
-use crate::ensemble_manager::server::run_predictions;
+use crate::ensemble_manager::pipeline::run_predictions;
 use crate::ensemble_manager::state::AppState;
 
 /// Spawn the event consumer if a database pool is configured.

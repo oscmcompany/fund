@@ -1,6 +1,6 @@
 //! Shared service infrastructure: observability, AWS clients, database pools,
-//! HTTP serving, and the PostgreSQL event bus. Deduplicates the bootstrap code
-//! common to every service.
+//! and the PostgreSQL event bus. Deduplicates the bootstrap code common to
+//! every module.
 
 pub mod alpaca;
 pub mod aws;
@@ -9,4 +9,3 @@ pub mod database;
 pub mod events;
 pub mod market_hours;
 pub mod observability;
-pub mod server;

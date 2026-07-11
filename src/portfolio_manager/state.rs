@@ -90,7 +90,7 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
     }
 }
 
-/// Shared state injected into every Axum handler via `axum::Extension`.
+/// Shared application state for the portfolio manager module.
 ///
 /// Constructed once at startup via `from_env()`. A value of this type proves
 /// that the database pool, Alpaca credentials, and portfolio constraints are

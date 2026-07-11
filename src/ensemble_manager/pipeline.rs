@@ -1,11 +1,5 @@
 use std::time::Instant;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
-use axum::routing::{get, post};
-use axum::Router;
-use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -13,31 +7,6 @@ use crate::ensemble_manager::artifact;
 use crate::ensemble_manager::database;
 use crate::ensemble_manager::predict;
 use crate::ensemble_manager::state::AppState;
-
-pub fn create_router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/predictions", post(predictions))
-        .with_state(state)
-        .layer(TraceLayer::new_for_http())
-}
-
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let model_loaded = state.model_state().lock().await.is_some();
-
-    let status = if model_loaded {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    let body = serde_json::json!({
-        "status": if model_loaded { "healthy" } else { "unhealthy" },
-        "model_loaded": model_loaded,
-    });
-
-    (status, Json(body))
-}
 
 /// Successful outcome of a prediction run.
 pub struct PredictionRun {
@@ -92,10 +61,11 @@ impl PipelineError {
 
 /// Run the full prediction pipeline once and persist the result.
 ///
-/// Shared by the HTTP handler and the Postgres event consumer. Predictions are
-/// inserted into `equity_predictions` and a `predictions_completed` event is
-/// emitted on success; any stage failure emits `predictions_errored` (with the
-/// stage as the reason) so downstream consumers aren't left waiting.
+/// Shared by the consolidated `fund` binary and the Postgres event consumer.
+/// Predictions are inserted into `equity_predictions` and a
+/// `predictions_completed` event is emitted on success; any stage failure emits
+/// `predictions_errored` (with the stage as the reason) so downstream consumers
+/// aren't left waiting.
 pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, PipelineError> {
     let start = Instant::now();
 
@@ -208,26 +178,6 @@ async fn run_pipeline_and_persist(
     Ok(PredictionRun::new(predictions, row_count))
 }
 
-async fn predictions(State(state): State<AppState>) -> impl IntoResponse {
-    let start = Instant::now();
-    info!("Prediction request received");
-
-    let response = match run_predictions(&state).await {
-        Ok(run) => (StatusCode::OK, Json(run.into_predictions())),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": error.message()})),
-        ),
-    };
-
-    info!(
-        duration_ms = start.elapsed().as_millis(),
-        "Prediction request complete"
-    );
-
-    response
-}
-
 /// Resolve the latest artifact and load it if it differs from the current
 /// model, recording training lineage in `model_runs`. Called once at startup
 /// (before the event consumer spawns, so a catch-up run has a model to use)
@@ -326,9 +276,6 @@ pub async fn start_artifact_polling(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
 
     fn make_test_state() -> AppState {
         let s3_client = {
@@ -347,71 +294,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_health_no_model() {
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_endpoint_removed() {
-        // Prometheus was dropped from this service entirely; observability
-        // lives in structured logs. The route must no longer exist.
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
     async fn test_run_predictions_without_pool_reports_stage() {
-        // The shared pipeline entrypoint surfaces the failing stage so the
-        // consumer can emit predictions_errored with a meaningful reason.
         let state = make_test_state();
 
         let result = run_predictions(&state).await;
         let error = result.err().expect("run must fail without a pool");
         assert_eq!(error.stage(), "no_pool");
-    }
-
-    #[tokio::test]
-    async fn test_predictions_no_model() {
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/predictions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -448,8 +336,6 @@ mod tests {
 
     #[test]
     fn test_pipeline_error_stage_strings_are_stable() {
-        // Stage name strings are stored in structured logs and emitted as event
-        // payloads; they must not change.
         let stages = [
             "no_pool",
             "model_not_loaded",
@@ -466,47 +352,6 @@ mod tests {
             let error = PipelineError::new(stage, String::new());
             assert_eq!(error.stage(), stage);
         }
-    }
-
-    #[tokio::test]
-    async fn test_health_response_body_no_model() {
-        use axum::body::to_bytes;
-
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["status"], "unhealthy");
-        assert_eq!(body["model_loaded"], false);
-    }
-
-    #[tokio::test]
-    async fn test_unknown_route_returns_404() {
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -551,9 +396,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_predictions_error_stage_is_no_pool() {
-        // Verifies that the error returned by run_predictions (with no pool)
-        // carries the "no_pool" stage string used in structured logs and event
-        // payloads.
         let state = make_test_state();
         let error = run_predictions(&state)
             .await
@@ -561,29 +403,5 @@ mod tests {
             .expect("expected an error when no pool is configured");
         assert_eq!(error.stage(), "no_pool");
         assert!(!error.message().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_predictions_endpoint_returns_json_error_body() {
-        use axum::body::to_bytes;
-
-        let state = make_test_state();
-        let app = create_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/predictions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert!(body.get("error").is_some());
     }
 }

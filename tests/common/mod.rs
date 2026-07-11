@@ -2,11 +2,9 @@
 
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
-use axum::Router;
-use std::{net::SocketAddr, sync::OnceLock, time::Duration};
+use std::{sync::OnceLock, time::Duration};
 use testcontainers::{runners::AsyncRunner, ContainerAsync};
 use testcontainers_modules::localstack::LocalStack;
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 const TEST_BUCKET: &str = "test-bucket";
 const TEST_ACCESS_KEY: &str = "test";
@@ -199,70 +197,4 @@ pub async fn put_test_object(s3_client: &S3Client, key: &str, bytes: Vec<u8>) {
 
 pub fn test_bucket_name() -> String {
     TEST_BUCKET.to_string()
-}
-
-pub struct SpawnedAppServer {
-    pub base_url: String,
-    shutdown_sender: Option<oneshot::Sender<()>>,
-    server_handle: Option<JoinHandle<()>>,
-}
-
-impl SpawnedAppServer {
-    pub async fn start(app: Router) -> Self {
-        initialize_test_tracing();
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_address = listener.local_addr().unwrap();
-        let base_url = format!("http://{}", local_address);
-
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
-
-        let server_handle = tokio::spawn(async move {
-            let server = axum::serve(listener, app);
-            tokio::select! {
-                _ = server => {}
-                _ = shutdown_receiver => {}
-            }
-        });
-
-        wait_for_server_start(local_address).await;
-
-        Self {
-            base_url,
-            shutdown_sender: Some(shutdown_sender),
-            server_handle: Some(server_handle),
-        }
-    }
-
-    pub fn url(&self, path: &str) -> String {
-        if path.starts_with('/') {
-            format!("{}{}", self.base_url, path)
-        } else {
-            format!("{}/{}", self.base_url, path)
-        }
-    }
-}
-
-impl Drop for SpawnedAppServer {
-    fn drop(&mut self) {
-        if let Some(shutdown_sender) = self.shutdown_sender.take() {
-            let _ = shutdown_sender.send(());
-        }
-
-        if let Some(server_handle) = self.server_handle.take() {
-            server_handle.abort();
-        }
-    }
-}
-
-async fn wait_for_server_start(address: SocketAddr) {
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(address).await.is_ok() {
-            return;
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    panic!("Server did not start listening on {}", address);
 }

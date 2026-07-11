@@ -199,7 +199,7 @@ in {
   ];
 
   # database:create   — apply the schema (idempotent DDL).
-  # database:backfill — populate equity bars via data-manager API.
+  # database:backfill — populate equity bars in S3 via the backfill binary.
   # database:restore  — fast recovery from a nightly S3 dump when schema has not changed.
   # database:reset    — drop and recreate the empty fund database; run before database:create
   #                     after a breaking schema change.
@@ -245,40 +245,13 @@ in {
 
     END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
 
-    echo "Waiting for data-manager to be healthy..."
-    attempt=0
-    max_attempts=30
-    while ! curl -sf http://localhost:8080/health > /dev/null 2>&1; do
-      attempt=$((attempt + 1))
-      if [ "$attempt" -ge "$max_attempts" ]; then
-        echo "data-manager did not become healthy after $((max_attempts * 2)) seconds"
-        exit 1
-      fi
-      sleep 2
-    done
-    echo "Data-manager is healthy"
-
-    echo "Fetching equity bars from $BACKFILL_START_DATE to $END_DATE"
-    current_date="$BACKFILL_START_DATE"
-    end_date_numeric="$(printf '%s' "$END_DATE" | tr -d '-')"
-    request_count=0
-    while [ "$(printf '%s' "$current_date" | tr -d '-')" -le "$end_date_numeric" ]; do
-      request_count=$((request_count + 1))
-      date_string="''${current_date}T12:00:00Z"
-      echo "Syncing equity bars for $current_date (request $request_count)"
-      status_code=$(curl -s -o /dev/null -w "%{http_code}" \
-        -X POST http://localhost:8080/equity-bars \
-        -H "Content-Type: application/json" \
-        -d "{\"date\": \"''${date_string}\"}" \
-        --max-time 60)
-      echo "Status: $status_code"
-      if [ "$status_code" -ge 400 ]; then
-        echo "Warning: request for $current_date returned HTTP $status_code"
-      fi
-      current_date=$(date -d "$current_date +1 day" +%Y-%m-%d 2>/dev/null \
-        || date -jf "%Y-%m-%d" "$current_date" -v+1d +%Y-%m-%d)
-    done
-    echo "All dates processed ($request_count requests)"
+    # Fetches grouped daily bars from Massive and writes them to S3 as
+    # Hive-partitioned Parquet. The fund binary's scheduler populates the
+    # PostgreSQL rolling buffer automatically on startup.
+    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
+    ${runtimeEnv}
+    secretspec run -- cargo run --no-default-features --features data_manager --bin backfill -- \
+      "$BACKFILL_START_DATE" "$END_DATE"
   '';
 
   scripts.reset-database.exec = ''
@@ -521,8 +494,8 @@ in {
       ${applySchema}
     '';
 
-    # Backfills equity bars into PostgreSQL via the data-manager API. Requires
-    # data-manager to be running. Use after database:create on a fresh VM.
+    # Backfills equity bars to S3 Parquet via the backfill binary. The fund
+    # binary's scheduler populates PostgreSQL automatically on startup.
     "database:backfill".exec = "fetch-database-equity-bars";
 
     "checks:base" = {
@@ -564,67 +537,22 @@ in {
       MODEL_VERSION = "latest";
     };
 
-    scripts.cleanup-application-services.exec = ''
-      for PORT in 8080 8082 8083; do
-        PID=$(lsof -ti tcp:$PORT 2>/dev/null || true)
-        if [ -n "$PID" ]; then
-          echo "Killing stale process on port $PORT (PID $PID)"
-          kill $PID 2>/dev/null || true
+    processes.fund.exec = ''
+      set -euo pipefail
+      ${runtimeEnv}
+      attempt=0
+      max_attempts=90
+      while ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "PostgreSQL (fund database) did not become ready after $((max_attempts * 2)) seconds"
+          exit 1
         fi
+        sleep 2
       done
-      sleep 1
+      ${applySchema}
+      exec secretspec run -- cargo run --release --bin fund
     '';
-
-    processes = let
-      killPort = port: ''
-        STALE_PID=$(lsof -ti tcp:${port} 2>/dev/null || true)
-        if [ -n "$STALE_PID" ]; then
-          echo "Killing stale process on port ${port} (PID $STALE_PID)"
-          kill $STALE_PID 2>/dev/null || true
-          sleep 1
-        fi
-      '';
-
-      waitForPostgres = ''
-        attempt=0
-        max_attempts=90
-        while ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; do
-          attempt=$((attempt + 1))
-          if [ "$attempt" -ge "$max_attempts" ]; then
-            echo "PostgreSQL (fund database) did not become ready after $((max_attempts * 2)) seconds"
-            exit 1
-          fi
-          sleep 2
-        done
-      '';
-    in {
-      data-manager.exec = ''
-        set -euo pipefail
-        ${runtimeEnv}
-        ${waitForPostgres}
-        ${applySchema}
-        ${killPort "8080"}
-        exec secretspec run -- cargo run --release --bin data_manager
-      '';
-
-      # ensemble_manager: serves predictions over HTTP and consumes
-      # predictions_requested from the Postgres event bus.
-      ensemble-manager.exec = ''
-        set -euo pipefail
-        ${runtimeEnv}
-        ${waitForPostgres}
-        ${killPort "8082"}
-        exec secretspec run -- cargo run --release --bin ensemble_manager
-      '';
-
-      portfolio-manager.exec = ''
-        set -euo pipefail
-        ${runtimeEnv}
-        ${waitForPostgres}
-        ${killPort "8083"}
-        exec secretspec run -- cargo run --release --bin portfolio_manager
-      '';
-    };
   };
 
   profiles.trainer.module = {
@@ -647,10 +575,8 @@ in {
       echo "    devenv --profile trainer shell     Model training environment"
       echo ""
       echo "  Services (application profile):"
-      echo "    Data Manager:      localhost:8080"
-      echo "    Ensemble Manager:  localhost:8082"
-      echo "    Portfolio Manager: localhost:8083"
-      echo "    PostgreSQL:        localhost:5432/fund"
+      echo "    Fund:         consolidated event-driven binary"
+      echo "    PostgreSQL:   localhost:5432/fund"
       echo ""
       echo "  Secrets (secretspec):"
       echo "    secretspec check          Validate production secrets"
@@ -670,7 +596,7 @@ in {
       echo "    checks:nix                     Nix checks (alejandra + statix)"
       echo "    database:connect               Open interactive psql session"
       echo "    database:create                Apply schema (idempotent, safe to re-run)"
-      echo "    database:backfill              Backfill equity bars into PostgreSQL (requires data-manager running, BACKFILL_START_DATE)"
+      echo "    database:backfill              Backfill equity bars to S3 Parquet (requires BACKFILL_START_DATE)"
       echo "    database:reset                 Drop and recreate the empty fund database"
       echo "                                   (run before database:create after a breaking schema change)"
       echo "    database:restore               Restore from nightly S3 dump (fast recovery, schema must match)"
