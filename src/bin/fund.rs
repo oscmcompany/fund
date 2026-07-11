@@ -31,16 +31,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let s3_client = fund::common::aws::s3_client().await;
 
     // --- data_manager ---
-    let data_manager_state = {
+    {
         let _span = tracing::info_span!("data_manager").entered();
         let state = fund::data_manager::state::State::with_pool(pool.clone(), s3_client.clone());
         fund::data_manager::startup::migrate_equity_details(&state).await;
         fund::data_manager::scheduler::spawn_sync_scheduler(state.clone());
         fund::data_manager::equity_quotes::spawn_quote_stream(state.clone());
         info!("Data manager started");
-        state
-    };
-    let _ = data_manager_state;
+    }
 
     // --- ensemble_manager ---
     {

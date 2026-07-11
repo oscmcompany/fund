@@ -38,6 +38,11 @@ name = "dashboard_service"
 path = "src/bin/dashboard_service.rs"
 required-features = ["dashboard_service"]
 
+[[bin]]
+name = "fund"
+path = "src/bin/fund.rs"
+required-features = ["data_manager", "ensemble_manager", "portfolio_manager"]
+
 [features]
 default = ["data_manager", "ensemble_manager", "portfolio_manager"]
 data_manager = [
