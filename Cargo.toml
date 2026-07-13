@@ -90,7 +90,7 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # data-only (optional; enabled by the `data` feature)
 chrono-tz = { version = "0.10", optional = true }
-tokio-tungstenite = { version = "0.26", features = [
+tokio-tungstenite = { version = "0.30", features = [
   "rustls-tls-native-roots",
 ], optional = true }
 futures-util = { version = "0.3", optional = true }
