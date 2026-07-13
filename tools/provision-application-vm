@@ -4,34 +4,43 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # provision-application-vm -- Provision a fund application VM on exe.dev
 #
-# Run locally: bash tools/provision-application-vm [--production]
+# Run locally: bash tools/provision-application-vm --environment <development|production>
 # --------------------------------------------------------------------------- #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 VM_ROLE="application"
 PRODUCTION=false
+ENVIRONMENT=""
 
 usage() {
-  echo "Usage: $(basename "$0") [--production]"
+  echo "Usage: $(basename "$0") --environment <development|production>"
   echo ""
   echo "Provision an oscm-fund application VM on exe.dev."
-  echo "Runs the consolidated fund binary (data, inference, and portfolio services)"
-  echo "under devenv --profile application."
+  echo "Runs the data, inference, and portfolio services under devenv --profile application."
   echo ""
   echo "Options:"
-  echo "  --production    Provision as a production VM (default: development)"
+  echo "  --environment   Required. Either 'development' or 'production'."
   echo "  -h, --help      Show this help message"
   exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --production) PRODUCTION=true; shift ;;
+    --environment)
+      [[ -z "${2:-}" ]] && { echo "Error: --environment requires a value" >&2; usage 1; }
+      ENVIRONMENT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "Error: unknown option '$1'" >&2; usage 1 ;;
   esac
 done
+
+case "$ENVIRONMENT" in
+  production) PRODUCTION=true ;;
+  development) PRODUCTION=false ;;
+  "") echo "Error: --environment is required" >&2; usage 1 ;;
+  *) echo "Error: --environment must be 'development' or 'production', got '$ENVIRONMENT'" >&2; usage 1 ;;
+esac
 
 # shellcheck source=provision-common-vm
 source "$SCRIPT_DIR/provision-common-vm"

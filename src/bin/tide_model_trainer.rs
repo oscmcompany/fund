@@ -41,7 +41,7 @@ const DRIFT_DEGRADATION_THRESHOLD: f64 = 0.20;
 
 #[tokio::main]
 async fn main() {
-    let _tracing_guard = init_tracing("tide-model-trainer.log", Some("info"));
+    let _tracing_guard = init_tracing("tide-model-trainer.log", Some("info"), "tide-model-trainer");
     if let Err(error) = run().await {
         error!("Training failed: {}", error);
         eprintln!("Training failed: {}", error);

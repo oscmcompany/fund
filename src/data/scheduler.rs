@@ -100,8 +100,8 @@ async fn sync_loop(state: State) {
     loop {
         let wait_duration = duration_until_next_sync(Utc::now());
         info!(
-            "Waiting for next equity bar sync, seconds_until_sync: {}",
-            wait_duration.as_secs()
+            seconds = wait_duration.as_secs(),
+            "Waiting for next equity bar sync"
         );
         sleep(wait_duration).await;
 
@@ -112,14 +112,14 @@ async fn sync_loop(state: State) {
 
         match run_equity_bar_sync(&state).await {
             Ok(Some(bar_count)) => {
-                info!("Equity bar sync completed, bar_count: {}", bar_count);
+                info!(rows = bar_count, "Equity bar sync completed");
                 state.mark_synced();
             }
             Ok(None) => {
                 info!("No equity bar data available for scheduled sync");
             }
             Err(error) => {
-                error!("Equity bar sync failed: {}", error);
+                error!(error = %error, "Equity bar sync failed");
             }
         }
     }
@@ -246,12 +246,12 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
     )
     .await
     {
-        warn!("Failed to emit equity_bars_sync_started: {}", error);
+        warn!(error = %error, "Failed to emit equity_bars_sync_started");
     }
 
     match run_equity_bar_sync(state).await {
         Ok(Some(bar_count)) => {
-            info!("Equity bar sync completed, bar_count: {}", bar_count);
+            info!(rows = bar_count, "Equity bar sync completed");
             if let Err(error) = emit_event(
                 pool,
                 EventType::EquityBarsSyncCompleted,
@@ -259,7 +259,7 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             )
             .await
             {
-                warn!("Failed to emit equity_bars_sync_completed: {}", error);
+                warn!(error = %error, "Failed to emit equity_bars_sync_completed");
             }
             state.mark_synced();
         }
@@ -272,11 +272,11 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             )
             .await
             {
-                warn!("Failed to emit equity_bars_sync_completed: {}", error);
+                warn!(error = %error, "Failed to emit equity_bars_sync_completed");
             }
         }
         Err(ref error) => {
-            error!("Equity bar sync errored: {}", error);
+            error!(error = %error, "Equity bar sync errored");
             if let Err(emit_error) = emit_event(
                 pool,
                 EventType::EquityBarsSyncErrored,
@@ -284,17 +284,14 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             )
             .await
             {
-                warn!("Failed to emit equity_bars_sync_errored: {}", emit_error);
+                warn!(error = %emit_error, "Failed to emit equity_bars_sync_errored");
             }
         }
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC, event_id).await
     {
-        warn!(
-            "Failed to update equity-bars-sync consumer offset: {}",
-            error
-        );
+        warn!(error = %error, "Failed to update equity-bars-sync consumer offset");
     }
 }
 
@@ -312,12 +309,12 @@ async fn handle_equity_bars_export(
     )
     .await
     {
-        warn!("Failed to emit equity_bars_export_started: {}", error);
+        warn!(error = %error, "Failed to emit equity_bars_export_started");
     }
 
     match run_export_job(state, "export-equity-bars", export_date).await {
         Ok(count) => {
-            info!("Equity bars export completed, count: {}", count);
+            info!(rows = count, "Equity bars export completed");
             if let Err(error) = emit_event(
                 pool,
                 EventType::EquityBarsExportCompleted,
@@ -325,11 +322,11 @@ async fn handle_equity_bars_export(
             )
             .await
             {
-                warn!("Failed to emit equity_bars_export_completed: {}", error);
+                warn!(error = %error, "Failed to emit equity_bars_export_completed");
             }
         }
         Err(ref error) => {
-            error!("Equity bars export errored: {}", error);
+            error!(error = %error, "Equity bars export errored");
             if let Err(emit_error) = emit_event(
                 pool,
                 EventType::EquityBarsExportErrored,
@@ -337,7 +334,7 @@ async fn handle_equity_bars_export(
             )
             .await
             {
-                warn!("Failed to emit equity_bars_export_errored: {}", emit_error);
+                warn!(error = %emit_error, "Failed to emit equity_bars_export_errored");
             }
         }
     }
@@ -345,10 +342,7 @@ async fn handle_equity_bars_export(
     if let Err(error) =
         update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_EXPORT, event_id).await
     {
-        warn!(
-            "Failed to update equity-bars-export consumer offset: {}",
-            error
-        );
+        warn!(error = %error, "Failed to update equity-bars-export consumer offset");
     }
 }
 
@@ -366,12 +360,12 @@ async fn handle_trading_history_export(
     )
     .await
     {
-        warn!("Failed to emit trading_history_export_started: {}", error);
+        warn!(error = %error, "Failed to emit trading_history_export_started");
     }
 
     match run_export_job(state, "export-trading-history", export_date).await {
         Ok(count) => {
-            info!("Trading history export completed, count: {}", count);
+            info!(rows = count, "Trading history export completed");
             if let Err(error) = emit_event(
                 pool,
                 EventType::TradingHistoryExportCompleted,
@@ -379,11 +373,11 @@ async fn handle_trading_history_export(
             )
             .await
             {
-                warn!("Failed to emit trading_history_export_completed: {}", error);
+                warn!(error = %error, "Failed to emit trading_history_export_completed");
             }
         }
         Err(ref error) => {
-            error!("Trading history export errored: {}", error);
+            error!(error = %error, "Trading history export errored");
             if let Err(emit_error) = emit_event(
                 pool,
                 EventType::TradingHistoryExportErrored,
@@ -391,10 +385,7 @@ async fn handle_trading_history_export(
             )
             .await
             {
-                warn!(
-                    "Failed to emit trading_history_export_errored: {}",
-                    emit_error
-                );
+                warn!(error = %emit_error, "Failed to emit trading_history_export_errored");
             }
         }
     }
@@ -402,10 +393,7 @@ async fn handle_trading_history_export(
     if let Err(error) =
         update_consumer_offset(pool, CONSUMER_DATA_TRADING_HISTORY_EXPORT, event_id).await
     {
-        warn!(
-            "Failed to update trading-history-export consumer offset: {}",
-            error
-        );
+        warn!(error = %error, "Failed to update trading-history-export consumer offset");
     }
 }
 
@@ -417,12 +405,12 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
     )
     .await
     {
-        warn!("Failed to emit database_backup_started: {}", error);
+        warn!(error = %error, "Failed to emit database_backup_started");
     }
 
     match run_backup_job(state).await {
         Ok(byte_count) => {
-            info!("Database backup completed, byte_count: {}", byte_count);
+            info!(bytes = byte_count, "Database backup completed");
             if let Err(error) = emit_event(
                 pool,
                 EventType::DatabaseBackupCompleted,
@@ -430,11 +418,11 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             )
             .await
             {
-                warn!("Failed to emit database_backup_completed: {}", error);
+                warn!(error = %error, "Failed to emit database_backup_completed");
             }
         }
         Err(ref error) => {
-            error!("Database backup errored: {}", error);
+            error!(error = %error, "Database backup errored");
             if let Err(emit_error) = emit_event(
                 pool,
                 EventType::DatabaseBackupErrored,
@@ -442,17 +430,14 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             )
             .await
             {
-                warn!("Failed to emit database_backup_errored: {}", emit_error);
+                warn!(error = %emit_error, "Failed to emit database_backup_errored");
             }
         }
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP, event_id).await
     {
-        warn!(
-            "Failed to update database-backup consumer offset: {}",
-            error
-        );
+        warn!(error = %error, "Failed to update database-backup consumer offset");
     }
 }
 
@@ -488,7 +473,7 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     let backup_key = std::env::var("AWS_S3_DATABASE_BACKUP_KEY")
         .unwrap_or_else(|_| "database/backups/fund-latest.dump.gz".to_string());
 
-    info!("Starting database backup to {}", backup_key);
+    info!(key = backup_key, "Starting database backup");
 
     let dump_path = "/tmp/fund-backup.dump";
     let dump_gz_path = "/tmp/fund-backup.dump.gz";
@@ -558,8 +543,9 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     let _ = tokio::fs::remove_file(dump_gz_path).await;
 
     info!(
-        "Database backup uploaded, byte_count: {}, key: {}",
-        byte_count, backup_key
+        bytes = byte_count,
+        key = backup_key,
+        "Database backup uploaded"
     );
     Ok(byte_count)
 }

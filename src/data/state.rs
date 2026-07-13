@@ -118,24 +118,24 @@ impl State {
             .region()
             .map(|r| r.as_ref().to_string())
             .unwrap_or_else(|| "not configured".to_string());
-        info!("AWS region: {}", region);
+        info!(region = region, "AWS region configured");
 
         let s3_client = S3Client::new(&config);
 
         let bucket_name = std::env::var("AWS_S3_BUCKET_NAME")
             .expect("AWS_S3_BUCKET_NAME environment variable must be set");
-        info!("Using S3 bucket: {}", bucket_name);
+        info!(bucket = bucket_name, "S3 bucket configured");
 
         let massive_base_url = std::env::var("MASSIVE_BASE_URL")
             .expect("MASSIVE_BASE_URL environment variable must be set");
-        info!("Using Massive API base URL: {}", massive_base_url);
+        info!(url = massive_base_url, "Massive API configured");
 
         let massive_api_key = std::env::var("MASSIVE_API_KEY")
             .expect("MASSIVE_API_KEY environment variable must be set");
 
         let alpaca_credentials = AlpacaCredentials::from_env();
         if let Some(ref credentials) = alpaca_credentials {
-            info!("Using Alpaca feed: {}", credentials.feed());
+            info!(feed = credentials.feed(), "Alpaca feed configured");
         } else {
             info!("Alpaca credentials not configured");
         }
@@ -149,7 +149,7 @@ impl State {
                         DatabaseState::Connected(pool)
                     }
                     Err(error) => {
-                        warn!("Failed to connect to PostgreSQL: {}", error);
+                        warn!(error = %error, "Failed to connect to PostgreSQL");
                         DatabaseState::ConnectFailed
                     }
                 }

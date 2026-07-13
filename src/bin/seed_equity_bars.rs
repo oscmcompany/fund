@@ -131,7 +131,11 @@ fn parse_arguments(arguments: &[String]) -> Result<Arguments, String> {
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
 
-    let _tracing_guard = init_tracing("seed-equity-bars-errors.log", Some("warn"));
+    let _tracing_guard = init_tracing(
+        "seed-equity-bars-errors.log",
+        Some("warn"),
+        "seed-equity-bars",
+    );
 
     let raw_arguments: Vec<String> = std::env::args().skip(1).collect();
     let arguments = match parse_arguments(&raw_arguments) {

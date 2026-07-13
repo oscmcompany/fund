@@ -38,7 +38,7 @@ const POOL_MAX_CONNECTIONS: u32 = 4;
 ///
 /// Panics on startup if `DATABASE_URL` is unset or the database is unreachable.
 pub async fn run() {
-    let _tracing_guard = init_tracing_file_only("dashboard-service.log");
+    let _tracing_guard = init_tracing_file_only("dashboard-service.log", "dashboard");
     info!("Starting dashboard service");
 
     let database_url =

@@ -114,7 +114,7 @@ async fn write_equity_bars_to_s3(
         .await
         .map_err(|error| format!("Failed to upload to S3: {}", error))?;
 
-    info!("Wrote equity bars Parquet to S3: {}", key);
+    info!(key = key, "Wrote equity bars Parquet to S3");
     Ok(())
 }
 
@@ -157,10 +157,7 @@ async fn fetch_equity_bars_for_date(
             "Failed to send API request".to_string()
         })?;
 
-    info!(
-        "Received response from Massive API, status: {}",
-        response.status()
-    );
+    info!(status = %response.status(), "Received response from Massive API");
 
     let text_content = response
         .error_for_status()
@@ -175,23 +172,23 @@ async fn fetch_equity_bars_for_date(
         .text()
         .await
         .map_err(|err| {
-            warn!("Failed to read response text: {}", err);
+            warn!(error = %err, "Failed to read response text");
             "Failed to read API response".to_string()
         })?;
 
-    info!(
-        "Received response body, length: {} bytes",
-        text_content.len()
-    );
+    info!(bytes = text_content.len(), "Received response body");
 
     let massive_response: MassiveResponse = serde_json::from_str(&text_content).map_err(|err| {
-        warn!("Failed to parse JSON response: {}", err);
+        warn!(error = %err, "Failed to parse JSON response");
         let truncated: String = text_content.chars().take(500).collect();
-        warn!("Raw response (first 500 chars): {}", truncated);
+        warn!(response = truncated, "Raw response preview");
         "Invalid JSON response from API".to_string()
     })?;
 
-    info!("API results count: {}", massive_response.results_count);
+    info!(
+        rows = massive_response.results_count,
+        "Massive API results received"
+    );
 
     let Some(results) = massive_response.results else {
         warn!("No results field in API response");
@@ -211,9 +208,9 @@ async fn fetch_equity_bars_for_date(
         .collect();
 
     debug!(
-        "Converted {}/{} results to valid equity bars",
-        equity_bars.len(),
-        raw_count
+        rows = equity_bars.len(),
+        total = raw_count,
+        "Converted results to valid equity bars"
     );
 
     Ok(Some(equity_bars))
@@ -233,13 +230,13 @@ pub async fn fetch_and_store_equity_bars(
         database::insert_equity_bars(pool, &equity_bars)
             .await
             .map_err(|error| {
-                warn!("Failed to write equity bars to PostgreSQL: {}", error);
+                warn!(error = %error, "Failed to write equity bars to PostgreSQL");
                 format!("Failed to insert equity bars: {}", error)
             })?;
     }
 
     if let Err(error) = write_equity_bars_to_s3(state, trading_date, &equity_bars).await {
-        warn!("Failed to write equity bars to S3: {}", error);
+        warn!(error = %error, "Failed to write equity bars to S3");
     }
 
     Ok(Some(equity_bars.len()))
@@ -514,11 +511,11 @@ pub async fn seed(
                     Ok(bar_count) => {
                         summary.days_processed += 1;
                         summary.total_bars += bar_count;
-                        info!("Seeded {} bars for {}", bar_count, date.format("%Y-%m-%d"));
+                        info!(rows = bar_count, date = %date.format("%Y-%m-%d"), "Seeded equity bars");
                     }
                     Err(error) => {
                         summary.days_failed += 1;
-                        warn!("Failed to seed {}: {}", date.format("%Y-%m-%d"), error);
+                        warn!(date = %date.format("%Y-%m-%d"), error = %error, "Failed to seed equity bars");
                     }
                 }
             }

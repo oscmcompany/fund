@@ -76,8 +76,8 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Erro
 
     if rejected_rows > 0 {
         warn!(
-            "Discarded {} row(s) with invalid ticker symbols while parsing equity details CSV",
-            rejected_rows
+            rows = rejected_rows,
+            "Discarded rows with invalid ticker symbols"
         );
     }
 
@@ -87,7 +87,10 @@ fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Erro
 /// Parses the compile-time-embedded equity details CSV.
 pub fn parse_embedded_equity_details() -> Result<Vec<EquityDetail>, Error> {
     let details = parse_equity_details_csv(EQUITY_DETAILS_CSV)?;
-    info!("Parsed {} equity details from embedded CSV", details.len());
+    info!(
+        rows = details.len(),
+        "Parsed equity details from embedded CSV"
+    );
     Ok(details)
 }
 

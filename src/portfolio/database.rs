@@ -140,7 +140,7 @@ pub async fn fetch_equity_predictions(
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     info!(
-        count = predictions.len(),
+        rows = predictions.len(),
         "Predictions fetched from PostgreSQL"
     );
     Ok(Fresh::new(predictions, StalenessWindow::predictions()))
@@ -205,7 +205,7 @@ pub async fn fetch_spy_equity_prices(pool: &PgPool) -> Result<Vec<f64>, sqlx::Er
 
     let prices: Vec<f64> = rows.into_iter().map(|row| row.close_price).collect();
 
-    info!(count = prices.len(), "SPY prices fetched from PostgreSQL");
+    info!(rows = prices.len(), "SPY prices fetched from PostgreSQL");
     Ok(prices)
 }
 
@@ -343,7 +343,7 @@ pub async fn fetch_open_pairs(pool: &PgPool) -> Result<Vec<OpenPair>, sqlx::Erro
         .collect::<Result<_, sqlx::Error>>()?;
 
     info!(
-        count = pairs.len(),
+        rows = pairs.len(),
         "Open equity pairs fetched from PostgreSQL"
     );
     Ok(pairs)

@@ -75,7 +75,7 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     }
 
     transaction.commit().await?;
-    info!("Inserted {} equity bars into PostgreSQL", rows_affected);
+    info!(rows = rows_affected, "Inserted equity bars into PostgreSQL");
     Ok(rows_affected)
 }
 
@@ -110,7 +110,10 @@ pub async fn insert_equity_quotes(
     }
 
     transaction.commit().await?;
-    debug!("Inserted {} equity quotes into PostgreSQL", rows_affected);
+    debug!(
+        rows = rows_affected,
+        "Inserted equity quotes into PostgreSQL"
+    );
     Ok(rows_affected)
 }
 
@@ -129,7 +132,10 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Erro
         .into_iter()
         .filter_map(|row| Ticker::new(&row.ticker))
         .collect();
-    debug!("Queried {} active tickers from PostgreSQL", tickers.len());
+    debug!(
+        rows = tickers.len(),
+        "Queried active tickers from PostgreSQL"
+    );
     Ok(tickers)
 }
 
@@ -211,7 +217,7 @@ pub async fn query_equity_quotes_for_date(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
-    debug!("Queried {} equity quotes for {}", quotes.len(), date);
+    debug!(rows = quotes.len(), date = %date, "Queried equity quotes from PostgreSQL");
     Ok(quotes)
 }
 
@@ -276,7 +282,7 @@ pub async fn query_equity_bars_for_date(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
-    debug!("Queried {} equity bars for {}", bars.len(), date);
+    debug!(rows = bars.len(), date = %date, "Queried equity bars from PostgreSQL");
     Ok(bars)
 }
 
@@ -505,11 +511,7 @@ pub async fn query_equity_predictions_for_date(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
-    debug!(
-        "Queried {} equity predictions for {}",
-        predictions.len(),
-        date
-    );
+    debug!(rows = predictions.len(), date = %date, "Queried equity predictions from PostgreSQL");
     Ok(predictions)
 }
 
