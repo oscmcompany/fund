@@ -9,8 +9,13 @@ name = "fund"
 path = "src/lib.rs"
 
 [[bin]]
-name = "backfill"
-path = "src/bin/backfill.rs"
+name = "seed_equity_bars"
+path = "src/bin/seed_equity_bars.rs"
+required-features = ["data"]
+
+[[bin]]
+name = "seed_equity_details"
+path = "src/bin/seed_equity_details.rs"
 required-features = ["data"]
 
 [[bin]]

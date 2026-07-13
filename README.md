@@ -36,15 +36,23 @@ bash tools/provision-trainer-vm
 
 #### Data
 
-After launching, the database has the schema applied and equity details inserted but historical data must
-be manually populated. Run the following commands locally or SSH into the application VM to backfill data.
+After launching, the database has the schema applied but equity details and historical bars must
+be manually populated. Use the data seeding tasks to bootstrap both S3 and PostgreSQL.
 
 ```sh
-# Backfill equity bars to S3 Parquet for model training
-BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill
+# Full bootstrap: seed equity details and bars into S3 and PostgreSQL
+SEED_SOURCE=massive SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
 
-# Backfill equity bars to S3 Parquet for training (no PostgreSQL needed)
-BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-s3-equity-bars
+# Or run individually:
+
+# Seed equity details (embedded CSV) into S3 and/or PostgreSQL
+SEED_TARGET=all devenv tasks run data:equity-details
+
+# Seed equity bars from Massive API or S3 into S3 and/or PostgreSQL
+SEED_SOURCE=massive SEED_TARGET=s3 SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars
+
+# Populate PostgreSQL from existing S3 Parquet (avoids re-fetching from Massive)
+SEED_SOURCE=s3 SEED_TARGET=postgresql SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars
 ```
 
 ### Principles
