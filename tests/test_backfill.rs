@@ -2,7 +2,7 @@ mod common;
 
 use chrono::NaiveDate;
 use fund::data::{
-    equity_bars::backfill,
+    equity_bars::{seed, SeedSource, SeedTarget},
     state::{MassiveSecrets, State},
 };
 use mockito::{Matcher, Server};
@@ -46,14 +46,16 @@ async fn create_state(massive_base: String, s3_endpoint: &str) -> State {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_backfill_start_after_end_returns_error() {
+async fn test_seed_start_after_end_returns_error() {
     let (endpoint, _s3) = setup_test_bucket().await;
     let state = create_state("http://127.0.0.1:1".to_string(), &endpoint).await;
 
-    let result = backfill(
+    let result = seed(
         &state,
         NaiveDate::from_ymd_opt(2025, 1, 10).unwrap(),
         NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+        SeedSource::Massive,
+        SeedTarget::S3,
     )
     .await;
 
@@ -62,7 +64,7 @@ async fn test_backfill_start_after_end_returns_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
-async fn test_backfill_writes_s3_and_skips_weekends() {
+async fn test_seed_writes_s3_and_skips_weekends() {
     let (endpoint, s3) = setup_test_bucket().await;
 
     // 2025-01-03 is Friday and 2025-01-06 is Monday; 2025-01-04/05 are weekend.
@@ -82,10 +84,12 @@ async fn test_backfill_writes_s3_and_skips_weekends() {
 
     let state = create_state(massive_server.url(), &endpoint).await;
 
-    let summary = backfill(
+    let summary = seed(
         &state,
         NaiveDate::from_ymd_opt(2025, 1, 3).unwrap(),
         NaiveDate::from_ymd_opt(2025, 1, 6).unwrap(),
+        SeedSource::Massive,
+        SeedTarget::S3,
     )
     .await
     .unwrap();

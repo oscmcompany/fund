@@ -4,8 +4,9 @@ use crate::data::types::{create_equity_bar_dataframe, EquityBar, TradingDate};
 use crate::domain::market::Ticker;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, NaiveDate, Utc};
-use polars::prelude::ParquetWriter;
+use polars::prelude::{ParquetReader, ParquetWriter, SerReader};
 use serde::Deserialize;
+use std::io::Cursor;
 use tracing::{debug, info, warn};
 
 #[derive(Deserialize)]
@@ -244,50 +245,263 @@ pub async fn fetch_and_store_equity_bars(
     Ok(Some(equity_bars.len()))
 }
 
-/// Result of a historical backfill run.
+/// Result of a seed (or backfill) run over a date range.
 #[derive(Debug, Default)]
-pub struct BackfillSummary {
+pub struct SeedSummary {
     pub days_processed: usize,
     pub days_skipped_weekend: usize,
     pub days_failed: usize,
     pub total_bars: usize,
 }
 
-/// Fetch one trading day's bars and write them to S3 only.
-///
-/// Historical backfill targets S3 (the model-training source); PostgreSQL is a
-/// 90-day rolling buffer, so backfill intentionally bypasses it.
-async fn backfill_one_day(state: &State, trading_date: &TradingDate) -> Result<usize, String> {
-    let Some(equity_bars) = fetch_equity_bars_for_date(state, trading_date).await? else {
-        return Ok(0);
-    };
-    write_equity_bars_to_s3(state, trading_date, &equity_bars)
-        .await
-        .map_err(|error| format!("Failed to write equity bars to S3: {}", error))?;
-    Ok(equity_bars.len())
+/// Where equity bar data is read from.
+#[derive(Debug)]
+pub enum SeedSource {
+    /// Fetch from the Massive grouped-daily API.
+    Massive,
+    /// Read existing Hive-partitioned Parquet files from S3.
+    S3,
 }
 
-/// Backfill historical equity bars over an inclusive date range, writing each
-/// trading day's bars to S3. Weekends are skipped; days with no market data
-/// (holidays) count as processed with zero bars.
-pub async fn backfill(
+/// Where equity bar data is written to.
+#[derive(Debug)]
+pub enum SeedTarget {
+    /// Write Hive-partitioned Parquet to S3.
+    S3,
+    /// Insert into the PostgreSQL `equity_bars` table.
+    PostgreSQL,
+    /// Write to both S3 and PostgreSQL.
+    All,
+}
+
+/// Read one day's equity bar Parquet from S3 and parse rows into validated
+/// `EquityBar` values. Uses the same `Ticker::new` boundary validation as the
+/// Massive API ingest path so both sources produce identical domain objects.
+async fn read_equity_bars_from_s3(
+    state: &State,
+    date: NaiveDate,
+) -> Result<Option<Vec<EquityBar>>, String> {
+    let key = equity_bars_key(date);
+
+    let response = match state
+        .s3_client
+        .get_object()
+        .bucket(&state.bucket_name)
+        .key(&key)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let error_string = error.to_string();
+            if error_string.contains("NoSuchKey") || error_string.contains("not found") {
+                debug!("No S3 object for {}: {}", key, error_string);
+                return Ok(None);
+            }
+            return Err(format!(
+                "Failed to read S3 object {}: {}",
+                key, error_string
+            ));
+        }
+    };
+
+    let bytes = response
+        .body
+        .collect()
+        .await
+        .map_err(|error| format!("Failed to read S3 body for {}: {}", key, error))?
+        .into_bytes();
+
+    let dataframe = ParquetReader::new(Cursor::new(bytes))
+        .finish()
+        .map_err(|error| format!("Failed to parse Parquet from {}: {}", key, error))?;
+
+    if dataframe.height() == 0 {
+        return Ok(None);
+    }
+
+    let inserted_at = Utc::now();
+    let mut bars = Vec::with_capacity(dataframe.height());
+    let mut rejected = 0usize;
+
+    let tickers = dataframe
+        .column("ticker")
+        .map_err(|error| format!("Missing ticker column: {}", error))?
+        .str()
+        .map_err(|error| format!("ticker column is not string: {}", error))?;
+    let timestamps = dataframe
+        .column("timestamp")
+        .map_err(|error| format!("Missing timestamp column: {}", error))?
+        .i64()
+        .map_err(|error| format!("timestamp column is not i64: {}", error))?;
+    let open_prices = dataframe
+        .column("open_price")
+        .map_err(|error| format!("Missing open_price column: {}", error))?
+        .f64()
+        .map_err(|error| format!("open_price column is not f64: {}", error))?;
+    let high_prices = dataframe
+        .column("high_price")
+        .map_err(|error| format!("Missing high_price column: {}", error))?
+        .f64()
+        .map_err(|error| format!("high_price column is not f64: {}", error))?;
+    let low_prices = dataframe
+        .column("low_price")
+        .map_err(|error| format!("Missing low_price column: {}", error))?
+        .f64()
+        .map_err(|error| format!("low_price column is not f64: {}", error))?;
+    let close_prices = dataframe
+        .column("close_price")
+        .map_err(|error| format!("Missing close_price column: {}", error))?
+        .f64()
+        .map_err(|error| format!("close_price column is not f64: {}", error))?;
+    let volumes = dataframe
+        .column("volume")
+        .map_err(|error| format!("Missing volume column: {}", error))?
+        .i64()
+        .map_err(|error| format!("volume column is not i64: {}", error))?;
+    let volume_weighted_average_prices = dataframe
+        .column("volume_weighted_average_price")
+        .map_err(|error| format!("Missing volume_weighted_average_price column: {}", error))?
+        .f64()
+        .map_err(|error| format!("volume_weighted_average_price column is not f64: {}", error))?;
+    let transactions = dataframe
+        .column("transactions")
+        .map_err(|error| format!("Missing transactions column: {}", error))?
+        .i64()
+        .map_err(|error| format!("transactions column is not i64: {}", error))?;
+
+    for row_index in 0..dataframe.height() {
+        let ticker = match tickers.get(row_index).and_then(Ticker::new) {
+            Some(ticker) => ticker,
+            None => {
+                rejected += 1;
+                continue;
+            }
+        };
+        let timestamp = match timestamps
+            .get(row_index)
+            .and_then(DateTime::from_timestamp_millis)
+        {
+            Some(timestamp) => timestamp,
+            None => {
+                rejected += 1;
+                continue;
+            }
+        };
+        let (Some(open_price), Some(high_price), Some(low_price), Some(close_price)) = (
+            open_prices.get(row_index),
+            high_prices.get(row_index),
+            low_prices.get(row_index),
+            close_prices.get(row_index),
+        ) else {
+            rejected += 1;
+            continue;
+        };
+        let Some(volume) = volumes.get(row_index) else {
+            rejected += 1;
+            continue;
+        };
+
+        bars.push(EquityBar::new(
+            ticker,
+            timestamp,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            volume,
+            volume_weighted_average_prices.get(row_index),
+            transactions.get(row_index),
+            inserted_at,
+        ));
+    }
+
+    if rejected > 0 {
+        warn!(
+            "Rejected {} of {} rows from S3 Parquet {}",
+            rejected,
+            dataframe.height(),
+            key
+        );
+    }
+
+    if bars.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(bars))
+    }
+}
+
+/// Seed one trading day's equity bars from the specified source to the
+/// specified target.
+async fn seed_one_day(
+    state: &State,
+    trading_date: &TradingDate,
+    source: &SeedSource,
+    target: &SeedTarget,
+) -> Result<usize, String> {
+    let equity_bars = match source {
+        SeedSource::Massive => fetch_equity_bars_for_date(state, trading_date).await?,
+        SeedSource::S3 => read_equity_bars_from_s3(state, trading_date.as_naive_date()).await?,
+    };
+
+    let Some(equity_bars) = equity_bars else {
+        return Ok(0);
+    };
+
+    let bar_count = equity_bars.len();
+
+    match target {
+        SeedTarget::S3 => {
+            write_equity_bars_to_s3(state, trading_date, &equity_bars).await?;
+        }
+        SeedTarget::PostgreSQL => {
+            let pool = state
+                .database
+                .pool()
+                .ok_or("PostgreSQL not configured but target is postgresql")?;
+            database::insert_equity_bars(pool, &equity_bars)
+                .await
+                .map_err(|error| format!("Failed to insert equity bars: {}", error))?;
+        }
+        SeedTarget::All => {
+            let pool = state
+                .database
+                .pool()
+                .ok_or("PostgreSQL not configured but target is all")?;
+            database::insert_equity_bars(pool, &equity_bars)
+                .await
+                .map_err(|error| format!("Failed to insert equity bars: {}", error))?;
+            write_equity_bars_to_s3(state, trading_date, &equity_bars).await?;
+        }
+    }
+
+    Ok(bar_count)
+}
+
+/// Seed equity bars over an inclusive date range from the given source to
+/// the given target. Weekends are skipped; days with no data count as
+/// processed with zero bars.
+pub async fn seed(
     state: &State,
     start: NaiveDate,
     end: NaiveDate,
-) -> Result<BackfillSummary, String> {
+    source: SeedSource,
+    target: SeedTarget,
+) -> Result<SeedSummary, String> {
     if start > end {
-        let message = format!("Backfill start date {} is after end date {}", start, end);
+        let message = format!("Seed start date {} is after end date {}", start, end);
         warn!("{}", message);
         return Err(message);
     }
 
     info!(
-        "Starting equity bar backfill from {} to {}",
+        "Starting equity bar seed from {} to {}",
         start.format("%Y-%m-%d"),
         end.format("%Y-%m-%d")
     );
 
-    let mut summary = BackfillSummary::default();
+    let mut summary = SeedSummary::default();
     let mut date = start;
     while date <= end {
         match TradingDate::from_naive_date(date) {
@@ -295,21 +509,19 @@ pub async fn backfill(
                 debug!("Skipping weekend date: {}", date.format("%Y-%m-%d"));
                 summary.days_skipped_weekend += 1;
             }
-            Some(trading_date) => match backfill_one_day(state, &trading_date).await {
-                Ok(bar_count) => {
-                    summary.days_processed += 1;
-                    summary.total_bars += bar_count;
-                    info!(
-                        "Backfilled {} bars for {}",
-                        bar_count,
-                        date.format("%Y-%m-%d")
-                    );
+            Some(trading_date) => {
+                match seed_one_day(state, &trading_date, &source, &target).await {
+                    Ok(bar_count) => {
+                        summary.days_processed += 1;
+                        summary.total_bars += bar_count;
+                        info!("Seeded {} bars for {}", bar_count, date.format("%Y-%m-%d"));
+                    }
+                    Err(error) => {
+                        summary.days_failed += 1;
+                        warn!("Failed to seed {}: {}", date.format("%Y-%m-%d"), error);
+                    }
                 }
-                Err(error) => {
-                    summary.days_failed += 1;
-                    warn!("Failed to backfill {}: {}", date.format("%Y-%m-%d"), error);
-                }
-            },
+            }
         }
         date = match date.succ_opt() {
             Some(next_date) => next_date,
@@ -318,7 +530,7 @@ pub async fn backfill(
     }
 
     info!(
-        "Backfill complete: {} days processed, {} weekends skipped, {} days failed, {} total bars",
+        "Seed complete: {} days processed, {} weekends skipped, {} days failed, {} total bars",
         summary.days_processed,
         summary.days_skipped_weekend,
         summary.days_failed,
@@ -543,9 +755,9 @@ mod tests {
     }
 
     #[test]
-    fn test_backfill_summary_default_is_all_zeros() {
-        use super::BackfillSummary;
-        let summary = BackfillSummary::default();
+    fn test_seed_summary_default_is_all_zeros() {
+        use super::SeedSummary;
+        let summary = SeedSummary::default();
         assert_eq!(summary.days_processed, 0);
         assert_eq!(summary.days_skipped_weekend, 0);
         assert_eq!(summary.days_failed, 0);
@@ -646,16 +858,16 @@ mod tests {
     }
 
     #[test]
-    fn test_backfill_summary_debug_is_implemented() {
-        use super::BackfillSummary;
-        let summary = BackfillSummary {
+    fn test_seed_summary_debug_is_implemented() {
+        use super::SeedSummary;
+        let summary = SeedSummary {
             days_processed: 5,
             days_skipped_weekend: 2,
             days_failed: 1,
             total_bars: 1000,
         };
         let debug_str = format!("{:?}", summary);
-        assert!(debug_str.contains("BackfillSummary"));
+        assert!(debug_str.contains("SeedSummary"));
         assert!(debug_str.contains("days_processed"));
         assert!(debug_str.contains("total_bars"));
     }

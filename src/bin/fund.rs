@@ -34,7 +34,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         let _span = tracing::info_span!("data").entered();
         let state = fund::data::state::State::with_pool(pool.clone(), s3_client.clone());
-        fund::data::startup::migrate_equity_details(&state).await;
         fund::data::scheduler::spawn_sync_scheduler(state.clone());
         fund::data::equity_quotes::spawn_quote_stream(state.clone());
         info!("Data service started");

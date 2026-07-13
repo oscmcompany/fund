@@ -4,10 +4,14 @@ use tracing::{info, warn};
 
 /// Equity details CSV embedded at compile time.
 ///
-/// The source file lives at `src/data/equity_details.csv` in the
-/// repository and is checked into version control. Changes require a rebuild
-/// and redeploy.
-const EQUITY_DETAILS_CSV: &str = include_str!("equity_details.csv");
+/// The source file lives at `data/equity_details.csv` in the repository root
+/// and is checked into version control. Changes require a rebuild and redeploy.
+const EQUITY_DETAILS_CSV: &str = include_str!("../../data/equity_details.csv");
+
+/// Returns the raw embedded equity details CSV content for uploading to S3.
+pub fn embedded_csv() -> &'static str {
+    EQUITY_DETAILS_CSV
+}
 
 fn parse_equity_details_csv(csv_content: &str) -> Result<Vec<EquityDetail>, Error> {
     let mut lines = csv_content.lines();

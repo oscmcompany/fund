@@ -8,6 +8,5 @@ pub mod equity_quotes;
 pub mod errors;
 pub mod export;
 pub mod scheduler;
-pub mod startup;
 pub mod state;
 pub mod types;

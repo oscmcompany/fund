@@ -198,28 +198,9 @@ in {
     yamllint
   ];
 
-  # database:create   — apply the schema (idempotent DDL).
-  # database:backfill — populate equity bars in S3 via the backfill binary.
-  # database:restore  — fast recovery from a nightly S3 dump when schema has not changed.
-  # database:reset    — drop and recreate the empty fund database; run before database:create
-  #                     after a breaking schema change.
-
-  scripts.restore-database.exec = ''
-    set -euo pipefail
-    ${runtimeEnv}
-    BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
-    echo "Downloading database backup from S3..."
-    aws s3 cp "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY" /tmp/fund-latest.dump.gz
-    rm -f /tmp/fund-latest.dump
-    gunzip /tmp/fund-latest.dump.gz
-    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_pre_restore();"
-    pg_restore --host 127.0.0.1 --port 5432 \
-      --no-owner --no-acl \
-      --dbname fund --clean --if-exists /tmp/fund-latest.dump || true
-    psql -h localhost -p 5432 -d fund -c "SELECT timescaledb_post_restore();"
-    rm -f /tmp/fund-latest.dump
-    echo "Database restored"
-  '';
+  # database:create  — apply the schema (idempotent DDL).
+  # database:reset   — drop and recreate the empty fund database; run before database:create
+  #                    after a breaking schema change.
 
   scripts.backup-database.exec = ''
     set -euo pipefail
@@ -232,26 +213,6 @@ in {
     aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
     rm -f /tmp/fund-latest.dump.gz
     echo "Database backup complete"
-  '';
-
-  scripts.fetch-database-equity-bars.exec = ''
-    set -euo pipefail
-
-    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill"
-      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
-      exit 1
-    fi
-
-    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
-
-    # Fetches grouped daily bars from Massive and writes them to S3 as
-    # Hive-partitioned Parquet. The fund binary's scheduler populates the
-    # PostgreSQL rolling buffer automatically on startup.
-    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
-    ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data --bin backfill -- \
-      "$BACKFILL_START_DATE" "$END_DATE"
   '';
 
   scripts.reset-database.exec = ''
@@ -402,24 +363,44 @@ in {
   scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm";
   scripts.provision-production-trainer-vm.exec = "bash tools/provision-trainer-vm --production";
 
-  scripts.backfill-s3-equity-bars.exec = ''
+  scripts.seed-equity-bars.exec = ''
     set -euo pipefail
 
-    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
-      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run data:backfill-s3-equity-bars"
-      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today)"
+    if [ -z "''${SEED_SOURCE:-}" ] || [ -z "''${SEED_TARGET:-}" ] || [ -z "''${SEED_START_DATE:-}" ]; then
+      echo "Usage: SEED_SOURCE=<massive|s3> SEED_TARGET=<s3|postgresql|all> SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars"
+      echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today)"
+      echo ""
+      echo "  Sources: massive (Massive API), s3 (existing S3 Parquet)"
+      echo "  Targets: s3, postgresql, all"
+      echo "  Note: --source s3 with --target s3 or --target all is not supported"
       exit 1
     fi
 
-    END_DATE="''${BACKFILL_END_DATE:-$(date -u +%Y-%m-%d)}"
+    END_DATE_ARGS=""
+    if [ -n "''${SEED_END_DATE:-}" ]; then
+      END_DATE_ARGS="$SEED_END_DATE"
+    fi
 
-    # Fetches grouped daily bars from Massive and writes them straight to S3 as
-    # Hive-partitioned Parquet. No HTTP server or Postgres required: historical
-    # bars are consumed by model training directly from S3.
-    echo "Backfilling equity bars from $BACKFILL_START_DATE to $END_DATE"
+    echo "Seeding equity bars: source=$SEED_SOURCE target=$SEED_TARGET from $SEED_START_DATE"
     ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data --bin backfill -- \
-      "$BACKFILL_START_DATE" "$END_DATE"
+    secretspec run -- cargo run --no-default-features --features data --bin seed_equity_bars -- \
+      --source "$SEED_SOURCE" --target "$SEED_TARGET" "$SEED_START_DATE" $END_DATE_ARGS
+  '';
+
+  scripts.seed-equity-details.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${SEED_TARGET:-}" ]; then
+      echo "Usage: SEED_TARGET=<s3|postgresql|all> devenv tasks run data:equity-details"
+      echo ""
+      echo "  Targets: s3, postgresql, all"
+      exit 1
+    fi
+
+    echo "Seeding equity details: target=$SEED_TARGET"
+    ${runtimeEnv}
+    secretspec run -- cargo run --no-default-features --features data --bin seed_equity_details -- \
+      --target "$SEED_TARGET"
   '';
 
   tasks = {
@@ -459,17 +440,53 @@ in {
 
     # --- Data tasks ---
 
-    # Historical S3 backfill: writes Hive-partitioned parquet that model
-    # training reads directly. Distinct from database:fetch-equity-bars, which
-    # populates the PostgreSQL rolling buffer through the data service.
-    "data:backfill-s3-equity-bars".exec = "backfill-s3-equity-bars";
+    # Seed equity bars from Massive API or S3 into S3 and/or PostgreSQL.
+    "data:equity-bars".exec = "seed-equity-bars";
+
+    # Seed equity details from the embedded CSV into S3 and/or PostgreSQL.
+    "data:equity-details".exec = "seed-equity-details";
+
+    # Full bootstrap: seed equity details and equity bars into all targets.
+    # Runs equity-details first (fast, no date range), then equity-bars.
+    "data:seed" = {
+      exec = ''
+        set -euo pipefail
+
+        if [ -z "''${SEED_START_DATE:-}" ]; then
+          echo "Usage: SEED_SOURCE=<massive|s3> SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed"
+          echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today)"
+          echo ""
+          echo "  Seeds equity details and equity bars into both S3 and PostgreSQL."
+          echo "  Source controls where equity bars are read from (massive or s3)."
+          exit 1
+        fi
+
+        if [ -z "''${SEED_SOURCE:-}" ]; then
+          echo "Error: SEED_SOURCE is required (massive or s3)"
+          exit 1
+        fi
+
+        echo "=== Seeding equity details (target=all) ==="
+        SEED_TARGET=all seed-equity-details
+
+        # When source is s3, target=all is rejected (s3-to-s3 is a no-op).
+        # Route to postgresql instead.
+        if [ "$SEED_SOURCE" = "s3" ]; then
+          BARS_TARGET="postgresql"
+        else
+          BARS_TARGET="all"
+        fi
+
+        echo ""
+        echo "=== Seeding equity bars (source=$SEED_SOURCE target=$BARS_TARGET) ==="
+        SEED_TARGET="$BARS_TARGET" seed-equity-bars
+      '';
+    };
 
     # --- Database lifecycle tasks ---
-    # Four lifecycle modes:
-    #   Create   — apply the schema (idempotent DDL). Use on a fresh VM or after schema changes.
-    #   Backfill — populate equity bars via the backfill binary. Run after create on a fresh VM.
-    #   Restore  — fast recovery from the nightly S3 dump when schema has not changed.
-    #   Reset    — drop and recreate the empty database. Run before create after breaking changes.
+    # Two lifecycle modes:
+    #   Create — apply the schema (idempotent DDL). Use on a fresh VM or after schema changes.
+    #   Reset  — drop and recreate the empty database. Run before create after breaking changes.
 
     # Opens an interactive psql session against the local fund database.
     "database:connect".exec = "psql -h localhost -p 5432 -d fund";
@@ -477,11 +494,6 @@ in {
     # Drops and recreates the empty fund database. Run before database:create when
     # recovering from a breaking schema change.
     "database:reset".exec = "reset-database";
-
-    # Downloads the nightly pg_dump from S3 and restores the full database: equity
-    # bars, details, predictions, model runs, and all trading history. Fast, but
-    # requires the schema to match the dump exactly.
-    "database:restore".exec = "restore-database";
 
     # Dumps the live database and uploads it to S3. Also runs automatically via
     # pg_cron at 22:00 UTC on weekdays after all nightly exports complete.
@@ -493,10 +505,6 @@ in {
       set -euo pipefail
       ${applySchema}
     '';
-
-    # Backfills equity bars to S3 Parquet via the backfill binary. The fund
-    # binary's scheduler populates PostgreSQL automatically on startup.
-    "database:backfill".exec = "fetch-database-equity-bars";
 
     "checks:base" = {
       exec = ''
@@ -596,13 +604,13 @@ in {
       echo "    checks:nix                     Nix checks (alejandra + statix)"
       echo "    database:connect               Open interactive psql session"
       echo "    database:create                Apply schema (idempotent, safe to re-run)"
-      echo "    database:backfill              Backfill equity bars to S3 Parquet (requires BACKFILL_START_DATE)"
       echo "    database:reset                 Drop and recreate the empty fund database"
       echo "                                   (run before database:create after a breaking schema change)"
-      echo "    database:restore               Restore from nightly S3 dump (fast recovery, schema must match)"
       echo "    database:backup                Dump fund database and upload to S3 (also runs nightly at 22:00 UTC)"
-      echo "    data:backfill-s3-equity-bars         Backfill equity bars to S3 Parquet for training (requires BACKFILL_START_DATE)"
-      echo "    models:tide:train                    Train tide model and upload artifacts"
+      echo "    data:equity-bars               Seed equity bars (requires SEED_SOURCE, SEED_TARGET, SEED_START_DATE)"
+      echo "    data:equity-details            Seed equity details (requires SEED_TARGET)"
+      echo "    data:seed                      Full bootstrap: seed details + bars (requires SEED_SOURCE, SEED_START_DATE)"
+      echo "    models:tide:train              Train tide model and upload artifacts"
       echo ""
       echo "  VM provisioning:"
       echo "    provision-development-application-vm  Provision a development application VM"
