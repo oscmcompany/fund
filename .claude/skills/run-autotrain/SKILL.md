@@ -1,5 +1,5 @@
 ---
-name: autotrain
+name: run-autotrain
 description: >
   Autonomous model training optimization loop using autoresearch methodology.
   Invoked as `/autotrain <model-name>` (e.g., `/autotrain tide`). Iteratively modifies model

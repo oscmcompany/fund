@@ -1,5 +1,5 @@
 ---
-name: fund-report
+name: generate-fund-report
 description: >
   Daily fund briefing combining platform health and trading activity.
   Use when the user asks "morning report", "daily report", "fund briefing",

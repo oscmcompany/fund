@@ -1,5 +1,5 @@
 ---
-name: platform-report
+name: generate-platform-report
 description: >
   Check fund platform health across all services. Use when the user asks
   "is everything running", "check the platform", "platform status",
