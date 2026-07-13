@@ -173,6 +173,7 @@ in {
     clang
     bacon
     cargo-llvm-cov
+    cargo-machete
     cargo-watch
     curl
     duckdb # retained for local data exploration and experimentation
@@ -258,6 +259,13 @@ in {
     echo "Running Rust lint checks"
     cargo clippy --workspace --all-features --all-targets
     echo "Rust linting completed successfully"
+  '';
+
+  scripts.check-unused-dependencies.exec = ''
+    set -euo pipefail
+    echo "Checking for unused Rust dependencies"
+    cargo machete
+    echo "No unused dependencies found"
   '';
 
   scripts.test-rust.exec = ''
@@ -416,6 +424,10 @@ in {
       exec = "test-rust";
       after = ["checks:rust:format"];
     };
+    "checks:rust:unused-dependencies" = {
+      exec = "check-unused-dependencies";
+      after = ["checks:rust:format"];
+    };
 
     # --- Standalone checks ---
 
@@ -528,6 +540,7 @@ in {
         "checks:rust:format"
         "checks:rust:lint"
         "checks:rust:test"
+        "checks:rust:unused-dependencies"
       ];
     };
   };
@@ -596,7 +609,7 @@ in {
       echo ""
       echo "  Tasks (devenv tasks run):"
       echo "    checks:base                    Non-language checks (nix, markdown, yaml, toml, sql)"
-      echo "    checks:rust                    All Rust checks (sequential: format, lint, test)"
+      echo "    checks:rust                    All Rust checks (sequential: format, then lint + test + unused-deps)"
       echo "    checks:markdown                Markdown lint"
       echo "    checks:yaml                    YAML lint"
       echo "    checks:toml                    TOML format check"

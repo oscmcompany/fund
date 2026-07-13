@@ -35,12 +35,7 @@ required-features = ["data", "inference", "portfolio"]
 
 [features]
 default = ["data", "inference", "portfolio"]
-data = [
-  "dep:chrono-tz",
-  "dep:urlencoding",
-  "dep:tokio-tungstenite",
-  "dep:futures-util",
-]
+data = ["dep:chrono-tz", "dep:tokio-tungstenite", "dep:futures-util"]
 inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
 portfolio = ["dep:chrono-tz"]
 dashboard_service = ["dep:ratatui", "dep:crossterm"]
@@ -54,11 +49,8 @@ train = ["inference", "dep:rand"]
 # Shared / base (always compiled)
 chrono = { version = "0.4.44", features = ["serde"] }
 polars = { version = "0.51.0", features = [
-  "json",
   "lazy",
   "parquet",
-  "temporal",
-  "serde",
   "strings",
   "is_in",
   "semi_anti_join",
@@ -98,7 +90,6 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # data-only (optional; enabled by the `data` feature)
 chrono-tz = { version = "0.10", optional = true }
-urlencoding = { version = "2.1.3", optional = true }
 tokio-tungstenite = { version = "0.26", features = [
   "rustls-tls-native-roots",
 ], optional = true }
