@@ -359,7 +359,7 @@ async fn read_equity_bars_from_s3(
         .map_err(|error| format!("Missing volume column: {}", error))?
         .i64()
         .map_err(|error| format!("volume column is not i64: {}", error))?;
-    let vwaps = dataframe
+    let volume_weighted_average_prices = dataframe
         .column("volume_weighted_average_price")
         .map_err(|error| format!("Missing volume_weighted_average_price column: {}", error))?
         .f64()
@@ -410,7 +410,7 @@ async fn read_equity_bars_from_s3(
             low_price,
             close_price,
             volume,
-            vwaps.get(row_index),
+            volume_weighted_average_prices.get(row_index),
             transactions.get(row_index),
             inserted_at,
         ));
@@ -465,11 +465,13 @@ async fn seed_one_day(
                 .map_err(|error| format!("Failed to insert equity bars: {}", error))?;
         }
         SeedTarget::All => {
-            if let Some(pool) = state.database.pool() {
-                database::insert_equity_bars(pool, &equity_bars)
-                    .await
-                    .map_err(|error| format!("Failed to insert equity bars: {}", error))?;
-            }
+            let pool = state
+                .database
+                .pool()
+                .ok_or("PostgreSQL not configured but target is all")?;
+            database::insert_equity_bars(pool, &equity_bars)
+                .await
+                .map_err(|error| format!("Failed to insert equity bars: {}", error))?;
             write_equity_bars_to_s3(state, trading_date, &equity_bars).await?;
         }
     }

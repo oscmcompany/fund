@@ -469,9 +469,17 @@ in {
         echo "=== Seeding equity details (target=all) ==="
         SEED_TARGET=all seed-equity-details
 
+        # When source is s3, target=all is rejected (s3-to-s3 is a no-op).
+        # Route to postgresql instead.
+        if [ "$SEED_SOURCE" = "s3" ]; then
+          BARS_TARGET="postgresql"
+        else
+          BARS_TARGET="all"
+        fi
+
         echo ""
-        echo "=== Seeding equity bars (source=$SEED_SOURCE target=all) ==="
-        SEED_TARGET=all seed-equity-bars
+        echo "=== Seeding equity bars (source=$SEED_SOURCE target=$BARS_TARGET) ==="
+        SEED_TARGET="$BARS_TARGET" seed-equity-bars
       '';
     };
 

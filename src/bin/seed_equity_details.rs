@@ -9,17 +9,12 @@
 
 use fund::common::observability::init_tracing;
 use fund::data::database::seed_equity_details;
-use fund::data::equity_details::parse_embedded_equity_details;
+use fund::data::equity_details::{embedded_csv, parse_embedded_equity_details};
 use fund::data::state::State;
 
 const USAGE: &str = "Usage: seed_equity_details --target <s3|postgresql|all>";
 
 const S3_KEY: &str = "data/equity/details/details.csv";
-
-/// The same CSV content embedded at compile time. Both the parser (which
-/// produces validated `EquityDetail` rows for PostgreSQL) and the S3 upload
-/// (which stores the raw CSV) read from this single source.
-const EQUITY_DETAILS_CSV: &str = include_str!("../../data/equity_details.csv");
 
 #[derive(Debug)]
 enum Target {
@@ -63,6 +58,7 @@ fn parse_arguments(arguments: &[String]) -> Result<Target, String> {
     target.ok_or_else(|| format!("--target is required\n{}", USAGE))
 }
 
+/// Upload the embedded equity details CSV to S3 as raw bytes.
 async fn upload_to_s3(state: &State) -> Result<(), String> {
     use aws_sdk_s3::primitives::ByteStream;
 
@@ -71,7 +67,7 @@ async fn upload_to_s3(state: &State) -> Result<(), String> {
         .put_object()
         .bucket(&state.bucket_name)
         .key(S3_KEY)
-        .body(ByteStream::from(EQUITY_DETAILS_CSV.as_bytes().to_vec()))
+        .body(ByteStream::from(embedded_csv().as_bytes().to_vec()))
         .send()
         .await
         .map_err(|error| format!("Failed to upload equity details to S3: {}", error))?;
@@ -80,6 +76,7 @@ async fn upload_to_s3(state: &State) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse the embedded equity details CSV and insert the rows into PostgreSQL.
 async fn insert_into_postgresql(state: &State) -> Result<u64, String> {
     let pool = state
         .database
@@ -120,19 +117,29 @@ async fn main() {
         Target::PostgreSQL => insert_into_postgresql(&state).await.map(|rows| {
             println!("Equity details seeded to PostgreSQL: {} rows", rows);
         }),
-        Target::All => match insert_into_postgresql(&state).await {
-            Ok(rows) => match upload_to_s3(&state).await {
-                Ok(()) => {
+        Target::All => {
+            let postgresql_result = insert_into_postgresql(&state).await;
+            let s3_result = upload_to_s3(&state).await;
+            match (&postgresql_result, &s3_result) {
+                (Ok(rows), Ok(())) => {
                     println!(
                         "Equity details seeded to PostgreSQL ({} rows) and S3 ({})",
                         rows, S3_KEY
                     );
                     Ok(())
                 }
-                Err(error) => Err(error),
-            },
-            Err(error) => Err(error),
-        },
+                _ => {
+                    let mut errors = Vec::new();
+                    if let Err(error) = postgresql_result {
+                        errors.push(format!("PostgreSQL: {}", error));
+                    }
+                    if let Err(error) = s3_result {
+                        errors.push(format!("S3: {}", error));
+                    }
+                    Err(errors.join("; "))
+                }
+            }
+        }
     };
 
     if let Err(error) = result {
