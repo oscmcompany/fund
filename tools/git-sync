@@ -5,35 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="/tmp/git-sync.pid"
 POLL_INTERVAL=60
-DEVENV_PID=""
+RESTART_FLAG="/tmp/git-sync-restart"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
 }
-
-cleanup() {
-  log "Received shutdown signal, cleaning up"
-  stop_devenv
-  rm -f "$PID_FILE"
-  log "Shutdown complete"
-  exit 0
-}
-
-trap cleanup SIGTERM SIGINT
-
-# ------------------------------------------------------------------ #
-# PID file guard -- prevent duplicate instances
-# ------------------------------------------------------------------ #
-if [[ -f "$PID_FILE" ]]; then
-  existing_pid="$(cat "$PID_FILE")"
-  if kill -0 "$existing_pid" 2>/dev/null; then
-    echo "git-sync is already running (PID $existing_pid)"
-    exit 1
-  fi
-  log "Removing stale PID file (PID $existing_pid no longer running)"
-  rm -f "$PID_FILE"
-fi
-echo $$ > "$PID_FILE"
 
 # ------------------------------------------------------------------ #
 # Clean up stale processes on service ports before starting
@@ -50,88 +26,107 @@ kill_port_holders() {
 }
 
 # ------------------------------------------------------------------ #
-# Start devenv as a managed subprocess
+# Subcommand: poll (runs in background tmux pane)
 # ------------------------------------------------------------------ #
-start_devenv() {
-  kill_port_holders
-  log "Starting devenv --profile application up"
-  cd "$REPO_ROOT"
-  devenv --profile application up &
-  DEVENV_PID=$!
-  log "devenv started (PID $DEVENV_PID)"
-}
+run_poll() {
+  log "Poller started (PID $$)"
 
-# ------------------------------------------------------------------ #
-# Stop devenv
-# ------------------------------------------------------------------ #
-stop_devenv() {
-  # Graceful position close: call the portfolio service before stopping devenv.
-  # TODO(#920): replace stub with real close-all-positions call once endpoint is available.
-  log "Graceful position close not yet implemented; stopping immediately"
+  while true; do
+    sleep "$POLL_INTERVAL"
 
-  if [[ -n "$DEVENV_PID" ]] && kill -0 "$DEVENV_PID" 2>/dev/null; then
-    log "Stopping devenv (PID $DEVENV_PID)"
-    kill "$DEVENV_PID" 2>/dev/null || true
-    local deadline=$((SECONDS + 15))
-    while kill -0 "$DEVENV_PID" 2>/dev/null && [[ $SECONDS -lt $deadline ]]; do
-      sleep 1
-    done
-    if kill -0 "$DEVENV_PID" 2>/dev/null; then
-      log "devenv did not exit after 15s, sending SIGKILL"
-      kill -9 "$DEVENV_PID" 2>/dev/null || true
+    cd "$REPO_ROOT"
+
+    if ! git fetch origin master 2>/dev/null; then
+      log "git fetch failed, will retry next cycle"
+      continue
     fi
-    wait "$DEVENV_PID" 2>/dev/null || true
-    DEVENV_PID=""
-  fi
+
+    local_head="$(git rev-parse HEAD)"
+    remote_head="$(git rev-parse origin/master)"
+
+    if [[ "$local_head" != "$remote_head" ]]; then
+      log "New commits detected (local=$local_head remote=$remote_head)"
+      log "Resetting to origin/master"
+      git reset --hard origin/master
+      devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
+      log "Now at $(git rev-parse --short HEAD)"
+      touch "$RESTART_FLAG"
+      # Send SIGTERM to the main pane's devenv process via the session
+      tmux send-keys -t fund:0.0 C-c
+    fi
+  done
 }
 
 # ------------------------------------------------------------------ #
-# Main loop
+# Subcommand: up (runs devenv foreground in primary tmux pane)
 # ------------------------------------------------------------------ #
-cd "$REPO_ROOT"
+run_up() {
+  # PID file guard -- prevent duplicate instances
+  if [[ -f "$PID_FILE" ]]; then
+    existing_pid="$(cat "$PID_FILE")"
+    if kill -0 "$existing_pid" 2>/dev/null; then
+      echo "git-sync is already running (PID $existing_pid)"
+      exit 1
+    fi
+    log "Removing stale PID file (PID $existing_pid no longer running)"
+    rm -f "$PID_FILE"
+  fi
+  echo $$ > "$PID_FILE"
 
-# Source .env so FUND_PROFILE is set during Nix evaluation
-if [[ -f "$REPO_ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$REPO_ROOT/.env"
-  set +a
-  log "Loaded .env (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
-else
-  log "WARNING: no .env found, FUND_PROFILE will be empty"
-fi
+  cleanup() {
+    log "Received shutdown signal, cleaning up"
+    # Kill the poller pane if it exists
+    tmux kill-pane -t fund:0.1 2>/dev/null || true
+    rm -f "$PID_FILE" "$RESTART_FLAG"
+    log "Shutdown complete"
+    exit 0
+  }
+  trap cleanup SIGTERM SIGINT
 
-log "git-sync starting in $REPO_ROOT"
+  cd "$REPO_ROOT"
 
-start_devenv
-
-while true; do
-  sleep "$POLL_INTERVAL"
-
-  # Check if devenv crashed
-  if [[ -n "$DEVENV_PID" ]] && ! kill -0 "$DEVENV_PID" 2>/dev/null; then
-    log "devenv process exited unexpectedly, restarting"
-    DEVENV_PID=""
-    start_devenv
-    continue
+  # Source .env so FUND_PROFILE is set during Nix evaluation
+  if [[ -f "$REPO_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/.env"
+    set +a
+    log "Loaded .env (FUND_PROFILE=${FUND_PROFILE:-<unset>})"
+  else
+    log "WARNING: no .env found, FUND_PROFILE will be empty"
   fi
 
-  # Poll for new commits on origin/master
-  if ! git fetch origin master 2>/dev/null; then
-    log "git fetch failed, will retry next cycle"
-    continue
-  fi
+  log "git-sync starting in $REPO_ROOT"
 
-  local_head="$(git rev-parse HEAD)"
-  remote_head="$(git rev-parse origin/master)"
+  # Start the poller in a small bottom tmux pane
+  rm -f "$RESTART_FLAG"
+  tmux split-window -t fund:0 -v -l 6 "bash $SCRIPT_DIR/git-sync poll"
 
-  if [[ "$local_head" != "$remote_head" ]]; then
-    log "New commits detected (local=$local_head remote=$remote_head)"
-    stop_devenv
-    log "Resetting to origin/master"
-    git reset --hard origin/master
-    devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
-    log "Now at $(git rev-parse --short HEAD)"
-    start_devenv
-  fi
-done
+  # Main loop: run devenv foreground, restart when poller signals
+  while true; do
+    kill_port_holders
+    log "Starting devenv --profile application up"
+    # Run devenv in foreground -- process-compose TUI renders here
+    devenv --profile application up || true
+
+    # If the restart flag is set, the poller pulled new code
+    if [[ -f "$RESTART_FLAG" ]]; then
+      rm -f "$RESTART_FLAG"
+      log "Restarting with updated code"
+      continue
+    fi
+
+    # devenv exited without a restart flag -- unexpected exit, restart after delay
+    log "devenv exited unexpectedly, restarting in 5s"
+    sleep 5
+  done
+}
+
+# ------------------------------------------------------------------ #
+# Dispatch subcommand
+# ------------------------------------------------------------------ #
+case "${1:-up}" in
+  up)   run_up ;;
+  poll) run_poll ;;
+  *)    echo "Usage: git-sync [up|poll]" >&2; exit 1 ;;
+esac
