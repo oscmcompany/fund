@@ -6,7 +6,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="/tmp/git-sync.pid"
 POLL_INTERVAL=60
 RESTART_FLAG="/tmp/git-sync-restart"
-POLL_LOG_DIR="/var/log/fund"
+POLL_LOG_DIR="${FUND_LOG_DIR:-/var/log/fund}"
+if [[ ! -w "$POLL_LOG_DIR" ]]; then
+  POLL_LOG_DIR="${HOME}/.local/state/fund/log"
+fi
+mkdir -p "$POLL_LOG_DIR"
 POLL_LOG="$POLL_LOG_DIR/git-sync-poll.log"
 
 log() {
@@ -31,7 +35,6 @@ kill_port_holders() {
 # Subcommand: poll (runs as background process, logs to file)
 # ------------------------------------------------------------------ #
 run_poll() {
-  mkdir -p "$POLL_LOG_DIR"
   log "Poller started (PID $$)" >> "$POLL_LOG" 2>&1
 
   while true; do
@@ -72,10 +75,11 @@ run_up() {
   fi
   echo $$ > "$PID_FILE"
 
+  POLL_PID=""
   cleanup() {
     log "Received shutdown signal, cleaning up"
     # Kill the background poller process
-    kill "$POLL_PID" 2>/dev/null || true
+    [[ -n "$POLL_PID" ]] && kill "$POLL_PID" 2>/dev/null || true
     rm -f "$PID_FILE" "$RESTART_FLAG"
     log "Shutdown complete"
     exit 0
