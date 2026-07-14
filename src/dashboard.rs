@@ -1,25 +1,25 @@
-//! Dashboard service: SSH-accessible read-only TUI displaying live fund data.
+//! Dashboard service: HTTP server rendering a read-only fund status page.
 //!
 //! Entry point is [`run`], which connects to the read-only production Postgres
 //! instance, spawns the background polling and event-listener tasks, then
-//! hands off to the ratatui terminal event loop.
+//! starts the Axum HTTP server.
 //!
 //! Data flow:
-//! - A single [`cache::spawn_polling_task`] refreshes all static view data
-//!   every 30 seconds behind an `Arc<RwLock<DashboardState>>`.
+//! - A single [`cache::spawn_polling_task`] refreshes all view data every 30
+//!   seconds behind an `Arc<RwLock<DashboardState>>`.
 //! - A [`cache::spawn_event_listener_task`] subscribes to the Postgres `events`
 //!   NOTIFY channel and appends real-time events to the ring buffer.
-//! - All SSH sessions (ratatui render loops) read from the shared cache without
-//!   touching the database directly, so viewer count does not affect Postgres
-//!   connection load.
+//! - HTTP request handlers read from the shared cache without touching the
+//!   database directly, so viewer count does not affect Postgres connection load.
 
-pub mod application;
 pub mod cache;
 pub mod database;
 pub mod events;
+pub mod html;
 pub mod performance;
 pub mod positions;
 pub mod predictions;
+pub mod server;
 pub mod trades;
 
 use sqlx::postgres::PgPoolOptions;
@@ -34,7 +34,7 @@ use crate::common::observability::init_tracing_file_only;
 const POOL_MAX_CONNECTIONS: u32 = 4;
 
 /// Initializes tracing, connects to the read-only database, spawns background
-/// tasks, and runs the ratatui terminal event loop.
+/// tasks, and starts the HTTP server.
 ///
 /// Panics on startup if `DATABASE_URL` is unset or the database is unreachable.
 pub async fn run() {
@@ -55,5 +55,5 @@ pub async fn run() {
     cache::spawn_polling_task(state.clone(), pool.clone());
     cache::spawn_event_listener_task(state.clone(), pool);
 
-    application::run_event_loop(state).await;
+    server::run_server(state).await;
 }

@@ -9,7 +9,7 @@ use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 
-use crate::dashboard_service::cache::{
+use crate::dashboard::cache::{
     ClosedTrade, ClosedTradesSummary, ModelRunInformation, OpenPosition, PerformanceSnapshot,
     PeriodReturns, PredictionRow,
 };

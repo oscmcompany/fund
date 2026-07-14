@@ -24,9 +24,9 @@ path = "src/bin/tide_model_trainer.rs"
 required-features = ["train"]
 
 [[bin]]
-name = "dashboard_service"
-path = "src/bin/dashboard_service.rs"
-required-features = ["dashboard_service"]
+name = "dashboard"
+path = "src/bin/dashboard.rs"
+required-features = ["dashboard"]
 
 [[bin]]
 name = "fund"
@@ -38,7 +38,7 @@ default = ["data", "inference", "portfolio"]
 data = ["dep:chrono-tz", "dep:tokio-tungstenite", "dep:futures-util"]
 inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
 portfolio = ["dep:chrono-tz"]
-dashboard_service = ["dep:ratatui", "dep:crossterm"]
+dashboard = ["dep:axum"]
 
 # Rust-native TiDE training. Reuses the inference model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
@@ -107,14 +107,15 @@ tempfile = { version = "3.27", optional = true }
 # train-only (optional; enabled by the `train` feature)
 rand = { version = "0.10", optional = true }
 
-# dashboard_service-only (optional; enabled by the `dashboard_service` feature)
-ratatui = { version = "0.30", optional = true }
-crossterm = { version = "0.29", optional = true }
+# dashboard-only (optional; enabled by the `dashboard` feature)
+axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"
+http = "1"
 mockito = "1.7"
 serial_test = "3.4"
+tower = { version = "0.5", features = ["util"] }
 testcontainers = "0.24"
 testcontainers-modules = { version = "0.12", features = [
   "localstack",

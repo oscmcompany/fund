@@ -1,5 +1,5 @@
 -- Idempotent: creates the dashboard_reader Postgres role and grants
--- read-only access to the seven tables queried by dashboard_service.
+-- read-only access to the seven tables queried by the dashboard.
 --
 -- Apply against the fund database after PostgreSQL is running:
 --   psql -h localhost -p 5432 -d fund -f tools/dashboard_reader_setup.sql
