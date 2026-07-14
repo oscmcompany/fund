@@ -28,14 +28,14 @@ devenv --profile application up
 
 For remote development or production instances, you can provision VMs on `exe.dev`.
 
-**Development:**
+Development:
 
 ```sh
 provision-development-application-vm
 provision-development-trainer-vm
 ```
 
-**Production:**
+Production:
 
 ```sh
 provision-production-application-vm
@@ -51,13 +51,13 @@ provision-production-trainer-vm
 After launching, the database has the schema applied but equity details and historical bars must
 be manually populated. Use the data seeding tasks to bootstrap both S3 and PostgreSQL.
 
-**Full bootstrap** to run all at once:
+Full bootstrap to run all at once:
 
 ```sh
 SEED_SOURCE=massive SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
 ```
 
-**Individual steps** if you need to run them separately:
+Individual steps if you need to run them separately:
 
 ```sh
 # Seed equity details (embedded CSV) into S3 and/or PostgreSQL
@@ -72,10 +72,10 @@ SEED_SOURCE=s3 SEED_TARGET=postgresql SEED_START_DATE=YYYY-MM-DD devenv tasks ru
 
 #### Dashboard
 
-The dashboard runs as a devenv process alongside the other services. It starts automatically
-with `devenv --profile application up` and connects to the local PostgreSQL instance.
-
-**Public access** (run once from your local machine after provisioning):
+The dashboard runs as a `devenv` process alongside the other services. It starts automatically
+with `devenv --profile application up` and connects to the local PostgreSQL instance. For public
+access to the production dashboard, run these commands once from your local machine after
+provisioning.
 
 ```sh
 # Set the dashboard port as the default HTTP proxy target
