@@ -560,7 +560,7 @@ in {
 
     # Shared setup: wait for PostgreSQL and apply schema before any module starts.
     # process-compose `depends_on` ensures this completes first.
-    processes.database.exec = ''
+    processes.schema.exec = ''
       set -euo pipefail
       ${runtimeEnv}
       attempt=0
@@ -582,7 +582,7 @@ in {
         ${runtimeEnv}
         exec secretspec run -- cargo run --release --bin fund -- --module data
       '';
-      process-compose.depends_on.database.condition = "process_completed_successfully";
+      process-compose.depends_on.schema.condition = "process_completed_successfully";
     };
 
     processes.inference = {
@@ -591,7 +591,7 @@ in {
         ${runtimeEnv}
         exec secretspec run -- cargo run --release --bin fund -- --module inference
       '';
-      process-compose.depends_on.database.condition = "process_completed_successfully";
+      process-compose.depends_on.schema.condition = "process_completed_successfully";
     };
 
     processes.portfolio = {
@@ -600,7 +600,7 @@ in {
         ${runtimeEnv}
         exec secretspec run -- cargo run --release --bin fund -- --module portfolio
       '';
-      process-compose.depends_on.database.condition = "process_completed_successfully";
+      process-compose.depends_on.schema.condition = "process_completed_successfully";
     };
   };
 
