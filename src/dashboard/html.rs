@@ -57,8 +57,14 @@ pub fn render_html(state: &DashboardState) -> String {
 
 fn format_last_updated(state: &DashboardState) -> String {
     match (&state.last_updated, &state.database_error) {
-        (Some(time), _) => format!("Last updated: {}", time.format("%Y-%m-%d %H:%M:%S UTC")),
-        (None, Some(error)) => format!("Database error: {error}"),
+        (Some(time), Some(_)) => format!(
+            "Database error (last ok: {})",
+            time.format("%Y-%m-%d %H:%M:%S UTC")
+        ),
+        (None, Some(_)) => "Database error".to_string(),
+        (Some(time), None) => {
+            format!("Last updated: {}", time.format("%Y-%m-%d %H:%M:%S UTC"))
+        }
         (None, None) => "Loading...".to_string(),
     }
 }
@@ -381,16 +387,14 @@ fn compute_bars_age_css_class(inserted_at: DateTime<Utc>, now: DateTime<Utc>) ->
     if inserted_at >= now {
         return "fresh";
     }
-    if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
-        return "fresh";
+    // Most recent expected trading day: step back from yesterday until we hit a weekday.
+    let mut last_expected_ingest_date = now.date_naive() - Duration::days(1);
+    while matches!(
+        last_expected_ingest_date.weekday(),
+        Weekday::Sat | Weekday::Sun
+    ) {
+        last_expected_ingest_date -= Duration::days(1);
     }
-    let yesterday = now.date_naive() - Duration::days(1);
-    let skip = match yesterday.weekday() {
-        Weekday::Sat => 1,
-        Weekday::Sun => 2,
-        _ => 0,
-    };
-    let last_expected_ingest_date = yesterday - Duration::days(skip);
     if inserted_at.date_naive() < last_expected_ingest_date {
         "stale"
     } else {
@@ -499,7 +503,19 @@ mod tests {
         let mut state = DashboardState::default();
         state.database_error = Some("connection refused".to_string());
         let html = render_html(&state);
-        assert!(html.contains("Database error: connection refused"));
+        assert!(html.contains("Database error"));
+        assert!(!html.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_render_html_database_error_does_not_render_raw_details() {
+        let mut state = DashboardState::default();
+        state.last_updated = Some(Utc::now());
+        state.database_error = Some("<script>alert(1)</script>".to_string());
+        let html = render_html(&state);
+        assert!(html.contains("Database error (last ok:"));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("alert(1)"));
     }
 
     #[test]
@@ -705,8 +721,57 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_bars_age_css_class_green_on_weekend() {
+    fn test_compute_bars_age_css_class_fresh_on_saturday_with_friday_ingest() {
+        // Saturday Jan 4, inserted Friday Jan 3 → fresh
         let now = NaiveDate::from_ymd_opt(2025, 1, 4)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_utc();
+        let inserted_at = NaiveDate::from_ymd_opt(2025, 1, 3)
+            .unwrap()
+            .and_hms_opt(22, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(compute_bars_age_css_class(inserted_at, now), "fresh");
+    }
+
+    #[test]
+    fn test_compute_bars_age_css_class_stale_on_saturday_with_old_ingest() {
+        // Saturday Jan 4, inserted Wednesday Jan 1 → stale (missed Thu+Fri)
+        let now = NaiveDate::from_ymd_opt(2025, 1, 4)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_utc();
+        let inserted_at = NaiveDate::from_ymd_opt(2025, 1, 1)
+            .unwrap()
+            .and_hms_opt(22, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(compute_bars_age_css_class(inserted_at, now), "stale");
+    }
+
+    #[test]
+    fn test_compute_bars_age_css_class_fresh_on_sunday_with_friday_ingest() {
+        // Sunday Jan 5, inserted Friday Jan 3 → fresh
+        let now = NaiveDate::from_ymd_opt(2025, 1, 5)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap()
+            .and_utc();
+        let inserted_at = NaiveDate::from_ymd_opt(2025, 1, 3)
+            .unwrap()
+            .and_hms_opt(22, 0, 0)
+            .unwrap()
+            .and_utc();
+        assert_eq!(compute_bars_age_css_class(inserted_at, now), "fresh");
+    }
+
+    #[test]
+    fn test_compute_bars_age_css_class_stale_on_sunday_with_old_ingest() {
+        // Sunday Jan 5, inserted Thursday Jan 2 → stale (missed Friday)
+        let now = NaiveDate::from_ymd_opt(2025, 1, 5)
             .unwrap()
             .and_hms_opt(9, 0, 0)
             .unwrap()
@@ -716,7 +781,7 @@ mod tests {
             .and_hms_opt(22, 0, 0)
             .unwrap()
             .and_utc();
-        assert_eq!(compute_bars_age_css_class(inserted_at, now), "fresh");
+        assert_eq!(compute_bars_age_css_class(inserted_at, now), "stale");
     }
 
     #[test]

@@ -112,8 +112,10 @@ axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"
+http = "1"
 mockito = "1.7"
 serial_test = "3.4"
+tower = { version = "0.5", features = ["util"] }
 testcontainers = "0.24"
 testcontainers-modules = { version = "0.12", features = [
   "localstack",

@@ -2,7 +2,7 @@
 //!
 //! A single background task polls production Postgres every [`POLL_INTERVAL_SECONDS`]
 //! seconds and updates [`DashboardState`] behind a [`SharedState`] lock. All
-//! ratatui render passes read from the cache without touching the database
+//! HTTP request handlers read from the cache without touching the database
 //! directly, so viewer count does not affect Postgres connection load.
 //!
 //! A separate [`spawn_event_listener_task`] subscribes to the `events` NOTIFY
@@ -179,7 +179,7 @@ pub struct EventEntry {
 /// All data shown across the five dashboard tabs.
 ///
 /// Updated atomically by the background polling task and the event listener.
-/// The ratatui render loop reads this under a shared lock without ever blocking
+/// HTTP request handlers read this under a shared lock without ever blocking
 /// on database I/O.
 #[derive(Debug, Default)]
 pub struct DashboardState {

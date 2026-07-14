@@ -46,15 +46,58 @@ async fn render_dashboard(State(state): State<SharedState>) -> Html<String> {
 mod tests {
     use super::*;
     use crate::dashboard::cache::DashboardState;
+    use http::Request;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+    use tower::ServiceExt;
 
-    #[test]
-    fn test_router_builds_without_panic() {
+    fn build_router() -> Router {
         let state: SharedState = Arc::new(RwLock::new(DashboardState::default()));
-        let _router: Router = Router::new()
+        Router::new()
             .route("/", get(render_dashboard))
             .route("/health", get(|| async { "ok" }))
-            .with_state(state);
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let router = build_router();
+        let request = Request::builder()
+            .uri("/health")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_endpoint() {
+        let router = build_router();
+        let request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header should be present")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("text/html"),
+            "expected text/html, got {content_type}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("OSCM"));
     }
 }
