@@ -506,7 +506,7 @@ in {
     #   Reset  — drop and recreate the empty database. Run before create after breaking changes.
 
     # Opens an interactive psql session against the local fund database.
-    "database:connect".exec = "psql -h localhost -p 5432 -d fund";
+    "database:connect".exec = "exec psql -h localhost -p 5432 -d fund";
 
     # Drops and recreates the empty fund database. Run before database:create when
     # recovering from a breaking schema change.
