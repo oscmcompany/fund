@@ -87,11 +87,11 @@ async fn refresh_active_symbols(state: &State, pool: &sqlx::PgPool) {
     match database::get_active_tickers(pool).await {
         Ok(tickers) => {
             let symbol_set: HashSet<Ticker> = tickers.into_iter().collect();
-            info!("Refreshed active symbols, count: {}", symbol_set.len());
+            info!(rows = symbol_set.len(), "Refreshed active symbols");
             let mut guard = state.active_symbols.write().await;
             *guard = symbol_set;
         }
-        Err(error) => warn!("Failed to refresh active symbols: {}", error),
+        Err(error) => warn!(error = %error, "Failed to refresh active symbols"),
     }
 }
 
@@ -109,8 +109,8 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
 
     let url = format!("{}/{}", ALPACA_WS_BASE_URL, credentials.feed());
     info!(
-        "Connecting to Alpaca quote stream, feed: {}",
-        credentials.feed()
+        feed = credentials.feed(),
+        "Connecting to Alpaca quote stream"
     );
 
     let (ws_stream, _) = connect_async(&url).await?;
@@ -174,7 +174,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
             })
             .to_string();
             write.send(Message::Text(subscribe_json.into())).await?;
-            info!("Subscribed to {} symbol(s)", symbols.len());
+            info!(rows = symbols.len(), "Subscribed to symbols");
         } else {
             info!("No active symbols, skipping initial subscription");
         }
@@ -269,7 +269,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                                     })
                                     .to_string();
                                     write.send(Message::Text(subscribe_json.into())).await?;
-                                    info!("Resubscribed to {} symbol(s)", symbols.len());
+                                    info!(rows = symbols.len(), "Resubscribed to symbols");
                                 }
                             }
                             Some(event_type)
@@ -290,7 +290,7 @@ async fn run_quote_stream(state: &State) -> Result<(), Box<dyn std::error::Error
                         }
                     }
                     Err(error) => {
-                        warn!("PostgreSQL events listener error: {}", error);
+                        warn!(error = %error, "PostgreSQL events listener error");
                         return Err(error.into());
                     }
                 }
@@ -315,9 +315,9 @@ async fn flush_quotes(pool: &sqlx::PgPool, buffer: &mut Vec<EquityQuote>) {
     let quotes = std::mem::take(buffer);
     let count = quotes.len();
     match database::insert_equity_quotes(pool, &quotes).await {
-        Ok(_) => info!("Flushed {} quote(s) to database", count),
+        Ok(_) => info!(rows = count, "Flushed quotes to database"),
         Err(error) => {
-            error!("Failed to flush quotes to database: {}", error);
+            error!(error = %error, "Failed to flush quotes to database");
             *buffer = quotes;
         }
     }

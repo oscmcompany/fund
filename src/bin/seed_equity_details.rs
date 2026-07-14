@@ -72,7 +72,7 @@ async fn upload_to_s3(state: &State) -> Result<(), String> {
         .await
         .map_err(|error| format!("Failed to upload equity details to S3: {}", error))?;
 
-    tracing::info!("Uploaded equity details CSV to S3: {}", S3_KEY);
+    tracing::info!(key = S3_KEY, "Uploaded equity details CSV to S3");
     Ok(())
 }
 
@@ -97,7 +97,11 @@ async fn insert_into_postgresql(state: &State) -> Result<u64, String> {
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
 
-    let _tracing_guard = init_tracing("seed-equity-details-errors.log", Some("warn"));
+    let _tracing_guard = init_tracing(
+        "seed-equity-details-errors.log",
+        Some("warn"),
+        "seed-equity-details",
+    );
 
     let raw_arguments: Vec<String> = std::env::args().skip(1).collect();
     let target = match parse_arguments(&raw_arguments) {

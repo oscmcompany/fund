@@ -440,7 +440,7 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
     )
     .await?;
 
-    info!(count = pairs_closed, "Open pairs closed at end of day");
+    info!(rows = pairs_closed, "Open pairs closed at end of day");
 
     Ok(pairs_closed)
 }
@@ -638,7 +638,7 @@ async fn close_triggered_pairs(
             .await?;
     }
 
-    info!(count = signals.len(), "Triggered pairs closed");
+    info!(rows = signals.len(), "Triggered pairs closed");
     Ok(signals.len())
 }
 

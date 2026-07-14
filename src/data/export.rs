@@ -30,14 +30,14 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
     let count = bars.len();
 
     if count == 0 {
-        info!("No equity bars to export for {}", date);
+        info!(date = %date, "No equity bars to export");
         return Ok(0);
     }
 
     let mut dataframe = create_equity_bar_export_dataframe(&bars)?;
     let key = date_partitioned_key("data/equity/bars", date);
     write_dataframe_to_s3(state, &mut dataframe, &key).await?;
-    info!("Exported {} equity bars to S3: {}", count, key);
+    info!(rows = count, key = key, "Exported equity bars to S3");
 
     Ok(count)
 }
@@ -72,7 +72,7 @@ pub async fn export_equity_trading_history(
             .await
             .map_err(|error| format!("Failed to delete equity quotes: {}", error))?;
     } else {
-        info!("No equity quotes to export for {}", date);
+        info!(date = %date, "No equity quotes to export");
     }
 
     let predictions = database::query_equity_predictions_for_date(pool, date)
@@ -88,7 +88,7 @@ pub async fn export_equity_trading_history(
         )
         .await?;
     } else {
-        info!("No equity predictions to export for {}", date);
+        info!(date = %date, "No equity predictions to export");
     }
 
     let sessions = database::query_equity_rebalance_sessions(pool)

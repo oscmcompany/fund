@@ -7,6 +7,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 /// Initialize structured JSON tracing for a service.
 ///
+/// The `service` parameter identifies which service is emitting logs
+/// (e.g. `"data"`, `"inference"`, `"portfolio"`) and is included in the
+/// initial `Tracing initialized` log line for correlation.
+///
 /// Logs to stdout at the `RUST_LOG` level (default `info`). When the log
 /// directory is writable, also logs to a rolling daily file there; the
 /// directory is `FUND_LOG_DIR` when set, otherwise `/var/log/fund` (local
@@ -25,7 +29,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 /// Services that own stdout for terminal rendering (e.g. the dashboard TUI)
 /// should call [`init_tracing_file_only`] instead to avoid corrupting the
 /// alternate screen with JSON log output.
-pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerGuard> {
+pub fn init_tracing(
+    log_file: &str,
+    file_filter: Option<&str>,
+    service: &str,
+) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
     let stdout_layer = tracing_subscriber::fmt::layer().json().with_target(true);
@@ -78,7 +86,11 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
         }
     };
 
-    tracing::info!(fund_profile = %fund_profile, "Tracing initialized");
+    tracing::info!(
+        service = service,
+        fund_profile = %fund_profile,
+        "Tracing initialized"
+    );
     guard
 }
 
@@ -90,7 +102,7 @@ pub fn init_tracing(log_file: &str, file_filter: Option<&str>) -> Option<WorkerG
 ///
 /// When the log directory is not writable, tracing is silently disabled rather
 /// than falling back to stdout.
-pub fn init_tracing_file_only(log_file: &str) -> Option<WorkerGuard> {
+pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
     let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
@@ -126,7 +138,11 @@ pub fn init_tracing_file_only(log_file: &str) -> Option<WorkerGuard> {
         }
     };
 
-    tracing::info!(fund_profile = %fund_profile, "Tracing initialized");
+    tracing::info!(
+        service = service,
+        fund_profile = %fund_profile,
+        "Tracing initialized"
+    );
     guard
 }
 
@@ -168,34 +184,23 @@ mod tests {
     #[test]
     #[serial]
     fn test_init_tracing_is_idempotent() {
-        // Exercises both the fixed-directive file filter and the RUST_LOG-derived
-        // one, and confirms a second initialization is a no-op (try_init). Works
-        // whether or not the log directory is writable.
-        let _first = init_tracing("test-observability.log", Some("warn"));
-        let _second = init_tracing("test-observability.log", None);
+        let _first = init_tracing("test-observability.log", Some("warn"), "test");
+        let _second = init_tracing("test-observability.log", None, "test");
     }
 
     #[test]
     #[serial]
     fn test_fund_log_dir_override_enables_file_logging() {
-        // FUND_LOG_DIR pointing at a writable directory activates file logging
-        // (a returned guard) and the directory is created on demand. This is the
-        // local-dev path where /var/log/fund is not writable.
         let log_dir = env::temp_dir().join("fund-observability-test");
         let _ = std::fs::remove_dir_all(&log_dir);
         let previous_log_dir = env::var("FUND_LOG_DIR").ok();
         env::set_var("FUND_LOG_DIR", &log_dir);
 
-        let guard = init_tracing("test-observability.log", None);
+        let guard = init_tracing("test-observability.log", None, "test");
 
-        // try_init is global, so file logging is only guaranteed active when this
-        // test wins the initialization race; in either case the directory the
-        // override names must have been created.
         assert!(log_dir.is_dir());
         let _ = guard;
 
-        // Restore the runner's value rather than unconditionally unsetting it,
-        // so later tests see the environment they started with.
         match previous_log_dir {
             Some(value) => env::set_var("FUND_LOG_DIR", value),
             None => env::remove_var("FUND_LOG_DIR"),
@@ -206,22 +211,18 @@ mod tests {
     #[test]
     #[serial]
     fn test_fund_profile_env_var_is_read() {
-        // When FUND_PROFILE is set, init_tracing uses it without panicking.
-        // Since try_init is idempotent, this mainly confirms the env-var read path
-        // is exercised rather than hitting the unwrap_or_else default.
         let _restore = EnvVarRestoreGuard::save("FUND_PROFILE");
         // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
         unsafe { env::set_var("FUND_PROFILE", "test-profile") };
-        let _tracing_guard = init_tracing("test-profile-observability.log", None);
+        let _tracing_guard = init_tracing("test-profile-observability.log", None, "test");
     }
 
     #[test]
     #[serial]
     fn test_fund_profile_env_var_absent_uses_unknown() {
-        // When FUND_PROFILE is not set, init_tracing must not panic.
         let _restore = EnvVarRestoreGuard::save("FUND_PROFILE");
         // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
         unsafe { env::remove_var("FUND_PROFILE") };
-        let _tracing_guard = init_tracing("test-no-profile-observability.log", None);
+        let _tracing_guard = init_tracing("test-no-profile-observability.log", None, "test");
     }
 }

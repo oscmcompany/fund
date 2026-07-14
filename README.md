@@ -29,9 +29,13 @@ devenv --profile application up
 For remote development or production instances, you can provision VMs on `exe.dev`.
 
 ```sh
-# Include the --production flag for production instances
-bash tools/provision-application-vm
-bash tools/provision-trainer-vm
+# Development
+provision-development-application-vm
+provision-development-trainer-vm
+
+# Production
+provision-production-application-vm
+provision-production-trainer-vm
 ```
 
 #### Data

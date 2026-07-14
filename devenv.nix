@@ -366,10 +366,10 @@ in {
     '{}')"
   '';
 
-  scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm";
-  scripts.provision-production-application-vm.exec = "bash tools/provision-application-vm --production";
-  scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm";
-  scripts.provision-production-trainer-vm.exec = "bash tools/provision-trainer-vm --production";
+  scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm --environment development";
+  scripts.provision-production-application-vm.exec = "bash tools/provision-application-vm --environment production";
+  scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm --environment development";
+  scripts.provision-production-trainer-vm.exec = "bash tools/provision-trainer-vm --environment production";
 
   scripts.seed-equity-bars.exec = ''
     set -euo pipefail
@@ -558,7 +558,9 @@ in {
       MODEL_VERSION = "latest";
     };
 
-    processes.fund.exec = ''
+    # Shared setup: wait for PostgreSQL and apply schema before any module starts.
+    # process-compose `depends_on` ensures this completes first.
+    processes.database.exec = ''
       set -euo pipefail
       ${runtimeEnv}
       attempt=0
@@ -572,8 +574,34 @@ in {
         sleep 2
       done
       ${applySchema}
-      exec secretspec run -- cargo run --release --bin fund
     '';
+
+    processes.data = {
+      exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        exec secretspec run -- cargo run --release --bin fund -- --module data
+      '';
+      process-compose.depends_on.database.condition = "process_completed_successfully";
+    };
+
+    processes.inference = {
+      exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        exec secretspec run -- cargo run --release --bin fund -- --module inference
+      '';
+      process-compose.depends_on.database.condition = "process_completed_successfully";
+    };
+
+    processes.portfolio = {
+      exec = ''
+        set -euo pipefail
+        ${runtimeEnv}
+        exec secretspec run -- cargo run --release --bin fund -- --module portfolio
+      '';
+      process-compose.depends_on.database.condition = "process_completed_successfully";
+    };
   };
 
   profiles.trainer.module = {
@@ -596,7 +624,9 @@ in {
       echo "    devenv --profile trainer shell     Model training environment"
       echo ""
       echo "  Services (application profile):"
-      echo "    Fund:         consolidated event-driven binary"
+      echo "    Data:         market data sync, quote streaming, nightly exports"
+      echo "    Inference:    model artifact polling, prediction pipeline"
+      echo "    Portfolio:    rebalance orchestration, liquidation"
       echo "    PostgreSQL:   localhost:5432/fund"
       echo ""
       echo "  Secrets (secretspec):"
