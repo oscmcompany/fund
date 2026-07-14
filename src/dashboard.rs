@@ -1,8 +1,8 @@
 //! Dashboard service: HTTP server rendering a read-only fund status page.
 //!
-//! Entry point is [`run`], which connects to the read-only production Postgres
-//! instance, spawns the background polling and event-listener tasks, then
-//! starts the Axum HTTP server.
+//! Entry point is [`run`], which connects to the local Postgres instance,
+//! spawns the background polling and event-listener tasks, then starts the
+//! Axum HTTP server.
 //!
 //! Data flow:
 //! - A single [`cache::spawn_polling_task`] refreshes all view data every 30

@@ -28,27 +28,38 @@ devenv --profile application up
 
 For remote development or production instances, you can provision VMs on `exe.dev`.
 
+**Development:**
+
 ```sh
-# Development
 provision-development-application-vm
 provision-development-trainer-vm
+```
 
-# Production
+**Production:**
+
+```sh
 provision-production-application-vm
 provision-production-trainer-vm
 ```
+
+> On production VMs, services run in a tmux session named `fund`. If you SSH in directly,
+> attach with `tmux attach -t fund`. Detach with `Ctrl-Space d` (the prefix is `C-Space`,
+> not the default `C-b`). The git-sync poller logs to `/var/log/fund/git-sync-poll.log`.
 
 #### Data
 
 After launching, the database has the schema applied but equity details and historical bars must
 be manually populated. Use the data seeding tasks to bootstrap both S3 and PostgreSQL.
 
+**Full bootstrap** to run all at once:
+
 ```sh
-# Full bootstrap: seed equity details and bars into S3 and PostgreSQL
 SEED_SOURCE=massive SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
+```
 
-# Or run individually:
+**Individual steps** if you need to run them separately:
 
+```sh
 # Seed equity details (embedded CSV) into S3 and/or PostgreSQL
 SEED_TARGET=all devenv tasks run data:equity-details
 
@@ -58,6 +69,25 @@ SEED_SOURCE=massive SEED_TARGET=s3 SEED_START_DATE=YYYY-MM-DD devenv tasks run d
 # Populate PostgreSQL from existing S3 Parquet (avoids re-fetching from Massive)
 SEED_SOURCE=s3 SEED_TARGET=postgresql SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars
 ```
+
+#### Dashboard
+
+The dashboard runs as a devenv process alongside the other services. It starts automatically
+with `devenv --profile application up` and connects to the local PostgreSQL instance.
+
+**Public access** (run once from your local machine after provisioning):
+
+```sh
+# Set the dashboard port as the default HTTP proxy target
+ssh exe.dev share port oscm-fund-production-application 8084
+
+# Make the HTTP proxy publicly accessible
+ssh exe.dev share set-public oscm-fund-production-application
+```
+
+The production dashboard is available at `https://oscm-fund-production-application.exe.xyz/`.
+For development VMs, the URL follows the pattern
+`https://oscm-fund-development-application-<first_name.last_name>.exe.xyz:8084/`.
 
 ### Principles
 
