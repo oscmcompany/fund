@@ -67,7 +67,7 @@ async fn main() {
     let _tracing_guard = fund::common::observability::init_tracing(&log_file, None, service_name);
 
     if let Err(error) = run(module).await {
-        error!("{}", error);
+        error!(error = %error, "Run failed");
         eprintln!("{}", error);
         std::process::exit(1);
     }
