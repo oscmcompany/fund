@@ -1,5 +1,5 @@
 #[tokio::main]
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
-    fund::dashboard_service::run().await;
+    fund::dashboard::run().await;
 }
