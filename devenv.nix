@@ -25,6 +25,11 @@
       -f ${./schema.sql} \
       --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
     echo "Schema applied"
+    echo "Applying dashboard reader role..."
+    psql -h localhost -p 5432 -d fund \
+      -f ${./tools/dashboard_reader_setup.sql} \
+      --quiet --set ON_ERROR_STOP=on --set client_min_messages=warning
+    echo "Dashboard reader role applied"
   '';
 
   # Training lookback window. Read from the environment so it can be overridden
@@ -599,6 +604,15 @@ in {
         set -euo pipefail
         ${runtimeEnv}
         exec secretspec run -- cargo run --release --bin fund -- --module portfolio
+      '';
+      process-compose.depends_on.schema.condition = "process_completed_successfully";
+    };
+
+    processes.dashboard = {
+      exec = ''
+        set -euo pipefail
+        export DATABASE_URL="postgresql://dashboard_reader@localhost:5432/fund"
+        exec cargo run --release --features dashboard --bin dashboard
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
     };

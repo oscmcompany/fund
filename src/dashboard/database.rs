@@ -1,8 +1,7 @@
 //! Read-only database queries for the dashboard service.
 //!
-//! All queries use raw `sqlx::query` (no compile-time macros) since the
-//! dashboard connects to production with a read-only user whose schema
-//! matches the live database, not the local `.sqlx` cache.
+//! All queries use raw `sqlx::query` (no compile-time macros) so the
+//! dashboard has no `.sqlx` offline cache entries to maintain.
 
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use num_traits::ToPrimitive;

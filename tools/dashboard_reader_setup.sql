@@ -1,11 +1,9 @@
 -- Idempotent: creates the dashboard_reader Postgres role and grants
--- read-only access to the seven tables queried by the dashboard.
+-- read-only access to the tables queried by the dashboard.
 --
--- Apply against the fund database after PostgreSQL is running:
+-- Applied automatically by the schema process during devenv startup.
+-- Can also be run manually:
 --   psql -h localhost -p 5432 -d fund -f tools/dashboard_reader_setup.sql
---
--- The role's login password is managed separately via secretspec
--- (profiles.dashboard, key: DATABASE_URL).
 
 DO $$
 BEGIN

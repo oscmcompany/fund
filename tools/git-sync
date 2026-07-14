@@ -6,6 +6,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="/tmp/git-sync.pid"
 POLL_INTERVAL=60
 RESTART_FLAG="/tmp/git-sync-restart"
+POLL_LOG_DIR="/var/log/fund"
+POLL_LOG="$POLL_LOG_DIR/git-sync-poll.log"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
@@ -26,18 +28,19 @@ kill_port_holders() {
 }
 
 # ------------------------------------------------------------------ #
-# Subcommand: poll (runs in background tmux pane)
+# Subcommand: poll (runs as background process, logs to file)
 # ------------------------------------------------------------------ #
 run_poll() {
-  log "Poller started (PID $$)"
+  mkdir -p "$POLL_LOG_DIR"
+  log "Poller started (PID $$)" >> "$POLL_LOG" 2>&1
 
   while true; do
     sleep "$POLL_INTERVAL"
 
     cd "$REPO_ROOT"
 
-    if ! git fetch origin master 2>/dev/null; then
-      log "git fetch failed, will retry next cycle"
+    if ! git fetch origin master >> "$POLL_LOG" 2>&1; then
+      log "git fetch failed, will retry next cycle" >> "$POLL_LOG"
       continue
     fi
 
@@ -45,7 +48,7 @@ run_poll() {
     remote_head="$(git rev-parse origin/master)"
 
     if [[ "$local_head" != "$remote_head" ]]; then
-      log "New commits detected (local=$local_head remote=$remote_head)"
+      log "New commits detected (local=$local_head remote=$remote_head)" >> "$POLL_LOG"
       touch "$RESTART_FLAG"
       # Kill devenv (child of the run_up shell) directly -- no SIGINT to the shell
       pkill -TERM -P "$(cat "$PID_FILE")" 2>/dev/null || true
@@ -71,8 +74,8 @@ run_up() {
 
   cleanup() {
     log "Received shutdown signal, cleaning up"
-    # Kill the poller pane if it exists
-    tmux kill-pane -t fund:0.1 2>/dev/null || true
+    # Kill the background poller process
+    kill "$POLL_PID" 2>/dev/null || true
     rm -f "$PID_FILE" "$RESTART_FLAG"
     log "Shutdown complete"
     exit 0
@@ -94,10 +97,9 @@ run_up() {
 
   log "git-sync starting in $REPO_ROOT"
 
-  # Kill stale poller pane before spawning a new one
-  tmux kill-pane -t fund:0.1 2>/dev/null || true
   rm -f "$RESTART_FLAG"
-  tmux split-window -t fund:0 -v -l 6 "bash $SCRIPT_DIR/git-sync poll"
+  bash "$SCRIPT_DIR/git-sync" poll &
+  POLL_PID=$!
 
   # Main loop: run devenv foreground, restart when poller signals
   while true; do
