@@ -46,13 +46,9 @@ run_poll() {
 
     if [[ "$local_head" != "$remote_head" ]]; then
       log "New commits detected (local=$local_head remote=$remote_head)"
-      log "Resetting to origin/master"
-      git reset --hard origin/master
-      devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
-      log "Now at $(git rev-parse --short HEAD)"
       touch "$RESTART_FLAG"
-      # Send SIGTERM to the main pane's devenv process via the session
-      tmux send-keys -t fund:0.0 C-c
+      # Kill devenv (child of the run_up shell) directly -- no SIGINT to the shell
+      pkill -TERM -P "$(cat "$PID_FILE")" 2>/dev/null || true
     fi
   done
 }
@@ -98,7 +94,8 @@ run_up() {
 
   log "git-sync starting in $REPO_ROOT"
 
-  # Start the poller in a small bottom tmux pane
+  # Kill stale poller pane before spawning a new one
+  tmux kill-pane -t fund:0.1 2>/dev/null || true
   rm -f "$RESTART_FLAG"
   tmux split-window -t fund:0 -v -l 6 "bash $SCRIPT_DIR/git-sync poll"
 
@@ -112,7 +109,10 @@ run_up() {
     # If the restart flag is set, the poller pulled new code
     if [[ -f "$RESTART_FLAG" ]]; then
       rm -f "$RESTART_FLAG"
-      log "Restarting with updated code"
+      log "Resetting to origin/master"
+      git reset --hard origin/master
+      devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
+      log "Restarting with updated code ($(git rev-parse --short HEAD))"
       continue
     fi
 
