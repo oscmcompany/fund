@@ -478,21 +478,29 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
     let dump_path = "/tmp/fund-backup.dump";
     let dump_gz_path = "/tmp/fund-backup.dump.gz";
 
-    let dump_status = tokio::process::Command::new("pg_dump")
-        .args([
-            "--format=custom",
-            "--file",
-            dump_path,
-            "--host",
-            &host,
-            "--port",
-            &port.to_string(),
-            "--username",
-            &username,
-            "--dbname",
-            &dbname,
-        ])
-        .env("PGPASSWORD", &password)
+    let mut args = vec![
+        "--format=custom".to_string(),
+        "--file".to_string(),
+        dump_path.to_string(),
+        "--host".to_string(),
+        host,
+        "--port".to_string(),
+        port.to_string(),
+        "--dbname".to_string(),
+        dbname,
+    ];
+    if let Some(ref name) = username {
+        args.push("--username".to_string());
+        args.push(name.clone());
+    }
+
+    let mut command = tokio::process::Command::new("pg_dump");
+    command.args(&args);
+    if let Some(ref pass) = password {
+        command.env("PGPASSWORD", pass);
+    }
+
+    let dump_status = command
         .status()
         .await
         .map_err(|error| format!("Failed to spawn pg_dump: {}", error))?;
@@ -554,23 +562,32 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
 ///
 /// Returns `(host, username, port, dbname, password)`.
 /// Supports `postgres://` and `postgresql://` schemes.
-fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String), String> {
+/// Handles credential-less URLs (e.g., `postgresql://localhost:5432/fund`)
+/// by returning `None` for username and password, allowing the caller to
+/// omit `--username` and `PGPASSWORD` so libpq falls back to OS defaults.
+/// Uses `rsplit_once('@')` so passwords containing `@` are parsed correctly.
+fn parse_postgres_url(
+    url: &str,
+) -> Result<(String, Option<String>, u16, String, Option<String>), String> {
     let without_scheme = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))
         .ok_or_else(|| "DATABASE_URL must start with postgres:// or postgresql://".to_string())?;
 
-    let (userinfo, rest) = without_scheme
-        .split_once('@')
-        .ok_or_else(|| "DATABASE_URL missing '@' separator".to_string())?;
+    let (username, password, hostinfo_and_db) = match without_scheme.rsplit_once('@') {
+        Some((userinfo, rest)) => {
+            let (username, password) = match userinfo.split_once(':') {
+                Some((user, pass)) => (Some(user.to_string()), Some(pass.to_string())),
+                None => (Some(userinfo.to_string()), None),
+            };
+            (username, password, rest)
+        }
+        None => (None, None, without_scheme),
+    };
 
-    let (hostinfo, dbname) = rest
+    let (hostinfo, dbname) = hostinfo_and_db
         .split_once('/')
         .ok_or_else(|| "DATABASE_URL missing database name after '/'".to_string())?;
-
-    let (username, password) = userinfo
-        .split_once(':')
-        .ok_or_else(|| "DATABASE_URL missing ':' between username and password".to_string())?;
 
     let (host, port_str) = hostinfo.split_once(':').unwrap_or((hostinfo, "5432"));
 
@@ -583,10 +600,10 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
 
     Ok((
         host.to_string(),
-        username.to_string(),
+        username,
         port,
         dbname.to_string(),
-        password.to_string(),
+        password,
     ))
 }
 
@@ -847,10 +864,10 @@ mod tests {
         let (host, username, port, dbname, password) =
             parse_postgres_url("postgres://alice:s3cr3t@db.example.com:5433/mydb").unwrap();
         assert_eq!(host, "db.example.com");
-        assert_eq!(username, "alice");
+        assert_eq!(username, Some("alice".to_string()));
         assert_eq!(port, 5433);
         assert_eq!(dbname, "mydb");
-        assert_eq!(password, "s3cr3t");
+        assert_eq!(password, Some("s3cr3t".to_string()));
     }
 
     #[test]
@@ -875,10 +892,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_postgres_url_missing_at_returns_error() {
-        let result = parse_postgres_url("postgres://user:passhost/db");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("'@'"));
+    fn test_parse_postgres_url_credential_less() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgresql://localhost:5432/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(username, None);
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "fund");
+        assert_eq!(password, None);
+    }
+
+    #[test]
+    fn test_parse_postgres_url_credential_less_default_port() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://localhost/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(username, None);
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "fund");
+        assert_eq!(password, None);
     }
 
     #[test]
@@ -959,14 +991,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_postgres_url_missing_password_separator_returns_error() {
-        // No ':' between username and password — should surface a clear error.
-        let result = parse_postgres_url("postgres://useronly@host/db");
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("':'"),
-            "Expected error about missing ':' between username and password"
-        );
+    fn test_parse_postgres_url_username_only() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://useronly@host/db").unwrap();
+        assert_eq!(host, "host");
+        assert_eq!(username, Some("useronly".to_string()));
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "db");
+        assert_eq!(password, None);
+    }
+
+    #[test]
+    fn test_parse_postgres_url_password_containing_at() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://user:p@ss@host:5432/db").unwrap();
+        assert_eq!(host, "host");
+        assert_eq!(username, Some("user".to_string()));
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "db");
+        assert_eq!(password, Some("p@ss".to_string()));
     }
 
     #[test]
