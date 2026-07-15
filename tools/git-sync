@@ -14,10 +14,11 @@ log() {
 # Resolve poll log path. Called after .env is sourced so FUND_LOG_DIR is available.
 init_poll_log() {
   local log_directory="${FUND_LOG_DIR:-/var/log/fund}"
+  mkdir -p "$log_directory" 2>/dev/null || true
   if [[ ! -w "$log_directory" ]]; then
     log_directory="${HOME}/.local/state/fund/log"
+    mkdir -p "$log_directory"
   fi
-  mkdir -p "$log_directory"
   POLL_LOG="$log_directory/git-sync-poll.log"
 }
 
@@ -67,12 +68,12 @@ run_poll() {
       # Kill process-compose (the process manager spawned by devenv) which
       # will in turn terminate all managed services. Also kill any devenv
       # process. This is more reliable than chasing PIDs through the tree.
-      if pkill -TERM -f "process-compose" 2>/dev/null; then
+      if pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null; then
         log_poll "Sent SIGTERM to process-compose"
       else
         log_poll "WARNING: process-compose not found"
       fi
-      if pkill -TERM -f "devenv.*--profile application" 2>/dev/null; then
+      if pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null; then
         log_poll "Sent SIGTERM to devenv"
       else
         log_poll "WARNING: devenv process not found"
@@ -102,9 +103,9 @@ run_up() {
     log "Received shutdown signal, cleaning up"
     # Kill the background poller process
     [[ -n "$POLL_PID" ]] && kill "$POLL_PID" 2>/dev/null || true
-    # Kill devenv and process-compose
-    pkill -TERM -f "process-compose" 2>/dev/null || true
-    pkill -TERM -f "devenv.*--profile application" 2>/dev/null || true
+    # Kill devenv and process-compose (scoped to current user)
+    pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null || true
+    pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null || true
     rm -f "$PID_FILE" "$RESTART_FLAG"
     log "Shutdown complete"
     exit 0

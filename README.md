@@ -50,7 +50,7 @@ If the dashboard reader database role does not exist (e.g., on a freshly provisi
 before the schema process has run with the setup script), apply it manually:
 
 ```sh
-psql -h localhost -p 5432 -d fund -f tools/dashboard_reader_setup.sql
+psql -h localhost -p 5432 -U exedev -d fund -f tools/dashboard_reader_setup.sql
 ```
 
 #### Data

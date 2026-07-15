@@ -43,8 +43,8 @@ If the SSH connection fails, ask the user which VM to target.
 Before running any AWS CLI commands, ask the user which AWS CLI profile to use
 (e.g., "Which AWS profile should I use for Secrets Manager access?"). Use their
 answer in all `--profile <PROFILE>` flags. If the user declines or the profile is
-not authenticated, skip Alpaca API sections (Phase 2 Group B) and note them as
-SKIPPED in the report.
+not authenticated, skip both Alpaca API sections (Phase 2 Group B) and the S3
+artifact freshness check, and note them as SKIPPED in the report.
 
 ## Execution order
 
@@ -86,10 +86,11 @@ Run all of these in parallel via the SSH tunnel.
 
 ### A0. Fund process health
 
-Check that the consolidated fund binary is running via SSH:
+Check that the consolidated fund binary is running via SSH (use the same VM
+host from the connection step above):
 
 ```bash
-ssh oscm-fund-production-application.exe.xyz 'pgrep -f "cargo run.*--bin fund" || pgrep -f "target/release/fund"'
+ssh <VM_HOST> 'pgrep -f "cargo run.*--bin fund" || pgrep -f "target/release/fund"'
 ```
 
 Flag if no fund process is found.
@@ -177,6 +178,16 @@ SELECT max(id) as latest_event_id FROM events;
 ```
 
 Flag if any consumer is more than 100 events behind.
+
+### A9. Data freshness
+
+```sql
+SELECT max(timestamp) as latest_bar FROM equity_bars;
+SELECT max(timestamp) as latest_prediction FROM equity_predictions;
+```
+
+Apply weekday-aware staleness logic (data syncs run at 05:00 UTC weekdays).
+These timestamps are also used for comparison with S3 artifact timestamps.
 
 ---
 
