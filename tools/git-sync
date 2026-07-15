@@ -6,22 +6,31 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="/tmp/git-sync.pid"
 POLL_INTERVAL=60
 RESTART_FLAG="/tmp/git-sync-restart"
-POLL_LOG_DIR="${FUND_LOG_DIR:-/var/log/fund}"
-if [[ ! -w "$POLL_LOG_DIR" ]]; then
-  POLL_LOG_DIR="${HOME}/.local/state/fund/log"
-fi
-mkdir -p "$POLL_LOG_DIR"
-POLL_LOG="$POLL_LOG_DIR/git-sync-poll.log"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+# Resolve poll log path. Called after .env is sourced so FUND_LOG_DIR is available.
+init_poll_log() {
+  local log_directory="${FUND_LOG_DIR:-/var/log/fund}"
+  if [[ ! -w "$log_directory" ]]; then
+    log_directory="${HOME}/.local/state/fund/log"
+  fi
+  mkdir -p "$log_directory"
+  POLL_LOG="$log_directory/git-sync-poll.log"
+}
+
+# Log a message to the poll log file (used by the poller subprocess).
+log_poll() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1" >> "$POLL_LOG" 2>&1
 }
 
 # ------------------------------------------------------------------ #
 # Clean up stale processes on service ports before starting
 # ------------------------------------------------------------------ #
 kill_port_holders() {
-  for port in 8080 8082 8083; do
+  for port in 8080 8082 8083 8084; do
     local pids
     pids="$(lsof -ti :"$port" 2>/dev/null || true)"
     if [[ -n "$pids" ]]; then
@@ -35,7 +44,8 @@ kill_port_holders() {
 # Subcommand: poll (runs as background process, logs to file)
 # ------------------------------------------------------------------ #
 run_poll() {
-  log "Poller started (PID $$)" >> "$POLL_LOG" 2>&1
+  init_poll_log
+  log_poll "Poller started (PID $$)"
 
   while true; do
     sleep "$POLL_INTERVAL"
@@ -43,7 +53,7 @@ run_poll() {
     cd "$REPO_ROOT"
 
     if ! git fetch origin master >> "$POLL_LOG" 2>&1; then
-      log "git fetch failed, will retry next cycle" >> "$POLL_LOG"
+      log_poll "git fetch failed, will retry next cycle"
       continue
     fi
 
@@ -51,10 +61,22 @@ run_poll() {
     remote_head="$(git rev-parse origin/master)"
 
     if [[ "$local_head" != "$remote_head" ]]; then
-      log "New commits detected (local=$local_head remote=$remote_head)" >> "$POLL_LOG"
+      log_poll "New commits detected (local=$local_head remote=$remote_head)"
       touch "$RESTART_FLAG"
-      # Kill devenv (child of the run_up shell) directly -- no SIGINT to the shell
-      pkill -TERM -P "$(cat "$PID_FILE")" 2>/dev/null || true
+
+      # Kill process-compose (the process manager spawned by devenv) which
+      # will in turn terminate all managed services. Also kill any devenv
+      # process. This is more reliable than chasing PIDs through the tree.
+      if pkill -TERM -f "process-compose" 2>/dev/null; then
+        log_poll "Sent SIGTERM to process-compose"
+      else
+        log_poll "WARNING: process-compose not found"
+      fi
+      if pkill -TERM -f "devenv.*--profile application" 2>/dev/null; then
+        log_poll "Sent SIGTERM to devenv"
+      else
+        log_poll "WARNING: devenv process not found"
+      fi
     fi
   done
 }
@@ -80,6 +102,9 @@ run_up() {
     log "Received shutdown signal, cleaning up"
     # Kill the background poller process
     [[ -n "$POLL_PID" ]] && kill "$POLL_PID" 2>/dev/null || true
+    # Kill devenv and process-compose
+    pkill -TERM -f "process-compose" 2>/dev/null || true
+    pkill -TERM -f "devenv.*--profile application" 2>/dev/null || true
     rm -f "$PID_FILE" "$RESTART_FLAG"
     log "Shutdown complete"
     exit 0
@@ -99,6 +124,7 @@ run_up() {
     log "WARNING: no .env found, FUND_PROFILE will be empty"
   fi
 
+  init_poll_log
   log "git-sync starting in $REPO_ROOT"
 
   rm -f "$RESTART_FLAG"
@@ -109,7 +135,8 @@ run_up() {
   while true; do
     kill_port_holders
     log "Starting devenv --profile application up"
-    # Run devenv in foreground -- process-compose TUI renders here
+    # Run devenv in the foreground so the process-compose TUI renders in
+    # the tmux pane. The poller terminates it by name (see run_poll).
     devenv --profile application up || true
 
     # If the restart flag is set, the poller pulled new code
