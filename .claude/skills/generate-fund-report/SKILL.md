@@ -4,7 +4,9 @@ description: >
   Daily fund briefing combining platform health and trading activity.
   Use when the user asks "morning report", "daily report", "fund briefing",
   "how is the fund", "fund status", "trading status", "portfolio summary",
-  "what happened overnight", "morning briefing", or "how are we doing".
+  "what happened overnight", "morning briefing", "how are we doing",
+  "is everything running", "check the platform", "platform status",
+  "are services healthy", "check health", or "is the fund ok".
 ---
 
 # Daily Fund Briefing
@@ -31,10 +33,18 @@ pg_isready -h localhost -p 15432 || { echo "SSH tunnel failed"; exit 1; }
 Then query with:
 
 ```bash
-psql -h localhost -p 15432 -d fund -c "<QUERY>"
+psql -h localhost -p 15432 -U exedev -d fund -c "<QUERY>"
 ```
 
 If the SSH connection fails, ask the user which VM to target.
+
+## AWS profile
+
+Before running any AWS CLI commands, ask the user which AWS CLI profile to use
+(e.g., "Which AWS profile should I use for Secrets Manager access?"). Use their
+answer in all `--profile <PROFILE>` flags. If the user declines or the profile is
+not authenticated, skip both Alpaca API sections (Phase 2 Group B) and the S3
+artifact freshness check, and note them as SKIPPED in the report.
 
 ## Execution order
 
@@ -51,7 +61,7 @@ If the SSH connection fails, ask the user which VM to target.
 Retrieve Alpaca credentials from AWS Secrets Manager for direct API calls:
 
 ```bash
-aws secretsmanager get-secret-value --profile oscm --region us-east-1 \
+aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
   --secret-id 'fund/production/portfolio-manager/all' \
   --query 'SecretString' --output text \
   | jq -r '{key: .ALPACA_API_KEY_ID, secret: .ALPACA_API_SECRET, paper: .ALPACA_IS_PAPER}'
@@ -66,13 +76,24 @@ Determine the base URL:
 - If `IS_PAPER` is `"true"`: `https://paper-api.alpaca.markets`
 - Otherwise: `https://api.alpaca.markets`
 
-If credential retrieval fails, skip Group B and suggest `aws sso login --profile oscm`.
+If credential retrieval fails, skip Group B and suggest `aws sso login --profile <PROFILE>`.
 
 ---
 
-## Phase 2, Group A: Database queries
+## Phase 2, Group A: Database queries and process checks
 
 Run all of these in parallel via the SSH tunnel.
+
+### A0. Fund process health
+
+Check that the consolidated fund binary is running via SSH (use the same VM
+host from the connection step above):
+
+```bash
+ssh <VM_HOST> 'pgrep -f "cargo run.*--bin fund" || pgrep -f "target/release/fund"'
+```
+
+Flag if no fund process is found.
 
 ### A1. Latest portfolio snapshot
 
@@ -142,6 +163,32 @@ GROUP BY event_type
 ORDER BY latest_event DESC;
 ```
 
+### A8. Consumer offsets
+
+```sql
+SELECT consumer_name, last_event_id, updated_at
+FROM event_consumer_offsets
+ORDER BY updated_at DESC;
+```
+
+Compare each consumer's `last_event_id` against:
+
+```sql
+SELECT max(id) as latest_event_id FROM events;
+```
+
+Flag if any consumer is more than 100 events behind.
+
+### A9. Data freshness
+
+```sql
+SELECT max(timestamp) as latest_bar FROM equity_bars;
+SELECT max(timestamp) as latest_prediction FROM equity_predictions;
+```
+
+Apply weekday-aware staleness logic (data syncs run at 05:00 UTC weekdays).
+These timestamps are also used for comparison with S3 artifact timestamps.
+
 ---
 
 ## Phase 2, Group B: Alpaca API calls
@@ -185,6 +232,29 @@ curl -sSf -w '\n%{http_code}' \
 For each position extract: `symbol`, `side`, `market_value`, `cost_basis`,
 `unrealized_pl`, `unrealized_plpc`.
 
+### S3 artifact freshness (optional, requires AWS profile)
+
+Skip if AWS credentials are unavailable. Discover buckets dynamically:
+
+```bash
+aws s3api list-buckets --profile <PROFILE> --region us-east-1 \
+  --query 'Buckets[?starts_with(Name, `fund-model-artifacts`) || starts_with(Name, `oscm-fund`)].Name' --output text
+```
+
+List recent model artifacts:
+
+```bash
+aws s3 ls s3://<ARTIFACTS_BUCKET>/models/tide/ --profile <PROFILE> --region us-east-1 --recursive | sort | tail -3
+```
+
+List recent equity bar exports:
+
+```bash
+aws s3 ls s3://<DATA_BUCKET>/data/equity/bars/ --profile <PROFILE> --region us-east-1 | sort | tail -5
+```
+
+Compare timestamps with model run and equity bar data from Group A. Flag discrepancies.
+
 ---
 
 ## Phase 3: Report output
@@ -200,6 +270,11 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 
   Market: OPEN / CLOSED (next open/close: <time>)
   Account mode: PAPER / LIVE
+
+--- PROCESS HEALTH ---
+
+  Fund process:    OK (PID 12345) / ERROR (not running)
+  PostgreSQL:      OK (connected)
 
 --- ACCOUNT ---
 
@@ -268,12 +343,27 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
   equity_bars_sync_requested        1       2026-07-10 05:00
   ...
 
+--- CONSUMER OFFSETS ---
+
+  Consumer              Last Event ID   Latest Event ID   Lag    Updated
+  --------------------  -------------   ---------------   ----   -------------------
+  data                  420             421               1      2026-07-10 05:01
+  ...
+
+  (Flag any consumer with lag > 100)
+
 --- REBALANCE SESSIONS ---
 
   Triggered            Reason              Status     Model Run
   -------------------  ------------------  ---------  ----------
   2026-07-09 09:31     market_session       completed  tide-2026-...
   ...
+
+--- S3 ARTIFACTS ---
+
+  Latest model artifact:    s3://.../models/tide/2026-07-09/...
+  Latest equity bar export: s3://.../data/equity/bars/2026-07-09.parquet
+  (or SKIPPED if AWS credentials unavailable)
 ```
 
 ---
@@ -283,9 +373,12 @@ with a sign prefix (e.g., `+1.23%`, `-0.45%`).
 | Failure | Behavior |
 |---------|----------|
 | SSH tunnel fails | Ask user which VM to target |
-| AWS CLI / SSO not authenticated | Skip Alpaca sections, suggest `aws sso login --profile oscm` |
+| Fund process not found | Mark PROCESS HEALTH as ERROR, suggest checking `devenv --profile application up` |
+| AWS CLI / SSO not authenticated | Skip Alpaca and S3 sections, suggest `aws sso login --profile <PROFILE>` |
 | Alpaca 401/403 | Mark trading sections as ERROR, suggest checking secret values |
 | Database query fails | Mark that section DEGRADED, continue with remaining queries |
+| Consumer lag > 100 | Flag in CONSUMER OFFSETS, suggest checking service logs in `/var/log/fund/` |
+| S3 timestamps don't match DB | Flag in S3 ARTIFACTS section |
 | No positions | Display "No open positions" |
 | No recent orders | Display "No recent orders" |
 | No active pairs | Display "No active pairs" |

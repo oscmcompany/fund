@@ -213,7 +213,7 @@ in {
     ${runtimeEnv}
     BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
     echo "Creating database backup..."
-    pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
+    pg_dump -Fc -h localhost -p 5432 -U exedev fund > /tmp/fund-latest.dump
     gzip -f /tmp/fund-latest.dump
     echo "Uploading backup to S3..."
     aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
@@ -224,8 +224,8 @@ in {
   scripts.reset-database.exec = ''
     set -euo pipefail
     echo "Resetting fund database..."
-    psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
-    psql -h localhost -p 5432 -d postgres -c "CREATE DATABASE fund"
+    psql -h localhost -p 5432 -U exedev -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
+    psql -h localhost -p 5432 -U exedev -d postgres -c "CREATE DATABASE fund"
     echo "Fund database reset"
   '';
 
