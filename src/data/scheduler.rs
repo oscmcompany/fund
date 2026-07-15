@@ -554,23 +554,27 @@ async fn run_backup_job(state: &State) -> Result<usize, String> {
 ///
 /// Returns `(host, username, port, dbname, password)`.
 /// Supports `postgres://` and `postgresql://` schemes.
+/// Handles credential-less URLs (e.g., `postgresql://localhost:5432/fund`)
+/// by defaulting username and password to empty strings.
 fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String), String> {
     let without_scheme = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))
         .ok_or_else(|| "DATABASE_URL must start with postgres:// or postgresql://".to_string())?;
 
-    let (userinfo, rest) = without_scheme
-        .split_once('@')
-        .ok_or_else(|| "DATABASE_URL missing '@' separator".to_string())?;
+    let (username, password, hostinfo_and_db) =
+        if let Some((userinfo, rest)) = without_scheme.split_once('@') {
+            let (username, password) = userinfo.split_once(':').ok_or_else(|| {
+                "DATABASE_URL missing ':' between username and password".to_string()
+            })?;
+            (username.to_string(), password.to_string(), rest)
+        } else {
+            (String::new(), String::new(), without_scheme)
+        };
 
-    let (hostinfo, dbname) = rest
+    let (hostinfo, dbname) = hostinfo_and_db
         .split_once('/')
         .ok_or_else(|| "DATABASE_URL missing database name after '/'".to_string())?;
-
-    let (username, password) = userinfo
-        .split_once(':')
-        .ok_or_else(|| "DATABASE_URL missing ':' between username and password".to_string())?;
 
     let (host, port_str) = hostinfo.split_once(':').unwrap_or((hostinfo, "5432"));
 
@@ -583,10 +587,10 @@ fn parse_postgres_url(url: &str) -> Result<(String, String, u16, String, String)
 
     Ok((
         host.to_string(),
-        username.to_string(),
+        username,
         port,
         dbname.to_string(),
-        password.to_string(),
+        password,
     ))
 }
 
@@ -875,10 +879,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_postgres_url_missing_at_returns_error() {
-        let result = parse_postgres_url("postgres://user:passhost/db");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("'@'"));
+    fn test_parse_postgres_url_credential_less() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgresql://localhost:5432/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(username, "");
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "fund");
+        assert_eq!(password, "");
+    }
+
+    #[test]
+    fn test_parse_postgres_url_credential_less_default_port() {
+        let (host, username, port, dbname, password) =
+            parse_postgres_url("postgres://localhost/fund").unwrap();
+        assert_eq!(host, "localhost");
+        assert_eq!(username, "");
+        assert_eq!(port, 5432);
+        assert_eq!(dbname, "fund");
+        assert_eq!(password, "");
     }
 
     #[test]
