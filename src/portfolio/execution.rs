@@ -29,6 +29,10 @@ pub enum ExecutionError {
     },
     /// Alpaca returned an API or network error when closing a position.
     PositionClose { ticker: String, source: ClientError },
+    /// Alpaca returned an error when fetching positions or account info.
+    PositionFetch { source: ClientError },
+    /// Alpaca and database state are inconsistent.
+    StateMismatch { message: String },
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -48,6 +52,12 @@ impl std::fmt::Display for ExecutionError {
             }
             ExecutionError::PositionClose { ticker, source } => {
                 write!(formatter, "Position close failed for {ticker}: {source}")
+            }
+            ExecutionError::PositionFetch { source } => {
+                write!(formatter, "Position fetch failed: {source}")
+            }
+            ExecutionError::StateMismatch { message } => {
+                write!(formatter, "State mismatch: {message}")
             }
         }
     }

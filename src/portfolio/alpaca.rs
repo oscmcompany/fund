@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::common::alpaca::AlpacaCredentials;
 
@@ -509,8 +509,30 @@ impl TradingClient {
         let result: Vec<Position> = positions
             .into_iter()
             .filter_map(|position| {
-                let market_value = position.market_value.parse::<f64>().ok()?;
-                let unrealized_profit_and_loss = position.unrealized_pl.parse::<f64>().ok()?;
+                let market_value = match position.market_value.parse::<f64>() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            symbol = position.symbol,
+                            raw_value = position.market_value,
+                            %error,
+                            "Skipping position with unparseable market_value"
+                        );
+                        return None;
+                    }
+                };
+                let unrealized_profit_and_loss = match position.unrealized_pl.parse::<f64>() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(
+                            symbol = position.symbol,
+                            raw_value = position.unrealized_pl,
+                            %error,
+                            "Skipping position with unparseable unrealized_pl"
+                        );
+                        return None;
+                    }
+                };
                 Some(Position {
                     symbol: position.symbol,
                     side: position.side,
@@ -526,7 +548,7 @@ impl TradingClient {
 
     /// Fetches latest quote snapshots for the given symbols from the Alpaca data API.
     ///
-    /// Returns a map from ticker to mid price `(bid + ask) / 2`. Symbols without
+    /// Returns a list of mid prices `(bid + ask) / 2`. Symbols without
     /// a valid quote are omitted from the result.
     pub async fn fetch_latest_quotes(
         &self,

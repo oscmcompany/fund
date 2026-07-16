@@ -39,7 +39,7 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio::alpaca::{ClientError, TradableAssets, TradingClient};
+use crate::portfolio::alpaca::{TradableAssets, TradingClient};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio::database::{
@@ -153,10 +153,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     // Phase 1: check Alpaca positions to decide build vs monitor path.
     let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
-        RebalanceError::Execution(ExecutionError::PositionClose {
-            ticker: "positions".to_string(),
-            source: error,
-        })
+        RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
 
     let open_pairs = fetch_open_pairs(pool).await?;
@@ -168,12 +165,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
                 alpaca_positions = alpaca_positions.len(),
                 "Alpaca has positions but database has no open pairs; state mismatch"
             );
-            return Err(RebalanceError::Execution(ExecutionError::PositionClose {
-                ticker: "state_mismatch".to_string(),
-                source: ClientError::Api {
-                    status: 0,
-                    body: "Alpaca has positions but database has no open pairs".to_string(),
-                },
+            return Err(RebalanceError::Execution(ExecutionError::StateMismatch {
+                message: "Alpaca has positions but database has no open pairs".to_string(),
             }));
         }
 
@@ -406,8 +399,7 @@ async fn run_monitor_cycle(
 /// Closes all open positions at end of day and emits `portfolio_liquidation_completed`.
 ///
 /// Fetches open pairs, submits close orders via Alpaca, marks each pair closed
-/// with `close_reason = 'end_of_day'`, then emits the completion event so
-/// the data service can unsubscribe from the WebSocket quote stream.
+/// with `close_reason = 'end_of_day'`, then emits the completion event.
 ///
 /// Returns the number of pairs closed, or a `RebalanceError` if Alpaca or
 /// the database returns an error.
@@ -420,10 +412,7 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
     if open_pairs.is_empty() {
         // No DB pairs, but check Alpaca for orphaned positions.
         let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
-            RebalanceError::Execution(ExecutionError::PositionClose {
-                ticker: "positions".to_string(),
-                source: error,
-            })
+            RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
         })?;
 
         if !alpaca_positions.is_empty() {
@@ -697,10 +686,7 @@ async fn check_drawdown(
     threshold: f64,
 ) -> Result<(f64, f64), RebalanceError> {
     let account = alpaca.get_account().await.map_err(|error| {
-        RebalanceError::Execution(ExecutionError::PositionClose {
-            ticker: "account".to_string(),
-            source: error,
-        })
+        RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
 
     let current_equity = account.equity;
