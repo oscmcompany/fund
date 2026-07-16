@@ -15,7 +15,7 @@ use crate::domain::portfolio::{
 };
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
-use crate::portfolio::alpaca::{AlpacaTradingClient, TradableAssets};
+use crate::portfolio::alpaca::{TradableAssets, TradingClient};
 use crate::portfolio::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
@@ -98,7 +98,7 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    alpaca_client: AlpacaTradingClient,
+    alpaca_client: TradingClient,
     confidence_floor: ConfidenceFloor,
     constraints: Constraints,
     /// Cached partitioned view of the Alpaca active asset universe.
@@ -130,7 +130,7 @@ impl AppState {
     }
 
     /// Returns a reference to the Alpaca trading client.
-    pub fn alpaca_client(&self) -> &AlpacaTradingClient {
+    pub fn alpaca_client(&self) -> &TradingClient {
         &self.alpaca_client
     }
 
@@ -198,7 +198,7 @@ impl AppState {
         let is_paper = env::var("ALPACA_IS_PAPER")
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let alpaca_client = AlpacaTradingClient::new(credentials, is_paper);
+        let alpaca_client = TradingClient::new(credentials, is_paper);
         let drawdown_threshold = Percent::new(env_f64(
             "PORTFOLIO_DRAWDOWN_THRESHOLD",
             DEFAULT_DRAWDOWN_THRESHOLD,
@@ -295,7 +295,7 @@ impl AppState {
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
-        let alpaca_client = AlpacaTradingClient::new(credentials, is_paper);
+        let alpaca_client = TradingClient::new(credentials, is_paper);
 
         // Risk and strategy parameters fall back to the safe defaults below but
         // can be overridden per environment (keyed off FUND_PROFILE via the

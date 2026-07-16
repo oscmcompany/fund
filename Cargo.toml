@@ -35,7 +35,7 @@ required-features = ["data", "inference", "portfolio"]
 
 [features]
 default = ["data", "inference", "portfolio"]
-data = ["dep:chrono-tz", "dep:tokio-tungstenite", "dep:futures-util"]
+data = ["dep:chrono-tz"]
 inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
 portfolio = ["dep:chrono-tz"]
 dashboard = ["dep:axum"]
@@ -90,10 +90,6 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 # data-only (optional; enabled by the `data` feature)
 chrono-tz = { version = "0.10", optional = true }
-tokio-tungstenite = { version = "0.30", features = [
-  "rustls-tls-native-roots",
-], optional = true }
-futures-util = { version = "0.3", optional = true }
 
 # inference-only (optional; enabled by the `inference` feature).
 # `autodiff` brings the Autodiff backend used by Rust-native training; it adds

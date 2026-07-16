@@ -93,7 +93,6 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     if run_data {
         let state = fund::data::state::State::with_pool(pool.clone(), s3_client.clone());
         fund::data::scheduler::spawn_sync_scheduler(state.clone());
-        fund::data::equity_quotes::spawn_quote_stream(state.clone());
         info!("Data service started");
     }
 

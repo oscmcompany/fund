@@ -2866,7 +2866,6 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "flate2",
- "futures-util",
  "http 1.4.2",
  "mockito",
  "ndarray 0.16.1",
@@ -2886,7 +2885,6 @@ dependencies = [
  "testcontainers-modules",
  "thiserror 2.0.18",
  "tokio",
- "tokio-tungstenite",
  "tower",
  "tracing",
  "tracing-appender",
@@ -8208,22 +8206,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
-dependencies = [
- "futures-util",
- "log",
- "rustls 0.23.41",
- "rustls-native-certs",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls 0.26.4",
- "tungstenite",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8421,24 +8403,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
-dependencies = [
- "bytes",
- "data-encoding",
- "http 1.4.2",
- "httparse",
- "log",
- "rand 0.10.2",
- "rustls 0.23.41",
- "rustls-pki-types",
- "sha1 0.11.0",
- "thiserror 2.0.18",
-]
 
 [[package]]
 name = "typenum"
