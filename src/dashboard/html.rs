@@ -431,7 +431,6 @@ fn html_escape(input: &str) -> String {
 /// Inline CSS for the dashboard page. Amber CRT terminal aesthetic with
 /// scanline overlay, matching the `oscm-terminal.html` reference design.
 const CSS: &str = r#"
-@import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
 :root {
     --bg: #0a0700;
     --amber: #ffb400;
@@ -442,7 +441,7 @@ const CSS: &str = r#"
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-    font-family: 'VT323', 'Courier New', Courier, monospace;
+    font-family: 'Courier New', Courier, monospace;
     font-size: 18px;
     line-height: 1.2;
     background-color: var(--bg);
@@ -738,7 +737,7 @@ mod tests {
         );
         let html = render_html(&state);
         assert!(html.contains("Tickers"));
-        assert!(html.contains("2"));
+        assert!(html.contains(">2<"));
         assert!(html.contains("Bullish / Bearish / Neutral"));
         assert!(html.contains("1 / 1 / 0"));
         assert!(html.contains("Median Q50"));
@@ -906,7 +905,6 @@ mod tests {
     fn test_render_html_has_amber_terminal_styling() {
         let state = DashboardState::default();
         let html = render_html(&state);
-        assert!(html.contains("VT323"));
         assert!(html.contains("#0a0700"));
         assert!(html.contains("#ffb400"));
         assert!(html.contains("sys-header"));
@@ -915,20 +913,17 @@ mod tests {
     }
 
     #[test]
-    fn test_render_html_escapes_xss_in_prediction_summary() {
+    fn test_render_html_escapes_xss_in_event_payload() {
         let mut state = DashboardState::default();
-        state.predictions = vec![PredictionRow {
-            ticker: Ticker::new("AAPL").unwrap(),
-            quantile_10: 0.0,
-            quantile_50: 0.0,
-            quantile_90: 0.0,
-            model_run_id: "<script>alert(1)</script>".to_string(),
-            timestamp: Utc::now(),
-        }];
+        state.events.push_back(EventEntry {
+            event_id: 1,
+            event_type: EventType::PortfolioRebalanceCompleted,
+            payload: serde_json::json!({"key": "<script>alert(1)</script>"}),
+            received_at: Utc::now(),
+        });
         let html = render_html(&state);
-        // Predictions are now a summary table, so model_run_id is not rendered.
-        // XSS vector no longer applies, but verify no script tags sneak through.
         assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]

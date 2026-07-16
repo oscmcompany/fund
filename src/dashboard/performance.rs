@@ -8,7 +8,7 @@ pub fn format_return(value: Option<f64>) -> String {
     }
 }
 
-/// Returns the CSS class for a return value: `"positive"`, `"negative"`, or `"dim"`.
+/// Returns the CSS class for a return value: `"positive"`, `"negative"`, `"dim"`, or `""`.
 pub fn return_css_class(value: Option<f64>) -> &'static str {
     match value {
         Some(return_value) if return_value > 0.0 => "positive",
