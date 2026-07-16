@@ -39,15 +39,14 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio::alpaca::{AlpacaTradingClient, TradableAssets};
+use crate::portfolio::alpaca::{ClientError, TradableAssets, TradingClient};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio::database::{
     close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
-    fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value,
-    fetch_live_quote_mid_prices, fetch_open_pairs, fetch_spy_equity_prices,
-    insert_equity_allocation, insert_equity_order, insert_equity_pair, insert_portfolio_snapshot,
-    insert_rebalance_session, update_rebalance_session_status, OpenPair,
+    fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value, fetch_open_pairs,
+    fetch_spy_equity_prices, insert_equity_allocation, insert_equity_order, insert_equity_pair,
+    insert_portfolio_snapshot, insert_rebalance_session, update_rebalance_session_status, OpenPair,
 };
 use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
@@ -137,19 +136,14 @@ impl From<PortfolioError> for RebalanceError {
     }
 }
 
-/// Runs one rebalance cycle.
+/// Runs one rebalance cycle using a cold-start / warm-start model.
 ///
-/// The portfolio lifecycle follows a build-then-monitor model:
-/// - **No open pairs**: build a fresh portfolio from scratch with full invariant
-///   validation (minimum pairs, concentration cap, beta neutrality, dollar neutrality).
-/// - **Open pairs exist**: evaluate each pair for close signals (convergence → profit
-///   taken, divergence → stop loss) and close only those that trigger. Closed slots
-///   are **not** refilled; capital sits idle until end-of-day liquidation or until
-///   all pairs close, which triggers a fresh portfolio build.
-///
-/// This avoids the complexity of partial portfolio construction (mixed kept/new pairs,
-/// ticker overlap, drifting concentration and beta). If idle capital from closed pairs
-/// becomes a recurring issue, the approach can be revisited.
+/// Alpaca positions are the source of truth for deciding the path:
+/// - **Cold start** (no Alpaca positions): build a fresh portfolio using account
+///   equity as the capital base. Entry prices come from the Alpaca REST snapshot API
+///   with daily close prices as fallback.
+/// - **Warm start** (Alpaca has positions): evaluate existing pairs for close signals
+///   (convergence, stop-loss). New pairs are never opened while any positions remain.
 ///
 /// Returns `RebalanceOutcome` on success or a `RebalanceError` describing
 /// why the cycle was skipped or failed.
@@ -157,11 +151,45 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let pool = state.pool();
     let alpaca = state.alpaca_client();
 
-    // Phase 1: load predictions and market data.
+    // Phase 1: check Alpaca positions to decide build vs monitor path.
+    let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+        RebalanceError::Execution(ExecutionError::PositionClose {
+            ticker: "positions".to_string(),
+            source: error,
+        })
+    })?;
+
+    let open_pairs = fetch_open_pairs(pool).await?;
+
+    if !alpaca_positions.is_empty() {
+        // Alpaca has live positions — enter monitor mode.
+        if open_pairs.is_empty() {
+            warn!(
+                alpaca_positions = alpaca_positions.len(),
+                "Alpaca has positions but database has no open pairs; state mismatch"
+            );
+            return Err(RebalanceError::Execution(ExecutionError::PositionClose {
+                ticker: "state_mismatch".to_string(),
+                source: ClientError::Api {
+                    status: 0,
+                    body: "Alpaca has positions but database has no open pairs".to_string(),
+                },
+            }));
+        }
+
+        // Load historical prices for monitor evaluation.
+        let historical_prices = fetch_historical_equity_prices(pool).await?;
+        return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
+    }
+
+    // Cold start: no Alpaca positions. Build a fresh portfolio.
+    info!("No Alpaca positions; building fresh portfolio");
+
+    // Phase 2: load predictions and market data.
     let (predictions, historical_prices, spy_prices, equity_details) =
         fetch_market_data(pool).await?;
 
-    // Phase 2: classify regime; skip if trending.
+    // Phase 3: classify regime; skip if trending.
     let regime_result = classify_regime(&spy_prices);
     let exposure_scale = regime_result.state.exposure_factor();
     if exposure_scale < 0.6 {
@@ -173,39 +201,27 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         return Err(RebalanceError::TrendingRegime);
     }
 
-    // Phase 3: consolidate signals.
+    // Phase 4: consolidate signals.
     let signals = consolidate_predictions(&predictions, &historical_prices, &equity_details);
     info!(tickers = signals.len(), "Signals consolidated");
 
-    // Phase 4: evaluate open pairs and close triggered ones.
-    let open_pairs = fetch_open_pairs(pool).await?;
-
-    if !open_pairs.is_empty() {
-        // Monitor path: evaluate existing pairs, close triggered ones, persist snapshot.
-        return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
-    }
-
-    // Build path: no open pairs — construct a fresh portfolio with full validation.
-    info!("No open pairs; building fresh portfolio");
-
-    // Phase 5: check drawdown.
-    let (current_equity, buying_power) = check_drawdown(
+    // Phase 5: check drawdown. Use current_equity as the capital base for sizing.
+    let (current_equity, _buying_power) = check_drawdown(
         alpaca,
         pool,
         state.constraints().drawdown_threshold().0.value(),
     )
     .await?;
 
-    // Phase 6: select, size, and execute new pairs.
+    // Phase 6: select, size, and execute new pairs using current_equity.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
     let filled = select_size_execute(
         alpaca,
-        pool,
         state.tradable_assets(),
         &signals,
         &historical_prices,
         &spy_prices,
-        buying_power,
+        current_equity,
         exposure_scale,
         state.candidate_pool_count(),
         required_pairs,
@@ -303,7 +319,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 async fn run_monitor_cycle(
     state: &AppState,
     pool: &sqlx::PgPool,
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     open_pairs: &[OpenPair],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
 ) -> Result<RebalanceOutcome, RebalanceError> {
@@ -400,8 +416,36 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
     let alpaca = state.alpaca_client();
 
     let open_pairs = fetch_open_pairs(pool).await?;
+
     if open_pairs.is_empty() {
-        info!("No open pairs to close at end of day");
+        // No DB pairs, but check Alpaca for orphaned positions.
+        let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+            RebalanceError::Execution(ExecutionError::PositionClose {
+                ticker: "positions".to_string(),
+                source: error,
+            })
+        })?;
+
+        if !alpaca_positions.is_empty() {
+            warn!(
+                alpaca_positions = alpaca_positions.len(),
+                "No open pairs in database but Alpaca has positions; closing all Alpaca positions"
+            );
+            let orphan_tickers: Vec<String> = alpaca_positions
+                .iter()
+                .map(|position| position.symbol.clone())
+                .collect();
+            close_positions(alpaca, &orphan_tickers)
+                .await
+                .map_err(RebalanceError::Execution)?;
+            info!(
+                rows = orphan_tickers.len(),
+                "Orphaned Alpaca positions closed at end of day"
+            );
+        } else {
+            info!("No open pairs to close at end of day");
+        }
+
         emit_event(
             pool,
             EventType::PortfolioLiquidationCompleted,
@@ -608,7 +652,7 @@ fn evaluate_open_pairs(
 ///
 /// Returns the number of pairs successfully closed.
 async fn close_triggered_pairs(
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     pool: &sqlx::PgPool,
     signals: &[PairCloseSignal],
 ) -> Result<usize, RebalanceError> {
@@ -648,7 +692,7 @@ async fn close_triggered_pairs(
 /// Errors with `DrawdownBreached` when the drop from the previous NAV exceeds
 /// the configured threshold.
 async fn check_drawdown(
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     pool: &sqlx::PgPool,
     threshold: f64,
 ) -> Result<(f64, f64), RebalanceError> {
@@ -692,13 +736,12 @@ async fn check_drawdown(
 /// `InsufficientPairs` when no fills are confirmed.
 #[allow(clippy::too_many_arguments)]
 async fn select_size_execute(
-    alpaca: &AlpacaTradingClient,
-    pool: &sqlx::PgPool,
+    alpaca: &TradingClient,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
     spy_prices: &[f64],
-    buying_power: f64,
+    capital: f64,
     exposure_scale: f64,
     candidate_pool: usize,
     required_pairs: usize,
@@ -717,13 +760,23 @@ async fn select_size_execute(
         .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
         .collect();
 
-    let mut entry_prices = fetch_live_quote_mid_prices(pool, &all_tickers).await?;
+    // Fetch live quotes from Alpaca REST API for all candidate tickers.
+    // Fall back to latest daily close price for any ticker without a quote.
+    let ticker_strings: Vec<String> = all_tickers.iter().map(|t| t.to_string()).collect();
+    let latest_quotes = alpaca
+        .fetch_latest_quotes(&ticker_strings)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(error = %error, "Failed to fetch Alpaca quotes; falling back to close prices");
+            Vec::new()
+        });
 
-    // Cold-start fallback: the live quote stream only subscribes to tickers held
-    // in open positions, so on the first rebalance (or for any candidate without a
-    // fresh quote) `equity_quotes` has no entry price. Fall back to the most recent
-    // daily close, already loaded in `historical_prices` (ordered oldest to
-    // newest), so the pair can still be sized.
+    let mut entry_prices: HashMap<Ticker, f64> = latest_quotes
+        .into_iter()
+        .filter_map(|quote| Ticker::new(&quote.symbol).map(|ticker| (ticker, quote.mid_price)))
+        .collect();
+
+    // Fill in any missing tickers with the most recent daily close price.
     for ticker in &all_tickers {
         if !entry_prices.contains_key(ticker) {
             if let Some(latest_close) = historical_prices
@@ -737,7 +790,7 @@ async fn select_size_execute(
 
     let sized_pairs = size_pairs_with_volatility_parity(
         &candidate_pairs,
-        buying_power,
+        capital,
         &market_betas,
         &entry_prices,
         exposure_scale,

@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::domain::orders::{FilledOrder, Order, OrderSide, PendingPair};
-use crate::portfolio::alpaca::{AlpacaError, AlpacaTradingClient};
+use crate::portfolio::alpaca::{ClientError, TradingClient};
 use crate::portfolio::sizing::SizedPair;
 
 /// Maximum number of fill-poll attempts per order before giving up.
@@ -21,14 +21,14 @@ const FILL_POLL_ATTEMPTS: usize = 5;
 #[derive(Debug)]
 pub enum ExecutionError {
     /// Alpaca returned an API or network error during order submission.
-    OrderSubmission { ticker: String, source: AlpacaError },
+    OrderSubmission { ticker: String, source: ClientError },
     /// Alpaca returned an API or network error during fill polling.
     FillPoll {
         alpaca_order_id: String,
-        source: AlpacaError,
+        source: ClientError,
     },
     /// Alpaca returned an API or network error when closing a position.
-    PositionClose { ticker: String, source: AlpacaError },
+    PositionClose { ticker: String, source: ClientError },
 }
 
 impl std::fmt::Display for ExecutionError {
@@ -64,7 +64,7 @@ impl std::error::Error for ExecutionError {}
 /// expected in live trading when individual tickers have liquidity or
 /// borrowing issues.
 pub async fn execute_open_pairs(
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     sized_pairs: &[SizedPair],
 ) -> Vec<(PendingPair, SizedPair)> {
     let mut results: Vec<(PendingPair, SizedPair)> = Vec::new();
@@ -158,11 +158,7 @@ pub async fn execute_open_pairs(
 /// Cancels an orphaned order, falling back to closing the resulting position
 /// if the order has already filled by the time compensation runs (Alpaca
 /// returns 422 for terminal-state orders).
-async fn compensate_orphaned_order(
-    alpaca: &AlpacaTradingClient,
-    alpaca_order_id: &str,
-    ticker: &str,
-) {
+async fn compensate_orphaned_order(alpaca: &TradingClient, alpaca_order_id: &str, ticker: &str) {
     match alpaca.cancel_order(alpaca_order_id).await {
         Ok(true) => {
             info!(
@@ -200,7 +196,7 @@ async fn compensate_orphaned_order(
 ///
 /// Returns only the pairs where both legs filled successfully.
 pub async fn confirm_fills(
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     pending_pairs: Vec<(PendingPair, SizedPair)>,
 ) -> Vec<(crate::domain::orders::FilledPair, SizedPair)> {
     let mut results = Vec::new();
@@ -234,7 +230,7 @@ pub async fn confirm_fills(
 ///
 /// Returns `None` after `FILL_POLL_ATTEMPTS` failed attempts or when the
 /// Alpaca order status does not indicate a fill.
-async fn poll_fill(alpaca: &AlpacaTradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
+async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
     for attempt in 1..=FILL_POLL_ATTEMPTS {
         match alpaca.get_order(alpaca_order_id).await {
             Ok(order_fill) if order_fill.status == "filled" => {
@@ -295,7 +291,7 @@ async fn poll_fill(alpaca: &AlpacaTradingClient, alpaca_order_id: &str) -> Optio
 /// the remaining closures. Returns an `ExecutionError` only when a network-level
 /// error (not a 404 "no position") is encountered.
 pub async fn close_positions(
-    alpaca: &AlpacaTradingClient,
+    alpaca: &TradingClient,
     tickers: &[String],
 ) -> Result<(), ExecutionError> {
     let mut first_error: Option<ExecutionError> = None;
@@ -341,7 +337,7 @@ mod tests {
     fn test_execution_error_display_order_submission() {
         let error = ExecutionError::OrderSubmission {
             ticker: "AAPL".to_string(),
-            source: AlpacaError::Parse("bad json".to_string()),
+            source: ClientError::Parse("bad json".to_string()),
         };
         let message = format!("{error}");
         assert!(message.contains("AAPL"));
@@ -352,7 +348,7 @@ mod tests {
     fn test_execution_error_display_fill_poll() {
         let error = ExecutionError::FillPoll {
             alpaca_order_id: "order-123".to_string(),
-            source: AlpacaError::Parse("timeout".to_string()),
+            source: ClientError::Parse("timeout".to_string()),
         };
         let message = format!("{error}");
         assert!(message.contains("order-123"));
@@ -363,7 +359,7 @@ mod tests {
     fn test_execution_error_display_position_close() {
         let error = ExecutionError::PositionClose {
             ticker: "MSFT".to_string(),
-            source: AlpacaError::Parse("network error".to_string()),
+            source: ClientError::Parse("network error".to_string()),
         };
         let message = format!("{error}");
         assert!(message.contains("MSFT"));
@@ -374,7 +370,7 @@ mod tests {
     fn test_execution_error_is_error_trait() {
         let error = ExecutionError::PositionClose {
             ticker: "TSLA".to_string(),
-            source: AlpacaError::Parse("x".to_string()),
+            source: ClientError::Parse("x".to_string()),
         };
         // Verify std::error::Error is implemented
         let _boxed: Box<dyn std::error::Error> = Box::new(error);
@@ -384,7 +380,7 @@ mod tests {
     fn test_execution_error_order_submission_source_included_in_display() {
         let error = ExecutionError::OrderSubmission {
             ticker: "NVDA".to_string(),
-            source: AlpacaError::Api {
+            source: ClientError::Api {
                 status: 422,
                 body: "insufficient funds".to_string(),
             },
@@ -398,7 +394,7 @@ mod tests {
     fn test_execution_error_fill_poll_source_included_in_display() {
         let error = ExecutionError::FillPoll {
             alpaca_order_id: "abc-456".to_string(),
-            source: AlpacaError::Api {
+            source: ClientError::Api {
                 status: 500,
                 body: "internal error".to_string(),
             },
@@ -412,7 +408,7 @@ mod tests {
     fn test_execution_error_position_close_source_included_in_display() {
         let error = ExecutionError::PositionClose {
             ticker: "AMZN".to_string(),
-            source: AlpacaError::Api {
+            source: ClientError::Api {
                 status: 404,
                 body: "position not found".to_string(),
             },
