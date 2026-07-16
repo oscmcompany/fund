@@ -62,6 +62,8 @@ Retrieve Alpaca credentials from AWS Secrets Manager. SecretSpec stores each key
 individually under `secretspec/fund/production/<KEY>`:
 
 ```bash
+set -euo pipefail
+
 ALPACA_KEY=$(aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
   --secret-id 'secretspec/fund/production/ALPACA_API_KEY_ID' \
   --query 'SecretString' --output text)
@@ -76,7 +78,7 @@ IS_PAPER=$(aws secretsmanager get-secret-value --profile <PROFILE> --region us-e
 ```
 
 Determine the base URL:
-- If `IS_PAPER` is `"true"`: `https://paper-api.alpaca.markets`
+- If `IS_PAPER` is `true`: `https://paper-api.alpaca.markets`
 - Otherwise: `https://api.alpaca.markets`
 
 If credential retrieval fails, skip Group B and suggest `aws sso login --profile <PROFILE>`.
