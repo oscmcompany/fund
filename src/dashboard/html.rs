@@ -1,8 +1,9 @@
 //! Server-rendered HTML page for the dashboard.
 //!
 //! Renders all five data sections (positions, performance, trades, predictions,
-//! events) as a single vertically-stacked page with a dark terminal aesthetic.
-//! The page auto-refreshes every 30 seconds via `<meta http-equiv="refresh">`.
+//! events) as a single vertically-stacked page with an amber CRT terminal
+//! aesthetic inspired by `oscm-terminal.html`. The page auto-refreshes every
+//! 30 seconds via `<meta http-equiv="refresh">`.
 
 use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
@@ -19,10 +20,13 @@ use crate::dashboard::predictions::model_run_age_css_class;
 use crate::dashboard::trades::format_holding_duration;
 
 /// Maximum number of events to display on the page.
-const EVENTS_DISPLAY_LIMIT: usize = 50;
+const EVENTS_DISPLAY_LIMIT: usize = 10;
 
 /// Renders the complete HTML page from the current dashboard state.
 pub fn render_html(state: &DashboardState) -> String {
+    let now = Utc::now();
+    let date_string = now.format("%d-%b-%Y").to_string().to_uppercase();
+    let time_string = now.format("%H:%M:%S UTC").to_string();
     let updated = format_last_updated(state);
     let positions = render_positions_section(state);
     let performance = render_performance_section(state);
@@ -41,15 +45,21 @@ pub fn render_html(state: &DashboardState) -> String {
 <style>{CSS}</style>
 </head>
 <body>
-<header>
-<h1>OSCM</h1>
-<span class="updated">{updated}</span>
+<header class="sys-header">
+<span>{date_string}</span>
+<span>OSCM // FUND MONITOR</span>
+<span>{time_string}</span>
 </header>
+<div class="updated">{updated}</div>
 {positions}
 {performance}
-{trades}
 {predictions}
+{trades}
 {events}
+<footer class="sys-footer">
+<span>AUTO-REFRESH: 30S</span>
+<span>STATUS: NOMINAL</span>
+</footer>
 </body>
 </html>"#,
     )
@@ -82,7 +92,7 @@ fn render_positions_section(state: &DashboardState) -> String {
     };
 
     let table_body = if state.open_positions.is_empty() {
-        "<tr><td colspan=\"8\" class=\"muted\">No open positions</td></tr>".to_string()
+        "<tr><td colspan=\"8\" class=\"dim\">No open positions</td></tr>".to_string()
     } else {
         state
             .open_positions
@@ -114,7 +124,7 @@ fn render_positions_section(state: &DashboardState) -> String {
 
     format!(
         r#"<section>
-<h2>Open Positions{rebalance_indicator}</h2>
+<div class="panel-header">Open Positions{rebalance_indicator}</div>
 <table>
 <thead><tr><th>PAIR</th><th>LONG</th><th>SHORT</th><th>Z-SCORE</th><th>SIGNAL</th><th>LONG $</th><th>SHORT $</th><th>OPENED</th></tr></thead>
 <tbody>{table_body}</tbody>
@@ -155,7 +165,7 @@ fn render_performance_section(state: &DashboardState) -> String {
 
     format!(
         r#"<section>
-<h2>Performance</h2>
+<div class="panel-header">Performance</div>
 <table>
 <thead><tr><th>PERIOD</th><th>FUND</th><th>SPY</th></tr></thead>
 <tbody>{rows}</tbody>
@@ -165,63 +175,16 @@ fn render_performance_section(state: &DashboardState) -> String {
 }
 
 fn render_trades_section(state: &DashboardState) -> String {
-    let table_body = if state.closed_trades.is_empty() {
-        "<tr><td colspan=\"8\" class=\"muted\">No closed trades</td></tr>".to_string()
-    } else {
-        state
-            .closed_trades
-            .iter()
-            .map(|trade| {
-                let profit_and_loss_str = trade
-                    .realized_profit_and_loss
-                    .map(|value| format!("${:.2}", value))
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let profit_and_loss_class = match trade.realized_profit_and_loss {
-                    Some(value) if value.is_sign_positive() && !value.is_zero() => "positive",
-                    Some(value) if value.is_sign_negative() => "negative",
-                    _ => "",
-                };
-
-                let return_str = trade
-                    .return_percent
-                    .map(|value| format!("{:+.2}%", value))
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let return_class = match trade.return_percent {
-                    Some(value) if value.is_sign_positive() && !value.is_zero() => "positive",
-                    Some(value) if value.is_sign_negative() => "negative",
-                    _ => "",
-                };
-
-                let holding = trade
-                    .holding_seconds
-                    .map(format_holding_duration)
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-                let reason = trade
-                    .close_reason
-                    .as_ref()
-                    .map(|reason| reason.as_str())
-                    .unwrap_or("\u{2014}");
-                let closed = trade
-                    .closed_at
-                    .map(|timestamp| timestamp.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "\u{2014}".to_string());
-
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td>\
-                     <td class=\"{profit_and_loss_class}\">{profit_and_loss_str}</td>\
-                     <td class=\"{return_class}\">{return_str}</td>\
-                     <td>{holding}</td><td>{}</td><td>{closed}</td></tr>",
-                    html_escape(trade.pair_id.as_str()),
-                    html_escape(trade.long_ticker.as_str()),
-                    html_escape(trade.short_ticker.as_str()),
-                    html_escape(reason),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
     let summary = &state.closed_trades_summary;
+
+    if summary.total_closed == 0 {
+        return r#"<section>
+<div class="panel-header">Closed Trades</div>
+<p class="dim">No closed trades</p>
+</section>"#
+            .to_string();
+    }
+
     let win_rate = summary
         .win_rate
         .map(|rate| format!("{:.1}%", rate * 100.0))
@@ -242,15 +205,26 @@ fn render_trades_section(state: &DashboardState) -> String {
         .total_realized_profit_and_loss
         .map(|value| format!("${:.2}", value))
         .unwrap_or_else(|| "\u{2014}".to_string());
+    let total_profit_and_loss_class = match summary.total_realized_profit_and_loss {
+        Some(value) if value.is_sign_positive() && !value.is_zero() => "positive",
+        Some(value) if value.is_sign_negative() => "negative",
+        _ => "",
+    };
 
     format!(
         r#"<section>
-<h2>Closed Trades</h2>
+<div class="panel-header">Closed Trades</div>
 <table>
-<thead><tr><th>PAIR</th><th>LONG</th><th>SHORT</th><th>P&amp;L</th><th>RETURN</th><th>HOLDING</th><th>REASON</th><th>CLOSED</th></tr></thead>
-<tbody>{table_body}</tbody>
+<thead><tr><th>METRIC</th><th>VALUE</th></tr></thead>
+<tbody>
+<tr><td>Total closed</td><td>{}</td></tr>
+<tr><td>Win rate</td><td>{win_rate}</td></tr>
+<tr><td>Profit factor</td><td>{profit_factor}</td></tr>
+<tr><td>Avg return</td><td>{average_return}</td></tr>
+<tr><td>Avg holding</td><td>{average_holding}</td></tr>
+<tr><td>Total P&amp;L</td><td class="{total_profit_and_loss_class}">{total_profit_and_loss}</td></tr>
+</tbody>
 </table>
-<p class="summary">{} closed | Win: {win_rate} | PF: {profit_factor} | Avg return: {average_return} | Avg hold: {average_holding} | Total P&amp;L: {total_profit_and_loss}</p>
 </section>"#,
         summary.total_closed,
     )
@@ -259,43 +233,86 @@ fn render_trades_section(state: &DashboardState) -> String {
 fn render_predictions_section(state: &DashboardState) -> String {
     let freshness = render_freshness_line(state);
 
-    let table_body = if state.predictions.is_empty() {
-        "<tr><td colspan=\"6\" class=\"muted\">No predictions available</td></tr>".to_string()
-    } else {
-        state
+    if state.predictions.is_empty() {
+        return format!(
+            r#"<section>
+<div class="panel-header">Model Predictions</div>
+<p class="freshness">{freshness}</p>
+<p class="dim">No predictions available</p>
+</section>"#,
+        );
+    }
+
+    let count = state.predictions.len();
+    let bullish = state
+        .predictions
+        .iter()
+        .filter(|prediction| prediction.quantile_50 > 0.0)
+        .count();
+    let bearish = state
+        .predictions
+        .iter()
+        .filter(|prediction| prediction.quantile_50 < 0.0)
+        .count();
+    let neutral = count - bullish - bearish;
+
+    let q50_values: Vec<f64> = {
+        let mut values: Vec<f64> = state
             .predictions
             .iter()
-            .map(|prediction| {
-                let q50_class = if prediction.quantile_50 > 0.0 {
-                    "positive"
-                } else if prediction.quantile_50 < 0.0 {
-                    "negative"
-                } else {
-                    ""
-                };
-
-                format!(
-                    "<tr><td>{}</td><td>{:+.4}</td><td class=\"{q50_class}\">{:+.4}</td>\
-                     <td>{:+.4}</td><td>{}</td><td>{}</td></tr>",
-                    html_escape(prediction.ticker.as_str()),
-                    prediction.quantile_10,
-                    prediction.quantile_50,
-                    prediction.quantile_90,
-                    html_escape(&prediction.model_run_id),
-                    format_age(prediction.timestamp),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|prediction| prediction.quantile_50)
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values
     };
+    let median_q50 = if q50_values.len() % 2 == 0 {
+        let mid = q50_values.len() / 2;
+        (q50_values[mid - 1] + q50_values[mid]) / 2.0
+    } else {
+        q50_values[q50_values.len() / 2]
+    };
+    let median_q50_class = if median_q50 > 0.0 {
+        "positive"
+    } else if median_q50 < 0.0 {
+        "negative"
+    } else {
+        ""
+    };
+
+    let q10_minimum = state
+        .predictions
+        .iter()
+        .map(|prediction| prediction.quantile_10)
+        .fold(f64::INFINITY, f64::min);
+    let q10_maximum = state
+        .predictions
+        .iter()
+        .map(|prediction| prediction.quantile_10)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let q90_minimum = state
+        .predictions
+        .iter()
+        .map(|prediction| prediction.quantile_90)
+        .fold(f64::INFINITY, f64::min);
+    let q90_maximum = state
+        .predictions
+        .iter()
+        .map(|prediction| prediction.quantile_90)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     format!(
         r#"<section>
-<h2>Model Predictions</h2>
+<div class="panel-header">Model Predictions</div>
 <p class="freshness">{freshness}</p>
 <table>
-<thead><tr><th>TICKER</th><th>Q10</th><th>Q50</th><th>Q90</th><th>MODEL RUN</th><th>AGE</th></tr></thead>
-<tbody>{table_body}</tbody>
+<thead><tr><th>METRIC</th><th>VALUE</th></tr></thead>
+<tbody>
+<tr><td>Tickers</td><td>{count}</td></tr>
+<tr><td>Bullish / Bearish / Neutral</td><td>{bullish} / {bearish} / {neutral}</td></tr>
+<tr><td>Median Q50</td><td class="{median_q50_class}">{median_q50:+.4}</td></tr>
+<tr><td>Q10 range</td><td>{q10_minimum:+.4} to {q10_maximum:+.4}</td></tr>
+<tr><td>Q90 range</td><td>{q90_minimum:+.4} to {q90_maximum:+.4}</td></tr>
+</tbody>
 </table>
 </section>"#,
     )
@@ -306,7 +323,7 @@ fn render_freshness_line(state: &DashboardState) -> String {
 
     match &state.model_run_information {
         None => {
-            parts.push(r#"<span class="muted">Model run: no completed runs</span>"#.to_string());
+            parts.push(r#"<span class="dim">Model run: no completed runs</span>"#.to_string());
         }
         Some(info) => {
             let age_class = model_run_age_css_class(info);
@@ -316,11 +333,11 @@ fn render_freshness_line(state: &DashboardState) -> String {
             ));
 
             if let Some(crps) = info.continuous_ranked_probability_score() {
-                parts.push(format!(r#"<span class="muted">CRPS:</span> {crps:.3}"#));
+                parts.push(format!(r#"<span class="dim">CRPS:</span> {crps:.3}"#));
             }
             if let Some(directional_accuracy) = info.directional_accuracy() {
                 parts.push(format!(
-                    r#"<span class="muted">DA:</span> {:.1}%"#,
+                    r#"<span class="dim">DA:</span> {:.1}%"#,
                     directional_accuracy * 100.0,
                 ));
             }
@@ -330,7 +347,7 @@ fn render_freshness_line(state: &DashboardState) -> String {
     if let Some(inserted_at) = state.latest_bars_inserted_at {
         let style = bars_age_css_class(inserted_at);
         parts.push(format!(
-            r#"<span class="muted">Bars:</span> <span class="{style}">{}</span>"#,
+            r#"<span class="dim">Bars:</span> <span class="{style}">{}</span>"#,
             format_age(inserted_at),
         ));
     }
@@ -348,21 +365,21 @@ fn render_events_section(state: &DashboardState) -> String {
             let event_class = event_type_css_class(entry.event_type.as_str());
             let payload_summary = html_escape(&truncate_payload(&entry.payload));
             format!(
-                r#"<tr><td class="muted">{time}</td><td class="{event_class}">{}</td><td class="muted">{payload_summary}</td></tr>"#,
+                r#"<tr><td class="dim">{time}</td><td class="{event_class}">{}</td><td class="dim">{payload_summary}</td></tr>"#,
                 html_escape(entry.event_type.as_str()),
             )
         })
         .collect();
 
     let table_body = if rows.is_empty() {
-        "<tr><td colspan=\"3\" class=\"muted\">No events received yet</td></tr>".to_string()
+        "<tr><td colspan=\"3\" class=\"dim\">No events received yet</td></tr>".to_string()
     } else {
         rows.join("\n")
     };
 
     format!(
         r#"<section>
-<h2>Recent Events</h2>
+<div class="panel-header">Recent Events</div>
 <table>
 <thead><tr><th>TIME</th><th>EVENT</th><th>PAYLOAD</th></tr></thead>
 <tbody>{table_body}</tbody>
@@ -411,61 +428,91 @@ fn html_escape(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Inline CSS for the dashboard page. Dark terminal aesthetic with monospace font.
+/// Inline CSS for the dashboard page. Amber CRT terminal aesthetic with
+/// scanline overlay, matching the `oscm-terminal.html` reference design.
 const CSS: &str = r#"
+@import url('https://fonts.googleapis.com/css2?family=VT323&display=swap');
 :root {
-    --bg: #1a1a2e;
-    --fg: #e0e0e0;
-    --muted: #666;
+    --bg: #0a0700;
+    --amber: #ffb400;
+    --amber-dim: #a67500;
+    --amber-dark: #4a3400;
     --green: #4ec9b0;
     --red: #f44747;
-    --yellow: #dcdcaa;
-    --border: #333;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
-    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'JetBrains Mono', monospace;
-    font-size: 13px;
-    background: var(--bg);
-    color: var(--fg);
-    padding: 16px;
+    font-family: 'VT323', 'Courier New', Courier, monospace;
+    font-size: 18px;
+    line-height: 1.2;
+    background-color: var(--bg);
+    color: var(--amber);
+    padding: 12px 16px;
     max-width: 1200px;
     margin: 0 auto;
+    background-image: linear-gradient(
+        to bottom,
+        rgba(255, 180, 0, 0),
+        rgba(255, 180, 0, 0) 50%,
+        rgba(0, 0, 0, 0.2) 50%,
+        rgba(0, 0, 0, 0.2)
+    );
+    background-size: 100% 4px;
+    text-shadow: 0 0 2px rgba(255, 180, 0, 0.4);
 }
-header {
+.sys-header {
     display: flex;
     justify-content: space-between;
-    align-items: center;
-    padding-bottom: 12px;
-    border-bottom: 1px solid var(--border);
-}
-h1 { font-size: 16px; font-weight: 700; }
-.updated { color: var(--muted); font-size: 12px; }
-section { margin-top: 20px; }
-h2 {
-    font-size: 13px;
-    font-weight: 600;
-    margin-bottom: 8px;
-    border-bottom: 1px solid var(--border);
     padding-bottom: 4px;
+    border-bottom: 1px solid var(--amber);
+    margin-bottom: 4px;
     text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--fg);
+}
+.updated {
+    color: var(--amber-dim);
+    font-size: 16px;
+    margin-bottom: 8px;
+}
+section { margin-top: 16px; }
+.panel-header {
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--amber-dim);
+    padding-bottom: 4px;
+    margin-bottom: 8px;
+    color: var(--amber-dim);
 }
 table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 3px 12px 3px 0; white-space: nowrap; }
-th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+th, td { text-align: left; padding: 2px 12px 2px 0; white-space: nowrap; }
+th {
+    color: var(--amber-dim);
+    font-weight: normal;
+    font-size: 16px;
+    text-transform: uppercase;
+    border-bottom: 1px dashed var(--amber-dark);
+    padding-bottom: 4px;
+}
+tr:hover { background-color: rgba(255, 180, 0, 0.1); }
 .positive { color: var(--green); }
 .negative { color: var(--red); }
 .stale { color: var(--red); }
-.warning { color: var(--yellow); }
+.warning { color: var(--amber); }
 .fresh { color: var(--green); }
-.muted { color: var(--muted); }
-.summary { color: var(--muted); margin-top: 6px; font-size: 12px; }
-.freshness { color: var(--fg); margin-bottom: 8px; font-size: 12px; }
+.dim { color: var(--amber-dim); }
+.summary { color: var(--amber-dim); margin-top: 6px; font-size: 16px; }
+.freshness { color: var(--amber); margin-bottom: 8px; font-size: 16px; }
 .event-errored { color: var(--red); }
 .event-completed { color: var(--green); }
-.event-started { color: var(--yellow); }
+.event-started { color: var(--amber); }
+.sys-footer {
+    margin-top: 20px;
+    background-color: var(--amber);
+    color: var(--bg);
+    padding: 4px 8px;
+    display: flex;
+    justify-content: space-between;
+    text-shadow: none;
+    text-transform: uppercase;
+}
 "#;
 
 #[cfg(test)]
@@ -621,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_html_with_closed_trade() {
+    fn test_render_html_with_closed_trade_summary() {
         let mut state = DashboardState::default();
         state.closed_trades = vec![ClosedTrade {
             pair_id: PairID::parse("AAPL-MSFT").unwrap(),
@@ -645,7 +692,9 @@ mod tests {
         assert!(html.contains("$500.00"));
         assert!(html.contains("positive"));
         assert!(html.contains("1h 0m"));
-        assert!(html.contains("1 closed"));
+        assert!(html.contains("Total closed"));
+        assert!(html.contains("Win rate"));
+        assert!(html.contains("100.0%"));
     }
 
     #[test]
@@ -657,16 +706,26 @@ mod tests {
     }
 
     #[test]
-    fn test_render_html_with_predictions() {
+    fn test_render_html_with_predictions_summary() {
         let mut state = DashboardState::default();
-        state.predictions = vec![PredictionRow {
-            ticker: Ticker::new("AAPL").unwrap(),
-            quantile_10: -0.001,
-            quantile_50: 0.002,
-            quantile_90: 0.005,
-            model_run_id: "run-abc123".to_string(),
-            timestamp: Utc::now() - Duration::hours(2),
-        }];
+        state.predictions = vec![
+            PredictionRow {
+                ticker: Ticker::new("AAPL").unwrap(),
+                quantile_10: -0.001,
+                quantile_50: 0.002,
+                quantile_90: 0.005,
+                model_run_id: "run-abc123".to_string(),
+                timestamp: Utc::now() - Duration::hours(2),
+            },
+            PredictionRow {
+                ticker: Ticker::new("MSFT").unwrap(),
+                quantile_10: -0.003,
+                quantile_50: -0.001,
+                quantile_90: 0.002,
+                model_run_id: "run-abc123".to_string(),
+                timestamp: Utc::now() - Duration::hours(2),
+            },
+        ];
         state.model_run_information = Some(
             ModelRunInformation::new(
                 Utc::now() - Duration::hours(2),
@@ -678,8 +737,11 @@ mod tests {
             .unwrap(),
         );
         let html = render_html(&state);
-        assert!(html.contains("AAPL"));
-        assert!(html.contains("run-abc123"));
+        assert!(html.contains("Tickers"));
+        assert!(html.contains("2"));
+        assert!(html.contains("Bullish / Bearish / Neutral"));
+        assert!(html.contains("1 / 1 / 0"));
+        assert!(html.contains("Median Q50"));
         assert!(html.contains("CRPS:"));
         assert!(html.contains("DA:"));
     }
@@ -714,6 +776,22 @@ mod tests {
     }
 
     #[test]
+    fn test_render_html_events_limited_to_10() {
+        let mut state = DashboardState::default();
+        for index in 0..20 {
+            state.events.push_back(EventEntry {
+                event_id: index,
+                event_type: EventType::PortfolioRebalanceCompleted,
+                payload: serde_json::json!({"index": index}),
+                received_at: Utc::now(),
+            });
+        }
+        let html = render_html(&state);
+        let event_row_count = html.matches("portfolio_rebalance_completed").count();
+        assert_eq!(event_row_count, 10);
+    }
+
+    #[test]
     fn test_html_escape_special_characters() {
         assert_eq!(html_escape("<script>"), "&lt;script&gt;");
         assert_eq!(html_escape("a&b"), "a&amp;b");
@@ -722,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_compute_bars_age_css_class_fresh_on_saturday_with_friday_ingest() {
-        // Saturday Jan 4, inserted Friday Jan 3 → fresh
+        // Saturday Jan 4, inserted Friday Jan 3 -> fresh
         let now = NaiveDate::from_ymd_opt(2025, 1, 4)
             .unwrap()
             .and_hms_opt(9, 0, 0)
@@ -738,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_compute_bars_age_css_class_stale_on_saturday_with_old_ingest() {
-        // Saturday Jan 4, inserted Wednesday Jan 1 → stale (missed Thu+Fri)
+        // Saturday Jan 4, inserted Wednesday Jan 1 -> stale (missed Thu+Fri)
         let now = NaiveDate::from_ymd_opt(2025, 1, 4)
             .unwrap()
             .and_hms_opt(9, 0, 0)
@@ -754,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_compute_bars_age_css_class_fresh_on_sunday_with_friday_ingest() {
-        // Sunday Jan 5, inserted Friday Jan 3 → fresh
+        // Sunday Jan 5, inserted Friday Jan 3 -> fresh
         let now = NaiveDate::from_ymd_opt(2025, 1, 5)
             .unwrap()
             .and_hms_opt(9, 0, 0)
@@ -770,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_compute_bars_age_css_class_stale_on_sunday_with_old_ingest() {
-        // Sunday Jan 5, inserted Thursday Jan 2 → stale (missed Friday)
+        // Sunday Jan 5, inserted Thursday Jan 2 -> stale (missed Friday)
         let now = NaiveDate::from_ymd_opt(2025, 1, 5)
             .unwrap()
             .and_hms_opt(9, 0, 0)
@@ -825,7 +903,19 @@ mod tests {
     }
 
     #[test]
-    fn test_render_html_escapes_xss_in_model_run_id() {
+    fn test_render_html_has_amber_terminal_styling() {
+        let state = DashboardState::default();
+        let html = render_html(&state);
+        assert!(html.contains("VT323"));
+        assert!(html.contains("#0a0700"));
+        assert!(html.contains("#ffb400"));
+        assert!(html.contains("sys-header"));
+        assert!(html.contains("sys-footer"));
+        assert!(html.contains("FUND MONITOR"));
+    }
+
+    #[test]
+    fn test_render_html_escapes_xss_in_prediction_summary() {
         let mut state = DashboardState::default();
         state.predictions = vec![PredictionRow {
             ticker: Ticker::new("AAPL").unwrap(),
@@ -836,8 +926,9 @@ mod tests {
             timestamp: Utc::now(),
         }];
         let html = render_html(&state);
+        // Predictions are now a summary table, so model_run_id is not rendered.
+        // XSS vector no longer applies, but verify no script tags sneak through.
         assert!(!html.contains("<script>"));
-        assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
