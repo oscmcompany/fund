@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::common::alpaca::AlpacaCredentials;
 
@@ -508,39 +508,28 @@ impl TradingClient {
 
         let result: Vec<Position> = positions
             .into_iter()
-            .filter_map(|position| {
-                let market_value = match position.market_value.parse::<f64>() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            symbol = position.symbol,
-                            raw_value = position.market_value,
-                            %error,
-                            "Skipping position with unparseable market_value"
-                        );
-                        return None;
-                    }
-                };
-                let unrealized_profit_and_loss = match position.unrealized_pl.parse::<f64>() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(
-                            symbol = position.symbol,
-                            raw_value = position.unrealized_pl,
-                            %error,
-                            "Skipping position with unparseable unrealized_pl"
-                        );
-                        return None;
-                    }
-                };
-                Some(Position {
+            .map(|position| {
+                let market_value = position.market_value.parse::<f64>().map_err(|error| {
+                    ClientError::Parse(format!(
+                        "Failed to parse market_value '{}' for {}: {error}",
+                        position.market_value, position.symbol
+                    ))
+                })?;
+                let unrealized_profit_and_loss =
+                    position.unrealized_pl.parse::<f64>().map_err(|error| {
+                        ClientError::Parse(format!(
+                            "Failed to parse unrealized_pl '{}' for {}: {error}",
+                            position.unrealized_pl, position.symbol
+                        ))
+                    })?;
+                Ok(Position {
                     symbol: position.symbol,
                     side: position.side,
                     market_value,
                     unrealized_profit_and_loss,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<Position>, ClientError>>()?;
 
         info!(positions = result.len(), "Alpaca positions fetched");
         Ok(result)
