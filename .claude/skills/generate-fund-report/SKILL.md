@@ -58,22 +58,27 @@ artifact freshness check, and note them as SKIPPED in the report.
 
 ## Phase 1: Credential retrieval
 
-Retrieve Alpaca credentials from AWS Secrets Manager for direct API calls:
+Retrieve Alpaca credentials from AWS Secrets Manager. SecretSpec stores each key
+individually under `secretspec/fund/production/<KEY>`:
 
 ```bash
-aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
-  --secret-id 'fund/production/portfolio-manager/all' \
-  --query 'SecretString' --output text \
-  | jq -r '{key: .ALPACA_API_KEY_ID, secret: .ALPACA_API_SECRET, paper: .ALPACA_IS_PAPER}'
+set -euo pipefail
+
+ALPACA_KEY=$(aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
+  --secret-id 'secretspec/fund/production/ALPACA_API_KEY_ID' \
+  --query 'SecretString' --output text)
+
+ALPACA_SECRET=$(aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
+  --secret-id 'secretspec/fund/production/ALPACA_API_SECRET' \
+  --query 'SecretString' --output text)
+
+IS_PAPER=$(aws secretsmanager get-secret-value --profile <PROFILE> --region us-east-1 \
+  --secret-id 'secretspec/fund/production/ALPACA_IS_PAPER' \
+  --query 'SecretString' --output text)
 ```
 
-Extract:
-- `ALPACA_KEY` = `.key`
-- `ALPACA_SECRET` = `.secret`
-- `IS_PAPER` = `.paper` (string `"true"` or `"false"`)
-
 Determine the base URL:
-- If `IS_PAPER` is `"true"`: `https://paper-api.alpaca.markets`
+- If `IS_PAPER` is `true`: `https://paper-api.alpaca.markets`
 - Otherwise: `https://api.alpaca.markets`
 
 If credential retrieval fails, skip Group B and suggest `aws sso login --profile <PROFILE>`.
