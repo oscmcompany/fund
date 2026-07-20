@@ -16,85 +16,49 @@ Below are resources for the project and repository.
 
 #### Local
 
-For local development, you can use the `devenv` tool to spin up a local environment with all dependencies.
-
 ```sh
-git clone https://github.com/oscmcompany/fund.git && cd fund
-bash tools/bootstrap-machine --profile development/first_name.last_name
+# Install devenv (https://devenv.sh/getting-started/), clone the repository
+# and enter the directory - available commands are printed on shell entry, and
+# start the application services.
+git clone git@github.com:oscmcompany/fund.git
+cd fund
 devenv --profile application up
 ```
 
 #### Remote
 
-For remote development or production instances, you can provision VMs on `exe.dev`.
-
-Development:
-
 ```sh
-provision-development-application-vm
-provision-development-trainer-vm
-```
-
-Production:
-
-```sh
+# Provision the application VM from your local machine then SSH in and
+# start services with sync cron.
 provision-production-application-vm
-provision-production-trainer-vm
-```
+ssh oscm-fund-production-application.vm.exe.dev
+start-application
 
-> On production VMs, services run in a tmux session named `fund`. If you SSH in directly,
-> attach with `tmux attach -t fund`. Detach with `Ctrl-Space d` (the prefix is `C-Space`,
-> not the default `C-b`). The git-sync poller logs to `/var/log/fund/git-sync-poll.log`.
-
-If the dashboard reader database role does not exist (e.g., on a freshly provisioned VM
-before the schema process has run with the setup script), apply it manually:
-
-```sh
-psql -h localhost -p 5432 -U exedev -d fund -f tools/dashboard_reader_setup.sql
-```
-
-#### Data
-
-After launching, the database has the schema applied but equity details and historical bars must
-be manually populated. Use the data seeding tasks to bootstrap both S3 and PostgreSQL.
-
-Full bootstrap to run all at once:
-
-```sh
+# Seed historical data into S3 and PostgreSQL on the running application.
+# Run without arguments for full usage and options.
 SEED_SOURCE=massive SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
+
+# Share the VM with the team and publish the dashboard externally.
+ssh exe.dev share add oscm-fund-production-application team
+ssh exe.dev share access allow oscm-fund-production-application
+ssh exe.dev publish oscm-fund-production-application 8084:8084
+
+# Provision the trainer VM from your local machine then SSH in and install
+# the training cron job.
+provision-production-trainer-vm
+ssh oscm-fund-production-application.vm.exe.dev
+start-trainer
 ```
 
-Individual steps if you need to run them separately:
+> For development VMs, run the equivalent `development` scripts.
+> The provision script handles environment-specific configuration.
 
-```sh
-# Seed equity details (embedded CSV) into S3 and/or PostgreSQL
-SEED_TARGET=all devenv tasks run data:equity-details
+#### Notes
 
-# Seed equity bars from Massive API or S3 into S3 and/or PostgreSQL
-SEED_SOURCE=massive SEED_TARGET=s3 SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars
-
-# Populate PostgreSQL from existing S3 Parquet (avoids re-fetching from Massive)
-SEED_SOURCE=s3 SEED_TARGET=postgresql SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars
-```
-
-#### Dashboard
-
-The dashboard runs as a `devenv` process alongside the other services. It starts automatically
-with `devenv --profile application up` and connects to the local PostgreSQL instance. For public
-access to the production dashboard, run these commands once from your local machine after
-provisioning.
-
-```sh
-# Set the dashboard port as the default HTTP proxy target
-ssh exe.dev share port oscm-fund-production-application 8084
-
-# Make the HTTP proxy publicly accessible
-ssh exe.dev share set-public oscm-fund-production-application
-```
-
-The production dashboard is available at `https://oscm-fund-production-application.exe.xyz/`.
-For development VMs, the URL follows the pattern
-`https://oscm-fund-development-application-<first_name.last_name>.exe.xyz:8084/`.
+- Application services run in a tmux session; attach with `tmux attach -t fund`
+- Dashboard is available at `http://<vm-name>.vm.exe.dev:8084`
+- Git sync checks for updates every minute; view logs at `/var/log/fund/sync-application.log`
+- Training runs weekdays at 06:00 UTC; view logs at `/var/log/fund/train-tide-model.log`
 
 ### Principles
 

@@ -53,16 +53,6 @@ phase_create_vm
 phase_bootstrap
 phase_reboot
 
-# --------------------------------------------------------------------------- #
-# Application-specific: start services
-# --------------------------------------------------------------------------- #
-
-if [[ "$PRODUCTION" == true ]]; then
-  step "Starting git-sync in tmux session"
-  remote "$NIX_SOURCE && cd ~/fund && tmux kill-session -t fund 2>/dev/null || true && tmux new-session -d -s fund 'bash tools/git-sync'"
-  echo "Services started via git-sync in tmux session 'fund'"
-fi
-
 phase_share_vm
 
 # --------------------------------------------------------------------------- #
@@ -80,14 +70,11 @@ else
   echo "  Tag:      #${VM_TAG}"
 fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
-if [[ "$PRODUCTION" == true ]]; then
-  echo "  Services: running via git-sync in tmux session 'fund'"
-fi
 echo ""
 echo "Next steps:"
 echo "  ssh $VM_NAME.exe.xyz"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  tmux attach -t fund        # attach to services session"
+  echo "  start-application              # start services and install sync cron"
 else
   echo "  cd ~/fund"
   echo "  devenv --profile application up    # start application services"
@@ -96,9 +83,5 @@ echo "-----------------"
 echo ""
 
 if confirm "Drop into VM now?"; then
-  if [[ "$PRODUCTION" == true ]]; then
-    exec ssh -t "$VM_NAME.exe.xyz" "tmux attach -t fund"
-  else
-    exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
-  fi
+  exec ssh -t "$VM_NAME.exe.xyz" "cd ~/fund && exec \$SHELL -l"
 fi

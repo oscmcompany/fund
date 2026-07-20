@@ -7,8 +7,8 @@ set -euo pipefail
 # Run locally: bash tools/provision-trainer-vm --environment <development|production>
 #
 # The trainer VM runs no persistent services. It bootstraps the devenv
-# environment and installs a cron job that runs model training daily at
-# 06:00 UTC on weekdays (one hour after equity bars are synced at 05:00 UTC).
+# environment. After provisioning, SSH in and run start-trainer to install
+# the training cron job (weekdays 06:00 UTC).
 # --------------------------------------------------------------------------- #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +21,7 @@ usage() {
   echo "Usage: $(basename "$0") --environment <development|production>"
   echo ""
   echo "Provision an oscm-fund trainer VM on exe.dev."
-  echo "Installs a daily training cron job (weekdays 06:00 UTC)."
+  echo "After provisioning, run start-trainer to install the training cron job."
   echo ""
   echo "Options:"
   echo "  --environment   Required. Either 'development' or 'production'."
@@ -57,55 +57,6 @@ phase_create_vm
 phase_bootstrap
 phase_reboot
 
-# --------------------------------------------------------------------------- #
-# Trainer-specific: install daily training cron job
-# --------------------------------------------------------------------------- #
-
-step "Installing training script"
-
-# Write a wrapper script that sources Nix before invoking devenv,
-# since cron runs with a minimal environment where Nix is not on PATH.
-cat << 'TRAINEOF' | remote "cat > ~/fund-train.sh"
-#!/usr/bin/env bash
-# Fund model training job - invoked by cron daily at 06:00 UTC on weekdays.
-# Equity bars are synced at 05:00 UTC, so training runs on fresh data.
-set -euo pipefail
-
-for p in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh /etc/profile.d/nix.sh; do
-  [ -f "$p" ] && . "$p" && break
-done
-
-cd ~/fund
-
-if [[ -f .env ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source .env
-  set +a
-fi
-
-# Pull latest code before training
-echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") Syncing to latest origin/master"
-git fetch origin master
-git reset --hard origin/master
-devenv allow 2>/dev/null || echo "WARNING: devenv allow failed"
-
-devenv tasks run models:tide:train
-TRAINEOF
-
-remote "chmod +x ~/fund-train.sh"
-echo "Training wrapper written to ~/fund-train.sh"
-
-remote 'sudo mkdir -p /var/log/fund && sudo touch /var/log/fund/trainer.log && sudo chown "$(id -un):$(id -gn)" /var/log/fund /var/log/fund/trainer.log'
-
-if [[ "$PRODUCTION" == true ]]; then
-  # Install crontab entry. Preserve any existing entries unrelated to fund training.
-  remote "(crontab -l 2>/dev/null | grep -v 'fund-train'; echo '0 6 * * 1-5 bash ~/fund-train.sh >> /var/log/fund/trainer.log 2>&1') | crontab -"
-  echo "Cron job installed: weekdays at 06:00 UTC"
-else
-  echo "Skipping cron job (development mode). Run manually: bash ~/fund-train.sh"
-fi
-
 phase_share_vm
 
 # --------------------------------------------------------------------------- #
@@ -123,18 +74,15 @@ else
   echo "  Tag:      #${VM_TAG}"
 fi
 echo "  Profile:  $SECRETSPEC_PROFILE"
-if [[ "$PRODUCTION" == true ]]; then
-  echo "  Training: daily weekdays at 06:00 UTC"
-fi
-echo "  Log:      /var/log/fund/trainer.log"
 echo ""
 echo "Next steps:"
 echo "  ssh $VM_NAME.exe.xyz"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+  echo "  start-trainer                         # install training cron job"
+  echo "  tail -f /var/log/fund/train-tide-model.log  # follow training log"
 else
-  echo "  bash ~/fund-train.sh                  # run training manually"
-  echo "  tail -f /var/log/fund/trainer.log     # follow training log"
+  echo "  cd ~/fund"
+  echo "  devenv tasks run models:tide:train    # run training manually"
 fi
 echo "-----------------"
 echo ""

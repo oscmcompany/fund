@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# train-tide-model -- Cron job that syncs to latest code and runs model
+# training. Scheduled weekdays at 06:00 UTC by start-trainer.
+#
+# Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+cd "$REPO_ROOT"
+
+log "Syncing to latest origin/master"
+git fetch origin master
+git reset --hard origin/master
+devenv allow 2>/dev/null || log "WARNING: devenv allow failed"
+
+log "Starting tide training pipeline"
+devenv tasks run models:tide:train
+log "Training complete"
