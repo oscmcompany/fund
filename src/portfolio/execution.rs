@@ -17,6 +17,9 @@ use crate::portfolio::sizing::SizedPair;
 /// Maximum number of fill-poll attempts per order before giving up.
 const FILL_POLL_ATTEMPTS: usize = 5;
 
+/// Backoff durations for fill polling: 500ms, 1s, 2s, 3s, 3.5s (total 10s).
+const FILL_POLL_BACKOFF_MILLIS: [u64; FILL_POLL_ATTEMPTS] = [500, 1000, 2000, 3000, 3500];
+
 /// Error produced during the open-positions execution phase.
 #[derive(Debug)]
 pub enum ExecutionError {
@@ -238,6 +241,7 @@ pub async fn confirm_fills(
 
 /// Polls Alpaca for a filled order, returning a `FilledOrder` on success.
 ///
+/// Uses exponential backoff: 500ms, 1s, 2s, 3s, 3.5s (total ~10s).
 /// Returns `None` after `FILL_POLL_ATTEMPTS` failed attempts or when the
 /// Alpaca order status does not indicate a fill.
 async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
@@ -284,13 +288,14 @@ async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<Fill
                 );
             }
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        let backoff = FILL_POLL_BACKOFF_MILLIS[attempt - 1];
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
 
     warn!(
         alpaca_order_id = alpaca_order_id,
         attempts = FILL_POLL_ATTEMPTS,
-        "Fill poll exhausted; order not confirmed"
+        "Fill poll exhausted after 10 seconds; order will be resolved by reconciliation"
     );
     None
 }
@@ -342,6 +347,31 @@ pub async fn close_positions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fill_poll_backoff_total_duration() {
+        let total_millis: u64 = FILL_POLL_BACKOFF_MILLIS.iter().sum();
+        assert_eq!(total_millis, 10_000, "Total backoff should be 10 seconds");
+    }
+
+    #[test]
+    fn test_fill_poll_backoff_is_monotonically_increasing() {
+        for window in FILL_POLL_BACKOFF_MILLIS.windows(2) {
+            assert!(
+                window[1] >= window[0],
+                "Backoff durations should be monotonically increasing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fill_poll_backoff_length_matches_attempts() {
+        assert_eq!(
+            FILL_POLL_BACKOFF_MILLIS.len(),
+            FILL_POLL_ATTEMPTS,
+            "Backoff array length must match FILL_POLL_ATTEMPTS"
+        );
+    }
 
     #[test]
     fn test_execution_error_display_order_submission() {

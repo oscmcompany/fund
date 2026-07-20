@@ -547,6 +547,163 @@ pub async fn insert_equity_order<'e>(
     Ok(())
 }
 
+/// A submitted order awaiting fill confirmation or reconciliation resolution.
+///
+/// Returned by [`fetch_submitted_orders`] for reconciliation to check against Alpaca.
+#[derive(Debug, Clone)]
+pub struct SubmittedOrder {
+    id: Uuid,
+    alpaca_order_id: String,
+    ticker: String,
+    side: String,
+    submitted_at: DateTime<Utc>,
+}
+
+impl SubmittedOrder {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn alpaca_order_id(&self) -> &str {
+        &self.alpaca_order_id
+    }
+
+    pub fn ticker(&self) -> &str {
+        &self.ticker
+    }
+
+    pub fn side(&self) -> &str {
+        &self.side
+    }
+
+    pub fn submitted_at(&self) -> DateTime<Utc> {
+        self.submitted_at
+    }
+}
+
+/// Inserts a submitted order record before polling for fills.
+///
+/// This creates a durable breadcrumb so that if the process crashes between
+/// order submission and fill confirmation, the reconciliation process can
+/// find and resolve the order.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_submitted_order(
+    pool: &PgPool,
+    id: Uuid,
+    alpaca_order_id: &str,
+    ticker: &str,
+    side: &str,
+    quantity: Decimal,
+    order_type: &str,
+    submitted_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO equity_orders \
+         (id, submitted_at, ticker, side, quantity, order_type, alpaca_order_id, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'submitted')",
+    )
+    .bind(id)
+    .bind(submitted_at)
+    .bind(ticker)
+    .bind(side)
+    .bind(quantity)
+    .bind(order_type)
+    .bind(alpaca_order_id)
+    .execute(pool)
+    .await?;
+
+    info!(
+        alpaca_order_id = alpaca_order_id,
+        ticker = ticker,
+        "Submitted order tracked in PostgreSQL"
+    );
+    Ok(())
+}
+
+/// Marks a submitted order as filled and sets the fill timestamp.
+///
+/// Accepts a generic executor so it can participate in an existing transaction.
+pub async fn mark_order_filled<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    id: Uuid,
+    allocation_id: Uuid,
+    filled_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE equity_orders \
+         SET status = 'filled', filled_at = $1, allocation_id = $2 \
+         WHERE id = $3 AND status = 'submitted'",
+    )
+    .bind(filled_at)
+    .bind(allocation_id)
+    .bind(id)
+    .execute(executor)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        warn!(
+            order_id = %id,
+            "Order not found or not in submitted status"
+        );
+    }
+
+    Ok(())
+}
+
+/// Marks a submitted order as cancelled.
+pub async fn mark_order_cancelled(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE equity_orders \
+         SET status = 'cancelled' \
+         WHERE id = $1 AND status = 'submitted'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Fetches all orders with `status = 'submitted'` older than the given threshold.
+///
+/// These represent orders that were submitted to Alpaca but never confirmed as
+/// filled. The reconciliation process uses this to check Alpaca for the order
+/// status and resolve them.
+pub async fn fetch_submitted_orders(
+    pool: &PgPool,
+    older_than: DateTime<Utc>,
+) -> Result<Vec<SubmittedOrder>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, alpaca_order_id, ticker, side, submitted_at \
+         FROM equity_orders \
+         WHERE status = 'submitted' AND submitted_at < $1 \
+         ORDER BY submitted_at ASC",
+    )
+    .bind(older_than)
+    .fetch_all(pool)
+    .await?;
+
+    let orders: Vec<SubmittedOrder> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            SubmittedOrder {
+                id: row.get("id"),
+                alpaca_order_id: row.get("alpaca_order_id"),
+                ticker: row.get("ticker"),
+                side: row.get("side"),
+                submitted_at: row.get("submitted_at"),
+            }
+        })
+        .collect();
+
+    info!(
+        rows = orders.len(),
+        "Submitted orders fetched from PostgreSQL"
+    );
+    Ok(orders)
+}
+
 /// Inserts an intraday portfolio snapshot recording the post-rebalance net asset value.
 pub async fn insert_portfolio_snapshot<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -760,6 +917,7 @@ mod tests {
                 CloseReason::ProfitTaken,
                 CloseReason::StopLoss,
                 CloseReason::EndOfDay,
+                CloseReason::ReconciliationAlpacaMissing,
             ] {
                 assert!(close_equity_pair_with_reason(
                     &lazy_pool(),
@@ -819,6 +977,89 @@ mod tests {
                 "alpaca-order-xyz".to_string(),
             );
             assert!(insert_equity_order(&lazy_pool(), &order).await.is_err());
+        });
+    }
+
+    // --- SubmittedOrder accessors ---
+
+    #[test]
+    fn test_submitted_order_accessors() {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let order = SubmittedOrder {
+            id,
+            alpaca_order_id: "alpaca-123".to_string(),
+            ticker: "AAPL".to_string(),
+            side: "LONG".to_string(),
+            submitted_at: now,
+        };
+        assert_eq!(order.id(), id);
+        assert_eq!(order.alpaca_order_id(), "alpaca-123");
+        assert_eq!(order.ticker(), "AAPL");
+        assert_eq!(order.side(), "LONG");
+        assert_eq!(order.submitted_at(), now);
+    }
+
+    #[test]
+    fn test_submitted_order_clone() {
+        let order = SubmittedOrder {
+            id: Uuid::new_v4(),
+            alpaca_order_id: "alpaca-456".to_string(),
+            ticker: "MSFT".to_string(),
+            side: "SHORT".to_string(),
+            submitted_at: Utc::now(),
+        };
+        let cloned = order.clone();
+        assert_eq!(cloned.alpaca_order_id(), order.alpaca_order_id());
+        assert_eq!(cloned.ticker(), order.ticker());
+    }
+
+    // --- compile / connection-error coverage for durable order tracking ---
+
+    #[test]
+    fn test_insert_submitted_order_compiles() {
+        make_runtime().block_on(async {
+            assert!(insert_submitted_order(
+                &lazy_pool(),
+                Uuid::new_v4(),
+                "alpaca-order-001",
+                "AAPL",
+                "LONG",
+                Decimal::from(100),
+                "market",
+                Utc::now(),
+            )
+            .await
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn test_mark_order_filled_compiles() {
+        make_runtime().block_on(async {
+            assert!(
+                mark_order_filled(&lazy_pool(), Uuid::new_v4(), Uuid::new_v4(), Utc::now(),)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn test_mark_order_cancelled_compiles() {
+        make_runtime().block_on(async {
+            assert!(mark_order_cancelled(&lazy_pool(), Uuid::new_v4())
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn test_fetch_submitted_orders_compiles() {
+        make_runtime().block_on(async {
+            assert!(fetch_submitted_orders(&lazy_pool(), Utc::now())
+                .await
+                .is_err());
         });
     }
 
