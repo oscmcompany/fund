@@ -388,7 +388,7 @@ in {
 
     # Idempotent: install cron entry only if not already present
     if ! crontab -l 2>/dev/null | grep -qF 'sync-application'; then
-      (crontab -l 2>/dev/null; echo '* * * * * bash ~/fund-cron.sh tools/sync-application >> /var/log/fund/sync-application.log 2>&1') | crontab -
+      (crontab -l 2>/dev/null || true; echo '* * * * * bash ~/fund-cron.sh tools/sync-application >> /var/log/fund/sync-application.log 2>&1') | crontab -
       echo "Installed sync-application cron entry"
     else
       echo "Sync cron entry already installed"
@@ -405,7 +405,7 @@ in {
 
     # Remove cron entry
     if crontab -l 2>/dev/null | grep -qF 'sync-application'; then
-      crontab -l 2>/dev/null | grep -vF 'sync-application' | crontab -
+      crontab -l 2>/dev/null | grep -vF 'sync-application' | crontab - || true
       echo "Removed sync-application cron entry"
     else
       echo "No sync cron entry to remove"
@@ -435,7 +435,7 @@ in {
       exit 0
     fi
 
-    (crontab -l 2>/dev/null; echo '0 6 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
+    (crontab -l 2>/dev/null || true; echo '0 6 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
     echo "Installed training cron entry (weekdays 06:00 UTC)"
   '';
 
@@ -443,7 +443,7 @@ in {
     set -euo pipefail
 
     if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
-      crontab -l 2>/dev/null | grep -vF 'train-tide-model' | crontab -
+      crontab -l 2>/dev/null | grep -vF 'train-tide-model' | crontab - || true
       echo "Removed training cron entry"
     else
       echo "No training cron entry to remove"

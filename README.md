@@ -46,7 +46,7 @@ ssh exe.dev publish oscm-fund-production-application 8084:8084
 # Provision the trainer VM from your local machine then SSH in and install
 # the training cron job.
 provision-production-trainer-vm
-ssh oscm-fund-production-application.vm.exe.dev
+ssh oscm-fund-production-trainer.vm.exe.dev
 start-trainer
 ```
 

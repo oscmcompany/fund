@@ -9,10 +9,22 @@ set -euo pipefail
 # automatically after this script terminates the running instance.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="/tmp/sync-application.pid"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
 }
+
+# Single-instance guard: prevent overlapping cron runs
+if [[ -f "$LOCK_FILE" ]]; then
+  existing_pid="$(cat "$LOCK_FILE")"
+  if kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$LOCK_FILE"
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
 
 cd "$REPO_ROOT"
 
