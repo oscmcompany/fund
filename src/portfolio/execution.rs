@@ -241,7 +241,7 @@ pub async fn confirm_fills(
 
 /// Polls Alpaca for a filled order, returning a `FilledOrder` on success.
 ///
-/// Uses exponential backoff: 500ms, 1s, 2s, 3s, 3.5s (total ~10s).
+/// Uses increasing backoff: 500ms, 1s, 2s, 3s, 3.5s (total ~10s).
 /// Returns `None` after `FILL_POLL_ATTEMPTS` failed attempts or when the
 /// Alpaca order status does not indicate a fill.
 async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
@@ -288,8 +288,10 @@ async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<Fill
                 );
             }
         }
-        let backoff = FILL_POLL_BACKOFF_MILLIS[attempt - 1];
-        tokio::time::sleep(Duration::from_millis(backoff)).await;
+        if attempt < FILL_POLL_ATTEMPTS {
+            let backoff = FILL_POLL_BACKOFF_MILLIS[attempt - 1];
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+        }
     }
 
     warn!(

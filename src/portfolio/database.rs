@@ -13,7 +13,7 @@ use crate::domain::freshness::{Fresh, StalenessWindow};
 use crate::domain::market::{PairID, Ticker};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
-    CloseReason, EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession,
+    CloseReason, EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession, OrderStatus,
     RebalanceSessionStatus,
 };
 
@@ -600,7 +600,7 @@ pub async fn insert_submitted_order(
     sqlx::query(
         "INSERT INTO equity_orders \
          (id, submitted_at, ticker, side, quantity, order_type, alpaca_order_id, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'submitted')",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(id)
     .bind(submitted_at)
@@ -609,6 +609,7 @@ pub async fn insert_submitted_order(
     .bind(quantity)
     .bind(order_type)
     .bind(alpaca_order_id)
+    .bind(OrderStatus::Submitted.as_str())
     .execute(pool)
     .await?;
 
@@ -631,12 +632,14 @@ pub async fn mark_order_filled<'e>(
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
         "UPDATE equity_orders \
-         SET status = 'filled', filled_at = $1, allocation_id = $2 \
-         WHERE id = $3 AND status = 'submitted'",
+         SET status = $1, filled_at = $2, allocation_id = $3 \
+         WHERE id = $4 AND status = $5",
     )
+    .bind(OrderStatus::Filled.as_str())
     .bind(filled_at)
     .bind(allocation_id)
     .bind(id)
+    .bind(OrderStatus::Submitted.as_str())
     .execute(executor)
     .await?;
 
@@ -654,10 +657,12 @@ pub async fn mark_order_filled<'e>(
 pub async fn mark_order_cancelled(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE equity_orders \
-         SET status = 'cancelled' \
-         WHERE id = $1 AND status = 'submitted'",
+         SET status = $1 \
+         WHERE id = $2 AND status = $3",
     )
+    .bind(OrderStatus::Cancelled.as_str())
     .bind(id)
+    .bind(OrderStatus::Submitted.as_str())
     .execute(pool)
     .await?;
 

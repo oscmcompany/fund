@@ -81,7 +81,7 @@ BEGIN
         ALTER TABLE equity_pairs DROP CONSTRAINT equity_pairs_close_reason_check;
     END IF;
     ALTER TABLE equity_pairs ADD CONSTRAINT equity_pairs_close_reason_check
-        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing'));
+        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')) NOT VALID;
 END;
 $do$;
 

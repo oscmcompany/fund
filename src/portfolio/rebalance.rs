@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
 use crate::domain::market::Ticker;
-use crate::domain::orders::FilledPair;
+use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
@@ -46,8 +46,8 @@ use crate::portfolio::database::{
     close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
     fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value, fetch_open_pairs,
     fetch_spy_equity_prices, insert_equity_allocation, insert_equity_order, insert_equity_pair,
-    insert_portfolio_snapshot, insert_rebalance_session, insert_submitted_order,
-    mark_order_cancelled, mark_order_filled, update_rebalance_session_status, OpenPair,
+    insert_portfolio_snapshot, insert_rebalance_session, insert_submitted_order, mark_order_filled,
+    update_rebalance_session_status, OpenPair,
 };
 use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
@@ -739,6 +739,31 @@ async fn check_drawdown(
     Ok((current_equity, buying_power))
 }
 
+/// Persists a single submitted order record for durable tracking.
+///
+/// Logs a warning and continues if the insert fails — the order has already
+/// been submitted to Alpaca, so we must not abort the pipeline.
+async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
+    if let Err(error) = insert_submitted_order(
+        pool,
+        leg.id,
+        &leg.alpaca_order_id,
+        &leg.ticker,
+        &leg.side.to_string(),
+        leg.quantity,
+        &leg.order_type,
+        leg.submitted_at,
+    )
+    .await
+    {
+        warn!(
+            alpaca_order_id = leg.alpaca_order_id.as_str(),
+            error = %error,
+            "Failed to persist submitted order; continuing without durable tracking"
+        );
+    }
+}
+
 /// Selects candidate pairs, sizes them, filters to shortable tickers, and executes orders.
 ///
 /// Submitted orders are persisted to the database before polling for fills,
@@ -866,71 +891,11 @@ async fn select_size_execute(
     // a durable breadcrumb so that if the process crashes during fill polling,
     // the reconciliation process can find and resolve these orders.
     for (pending_pair, _sized_pair) in &pending {
-        let long = pending_pair.long();
-        if let Err(error) = insert_submitted_order(
-            pool,
-            long.id,
-            &long.alpaca_order_id,
-            &long.ticker,
-            &long.side.to_string(),
-            long.quantity,
-            &long.order_type,
-            long.submitted_at,
-        )
-        .await
-        {
-            warn!(
-                alpaca_order_id = long.alpaca_order_id.as_str(),
-                error = %error,
-                "Failed to persist submitted order; continuing without durable tracking"
-            );
-        }
-        let short = pending_pair.short();
-        if let Err(error) = insert_submitted_order(
-            pool,
-            short.id,
-            &short.alpaca_order_id,
-            &short.ticker,
-            &short.side.to_string(),
-            short.quantity,
-            &short.order_type,
-            short.submitted_at,
-        )
-        .await
-        {
-            warn!(
-                alpaca_order_id = short.alpaca_order_id.as_str(),
-                error = %error,
-                "Failed to persist submitted order; continuing without durable tracking"
-            );
-        }
+        persist_submitted_order(pool, pending_pair.long()).await;
+        persist_submitted_order(pool, pending_pair.short()).await;
     }
-
-    // Collect all submitted order IDs before confirm_fills consumes the pending pairs.
-    let all_submitted_order_ids: Vec<Uuid> = pending
-        .iter()
-        .flat_map(|(pending_pair, _)| [pending_pair.long().id, pending_pair.short().id])
-        .collect();
 
     let filled = confirm_fills(alpaca, pending).await;
-
-    // Cancel tracking records for orders that did not fill. Filled orders will
-    // be updated with allocation_id in persist_filled_pairs.
-    let filled_order_ids: std::collections::HashSet<Uuid> = filled
-        .iter()
-        .flat_map(|(filled_pair, _)| [filled_pair.long.id, filled_pair.short.id])
-        .collect();
-    for order_id in &all_submitted_order_ids {
-        if !filled_order_ids.contains(order_id) {
-            if let Err(error) = mark_order_cancelled(pool, *order_id).await {
-                warn!(
-                    order_id = %order_id,
-                    error = %error,
-                    "Failed to mark unfilled order as cancelled"
-                );
-            }
-        }
-    }
 
     if filled.is_empty() {
         warn!("No pairs filled; aborting rebalance session");
