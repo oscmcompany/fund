@@ -66,9 +66,24 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     closed_at                  TIMESTAMPTZ,
     realized_profit_and_loss   NUMERIC,
     return_percent             NUMERIC,
-    close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day')),
+    close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')),
     UNIQUE (pair_id, opened_at)
 );
+
+-- Idempotent constraint replacement: updates close_reason CHECK to include reconciliation_alpaca_missing
+-- for existing deployments where CREATE TABLE was a no-op.
+DO $do$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'equity_pairs_close_reason_check' AND conrelid = 'equity_pairs'::regclass
+    ) THEN
+        ALTER TABLE equity_pairs DROP CONSTRAINT equity_pairs_close_reason_check;
+    END IF;
+    ALTER TABLE equity_pairs ADD CONSTRAINT equity_pairs_close_reason_check
+        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')) NOT VALID;
+END;
+$do$;
 
 -- equity_allocations: one row per ticker leg per rebalance cycle
 -- side and action match PositionSide/PositionAction enums in portfolio_schema.py
@@ -95,16 +110,20 @@ CREATE TABLE IF NOT EXISTS equity_allocations (
 CREATE INDEX IF NOT EXISTS idx_equity_allocations_rebalance_id ON equity_allocations (rebalance_id); -- noqa: PG01
 
 -- equity_orders: orders submitted to Alpaca, linked to allocations
+-- allocation_id is nullable: submitted orders are tracked before allocations exist.
+-- status tracks the order lifecycle: submitted → filled or cancelled.
 CREATE TABLE IF NOT EXISTS equity_orders (
     id               UUID        PRIMARY KEY,
-    allocation_id    UUID        NOT NULL REFERENCES equity_allocations(id),
+    allocation_id    UUID        REFERENCES equity_allocations(id),
     submitted_at     TIMESTAMPTZ NOT NULL,
     ticker           TEXT        NOT NULL,
     side             TEXT        NOT NULL CHECK (side IN ('LONG', 'SHORT')),
     quantity         NUMERIC     NOT NULL,
     order_type       TEXT        NOT NULL,
     limit_price      NUMERIC,
-    alpaca_order_id  TEXT        NOT NULL
+    alpaca_order_id  TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'filled' CHECK (status IN ('submitted', 'filled', 'cancelled')),
+    filled_at        TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_equity_orders_allocation_id ON equity_orders (allocation_id); -- noqa: PG01
@@ -119,6 +138,34 @@ BEGIN
     ) THEN
         ALTER TABLE equity_orders ADD CONSTRAINT equity_orders_side_check CHECK (side IN ('LONG', 'SHORT')) NOT VALID;
     END IF;
+END;
+$do$;
+
+-- Idempotent column backfill: adds status and filled_at columns, relaxes allocation_id NOT NULL
+-- for existing deployments where CREATE TABLE was a no-op.
+DO $do$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_orders' AND column_name = 'status'
+    ) THEN
+        ALTER TABLE equity_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'filled';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'equity_orders' AND column_name = 'filled_at'
+    ) THEN
+        ALTER TABLE equity_orders ADD COLUMN filled_at TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'equity_orders_status_check' AND conrelid = 'equity_orders'::regclass
+    ) THEN
+        ALTER TABLE equity_orders ADD CONSTRAINT equity_orders_status_check
+            CHECK (status IN ('submitted', 'filled', 'cancelled')) NOT VALID;
+    END IF;
+    -- Relax allocation_id NOT NULL so submitted orders can be tracked before allocations exist.
+    ALTER TABLE equity_orders ALTER COLUMN allocation_id DROP NOT NULL;
 END;
 $do$;
 

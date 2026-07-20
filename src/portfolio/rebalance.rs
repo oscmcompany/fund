@@ -27,12 +27,12 @@ use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
 use crate::domain::market::Ticker;
-use crate::domain::orders::FilledPair;
+use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
@@ -46,7 +46,8 @@ use crate::portfolio::database::{
     close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
     fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value, fetch_open_pairs,
     fetch_spy_equity_prices, insert_equity_allocation, insert_equity_order, insert_equity_pair,
-    insert_portfolio_snapshot, insert_rebalance_session, update_rebalance_session_status, OpenPair,
+    insert_portfolio_snapshot, insert_rebalance_session, insert_submitted_order, mark_order_filled,
+    update_rebalance_session_status, OpenPair,
 };
 use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
@@ -175,6 +176,27 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
     }
 
+    // Alpaca has no positions. If DB still has open pairs, they were closed
+    // externally (manual close, Alpaca risk controls, corporate action). Mark
+    // them closed with a reconciliation-specific reason and continue as cold start.
+    if !open_pairs.is_empty() {
+        error!(
+            open_pairs = open_pairs.len(),
+            "Database has open pairs but Alpaca has no positions; \
+             marking stale pairs closed with reconciliation_alpaca_missing"
+        );
+        let closed_at = Utc::now();
+        for pair in &open_pairs {
+            close_equity_pair_with_reason(
+                pool,
+                pair.id(),
+                closed_at,
+                &CloseReason::ReconciliationAlpacaMissing,
+            )
+            .await?;
+        }
+    }
+
     // Cold start: no Alpaca positions. Build a fresh portfolio.
     info!("No Alpaca positions; building fresh portfolio");
 
@@ -209,6 +231,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     // Phase 6: select, size, and execute new pairs using current_equity.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
     let filled = select_size_execute(
+        pool,
         alpaca,
         state.tradable_assets(),
         &signals,
@@ -716,12 +739,42 @@ async fn check_drawdown(
     Ok((current_equity, buying_power))
 }
 
+/// Persists a single submitted order record for durable tracking.
+///
+/// Logs a warning and continues if the insert fails — the order has already
+/// been submitted to Alpaca, so we must not abort the pipeline.
+async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
+    if let Err(error) = insert_submitted_order(
+        pool,
+        leg.id,
+        &leg.alpaca_order_id,
+        &leg.ticker,
+        &leg.side.to_string(),
+        leg.quantity,
+        &leg.order_type,
+        leg.submitted_at,
+    )
+    .await
+    {
+        warn!(
+            alpaca_order_id = leg.alpaca_order_id.as_str(),
+            error = %error,
+            "Failed to persist submitted order; continuing without durable tracking"
+        );
+    }
+}
+
 /// Selects candidate pairs, sizes them, filters to shortable tickers, and executes orders.
+///
+/// Submitted orders are persisted to the database before polling for fills,
+/// ensuring that a crash between submission and fill confirmation leaves a
+/// durable breadcrumb for reconciliation to resolve.
 ///
 /// Returns the filled pairs paired with their sizing metadata. Errors with
 /// `InsufficientPairs` when no fills are confirmed.
 #[allow(clippy::too_many_arguments)]
 async fn select_size_execute(
+    pool: &sqlx::PgPool,
     alpaca: &TradingClient,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     signals: &[ConsolidatedSignal],
@@ -833,6 +886,15 @@ async fn select_size_execute(
         .collect();
 
     let pending = execute_open_pairs(alpaca, &eligible_pairs).await;
+
+    // Persist submitted order records before polling for fills. Each order gets
+    // a durable breadcrumb so that if the process crashes during fill polling,
+    // the reconciliation process can find and resolve these orders.
+    for (pending_pair, _sized_pair) in &pending {
+        persist_submitted_order(pool, pending_pair.long()).await;
+        persist_submitted_order(pool, pending_pair.short()).await;
+    }
+
     let filled = confirm_fills(alpaca, pending).await;
 
     if filled.is_empty() {
@@ -969,6 +1031,19 @@ async fn persist_filled_pairs(
             filled_pair.short.alpaca_order_id.clone(),
         );
         insert_equity_order(&mut **transaction, &short_order).await?;
+
+        // Mark the original submitted order tracking records as filled.
+        // Uses the Order ID from the filled pair (same UUID that was used in
+        // insert_submitted_order). Silently handles the case where the submitted
+        // record was never persisted (e.g., DB was unavailable at submission time).
+        mark_order_filled(&mut **transaction, filled_pair.long.id, long_alloc_id, now).await?;
+        mark_order_filled(
+            &mut **transaction,
+            filled_pair.short.id,
+            short_alloc_id,
+            now,
+        )
+        .await?;
 
         // Slippage estimate: 1 bp per leg (0.01% of notional).
         let pair_notional = long_notional_decimal + short_notional_decimal;

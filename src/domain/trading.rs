@@ -151,7 +151,7 @@ impl SnapshotType {
 /// Reason a long-short pair position was closed.
 ///
 /// Mirrors the `CHECK` constraint on `equity_pairs.close_reason`:
-/// `('profit_taken', 'stop_loss', 'end_of_day')`.
+/// `('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +162,8 @@ pub enum CloseReason {
     StopLoss,
     /// All positions closed before market close (go to cash).
     EndOfDay,
+    /// Reconciliation detected that Alpaca no longer holds positions for this pair.
+    ReconciliationAlpacaMissing,
 }
 
 impl CloseReason {
@@ -171,6 +173,7 @@ impl CloseReason {
             Self::ProfitTaken => "profit_taken",
             Self::StopLoss => "stop_loss",
             Self::EndOfDay => "end_of_day",
+            Self::ReconciliationAlpacaMissing => "reconciliation_alpaca_missing",
         }
     }
 
@@ -180,6 +183,43 @@ impl CloseReason {
             "profit_taken" => Some(Self::ProfitTaken),
             "stop_loss" => Some(Self::StopLoss),
             "end_of_day" => Some(Self::EndOfDay),
+            "reconciliation_alpaca_missing" => Some(Self::ReconciliationAlpacaMissing),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle status of an order submitted to Alpaca.
+///
+/// Mirrors the `CHECK` constraint on `equity_orders.status`:
+/// `('submitted', 'filled', 'cancelled')`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderStatus {
+    /// Order has been submitted to Alpaca but fill has not been confirmed.
+    Submitted,
+    /// Order fill has been confirmed by Alpaca.
+    Filled,
+    /// Order was cancelled (by reconciliation or compensation).
+    Cancelled,
+}
+
+impl OrderStatus {
+    /// Returns the database string identifier for this order status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Filled => "filled",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parses a stored database value. Returns `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "submitted" => Some(Self::Submitted),
+            "filled" => Some(Self::Filled),
+            "cancelled" => Some(Self::Cancelled),
             _ => None,
         }
     }
@@ -764,6 +804,7 @@ mod tests {
             CloseReason::ProfitTaken,
             CloseReason::StopLoss,
             CloseReason::EndOfDay,
+            CloseReason::ReconciliationAlpacaMissing,
         ] {
             assert_eq!(CloseReason::parse(reason.as_str()), Some(reason.clone()));
             let serialized = serde_json::to_string(&reason).unwrap();
@@ -785,6 +826,10 @@ mod tests {
         assert_eq!(CloseReason::ProfitTaken.to_string(), "profit_taken");
         assert_eq!(CloseReason::StopLoss.to_string(), "stop_loss");
         assert_eq!(CloseReason::EndOfDay.to_string(), "end_of_day");
+        assert_eq!(
+            CloseReason::ReconciliationAlpacaMissing.to_string(),
+            "reconciliation_alpaca_missing"
+        );
     }
 
     #[test]
@@ -793,6 +838,31 @@ mod tests {
         assert_eq!(CloseReason::ProfitTaken.as_str(), "profit_taken");
         assert_eq!(CloseReason::StopLoss.as_str(), "stop_loss");
         assert_eq!(CloseReason::EndOfDay.as_str(), "end_of_day");
+        assert_eq!(
+            CloseReason::ReconciliationAlpacaMissing.as_str(),
+            "reconciliation_alpaca_missing"
+        );
+    }
+
+    #[test]
+    fn test_order_status_round_trip() {
+        for status in [
+            OrderStatus::Submitted,
+            OrderStatus::Filled,
+            OrderStatus::Cancelled,
+        ] {
+            assert_eq!(OrderStatus::parse(status.as_str()), Some(status.clone()));
+            let serialized = serde_json::to_string(&status).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", status.as_str()));
+            let deserialized: OrderStatus = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, status);
+        }
+    }
+
+    #[test]
+    fn test_order_status_parse_rejects_unknown() {
+        assert_eq!(OrderStatus::parse("pending"), None);
+        assert_eq!(OrderStatus::parse("FILLED"), None);
     }
 
     #[test]
