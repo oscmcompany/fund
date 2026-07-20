@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sync-application -- Per-minute cron job that checks for new commits on
+# origin/master and restarts devenv in the tmux session when code changes.
+#
+# Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+# The tmux restart loop in start-application picks devenv back up
+# automatically after this script terminates the running instance.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="/tmp/sync-application.pid"
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+# Single-instance guard: prevent overlapping cron runs
+if [[ -f "$LOCK_FILE" ]]; then
+  existing_pid="$(cat "$LOCK_FILE")"
+  if kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$LOCK_FILE"
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+cd "$REPO_ROOT"
+
+if ! git fetch origin master 2>&1; then
+  log "git fetch failed, will retry next cycle"
+  exit 0
+fi
+
+local_head="$(git rev-parse HEAD)"
+remote_head="$(git rev-parse origin/master)"
+
+if [[ "$local_head" == "$remote_head" ]]; then
+  exit 0
+fi
+
+log "New commits detected (local=$local_head remote=$remote_head)"
+
+# Stop devenv by terminating process-compose (the process manager spawned by
+# devenv) which in turn terminates all managed services.
+if pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null; then
+  log "Sent SIGTERM to process-compose"
+else
+  log "WARNING: process-compose not found"
+fi
+if pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null; then
+  log "Sent SIGTERM to devenv"
+else
+  log "WARNING: devenv process not found"
+fi
+
+log "Resetting to origin/master"
+git reset --hard origin/master
+devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
+log "Updated to $(git rev-parse --short HEAD)"

@@ -321,6 +321,28 @@ sudo chown "$(whoami)" /var/log/fund
 echo "Created /var/log/fund"
 
 # --------------------------------------------------------------------------- #
+# 8b. Write ~/fund-cron.sh (common cron shim for both profiles)
+# --------------------------------------------------------------------------- #
+step "Writing ~/fund-cron.sh"
+cat > "$HOME/fund-cron.sh" << 'CRONEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+for p in /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh /etc/profile.d/nix.sh; do
+  [ -f "$p" ] && . "$p" && break
+done
+cd ~/fund
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source .env
+  set +a
+fi
+exec "$@"
+CRONEOF
+chmod +x "$HOME/fund-cron.sh"
+echo "Wrote $HOME/fund-cron.sh"
+
+# --------------------------------------------------------------------------- #
 # 9. Build the devenv environment
 # --------------------------------------------------------------------------- #
 step "Building devenv environment"
@@ -348,8 +370,9 @@ echo ""
 echo "Next steps:"
 echo "  cd $REPO_ROOT"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  tmux new-session -d -s fund 'devenv --profile application up'"
-  echo "  tmux attach -t fund        # attach to services session"
+  echo "  start-application   # start services and install sync cron"
+  echo "  # or"
+  echo "  start-trainer       # install training cron job"
 else
   echo "  devenv shell        # enter the development environment"
   echo "  devenv --profile application up  # start application services"

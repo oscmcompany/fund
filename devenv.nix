@@ -376,6 +376,80 @@ in {
   scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm --environment development";
   scripts.provision-production-trainer-vm.exec = "bash tools/provision-trainer-vm --environment production";
 
+  scripts.start-application.exec = ''
+    set -euo pipefail
+
+    # Idempotent: skip if tmux session already exists
+    if tmux has-session -t fund 2>/dev/null; then
+      echo "Application is already running (tmux session 'fund' exists)"
+      echo "  tmux attach -t fund    # attach to session"
+      exit 0
+    fi
+
+    # Idempotent: install cron entry only if not already present
+    if ! crontab -l 2>/dev/null | grep -qF 'sync-application'; then
+      (crontab -l 2>/dev/null || true; echo '* * * * * bash ~/fund-cron.sh tools/sync-application >> /var/log/fund/sync-application.log 2>&1') | crontab -
+      echo "Installed sync-application cron entry"
+    else
+      echo "Sync cron entry already installed"
+    fi
+
+    # Start devenv in a tmux session with a restart loop
+    tmux new-session -d -s fund 'cd ~/fund && while true; do devenv --profile application up; sleep 5; done'
+    echo "Application started in tmux session 'fund'"
+    echo "  tmux attach -t fund    # attach to session"
+  '';
+
+  scripts.stop-application.exec = ''
+    set -euo pipefail
+
+    # Remove cron entry
+    if crontab -l 2>/dev/null | grep -qF 'sync-application'; then
+      crontab -l 2>/dev/null | grep -vF 'sync-application' | crontab - || true
+      echo "Removed sync-application cron entry"
+    else
+      echo "No sync cron entry to remove"
+    fi
+
+    # Stop devenv processes
+    pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null && echo "Sent SIGTERM to process-compose" || true
+    pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null && echo "Sent SIGTERM to devenv" || true
+
+    # Kill tmux session (breaks the restart loop)
+    if tmux has-session -t fund 2>/dev/null; then
+      tmux kill-session -t fund
+      echo "Killed tmux session 'fund'"
+    else
+      echo "No tmux session to kill"
+    fi
+
+    echo "Application stopped"
+  '';
+
+  scripts.start-trainer.exec = ''
+    set -euo pipefail
+
+    # Idempotent: install cron entry only if not already present
+    if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
+      echo "Training cron entry already installed"
+      exit 0
+    fi
+
+    (crontab -l 2>/dev/null || true; echo '0 6 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
+    echo "Installed training cron entry (weekdays 06:00 UTC)"
+  '';
+
+  scripts.stop-trainer.exec = ''
+    set -euo pipefail
+
+    if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
+      crontab -l 2>/dev/null | grep -vF 'train-tide-model' | crontab - || true
+      echo "Removed training cron entry"
+    else
+      echo "No training cron entry to remove"
+    fi
+  '';
+
   scripts.seed-equity-bars.exec = ''
     set -euo pipefail
 
@@ -536,9 +610,9 @@ in {
       ];
     };
 
-    "checks:continuous-integration" = {
+    "checks:all" = {
       exec = ''
-        echo "All continuous integration checks passed"
+        echo "All checks passed"
       '';
       after = [
         "checks:base"
@@ -634,49 +708,59 @@ in {
       echo "  Bucket: $AWS_S3_BUCKET_NAME"
       echo ""
       echo "  Profiles:"
-      echo "    devenv --profile application up      Start application services"
-      echo "    devenv --profile trainer shell     Model training environment"
+      echo "    devenv --profile application up      Start application processes"
+      echo "    devenv --profile trainer shell       Model training environment"
       echo ""
-      echo "  Services (application profile):"
-      echo "    Data:         market data sync, quote streaming, nightly exports"
-      echo "    Inference:    model artifact polling, prediction pipeline"
-      echo "    Portfolio:    rebalance orchestration, liquidation"
-      echo "    PostgreSQL:   localhost:5432/fund"
+      echo "  Processes (application profile):"
+      echo "    postgresql                  PostgreSQL 16 with TimescaleDB"
+      echo "                                and pg_cron (localhost:5432)"
+      echo "    schema                      Apply database schema"
+      echo "                                (runs first, then exits)"
+      echo "    data                        Market data sync, nightly exports,"
+      echo "                                database backups"
+      echo "    inference                   Model artifact polling,"
+      echo "                                prediction pipeline"
+      echo "    portfolio                   Rebalance orchestration,"
+      echo "                                liquidation"
+      echo "    dashboard                   Monitoring UI"
       echo ""
-      echo "  Secrets (secretspec):"
-      echo "    secretspec check          Validate production secrets"
-      echo "    secretspec set <KEY>      Set a secret value"
+      echo "  Scripts:"
+      echo "    provision-{production|development}-{application|trainer}-vm"
+      echo "                                Provision a VM on exe.dev for the"
+      echo "                                given environment and role"
+      echo "    start-application           Start application processes and"
+      echo "                                install sync cron (run on VM)"
+      echo "    stop-application            Stop application processes and"
+      echo "                                remove sync cron (run on VM)"
+      echo "    start-trainer               Install training cron job"
+      echo "                                (run on VM)"
+      echo "    stop-trainer                Remove training cron job"
+      echo "                                (run on VM)"
+      echo "    list-aws-buckets            List fund S3 buckets"
+      echo "    list-aws-secrets            List fund secrets in AWS"
+      echo "    trigger-rebalance           Emit an intraday_check event"
+      echo "                                manually"
+      echo "    bump-rust-dependencies      Update all dependency lockfiles"
       echo ""
-      echo "  AWS:"
-      echo "    list-aws-buckets       List fund S3 buckets"
-      echo "    list-aws-secrets       List fund secrets"
-      echo ""
-      echo "  Tasks (devenv tasks run):"
-      echo "    checks:base                    Non-language checks (nix, markdown, yaml, toml, sql)"
-      echo "    checks:rust                    All Rust checks (sequential: format, then lint + test + unused-deps)"
-      echo "    checks:markdown                Markdown lint"
-      echo "    checks:yaml                    YAML lint"
-      echo "    checks:toml                    TOML format check"
-      echo "    checks:sql                     SQL lint (PostgreSQL)"
-      echo "    checks:nix                     Nix checks (alejandra + statix)"
-      echo "    database:connect               Open interactive psql session"
-      echo "    database:create                Apply schema (idempotent, safe to re-run)"
-      echo "    database:reset                 Drop and recreate the empty fund database"
-      echo "                                   (run before database:create after a breaking schema change)"
-      echo "    database:backup                Dump fund database and upload to S3 (also runs nightly at 22:00 UTC)"
-      echo "    data:equity-bars               Seed equity bars (requires SEED_SOURCE, SEED_TARGET, SEED_START_DATE)"
-      echo "    data:equity-details            Seed equity details (requires SEED_TARGET)"
-      echo "    data:seed                      Full bootstrap: seed details + bars (requires SEED_SOURCE, SEED_START_DATE)"
-      echo "    models:tide:train              Train tide model and upload artifacts"
-      echo ""
-      echo "  VM provisioning:"
-      echo "    provision-development-application-vm  Provision a development application VM"
-      echo "    provision-production-application-vm   Provision a production application VM"
-      echo "    provision-development-trainer-vm      Provision a development trainer VM"
-      echo "    provision-production-trainer-vm       Provision a production trainer VM"
-      echo ""
-      echo "  Utilities:"
-      echo "    bump-rust-dependencies           Update all dependency lockfiles"
+      echo "  Tasks (devenv tasks run <name>):"
+      echo "    checks:rust                 All Rust checks (format, lint,"
+      echo "                                test, unused-deps)"
+      echo "    checks:base                 Non-language checks (nix, markdown,"
+      echo "                                yaml, toml, sql)"
+      echo "    checks:all                  All checks combined"
+      echo "    database:connect            Open interactive psql session"
+      echo "    database:create             Apply schema (idempotent)"
+      echo "    database:reset              Drop and recreate empty fund"
+      echo "                                database"
+      echo "    database:backup             Dump database and upload to S3"
+      echo "    data:seed                   Full data bootstrap (run without"
+      echo "                                arguments for usage)"
+      echo "    data:equity-bars            Seed equity bars (run without"
+      echo "                                arguments for usage)"
+      echo "    data:equity-details         Seed equity details (run without"
+      echo "                                arguments for usage)"
+      echo "    models:tide:train           Train TiDE model and upload"
+      echo "                                artifacts"
     } >&2
   '';
 
