@@ -794,16 +794,18 @@ struct SnapshotQuote {
 /// Test-only mock implementation of the [`Trading`] trait.
 ///
 /// Configurable via public fields. Default values return empty success responses.
-/// Set `should_fail_order` to `true` to make order submission return an error.
-/// Set `should_fail_cancel` to `true` to make cancel return an error.
-/// Set `should_fail_close` to `true` to make close_position return an error.
+/// Set `should_fail_long_order` or `should_fail_short_order` to make the
+/// respective order submission return an error. Set `should_fail_cancel` to
+/// make cancel return an error. Set `should_fail_close` to make
+/// `close_position` return an error.
 #[cfg(test)]
 pub struct MockTrading {
     pub positions: Vec<Position>,
     pub account: AccountInfo,
     pub order_responses: std::sync::Mutex<Vec<String>>,
     pub order_fills: std::sync::Mutex<Vec<OrderFill>>,
-    pub should_fail_order: bool,
+    pub should_fail_long_order: bool,
+    pub should_fail_short_order: bool,
     pub should_fail_cancel: bool,
     pub should_fail_close: bool,
     pub market_open: bool,
@@ -823,7 +825,8 @@ impl Default for MockTrading {
             },
             order_responses: std::sync::Mutex::new(Vec::new()),
             order_fills: std::sync::Mutex::new(Vec::new()),
-            should_fail_order: false,
+            should_fail_long_order: false,
+            should_fail_short_order: false,
             should_fail_cancel: false,
             should_fail_close: false,
             market_open: true,
@@ -848,10 +851,10 @@ impl Trading for MockTrading {
         _ticker: &str,
         _notional: f64,
     ) -> Result<String, ClientError> {
-        if self.should_fail_order {
+        if self.should_fail_long_order {
             return Err(ClientError::Api {
                 status: 422,
-                body: "mock order failure".to_string(),
+                body: "mock long order failure".to_string(),
             });
         }
         let mut responses = self.order_responses.lock().unwrap();
@@ -867,10 +870,10 @@ impl Trading for MockTrading {
         _ticker: &str,
         _quantity: i64,
     ) -> Result<String, ClientError> {
-        if self.should_fail_order {
+        if self.should_fail_short_order {
             return Err(ClientError::Api {
                 status: 422,
-                body: "mock order failure".to_string(),
+                body: "mock short order failure".to_string(),
             });
         }
         let mut responses = self.order_responses.lock().unwrap();

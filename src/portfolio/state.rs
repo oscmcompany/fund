@@ -165,6 +165,15 @@ impl AppState {
         self.rebalance_cycle_started_at.load(Ordering::SeqCst)
     }
 
+    /// Returns a reference to the raw atomic storing the cycle-start timestamp.
+    ///
+    /// Exposed for tests that need to simulate a stale cycle by backdating
+    /// the timestamp directly.
+    #[cfg(test)]
+    pub fn rebalance_cycle_started_at_atomic(&self) -> &AtomicI64 {
+        &self.rebalance_cycle_started_at
+    }
+
     /// Sets or clears the rebalance-cycle-in-progress flag.
     ///
     /// When `in_progress` is `true`, also records the current time so callers
