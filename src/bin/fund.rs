@@ -6,6 +6,8 @@
 //! own log stream and TUI panel while still sharing the same PostgreSQL
 //! event bus for inter-service coordination.
 
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 const USAGE: &str = "Usage: fund [--module <data|inference|portfolio>]";
@@ -86,36 +88,78 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
+    let shutdown_token = CancellationToken::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
     let run_data = module.is_none() || module == Some(Module::Data);
     let run_inference = module.is_none() || module == Some(Module::Inference);
     let run_portfolio = module.is_none() || module == Some(Module::Portfolio);
 
     if run_data {
         let state = fund::data::state::State::with_pool(pool.clone(), s3_client.clone());
-        fund::data::scheduler::spawn_sync_scheduler(state.clone());
+        let data_handles =
+            fund::data::scheduler::spawn_sync_scheduler(state.clone(), shutdown_token.clone());
+        handles.extend(data_handles);
         info!("Data service started");
     }
 
     if run_inference {
         let state = fund::inference::state::AppState::with_pool(pool.clone(), s3_client.clone());
         fund::inference::pipeline::poll_artifact_once(&state).await;
-        tokio::spawn(fund::inference::pipeline::start_artifact_polling(
-            state.clone(),
+        handles.push(tokio::spawn(
+            fund::inference::pipeline::start_artifact_polling(
+                state.clone(),
+                shutdown_token.clone(),
+            ),
         ));
-        fund::inference::consumer::spawn_event_consumer(state);
+        handles.extend(fund::inference::consumer::spawn_event_consumer(
+            state,
+            shutdown_token.clone(),
+        ));
         info!("Inference service started");
     }
 
     if run_portfolio {
         let state = fund::portfolio::state::AppState::with_pool(pool)?;
-        fund::portfolio::consumer::spawn_event_consumer(state);
+        handles.push(fund::portfolio::consumer::spawn_event_consumer(
+            state,
+            shutdown_token.clone(),
+        ));
         info!("Portfolio service started");
     }
 
     info!("Waiting for events");
-    tokio::signal::ctrl_c().await?;
-    info!("Shutting down");
+    await_shutdown_signal().await;
+    info!("Shutdown signal received, waiting for consumers to drain");
+    shutdown_token.cancel();
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    info!("Shutdown complete");
     Ok(())
+}
+
+/// Waits for either SIGTERM or Ctrl+C (SIGINT).
+async fn await_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +184,16 @@ mod tests {
         for module in [Module::Data, Module::Inference, Module::Portfolio] {
             assert_eq!(Module::parse(module.as_str()).unwrap(), module);
         }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signal_cancels_token() {
+        let token = CancellationToken::new();
+        let child = token.child_token();
+
+        // Cancelling the parent token should resolve the child.
+        token.cancel();
+        child.cancelled().await;
+        assert!(child.is_cancelled());
     }
 }

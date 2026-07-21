@@ -12,7 +12,9 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::US::Eastern;
 use sqlx::postgres::PgListener;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const SYNC_HOUR: u32 = 1;
@@ -76,15 +78,20 @@ fn export_date_from_payload(payload: &serde_json::Value) -> NaiveDate {
         .unwrap_or_else(|| Utc::now().date_naive())
 }
 
-pub fn spawn_sync_scheduler(state: State) {
+pub fn spawn_sync_scheduler(
+    state: State,
+    shutdown_token: CancellationToken,
+) -> Vec<JoinHandle<()>> {
     let listen_state = state.clone();
+    let mut handles = Vec::new();
     // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
     // unavailable (e.g., local development without a database). In production the
     // pg_cron + LISTEN/NOTIFY path (listen_loop) is the sole trigger mechanism.
     if !state.database.is_configured() {
-        tokio::spawn(sync_loop(state));
+        handles.push(tokio::spawn(sync_loop(state, shutdown_token.clone())));
     }
-    tokio::spawn(listen_loop(listen_state));
+    handles.push(tokio::spawn(listen_loop(listen_state, shutdown_token)));
+    handles
 }
 
 async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
@@ -96,14 +103,24 @@ async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
     fetch_and_store_equity_bars(state, &trading_date).await
 }
 
-async fn sync_loop(state: State) {
+async fn sync_loop(state: State, shutdown_token: CancellationToken) {
     loop {
         let wait_duration = duration_until_next_sync(Utc::now());
         info!(
             seconds = wait_duration.as_secs(),
             "Waiting for next equity bar sync"
         );
-        sleep(wait_duration).await;
+        tokio::select! {
+            _ = sleep(wait_duration) => {}
+            _ = shutdown_token.cancelled() => {
+                info!("Sync loop stopped for shutdown");
+                break;
+            }
+        }
+
+        if shutdown_token.is_cancelled() {
+            break;
+        }
 
         if state.synced_recently(SYNC_DEDUP_TTL_SECS) {
             info!("Skipping sync loop run, synced recently");
@@ -125,7 +142,7 @@ async fn sync_loop(state: State) {
     }
 }
 
-async fn listen_loop(state: State) {
+async fn listen_loop(state: State, shutdown_token: CancellationToken) {
     let pool = match state.database.pool() {
         Some(pool) => pool.clone(),
         None => {
@@ -135,19 +152,37 @@ async fn listen_loop(state: State) {
     };
 
     loop {
-        match run_listener(&state, &pool).await {
+        match run_listener(&state, &pool, &shutdown_token).await {
             Ok(()) => {
+                if shutdown_token.is_cancelled() {
+                    info!("LISTEN handler stopped for shutdown");
+                    break;
+                }
                 info!("LISTEN handler exited, restarting");
             }
             Err(error) => {
+                if shutdown_token.is_cancelled() {
+                    info!("LISTEN handler stopped for shutdown");
+                    break;
+                }
                 warn!("LISTEN handler error: {}, restarting in 30s", error);
-                sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(30)) => {}
+                    _ = shutdown_token.cancelled() => {
+                        info!("LISTEN handler stopped for shutdown");
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
-async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+async fn run_listener(
+    state: &State,
+    pool: &sqlx::PgPool,
+    shutdown_token: &CancellationToken,
+) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
@@ -205,7 +240,13 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
 
     // Main event loop.
     loop {
-        let notification = listener.recv().await?;
+        let notification = tokio::select! {
+            result = listener.recv() => result?,
+            _ = shutdown_token.cancelled() => {
+                info!("Shutdown signal received, draining");
+                break;
+            }
+        };
         let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
             Ok(value) => value,
             Err(_) => continue,
@@ -236,6 +277,8 @@ async fn run_listener(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Er
             handle_database_backup(state, pool, event_id).await;
         }
     }
+
+    Ok(())
 }
 
 async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {
@@ -616,6 +659,7 @@ mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     /// RAII guard that removes an environment variable for the duration of a test
     /// and restores the original value (or absence) on drop.
@@ -1080,7 +1124,8 @@ mod tests {
             "test-bucket".to_string(),
         );
         // listen_loop must return immediately (no pool configured).
-        listen_loop(state).await;
+        let token = CancellationToken::new();
+        listen_loop(state, token).await;
     }
 
     #[tokio::test]
@@ -1116,9 +1161,13 @@ mod tests {
         // DatabaseState::NotConfigured so is_configured() == false, which
         // causes both the sync_loop and listen_loop tasks to be spawned.
         // listen_loop returns immediately without a pool.
-        spawn_sync_scheduler(state);
-        // Yield once so the spawned listen_loop task can run to completion.
-        tokio::task::yield_now().await;
+        let token = CancellationToken::new();
+        let handles = spawn_sync_scheduler(state, token.clone());
+        // Cancel so the sync_loop task exits its sleep and terminates.
+        token.cancel();
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     #[test]

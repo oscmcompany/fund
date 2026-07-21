@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::events::{
@@ -20,33 +22,59 @@ use crate::inference::pipeline::run_predictions;
 use crate::inference::state::AppState;
 
 /// Spawn the event consumer if a database pool is configured.
-pub fn spawn_event_consumer(state: AppState) {
+///
+/// Returns the join handle for the spawned task, or an empty vec if no pool
+/// is available.
+pub fn spawn_event_consumer(
+    state: AppState,
+    shutdown_token: CancellationToken,
+) -> Vec<JoinHandle<()>> {
     if state.pool().is_none() {
         info!("PostgreSQL not available, event consumer disabled");
-        return;
+        return Vec::new();
     }
-    tokio::spawn(consumer_loop(state));
+    vec![tokio::spawn(consumer_loop(state, shutdown_token))]
 }
 
 /// Supervisor: restart the listener on error with a backoff.
-async fn consumer_loop(state: AppState) {
+async fn consumer_loop(state: AppState, shutdown_token: CancellationToken) {
     let pool = match state.pool() {
         Some(pool) => pool.clone(),
         None => return,
     };
 
     loop {
-        match run_consumer(&state, &pool).await {
-            Ok(()) => info!("Event consumer exited, restarting"),
+        match run_consumer(&state, &pool, &shutdown_token).await {
+            Ok(()) => {
+                if shutdown_token.is_cancelled() {
+                    info!("Event consumer stopped for shutdown");
+                    break;
+                }
+                info!("Event consumer exited, restarting");
+            }
             Err(error) => {
+                if shutdown_token.is_cancelled() {
+                    info!("Event consumer stopped for shutdown");
+                    break;
+                }
                 warn!("Event consumer error: {}, restarting in 30s", error);
-                sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(30)) => {}
+                    _ = shutdown_token.cancelled() => {
+                        info!("Event consumer stopped for shutdown");
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
-async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error> {
+async fn run_consumer(
+    state: &AppState,
+    pool: &PgPool,
+    shutdown_token: &CancellationToken,
+) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
@@ -64,7 +92,13 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     }
 
     loop {
-        let notification = listener.recv().await?;
+        let notification = tokio::select! {
+            result = listener.recv() => result?,
+            _ = shutdown_token.cancelled() => {
+                info!("Shutdown signal received, draining");
+                break;
+            }
+        };
         let payload = notification.payload();
 
         if parse_event_type(payload).as_deref()
@@ -81,6 +115,8 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
         info!(event_id, "Received equity_predictions_requested");
         handle_equity_predictions_requested(state, pool, event_id).await;
     }
+
+    Ok(())
 }
 
 /// Parse an event notification payload and return the event type string if
@@ -223,7 +259,9 @@ mod tests {
             "prefix/".to_string(),
             "latest".to_string(),
         );
+        let token = CancellationToken::new();
         // No pool configured; the function must log and return without spawning.
-        spawn_event_consumer(state);
+        let handles = spawn_event_consumer(state, token);
+        assert!(handles.is_empty());
     }
 }
