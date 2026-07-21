@@ -47,6 +47,7 @@ train = ["inference", "dep:rand"]
 
 [dependencies]
 # Shared / base (always compiled)
+async-trait = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 polars = { version = "0.51.0", features = [
   "lazy",

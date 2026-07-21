@@ -9,88 +9,12 @@ use fund::common::events::{
 };
 use fund::inference::database::{insert_predictions, upsert_model_run, ModelRunRecord};
 use serial_test::serial;
-use sqlx::PgPool;
-use std::sync::OnceLock;
-use std::time::Duration;
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
-use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
-
-static PG_URL: OnceLock<String> = OnceLock::new();
-static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new();
-
-const SCHEMA_SQL: &str = include_str!("../schema.sql");
-
-/// Strip lines that need pg_cron or TimescaleDB (unavailable in vanilla Postgres).
-fn filter_schema_for_test(schema: &str) -> String {
-    let mut inside_cron_block = false;
-    schema
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim().to_lowercase();
-            if trimmed.starts_with("do $do$") {
-                inside_cron_block = true;
-            }
-            if inside_cron_block {
-                if trimmed.starts_with("$do$;") {
-                    inside_cron_block = false;
-                }
-                return false;
-            }
-            !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("create extension if not exists timescaledb")
-                && !trimmed.starts_with("select cron.schedule")
-                && !trimmed.starts_with("select create_hypertable")
-                && !trimmed.starts_with("select add_retention_policy")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-async fn get_pg_pool() -> PgPool {
-    if let Some(url) = PG_URL.get() {
-        return PgPool::connect(url).await.unwrap();
-    }
-
-    let container = Postgres::default()
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container — is Docker running?");
-
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
-
-    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let pool = loop {
-        match PgPool::connect(&url).await {
-            Ok(pool) => break pool,
-            Err(error) => {
-                if tokio::time::Instant::now() >= connect_deadline {
-                    panic!("Failed to connect to PostgreSQL within timeout: {error}");
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    };
-
-    let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
-    sqlx::raw_sql(&filtered_schema)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
-    let _ = PG_CONTAINER.set(leaked);
-    let _ = PG_URL.set(url);
-
-    pool
-}
 
 #[tokio::test]
 #[serial]
 async fn test_consumer_offset_round_trip() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     let consumer = "ensemble-offset-test";
 
     assert_eq!(get_consumer_offset(&pool, consumer).await.unwrap(), 0);
@@ -109,7 +33,7 @@ async fn test_consumer_offset_round_trip() {
 #[tokio::test]
 #[serial]
 async fn test_latest_event_after_matches_only_requested_type() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
 
     let before = latest_event_after(&pool, EventType::EquityPredictionsRequested, 0)
         .await
@@ -146,7 +70,7 @@ async fn test_latest_event_after_matches_only_requested_type() {
 #[tokio::test]
 #[serial]
 async fn test_upsert_model_run_inserts_then_updates() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
 
     let metadata = serde_json::json!({
         "lookback_days": 1200,
@@ -197,7 +121,7 @@ async fn test_upsert_model_run_inserts_then_updates() {
 #[tokio::test]
 #[serial]
 async fn test_insert_predictions_writes_rows() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
 
     let predictions = vec![serde_json::json!({
         "ticker": "PREDTEST",

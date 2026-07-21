@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::orders::{FilledOrder, Order, OrderSide, PendingPair};
 use crate::domain::trading::{ReconciliationAction, ReconciliationEventType};
-use crate::portfolio::alpaca::{ClientError, TradingClient};
+use crate::portfolio::alpaca::{ClientError, Trading};
 use crate::portfolio::database;
 use crate::portfolio::sizing::SizedPair;
 
@@ -80,7 +80,7 @@ impl std::error::Error for ExecutionError {}
 /// expected in live trading when individual tickers have liquidity or
 /// borrowing issues.
 pub async fn execute_open_pairs(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &PgPool,
     sized_pairs: &[SizedPair],
 ) -> Vec<(PendingPair, SizedPair)> {
@@ -189,7 +189,7 @@ pub async fn execute_open_pairs(
 /// When both cancellation and position close fail, persists a `compensation_failure`
 /// event to the reconciliation table so it can be retried on the next pass.
 async fn compensate_orphaned_order(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &PgPool,
     alpaca_order_id: &str,
     ticker: &str,
@@ -268,7 +268,7 @@ async fn persist_compensation_failure(pool: &PgPool, ticker: &str, alpaca_order_
 ///
 /// Returns only the pairs where both legs filled successfully.
 pub async fn confirm_fills(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pending_pairs: Vec<(PendingPair, SizedPair)>,
 ) -> Vec<(crate::domain::orders::FilledPair, SizedPair)> {
     let mut results = Vec::new();
@@ -303,7 +303,7 @@ pub async fn confirm_fills(
 /// Uses increasing backoff: 500ms, 1s, 2s, 3s, 3.5s (total ~10s).
 /// Returns `None` after `FILL_POLL_ATTEMPTS` failed attempts or when the
 /// Alpaca order status does not indicate a fill.
-async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
+async fn poll_fill(alpaca: &dyn Trading, alpaca_order_id: &str) -> Option<FilledOrder> {
     for attempt in 1..=FILL_POLL_ATTEMPTS {
         match alpaca.get_order(alpaca_order_id).await {
             Ok(order_fill) if order_fill.status == "filled" => {
@@ -367,7 +367,7 @@ async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<Fill
 /// the remaining closures. Returns an `ExecutionError` only when a network-level
 /// error (not a 404 "no position") is encountered.
 pub async fn close_positions(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     tickers: &[String],
 ) -> Result<(), ExecutionError> {
     let mut first_error: Option<ExecutionError> = None;
@@ -559,5 +559,468 @@ mod tests {
         assert!((pending_pair.short_beta() - 0.9).abs() < f64::EPSILON);
         assert_eq!(pending_pair.long().alpaca_order_id, "alpaca-long-001");
         assert_eq!(pending_pair.short().alpaca_order_id, "alpaca-short-001");
+    }
+
+    // --- Async unit tests using MockTrading ---
+
+    use crate::domain::market::{PairID, Ticker};
+    use crate::portfolio::alpaca::{MockTrading, OrderFill};
+
+    /// Creates a dummy `PgPool` that never actually connects to a database.
+    ///
+    /// Uses port 1 (TCP reserved, unreachable) so that any accidental query
+    /// fails immediately rather than connecting to a real local Postgres.
+    /// The pool is only touched in the compensation error path, where failed
+    /// DB writes are handled gracefully (logged and swallowed).
+    fn dummy_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost:1/nonexistent_execution_test")
+            .expect("lazy pool creation should not fail")
+    }
+
+    /// Creates a single `SizedPair` for use in execution tests.
+    fn make_test_sized_pair(long_ticker: &str, short_ticker: &str) -> SizedPair {
+        SizedPair::new(
+            PairID::new(
+                Ticker::new(long_ticker).unwrap(),
+                Ticker::new(short_ticker).unwrap(),
+            ),
+            Ticker::new(long_ticker).unwrap(),
+            Ticker::new(short_ticker).unwrap(),
+            5000.0,
+            5000.0,
+            50,
+            100.0,
+            100.0,
+            2.5,
+            1.0,
+            0.05,
+            1.1,
+            0.9,
+        )
+        .expect("test sized pair should be valid")
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_happy_path_both_legs_submitted() {
+        let mock = MockTrading::default();
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        assert_eq!(results.len(), 1);
+        let (pending_pair, returned_sized) = &results[0];
+        assert_eq!(pending_pair.long().ticker, "AAPL");
+        assert_eq!(pending_pair.short().ticker, "MSFT");
+        assert_eq!(
+            pending_pair.long().side,
+            crate::domain::orders::OrderSide::Long
+        );
+        assert_eq!(
+            pending_pair.short().side,
+            crate::domain::orders::OrderSide::Short
+        );
+        assert_eq!(returned_sized.pair_id().as_str(), "AAPL-MSFT");
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_multiple_pairs() {
+        let mock = MockTrading::default();
+        let pool = dummy_pool();
+        let sized_pairs = vec![
+            make_test_sized_pair("AAPL", "MSFT"),
+            make_test_sized_pair("GOOG", "META"),
+        ];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0.long().ticker, "AAPL");
+        assert_eq!(results[1].0.long().ticker, "GOOG");
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_short_fails_compensates_long() {
+        let mock = MockTrading {
+            should_fail_short_order: true,
+            ..MockTrading::default()
+        };
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        // Pair should be skipped because the short leg failed.
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_long_fails_compensates_short() {
+        let mock = MockTrading {
+            should_fail_long_order: true,
+            ..MockTrading::default()
+        };
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        // Pair should be skipped because the long leg failed.
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_both_legs_fail_skips_pair() {
+        let mock = MockTrading {
+            should_fail_long_order: true,
+            should_fail_short_order: true,
+            ..MockTrading::default()
+        };
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_cancel_fails_falls_back_to_close() {
+        // Short leg fails → compensate orphaned long → cancel fails → close_position fallback.
+        let mock = MockTrading {
+            should_fail_short_order: true,
+            should_fail_cancel: true,
+            ..MockTrading::default()
+        };
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        // Pair is still skipped; the close_position fallback should succeed
+        // (should_fail_close defaults to false).
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_cancel_and_close_both_fail_persists_compensation() {
+        // Short leg fails → compensate orphaned long → cancel fails → close fails
+        // → persist_compensation_failure (which will fail on dummy pool but is swallowed).
+        let mock = MockTrading {
+            should_fail_short_order: true,
+            should_fail_cancel: true,
+            should_fail_close: true,
+            ..MockTrading::default()
+        };
+        let pool = dummy_pool();
+        let sized_pairs = vec![make_test_sized_pair("AAPL", "MSFT")];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        // Pair is skipped. The compensation failure persist will also fail (dummy
+        // pool), but execution must not panic.
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_empty_input() {
+        let mock = MockTrading::default();
+        let pool = dummy_pool();
+
+        let results = execute_open_pairs(&mock, &pool, &[]).await;
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_open_pairs_multiple_pairs_all_succeed() {
+        // Verifies that when no failure flags are set, all pairs in a batch
+        // are submitted and returned successfully.
+        let mock = MockTrading::default();
+        let pool = dummy_pool();
+        let sized_pairs = vec![
+            make_test_sized_pair("AAPL", "MSFT"),
+            make_test_sized_pair("GOOG", "META"),
+        ];
+
+        let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
+
+        assert_eq!(results.len(), 2);
+    }
+
+    // --- confirm_fills tests ---
+
+    /// Creates a `PendingPair` with known alpaca order IDs for fill testing.
+    fn make_test_pending_pair(long_ticker: &str, short_ticker: &str) -> (PendingPair, SizedPair) {
+        let now = Utc::now();
+        let long_order = Order::<crate::domain::orders::Pending>::new(
+            Uuid::new_v4(),
+            long_ticker.to_string(),
+            OrderSide::Long,
+            Decimal::ZERO,
+            "market".to_string(),
+            None,
+            format!("alpaca-long-{}", long_ticker.to_lowercase()),
+            now,
+        );
+        let short_order = Order::<crate::domain::orders::Pending>::new(
+            Uuid::new_v4(),
+            short_ticker.to_string(),
+            OrderSide::Short,
+            Decimal::from(50),
+            "market".to_string(),
+            None,
+            format!("alpaca-short-{}", short_ticker.to_lowercase()),
+            now,
+        );
+        let pending_pair = PendingPair::new(long_order, short_order, 1.1, 0.9);
+        let sized_pair = make_test_sized_pair(long_ticker, short_ticker);
+        (pending_pair, sized_pair)
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_happy_path_both_legs_fill() {
+        let mock = MockTrading::default();
+        let (pending_pair, sized_pair) = make_test_pending_pair("AAPL", "MSFT");
+
+        let results = confirm_fills(&mock, vec![(pending_pair, sized_pair)]).await;
+
+        assert_eq!(results.len(), 1);
+        let (filled_pair, _) = &results[0];
+        assert_eq!(filled_pair.long.ticker, "AAPL");
+        assert_eq!(filled_pair.short.ticker, "MSFT");
+        assert!(filled_pair.long.fill_price.is_some());
+        assert!(filled_pair.short.fill_price.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_long_never_fills_pair_dropped() {
+        // Pre-load order_fills so the long leg returns "new" (not filled) on
+        // every poll attempt, and the short leg fills normally.
+        let mut fills = Vec::new();
+        // Long leg polls: 5 attempts, all return "new" status.
+        for _ in 0..FILL_POLL_ATTEMPTS {
+            fills.push(OrderFill {
+                alpaca_order_id: "alpaca-long-aapl".to_string(),
+                status: "new".to_string(),
+                filled_quantity: None,
+                fill_price: None,
+            });
+        }
+        // Short leg polls: filled on first attempt.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-short-msft".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(50.0),
+            fill_price: Some(100.0),
+        });
+
+        let mock = MockTrading {
+            order_fills: std::sync::Mutex::new(fills),
+            ..MockTrading::default()
+        };
+        let (pending_pair, sized_pair) = make_test_pending_pair("AAPL", "MSFT");
+
+        let results = confirm_fills(&mock, vec![(pending_pair, sized_pair)]).await;
+
+        // Pair should be dropped because the long leg never filled.
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_short_never_fills_pair_dropped() {
+        let mut fills = Vec::new();
+        // Long leg: fills on first attempt.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-long-aapl".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(100.0),
+            fill_price: Some(150.0),
+        });
+        // Short leg: 5 attempts, all "new".
+        for _ in 0..FILL_POLL_ATTEMPTS {
+            fills.push(OrderFill {
+                alpaca_order_id: "alpaca-short-msft".to_string(),
+                status: "new".to_string(),
+                filled_quantity: None,
+                fill_price: None,
+            });
+        }
+
+        let mock = MockTrading {
+            order_fills: std::sync::Mutex::new(fills),
+            ..MockTrading::default()
+        };
+        let (pending_pair, sized_pair) = make_test_pending_pair("AAPL", "MSFT");
+
+        let results = confirm_fills(&mock, vec![(pending_pair, sized_pair)]).await;
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_zero_fill_price_retries() {
+        let mut fills = Vec::new();
+        // Long leg: first attempt has zero price, second attempt has valid fill.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-long-aapl".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(100.0),
+            fill_price: Some(0.0),
+        });
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-long-aapl".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(100.0),
+            fill_price: Some(150.0),
+        });
+        // Short leg: fills immediately.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-short-msft".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(50.0),
+            fill_price: Some(100.0),
+        });
+
+        let mock = MockTrading {
+            order_fills: std::sync::Mutex::new(fills),
+            ..MockTrading::default()
+        };
+        let (pending_pair, sized_pair) = make_test_pending_pair("AAPL", "MSFT");
+
+        let results = confirm_fills(&mock, vec![(pending_pair, sized_pair)]).await;
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_empty_input() {
+        let mock = MockTrading::default();
+
+        let results = confirm_fills(&mock, vec![]).await;
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_confirm_fills_multiple_pairs_partial_success() {
+        let mut fills = Vec::new();
+        // Pair 1 (AAPL-MSFT): both legs fill.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-long-aapl".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(100.0),
+            fill_price: Some(150.0),
+        });
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-short-msft".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(50.0),
+            fill_price: Some(100.0),
+        });
+        // Pair 2 (GOOG-META): long fills but short never fills.
+        fills.push(OrderFill {
+            alpaca_order_id: "alpaca-long-goog".to_string(),
+            status: "filled".to_string(),
+            filled_quantity: Some(20.0),
+            fill_price: Some(180.0),
+        });
+        for _ in 0..FILL_POLL_ATTEMPTS {
+            fills.push(OrderFill {
+                alpaca_order_id: "alpaca-short-meta".to_string(),
+                status: "new".to_string(),
+                filled_quantity: None,
+                fill_price: None,
+            });
+        }
+
+        let mock = MockTrading {
+            order_fills: std::sync::Mutex::new(fills),
+            ..MockTrading::default()
+        };
+        let (pair1, sized1) = make_test_pending_pair("AAPL", "MSFT");
+        let (pair2, sized2) = make_test_pending_pair("GOOG", "META");
+
+        let results = confirm_fills(&mock, vec![(pair1, sized1), (pair2, sized2)]).await;
+
+        // Only pair 1 should succeed.
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.long.ticker, "AAPL");
+    }
+
+    // --- close_positions tests ---
+
+    #[tokio::test]
+    async fn test_close_positions_happy_path() {
+        let mock = MockTrading::default();
+        let tickers = vec!["AAPL".to_string(), "MSFT".to_string()];
+
+        let result = close_positions(&mock, &tickers).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_positions_empty_tickers() {
+        let mock = MockTrading::default();
+
+        let result = close_positions(&mock, &[]).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_close_positions_failure_returns_first_error() {
+        let mock = MockTrading {
+            should_fail_close: true,
+            ..MockTrading::default()
+        };
+        let tickers = vec!["AAPL".to_string(), "MSFT".to_string()];
+
+        let result = close_positions(&mock, &tickers).await;
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        // The first error should reference the first ticker.
+        let message = format!("{error}");
+        assert!(message.contains("AAPL"));
+    }
+
+    #[tokio::test]
+    async fn test_close_positions_continues_after_failure() {
+        // Even when close fails for one ticker, the function should attempt
+        // closing all remaining tickers (returning the first error only).
+        let mock = MockTrading {
+            should_fail_close: true,
+            ..MockTrading::default()
+        };
+        let tickers = vec!["AAPL".to_string(), "MSFT".to_string(), "GOOG".to_string()];
+
+        let result = close_positions(&mock, &tickers).await;
+
+        // Should error but not panic — all tickers attempted.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execution_error_display_position_fetch() {
+        let error = ExecutionError::PositionFetch {
+            source: ClientError::Parse("connection refused".to_string()),
+        };
+        let message = format!("{error}");
+        assert!(message.contains("Position fetch"));
+        assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn test_execution_error_display_state_mismatch() {
+        let error = ExecutionError::StateMismatch {
+            message: "Alpaca has 3 positions but database has 0 open pairs".to_string(),
+        };
+        let message = format!("{error}");
+        assert!(message.contains("State mismatch"));
+        assert!(message.contains("3 positions"));
     }
 }

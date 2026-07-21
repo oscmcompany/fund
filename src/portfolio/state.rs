@@ -15,7 +15,7 @@ use crate::domain::portfolio::{
 };
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
-use crate::portfolio::alpaca::{TradableAssets, TradingClient};
+use crate::portfolio::alpaca::{TradableAssets, Trading, TradingClient};
 use crate::portfolio::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
@@ -98,7 +98,7 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    alpaca_client: TradingClient,
+    alpaca_client: Arc<dyn Trading>,
     confidence_floor: ConfidenceFloor,
     constraints: Constraints,
     /// Cached partitioned view of the Alpaca active asset universe.
@@ -130,8 +130,8 @@ impl AppState {
     }
 
     /// Returns a reference to the Alpaca trading client.
-    pub fn alpaca_client(&self) -> &TradingClient {
-        &self.alpaca_client
+    pub fn alpaca_client(&self) -> &dyn Trading {
+        self.alpaca_client.as_ref()
     }
 
     /// Returns the confidence floor used to gate signals.
@@ -163,6 +163,15 @@ impl AppState {
     /// or `0` if no cycle is in progress.
     pub fn rebalance_cycle_started_at(&self) -> i64 {
         self.rebalance_cycle_started_at.load(Ordering::SeqCst)
+    }
+
+    /// Returns a reference to the raw atomic storing the cycle-start timestamp.
+    ///
+    /// Exposed for tests that need to simulate a stale cycle by backdating
+    /// the timestamp directly.
+    #[cfg(test)]
+    pub fn rebalance_cycle_started_at_atomic(&self) -> &AtomicI64 {
+        &self.rebalance_cycle_started_at
     }
 
     /// Sets or clears the rebalance-cycle-in-progress flag.
@@ -198,7 +207,7 @@ impl AppState {
         let is_paper = env::var("ALPACA_IS_PAPER")
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let alpaca_client = TradingClient::new(credentials, is_paper);
+        let alpaca_client: Arc<dyn Trading> = Arc::new(TradingClient::new(credentials, is_paper));
         let drawdown_threshold = Percent::new(env_f64(
             "PORTFOLIO_DRAWDOWN_THRESHOLD",
             DEFAULT_DRAWDOWN_THRESHOLD,
@@ -295,7 +304,7 @@ impl AppState {
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
-        let alpaca_client = TradingClient::new(credentials, is_paper);
+        let alpaca_client: Arc<dyn Trading> = Arc::new(TradingClient::new(credentials, is_paper));
 
         // Risk and strategy parameters fall back to the safe defaults below but
         // can be overridden per environment (keyed off FUND_PROFILE via the
@@ -358,6 +367,39 @@ impl AppState {
             rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
         })
+    }
+
+    /// Test-only constructor that accepts an arbitrary `Trading` implementation.
+    ///
+    /// Uses safe defaults for all portfolio constraints so tests only need to
+    /// provide the pool and trading client they want to control.
+    #[cfg(test)]
+    pub fn with_mock(pool: PgPool, client: Arc<dyn Trading>) -> Self {
+        use std::num::NonZeroU8;
+
+        let drawdown_threshold =
+            DrawdownThreshold(Percent::new(DEFAULT_DRAWDOWN_THRESHOLD).unwrap());
+        let concentration_cap = ConcentrationCap(Percent::new(DEFAULT_CONCENTRATION_CAP).unwrap());
+        let minimum_pairs = MinimumPairs(NonZeroU8::new(DEFAULT_MINIMUM_PAIRS).unwrap());
+        let beta_tolerance = BetaTolerance::new(DEFAULT_BETA_TOLERANCE).unwrap();
+        let confidence_floor = ConfidenceFloor(Percent::new(DEFAULT_CONFIDENCE_FLOOR).unwrap());
+        let candidate_pool_count = DEFAULT_CANDIDATE_POOL.max(DEFAULT_MINIMUM_PAIRS as usize);
+
+        Self {
+            pool,
+            alpaca_client: client,
+            confidence_floor,
+            constraints: Constraints::new(
+                drawdown_threshold,
+                concentration_cap,
+                minimum_pairs,
+                beta_tolerance,
+            ),
+            tradable_assets: Arc::new(RwLock::new(None)),
+            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
+            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            candidate_pool_count,
+        }
     }
 }
 

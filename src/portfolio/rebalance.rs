@@ -39,7 +39,7 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio::alpaca::{TradableAssets, TradingClient};
+use crate::portfolio::alpaca::{TradableAssets, Trading};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio::database::{
@@ -341,7 +341,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 async fn run_monitor_cycle(
     state: &AppState,
     pool: &sqlx::PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     open_pairs: &[OpenPair],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
 ) -> Result<RebalanceOutcome, RebalanceError> {
@@ -670,7 +670,7 @@ fn evaluate_open_pairs(
 ///
 /// Returns the number of pairs successfully closed.
 async fn close_triggered_pairs(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &sqlx::PgPool,
     signals: &[PairCloseSignal],
 ) -> Result<usize, RebalanceError> {
@@ -710,7 +710,7 @@ async fn close_triggered_pairs(
 /// Errors with `DrawdownBreached` when the drop from the previous NAV exceeds
 /// the configured threshold.
 async fn check_drawdown(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &sqlx::PgPool,
     threshold: f64,
 ) -> Result<(f64, f64), RebalanceError> {
@@ -781,7 +781,7 @@ async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
 #[allow(clippy::too_many_arguments)]
 async fn select_size_execute(
     pool: &sqlx::PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
@@ -1319,5 +1319,105 @@ mod tests {
         // Verify the threshold constant is the expected value (guards against
         // accidental changes without updating documentation).
         assert!((STOP_LOSS_Z_SCORE_THRESHOLD - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_single_price_point_insufficient() {
+        // A single price point per leg does not meet the >= 2 threshold for
+        // z-score computation. The pair should be silently kept open.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0]);
+        prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0]);
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_different_length_histories() {
+        // When price histories have different lengths, the function trims to
+        // the common length. With a 60-point long history and a 30-point short
+        // history, the spread is computed over the last 30 points.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        // Long: 60 points decreasing (converging toward short).
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, -1.0));
+        // Short: only 30 points increasing.
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(30, 100.0, 1.0));
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        // Should still evaluate correctly using the last 30 points.
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_long_prices_only_keeps_pair() {
+        // When only the long leg has price data, the pair is kept open.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
+        // No MSFT prices.
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_stop_loss_negative_entry_z() {
+        // Entry z < 0, spread diverges further negative past threshold → stop loss.
+        let pair = make_open_pair("AAPL", "MSFT", -2.5, 1.0);
+        // Build prices where the spread is stable near zero for most of the window,
+        // then collapses dramatically at the end (long drops, short spikes).
+        let mut long_prices = vec![150.0; 58];
+        long_prices.push(10.0);
+        long_prices.push(5.0);
+        let short_prices = vec![100.0; 60];
+
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
+        prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::StopLoss);
+    }
+
+    #[test]
+    fn test_evaluate_open_pairs_hedge_ratio_affects_spread() {
+        // With a hedge ratio of 2.0, the spread is long - 2*short.
+        // Even if long rises, a doubling short ratio can cause the spread to
+        // cross zero, triggering convergence.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 2.0);
+        let mut prices = HashMap::new();
+        // Long increases slowly, short increases faster.
+        // spread = long - 2*short = (150 + i) - 2*(100 + 1.5*i) = -50 - 2*i
+        // Spread goes very negative with entry_z > 0 → converged.
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.5));
+
+        let signals = evaluate_open_pairs(&[pair], &prices);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_rebalance_error_display_execution() {
+        let error = RebalanceError::Execution(ExecutionError::PositionFetch {
+            source: crate::portfolio::alpaca::ClientError::Parse("timeout".to_string()),
+        });
+        let message = format!("{error}");
+        assert!(message.contains("Execution"));
+        assert!(message.contains("timeout"));
+    }
+
+    #[test]
+    fn test_rebalance_error_display_conversion() {
+        let error =
+            RebalanceError::Conversion("z_score cannot be represented as Decimal".to_string());
+        let message = format!("{error}");
+        assert!(message.contains("Numeric conversion"));
+        assert!(message.contains("z_score"));
     }
 }
