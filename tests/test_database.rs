@@ -8,82 +8,6 @@ use fund::data::database::{
 };
 use fund::data::types::{EquityBar, Ticker};
 use serial_test::serial;
-use sqlx::PgPool;
-use std::sync::OnceLock;
-use std::time::Duration;
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
-use testcontainers_modules::postgres::Postgres;
-
-static PG_URL: OnceLock<String> = OnceLock::new();
-static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new();
-
-const SCHEMA_SQL: &str = include_str!("../schema.sql");
-
-/// Lines from schema.sql that require pg_cron or TimescaleDB (not available in vanilla Postgres).
-fn filter_schema_for_test(schema: &str) -> String {
-    let mut inside_cron_block = false;
-    schema
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim().to_lowercase();
-            if trimmed.starts_with("do $do$") {
-                inside_cron_block = true;
-            }
-            if inside_cron_block {
-                if trimmed.starts_with("$do$;") {
-                    inside_cron_block = false;
-                }
-                return false;
-            }
-            !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("create extension if not exists timescaledb")
-                && !trimmed.starts_with("select cron.schedule")
-                && !trimmed.starts_with("select create_hypertable")
-                && !trimmed.starts_with("select add_retention_policy")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-async fn get_pg_pool() -> PgPool {
-    if let Some(url) = PG_URL.get() {
-        return PgPool::connect(url).await.unwrap();
-    }
-
-    let container = Postgres::default()
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container — is Docker running?");
-
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
-
-    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let pool = loop {
-        match PgPool::connect(&url).await {
-            Ok(pool) => break pool,
-            Err(error) => {
-                if tokio::time::Instant::now() >= connect_deadline {
-                    panic!("Failed to connect to PostgreSQL within timeout: {error}");
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        }
-    };
-
-    let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
-    sqlx::raw_sql(&filtered_schema)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
-    let _ = PG_CONTAINER.set(leaked);
-    let _ = PG_URL.set(url);
-
-    pool
-}
 
 fn sample_bars() -> Vec<EquityBar> {
     let now = Utc::now();
@@ -115,7 +39,7 @@ fn sample_bars() -> Vec<EquityBar> {
     ]
 }
 
-async fn clean_tables(pool: &PgPool) {
+async fn clean_tables(pool: &sqlx::PgPool) {
     sqlx::raw_sql("DELETE FROM equity_bars;")
         .execute(pool)
         .await
@@ -125,7 +49,7 @@ async fn clean_tables(pool: &PgPool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_insert_and_query_equity_bars() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
 
     let bars = sample_bars();
@@ -161,7 +85,7 @@ async fn test_insert_and_query_equity_bars() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_with_ticker_filter() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
 
     let bars = sample_bars();
@@ -184,7 +108,7 @@ async fn test_query_with_ticker_filter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_old_bars_excluded() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
 
     let old_timestamp = Utc::now() - chrono::Duration::days(15);
@@ -222,7 +146,7 @@ async fn test_query_old_bars_excluded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_upsert_updates_existing_bar() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
 
     let bars = sample_bars();
@@ -269,7 +193,7 @@ async fn test_upsert_updates_existing_bar() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_quotes_for_date_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
     let quotes = query_equity_quotes_for_date(&pool, date).await.unwrap();
@@ -279,7 +203,7 @@ async fn test_query_equity_quotes_for_date_returns_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_bars_for_date_returns_empty_for_future_date() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let date = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
     let bars = query_equity_bars_for_date(&pool, date).await.unwrap();
@@ -289,7 +213,7 @@ async fn test_query_equity_bars_for_date_returns_empty_for_future_date() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_rebalance_sessions_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let sessions = query_equity_rebalance_sessions(&pool).await.unwrap();
     assert!(sessions.is_empty());
@@ -298,7 +222,7 @@ async fn test_query_equity_rebalance_sessions_returns_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_pairs_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let pairs = query_equity_pairs(&pool).await.unwrap();
     assert!(pairs.is_empty());
@@ -307,7 +231,7 @@ async fn test_query_equity_pairs_returns_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_allocations_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let allocations = query_equity_allocations(&pool).await.unwrap();
     assert!(allocations.is_empty());
@@ -316,7 +240,7 @@ async fn test_query_equity_allocations_returns_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_orders_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let orders = query_equity_orders(&pool).await.unwrap();
     assert!(orders.is_empty());
@@ -325,7 +249,7 @@ async fn test_query_equity_orders_returns_empty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn test_query_equity_portfolio_snapshots_returns_empty() {
-    let pool = get_pg_pool().await;
+    let pool = common::get_pg_pool().await;
     clean_tables(&pool).await;
     let snapshots = query_equity_portfolio_snapshots(&pool).await.unwrap();
     assert!(snapshots.is_empty());
