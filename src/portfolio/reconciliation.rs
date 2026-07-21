@@ -9,7 +9,6 @@
 //! - **Alpaca-only**: Alpaca holds a position the DB does not track → close orphan.
 //! - **DB-only**: DB has an open pair but Alpaca has no position → mark pair closed.
 //! - **Partial position loss**: One leg of a pair is missing → close surviving leg.
-//! - **Quantity mismatch**: Both agree the ticker is held, but quantities differ → log only.
 //! - **Stale submitted order**: An order exceeded the staleness threshold → query Alpaca
 //!   and either confirm fill or cancel.
 //! - **Compensation failure retry**: A prior compensation failure is retried.
@@ -37,8 +36,6 @@ pub struct ReconciliationReport {
     pub pairs_marked_closed: usize,
     /// Number of partial position losses handled (surviving leg closed).
     pub partial_positions_closed: usize,
-    /// Number of quantity mismatches logged.
-    pub quantity_mismatches_logged: usize,
     /// Number of stale submitted orders resolved (confirmed or cancelled).
     pub stale_orders_resolved: usize,
     /// Number of compensation failures retried.
@@ -92,7 +89,6 @@ pub async fn reconcile(
         orphans_closed: 0,
         pairs_marked_closed: 0,
         partial_positions_closed: 0,
-        quantity_mismatches_logged: 0,
         stale_orders_resolved: 0,
         compensation_retries: 0,
     };
@@ -168,7 +164,7 @@ pub async fn reconcile(
                 "DB pair has no Alpaca positions; marking closed"
             );
             let closed_at = Utc::now();
-            if let Err(error) = database::close_equity_pair_with_reason(
+            let pair_closed = match database::close_equity_pair_with_reason(
                 pool,
                 pair.id(),
                 closed_at,
@@ -176,12 +172,23 @@ pub async fn reconcile(
             )
             .await
             {
-                error!(error = %error, "Failed to mark DB pair as closed");
-            } else {
-                closed_pair_ids.insert(pair.id());
-                report.pairs_marked_closed += 1;
-            }
+                Ok(()) => {
+                    closed_pair_ids.insert(pair.id());
+                    report.pairs_marked_closed += 1;
+                    true
+                }
+                Err(error) => {
+                    error!(error = %error, "Failed to mark DB pair as closed");
+                    false
+                }
+            };
             // Record event for both tickers.
+            let action = if pair_closed {
+                ReconciliationAction::MarkedPairClosed
+            } else {
+                ReconciliationAction::LoggedOnly
+            };
+            let resolved_at = if pair_closed { Some(closed_at) } else { None };
             for ticker in [pair.long_ticker().as_str(), pair.short_ticker().as_str()] {
                 if let Err(error) = database::insert_reconciliation_event(
                     pool,
@@ -191,8 +198,8 @@ pub async fn reconcile(
                     None,
                     Some(pair.id()),
                     None,
-                    &ReconciliationAction::MarkedPairClosed,
-                    Some(closed_at),
+                    &action,
+                    resolved_at,
                 )
                 .await
                 {
@@ -270,8 +277,8 @@ pub async fn reconcile(
             // ticker is shared (the position belongs to another pair). If the
             // close failed, leave the pair open so compensation retry picks it up.
             let closed_at = Utc::now();
-            if close_succeeded || ticker_shared_by_other_pair {
-                if let Err(error) = database::close_equity_pair_with_reason(
+            let pair_closed = if close_succeeded || ticker_shared_by_other_pair {
+                match database::close_equity_pair_with_reason(
                     pool,
                     pair.id(),
                     closed_at,
@@ -279,19 +286,28 @@ pub async fn reconcile(
                 )
                 .await
                 {
-                    error!(error = %error, "Failed to mark partial pair as closed");
-                } else {
-                    closed_pair_ids.insert(pair.id());
-                    report.pairs_marked_closed += 1;
+                    Ok(()) => {
+                        closed_pair_ids.insert(pair.id());
+                        report.pairs_marked_closed += 1;
+                        true
+                    }
+                    Err(error) => {
+                        error!(error = %error, "Failed to mark partial pair as closed");
+                        false
+                    }
                 }
-            }
+            } else {
+                false
+            };
 
             let action = if close_succeeded {
                 ReconciliationAction::ClosedSurvivingLeg
+            } else if pair_closed {
+                ReconciliationAction::MarkedPairClosed
             } else {
                 ReconciliationAction::LoggedOnly
             };
-            let resolved_at = if close_succeeded || ticker_shared_by_other_pair {
+            let resolved_at = if pair_closed || close_succeeded {
                 Some(closed_at)
             } else {
                 None
@@ -312,7 +328,9 @@ pub async fn reconcile(
             {
                 error!(error = %error, "Failed to persist partial_position_loss reconciliation event");
             }
-            report.partial_positions_closed += 1;
+            if close_succeeded || pair_closed {
+                report.partial_positions_closed += 1;
+            }
         }
     }
 
@@ -332,7 +350,6 @@ pub async fn reconcile(
         orphans_closed = report.orphans_closed,
         pairs_marked_closed = report.pairs_marked_closed,
         partial_positions_closed = report.partial_positions_closed,
-        quantity_mismatches = report.quantity_mismatches_logged,
         stale_orders_resolved = report.stale_orders_resolved,
         compensation_retries = report.compensation_retries,
         "Reconciliation pass completed"
@@ -418,7 +435,8 @@ async fn resolve_stale_order(
             match alpaca.cancel_order(order.alpaca_order_id()).await {
                 Ok(true) => {
                     if let Err(error) = database::mark_order_cancelled(pool, order.id()).await {
-                        error!(error = %error, "Failed to mark cancelled stale order in DB");
+                        error!(error = %error, "Failed to mark cancelled stale order in DB; will retry");
+                        return 0;
                     }
                     if let Err(error) = database::insert_reconciliation_event(
                         pool,
@@ -584,14 +602,12 @@ mod tests {
             orphans_closed: 0,
             pairs_marked_closed: 0,
             partial_positions_closed: 0,
-            quantity_mismatches_logged: 0,
             stale_orders_resolved: 0,
             compensation_retries: 0,
         };
         assert_eq!(report.orphans_closed, 0);
         assert_eq!(report.pairs_marked_closed, 0);
         assert_eq!(report.partial_positions_closed, 0);
-        assert_eq!(report.quantity_mismatches_logged, 0);
         assert_eq!(report.stale_orders_resolved, 0);
         assert_eq!(report.compensation_retries, 0);
     }
