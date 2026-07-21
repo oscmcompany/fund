@@ -213,7 +213,7 @@ pub fn test_bucket_name() -> String {
 
 const SCHEMA_SQL: &str = include_str!("../../schema.sql");
 
-static PG_URL: OnceLock<String> = OnceLock::new();
+static PG_POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const_new();
 static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new();
 
 /// Strips lines that require pg_cron or TimescaleDB (unavailable in vanilla Postgres).
@@ -246,45 +246,45 @@ fn filter_schema_for_test(schema: &str) -> String {
 ///
 /// The first call starts the container, applies the filtered schema, and leaks
 /// the container handle so it lives for the entire test-binary process. Subsequent
-/// calls reuse the same container and URL.
+/// calls return a clone of the same pool, avoiding redundant connections.
 pub async fn get_pg_pool() -> PgPool {
-    if let Some(url) = PG_URL.get() {
-        return PgPool::connect(url).await.unwrap();
-    }
+    PG_POOL
+        .get_or_init(|| async {
+            let container = Postgres::default()
+                .start()
+                .await
+                .expect("Failed to start PostgreSQL container — is Docker running?");
 
-    let container = Postgres::default()
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container — is Docker running?");
+            let host = container.get_host().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
 
-    let host = container.get_host().await.unwrap();
-    let port = container.get_host_port_ipv4(5432).await.unwrap();
-    let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
-
-    let connect_deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
-    let pool = loop {
-        match PgPool::connect(&url).await {
-            Ok(pool) => break pool,
-            Err(error) => {
-                if tokio::time::Instant::now() >= connect_deadline {
-                    panic!("Failed to connect to PostgreSQL within timeout: {error}");
+            let connect_deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
+            let pool = loop {
+                match PgPool::connect(&url).await {
+                    Ok(pool) => break pool,
+                    Err(error) => {
+                        if tokio::time::Instant::now() >= connect_deadline {
+                            panic!("Failed to connect to PostgreSQL within timeout: {error}");
+                        }
+                        tokio::time::sleep(StdDuration::from_millis(250)).await;
+                    }
                 }
-                tokio::time::sleep(StdDuration::from_millis(250)).await;
-            }
-        }
-    };
+            };
 
-    let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
-    sqlx::raw_sql(&filtered_schema)
-        .execute(&pool)
+            let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
+            sqlx::raw_sql(&filtered_schema)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
+            let _ = PG_CONTAINER.set(leaked);
+
+            pool
+        })
         .await
-        .unwrap();
-
-    let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
-    let _ = PG_CONTAINER.set(leaked);
-    let _ = PG_URL.set(url);
-
-    pool
+        .clone()
 }
 
 /// Truncates all portfolio-related tables in dependency order.

@@ -568,14 +568,14 @@ mod tests {
 
     /// Creates a dummy `PgPool` that never actually connects to a database.
     ///
-    /// Used by tests that call `execute_open_pairs`, where the pool is only
-    /// touched in the compensation error path. The failed DB write is handled
-    /// gracefully (logged and swallowed), so the tests still exercise all the
-    /// important control flow.
+    /// Uses port 1 (TCP reserved, unreachable) so that any accidental query
+    /// fails immediately rather than connecting to a real local Postgres.
+    /// The pool is only touched in the compensation error path, where failed
+    /// DB writes are handled gracefully (logged and swallowed).
     fn dummy_pool() -> PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect_lazy("postgres://localhost:5432/nonexistent_execution_test")
+            .connect_lazy("postgres://localhost:1/nonexistent_execution_test")
             .expect("lazy pool creation should not fail")
     }
 
@@ -735,11 +735,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_open_pairs_partial_success_mixed_pairs() {
-        // Two pairs: first succeeds, second has both legs fail.
-        // We need the second pair's submissions to fail but the first pair's to succeed.
-        // Since MockTrading applies failure flags uniformly, we test partial success
-        // by verifying that successful pairs are returned while failed ones are skipped.
+    async fn test_execute_open_pairs_multiple_pairs_all_succeed() {
+        // Verifies that when no failure flags are set, all pairs in a batch
+        // are submitted and returned successfully.
         let mock = MockTrading::default();
         let pool = dummy_pool();
         let sized_pairs = vec![
@@ -749,7 +747,6 @@ mod tests {
 
         let results = execute_open_pairs(&mock, &pool, &sized_pairs).await;
 
-        // Both should succeed with default mock.
         assert_eq!(results.len(), 2);
     }
 

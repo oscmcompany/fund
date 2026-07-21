@@ -397,10 +397,13 @@ mod tests {
     use std::sync::Arc;
 
     /// Creates an `AppState` with a dummy pool and the given mock trading client.
+    ///
+    /// Uses port 1 (TCP reserved, unreachable) so that any accidental query
+    /// fails immediately rather than connecting to a real local Postgres.
     fn make_test_state(mock: MockTrading) -> AppState {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect_lazy("postgres://localhost:5432/nonexistent_consumer_test")
+            .connect_lazy("postgres://localhost:1/nonexistent_consumer_test")
             .expect("lazy pool creation should not fail");
         AppState::with_mock(pool, Arc::new(mock))
     }
