@@ -8,6 +8,7 @@
 //! Discrepancy categories:
 //! - **Alpaca-only**: Alpaca holds a position the DB does not track → close orphan.
 //! - **DB-only**: DB has an open pair but Alpaca has no position → mark pair closed.
+//! - **Partial position loss**: One leg of a pair is missing → close surviving leg.
 //! - **Quantity mismatch**: Both agree the ticker is held, but quantities differ → log only.
 //! - **Stale submitted order**: An order exceeded the staleness threshold → query Alpaca
 //!   and either confirm fill or cancel.
@@ -22,7 +23,7 @@ use tracing::{error, info, warn};
 
 use crate::domain::trading::{CloseReason, ReconciliationAction, ReconciliationEventType};
 use crate::portfolio::alpaca::{Position, TradingClient};
-use crate::portfolio::database::{self, OpenPair, SubmittedOrder, UnresolvedReconciliationEvent};
+use crate::portfolio::database::{self, SubmittedOrder, UnresolvedReconciliationEvent};
 
 /// Default staleness threshold for submitted orders (seconds).
 const STALE_ORDER_THRESHOLD_SECONDS: i64 = 60;
@@ -34,6 +35,8 @@ pub struct ReconciliationReport {
     pub orphans_closed: usize,
     /// Number of DB pairs marked closed because Alpaca no longer holds them.
     pub pairs_marked_closed: usize,
+    /// Number of partial position losses handled (surviving leg closed).
+    pub partial_positions_closed: usize,
     /// Number of quantity mismatches logged.
     pub quantity_mismatches_logged: usize,
     /// Number of stale submitted orders resolved (confirmed or cancelled).
@@ -80,24 +83,15 @@ pub async fn reconcile(
 
     // Collect all tickers from open pairs (both long and short legs).
     let mut database_symbols: HashSet<String> = HashSet::new();
-    // Map from ticker to (pair_id, expected side) for pair-level tracking.
-    let mut ticker_to_pair: HashMap<String, Vec<&OpenPair>> = HashMap::new();
     for pair in &open_pairs {
         database_symbols.insert(pair.long_ticker().as_str().to_string());
         database_symbols.insert(pair.short_ticker().as_str().to_string());
-        ticker_to_pair
-            .entry(pair.long_ticker().as_str().to_string())
-            .or_default()
-            .push(pair);
-        ticker_to_pair
-            .entry(pair.short_ticker().as_str().to_string())
-            .or_default()
-            .push(pair);
     }
 
     let mut report = ReconciliationReport {
         orphans_closed: 0,
         pairs_marked_closed: 0,
+        partial_positions_closed: 0,
         quantity_mismatches_logged: 0,
         stale_orders_resolved: 0,
         compensation_retries: 0,
@@ -136,7 +130,17 @@ pub async fn reconcile(
                 &ReconciliationEventType::AlpacaOnly,
                 symbol,
                 None,
-                Some(Decimal::try_from(position.quantity).unwrap_or(Decimal::ZERO)),
+                Some(
+                    Decimal::try_from(position.quantity).unwrap_or_else(|error| {
+                        error!(
+                            ticker = *symbol,
+                            quantity = position.quantity,
+                            error = %error,
+                            "Failed to convert position quantity to Decimal"
+                        );
+                        Decimal::ZERO
+                    }),
+                ),
                 None,
                 None,
                 &action,
@@ -200,8 +204,8 @@ pub async fn reconcile(
 
     // --- Partial position loss: close surviving leg and mark pair closed ---
     // When only one leg of a pair remains on Alpaca, the hedge is broken and the
-    // portfolio carries naked directional risk. Close the surviving leg and mark
-    // the pair closed to restore a balanced state.
+    // portfolio carries naked directional risk. Close the surviving leg (if no
+    // other open pair also uses that ticker) and mark the pair closed.
     for pair in &open_pairs {
         if closed_pair_ids.contains(&pair.id()) {
             continue;
@@ -219,49 +223,75 @@ pub async fn reconcile(
             } else {
                 pair.short_ticker().as_str()
             };
-            error!(
-                pair_id = pair.pair_id().as_str(),
-                missing_ticker = missing_ticker,
-                present_ticker = present_ticker,
-                "Partial position: one leg missing; closing surviving leg to eliminate directional risk"
-            );
 
-            // Close the surviving leg on Alpaca.
-            let close_succeeded = match alpaca.close_position(present_ticker).await {
-                Ok(_) => true,
-                Err(close_error) => {
-                    error!(
-                        ticker = present_ticker,
-                        error = %close_error,
-                        "Failed to close surviving leg of partial pair"
-                    );
-                    false
+            // Check if any other open pair (not already closed) also uses the
+            // surviving ticker. If so, skip the close — the position is still
+            // needed by the other pair.
+            let ticker_shared_by_other_pair = open_pairs.iter().any(|other| {
+                other.id() != pair.id()
+                    && !closed_pair_ids.contains(&other.id())
+                    && (other.long_ticker().as_str() == present_ticker
+                        || other.short_ticker().as_str() == present_ticker)
+            });
+
+            if ticker_shared_by_other_pair {
+                warn!(
+                    pair_id = pair.pair_id().as_str(),
+                    present_ticker = present_ticker,
+                    "Surviving leg shared by another open pair; skipping close, marking pair closed only"
+                );
+            } else {
+                error!(
+                    pair_id = pair.pair_id().as_str(),
+                    missing_ticker = missing_ticker,
+                    present_ticker = present_ticker,
+                    "Partial position: one leg missing; closing surviving leg to eliminate directional risk"
+                );
+            }
+
+            // Close the surviving leg on Alpaca unless another pair needs it.
+            let close_succeeded = if ticker_shared_by_other_pair {
+                false
+            } else {
+                match alpaca.close_position(present_ticker).await {
+                    Ok(_) => true,
+                    Err(close_error) => {
+                        error!(
+                            ticker = present_ticker,
+                            error = %close_error,
+                            "Failed to close surviving leg of partial pair"
+                        );
+                        false
+                    }
                 }
             };
 
-            // Mark the pair closed in the DB regardless of whether the Alpaca
-            // close succeeded — the pair is already broken.
+            // Only mark pair closed in DB when the close succeeds or when the
+            // ticker is shared (the position belongs to another pair). If the
+            // close failed, leave the pair open so compensation retry picks it up.
             let closed_at = Utc::now();
-            if let Err(error) = database::close_equity_pair_with_reason(
-                pool,
-                pair.id(),
-                closed_at,
-                &CloseReason::ReconciliationAlpacaMissing,
-            )
-            .await
-            {
-                error!(error = %error, "Failed to mark partial pair as closed");
-            } else {
-                closed_pair_ids.insert(pair.id());
-                report.pairs_marked_closed += 1;
+            if close_succeeded || ticker_shared_by_other_pair {
+                if let Err(error) = database::close_equity_pair_with_reason(
+                    pool,
+                    pair.id(),
+                    closed_at,
+                    &CloseReason::ReconciliationAlpacaMissing,
+                )
+                .await
+                {
+                    error!(error = %error, "Failed to mark partial pair as closed");
+                } else {
+                    closed_pair_ids.insert(pair.id());
+                    report.pairs_marked_closed += 1;
+                }
             }
 
             let action = if close_succeeded {
-                ReconciliationAction::ClosedOrphan
+                ReconciliationAction::ClosedSurvivingLeg
             } else {
                 ReconciliationAction::LoggedOnly
             };
-            let resolved_at = if close_succeeded {
+            let resolved_at = if close_succeeded || ticker_shared_by_other_pair {
                 Some(closed_at)
             } else {
                 None
@@ -269,7 +299,7 @@ pub async fn reconcile(
 
             if let Err(error) = database::insert_reconciliation_event(
                 pool,
-                &ReconciliationEventType::QuantityMismatch,
+                &ReconciliationEventType::PartialPositionLoss,
                 missing_ticker,
                 None,
                 None,
@@ -280,9 +310,9 @@ pub async fn reconcile(
             )
             .await
             {
-                error!(error = %error, "Failed to persist quantity_mismatch reconciliation event");
+                error!(error = %error, "Failed to persist partial_position_loss reconciliation event");
             }
-            report.quantity_mismatches_logged += 1;
+            report.partial_positions_closed += 1;
         }
     }
 
@@ -301,6 +331,7 @@ pub async fn reconcile(
     info!(
         orphans_closed = report.orphans_closed,
         pairs_marked_closed = report.pairs_marked_closed,
+        partial_positions_closed = report.partial_positions_closed,
         quantity_mismatches = report.quantity_mismatches_logged,
         stale_orders_resolved = report.stale_orders_resolved,
         compensation_retries = report.compensation_retries,
@@ -325,11 +356,10 @@ async fn resolve_stale_order(
                 ticker = order.ticker(),
                 "Stale submitted order was actually filled; confirming"
             );
-            // Mark order as filled in DB (allocation_id is unknown for stale orders,
-            // so we use the order's own ID as a placeholder — the allocation will be
-            // linked when the full persistence path runs).
+            // Mark order as filled in DB. allocation_id is None because stale
+            // orders resolved by reconciliation have no associated allocation.
             if let Err(error) =
-                database::mark_order_filled(pool, order.id(), order.id(), Utc::now()).await
+                database::mark_order_filled(pool, order.id(), None, Utc::now()).await
             {
                 error!(error = %error, "Failed to mark stale order as filled");
                 return 0;
@@ -467,7 +497,8 @@ async fn retry_compensation_failure(
                     "Orphaned order cancelled on retry"
                 );
                 if let Err(error) = database::resolve_reconciliation_event(pool, event.id()).await {
-                    error!(error = %error, "Failed to resolve compensation event");
+                    error!(error = %error, "Failed to resolve compensation event after cancel; will retry");
+                    return 0;
                 }
                 return 1;
             }
@@ -485,7 +516,8 @@ async fn retry_compensation_failure(
         Ok(_) => {
             info!(ticker = event.ticker(), "Orphaned position closed on retry");
             if let Err(error) = database::resolve_reconciliation_event(pool, event.id()).await {
-                error!(error = %error, "Failed to resolve compensation event");
+                error!(error = %error, "Failed to resolve compensation event after close; will retry");
+                return 0;
             }
             1
         }
@@ -551,12 +583,14 @@ mod tests {
         let report = ReconciliationReport {
             orphans_closed: 0,
             pairs_marked_closed: 0,
+            partial_positions_closed: 0,
             quantity_mismatches_logged: 0,
             stale_orders_resolved: 0,
             compensation_retries: 0,
         };
         assert_eq!(report.orphans_closed, 0);
         assert_eq!(report.pairs_marked_closed, 0);
+        assert_eq!(report.partial_positions_closed, 0);
         assert_eq!(report.quantity_mismatches_logged, 0);
         assert_eq!(report.stale_orders_resolved, 0);
         assert_eq!(report.compensation_retries, 0);

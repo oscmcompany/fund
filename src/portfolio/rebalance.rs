@@ -1042,11 +1042,17 @@ async fn persist_filled_pairs(
         // Uses the Order ID from the filled pair (same UUID that was used in
         // insert_submitted_order). Silently handles the case where the submitted
         // record was never persisted (e.g., DB was unavailable at submission time).
-        mark_order_filled(&mut **transaction, filled_pair.long.id, long_alloc_id, now).await?;
+        mark_order_filled(
+            &mut **transaction,
+            filled_pair.long.id,
+            Some(long_alloc_id),
+            now,
+        )
+        .await?;
         mark_order_filled(
             &mut **transaction,
             filled_pair.short.id,
-            short_alloc_id,
+            Some(short_alloc_id),
             now,
         )
         .await?;

@@ -251,7 +251,7 @@ CREATE TABLE IF NOT EXISTS equity_reconciliation_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_equity_reconciliation_events_unresolved -- noqa: PG01
-    ON equity_reconciliation_events (event_type)
+    ON equity_reconciliation_events (detected_at)
     WHERE resolved_at IS NULL;
 
 -- Nightly equity bar sync: weekdays at 05:00 UTC

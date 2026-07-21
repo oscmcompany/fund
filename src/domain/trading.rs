@@ -238,6 +238,8 @@ pub enum ReconciliationEventType {
     DatabaseOnly,
     /// Both agree the ticker is held, but quantities differ.
     QuantityMismatch,
+    /// One leg of a pair is missing from Alpaca, leaving a naked directional position.
+    PartialPositionLoss,
     /// Orphan compensation (cancel + close) failed and needs retry.
     CompensationFailure,
     /// A submitted order exceeded the staleness threshold without confirmation.
@@ -251,6 +253,7 @@ impl ReconciliationEventType {
             Self::AlpacaOnly => "alpaca_only",
             Self::DatabaseOnly => "database_only",
             Self::QuantityMismatch => "quantity_mismatch",
+            Self::PartialPositionLoss => "partial_position_loss",
             Self::CompensationFailure => "compensation_failure",
             Self::StaleSubmittedOrder => "stale_submitted_order",
         }
@@ -262,6 +265,7 @@ impl ReconciliationEventType {
             "alpaca_only" => Some(Self::AlpacaOnly),
             "database_only" => Some(Self::DatabaseOnly),
             "quantity_mismatch" => Some(Self::QuantityMismatch),
+            "partial_position_loss" => Some(Self::PartialPositionLoss),
             "compensation_failure" => Some(Self::CompensationFailure),
             "stale_submitted_order" => Some(Self::StaleSubmittedOrder),
             _ => None,
@@ -274,6 +278,8 @@ impl ReconciliationEventType {
 pub enum ReconciliationAction {
     /// Closed an orphaned Alpaca position not tracked by the database.
     ClosedOrphan,
+    /// Closed the surviving leg of a partial pair to eliminate directional risk.
+    ClosedSurvivingLeg,
     /// Marked a database pair as closed because Alpaca no longer holds it.
     MarkedPairClosed,
     /// Confirmed a fill for a stale submitted order after querying Alpaca.
@@ -289,6 +295,7 @@ impl ReconciliationAction {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::ClosedOrphan => "closed_orphan",
+            Self::ClosedSurvivingLeg => "closed_surviving_leg",
             Self::MarkedPairClosed => "marked_pair_closed",
             Self::ConfirmedFill => "confirmed_fill",
             Self::CancelledStaleOrder => "cancelled_stale_order",
@@ -300,6 +307,7 @@ impl ReconciliationAction {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "closed_orphan" => Some(Self::ClosedOrphan),
+            "closed_surviving_leg" => Some(Self::ClosedSurvivingLeg),
             "marked_pair_closed" => Some(Self::MarkedPairClosed),
             "confirmed_fill" => Some(Self::ConfirmedFill),
             "cancelled_stale_order" => Some(Self::CancelledStaleOrder),
@@ -1406,6 +1414,7 @@ mod tests {
             ReconciliationEventType::AlpacaOnly,
             ReconciliationEventType::DatabaseOnly,
             ReconciliationEventType::QuantityMismatch,
+            ReconciliationEventType::PartialPositionLoss,
             ReconciliationEventType::CompensationFailure,
             ReconciliationEventType::StaleSubmittedOrder,
         ] {
@@ -1426,6 +1435,7 @@ mod tests {
     fn test_reconciliation_action_round_trip() {
         for action in [
             ReconciliationAction::ClosedOrphan,
+            ReconciliationAction::ClosedSurvivingLeg,
             ReconciliationAction::MarkedPairClosed,
             ReconciliationAction::ConfirmedFill,
             ReconciliationAction::CancelledStaleOrder,

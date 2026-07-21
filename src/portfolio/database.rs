@@ -627,7 +627,7 @@ pub async fn insert_submitted_order(
 pub async fn mark_order_filled<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     id: Uuid,
-    allocation_id: Uuid,
+    allocation_id: Option<Uuid>,
     filled_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
@@ -1162,11 +1162,14 @@ mod tests {
     #[test]
     fn test_mark_order_filled_compiles() {
         make_runtime().block_on(async {
-            assert!(
-                mark_order_filled(&lazy_pool(), Uuid::new_v4(), Uuid::new_v4(), Utc::now(),)
-                    .await
-                    .is_err()
-            );
+            assert!(mark_order_filled(
+                &lazy_pool(),
+                Uuid::new_v4(),
+                Some(Uuid::new_v4()),
+                Utc::now(),
+            )
+            .await
+            .is_err());
         });
     }
 
