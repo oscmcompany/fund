@@ -122,7 +122,7 @@ pub fn spawn_sync_scheduler(
 /// Fetches equity bars for a single trading date with exponential-backoff retry.
 ///
 /// Retries up to [`FETCH_MAX_RETRIES`] times on transient failures, with
-/// delays of 1s, 2s, 4s between attempts.
+/// delays of 1s, 2s between attempts (no delay after the final attempt).
 async fn fetch_with_retry(
     state: &State,
     trading_date: &TradingDate,
@@ -151,6 +151,21 @@ async fn fetch_with_retry(
     Err(last_error)
 }
 
+/// Returns expected trading days that are missing from the covered set, excluding
+/// any dates in the `exclude` list (typically today and the just-synced primary date).
+fn detect_coverage_gaps(
+    expected_days: &[NaiveDate],
+    covered_dates: &std::collections::HashSet<NaiveDate>,
+    exclude: &[NaiveDate],
+) -> Vec<NaiveDate> {
+    expected_days
+        .iter()
+        .filter(|date| !covered_dates.contains(date))
+        .filter(|date| !exclude.contains(date))
+        .copied()
+        .collect()
+}
+
 /// Self-healing equity bar sync: fetches yesterday's data, then detects and
 /// backfills any gaps in the lookback window.
 async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
@@ -175,16 +190,19 @@ async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
     let expected_days = market_calendar::trading_days_in_range(lookback_start, today);
 
     let covered_dates =
-        crate::data::database::distinct_equity_bar_dates(pool, lookback_start, today)
-            .await
-            .map_err(|error| format!("Gap detection query failed: {}", error))?;
+        match crate::data::database::distinct_equity_bar_dates(pool, lookback_start, today).await {
+            Ok(dates) => dates,
+            Err(error) => {
+                warn!(error = %error, "Gap detection query failed, skipping backfill this run");
+                return Ok(Some(total_bars));
+            }
+        };
 
-    let gaps: Vec<NaiveDate> = expected_days
-        .into_iter()
-        .filter(|date| !covered_dates.contains(date))
-        // Exclude today and the primary date we just synced.
-        .filter(|date| *date != today && *date != trading_date.as_naive_date())
-        .collect();
+    let gaps = detect_coverage_gaps(
+        &expected_days,
+        &covered_dates,
+        &[today, trading_date.as_naive_date()],
+    );
 
     if gaps.is_empty() {
         info!("No gaps detected in equity bar coverage");
@@ -830,8 +848,8 @@ fn parse_postgres_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        duration_until_next_sync, export_date_from_payload, listen_loop, parse_postgres_url,
-        prior_trading_day, run_export_job, spawn_sync_scheduler, sync_date_for,
+        detect_coverage_gaps, duration_until_next_sync, export_date_from_payload, listen_loop,
+        parse_postgres_url, prior_trading_day, run_export_job, spawn_sync_scheduler, sync_date_for,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
@@ -1229,6 +1247,57 @@ mod tests {
         let monday = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
         let prior = prior_trading_day(monday);
         assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+    }
+
+    // --- detect_coverage_gaps ---
+
+    #[test]
+    fn test_detect_coverage_gaps_finds_missing_dates() {
+        let expected = vec![
+            NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+        ];
+        let covered: std::collections::HashSet<NaiveDate> =
+            [NaiveDate::from_ymd_opt(2026, 6, 8).unwrap()]
+                .into_iter()
+                .collect();
+        let gaps = detect_coverage_gaps(&expected, &covered, &[]);
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.contains(&NaiveDate::from_ymd_opt(2026, 6, 9).unwrap()));
+        assert!(gaps.contains(&NaiveDate::from_ymd_opt(2026, 6, 10).unwrap()));
+    }
+
+    #[test]
+    fn test_detect_coverage_gaps_excludes_specified_dates() {
+        let expected = vec![
+            NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+        ];
+        let covered: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
+        let exclude = [NaiveDate::from_ymd_opt(2026, 6, 10).unwrap()];
+        let gaps = detect_coverage_gaps(&expected, &covered, &exclude);
+        assert_eq!(gaps.len(), 2);
+        assert!(!gaps.contains(&NaiveDate::from_ymd_opt(2026, 6, 10).unwrap()));
+    }
+
+    #[test]
+    fn test_detect_coverage_gaps_returns_empty_when_fully_covered() {
+        let expected = vec![
+            NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+        ];
+        let covered: std::collections::HashSet<NaiveDate> = expected.iter().copied().collect();
+        let gaps = detect_coverage_gaps(&expected, &covered, &[]);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn test_detect_coverage_gaps_empty_expected() {
+        let covered: std::collections::HashSet<NaiveDate> = std::collections::HashSet::new();
+        let gaps = detect_coverage_gaps(&[], &covered, &[]);
+        assert!(gaps.is_empty());
     }
 
     #[test]

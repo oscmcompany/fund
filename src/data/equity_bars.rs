@@ -527,7 +527,7 @@ pub async fn seed(
     }
 
     info!(
-        "Seed complete: {} days processed, {} weekends skipped, {} days failed, {} total bars",
+        "Seed complete: {} days processed, {} non-trading days skipped, {} days failed, {} total bars",
         summary.days_processed,
         summary.days_skipped_non_trading,
         summary.days_failed,

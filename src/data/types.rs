@@ -6,19 +6,20 @@ use tracing::{debug, info};
 
 pub use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 
-/// A validated US market trading date (weekday and not a holiday).
+/// A validated US market trading date (weekday and not a known holiday).
 ///
 /// The private field prevents construction without going through
 /// [`TradingDate::from_naive_date`], which rejects weekends and known
-/// NYSE holidays. A `TradingDate` in scope is proof the date is a real
-/// trading day.
+/// NYSE holidays within the covered year range (currently 2024-2027).
+/// Outside that range, validation falls back to weekday-only.
 #[derive(Debug, Clone, Copy)]
 pub struct TradingDate(NaiveDate);
 
 impl TradingDate {
     /// Constructs a `TradingDate` from a `NaiveDate`.
     ///
-    /// Returns `None` if the date falls on a weekend or a known NYSE holiday.
+    /// Returns `None` if the date falls on a weekend or a known NYSE holiday
+    /// (within the covered year range).
     pub fn from_naive_date(date: NaiveDate) -> Option<Self> {
         if market_calendar::is_trading_day(date) {
             Some(Self(date))

@@ -165,8 +165,10 @@ pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result
 
         query_builder.push(
             " ON CONFLICT (ticker) DO UPDATE SET \
-             sector = EXCLUDED.sector, \
-             industry = EXCLUDED.industry",
+             sector = CASE WHEN EXCLUDED.sector <> 'NOT AVAILABLE' \
+                          THEN EXCLUDED.sector ELSE equity_details.sector END, \
+             industry = CASE WHEN EXCLUDED.industry <> 'NOT AVAILABLE' \
+                            THEN EXCLUDED.industry ELSE equity_details.industry END",
         );
 
         let result = query_builder.build().execute(pool).await?;
@@ -275,8 +277,8 @@ pub async fn distinct_equity_bar_dates(
 
     let dates: std::collections::HashSet<NaiveDate> = rows
         .into_iter()
-        .filter_map(|row| row.try_get::<NaiveDate, _>("trading_date").ok())
-        .collect();
+        .map(|row| row.try_get::<NaiveDate, _>("trading_date"))
+        .collect::<Result<_, _>>()?;
 
     debug!(
         dates = dates.len(),

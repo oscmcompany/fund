@@ -287,7 +287,10 @@ mod tests {
     /// built-in reminder to add the next year's holidays before they're needed.
     #[test]
     fn test_current_year_has_holiday_coverage() {
-        let current_year = chrono::Utc::now().date_naive().year();
+        let current_year = chrono::Utc::now()
+            .with_timezone(&chrono_tz::US::Eastern)
+            .date_naive()
+            .year();
         assert!(
             has_holiday_coverage(current_year),
             "NYSE_HOLIDAYS table does not cover {} — add holidays for this year",
