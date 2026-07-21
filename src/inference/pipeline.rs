@@ -264,11 +264,23 @@ pub async fn poll_artifact_once(state: &AppState) {
     }
 }
 
-pub async fn start_artifact_polling(state: AppState) {
+pub async fn start_artifact_polling(
+    state: AppState,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
     let poll_interval = std::time::Duration::from_secs(60);
 
     loop {
-        tokio::time::sleep(poll_interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = shutdown_token.cancelled() => {
+                info!("Artifact polling stopped for shutdown");
+                break;
+            }
+        }
+        if shutdown_token.is_cancelled() {
+            break;
+        }
         poll_artifact_once(&state).await;
     }
 }

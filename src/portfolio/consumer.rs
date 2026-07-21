@@ -10,7 +10,9 @@ use std::time::Duration;
 use chrono::Utc;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::events::{
@@ -23,27 +25,51 @@ use crate::portfolio::reconciliation;
 use crate::portfolio::state::AppState;
 
 /// Spawns the event consumer as a background task.
-pub fn spawn_event_consumer(state: AppState) {
-    tokio::spawn(consumer_loop(state));
+pub fn spawn_event_consumer(state: AppState, shutdown_token: CancellationToken) -> JoinHandle<()> {
+    tokio::spawn(consumer_loop(state, shutdown_token))
 }
 
-async fn consumer_loop(state: AppState) {
+async fn consumer_loop(state: AppState, shutdown_token: CancellationToken) {
     let pool = state.pool().clone();
     loop {
-        match run_consumer(&state, &pool).await {
-            Ok(()) => info!("Event consumer exited, restarting"),
+        match run_consumer(&state, &pool, &shutdown_token).await {
+            Ok(()) => {
+                if shutdown_token.is_cancelled() {
+                    info!("Event consumer stopped for shutdown");
+                    break;
+                }
+                info!("Event consumer exited, restarting");
+            }
             Err(error) => {
+                if shutdown_token.is_cancelled() {
+                    info!("Event consumer stopped for shutdown");
+                    break;
+                }
                 warn!("Event consumer error: {}, restarting in 30s", error);
-                sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(30)) => {}
+                    _ = shutdown_token.cancelled() => {
+                        info!("Event consumer stopped for shutdown");
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
-async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error> {
+async fn run_consumer(
+    state: &AppState,
+    pool: &PgPool,
+    shutdown_token: &CancellationToken,
+) -> Result<(), sqlx::Error> {
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
+
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
 
     // Run startup reconciliation to resolve any DB-Alpaca drift accumulated
     // while the service was down.
@@ -110,7 +136,13 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     }
 
     loop {
-        let notification = listener.recv().await?;
+        let notification = tokio::select! {
+            result = listener.recv() => result?,
+            _ = shutdown_token.cancelled() => {
+                info!("Shutdown signal received, draining");
+                break;
+            }
+        };
         let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
             Ok(value) => value,
             Err(_) => continue,
@@ -141,6 +173,8 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
             handle_portfolio_liquidation(state, pool, event_id).await;
         }
     }
+
+    Ok(())
 }
 
 /// Maximum duration (seconds) for a prediction-pipeline run before the in-progress

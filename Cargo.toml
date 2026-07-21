@@ -69,6 +69,7 @@ sqlx = { version = "0.8", default-features = false, features = [
   "json",
 ] }
 tokio = { version = "1.51.1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = [
   "env-filter",

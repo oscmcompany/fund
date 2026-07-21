@@ -662,6 +662,8 @@ in {
         exec secretspec run -- cargo run --release --bin fund -- --module data
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
+      process-compose.shutdown.signal = 15;
+      process-compose.shutdown.timeout_seconds = 60;
     };
 
     processes.inference = {
@@ -671,6 +673,8 @@ in {
         exec secretspec run -- cargo run --release --bin fund -- --module inference
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
+      process-compose.shutdown.signal = 15;
+      process-compose.shutdown.timeout_seconds = 120;
     };
 
     processes.portfolio = {
@@ -680,6 +684,8 @@ in {
         exec secretspec run -- cargo run --release --bin fund -- --module portfolio
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
+      process-compose.shutdown.signal = 15;
+      process-compose.shutdown.timeout_seconds = 120;
     };
 
     processes.dashboard = {
