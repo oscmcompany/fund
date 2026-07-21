@@ -39,7 +39,7 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio::alpaca::{TradableAssets, TradingClient};
+use crate::portfolio::alpaca::{TradableAssets, Trading};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio::database::{
@@ -341,7 +341,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 async fn run_monitor_cycle(
     state: &AppState,
     pool: &sqlx::PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     open_pairs: &[OpenPair],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
 ) -> Result<RebalanceOutcome, RebalanceError> {
@@ -670,7 +670,7 @@ fn evaluate_open_pairs(
 ///
 /// Returns the number of pairs successfully closed.
 async fn close_triggered_pairs(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &sqlx::PgPool,
     signals: &[PairCloseSignal],
 ) -> Result<usize, RebalanceError> {
@@ -710,7 +710,7 @@ async fn close_triggered_pairs(
 /// Errors with `DrawdownBreached` when the drop from the previous NAV exceeds
 /// the configured threshold.
 async fn check_drawdown(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &sqlx::PgPool,
     threshold: f64,
 ) -> Result<(f64, f64), RebalanceError> {
@@ -781,7 +781,7 @@ async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
 #[allow(clippy::too_many_arguments)]
 async fn select_size_execute(
     pool: &sqlx::PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,

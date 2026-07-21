@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::orders::{FilledOrder, Order, OrderSide, PendingPair};
 use crate::domain::trading::{ReconciliationAction, ReconciliationEventType};
-use crate::portfolio::alpaca::{ClientError, TradingClient};
+use crate::portfolio::alpaca::{ClientError, Trading};
 use crate::portfolio::database;
 use crate::portfolio::sizing::SizedPair;
 
@@ -80,7 +80,7 @@ impl std::error::Error for ExecutionError {}
 /// expected in live trading when individual tickers have liquidity or
 /// borrowing issues.
 pub async fn execute_open_pairs(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &PgPool,
     sized_pairs: &[SizedPair],
 ) -> Vec<(PendingPair, SizedPair)> {
@@ -189,7 +189,7 @@ pub async fn execute_open_pairs(
 /// When both cancellation and position close fail, persists a `compensation_failure`
 /// event to the reconciliation table so it can be retried on the next pass.
 async fn compensate_orphaned_order(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pool: &PgPool,
     alpaca_order_id: &str,
     ticker: &str,
@@ -268,7 +268,7 @@ async fn persist_compensation_failure(pool: &PgPool, ticker: &str, alpaca_order_
 ///
 /// Returns only the pairs where both legs filled successfully.
 pub async fn confirm_fills(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     pending_pairs: Vec<(PendingPair, SizedPair)>,
 ) -> Vec<(crate::domain::orders::FilledPair, SizedPair)> {
     let mut results = Vec::new();
@@ -303,7 +303,7 @@ pub async fn confirm_fills(
 /// Uses increasing backoff: 500ms, 1s, 2s, 3s, 3.5s (total ~10s).
 /// Returns `None` after `FILL_POLL_ATTEMPTS` failed attempts or when the
 /// Alpaca order status does not indicate a fill.
-async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<FilledOrder> {
+async fn poll_fill(alpaca: &dyn Trading, alpaca_order_id: &str) -> Option<FilledOrder> {
     for attempt in 1..=FILL_POLL_ATTEMPTS {
         match alpaca.get_order(alpaca_order_id).await {
             Ok(order_fill) if order_fill.status == "filled" => {
@@ -367,7 +367,7 @@ async fn poll_fill(alpaca: &TradingClient, alpaca_order_id: &str) -> Option<Fill
 /// the remaining closures. Returns an `ExecutionError` only when a network-level
 /// error (not a 404 "no position") is encountered.
 pub async fn close_positions(
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     tickers: &[String],
 ) -> Result<(), ExecutionError> {
     let mut first_error: Option<ExecutionError> = None;

@@ -21,7 +21,7 @@ use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::domain::trading::{CloseReason, ReconciliationAction, ReconciliationEventType};
-use crate::portfolio::alpaca::{Position, TradingClient};
+use crate::portfolio::alpaca::{Position, Trading};
 use crate::portfolio::database::{self, SubmittedOrder, UnresolvedReconciliationEvent};
 
 /// Default staleness threshold for submitted orders (seconds).
@@ -54,7 +54,7 @@ pub struct ReconciliationReport {
 /// Returns a [`ReconciliationReport`] summarizing actions taken.
 pub async fn reconcile(
     pool: &PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
 ) -> Result<ReconciliationReport, ReconciliationError> {
     let alpaca_positions = alpaca
         .fetch_positions()
@@ -360,11 +360,7 @@ pub async fn reconcile(
 
 /// Queries Alpaca for a stale submitted order and either confirms the fill
 /// or cancels it. Returns 1 if resolved, 0 otherwise.
-async fn resolve_stale_order(
-    pool: &PgPool,
-    alpaca: &TradingClient,
-    order: &SubmittedOrder,
-) -> usize {
+async fn resolve_stale_order(pool: &PgPool, alpaca: &dyn Trading, order: &SubmittedOrder) -> usize {
     let order_result = alpaca.get_order(order.alpaca_order_id()).await;
     match order_result {
         Ok(fill) if fill.status == "filled" => {
@@ -497,7 +493,7 @@ fn is_terminal_non_filled(status: &str) -> bool {
 /// Returns 1 if the retry succeeded and the event was resolved, 0 otherwise.
 async fn retry_compensation_failure(
     pool: &PgPool,
-    alpaca: &TradingClient,
+    alpaca: &dyn Trading,
     event: &UnresolvedReconciliationEvent,
 ) -> usize {
     info!(

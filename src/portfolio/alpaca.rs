@@ -121,6 +121,46 @@ impl From<reqwest::Error> for ClientError {
     }
 }
 
+/// Abstraction over the Alpaca trading API surface used by the portfolio module.
+///
+/// Implemented by [`TradingClient`] for production and by `MockTrading` (under
+/// `#[cfg(test)]`) for unit tests that need to control API responses.
+#[async_trait::async_trait]
+pub trait Trading: Send + Sync {
+    /// Returns account details (cash, buying power, equity).
+    async fn get_account(&self) -> Result<AccountInfo, ClientError>;
+
+    /// Submits a market buy order using notional dollar amount. Returns the Alpaca order ID.
+    async fn submit_long_order(&self, ticker: &str, notional: f64) -> Result<String, ClientError>;
+
+    /// Submits a market sell (short) order using a whole-share quantity. Returns the Alpaca order ID.
+    async fn submit_short_order(&self, ticker: &str, quantity: i64) -> Result<String, ClientError>;
+
+    /// Retrieves the current fill status of an order by its Alpaca order ID.
+    async fn get_order(&self, alpaca_order_id: &str) -> Result<OrderFill, ClientError>;
+
+    /// Closes the full position for `ticker`. Returns `true` when closed, `false` when not found.
+    async fn close_position(&self, ticker: &str) -> Result<bool, ClientError>;
+
+    /// Fetches all active US equity assets partitioned into tradable and shortable sets.
+    async fn fetch_tradable_assets(&self) -> Result<TradableAssets, ClientError>;
+
+    /// Attempts to cancel an open order. Returns `true` when cancelled, `false` when already terminal.
+    async fn cancel_order(&self, alpaca_order_id: &str) -> Result<bool, ClientError>;
+
+    /// Returns whether the market is currently open.
+    async fn is_market_open(&self) -> Result<bool, ClientError>;
+
+    /// Fetches all open positions from the Alpaca account.
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError>;
+
+    /// Fetches latest quote snapshots for the given symbols.
+    async fn fetch_latest_quotes(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError>;
+}
+
 /// Alpaca trading REST client.
 #[derive(Clone)]
 pub struct TradingClient {
@@ -605,6 +645,52 @@ impl TradingClient {
     }
 }
 
+#[async_trait::async_trait]
+impl Trading for TradingClient {
+    async fn get_account(&self) -> Result<AccountInfo, ClientError> {
+        self.get_account().await
+    }
+
+    async fn submit_long_order(&self, ticker: &str, notional: f64) -> Result<String, ClientError> {
+        self.submit_long_order(ticker, notional).await
+    }
+
+    async fn submit_short_order(&self, ticker: &str, quantity: i64) -> Result<String, ClientError> {
+        self.submit_short_order(ticker, quantity).await
+    }
+
+    async fn get_order(&self, alpaca_order_id: &str) -> Result<OrderFill, ClientError> {
+        self.get_order(alpaca_order_id).await
+    }
+
+    async fn close_position(&self, ticker: &str) -> Result<bool, ClientError> {
+        self.close_position(ticker).await
+    }
+
+    async fn fetch_tradable_assets(&self) -> Result<TradableAssets, ClientError> {
+        self.fetch_tradable_assets().await
+    }
+
+    async fn cancel_order(&self, alpaca_order_id: &str) -> Result<bool, ClientError> {
+        self.cancel_order(alpaca_order_id).await
+    }
+
+    async fn is_market_open(&self) -> Result<bool, ClientError> {
+        self.is_market_open().await
+    }
+
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
+        self.fetch_positions().await
+    }
+
+    async fn fetch_latest_quotes(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError> {
+        self.fetch_latest_quotes(symbols).await
+    }
+}
+
 /// Partitioned view of the Alpaca active asset universe.
 ///
 /// `tradable` contains all active US equities that accept buy orders.
@@ -703,6 +789,150 @@ struct SnapshotResponse {
 struct SnapshotQuote {
     bp: Option<f64>,
     ap: Option<f64>,
+}
+
+/// Test-only mock implementation of the [`Trading`] trait.
+///
+/// Configurable via public fields. Default values return empty success responses.
+/// Set `should_fail_order` to `true` to make order submission return an error.
+/// Set `should_fail_cancel` to `true` to make cancel return an error.
+/// Set `should_fail_close` to `true` to make close_position return an error.
+#[cfg(test)]
+pub struct MockTrading {
+    pub positions: Vec<Position>,
+    pub account: AccountInfo,
+    pub order_responses: std::sync::Mutex<Vec<String>>,
+    pub order_fills: std::sync::Mutex<Vec<OrderFill>>,
+    pub should_fail_order: bool,
+    pub should_fail_cancel: bool,
+    pub should_fail_close: bool,
+    pub market_open: bool,
+    pub tradable_assets: TradableAssets,
+    pub latest_quotes: Vec<LatestQuote>,
+}
+
+#[cfg(test)]
+impl Default for MockTrading {
+    fn default() -> Self {
+        Self {
+            positions: Vec::new(),
+            account: AccountInfo {
+                cash_amount: 100_000.0,
+                buying_power: 200_000.0,
+                equity: 100_000.0,
+            },
+            order_responses: std::sync::Mutex::new(Vec::new()),
+            order_fills: std::sync::Mutex::new(Vec::new()),
+            should_fail_order: false,
+            should_fail_cancel: false,
+            should_fail_close: false,
+            market_open: true,
+            tradable_assets: TradableAssets {
+                tradable: std::collections::HashSet::new(),
+                shortable: std::collections::HashSet::new(),
+            },
+            latest_quotes: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Trading for MockTrading {
+    async fn get_account(&self) -> Result<AccountInfo, ClientError> {
+        Ok(self.account.clone())
+    }
+
+    async fn submit_long_order(
+        &self,
+        _ticker: &str,
+        _notional: f64,
+    ) -> Result<String, ClientError> {
+        if self.should_fail_order {
+            return Err(ClientError::Api {
+                status: 422,
+                body: "mock order failure".to_string(),
+            });
+        }
+        let mut responses = self.order_responses.lock().unwrap();
+        if responses.is_empty() {
+            Ok(uuid::Uuid::new_v4().to_string())
+        } else {
+            Ok(responses.remove(0))
+        }
+    }
+
+    async fn submit_short_order(
+        &self,
+        _ticker: &str,
+        _quantity: i64,
+    ) -> Result<String, ClientError> {
+        if self.should_fail_order {
+            return Err(ClientError::Api {
+                status: 422,
+                body: "mock order failure".to_string(),
+            });
+        }
+        let mut responses = self.order_responses.lock().unwrap();
+        if responses.is_empty() {
+            Ok(uuid::Uuid::new_v4().to_string())
+        } else {
+            Ok(responses.remove(0))
+        }
+    }
+
+    async fn get_order(&self, alpaca_order_id: &str) -> Result<OrderFill, ClientError> {
+        let mut fills = self.order_fills.lock().unwrap();
+        if fills.is_empty() {
+            Ok(OrderFill {
+                alpaca_order_id: alpaca_order_id.to_string(),
+                status: "filled".to_string(),
+                filled_quantity: Some(100.0),
+                fill_price: Some(150.0),
+            })
+        } else {
+            Ok(fills.remove(0))
+        }
+    }
+
+    async fn close_position(&self, _ticker: &str) -> Result<bool, ClientError> {
+        if self.should_fail_close {
+            return Err(ClientError::Api {
+                status: 500,
+                body: "mock close failure".to_string(),
+            });
+        }
+        Ok(true)
+    }
+
+    async fn fetch_tradable_assets(&self) -> Result<TradableAssets, ClientError> {
+        Ok(self.tradable_assets.clone())
+    }
+
+    async fn cancel_order(&self, _alpaca_order_id: &str) -> Result<bool, ClientError> {
+        if self.should_fail_cancel {
+            return Err(ClientError::Api {
+                status: 500,
+                body: "mock cancel failure".to_string(),
+            });
+        }
+        Ok(true)
+    }
+
+    async fn is_market_open(&self) -> Result<bool, ClientError> {
+        Ok(self.market_open)
+    }
+
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
+        Ok(self.positions.clone())
+    }
+
+    async fn fetch_latest_quotes(
+        &self,
+        _symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError> {
+        Ok(self.latest_quotes.clone())
+    }
 }
 
 #[cfg(test)]
