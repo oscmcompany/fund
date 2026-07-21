@@ -67,6 +67,10 @@ async fn run_consumer(
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
 
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
+
     // Run startup reconciliation to resolve any DB-Alpaca drift accumulated
     // while the service was down.
     match reconciliation::reconcile(pool, state.alpaca_client()).await {

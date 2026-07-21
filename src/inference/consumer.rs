@@ -23,8 +23,9 @@ use crate::inference::state::AppState;
 
 /// Spawn the event consumer if a database pool is configured.
 ///
-/// Returns the join handle for the spawned task, or an empty vec if no pool
-/// is available.
+/// Returns join handles for the spawned tasks, or an empty vec if no pool
+/// is available. Callers must cancel the `shutdown_token` and then await the
+/// returned handles for graceful shutdown.
 pub fn spawn_event_consumer(
     state: AppState,
     shutdown_token: CancellationToken,
@@ -78,6 +79,10 @@ async fn run_consumer(
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
+
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
 
     // Catch up on an equity_predictions_requested that arrived while we were down.
     let offset = get_consumer_offset(pool, CONSUMER_INFERENCE).await?;

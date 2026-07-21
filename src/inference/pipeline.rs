@@ -278,6 +278,9 @@ pub async fn start_artifact_polling(
                 break;
             }
         }
+        if shutdown_token.is_cancelled() {
+            break;
+        }
         poll_artifact_once(&state).await;
     }
 }

@@ -78,6 +78,10 @@ fn export_date_from_payload(payload: &serde_json::Value) -> NaiveDate {
         .unwrap_or_else(|| Utc::now().date_naive())
 }
 
+/// Spawns the data sync scheduler loops as background tasks.
+///
+/// Returns join handles that callers must await after cancelling the
+/// `shutdown_token` to allow in-flight work to drain before exit.
 pub fn spawn_sync_scheduler(
     state: State,
     shutdown_token: CancellationToken,
@@ -186,6 +190,10 @@ async fn run_listener(
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
+
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
 
     // Catch up on any missed one-time actionable events (latest missed instance each).
     let sync_offset = get_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC).await?;

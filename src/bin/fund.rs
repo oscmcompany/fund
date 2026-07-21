@@ -8,7 +8,7 @@
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const USAGE: &str = "Usage: fund [--module <data|inference|portfolio>]";
 
@@ -88,12 +88,22 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
-    let shutdown_token = CancellationToken::new();
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
-
     let run_data = module.is_none() || module == Some(Module::Data);
     let run_inference = module.is_none() || module == Some(Module::Inference);
     let run_portfolio = module.is_none() || module == Some(Module::Portfolio);
+
+    // Construct fallible state objects before spawning any tasks so that a
+    // configuration error (e.g. missing ALPACA_API_KEY_ID) aborts before any
+    // background work starts, rather than leaving already-spawned tasks to be
+    // killed without draining.
+    let portfolio_state = if run_portfolio {
+        Some(fund::portfolio::state::AppState::with_pool(pool.clone())?)
+    } else {
+        None
+    };
+
+    let shutdown_token = CancellationToken::new();
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     if run_data {
         let state = fund::data::state::State::with_pool(pool.clone(), s3_client.clone());
@@ -119,8 +129,7 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
         info!("Inference service started");
     }
 
-    if run_portfolio {
-        let state = fund::portfolio::state::AppState::with_pool(pool)?;
+    if let Some(state) = portfolio_state {
         handles.push(fund::portfolio::consumer::spawn_event_consumer(
             state,
             shutdown_token.clone(),
@@ -134,7 +143,9 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     shutdown_token.cancel();
 
     for handle in handles {
-        let _ = handle.await;
+        if let Err(error) = handle.await {
+            warn!(error = %error, "Task failed during shutdown");
+        }
     }
 
     info!("Shutdown complete");
@@ -146,11 +157,17 @@ async fn await_shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to install SIGTERM handler, falling back to Ctrl+C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
         }
     }
 
@@ -187,7 +204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shutdown_signal_cancels_token() {
+    async fn test_cancellation_token_propagates_to_child() {
         let token = CancellationToken::new();
         let child = token.child_token();
 
@@ -195,5 +212,29 @@ mod tests {
         token.cancel();
         child.cancelled().await;
         assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_token_drains_spawned_tasks() {
+        let token = CancellationToken::new();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = completed.clone();
+
+        let handle = tokio::spawn({
+            let token = token.clone();
+            async move {
+                token.cancelled().await;
+                completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // Task should be waiting on cancellation.
+        tokio::task::yield_now().await;
+        assert!(!completed.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Cancel and await — task should complete.
+        token.cancel();
+        handle.await.unwrap();
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
