@@ -19,6 +19,7 @@ use crate::common::events::{
 };
 use crate::common::market_hours::is_within_trading_session;
 use crate::portfolio::rebalance::{run_end_of_day_liquidation, run_rebalance, RebalanceError};
+use crate::portfolio::reconciliation;
 use crate::portfolio::state::AppState;
 
 /// Spawns the event consumer as a background task.
@@ -43,6 +44,23 @@ async fn run_consumer(state: &AppState, pool: &PgPool) -> Result<(), sqlx::Error
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
+
+    // Run startup reconciliation to resolve any DB-Alpaca drift accumulated
+    // while the service was down.
+    match reconciliation::reconcile(pool, state.alpaca_client()).await {
+        Ok(report) => {
+            info!(
+                orphans_closed = report.orphans_closed,
+                pairs_marked_closed = report.pairs_marked_closed,
+                stale_orders_resolved = report.stale_orders_resolved,
+                compensation_retries = report.compensation_retries,
+                "Startup reconciliation completed"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "Startup reconciliation failed; continuing with event loop");
+        }
+    }
 
     // Catch up on equity_predictions_completed that arrived while we were down.
     // Periodic market_session_check ticks are intentionally not caught up because

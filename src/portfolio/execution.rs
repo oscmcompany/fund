@@ -6,12 +6,15 @@
 
 use chrono::Utc;
 use rust_decimal::Decimal;
+use sqlx::PgPool;
 use tokio::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::domain::orders::{FilledOrder, Order, OrderSide, PendingPair};
+use crate::domain::trading::{ReconciliationAction, ReconciliationEventType};
 use crate::portfolio::alpaca::{ClientError, TradingClient};
+use crate::portfolio::database;
 use crate::portfolio::sizing::SizedPair;
 
 /// Maximum number of fill-poll attempts per order before giving up.
@@ -78,6 +81,7 @@ impl std::error::Error for ExecutionError {}
 /// borrowing issues.
 pub async fn execute_open_pairs(
     alpaca: &TradingClient,
+    pool: &PgPool,
     sized_pairs: &[SizedPair],
 ) -> Vec<(PendingPair, SizedPair)> {
     let mut results: Vec<(PendingPair, SizedPair)> = Vec::new();
@@ -102,8 +106,13 @@ pub async fn execute_open_pairs(
                     error = %error,
                     "Short order submission failed; cancelling orphaned long order"
                 );
-                compensate_orphaned_order(alpaca, &long_id, sized_pair.long_ticker().as_str())
-                    .await;
+                compensate_orphaned_order(
+                    alpaca,
+                    pool,
+                    &long_id,
+                    sized_pair.long_ticker().as_str(),
+                )
+                .await;
                 continue;
             }
             (Ok(short_id), Err(error)) => {
@@ -112,8 +121,13 @@ pub async fn execute_open_pairs(
                     error = %error,
                     "Long order submission failed; cancelling orphaned short order"
                 );
-                compensate_orphaned_order(alpaca, &short_id, sized_pair.short_ticker().as_str())
-                    .await;
+                compensate_orphaned_order(
+                    alpaca,
+                    pool,
+                    &short_id,
+                    sized_pair.short_ticker().as_str(),
+                )
+                .await;
                 continue;
             }
             (Err(short_error), Err(long_error)) => {
@@ -171,7 +185,15 @@ pub async fn execute_open_pairs(
 /// Cancels an orphaned order, falling back to closing the resulting position
 /// if the order has already filled by the time compensation runs (Alpaca
 /// returns 422 for terminal-state orders).
-async fn compensate_orphaned_order(alpaca: &TradingClient, alpaca_order_id: &str, ticker: &str) {
+///
+/// When both cancellation and position close fail, persists a `compensation_failure`
+/// event to the reconciliation table so it can be retried on the next pass.
+async fn compensate_orphaned_order(
+    alpaca: &TradingClient,
+    pool: &PgPool,
+    alpaca_order_id: &str,
+    ticker: &str,
+) {
     match alpaca.cancel_order(alpaca_order_id).await {
         Ok(true) => {
             info!(
@@ -182,22 +204,59 @@ async fn compensate_orphaned_order(alpaca: &TradingClient, alpaca_order_id: &str
         }
         Ok(false) => {
             // Order already in a terminal state; close the filled position.
-            if let Err(error) = alpaca.close_position(ticker).await {
-                warn!(
+            if let Err(close_error) = alpaca.close_position(ticker).await {
+                error!(
                     ticker = ticker,
-                    error = %error,
-                    "Failed to close orphaned position after order already filled"
+                    alpaca_order_id = alpaca_order_id,
+                    error = %close_error,
+                    "Failed to close orphaned position after order already filled; persisting compensation failure"
                 );
+                persist_compensation_failure(pool, ticker, alpaca_order_id).await;
             }
         }
-        Err(error) => {
+        Err(cancel_error) => {
+            // Cancel failed — try closing the position directly.
             warn!(
                 alpaca_order_id = alpaca_order_id,
                 ticker = ticker,
-                error = %error,
-                "Failed to cancel orphaned order"
+                error = %cancel_error,
+                "Failed to cancel orphaned order; attempting close_position fallback"
             );
+            if let Err(close_error) = alpaca.close_position(ticker).await {
+                error!(
+                    ticker = ticker,
+                    alpaca_order_id = alpaca_order_id,
+                    cancel_error = %cancel_error,
+                    close_error = %close_error,
+                    "Both cancel and close failed; persisting compensation failure"
+                );
+                persist_compensation_failure(pool, ticker, alpaca_order_id).await;
+            }
         }
+    }
+}
+
+/// Persists a compensation failure event so reconciliation can retry it.
+async fn persist_compensation_failure(pool: &PgPool, ticker: &str, alpaca_order_id: &str) {
+    if let Err(error) = database::insert_reconciliation_event(
+        pool,
+        &ReconciliationEventType::CompensationFailure,
+        ticker,
+        None,
+        None,
+        None,
+        Some(alpaca_order_id),
+        &ReconciliationAction::LoggedOnly,
+        None,
+    )
+    .await
+    {
+        error!(
+            error = %error,
+            ticker = ticker,
+            alpaca_order_id = alpaca_order_id,
+            "Failed to persist compensation failure event"
+        );
     }
 }
 

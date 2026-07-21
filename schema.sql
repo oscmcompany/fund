@@ -234,6 +234,26 @@ CREATE TABLE IF NOT EXISTS model_runs (
 CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status); -- noqa: PG01
 CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC); -- noqa: PG01
 
+-- equity_reconciliation_events: audit trail for DB-Alpaca state discrepancies.
+-- Append-only during detection; resolved_at is updated when corrective action succeeds.
+-- Designed for Phase 2b continuous reconciliation without schema migration.
+CREATE TABLE IF NOT EXISTS equity_reconciliation_events (
+    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    detected_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_type        TEXT        NOT NULL,
+    ticker            TEXT        NOT NULL,
+    expected_quantity NUMERIC,
+    actual_quantity   NUMERIC,
+    equity_pair_id    UUID        REFERENCES equity_pairs(id),
+    alpaca_order_id   TEXT,
+    action_taken      TEXT        NOT NULL,
+    resolved_at       TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_equity_reconciliation_events_unresolved -- noqa: PG01
+    ON equity_reconciliation_events (event_type)
+    WHERE resolved_at IS NULL;
+
 -- Nightly equity bar sync: weekdays at 05:00 UTC
 DO $do$
 BEGIN

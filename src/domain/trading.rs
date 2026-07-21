@@ -225,6 +225,90 @@ impl OrderStatus {
     }
 }
 
+/// Type of discrepancy detected during reconciliation.
+///
+/// Event types are stored as free-text in `equity_reconciliation_events.event_type`
+/// to support future extensibility (e.g., Phase 2b risk limit breaches) without
+/// schema migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationEventType {
+    /// Alpaca holds a position the database does not track.
+    AlpacaOnly,
+    /// Database has an open pair but Alpaca has no corresponding position.
+    DatabaseOnly,
+    /// Both agree the ticker is held, but quantities differ.
+    QuantityMismatch,
+    /// Orphan compensation (cancel + close) failed and needs retry.
+    CompensationFailure,
+    /// A submitted order exceeded the staleness threshold without confirmation.
+    StaleSubmittedOrder,
+}
+
+impl ReconciliationEventType {
+    /// Returns the database string identifier for this event type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AlpacaOnly => "alpaca_only",
+            Self::DatabaseOnly => "database_only",
+            Self::QuantityMismatch => "quantity_mismatch",
+            Self::CompensationFailure => "compensation_failure",
+            Self::StaleSubmittedOrder => "stale_submitted_order",
+        }
+    }
+
+    /// Parses a stored database value. Returns `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "alpaca_only" => Some(Self::AlpacaOnly),
+            "database_only" => Some(Self::DatabaseOnly),
+            "quantity_mismatch" => Some(Self::QuantityMismatch),
+            "compensation_failure" => Some(Self::CompensationFailure),
+            "stale_submitted_order" => Some(Self::StaleSubmittedOrder),
+            _ => None,
+        }
+    }
+}
+
+/// Corrective action taken (or deferred) for a reconciliation event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconciliationAction {
+    /// Closed an orphaned Alpaca position not tracked by the database.
+    ClosedOrphan,
+    /// Marked a database pair as closed because Alpaca no longer holds it.
+    MarkedPairClosed,
+    /// Confirmed a fill for a stale submitted order after querying Alpaca.
+    ConfirmedFill,
+    /// Cancelled a stale submitted order that Alpaca had not filled.
+    CancelledStaleOrder,
+    /// No corrective action taken; discrepancy logged for human review.
+    LoggedOnly,
+}
+
+impl ReconciliationAction {
+    /// Returns the database string identifier for this action.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ClosedOrphan => "closed_orphan",
+            Self::MarkedPairClosed => "marked_pair_closed",
+            Self::ConfirmedFill => "confirmed_fill",
+            Self::CancelledStaleOrder => "cancelled_stale_order",
+            Self::LoggedOnly => "logged_only",
+        }
+    }
+
+    /// Parses a stored database value. Returns `None` for unknown values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "closed_orphan" => Some(Self::ClosedOrphan),
+            "marked_pair_closed" => Some(Self::MarkedPairClosed),
+            "confirmed_fill" => Some(Self::ConfirmedFill),
+            "cancelled_stale_order" => Some(Self::CancelledStaleOrder),
+            "logged_only" => Some(Self::LoggedOnly),
+            _ => None,
+        }
+    }
+}
+
 impl std::fmt::Display for CloseReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
@@ -1314,6 +1398,47 @@ mod tests {
         assert_eq!(order.order_type(), "limit");
         assert!(order.limit_price().is_some());
         assert_eq!(order.alpaca_order_id(), "alpaca-001");
+    }
+
+    #[test]
+    fn test_reconciliation_event_type_round_trip() {
+        for event_type in [
+            ReconciliationEventType::AlpacaOnly,
+            ReconciliationEventType::DatabaseOnly,
+            ReconciliationEventType::QuantityMismatch,
+            ReconciliationEventType::CompensationFailure,
+            ReconciliationEventType::StaleSubmittedOrder,
+        ] {
+            assert_eq!(
+                ReconciliationEventType::parse(event_type.as_str()),
+                Some(event_type)
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconciliation_event_type_parse_rejects_unknown() {
+        assert_eq!(ReconciliationEventType::parse("unknown_type"), None);
+        assert_eq!(ReconciliationEventType::parse("ALPACA_ONLY"), None);
+    }
+
+    #[test]
+    fn test_reconciliation_action_round_trip() {
+        for action in [
+            ReconciliationAction::ClosedOrphan,
+            ReconciliationAction::MarkedPairClosed,
+            ReconciliationAction::ConfirmedFill,
+            ReconciliationAction::CancelledStaleOrder,
+            ReconciliationAction::LoggedOnly,
+        ] {
+            assert_eq!(ReconciliationAction::parse(action.as_str()), Some(action));
+        }
+    }
+
+    #[test]
+    fn test_reconciliation_action_parse_rejects_unknown() {
+        assert_eq!(ReconciliationAction::parse("unknown_action"), None);
+        assert_eq!(ReconciliationAction::parse("CLOSED_ORPHAN"), None);
     }
 
     #[test]
