@@ -4,7 +4,9 @@ use crate::common::events::{
     CONSUMER_DATA_EQUITY_BARS_SYNC, CONSUMER_DATA_TRADING_HISTORY_EXPORT,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
+use crate::data::equity_details;
 use crate::data::export;
+use crate::data::market_calendar;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
@@ -21,9 +23,15 @@ const SYNC_HOUR: u32 = 1;
 const SYNC_MINUTE: u32 = 0;
 const SYNC_DEDUP_TTL_SECS: u64 = 300;
 
+/// Maximum number of retry attempts for a single Massive API fetch.
+const FETCH_MAX_RETRIES: u32 = 3;
+
+/// Number of calendar days to look back for gap detection during self-healing sync.
+const GAP_DETECTION_LOOKBACK_DAYS: i64 = 90;
+
 fn prior_trading_day(date: NaiveDate) -> NaiveDate {
     let mut prior = date.pred_opt().unwrap();
-    while matches!(prior.weekday(), Weekday::Sat | Weekday::Sun) {
+    while !market_calendar::is_trading_day(prior) {
         prior = prior.pred_opt().unwrap();
     }
     prior
@@ -86,6 +94,19 @@ pub fn spawn_sync_scheduler(
     state: State,
     shutdown_token: CancellationToken,
 ) -> Vec<JoinHandle<()>> {
+    // Warn if the market calendar holiday table does not cover the current year.
+    // Gap detection degrades to weekday-only without holiday coverage, which
+    // causes false-positive gap alerts on holidays.
+    let current_year = Utc::now().with_timezone(&Eastern).date_naive().year();
+    if !market_calendar::has_holiday_coverage(current_year) {
+        warn!(
+            year = current_year,
+            "Market calendar has no holiday data for the current year; \
+             gap detection will treat holidays as missing data. \
+             Update NYSE_HOLIDAYS in src/data/market_calendar.rs"
+        );
+    }
+
     let listen_state = state.clone();
     let mut handles = Vec::new();
     // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
@@ -98,13 +119,122 @@ pub fn spawn_sync_scheduler(
     handles
 }
 
+/// Fetches equity bars for a single trading date with exponential-backoff retry.
+///
+/// Retries up to [`FETCH_MAX_RETRIES`] times on transient failures, with
+/// delays of 1s, 2s, 4s between attempts.
+async fn fetch_with_retry(
+    state: &State,
+    trading_date: &TradingDate,
+) -> Result<Option<usize>, String> {
+    let mut last_error = String::new();
+    for attempt in 0..FETCH_MAX_RETRIES {
+        match fetch_and_store_equity_bars(state, trading_date).await {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                last_error = error;
+                if attempt + 1 < FETCH_MAX_RETRIES {
+                    let backoff = Duration::from_secs(1 << attempt);
+                    warn!(
+                        attempt = attempt + 1,
+                        max = FETCH_MAX_RETRIES,
+                        backoff_seconds = backoff.as_secs(),
+                        date = %trading_date.as_naive_date(),
+                        error = %last_error,
+                        "Equity bar fetch failed, retrying"
+                    );
+                    sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// Self-healing equity bar sync: fetches yesterday's data, then detects and
+/// backfills any gaps in the lookback window.
 async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
     let trading_date = sync_date_for(Utc::now());
     info!(
         "Starting equity bar sync for {}",
         trading_date.as_naive_date().format("%Y-%m-%d")
     );
-    fetch_and_store_equity_bars(state, &trading_date).await
+
+    // Sync the primary target date first (yesterday's trading day).
+    let primary_count = fetch_with_retry(state, &trading_date).await?;
+    let mut total_bars = primary_count.unwrap_or(0);
+
+    // Self-healing: detect and backfill gaps in the lookback window.
+    let pool = match state.database.pool() {
+        Some(pool) => pool,
+        None => return Ok(primary_count),
+    };
+
+    let today = Utc::now().with_timezone(&Eastern).date_naive();
+    let lookback_start = today - chrono::Duration::days(GAP_DETECTION_LOOKBACK_DAYS);
+    let expected_days = market_calendar::trading_days_in_range(lookback_start, today);
+
+    let covered_dates =
+        crate::data::database::distinct_equity_bar_dates(pool, lookback_start, today)
+            .await
+            .map_err(|error| format!("Gap detection query failed: {}", error))?;
+
+    let gaps: Vec<NaiveDate> = expected_days
+        .into_iter()
+        .filter(|date| !covered_dates.contains(date))
+        // Exclude today and the primary date we just synced.
+        .filter(|date| *date != today && *date != trading_date.as_naive_date())
+        .collect();
+
+    if gaps.is_empty() {
+        info!("No gaps detected in equity bar coverage");
+        return Ok(Some(total_bars));
+    }
+
+    info!(
+        gap_count = gaps.len(),
+        "Detected gaps in equity bar coverage, backfilling"
+    );
+
+    let mut backfilled = 0usize;
+    let mut failed = 0usize;
+    for gap_date in &gaps {
+        let Some(gap_trading_date) = TradingDate::from_naive_date(*gap_date) else {
+            continue;
+        };
+        match fetch_with_retry(state, &gap_trading_date).await {
+            Ok(Some(count)) => {
+                backfilled += 1;
+                total_bars += count;
+                info!(
+                    date = %gap_date,
+                    bars = count,
+                    "Backfilled gap"
+                );
+            }
+            Ok(None) => {
+                info!(date = %gap_date, "No data available for gap date");
+            }
+            Err(error) => {
+                failed += 1;
+                warn!(
+                    date = %gap_date,
+                    error = %error,
+                    "Failed to backfill gap"
+                );
+            }
+        }
+    }
+
+    info!(
+        gaps_detected = gaps.len(),
+        gaps_backfilled = backfilled,
+        gaps_failed = failed,
+        total_bars = total_bars,
+        "Self-healing sync complete"
+    );
+
+    Ok(Some(total_bars))
 }
 
 async fn sync_loop(state: State, shutdown_token: CancellationToken) {
@@ -340,9 +470,48 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
         }
     }
 
+    // Self-healing equity details: refresh from embedded CSV on every sync
+    // so that sector/industry reclassifications are picked up automatically.
+    run_equity_details_sync(state, pool).await;
+
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC, event_id).await
     {
         warn!(error = %error, "Failed to update equity-bars-sync consumer offset");
+    }
+}
+
+/// Re-seeds equity details from the compile-time embedded CSV.
+///
+/// Uses `ON CONFLICT DO UPDATE` so sector/industry changes propagate.
+/// Also uploads the CSV to S3 to keep the durable store in sync.
+async fn run_equity_details_sync(state: &State, pool: &sqlx::PgPool) {
+    let details = match equity_details::parse_embedded_equity_details() {
+        Ok(details) => details,
+        Err(error) => {
+            warn!(error = %error, "Failed to parse embedded equity details");
+            return;
+        }
+    };
+
+    match crate::data::database::seed_equity_details(pool, &details).await {
+        Ok(count) => info!(rows = count, "Equity details refreshed in PostgreSQL"),
+        Err(error) => warn!(error = %error, "Failed to refresh equity details in PostgreSQL"),
+    }
+
+    let csv_bytes = equity_details::embedded_csv().as_bytes();
+    let key = "data/equity/details/details.csv";
+    if let Err(error) = state
+        .s3_client
+        .put_object()
+        .bucket(&state.bucket_name)
+        .key(key)
+        .body(ByteStream::from(csv_bytes.to_vec()))
+        .send()
+        .await
+    {
+        warn!(error = %error, "Failed to upload equity details CSV to S3");
+    } else {
+        info!(key = key, "Uploaded equity details CSV to S3");
     }
 }
 
@@ -1040,6 +1209,41 @@ mod tests {
         let saturday = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
         let prior = prior_trading_day(saturday);
         assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 5, 1).unwrap());
+    }
+
+    #[test]
+    fn test_prior_trading_day_skips_holiday() {
+        // Christmas 2026 is Friday Dec 25. The day after (Dec 28) is Monday.
+        // prior_trading_day(Dec 28) should skip the weekend AND Christmas,
+        // landing on Wednesday Dec 24.
+        let monday = NaiveDate::from_ymd_opt(2026, 12, 28).unwrap();
+        let prior = prior_trading_day(monday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 12, 24).unwrap());
+    }
+
+    #[test]
+    fn test_prior_trading_day_skips_observed_holiday() {
+        // Independence Day 2026 is Saturday July 4; observed Friday July 3.
+        // prior_trading_day(Mon July 6) should skip weekend + observed holiday,
+        // landing on Thursday July 2.
+        let monday = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
+        let prior = prior_trading_day(monday);
+        assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+    }
+
+    #[test]
+    fn test_sync_date_for_day_after_holiday_skips_holiday() {
+        // Tuesday Dec 29, 2026 at 01:00 ET — prior trading day is Wednesday Dec 24
+        // (skips Christmas on Dec 25 + weekend Dec 26-27).
+        let now = chrono_tz::US::Eastern
+            .with_ymd_and_hms(2026, 12, 29, 1, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let sync_date = sync_date_for(now);
+        assert_eq!(
+            sync_date.as_naive_date(),
+            NaiveDate::from_ymd_opt(2026, 12, 28).unwrap()
+        );
     }
 
     #[test]

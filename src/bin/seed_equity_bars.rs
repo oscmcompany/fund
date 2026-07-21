@@ -159,20 +159,20 @@ async fn main() {
     {
         Ok(summary) => {
             println!(
-                "Seed {}: {} day(s) written, {} weekend day(s) skipped, {} day(s) failed, {} total bars.",
+                "Seed {}: {} day(s) written, {} non-trading day(s) skipped, {} day(s) failed, {} total bars.",
                 if summary.days_failed == 0 {
                     "complete"
                 } else {
                     "INCOMPLETE"
                 },
                 summary.days_processed,
-                summary.days_skipped_weekend,
+                summary.days_skipped_non_trading,
                 summary.days_failed,
                 summary.total_bars,
             );
             tracing::info!(
                 days_processed = summary.days_processed,
-                days_skipped_weekend = summary.days_skipped_weekend,
+                days_skipped_non_trading = summary.days_skipped_non_trading,
                 days_failed = summary.days_failed,
                 total_bars = summary.total_bars,
                 "Seed finished"
@@ -208,7 +208,7 @@ mod tests {
         let mut summary = SeedSummary::default();
         assert_eq!(exit_code_for(&summary), 0);
 
-        summary.days_skipped_weekend = 3;
+        summary.days_skipped_non_trading = 3;
         summary.days_processed = 5;
         assert_eq!(exit_code_for(&summary), 0);
 

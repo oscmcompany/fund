@@ -1,26 +1,29 @@
 use crate::data::errors::Error;
-use chrono::{Datelike, NaiveDate, Weekday};
+use crate::data::market_calendar;
+use chrono::NaiveDate;
 use polars::prelude::*;
 use tracing::{debug, info};
 
 pub use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
 
-/// A validated US market trading date (Monday through Friday).
+/// A validated US market trading date (weekday and not a holiday).
 ///
 /// The private field prevents construction without going through
-/// [`TradingDate::from_naive_date`], which rejects weekend dates.
-/// A `TradingDate` in scope is proof the date is a weekday.
+/// [`TradingDate::from_naive_date`], which rejects weekends and known
+/// NYSE holidays. A `TradingDate` in scope is proof the date is a real
+/// trading day.
 #[derive(Debug, Clone, Copy)]
 pub struct TradingDate(NaiveDate);
 
 impl TradingDate {
     /// Constructs a `TradingDate` from a `NaiveDate`.
     ///
-    /// Returns `None` if the date falls on a Saturday or Sunday.
+    /// Returns `None` if the date falls on a weekend or a known NYSE holiday.
     pub fn from_naive_date(date: NaiveDate) -> Option<Self> {
-        match date.weekday() {
-            Weekday::Sat | Weekday::Sun => None,
-            _ => Some(Self(date)),
+        if market_calendar::is_trading_day(date) {
+            Some(Self(date))
+        } else {
+            None
         }
     }
 
@@ -139,6 +142,20 @@ mod tests {
     fn test_trading_date_rejects_sunday() {
         let sunday = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
         assert!(TradingDate::from_naive_date(sunday).is_none());
+    }
+
+    #[test]
+    fn test_trading_date_rejects_holiday() {
+        // Christmas 2026 is a Friday — weekday but a holiday.
+        let christmas = NaiveDate::from_ymd_opt(2026, 12, 25).unwrap();
+        assert!(TradingDate::from_naive_date(christmas).is_none());
+    }
+
+    #[test]
+    fn test_trading_date_rejects_observed_holiday() {
+        // Independence Day 2026 falls on Saturday; observed Friday July 3.
+        let observed = NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+        assert!(TradingDate::from_naive_date(observed).is_none());
     }
 
     #[test]
