@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
@@ -53,6 +53,7 @@ use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
 };
 use crate::portfolio::math::z_score_last;
+use crate::portfolio::reconciliation;
 use crate::portfolio::regime::classify_regime;
 use crate::portfolio::sizing::{size_pairs_with_volatility_parity, SizingError};
 use crate::portfolio::state::AppState;
@@ -152,22 +153,48 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let pool = state.pool();
     let alpaca = state.alpaca_client();
 
-    // Phase 1: check Alpaca positions to decide build vs monitor path.
+    // Phase 1: reconcile DB state against Alpaca positions, then decide path.
+    let reconciliation_report = match reconciliation::reconcile(pool, alpaca).await {
+        Ok(report) => report,
+        Err(reconciliation::ReconciliationError::AlpacaFetch(error)) => {
+            return Err(RebalanceError::Execution(ExecutionError::PositionFetch {
+                source: error,
+            }));
+        }
+        Err(reconciliation::ReconciliationError::Database(error)) => {
+            return Err(RebalanceError::Database(error));
+        }
+    };
+
+    if reconciliation_report.orphans_closed > 0
+        || reconciliation_report.pairs_marked_closed > 0
+        || reconciliation_report.stale_orders_resolved > 0
+    {
+        info!(
+            orphans_closed = reconciliation_report.orphans_closed,
+            pairs_marked_closed = reconciliation_report.pairs_marked_closed,
+            stale_orders_resolved = reconciliation_report.stale_orders_resolved,
+            "Reconciliation resolved discrepancies before rebalance"
+        );
+    }
+
+    // Re-fetch state after reconciliation to get the corrected view.
     let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
         RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
-
     let open_pairs = fetch_open_pairs(pool).await?;
 
     if !alpaca_positions.is_empty() {
         // Alpaca has live positions — enter monitor mode.
         if open_pairs.is_empty() {
+            // Reconciliation should have resolved this, but if it persists, halt.
             warn!(
                 alpaca_positions = alpaca_positions.len(),
-                "Alpaca has positions but database has no open pairs; state mismatch"
+                "Alpaca has positions but database has no open pairs after reconciliation"
             );
             return Err(RebalanceError::Execution(ExecutionError::StateMismatch {
-                message: "Alpaca has positions but database has no open pairs".to_string(),
+                message: "Alpaca has positions but database has no open pairs after reconciliation"
+                    .to_string(),
             }));
         }
 
@@ -176,28 +203,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
     }
 
-    // Alpaca has no positions. If DB still has open pairs, they were closed
-    // externally (manual close, Alpaca risk controls, corporate action). Mark
-    // them closed with a reconciliation-specific reason and continue as cold start.
-    if !open_pairs.is_empty() {
-        error!(
-            open_pairs = open_pairs.len(),
-            "Database has open pairs but Alpaca has no positions; \
-             marking stale pairs closed with reconciliation_alpaca_missing"
-        );
-        let closed_at = Utc::now();
-        for pair in &open_pairs {
-            close_equity_pair_with_reason(
-                pool,
-                pair.id(),
-                closed_at,
-                &CloseReason::ReconciliationAlpacaMissing,
-            )
-            .await?;
-        }
-    }
-
-    // Cold start: no Alpaca positions. Build a fresh portfolio.
+    // Cold start: no Alpaca positions, no open DB pairs. Build a fresh portfolio.
     info!("No Alpaca positions; building fresh portfolio");
 
     // Phase 2: load predictions and market data.
@@ -885,7 +891,7 @@ async fn select_size_execute(
         })
         .collect();
 
-    let pending = execute_open_pairs(alpaca, &eligible_pairs).await;
+    let pending = execute_open_pairs(alpaca, pool, &eligible_pairs).await;
 
     // Persist submitted order records before polling for fills. Each order gets
     // a durable breadcrumb so that if the process crashes during fill polling,
@@ -1036,11 +1042,17 @@ async fn persist_filled_pairs(
         // Uses the Order ID from the filled pair (same UUID that was used in
         // insert_submitted_order). Silently handles the case where the submitted
         // record was never persisted (e.g., DB was unavailable at submission time).
-        mark_order_filled(&mut **transaction, filled_pair.long.id, long_alloc_id, now).await?;
+        mark_order_filled(
+            &mut **transaction,
+            filled_pair.long.id,
+            Some(long_alloc_id),
+            now,
+        )
+        .await?;
         mark_order_filled(
             &mut **transaction,
             filled_pair.short.id,
-            short_alloc_id,
+            Some(short_alloc_id),
             now,
         )
         .await?;

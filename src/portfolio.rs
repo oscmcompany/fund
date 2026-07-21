@@ -10,6 +10,7 @@ pub mod database;
 pub mod execution;
 pub mod math;
 pub mod rebalance;
+pub mod reconciliation;
 pub mod regime;
 pub mod sizing;
 pub mod state;

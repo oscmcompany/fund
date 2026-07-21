@@ -60,6 +60,8 @@ pub struct Position {
     pub symbol: String,
     /// Position side (`"long"` or `"short"`).
     pub side: String,
+    /// Absolute number of shares held.
+    pub quantity: f64,
     /// Current market value (negative for shorts).
     pub market_value: f64,
     /// Unrealised profit or loss on this position.
@@ -509,6 +511,12 @@ impl TradingClient {
         let result: Vec<Position> = positions
             .into_iter()
             .map(|position| {
+                let quantity = position.qty.parse::<f64>().map_err(|error| {
+                    ClientError::Parse(format!(
+                        "Failed to parse qty '{}' for {}: {error}",
+                        position.qty, position.symbol
+                    ))
+                })?;
                 let market_value = position.market_value.parse::<f64>().map_err(|error| {
                     ClientError::Parse(format!(
                         "Failed to parse market_value '{}' for {}: {error}",
@@ -525,6 +533,7 @@ impl TradingClient {
                 Ok(Position {
                     symbol: position.symbol,
                     side: position.side,
+                    quantity: quantity.abs(),
                     market_value,
                     unrealized_profit_and_loss,
                 })
@@ -679,6 +688,7 @@ struct ClockResponse {
 struct PositionResponse {
     symbol: String,
     side: String,
+    qty: String,
     market_value: String,
     unrealized_pl: String,
 }
@@ -994,8 +1004,8 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"[
-                {"symbol": "AAPL", "side": "long", "market_value": "15000.50", "unrealized_pl": "500.25"},
-                {"symbol": "MSFT", "side": "short", "market_value": "-8000.00", "unrealized_pl": "-200.75"}
+                {"symbol": "AAPL", "side": "long", "qty": "100", "market_value": "15000.50", "unrealized_pl": "500.25"},
+                {"symbol": "MSFT", "side": "short", "qty": "-50", "market_value": "-8000.00", "unrealized_pl": "-200.75"}
             ]"#,
             )
             .create_async()
@@ -1007,10 +1017,12 @@ mod tests {
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[0].symbol, "AAPL");
         assert_eq!(positions[0].side, "long");
+        assert!((positions[0].quantity - 100.0).abs() < 1e-6);
         assert!((positions[0].market_value - 15_000.50).abs() < 1e-6);
         assert!((positions[0].unrealized_profit_and_loss - 500.25).abs() < 1e-6);
         assert_eq!(positions[1].symbol, "MSFT");
         assert_eq!(positions[1].side, "short");
+        assert!((positions[1].quantity - 50.0).abs() < 1e-6);
         assert!((positions[1].market_value - (-8_000.0)).abs() < 1e-6);
         assert!((positions[1].unrealized_profit_and_loss - (-200.75)).abs() < 1e-6);
         mock.assert_async().await;

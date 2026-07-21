@@ -14,7 +14,7 @@ use crate::domain::market::{PairID, Ticker};
 use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
     CloseReason, EquityAllocation, EquityOrder, EquityPair, EquityRebalanceSession, OrderStatus,
-    RebalanceSessionStatus,
+    RebalanceSessionStatus, ReconciliationAction, ReconciliationEventType,
 };
 
 /// Lookback window for historical close prices (calendar days).
@@ -627,7 +627,7 @@ pub async fn insert_submitted_order(
 pub async fn mark_order_filled<'e>(
     executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     id: Uuid,
-    allocation_id: Uuid,
+    allocation_id: Option<Uuid>,
     filled_at: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let result = sqlx::query(
@@ -707,6 +707,126 @@ pub async fn fetch_submitted_orders(
         "Submitted orders fetched from PostgreSQL"
     );
     Ok(orders)
+}
+
+/// An unresolved reconciliation event awaiting retry or human review.
+///
+/// Returned by [`fetch_unresolved_reconciliation_events`] for the reconciliation
+/// process to retry corrective actions.
+#[derive(Debug, Clone)]
+pub struct UnresolvedReconciliationEvent {
+    id: i64,
+    event_type: String,
+    ticker: String,
+    alpaca_order_id: Option<String>,
+}
+
+impl UnresolvedReconciliationEvent {
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    pub fn ticker(&self) -> &str {
+        &self.ticker
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+}
+
+/// Inserts a reconciliation event recording a detected discrepancy and the action taken.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_reconciliation_event(
+    pool: &PgPool,
+    event_type: &ReconciliationEventType,
+    ticker: &str,
+    expected_quantity: Option<Decimal>,
+    actual_quantity: Option<Decimal>,
+    equity_pair_id: Option<Uuid>,
+    alpaca_order_id: Option<&str>,
+    action_taken: &ReconciliationAction,
+    resolved_at: Option<DateTime<Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO equity_reconciliation_events \
+         (event_type, ticker, expected_quantity, actual_quantity, equity_pair_id, \
+          alpaca_order_id, action_taken, resolved_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(event_type.as_str())
+    .bind(ticker)
+    .bind(expected_quantity)
+    .bind(actual_quantity)
+    .bind(equity_pair_id)
+    .bind(alpaca_order_id)
+    .bind(action_taken.as_str())
+    .bind(resolved_at)
+    .execute(pool)
+    .await?;
+
+    info!(
+        event_type = event_type.as_str(),
+        ticker = ticker,
+        action = action_taken.as_str(),
+        "Reconciliation event recorded"
+    );
+    Ok(())
+}
+
+/// Fetches all unresolved reconciliation events (where `resolved_at IS NULL`).
+///
+/// Used by the reconciliation process to retry compensation failures and
+/// other events that need follow-up.
+pub async fn fetch_unresolved_reconciliation_events(
+    pool: &PgPool,
+) -> Result<Vec<UnresolvedReconciliationEvent>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, event_type, ticker, alpaca_order_id \
+         FROM equity_reconciliation_events \
+         WHERE resolved_at IS NULL \
+         ORDER BY detected_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let events: Vec<UnresolvedReconciliationEvent> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            UnresolvedReconciliationEvent {
+                id: row.get("id"),
+                event_type: row.get("event_type"),
+                ticker: row.get("ticker"),
+                alpaca_order_id: row.get("alpaca_order_id"),
+            }
+        })
+        .collect();
+
+    info!(
+        rows = events.len(),
+        "Unresolved reconciliation events fetched from PostgreSQL"
+    );
+    Ok(events)
+}
+
+/// Marks a reconciliation event as resolved by setting `resolved_at`.
+pub async fn resolve_reconciliation_event(pool: &PgPool, event_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE equity_reconciliation_events \
+         SET resolved_at = now() \
+         WHERE id = $1",
+    )
+    .bind(event_id)
+    .execute(pool)
+    .await?;
+
+    info!(event_id = event_id, "Reconciliation event resolved");
+    Ok(())
 }
 
 /// Inserts an intraday portfolio snapshot recording the post-rebalance net asset value.
@@ -1042,11 +1162,14 @@ mod tests {
     #[test]
     fn test_mark_order_filled_compiles() {
         make_runtime().block_on(async {
-            assert!(
-                mark_order_filled(&lazy_pool(), Uuid::new_v4(), Uuid::new_v4(), Utc::now(),)
-                    .await
-                    .is_err()
-            );
+            assert!(mark_order_filled(
+                &lazy_pool(),
+                Uuid::new_v4(),
+                Some(Uuid::new_v4()),
+                Utc::now(),
+            )
+            .await
+            .is_err());
         });
     }
 
@@ -1065,6 +1188,84 @@ mod tests {
             assert!(fetch_submitted_orders(&lazy_pool(), Utc::now())
                 .await
                 .is_err());
+        });
+    }
+
+    // --- UnresolvedReconciliationEvent accessors ---
+
+    #[test]
+    fn test_unresolved_reconciliation_event_accessors() {
+        let event = UnresolvedReconciliationEvent {
+            id: 42,
+            event_type: "compensation_failure".to_string(),
+            ticker: "AAPL".to_string(),
+            alpaca_order_id: Some("alpaca-order-001".to_string()),
+        };
+        assert_eq!(event.id(), 42);
+        assert_eq!(event.event_type(), "compensation_failure");
+        assert_eq!(event.ticker(), "AAPL");
+        assert_eq!(event.alpaca_order_id(), Some("alpaca-order-001"));
+    }
+
+    #[test]
+    fn test_unresolved_reconciliation_event_without_order_id() {
+        let event = UnresolvedReconciliationEvent {
+            id: 1,
+            event_type: "database_only".to_string(),
+            ticker: "MSFT".to_string(),
+            alpaca_order_id: None,
+        };
+        assert!(event.alpaca_order_id().is_none());
+    }
+
+    #[test]
+    fn test_unresolved_reconciliation_event_clone() {
+        let event = UnresolvedReconciliationEvent {
+            id: 5,
+            event_type: "alpaca_only".to_string(),
+            ticker: "GOOG".to_string(),
+            alpaca_order_id: None,
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.id(), event.id());
+        assert_eq!(cloned.ticker(), event.ticker());
+    }
+
+    // --- compile / connection-error coverage for reconciliation DB functions ---
+
+    #[test]
+    fn test_insert_reconciliation_event_compiles() {
+        make_runtime().block_on(async {
+            use crate::domain::trading::{ReconciliationAction, ReconciliationEventType};
+            assert!(insert_reconciliation_event(
+                &lazy_pool(),
+                &ReconciliationEventType::AlpacaOnly,
+                "AAPL",
+                None,
+                Some(Decimal::from(100)),
+                None,
+                None,
+                &ReconciliationAction::ClosedOrphan,
+                Some(Utc::now()),
+            )
+            .await
+            .is_err());
+        });
+    }
+
+    #[test]
+    fn test_fetch_unresolved_reconciliation_events_compiles() {
+        make_runtime().block_on(async {
+            assert!(fetch_unresolved_reconciliation_events(&lazy_pool())
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn test_resolve_reconciliation_event_compiles() {
+        make_runtime().block_on(async {
+            assert!(resolve_reconciliation_event(&lazy_pool(), 1).await.is_err());
         });
     }
 
