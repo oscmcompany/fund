@@ -29,6 +29,28 @@ const FETCH_MAX_RETRIES: u32 = 3;
 /// Number of calendar days to look back for gap detection during self-healing sync.
 const GAP_DETECTION_LOOKBACK_DAYS: i64 = 90;
 
+/// pg_cron job names that must be present for the nightly pipeline to function.
+const EXPECTED_CRON_JOBS: &[&str] = &[
+    "equity-bars-sync-requested",
+    "market-session-check",
+    "portfolio-liquidation-requested",
+    "equity-bars-export-requested",
+    "trading-history-export-requested",
+    "database-backup-requested",
+    "cron-run-details-cleanup",
+];
+
+/// Nightly event types and their maximum expected age in hours. Events older
+/// than their threshold trigger a warning on startup. Market-hours-only events
+/// (market_session_check, portfolio_liquidation_requested) are excluded because
+/// they would produce false positives outside trading windows.
+const EVENT_FRESHNESS_THRESHOLDS: &[(&str, i64)] = &[
+    ("equity_bars_sync_requested", 26),
+    ("equity_bars_export_requested", 26),
+    ("trading_history_export_requested", 26),
+    ("database_backup_requested", 26),
+];
+
 fn prior_trading_day(date: NaiveDate) -> NaiveDate {
     let mut prior = date.pred_opt().unwrap();
     while !market_calendar::is_trading_day(prior) {
@@ -330,6 +352,136 @@ async fn listen_loop(state: State, shutdown_token: CancellationToken) {
     }
 }
 
+/// Validates that all expected pg_cron jobs are registered. Logs an error for
+/// each missing job. Gracefully skips if pg_cron is not installed (e.g., vanilla
+/// PostgreSQL in tests or local development without extensions). Returns
+/// whether pg_cron is available so callers can gate dependent checks.
+async fn validate_cron_jobs(pool: &sqlx::PgPool) -> bool {
+    // Check whether the cron schema exists before querying it.
+    let cron_exists = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cron')",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(error = %error, "Failed to check pg_cron availability, skipping job validation");
+            return false;
+        }
+    };
+
+    if !cron_exists {
+        info!("pg_cron not available, skipping job validation");
+        return false;
+    }
+
+    let rows: Vec<String> = match sqlx::query_scalar("SELECT jobname FROM cron.job")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(error = %error, "Failed to query pg_cron jobs, skipping job validation");
+            return true;
+        }
+    };
+
+    let mut missing_count = 0;
+    for &expected_name in EXPECTED_CRON_JOBS {
+        if !rows.iter().any(|name| name == expected_name) {
+            error!(job_name = expected_name, "Expected pg_cron job is missing");
+            missing_count += 1;
+        }
+    }
+
+    if missing_count == 0 {
+        info!(
+            job_count = EXPECTED_CRON_JOBS.len(),
+            "All expected pg_cron jobs are active"
+        );
+    } else {
+        warn!(
+            missing = missing_count,
+            total = EXPECTED_CRON_JOBS.len(),
+            "Some expected pg_cron jobs are missing"
+        );
+    }
+
+    true
+}
+
+/// Checks when each nightly event type last fired. Warns if any are overdue,
+/// which indicates pg_cron may not be running or a job's SQL is failing silently.
+async fn check_event_freshness(pool: &sqlx::PgPool) {
+    let now = Utc::now();
+    let mut stale_count = 0;
+
+    for &(event_type, threshold_hours) in EVENT_FRESHNESS_THRESHOLDS {
+        let last_seen: Option<DateTime<Utc>> = match sqlx::query_scalar(
+            "SELECT created_at FROM events WHERE event_type = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(event_type)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    event_type,
+                    error = %error,
+                    "Failed to query event freshness, skipping"
+                );
+                continue;
+            }
+        };
+
+        let is_stale = is_event_stale(last_seen, now, threshold_hours);
+
+        if is_stale {
+            stale_count += 1;
+            match last_seen {
+                Some(timestamp) => {
+                    let age_hours = (now - timestamp).num_hours();
+                    warn!(
+                        event_type,
+                        last_seen = %timestamp,
+                        age_hours,
+                        threshold_hours,
+                        "Event is overdue"
+                    );
+                }
+                None => {
+                    warn!(event_type, "Event has never been recorded");
+                }
+            }
+        }
+    }
+
+    if stale_count == 0 {
+        info!(
+            event_count = EVENT_FRESHNESS_THRESHOLDS.len(),
+            "All monitored event types are fresh"
+        );
+    }
+}
+
+/// Returns `true` if the event is stale (last seen at least `threshold_hours`
+/// ago, or never seen at all).
+fn is_event_stale(
+    last_seen: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    threshold_hours: i64,
+) -> bool {
+    match last_seen {
+        None => true,
+        Some(timestamp) => {
+            let age = now - timestamp;
+            age.num_hours() >= threshold_hours
+        }
+    }
+}
+
 async fn run_listener(
     state: &State,
     pool: &sqlx::PgPool,
@@ -338,6 +490,14 @@ async fn run_listener(
     let mut listener = PgListener::connect_with(pool).await?;
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
+
+    // Validate pg_cron jobs and event freshness on startup. Event freshness
+    // is only meaningful when pg_cron is installed (otherwise no cron-triggered
+    // events exist and every check would produce a false warning).
+    let pg_cron_available = validate_cron_jobs(pool).await;
+    if pg_cron_available {
+        check_event_freshness(pool).await;
+    }
 
     if shutdown_token.is_cancelled() {
         return Ok(());
@@ -851,8 +1011,9 @@ fn parse_postgres_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_coverage_gaps, duration_until_next_sync, export_date_from_payload, listen_loop,
-        parse_postgres_url, prior_trading_day, run_export_job, spawn_sync_scheduler, sync_date_for,
+        detect_coverage_gaps, duration_until_next_sync, export_date_from_payload, is_event_stale,
+        listen_loop, parse_postgres_url, prior_trading_day, run_export_job, spawn_sync_scheduler,
+        sync_date_for, EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
@@ -1615,5 +1776,64 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("database not connected"));
         });
+    }
+
+    #[test]
+    fn test_expected_cron_jobs_list_is_complete() {
+        assert_eq!(EXPECTED_CRON_JOBS.len(), 7);
+        assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"market-session-check"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-export-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"trading-history-export-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"database-backup-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
+    }
+
+    #[test]
+    fn test_event_freshness_thresholds_cover_nightly_jobs() {
+        assert_eq!(EVENT_FRESHNESS_THRESHOLDS.len(), 4);
+        let event_types: Vec<&str> = EVENT_FRESHNESS_THRESHOLDS
+            .iter()
+            .map(|(event_type, _)| *event_type)
+            .collect();
+        assert!(event_types.contains(&"equity_bars_sync_requested"));
+        assert!(event_types.contains(&"equity_bars_export_requested"));
+        assert!(event_types.contains(&"trading_history_export_requested"));
+        assert!(event_types.contains(&"database_backup_requested"));
+    }
+
+    #[test]
+    fn test_is_event_stale_never_seen() {
+        let now = Utc::now();
+        assert!(is_event_stale(None, now, 26));
+    }
+
+    #[test]
+    fn test_is_event_stale_recent_event_is_fresh() {
+        let now = Utc::now();
+        let one_hour_ago = now - chrono::Duration::hours(1);
+        assert!(!is_event_stale(Some(one_hour_ago), now, 26));
+    }
+
+    #[test]
+    fn test_is_event_stale_old_event_is_stale() {
+        let now = Utc::now();
+        let two_days_ago = now - chrono::Duration::hours(48);
+        assert!(is_event_stale(Some(two_days_ago), now, 26));
+    }
+
+    #[test]
+    fn test_is_event_stale_at_exact_threshold() {
+        let now = Utc::now();
+        let exactly_at_threshold = now - chrono::Duration::hours(26);
+        assert!(is_event_stale(Some(exactly_at_threshold), now, 26));
+    }
+
+    #[test]
+    fn test_is_event_stale_just_under_threshold() {
+        let now = Utc::now();
+        let just_under = now - chrono::Duration::hours(25);
+        assert!(!is_event_stale(Some(just_under), now, 26));
     }
 }
