@@ -52,11 +52,10 @@ pub fn create_equity_bar_dataframe(equity_bars_rows: &[EquityBar]) -> Result<Dat
         "volume_weighted_average_price" => equity_bars_rows.iter().map(|b| b.volume_weighted_average_price()).collect::<Vec<_>>(),
         "transactions" => equity_bars_rows.iter().map(|b| b.transactions()).collect::<Vec<_>>(),
         // `inserted_at` is deliberately excluded: the S3 parquet schema is the
-        // equity_bars_schema pandera contract (9 columns, Int64 timestamp),
-        // which the nightly pg_parquet export (export_equity_bars in schema.sql)
-        // also targets. Including inserted_at made backfilled files 10 columns
-        // wide and broke the tide training reader's per-day concat. inserted_at
-        // remains on the EquityBar row for the PostgreSQL insert path only.
+        // equity_bars_schema pandera contract (9 columns, Int64 timestamp).
+        // Including inserted_at made backfilled files 10 columns wide and broke
+        // the tide training reader's per-day concat. inserted_at remains on the
+        // EquityBar row for the PostgreSQL insert path only.
     )
     .map_err(|e| Error::Other(format!("Failed to create equity bar DataFrame: {}", e)))?;
 

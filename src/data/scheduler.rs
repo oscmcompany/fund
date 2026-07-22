@@ -1,7 +1,7 @@
 use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
-    EventType, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_EQUITY_BARS_EXPORT,
-    CONSUMER_DATA_EQUITY_BARS_SYNC, CONSUMER_DATA_TRADING_HISTORY_EXPORT,
+    EventType, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_DATABASE_EXPORT,
+    CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
 use crate::data::equity_details;
@@ -34,9 +34,7 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
     "equity-bars-sync-requested",
     "market-session-check",
     "portfolio-liquidation-requested",
-    "equity-bars-export-requested",
-    "trading-history-export-requested",
-    "database-backup-requested",
+    "database-export-requested",
     "cron-run-details-cleanup",
 ];
 
@@ -46,9 +44,7 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
 /// they would produce false positives outside trading windows.
 const EVENT_FRESHNESS_THRESHOLDS: &[(&str, i64)] = &[
     ("equity_bars_sync_requested", 26),
-    ("equity_bars_export_requested", 26),
-    ("trading_history_export_requested", 26),
-    ("database_backup_requested", 26),
+    ("database_export_requested", 26),
 ];
 
 fn prior_trading_day(date: NaiveDate) -> NaiveDate {
@@ -515,35 +511,12 @@ async fn run_listener(
     // Export events carry date-specific payloads, so every missed event must be
     // replayed in order. Skipping to the latest would permanently lose export dates
     // for any intermediate days the service was down.
-    let export_bars_offset = get_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_EXPORT).await?;
-    for (event_id, payload) in events_after(
-        pool,
-        EventType::EquityBarsExportRequested,
-        export_bars_offset,
-    )
-    .await?
+    let export_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_EXPORT).await?;
+    for (event_id, payload) in
+        events_after(pool, EventType::DatabaseExportRequested, export_offset).await?
     {
-        info!(
-            event_id,
-            "Catching up on missed equity_bars_export_requested"
-        );
-        handle_equity_bars_export(state, pool, event_id, &payload).await;
-    }
-
-    let export_history_offset =
-        get_consumer_offset(pool, CONSUMER_DATA_TRADING_HISTORY_EXPORT).await?;
-    for (event_id, payload) in events_after(
-        pool,
-        EventType::TradingHistoryExportRequested,
-        export_history_offset,
-    )
-    .await?
-    {
-        info!(
-            event_id,
-            "Catching up on missed trading_history_export_requested"
-        );
-        handle_trading_history_export(state, pool, event_id, &payload).await;
+        info!(event_id, "Catching up on missed database_export_requested");
+        handle_database_export(state, pool, event_id, &payload).await;
     }
 
     let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP).await?;
@@ -552,6 +525,14 @@ async fn run_listener(
     {
         info!(event_id, "Catching up on missed database_backup_requested");
         handle_database_backup(state, pool, event_id).await;
+    }
+
+    let purge_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::DatabasePurgeRequested, purge_offset).await?
+    {
+        info!(event_id, "Catching up on missed database_purge_requested");
+        handle_database_purge(pool, event_id).await;
     }
 
     // Main event loop.
@@ -582,15 +563,15 @@ async fn run_listener(
         if event_type == EventType::EquityBarsSyncRequested.as_str() {
             info!(event_id, "Received equity_bars_sync_requested");
             handle_equity_bars_sync(state, pool, event_id).await;
-        } else if event_type == EventType::EquityBarsExportRequested.as_str() {
-            info!(event_id, "Received equity_bars_export_requested");
-            handle_equity_bars_export(state, pool, event_id, payload).await;
-        } else if event_type == EventType::TradingHistoryExportRequested.as_str() {
-            info!(event_id, "Received trading_history_export_requested");
-            handle_trading_history_export(state, pool, event_id, payload).await;
+        } else if event_type == EventType::DatabaseExportRequested.as_str() {
+            info!(event_id, "Received database_export_requested");
+            handle_database_export(state, pool, event_id, payload).await;
         } else if event_type == EventType::DatabaseBackupRequested.as_str() {
             info!(event_id, "Received database_backup_requested");
             handle_database_backup(state, pool, event_id).await;
+        } else if event_type == EventType::DatabasePurgeRequested.as_str() {
+            info!(event_id, "Received database_purge_requested");
+            handle_database_purge(pool, event_id).await;
         }
     }
 
@@ -696,7 +677,7 @@ async fn run_equity_details_sync(state: &State, pool: &sqlx::PgPool) {
     }
 }
 
-async fn handle_equity_bars_export(
+async fn handle_database_export(
     state: &State,
     pool: &sqlx::PgPool,
     event_id: i64,
@@ -705,96 +686,55 @@ async fn handle_equity_bars_export(
     let export_date = export_date_from_payload(payload);
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityBarsExportStarted,
+        EventType::DatabaseExportStarted,
         &serde_json::json!({"date": export_date.to_string()}),
     )
     .await
     {
-        warn!(error = %error, "Failed to emit equity_bars_export_started");
+        warn!(error = %error, "Failed to emit database_export_started");
     }
 
-    match run_export_job(state, "export-equity-bars", export_date).await {
+    match export::export_database(state, export_date).await {
         Ok(count) => {
-            info!(rows = count, "Equity bars export completed");
+            info!(rows = count, "Database export completed");
             if let Err(error) = emit_event(
                 pool,
-                EventType::EquityBarsExportCompleted,
+                EventType::DatabaseExportCompleted,
                 &serde_json::json!({"count": count, "date": export_date.to_string()}),
             )
             .await
             {
-                warn!(error = %error, "Failed to emit equity_bars_export_completed");
+                warn!(error = %error, "Failed to emit database_export_completed");
             }
-        }
-        Err(ref error) => {
-            error!(error = %error, "Equity bars export errored");
-            if let Err(emit_error) = emit_event(
-                pool,
-                EventType::EquityBarsExportErrored,
-                &serde_json::json!({"error": error, "date": export_date.to_string()}),
-            )
-            .await
-            {
-                warn!(error = %emit_error, "Failed to emit equity_bars_export_errored");
-            }
-        }
-    }
 
-    if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_EXPORT, event_id).await
-    {
-        warn!(error = %error, "Failed to update equity-bars-export consumer offset");
-    }
-}
-
-async fn handle_trading_history_export(
-    state: &State,
-    pool: &sqlx::PgPool,
-    event_id: i64,
-    payload: &serde_json::Value,
-) {
-    let export_date = export_date_from_payload(payload);
-    if let Err(error) = emit_event(
-        pool,
-        EventType::TradingHistoryExportStarted,
-        &serde_json::json!({"date": export_date.to_string()}),
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to emit trading_history_export_started");
-    }
-
-    match run_export_job(state, "export-trading-history", export_date).await {
-        Ok(count) => {
-            info!(rows = count, "Trading history export completed");
+            // Chain: export success → backup
             if let Err(error) = emit_event(
                 pool,
-                EventType::TradingHistoryExportCompleted,
-                &serde_json::json!({"count": count, "date": export_date.to_string()}),
+                EventType::DatabaseBackupRequested,
+                &serde_json::json!({}),
             )
             .await
             {
-                warn!(error = %error, "Failed to emit trading_history_export_completed");
+                warn!(error = %error, "Failed to emit database_backup_requested");
             }
         }
         Err(ref error) => {
-            error!(error = %error, "Trading history export errored");
+            error!(error = %error, "Database export errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::TradingHistoryExportErrored,
+                EventType::DatabaseExportErrored,
                 &serde_json::json!({"error": error, "date": export_date.to_string()}),
             )
             .await
             {
-                warn!(error = %emit_error, "Failed to emit trading_history_export_errored");
+                warn!(error = %emit_error, "Failed to emit database_export_errored");
             }
         }
     }
 
-    if let Err(error) =
-        update_consumer_offset(pool, CONSUMER_DATA_TRADING_HISTORY_EXPORT, event_id).await
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_EXPORT, event_id).await
     {
-        warn!(error = %error, "Failed to update trading-history-export consumer offset");
+        warn!(error = %error, "Failed to update database-export consumer offset");
     }
 }
 
@@ -821,6 +761,16 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             {
                 warn!(error = %error, "Failed to emit database_backup_completed");
             }
+            // Chain: backup success → purge
+            if let Err(chain_error) = emit_event(
+                pool,
+                EventType::DatabasePurgeRequested,
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                warn!(error = %chain_error, "Failed to emit database_purge_requested");
+            }
         }
         Err(ref error) => {
             error!(error = %error, "Database backup errored");
@@ -842,19 +792,37 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
     }
 }
 
-async fn run_export_job(
-    state: &State,
-    job_name: &str,
-    export_date: NaiveDate,
-) -> Result<usize, String> {
-    match job_name {
-        "export-equity-bars" => export::export_equity_bars(state, export_date).await,
-        "export-trading-history" => export::export_equity_trading_history(state, export_date).await,
-        "backup-database" => run_backup_job(state).await,
-        _ => {
-            let message = format!("Unknown export job: {}", job_name);
-            Err(message)
+async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::DatabasePurgeStarted,
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit database_purge_started");
+    }
+
+    let summary = crate::data::database::purge_ephemeral_tables(pool).await;
+    let total: u64 = summary.rows_deleted.iter().map(|(_, count)| count).sum();
+    for (table, count) in &summary.rows_deleted {
+        if *count > 0 {
+            info!(table, rows = count, "Purged old rows");
         }
+    }
+    info!(total_rows = total, "Database purge completed");
+    if let Err(error) = emit_event(
+        pool,
+        EventType::DatabasePurgeCompleted,
+        &serde_json::json!({"total_rows_deleted": total}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit database_purge_completed");
+    }
+
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE, event_id).await {
+        warn!(error = %error, "Failed to update database-purge consumer offset");
     }
 }
 
@@ -1012,47 +980,13 @@ fn parse_postgres_url(
 mod tests {
     use super::{
         detect_coverage_gaps, duration_until_next_sync, export_date_from_payload, is_event_stale,
-        listen_loop, parse_postgres_url, prior_trading_day, run_export_job, spawn_sync_scheduler,
-        sync_date_for, EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
+        listen_loop, parse_postgres_url, prior_trading_day, spawn_sync_scheduler, sync_date_for,
+        EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
-
-    /// RAII guard that removes an environment variable for the duration of a test
-    /// and restores the original value (or absence) on drop.
-    ///
-    /// Tests using this guard must be marked `#[serial_test::serial]` to prevent
-    /// concurrent mutation of the process environment.
-    struct EnvironmentVariableGuard {
-        name: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvironmentVariableGuard {
-        /// Removes `name` from the environment and returns a guard that restores it on drop.
-        fn remove(name: &'static str) -> Self {
-            let original = std::env::var(name).ok();
-            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
-            unsafe {
-                std::env::remove_var(name);
-            }
-            Self { name, original }
-        }
-    }
-
-    impl Drop for EnvironmentVariableGuard {
-        fn drop(&mut self) {
-            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
-            unsafe {
-                match self.original.as_ref() {
-                    Some(value) => std::env::set_var(self.name, value),
-                    None => std::env::remove_var(self.name),
-                }
-            }
-        }
-    }
 
     #[test]
     fn test_duration_until_next_sync_is_positive() {
@@ -1218,51 +1152,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_run_backup_job_returns_error_when_database_url_missing() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data::state::{MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            // Ensure DATABASE_URL is unset so run_backup_job returns early with an error.
-            // The guard restores the original value (or absence) when it drops.
-            let _database_url_guard = EnvironmentVariableGuard::remove("DATABASE_URL");
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = run_export_job(&state, "backup-database", date).await;
-
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("DATABASE_URL not set"));
-        });
-    }
-
-    #[test]
     fn test_parse_postgres_url_full_url() {
         let (host, username, port, dbname, password) =
             parse_postgres_url("postgres://alice:s3cr3t@db.example.com:5433/mydb").unwrap();
@@ -1321,45 +1210,6 @@ mod tests {
         let result = parse_postgres_url("postgres://user:pass@host");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("database name"));
-    }
-
-    #[test]
-    fn test_run_export_job_returns_error_for_unknown_job() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data::state::{MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = run_export_job(&state, "unknown-job", date).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("Unknown export job"));
-        });
     }
 
     // --- Additional pure-logic tests ---
@@ -1701,106 +1551,24 @@ mod tests {
     }
 
     #[test]
-    fn test_run_export_job_export_equity_bars_returns_error_when_no_database() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data::state::{MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = run_export_job(&state, "export-equity-bars", date).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("database not connected"));
-        });
-    }
-
-    #[test]
-    fn test_run_export_job_export_trading_history_returns_error_when_no_database() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data::state::{MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = run_export_job(&state, "export-trading-history", date).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("database not connected"));
-        });
-    }
-
-    #[test]
     fn test_expected_cron_jobs_list_is_complete() {
-        assert_eq!(EXPECTED_CRON_JOBS.len(), 7);
+        assert_eq!(EXPECTED_CRON_JOBS.len(), 5);
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"market-session-check"));
         assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-export-requested"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"trading-history-export-requested"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"database-backup-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"database-export-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
     }
 
     #[test]
     fn test_event_freshness_thresholds_cover_nightly_jobs() {
-        assert_eq!(EVENT_FRESHNESS_THRESHOLDS.len(), 4);
+        assert_eq!(EVENT_FRESHNESS_THRESHOLDS.len(), 2);
         let event_types: Vec<&str> = EVENT_FRESHNESS_THRESHOLDS
             .iter()
             .map(|(event_type, _)| *event_type)
             .collect();
         assert!(event_types.contains(&"equity_bars_sync_requested"));
-        assert!(event_types.contains(&"equity_bars_export_requested"));
-        assert!(event_types.contains(&"trading_history_export_requested"));
-        assert!(event_types.contains(&"database_backup_requested"));
+        assert!(event_types.contains(&"database_export_requested"));
     }
 
     #[test]

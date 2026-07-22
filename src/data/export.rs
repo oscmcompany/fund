@@ -1,4 +1,4 @@
-//! Parquet export tasks for equity market data and trading history.
+//! Parquet export tasks for database tables.
 //!
 //! Each task reads rows from PostgreSQL into typed structs using explicit
 //! column lists, serializes to Parquet with deterministic column ordering,
@@ -6,54 +6,24 @@
 
 use crate::common::aws::date_partitioned_key;
 use crate::data::{database, state::State};
-use crate::domain::market::{EquityBar, EquityQuote};
+use crate::domain::market::EquityQuote;
 use crate::domain::predictions::{EquityPrediction, ModelRun};
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
+    EquityReconciliationEvent,
 };
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::NaiveDate;
 use polars::prelude::*;
 use tracing::info;
 
-/// Exports equity bars for the given date to S3 Parquet.
-pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize, String> {
-    let pool = state
-        .database
-        .pool()
-        .ok_or_else(|| "database not connected".to_string())?;
-
-    let bars = database::query_equity_bars_for_date(pool, date)
-        .await
-        .map_err(|error| format!("Failed to query equity bars: {}", error))?;
-
-    let count = bars.len();
-
-    if count == 0 {
-        info!(date = %date, "No equity bars to export");
-        return Ok(0);
-    }
-
-    let mut dataframe = create_equity_bar_export_dataframe(&bars)?;
-
-    crate::data::validation::validate_equity_bars_or_reject(&dataframe, date)?;
-
-    let key = date_partitioned_key("data/equity/bars", date);
-    write_dataframe_to_s3(state, &mut dataframe, &key).await?;
-    info!(rows = count, key = key, "Exported equity bars to S3");
-
-    Ok(count)
-}
-
-/// Exports all trading history tables to S3 Parquet.
+/// Exports all database tables to S3 Parquet.
 ///
 /// Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
-/// equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs. Deletes the
-/// exported equity_quotes rows from the database after a successful S3 write.
-pub async fn export_equity_trading_history(
-    state: &State,
-    date: NaiveDate,
-) -> Result<usize, String> {
+/// equity_allocations, equity_orders, equity_portfolio_snapshots, model_runs, and
+/// equity_reconciliation_events. Rows are not deleted here — the unified purge handler
+/// cleans up old data after backup completes.
+pub async fn export_database(state: &State, date: NaiveDate) -> Result<usize, String> {
     let pool = state
         .database
         .pool()
@@ -71,9 +41,6 @@ pub async fn export_equity_trading_history(
             &date_partitioned_key("data/equity/quotes", date),
         )
         .await?;
-        database::delete_equity_quotes_for_date(pool, date)
-            .await
-            .map_err(|error| format!("Failed to delete equity quotes: {}", error))?;
     } else {
         info!(date = %date, "No equity quotes to export");
     }
@@ -166,9 +133,26 @@ pub async fn export_equity_trading_history(
     )
     .await?;
 
+    let reconciliation_events = database::query_equity_reconciliation_events_for_date(pool, date)
+        .await
+        .map_err(|error| format!("Failed to query equity reconciliation events: {}", error))?;
+    let reconciliation_event_count = reconciliation_events.len();
+    if reconciliation_event_count > 0 {
+        let mut reconciliation_dataframe =
+            create_equity_reconciliation_event_dataframe(&reconciliation_events)?;
+        write_dataframe_to_s3(
+            state,
+            &mut reconciliation_dataframe,
+            &date_partitioned_key("exports/equity/reconciliation-events", date),
+        )
+        .await?;
+    } else {
+        info!(date = %date, "No equity reconciliation events to export");
+    }
+
     info!(
-        "Exported trading history to S3: {} quotes, {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs",
-        quote_count, prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count
+        "Exported database to S3: {} quotes, {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs, {} reconciliation events",
+        quote_count, prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count, reconciliation_event_count
     );
 
     Ok(quote_count
@@ -178,7 +162,8 @@ pub async fn export_equity_trading_history(
         + allocation_count
         + order_count
         + snapshot_count
-        + model_run_count)
+        + model_run_count
+        + reconciliation_event_count)
 }
 
 async fn write_dataframe_to_s3(
@@ -214,26 +199,6 @@ fn create_equity_quote_dataframe(quotes: &[EquityQuote]) -> Result<DataFrame, St
         "ask_size" => quotes.iter().map(|quote| quote.ask_size()).collect::<Vec<i32>>(),
     )
     .map_err(|error| format!("Failed to create equity quote DataFrame: {}", error))
-}
-
-fn create_equity_bar_export_dataframe(bars: &[EquityBar]) -> Result<DataFrame, String> {
-    // The exported parquet must match the equity_bars_schema pandera contract
-    // (9 columns, Int64 millisecond timestamp) and the backfill writer
-    // (data::create_equity_bar_dataframe): the tide trainer concatenates the
-    // daily exports with backfilled files, so a schema drift breaks training.
-    // inserted_at stays on the EquityBar row for PostgreSQL only.
-    df!(
-        "ticker" => bars.iter().map(|bar| bar.ticker().as_str()).collect::<Vec<&str>>(),
-        "timestamp" => bars.iter().map(|bar| bar.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
-        "open_price" => bars.iter().map(|bar| bar.open_price()).collect::<Vec<f64>>(),
-        "high_price" => bars.iter().map(|bar| bar.high_price()).collect::<Vec<f64>>(),
-        "low_price" => bars.iter().map(|bar| bar.low_price()).collect::<Vec<f64>>(),
-        "close_price" => bars.iter().map(|bar| bar.close_price()).collect::<Vec<f64>>(),
-        "volume" => bars.iter().map(|bar| bar.volume()).collect::<Vec<i64>>(),
-        "volume_weighted_average_price" => bars.iter().map(|bar| bar.volume_weighted_average_price()).collect::<Vec<Option<f64>>>(),
-        "transactions" => bars.iter().map(|bar| bar.transactions()).collect::<Vec<Option<i64>>>(),
-    )
-    .map_err(|error| format!("Failed to create equity bar export DataFrame: {}", error))
 }
 
 fn create_equity_rebalance_session_dataframe(
@@ -368,6 +333,24 @@ fn create_model_run_dataframe(model_runs: &[ModelRun]) -> Result<DataFrame, Stri
     .map_err(|error| format!("Failed to create model run DataFrame: {}", error))
 }
 
+fn create_equity_reconciliation_event_dataframe(
+    events: &[EquityReconciliationEvent],
+) -> Result<DataFrame, String> {
+    df!(
+        "id" => events.iter().map(|event| event.id()).collect::<Vec<i64>>(),
+        "detected_at" => events.iter().map(|event| event.detected_at().timestamp_millis()).collect::<Vec<i64>>(),
+        "event_type" => events.iter().map(|event| event.event_type()).collect::<Vec<&str>>(),
+        "ticker" => events.iter().map(|event| event.ticker()).collect::<Vec<&str>>(),
+        "expected_quantity" => events.iter().map(|event| event.expected_quantity().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "actual_quantity" => events.iter().map(|event| event.actual_quantity().map(|decimal| decimal.to_string())).collect::<Vec<Option<String>>>(),
+        "equity_pair_id" => events.iter().map(|event| event.equity_pair_id().map(|uuid| uuid.to_string())).collect::<Vec<Option<String>>>(),
+        "alpaca_order_id" => events.iter().map(|event| event.alpaca_order_id()).collect::<Vec<Option<&str>>>(),
+        "action_taken" => events.iter().map(|event| event.action_taken()).collect::<Vec<&str>>(),
+        "resolved_at" => events.iter().map(|event| event.resolved_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
+    )
+    .map_err(|error| format!("Failed to create equity reconciliation event DataFrame: {}", error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,22 +368,6 @@ mod tests {
             EquityQuote::new(now, Ticker::new("AAPL").unwrap(), 150.50, 150.55, 10, 5),
             EquityQuote::new(now, Ticker::new("MSFT").unwrap(), 420.10, 420.20, 2, 4),
         ]
-    }
-
-    fn sample_bars() -> Vec<EquityBar> {
-        let now = Utc::now();
-        vec![EquityBar::new(
-            Ticker::new("AAPL").unwrap(),
-            now,
-            150.0,
-            155.0,
-            149.0,
-            153.0,
-            1_000_000,
-            Some(152.0),
-            Some(50_000),
-            now,
-        )]
     }
 
     fn sample_sessions() -> Vec<EquityRebalanceSession> {
@@ -495,43 +462,6 @@ mod tests {
         let dataframe = create_equity_quote_dataframe(&[]).unwrap();
         assert_eq!(dataframe.height(), 0);
         assert_eq!(dataframe.width(), 6);
-    }
-
-    #[test]
-    fn test_create_equity_bar_export_dataframe_matches_pandera_contract() {
-        // The S3 parquet schema is the equity_bars_schema pandera contract:
-        // 9 columns, Int64 millisecond timestamp, no inserted_at. The tide
-        // trainer concatenates these daily exports with the backfill writer's
-        // files (create_equity_bar_dataframe), so the schemas must agree.
-        let bars = sample_bars();
-        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
-        assert_eq!(dataframe.height(), 1);
-        assert_eq!(
-            dataframe.get_column_names_str(),
-            vec![
-                "ticker",
-                "timestamp",
-                "open_price",
-                "high_price",
-                "low_price",
-                "close_price",
-                "volume",
-                "volume_weighted_average_price",
-                "transactions",
-            ]
-        );
-        assert!(dataframe.column("inserted_at").is_err());
-        assert_eq!(
-            dataframe.column("timestamp").unwrap().dtype(),
-            &DataType::Int64
-        );
-    }
-
-    #[test]
-    fn test_create_equity_bar_export_dataframe_empty() {
-        let dataframe = create_equity_bar_export_dataframe(&[]).unwrap();
-        assert_eq!(dataframe.height(), 0);
-        assert_eq!(dataframe.width(), 9);
     }
 
     #[test]
@@ -769,28 +699,6 @@ mod tests {
         let dataframe = create_model_run_dataframe(&model_runs).unwrap();
         let stage_counts_series = dataframe.column("stage_counts").unwrap();
         assert_eq!(stage_counts_series.dtype(), &DataType::String);
-    }
-
-    #[test]
-    fn test_create_equity_bar_export_dataframe_optional_fields_can_be_none() {
-        let now = chrono::Utc::now();
-        let bars = vec![crate::domain::market::EquityBar::new(
-            Ticker::new("TSLA").unwrap(),
-            now,
-            200.0,
-            210.0,
-            198.0,
-            205.0,
-            500_000,
-            None,
-            None,
-            now,
-        )];
-        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
-        assert_eq!(dataframe.height(), 1);
-        // volume_weighted_average_price and transactions are optional — confirm columns exist
-        assert!(dataframe.column("volume_weighted_average_price").is_ok());
-        assert!(dataframe.column("transactions").is_ok());
     }
 
     #[test]
@@ -1045,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_export_equity_bars_returns_error_when_no_database() {
+    fn test_export_database_returns_error_when_no_database() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1080,49 +988,7 @@ mod tests {
             assert!(matches!(state.database, DatabaseState::NotConfigured));
 
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = export_equity_bars(&state, date).await;
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("database not connected"));
-        });
-    }
-
-    #[test]
-    fn test_export_equity_trading_history_returns_error_when_no_database() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use crate::data::state::{DatabaseState, MassiveSecrets, State};
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-            use chrono::NaiveDate;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            assert!(matches!(state.database, DatabaseState::NotConfigured));
-
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = export_equity_trading_history(&state, date).await;
+            let result = export_database(&state, date).await;
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("database not connected"));
         });
@@ -1146,30 +1012,6 @@ mod tests {
             dataframe.column("ticker").unwrap().dtype(),
             &DataType::String
         );
-    }
-
-    #[test]
-    fn test_create_equity_bar_export_dataframe_volume_is_int64() {
-        let bars = sample_bars();
-        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
-        assert_eq!(
-            dataframe.column("volume").unwrap().dtype(),
-            &DataType::Int64
-        );
-    }
-
-    #[test]
-    fn test_create_equity_bar_export_dataframe_price_columns_are_float64() {
-        let bars = sample_bars();
-        let dataframe = create_equity_bar_export_dataframe(&bars).unwrap();
-        for column_name in &["open_price", "high_price", "low_price", "close_price"] {
-            assert_eq!(
-                dataframe.column(column_name).unwrap().dtype(),
-                &DataType::Float64,
-                "column {} should be Float64",
-                column_name
-            );
-        }
     }
 
     #[test]
@@ -1353,5 +1195,45 @@ mod tests {
             dataframe.column("model_run_id").unwrap().dtype(),
             &DataType::String
         );
+    }
+
+    fn sample_reconciliation_events() -> Vec<EquityReconciliationEvent> {
+        vec![EquityReconciliationEvent::new(
+            1,
+            Utc::now(),
+            "quantity_mismatch".to_string(),
+            "AAPL".to_string(),
+            Some("100".parse().unwrap()),
+            Some("95".parse().unwrap()),
+            Some("550e8400-e29b-41d4-a716-446655440001".parse().unwrap()),
+            Some("alpaca-order-123".to_string()),
+            "logged_only".to_string(),
+            None,
+        )]
+    }
+
+    #[test]
+    fn test_create_equity_reconciliation_event_dataframe_columns_and_rows() {
+        let events = sample_reconciliation_events();
+        let dataframe = create_equity_reconciliation_event_dataframe(&events).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.width(), 10);
+        assert!(dataframe.column("id").is_ok());
+        assert!(dataframe.column("detected_at").is_ok());
+        assert!(dataframe.column("event_type").is_ok());
+        assert!(dataframe.column("ticker").is_ok());
+        assert!(dataframe.column("expected_quantity").is_ok());
+        assert!(dataframe.column("actual_quantity").is_ok());
+        assert!(dataframe.column("equity_pair_id").is_ok());
+        assert!(dataframe.column("alpaca_order_id").is_ok());
+        assert!(dataframe.column("action_taken").is_ok());
+        assert!(dataframe.column("resolved_at").is_ok());
+    }
+
+    #[test]
+    fn test_create_equity_reconciliation_event_dataframe_empty() {
+        let dataframe = create_equity_reconciliation_event_dataframe(&[]).unwrap();
+        assert_eq!(dataframe.height(), 0);
+        assert_eq!(dataframe.width(), 10);
     }
 }

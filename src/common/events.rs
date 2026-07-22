@@ -26,26 +26,17 @@ pub enum EventType {
     /// data: equity bar sync encountered an error.
     EquityBarsSyncErrored,
 
-    // --- Nightly exports ---
-    /// pg_cron trigger: equity bars S3 export requested.
-    EquityBarsExportRequested,
-    /// data: equity bars export has started.
-    EquityBarsExportStarted,
-    /// data: equity bars export completed successfully.
-    EquityBarsExportCompleted,
-    /// data: equity bars export encountered an error.
-    EquityBarsExportErrored,
+    // --- Nightly post-market chain: export → backup → purge ---
+    /// pg_cron trigger: nightly database export to S3 Parquet requested.
+    DatabaseExportRequested,
+    /// data: database export has started.
+    DatabaseExportStarted,
+    /// data: database export completed successfully.
+    DatabaseExportCompleted,
+    /// data: database export encountered an error.
+    DatabaseExportErrored,
 
-    /// pg_cron trigger: trading history S3 export requested.
-    TradingHistoryExportRequested,
-    /// data: trading history export has started.
-    TradingHistoryExportStarted,
-    /// data: trading history export completed successfully.
-    TradingHistoryExportCompleted,
-    /// data: trading history export encountered an error.
-    TradingHistoryExportErrored,
-
-    /// pg_cron trigger: database backup requested.
+    /// data: database backup requested (chained from export completion).
     DatabaseBackupRequested,
     /// data: database backup has started.
     DatabaseBackupStarted,
@@ -53,6 +44,15 @@ pub enum EventType {
     DatabaseBackupCompleted,
     /// data: database backup encountered an error.
     DatabaseBackupErrored,
+
+    /// data: database purge requested (chained from backup completion).
+    DatabasePurgeRequested,
+    /// data: database purge has started.
+    DatabasePurgeStarted,
+    /// data: database purge completed successfully.
+    DatabasePurgeCompleted,
+    /// data: database purge encountered an error.
+    DatabasePurgeErrored,
 
     // --- Prediction pipeline ---
     /// pg_cron periodic trigger: intraday market session check.
@@ -93,18 +93,18 @@ impl EventType {
             Self::EquityBarsSyncStarted => "equity_bars_sync_started",
             Self::EquityBarsSyncCompleted => "equity_bars_sync_completed",
             Self::EquityBarsSyncErrored => "equity_bars_sync_errored",
-            Self::EquityBarsExportRequested => "equity_bars_export_requested",
-            Self::EquityBarsExportStarted => "equity_bars_export_started",
-            Self::EquityBarsExportCompleted => "equity_bars_export_completed",
-            Self::EquityBarsExportErrored => "equity_bars_export_errored",
-            Self::TradingHistoryExportRequested => "trading_history_export_requested",
-            Self::TradingHistoryExportStarted => "trading_history_export_started",
-            Self::TradingHistoryExportCompleted => "trading_history_export_completed",
-            Self::TradingHistoryExportErrored => "trading_history_export_errored",
+            Self::DatabaseExportRequested => "database_export_requested",
+            Self::DatabaseExportStarted => "database_export_started",
+            Self::DatabaseExportCompleted => "database_export_completed",
+            Self::DatabaseExportErrored => "database_export_errored",
             Self::DatabaseBackupRequested => "database_backup_requested",
             Self::DatabaseBackupStarted => "database_backup_started",
             Self::DatabaseBackupCompleted => "database_backup_completed",
             Self::DatabaseBackupErrored => "database_backup_errored",
+            Self::DatabasePurgeRequested => "database_purge_requested",
+            Self::DatabasePurgeStarted => "database_purge_started",
+            Self::DatabasePurgeCompleted => "database_purge_completed",
+            Self::DatabasePurgeErrored => "database_purge_errored",
             Self::MarketSessionCheck => "market_session_check",
             Self::EquityPredictionsRequested => "equity_predictions_requested",
             Self::EquityPredictionsStarted => "equity_predictions_started",
@@ -127,18 +127,18 @@ impl EventType {
             "equity_bars_sync_started" => Some(Self::EquityBarsSyncStarted),
             "equity_bars_sync_completed" => Some(Self::EquityBarsSyncCompleted),
             "equity_bars_sync_errored" => Some(Self::EquityBarsSyncErrored),
-            "equity_bars_export_requested" => Some(Self::EquityBarsExportRequested),
-            "equity_bars_export_started" => Some(Self::EquityBarsExportStarted),
-            "equity_bars_export_completed" => Some(Self::EquityBarsExportCompleted),
-            "equity_bars_export_errored" => Some(Self::EquityBarsExportErrored),
-            "trading_history_export_requested" => Some(Self::TradingHistoryExportRequested),
-            "trading_history_export_started" => Some(Self::TradingHistoryExportStarted),
-            "trading_history_export_completed" => Some(Self::TradingHistoryExportCompleted),
-            "trading_history_export_errored" => Some(Self::TradingHistoryExportErrored),
+            "database_export_requested" => Some(Self::DatabaseExportRequested),
+            "database_export_started" => Some(Self::DatabaseExportStarted),
+            "database_export_completed" => Some(Self::DatabaseExportCompleted),
+            "database_export_errored" => Some(Self::DatabaseExportErrored),
             "database_backup_requested" => Some(Self::DatabaseBackupRequested),
             "database_backup_started" => Some(Self::DatabaseBackupStarted),
             "database_backup_completed" => Some(Self::DatabaseBackupCompleted),
             "database_backup_errored" => Some(Self::DatabaseBackupErrored),
+            "database_purge_requested" => Some(Self::DatabasePurgeRequested),
+            "database_purge_started" => Some(Self::DatabasePurgeStarted),
+            "database_purge_completed" => Some(Self::DatabasePurgeCompleted),
+            "database_purge_errored" => Some(Self::DatabasePurgeErrored),
             "market_session_check" => Some(Self::MarketSessionCheck),
             "equity_predictions_requested" => Some(Self::EquityPredictionsRequested),
             "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
@@ -179,14 +179,14 @@ pub const CONSUMER_PORTFOLIO_LIQUIDATION: &str = "portfolio-liquidation";
 /// Consumer name for the data equity bars sync consumer.
 pub const CONSUMER_DATA_EQUITY_BARS_SYNC: &str = "data-equity-bars-sync";
 
-/// Consumer name for the data equity bars export consumer.
-pub const CONSUMER_DATA_EQUITY_BARS_EXPORT: &str = "data-equity-bars-export";
-
-/// Consumer name for the data trading history export consumer.
-pub const CONSUMER_DATA_TRADING_HISTORY_EXPORT: &str = "data-trading-history-export";
+/// Consumer name for the data database export consumer.
+pub const CONSUMER_DATA_DATABASE_EXPORT: &str = "data-database-export";
 
 /// Consumer name for the data database backup consumer.
 pub const CONSUMER_DATA_DATABASE_BACKUP: &str = "data-database-backup";
+
+/// Consumer name for the data database purge consumer.
+pub const CONSUMER_DATA_DATABASE_PURGE: &str = "data-database-purge";
 
 // --- Database helpers ---
 
@@ -335,18 +335,18 @@ mod tests {
             EventType::EquityBarsSyncStarted,
             EventType::EquityBarsSyncCompleted,
             EventType::EquityBarsSyncErrored,
-            EventType::EquityBarsExportRequested,
-            EventType::EquityBarsExportStarted,
-            EventType::EquityBarsExportCompleted,
-            EventType::EquityBarsExportErrored,
-            EventType::TradingHistoryExportRequested,
-            EventType::TradingHistoryExportStarted,
-            EventType::TradingHistoryExportCompleted,
-            EventType::TradingHistoryExportErrored,
+            EventType::DatabaseExportRequested,
+            EventType::DatabaseExportStarted,
+            EventType::DatabaseExportCompleted,
+            EventType::DatabaseExportErrored,
             EventType::DatabaseBackupRequested,
             EventType::DatabaseBackupStarted,
             EventType::DatabaseBackupCompleted,
             EventType::DatabaseBackupErrored,
+            EventType::DatabasePurgeRequested,
+            EventType::DatabasePurgeStarted,
+            EventType::DatabasePurgeCompleted,
+            EventType::DatabasePurgeErrored,
             EventType::MarketSessionCheck,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
@@ -427,12 +427,9 @@ mod tests {
         assert_eq!(CONSUMER_PORTFOLIO, "portfolio");
         assert_eq!(CONSUMER_PORTFOLIO_LIQUIDATION, "portfolio-liquidation");
         assert_eq!(CONSUMER_DATA_EQUITY_BARS_SYNC, "data-equity-bars-sync");
-        assert_eq!(CONSUMER_DATA_EQUITY_BARS_EXPORT, "data-equity-bars-export");
-        assert_eq!(
-            CONSUMER_DATA_TRADING_HISTORY_EXPORT,
-            "data-trading-history-export"
-        );
+        assert_eq!(CONSUMER_DATA_DATABASE_EXPORT, "data-database-export");
         assert_eq!(CONSUMER_DATA_DATABASE_BACKUP, "data-database-backup");
+        assert_eq!(CONSUMER_DATA_DATABASE_PURGE, "data-database-purge");
     }
 
     #[test]
@@ -481,7 +478,7 @@ mod tests {
     fn test_events_after_compiles() {
         make_runtime().block_on(async {
             assert!(
-                events_after(&lazy_pool(), EventType::EquityBarsExportRequested, 0)
+                events_after(&lazy_pool(), EventType::DatabaseExportRequested, 0)
                     .await
                     .is_err()
             );
@@ -492,7 +489,7 @@ mod tests {
     fn test_query_event_payload_compiles() {
         make_runtime().block_on(async {
             assert!(
-                query_event_payload(&lazy_pool(), EventType::EquityBarsExportRequested, 1)
+                query_event_payload(&lazy_pool(), EventType::DatabaseExportRequested, 1)
                     .await
                     .is_err()
             );
@@ -502,7 +499,6 @@ mod tests {
     #[test]
     fn test_event_type_as_str_all_variants() {
         // Exhaustively verify every variant maps to its expected snake_case string.
-        // This catches any future variant added without updating as_str().
         let cases: &[(EventType, &str)] = &[
             (
                 EventType::EquityBarsSyncRequested,
@@ -515,37 +511,15 @@ mod tests {
             ),
             (EventType::EquityBarsSyncErrored, "equity_bars_sync_errored"),
             (
-                EventType::EquityBarsExportRequested,
-                "equity_bars_export_requested",
+                EventType::DatabaseExportRequested,
+                "database_export_requested",
             ),
+            (EventType::DatabaseExportStarted, "database_export_started"),
             (
-                EventType::EquityBarsExportStarted,
-                "equity_bars_export_started",
+                EventType::DatabaseExportCompleted,
+                "database_export_completed",
             ),
-            (
-                EventType::EquityBarsExportCompleted,
-                "equity_bars_export_completed",
-            ),
-            (
-                EventType::EquityBarsExportErrored,
-                "equity_bars_export_errored",
-            ),
-            (
-                EventType::TradingHistoryExportRequested,
-                "trading_history_export_requested",
-            ),
-            (
-                EventType::TradingHistoryExportStarted,
-                "trading_history_export_started",
-            ),
-            (
-                EventType::TradingHistoryExportCompleted,
-                "trading_history_export_completed",
-            ),
-            (
-                EventType::TradingHistoryExportErrored,
-                "trading_history_export_errored",
-            ),
+            (EventType::DatabaseExportErrored, "database_export_errored"),
             (
                 EventType::DatabaseBackupRequested,
                 "database_backup_requested",
@@ -556,6 +530,16 @@ mod tests {
                 "database_backup_completed",
             ),
             (EventType::DatabaseBackupErrored, "database_backup_errored"),
+            (
+                EventType::DatabasePurgeRequested,
+                "database_purge_requested",
+            ),
+            (EventType::DatabasePurgeStarted, "database_purge_started"),
+            (
+                EventType::DatabasePurgeCompleted,
+                "database_purge_completed",
+            ),
+            (EventType::DatabasePurgeErrored, "database_purge_errored"),
             (EventType::MarketSessionCheck, "market_session_check"),
             (
                 EventType::EquityPredictionsRequested,
@@ -620,18 +604,18 @@ mod tests {
             EventType::EquityBarsSyncStarted,
             EventType::EquityBarsSyncCompleted,
             EventType::EquityBarsSyncErrored,
-            EventType::EquityBarsExportRequested,
-            EventType::EquityBarsExportStarted,
-            EventType::EquityBarsExportCompleted,
-            EventType::EquityBarsExportErrored,
-            EventType::TradingHistoryExportRequested,
-            EventType::TradingHistoryExportStarted,
-            EventType::TradingHistoryExportCompleted,
-            EventType::TradingHistoryExportErrored,
+            EventType::DatabaseExportRequested,
+            EventType::DatabaseExportStarted,
+            EventType::DatabaseExportCompleted,
+            EventType::DatabaseExportErrored,
             EventType::DatabaseBackupRequested,
             EventType::DatabaseBackupStarted,
             EventType::DatabaseBackupCompleted,
             EventType::DatabaseBackupErrored,
+            EventType::DatabasePurgeRequested,
+            EventType::DatabasePurgeStarted,
+            EventType::DatabasePurgeCompleted,
+            EventType::DatabasePurgeErrored,
             EventType::MarketSessionCheck,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,

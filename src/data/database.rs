@@ -228,26 +228,58 @@ pub async fn query_equity_quotes_for_date(
     Ok(quotes)
 }
 
-pub async fn delete_equity_quotes_for_date(
-    pool: &PgPool,
-    date: NaiveDate,
-) -> Result<u64, sqlx::Error> {
-    let (date_start, date_end) = date_to_utc_range(date);
+/// Summary of rows deleted during a database purge.
+pub struct PurgeSummary {
+    /// Each entry is `(table_name, rows_deleted)`.
+    pub rows_deleted: Vec<(String, u64)>,
+}
 
-    let result = sqlx::query!(
-        "DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2",
-        date_start,
-        date_end
-    )
-    .execute(pool)
-    .await?;
+/// Deletes rows older than 1 day from all ephemeral tables.
+///
+/// Tables are deleted in child-first order to respect foreign key constraints.
+/// Returns a summary with per-table row counts.
+pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
+    let cutoff = Utc::now() - chrono::Duration::days(1);
+    let mut rows_deleted = Vec::new();
 
-    let deleted = result.rows_affected();
-    info!(
-        "Deleted {} equity quotes from PostgreSQL for {}",
-        deleted, date
-    );
-    Ok(deleted)
+    // Child-first ordering to avoid foreign key violations.
+    // The optional third element adds an extra WHERE clause condition.
+    let tables: &[(&str, &str, Option<&str>)] = &[
+        ("equity_orders", "submitted_at", None),
+        ("equity_allocations", "generated_at", None),
+        (
+            "equity_reconciliation_events",
+            "detected_at",
+            Some("AND resolved_at IS NOT NULL"),
+        ),
+        ("equity_pairs", "opened_at", None),
+        ("equity_rebalance_sessions", "triggered_at", None),
+        ("equity_portfolio_snapshots", "created_at", None),
+        ("equity_quotes", "timestamp", None),
+        ("equity_predictions", "timestamp", None),
+        ("events", "created_at", None),
+        ("model_runs", "started_at", None),
+    ];
+
+    for &(table, time_column, extra_condition) in tables {
+        let query = match extra_condition {
+            Some(condition) => {
+                format!(
+                    "DELETE FROM {} WHERE {} < $1 {}",
+                    table, time_column, condition
+                )
+            }
+            None => format!("DELETE FROM {} WHERE {} < $1", table, time_column),
+        };
+        match sqlx::query(&query).bind(cutoff).execute(pool).await {
+            Ok(result) => rows_deleted.push((table.to_string(), result.rows_affected())),
+            Err(error) => {
+                tracing::warn!(table, error = %error, "Failed to purge table, continuing with remaining tables");
+            }
+        }
+    }
+
+    PurgeSummary { rows_deleted }
 }
 
 /// Returns the set of dates that have at least one equity bar row in the
@@ -597,6 +629,51 @@ pub async fn query_model_runs(pool: &PgPool) -> Result<Vec<ModelRun>, sqlx::Erro
         .collect()
 }
 
+pub async fn query_equity_reconciliation_events_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<crate::domain::trading::EquityReconciliationEvent>, sqlx::Error> {
+    let (date_start, date_end) = date_to_utc_range(date);
+
+    let rows = sqlx::query(
+        "SELECT id, detected_at, event_type, ticker, expected_quantity, actual_quantity,
+         equity_pair_id, alpaca_order_id, action_taken, resolved_at
+         FROM equity_reconciliation_events
+         WHERE detected_at >= $1 AND detected_at < $2
+         ORDER BY detected_at ASC",
+    )
+    .bind(date_start)
+    .bind(date_end)
+    .fetch_all(pool)
+    .await?;
+
+    let events: Vec<crate::domain::trading::EquityReconciliationEvent> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            crate::domain::trading::EquityReconciliationEvent::new(
+                row.get("id"),
+                row.get("detected_at"),
+                row.get("event_type"),
+                row.get("ticker"),
+                row.get("expected_quantity"),
+                row.get("actual_quantity"),
+                row.get("equity_pair_id"),
+                row.get("alpaca_order_id"),
+                row.get("action_taken"),
+                row.get("resolved_at"),
+            )
+        })
+        .collect();
+
+    debug!(
+        rows = events.len(),
+        date = %date,
+        "Queried equity reconciliation events from PostgreSQL"
+    );
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,21 +829,6 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_equity_quotes_for_date_compiles() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use chrono::NaiveDate;
-            let pool = test_pool();
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = delete_equity_quotes_for_date(&pool, date).await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
     fn test_distinct_equity_bar_dates_compiles() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -889,6 +951,36 @@ mod tests {
                 .expect("lazy pool creation should not fail");
             let result = query_model_runs(&pool).await;
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_reconciliation_events_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+            let result = query_equity_reconciliation_events_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_purge_ephemeral_tables_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let summary = purge_ephemeral_tables(&pool).await;
+            // With no database connection, all tables fail silently and return empty summary.
+            assert!(summary.rows_deleted.is_empty());
         });
     }
 }

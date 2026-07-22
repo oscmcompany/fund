@@ -25,8 +25,8 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_
 CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC); -- noqa: PG01
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- equity_quotes: intraday bid/ask rolling 24-hour buffer
--- Exported to S3 Parquet daily, then purged from Postgres; the S3 copy is retained for auditing and TUI use.
+-- equity_quotes: intraday bid/ask buffer
+-- Exported to S3 Parquet nightly and purged by the unified database purge handler.
 CREATE TABLE IF NOT EXISTS equity_quotes (
     timestamp   TIMESTAMPTZ NOT NULL,
     ticker      TEXT        NOT NULL,
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS equity_quotes (
 );
 SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC); -- noqa: PG01
-SELECT add_retention_policy('equity_quotes', INTERVAL '1 day', if_not_exists => TRUE);
+SELECT remove_retention_policy('equity_quotes', if_exists => TRUE);
 
 -- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
 CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
@@ -277,7 +277,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id); -- noqa: PG01
-SELECT add_retention_policy('events', INTERVAL '30 days', if_not_exists => TRUE);
+SELECT remove_retention_policy('events', if_exists => TRUE);
 
 -- notify_event: fires pg_notify on the 'events' channel after each insert.
 -- Payload is JSON with event_id, event_type, and the event payload so consumers
@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS event_consumer_offsets (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- equity_predictions: model output quantiles (7-day rolling buffer)
+-- equity_predictions: model output quantiles (purged nightly by unified database purge)
 -- Columns match the Prediction struct in src/data/types.rs and
 -- the predictions_schema pandera definition in the inference module.
 -- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
@@ -341,7 +341,7 @@ CREATE TABLE IF NOT EXISTS equity_predictions (
 );
 
 SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
-SELECT add_retention_policy('equity_predictions', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 
 -- Market session check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
 -- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
@@ -438,51 +438,16 @@ BEGIN
 END;
 $do$;
 
--- Nightly equity bars export: weekdays at 21:30 UTC.
+-- Nightly database export: weekdays at 21:45 UTC.
+-- Exports all ephemeral tables to S3 Parquet, then chains backup and purge via events:
+-- database_export → database_backup → database_purge.
 DO $do$
 BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-equity-bars') THEN
-        PERFORM cron.unschedule('export-equity-bars');
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-export-requested') THEN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'database-export-requested') THEN
         PERFORM cron.schedule(
-            'equity-bars-export-requested',
-            '30 21 * * 1-5',
-            $$SELECT emit_event('equity_bars_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
-        );
-    END IF;
-END;
-$do$;
-
--- Nightly trading history export: weekdays at 21:45 UTC.
--- Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
--- equity_allocations, equity_orders, equity_portfolio_snapshots, and model_runs; deletes exported equity_quotes rows.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'export-trading-history') THEN
-        PERFORM cron.unschedule('export-trading-history');
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'trading-history-export-requested') THEN
-        PERFORM cron.schedule(
-            'trading-history-export-requested',
+            'database-export-requested',
             '45 21 * * 1-5',
-            $$SELECT emit_event('trading_history_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
-        );
-    END IF;
-END;
-$do$;
-
--- Nightly database backup: weekdays at 22:00 UTC (after all nightly exports complete).
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'backup-database') THEN
-        PERFORM cron.unschedule('backup-database');
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'database-backup-requested') THEN
-        PERFORM cron.schedule(
-            'database-backup-requested',
-            '0 22 * * 1-5',
-            $$SELECT emit_event('database_backup_requested', '{}')$$
+            $$SELECT emit_event('database_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
         );
     END IF;
 END;
