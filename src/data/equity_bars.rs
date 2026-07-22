@@ -97,12 +97,10 @@ async fn write_equity_bars_to_s3(
     let mut dataframe = create_equity_bar_dataframe(bars)
         .map_err(|error| format!("Failed to create DataFrame: {}", error))?;
 
-    let report =
-        crate::data::validation::validate_equity_bars(&dataframe, trading_date.as_naive_date());
-    report.log();
-    if report.error_count() > 0 {
-        return Err(format!("Data quality errors: {}", report.error_summary()));
-    }
+    crate::data::validation::validate_equity_bars_or_reject(
+        &dataframe,
+        trading_date.as_naive_date(),
+    )?;
 
     let mut buffer = Vec::new();
     ParquetWriter::new(&mut buffer)

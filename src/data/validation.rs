@@ -1,13 +1,14 @@
 //! Data quality validation for DataFrames before S3 writes.
 //!
 //! Provides schema conformance, null detection, value range, and consistency
-//! checks. Validation issues are logged as structured warnings but do not
-//! block writes — this is an observability-first framework that surfaces
-//! quality problems for monitoring and future automated remediation.
+//! checks. Error-severity issues (schema mismatches, wrong column types) block
+//! S3 writes by returning an error from [`validate_equity_bars_or_reject`].
+//! Warning-severity issues (price anomalies, OHLC inconsistencies) are logged
+//! for observability without blocking writes.
 
 use chrono::NaiveDate;
 use polars::prelude::*;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Severity level for a validation issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +83,7 @@ impl ValidationReport {
         for issue in &self.issues {
             match issue.severity {
                 Severity::Error => {
-                    warn!(
+                    error!(
                         dataset = %self.dataset,
                         check = %issue.check,
                         "Data quality error: {}",
@@ -105,8 +106,8 @@ impl ValidationReport {
 /// Expected column schema for equity bars Parquet files.
 ///
 /// Each entry is `(column_name, polars_data_type, nullable)`. This is the
-/// single source of truth for the S3 parquet shape — validation, manifest
-/// generation, and the DataFrame creation test in `types.rs` all reference it.
+/// single source of truth for the S3 parquet shape — validation and manifest
+/// generation both reference it.
 pub const EQUITY_BARS_COLUMNS: &[(&str, DataType, bool)] = &[
     ("ticker", DataType::String, false),
     ("timestamp", DataType::Int64, false),
@@ -136,6 +137,20 @@ pub fn validate_equity_bars(dataframe: &DataFrame, date: NaiveDate) -> Validatio
     check_timestamp_range(dataframe, date, &mut report);
 
     report
+}
+
+/// Validates an equity bars DataFrame and returns an error if any error-level
+/// issues are found. Warning-level issues are logged but do not cause rejection.
+pub fn validate_equity_bars_or_reject(
+    dataframe: &DataFrame,
+    date: NaiveDate,
+) -> Result<(), String> {
+    let report = validate_equity_bars(dataframe, date);
+    report.log();
+    if report.error_count() > 0 {
+        return Err(format!("Data quality errors: {}", report.error_summary()));
+    }
+    Ok(())
 }
 
 /// Check that the DataFrame has at least one row.
@@ -228,7 +243,7 @@ fn check_nulls(
     }
 }
 
-/// Check that price columns are all positive.
+/// Check that price columns are all finite and positive.
 fn check_positive_prices(dataframe: &DataFrame, report: &mut ValidationReport) {
     for column_name in ["open_price", "high_price", "low_price", "close_price"] {
         let Ok(column) = dataframe.column(column_name) else {
@@ -237,17 +252,17 @@ fn check_positive_prices(dataframe: &DataFrame, report: &mut ValidationReport) {
         let Ok(values) = column.f64() else {
             continue;
         };
-        let non_positive = values
+        let invalid = values
             .into_iter()
-            .filter(|v| matches!(v, Some(p) if *p <= 0.0))
+            .filter(|v| matches!(v, Some(p) if !p.is_finite() || *p <= 0.0))
             .count();
-        if non_positive > 0 {
+        if invalid > 0 {
             report.add(
                 Severity::Warning,
                 "positive_prices",
                 format!(
-                    "Column '{}' has {} non-positive values",
-                    column_name, non_positive
+                    "Column '{}' has {} non-positive or non-finite values",
+                    column_name, invalid
                 ),
             );
         }
@@ -267,7 +282,7 @@ fn check_high_low_consistency(dataframe: &DataFrame, report: &mut ValidationRepo
     };
     let violations: usize = high_values
         .into_iter()
-        .zip(&*low_values)
+        .zip(low_values)
         .filter(|(high, low)| matches!((high, low), (Some(h), Some(l)) if h < l))
         .count();
     if violations > 0 {
@@ -479,6 +494,36 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.check == "positive_prices"));
+    }
+
+    #[test]
+    fn test_nan_and_infinity_prices_flagged() {
+        let timestamp_millis = date(2026, 6, 15)
+            .and_hms_opt(16, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+
+        let dataframe = df!(
+            "ticker" => ["AAPL", "MSFT"],
+            "timestamp" => vec![timestamp_millis; 2],
+            "open_price" => [f64::NAN, f64::INFINITY],
+            "high_price" => [155.0_f64, 155.0],
+            "low_price" => [148.0_f64, 148.0],
+            "close_price" => [152.0_f64, 152.0],
+            "volume" => vec![1_000_000_i64; 2],
+            "volume_weighted_average_price" => vec![Some(151.5_f64); 2],
+            "transactions" => vec![Some(5000_i64); 2],
+        )
+        .unwrap();
+        let report = validate_equity_bars(&dataframe, date(2026, 6, 15));
+        let price_issues: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|issue| issue.check == "positive_prices")
+            .collect();
+        assert_eq!(price_issues.len(), 1);
+        assert!(price_issues[0].message.contains("non-finite"));
     }
 
     #[test]
