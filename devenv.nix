@@ -169,6 +169,7 @@ in {
       shared_preload_libraries = "timescaledb,pg_cron";
       "cron.database_name" = "fund";
       "cron.timezone" = "UTC";
+      "cron.log_run" = "on";
     };
   };
 

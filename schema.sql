@@ -487,3 +487,48 @@ BEGIN
     END IF;
 END;
 $do$;
+
+-- Weekly cleanup of pg_cron run history: retain 7 days to keep the table small
+-- while providing enough history for health monitoring and debugging.
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'cron-run-details-cleanup') THEN
+        PERFORM cron.schedule(
+            'cron-run-details-cleanup',
+            '0 3 * * 0',
+            $$DELETE FROM cron.job_run_details WHERE end_time < now() - interval '7 days'$$
+        );
+    END IF;
+END;
+$do$;
+
+-- check_cron_job_health: returns the most recent execution status for each pg_cron job.
+-- Operators, the dashboard, or a future bot can call
+-- SELECT * FROM check_cron_job_health() to inspect job health at a glance.
+CREATE OR REPLACE FUNCTION check_cron_job_health()
+RETURNS TABLE (
+    job_name TEXT,
+    schedule TEXT,
+    last_run_time TIMESTAMPTZ,
+    last_status TEXT,
+    last_return_message TEXT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        j.jobname::TEXT,
+        j.schedule::TEXT,
+        d.end_time,
+        d.status,
+        d.return_message
+    FROM cron.job j
+    LEFT JOIN LATERAL (
+        SELECT rd.end_time, rd.status, rd.return_message
+        FROM cron.job_run_details rd
+        WHERE rd.jobid = j.jobid
+        ORDER BY rd.end_time DESC
+        LIMIT 1
+    ) d ON TRUE
+    ORDER BY j.jobname;
+END;
+$$ LANGUAGE plpgsql;
