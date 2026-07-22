@@ -354,25 +354,38 @@ async fn listen_loop(state: State, shutdown_token: CancellationToken) {
 
 /// Validates that all expected pg_cron jobs are registered. Logs an error for
 /// each missing job. Gracefully skips if pg_cron is not installed (e.g., vanilla
-/// PostgreSQL in tests or local development without extensions).
-async fn validate_cron_jobs(pool: &sqlx::PgPool) {
+/// PostgreSQL in tests or local development without extensions). Returns
+/// whether pg_cron is available so callers can gate dependent checks.
+async fn validate_cron_jobs(pool: &sqlx::PgPool) -> bool {
     // Check whether the cron schema exists before querying it.
-    let cron_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cron')")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(Some(false))
-            .unwrap_or(false);
+    let cron_exists = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cron')",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(error = %error, "Failed to check pg_cron availability, skipping job validation");
+            return false;
+        }
+    };
 
     if !cron_exists {
         info!("pg_cron not available, skipping job validation");
-        return;
+        return false;
     }
 
-    let rows: Vec<String> = sqlx::query_scalar("SELECT jobname FROM cron.job")
+    let rows: Vec<String> = match sqlx::query_scalar("SELECT jobname FROM cron.job")
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(error = %error, "Failed to query pg_cron jobs, skipping job validation");
+            return true;
+        }
+    };
 
     let mut missing_count = 0;
     for &expected_name in EXPECTED_CRON_JOBS {
@@ -394,6 +407,8 @@ async fn validate_cron_jobs(pool: &sqlx::PgPool) {
             "Some expected pg_cron jobs are missing"
         );
     }
+
+    true
 }
 
 /// Checks when each nightly event type last fired. Warns if any are overdue,
@@ -403,12 +418,23 @@ async fn check_event_freshness(pool: &sqlx::PgPool) {
     let mut stale_count = 0;
 
     for &(event_type, threshold_hours) in EVENT_FRESHNESS_THRESHOLDS {
-        let last_seen: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT MAX(created_at) FROM events WHERE event_type = $1")
-                .bind(event_type)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(None);
+        let last_seen: Option<DateTime<Utc>> = match sqlx::query_scalar(
+            "SELECT created_at FROM events WHERE event_type = $1 ORDER BY id DESC LIMIT 1",
+        )
+        .bind(event_type)
+        .fetch_optional(pool)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    event_type,
+                    error = %error,
+                    "Failed to query event freshness, skipping"
+                );
+                continue;
+            }
+        };
 
         let is_stale = is_event_stale(last_seen, now, threshold_hours);
 
@@ -440,7 +466,7 @@ async fn check_event_freshness(pool: &sqlx::PgPool) {
     }
 }
 
-/// Returns `true` if the event is stale (last seen more than `threshold_hours`
+/// Returns `true` if the event is stale (last seen at least `threshold_hours`
 /// ago, or never seen at all).
 fn is_event_stale(
     last_seen: Option<DateTime<Utc>>,
@@ -465,9 +491,13 @@ async fn run_listener(
     listener.listen("events").await?;
     info!("Event consumer connected, listening on channel 'events'");
 
-    // Validate pg_cron jobs and event freshness on startup.
-    validate_cron_jobs(pool).await;
-    check_event_freshness(pool).await;
+    // Validate pg_cron jobs and event freshness on startup. Event freshness
+    // is only meaningful when pg_cron is installed (otherwise no cron-triggered
+    // events exist and every check would produce a false warning).
+    let pg_cron_available = validate_cron_jobs(pool).await;
+    if pg_cron_available {
+        check_event_freshness(pool).await;
+    }
 
     if shutdown_token.is_cancelled() {
         return Ok(());

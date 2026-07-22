@@ -488,14 +488,14 @@ BEGIN
 END;
 $do$;
 
--- Weekly cleanup of pg_cron run history: retain 7 days to keep the table small
+-- Daily cleanup of pg_cron run history: retain 7 days to keep the table small
 -- while providing enough history for health monitoring and debugging.
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'cron-run-details-cleanup') THEN
         PERFORM cron.schedule(
             'cron-run-details-cleanup',
-            '0 3 * * 0',
+            '0 3 * * *',
             $$DELETE FROM cron.job_run_details WHERE end_time < now() - interval '7 days'$$
         );
     END IF;
