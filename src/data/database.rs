@@ -238,31 +238,48 @@ pub struct PurgeSummary {
 ///
 /// Tables are deleted in child-first order to respect foreign key constraints.
 /// Returns a summary with per-table row counts.
-pub async fn purge_ephemeral_tables(pool: &PgPool) -> Result<PurgeSummary, sqlx::Error> {
+pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
     let cutoff = Utc::now() - chrono::Duration::days(1);
     let mut rows_deleted = Vec::new();
 
     // Child-first ordering to avoid foreign key violations.
-    let tables: &[(&str, &str)] = &[
-        ("equity_orders", "submitted_at"),
-        ("equity_allocations", "generated_at"),
-        ("equity_reconciliation_events", "detected_at"),
-        ("equity_pairs", "opened_at"),
-        ("equity_rebalance_sessions", "triggered_at"),
-        ("equity_portfolio_snapshots", "created_at"),
-        ("equity_quotes", "timestamp"),
-        ("equity_predictions", "timestamp"),
-        ("events", "created_at"),
-        ("model_runs", "started_at"),
+    // The optional third element adds an extra WHERE clause condition.
+    let tables: &[(&str, &str, Option<&str>)] = &[
+        ("equity_orders", "submitted_at", None),
+        ("equity_allocations", "generated_at", None),
+        (
+            "equity_reconciliation_events",
+            "detected_at",
+            Some("AND resolved_at IS NOT NULL"),
+        ),
+        ("equity_pairs", "opened_at", None),
+        ("equity_rebalance_sessions", "triggered_at", None),
+        ("equity_portfolio_snapshots", "created_at", None),
+        ("equity_quotes", "timestamp", None),
+        ("equity_predictions", "timestamp", None),
+        ("events", "created_at", None),
+        ("model_runs", "started_at", None),
     ];
 
-    for &(table, time_column) in tables {
-        let query = format!("DELETE FROM {} WHERE {} < $1", table, time_column);
-        let result = sqlx::query(&query).bind(cutoff).execute(pool).await?;
-        rows_deleted.push((table.to_string(), result.rows_affected()));
+    for &(table, time_column, extra_condition) in tables {
+        let query = match extra_condition {
+            Some(condition) => {
+                format!(
+                    "DELETE FROM {} WHERE {} < $1 {}",
+                    table, time_column, condition
+                )
+            }
+            None => format!("DELETE FROM {} WHERE {} < $1", table, time_column),
+        };
+        match sqlx::query(&query).bind(cutoff).execute(pool).await {
+            Ok(result) => rows_deleted.push((table.to_string(), result.rows_affected())),
+            Err(error) => {
+                tracing::warn!(table, error = %error, "Failed to purge table, continuing with remaining tables");
+            }
+        }
     }
 
-    Ok(PurgeSummary { rows_deleted })
+    PurgeSummary { rows_deleted }
 }
 
 /// Returns the set of dates that have at least one equity bar row in the
@@ -934,6 +951,36 @@ mod tests {
                 .expect("lazy pool creation should not fail");
             let result = query_model_runs(&pool).await;
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_query_equity_reconciliation_events_for_date_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+            let result = query_equity_reconciliation_events_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_purge_ephemeral_tables_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let summary = purge_ephemeral_tables(&pool).await;
+            // With no database connection, all tables fail silently and return empty summary.
+            assert!(summary.rows_deleted.is_empty());
         });
     }
 }

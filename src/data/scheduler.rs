@@ -519,6 +519,22 @@ async fn run_listener(
         handle_database_export(state, pool, event_id, &payload).await;
     }
 
+    let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::DatabaseBackupRequested, backup_offset).await?
+    {
+        info!(event_id, "Catching up on missed database_backup_requested");
+        handle_database_backup(state, pool, event_id).await;
+    }
+
+    let purge_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::DatabasePurgeRequested, purge_offset).await?
+    {
+        info!(event_id, "Catching up on missed database_purge_requested");
+        handle_database_purge(pool, event_id).await;
+    }
+
     // Main event loop.
     loop {
         let notification = tokio::select! {
@@ -690,6 +706,17 @@ async fn handle_database_export(
             {
                 warn!(error = %error, "Failed to emit database_export_completed");
             }
+
+            // Chain: export success → backup
+            if let Err(error) = emit_event(
+                pool,
+                EventType::DatabaseBackupRequested,
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                warn!(error = %error, "Failed to emit database_backup_requested");
+            }
         }
         Err(ref error) => {
             error!(error = %error, "Database export errored");
@@ -703,17 +730,6 @@ async fn handle_database_export(
                 warn!(error = %emit_error, "Failed to emit database_export_errored");
             }
         }
-    }
-
-    // Chain: export (success or error) → backup
-    if let Err(error) = emit_event(
-        pool,
-        EventType::DatabaseBackupRequested,
-        &serde_json::json!({}),
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to emit database_backup_requested");
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_EXPORT, event_id).await
@@ -787,37 +803,22 @@ async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
         warn!(error = %error, "Failed to emit database_purge_started");
     }
 
-    match crate::data::database::purge_ephemeral_tables(pool).await {
-        Ok(summary) => {
-            let total: u64 = summary.rows_deleted.iter().map(|(_, count)| count).sum();
-            for (table, count) in &summary.rows_deleted {
-                if *count > 0 {
-                    info!(table, rows = count, "Purged old rows");
-                }
-            }
-            info!(total_rows = total, "Database purge completed");
-            if let Err(error) = emit_event(
-                pool,
-                EventType::DatabasePurgeCompleted,
-                &serde_json::json!({"total_rows_deleted": total}),
-            )
-            .await
-            {
-                warn!(error = %error, "Failed to emit database_purge_completed");
-            }
+    let summary = crate::data::database::purge_ephemeral_tables(pool).await;
+    let total: u64 = summary.rows_deleted.iter().map(|(_, count)| count).sum();
+    for (table, count) in &summary.rows_deleted {
+        if *count > 0 {
+            info!(table, rows = count, "Purged old rows");
         }
-        Err(ref error) => {
-            error!(error = %error, "Database purge errored");
-            if let Err(emit_error) = emit_event(
-                pool,
-                EventType::DatabasePurgeErrored,
-                &serde_json::json!({"error": error.to_string()}),
-            )
-            .await
-            {
-                warn!(error = %emit_error, "Failed to emit database_purge_errored");
-            }
-        }
+    }
+    info!(total_rows = total, "Database purge completed");
+    if let Err(error) = emit_event(
+        pool,
+        EventType::DatabasePurgeCompleted,
+        &serde_json::json!({"total_rows_deleted": total}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit database_purge_completed");
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE, event_id).await {

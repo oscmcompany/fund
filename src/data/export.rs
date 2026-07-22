@@ -1196,4 +1196,44 @@ mod tests {
             &DataType::String
         );
     }
+
+    fn sample_reconciliation_events() -> Vec<EquityReconciliationEvent> {
+        vec![EquityReconciliationEvent::new(
+            1,
+            Utc::now(),
+            "quantity_mismatch".to_string(),
+            "AAPL".to_string(),
+            Some("100".parse().unwrap()),
+            Some("95".parse().unwrap()),
+            Some("550e8400-e29b-41d4-a716-446655440001".parse().unwrap()),
+            Some("alpaca-order-123".to_string()),
+            "logged_only".to_string(),
+            None,
+        )]
+    }
+
+    #[test]
+    fn test_create_equity_reconciliation_event_dataframe_columns_and_rows() {
+        let events = sample_reconciliation_events();
+        let dataframe = create_equity_reconciliation_event_dataframe(&events).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.width(), 10);
+        assert!(dataframe.column("id").is_ok());
+        assert!(dataframe.column("detected_at").is_ok());
+        assert!(dataframe.column("event_type").is_ok());
+        assert!(dataframe.column("ticker").is_ok());
+        assert!(dataframe.column("expected_quantity").is_ok());
+        assert!(dataframe.column("actual_quantity").is_ok());
+        assert!(dataframe.column("equity_pair_id").is_ok());
+        assert!(dataframe.column("alpaca_order_id").is_ok());
+        assert!(dataframe.column("action_taken").is_ok());
+        assert!(dataframe.column("resolved_at").is_ok());
+    }
+
+    #[test]
+    fn test_create_equity_reconciliation_event_dataframe_empty() {
+        let dataframe = create_equity_reconciliation_event_dataframe(&[]).unwrap();
+        assert_eq!(dataframe.height(), 0);
+        assert_eq!(dataframe.width(), 10);
+    }
 }

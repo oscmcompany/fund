@@ -898,7 +898,7 @@ pub struct EquityReconciliationEvent {
 }
 
 impl EquityReconciliationEvent {
-    /// Constructs an `EquityReconciliationEvent` from validated field values.
+    /// Constructs an `EquityReconciliationEvent` from database row values.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: i64,
