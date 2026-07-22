@@ -228,26 +228,41 @@ pub async fn query_equity_quotes_for_date(
     Ok(quotes)
 }
 
-pub async fn delete_equity_quotes_for_date(
-    pool: &PgPool,
-    date: NaiveDate,
-) -> Result<u64, sqlx::Error> {
-    let (date_start, date_end) = date_to_utc_range(date);
+/// Summary of rows deleted during a database purge.
+pub struct PurgeSummary {
+    /// Each entry is `(table_name, rows_deleted)`.
+    pub rows_deleted: Vec<(String, u64)>,
+}
 
-    let result = sqlx::query!(
-        "DELETE FROM equity_quotes WHERE timestamp >= $1 AND timestamp < $2",
-        date_start,
-        date_end
-    )
-    .execute(pool)
-    .await?;
+/// Deletes rows older than 1 day from all ephemeral tables.
+///
+/// Tables are deleted in child-first order to respect foreign key constraints.
+/// Returns a summary with per-table row counts.
+pub async fn purge_ephemeral_tables(pool: &PgPool) -> Result<PurgeSummary, sqlx::Error> {
+    let cutoff = Utc::now() - chrono::Duration::days(1);
+    let mut rows_deleted = Vec::new();
 
-    let deleted = result.rows_affected();
-    info!(
-        "Deleted {} equity quotes from PostgreSQL for {}",
-        deleted, date
-    );
-    Ok(deleted)
+    // Child-first ordering to avoid foreign key violations.
+    let tables: &[(&str, &str)] = &[
+        ("equity_orders", "submitted_at"),
+        ("equity_allocations", "generated_at"),
+        ("equity_reconciliation_events", "detected_at"),
+        ("equity_pairs", "opened_at"),
+        ("equity_rebalance_sessions", "triggered_at"),
+        ("equity_portfolio_snapshots", "created_at"),
+        ("equity_quotes", "timestamp"),
+        ("equity_predictions", "timestamp"),
+        ("events", "created_at"),
+        ("model_runs", "started_at"),
+    ];
+
+    for &(table, time_column) in tables {
+        let query = format!("DELETE FROM {} WHERE {} < $1", table, time_column);
+        let result = sqlx::query(&query).bind(cutoff).execute(pool).await?;
+        rows_deleted.push((table.to_string(), result.rows_affected()));
+    }
+
+    Ok(PurgeSummary { rows_deleted })
 }
 
 /// Returns the set of dates that have at least one equity bar row in the
@@ -597,6 +612,51 @@ pub async fn query_model_runs(pool: &PgPool) -> Result<Vec<ModelRun>, sqlx::Erro
         .collect()
 }
 
+pub async fn query_equity_reconciliation_events_for_date(
+    pool: &PgPool,
+    date: NaiveDate,
+) -> Result<Vec<crate::domain::trading::EquityReconciliationEvent>, sqlx::Error> {
+    let (date_start, date_end) = date_to_utc_range(date);
+
+    let rows = sqlx::query(
+        "SELECT id, detected_at, event_type, ticker, expected_quantity, actual_quantity,
+         equity_pair_id, alpaca_order_id, action_taken, resolved_at
+         FROM equity_reconciliation_events
+         WHERE detected_at >= $1 AND detected_at < $2
+         ORDER BY detected_at ASC",
+    )
+    .bind(date_start)
+    .bind(date_end)
+    .fetch_all(pool)
+    .await?;
+
+    let events: Vec<crate::domain::trading::EquityReconciliationEvent> = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            crate::domain::trading::EquityReconciliationEvent::new(
+                row.get("id"),
+                row.get("detected_at"),
+                row.get("event_type"),
+                row.get("ticker"),
+                row.get("expected_quantity"),
+                row.get("actual_quantity"),
+                row.get("equity_pair_id"),
+                row.get("alpaca_order_id"),
+                row.get("action_taken"),
+                row.get("resolved_at"),
+            )
+        })
+        .collect();
+
+    debug!(
+        rows = events.len(),
+        date = %date,
+        "Queried equity reconciliation events from PostgreSQL"
+    );
+    Ok(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,21 +807,6 @@ mod tests {
             let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = query_equity_quotes_for_date(&pool, date).await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_delete_equity_quotes_for_date_compiles() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use chrono::NaiveDate;
-            let pool = test_pool();
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = delete_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
         });
     }

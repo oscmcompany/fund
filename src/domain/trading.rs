@@ -879,6 +879,94 @@ impl PortfolioSnapshots {
     }
 }
 
+/// Audit trail record for a discrepancy detected between database and Alpaca state.
+///
+/// Maps to the `equity_reconciliation_events` table. Rows are append-only during
+/// detection; `resolved_at` is updated when the corrective action succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquityReconciliationEvent {
+    id: i64,
+    detected_at: DateTime<Utc>,
+    event_type: String,
+    ticker: String,
+    expected_quantity: Option<Decimal>,
+    actual_quantity: Option<Decimal>,
+    equity_pair_id: Option<Uuid>,
+    alpaca_order_id: Option<String>,
+    action_taken: String,
+    resolved_at: Option<DateTime<Utc>>,
+}
+
+impl EquityReconciliationEvent {
+    /// Constructs an `EquityReconciliationEvent` from validated field values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: i64,
+        detected_at: DateTime<Utc>,
+        event_type: String,
+        ticker: String,
+        expected_quantity: Option<Decimal>,
+        actual_quantity: Option<Decimal>,
+        equity_pair_id: Option<Uuid>,
+        alpaca_order_id: Option<String>,
+        action_taken: String,
+        resolved_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            id,
+            detected_at,
+            event_type,
+            ticker,
+            expected_quantity,
+            actual_quantity,
+            equity_pair_id,
+            alpaca_order_id,
+            action_taken,
+            resolved_at,
+        }
+    }
+
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub fn detected_at(&self) -> DateTime<Utc> {
+        self.detected_at
+    }
+
+    pub fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    pub fn ticker(&self) -> &str {
+        &self.ticker
+    }
+
+    pub fn expected_quantity(&self) -> Option<&Decimal> {
+        self.expected_quantity.as_ref()
+    }
+
+    pub fn actual_quantity(&self) -> Option<&Decimal> {
+        self.actual_quantity.as_ref()
+    }
+
+    pub fn equity_pair_id(&self) -> Option<Uuid> {
+        self.equity_pair_id
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+
+    pub fn action_taken(&self) -> &str {
+        &self.action_taken
+    }
+
+    pub fn resolved_at(&self) -> Option<DateTime<Utc>> {
+        self.resolved_at
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

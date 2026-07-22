@@ -80,11 +80,9 @@ fn parse_equity_bar(result: &EquityBarResult, inserted_at: DateTime<Utc>) -> Opt
 
 /// S3 key for a day's equity bars.
 ///
-/// This must stay byte-for-byte aligned with the nightly pg_parquet export
-/// (`export_equity_bars` in `schema.sql`) and the tide training reader so that
-/// backfilled and nightly files are read uniformly from one prefix; an earlier
-/// stray `daily/` segment here diverged from both and hid backfilled data from
-/// training.
+/// This must stay byte-for-byte aligned with the tide training reader so that
+/// synced and backfilled files are read uniformly from one prefix; an earlier
+/// stray `daily/` segment here diverged and hid backfilled data from training.
 fn equity_bars_key(date: NaiveDate) -> String {
     crate::common::aws::date_partitioned_key("data/equity/bars", date)
 }
@@ -549,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_equity_bars_key_matches_export_convention() {
-        // Must match `export_equity_bars` in schema.sql and the tide reader:
+        // Must match the tide reader convention:
         // `data/equity/bars/year=YYYY/month=MM/day=DD/data.parquet` (no `daily/`).
         let date = NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
         assert_eq!(

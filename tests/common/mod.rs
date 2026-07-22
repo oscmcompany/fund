@@ -237,6 +237,7 @@ fn filter_schema_for_test(schema: &str) -> String {
                 && !trimmed.starts_with("select cron.schedule")
                 && !trimmed.starts_with("select create_hypertable")
                 && !trimmed.starts_with("select add_retention_policy")
+                && !trimmed.starts_with("select remove_retention_policy")
         })
         .collect::<Vec<_>>()
         .join("\n")
