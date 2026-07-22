@@ -492,6 +492,9 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
     // so that sector/industry reclassifications are picked up automatically.
     run_equity_details_sync(state, pool).await;
 
+    // Update the data lake manifest so downstream consumers can discover datasets.
+    crate::data::manifest::write_manifest(&state.s3_client, &state.bucket_name).await;
+
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC, event_id).await
     {
         warn!(error = %error, "Failed to update equity-bars-sync consumer offset");
