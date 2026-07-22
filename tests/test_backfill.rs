@@ -95,7 +95,7 @@ async fn test_seed_writes_s3_and_skips_weekends() {
     .unwrap();
 
     assert_eq!(summary.days_processed, 2);
-    assert_eq!(summary.days_skipped_weekend, 2);
+    assert_eq!(summary.days_skipped_non_trading, 2);
     assert_eq!(summary.days_failed, 0);
     assert_eq!(summary.total_bars, 2);
 

@@ -246,7 +246,7 @@ pub async fn fetch_and_store_equity_bars(
 #[derive(Debug, Default)]
 pub struct SeedSummary {
     pub days_processed: usize,
-    pub days_skipped_weekend: usize,
+    pub days_skipped_non_trading: usize,
     pub days_failed: usize,
     pub total_bars: usize,
 }
@@ -503,8 +503,8 @@ pub async fn seed(
     while date <= end {
         match TradingDate::from_naive_date(date) {
             None => {
-                debug!("Skipping weekend date: {}", date.format("%Y-%m-%d"));
-                summary.days_skipped_weekend += 1;
+                debug!("Skipping non-trading date: {}", date.format("%Y-%m-%d"));
+                summary.days_skipped_non_trading += 1;
             }
             Some(trading_date) => {
                 match seed_one_day(state, &trading_date, &source, &target).await {
@@ -527,9 +527,9 @@ pub async fn seed(
     }
 
     info!(
-        "Seed complete: {} days processed, {} weekends skipped, {} days failed, {} total bars",
+        "Seed complete: {} days processed, {} non-trading days skipped, {} days failed, {} total bars",
         summary.days_processed,
-        summary.days_skipped_weekend,
+        summary.days_skipped_non_trading,
         summary.days_failed,
         summary.total_bars
     );
@@ -756,7 +756,7 @@ mod tests {
         use super::SeedSummary;
         let summary = SeedSummary::default();
         assert_eq!(summary.days_processed, 0);
-        assert_eq!(summary.days_skipped_weekend, 0);
+        assert_eq!(summary.days_skipped_non_trading, 0);
         assert_eq!(summary.days_failed, 0);
         assert_eq!(summary.total_bars, 0);
     }
@@ -859,7 +859,7 @@ mod tests {
         use super::SeedSummary;
         let summary = SeedSummary {
             days_processed: 5,
-            days_skipped_weekend: 2,
+            days_skipped_non_trading: 2,
             days_failed: 1,
             total_bars: 1000,
         };

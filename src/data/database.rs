@@ -139,10 +139,11 @@ pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Erro
     Ok(tickers)
 }
 
-/// Seeds `equity_details` from the provided rows using an idempotent upsert.
+/// Upserts `equity_details` from the provided rows.
 ///
-/// Assumes a blank database on first startup. Subsequent runs are safe because
-/// `ON CONFLICT (ticker) DO NOTHING` skips rows that already exist.
+/// Uses `ON CONFLICT (ticker) DO UPDATE` so that sector and industry
+/// values stay current when the embedded CSV is updated. Safe to call on
+/// every sync run.
 pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result<u64, sqlx::Error> {
     if rows.is_empty() {
         warn!("No equity details rows provided for seeding; skipping");
@@ -162,13 +163,19 @@ pub async fn seed_equity_details(pool: &PgPool, rows: &[EquityDetail]) -> Result
                 .push_bind(detail.industry());
         });
 
-        query_builder.push(" ON CONFLICT (ticker) DO NOTHING");
+        query_builder.push(
+            " ON CONFLICT (ticker) DO UPDATE SET \
+             sector = CASE WHEN EXCLUDED.sector <> 'NOT AVAILABLE' \
+                          THEN EXCLUDED.sector ELSE equity_details.sector END, \
+             industry = CASE WHEN EXCLUDED.industry <> 'NOT AVAILABLE' \
+                            THEN EXCLUDED.industry ELSE equity_details.industry END",
+        );
 
         let result = query_builder.build().execute(pool).await?;
         rows_affected += result.rows_affected();
     }
 
-    info!("Seeded equity_details with {} rows", rows_affected);
+    info!("Upserted equity_details with {} rows", rows_affected);
     Ok(rows_affected)
 }
 
@@ -241,6 +248,43 @@ pub async fn delete_equity_quotes_for_date(
         deleted, date
     );
     Ok(deleted)
+}
+
+/// Returns the set of dates that have at least one equity bar row in the
+/// inclusive range `[start, end]`.
+///
+/// Used by the self-healing sync to detect gaps: any expected trading day
+/// absent from this set is a candidate for backfill.
+pub async fn distinct_equity_bar_dates(
+    pool: &PgPool,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<std::collections::HashSet<NaiveDate>, sqlx::Error> {
+    use sqlx::Row;
+
+    let (range_start, _) = date_to_utc_range(start);
+    let (_, range_end) = date_to_utc_range(end);
+
+    let rows = sqlx::query(
+        "SELECT DISTINCT (timestamp AT TIME ZONE 'UTC')::date AS trading_date
+         FROM equity_bars
+         WHERE timestamp >= $1 AND timestamp < $2",
+    )
+    .bind(range_start)
+    .bind(range_end)
+    .fetch_all(pool)
+    .await?;
+
+    let dates: std::collections::HashSet<NaiveDate> = rows
+        .into_iter()
+        .map(|row| row.try_get::<NaiveDate, _>("trading_date"))
+        .collect::<Result<_, _>>()?;
+
+    debug!(
+        dates = dates.len(),
+        "Queried distinct equity bar dates from PostgreSQL"
+    );
+    Ok(dates)
 }
 
 pub async fn query_equity_bars_for_date(
@@ -718,6 +762,22 @@ mod tests {
             let pool = test_pool();
             let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
             let result = delete_equity_quotes_for_date(&pool, date).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_distinct_equity_bar_dates_compiles() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use chrono::NaiveDate;
+            let pool = test_pool();
+            let start = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+            let end = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+            let result = distinct_equity_bar_dates(&pool, start, end).await;
             assert!(result.is_err());
         });
     }

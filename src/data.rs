@@ -7,6 +7,7 @@ pub mod equity_details;
 pub mod equity_quotes;
 pub mod errors;
 pub mod export;
+pub mod market_calendar;
 pub mod scheduler;
 pub mod state;
 pub mod types;
