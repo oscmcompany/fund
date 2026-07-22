@@ -35,6 +35,13 @@ pub async fn export_equity_bars(state: &State, date: NaiveDate) -> Result<usize,
     }
 
     let mut dataframe = create_equity_bar_export_dataframe(&bars)?;
+
+    let report = crate::data::validation::validate_equity_bars(&dataframe, date);
+    report.log();
+    if report.error_count() > 0 {
+        return Err(format!("Data quality errors: {}", report.error_summary()));
+    }
+
     let key = date_partitioned_key("data/equity/bars", date);
     write_dataframe_to_s3(state, &mut dataframe, &key).await?;
     info!(rows = count, key = key, "Exported equity bars to S3");
