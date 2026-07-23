@@ -31,13 +31,14 @@ required-features = ["dashboard"]
 [[bin]]
 name = "fund"
 path = "src/bin/fund.rs"
-required-features = ["data", "inference", "portfolio"]
+required-features = ["data", "inference", "portfolio", "stream"]
 
 [features]
-default = ["data", "inference", "portfolio"]
+default = ["data", "inference", "portfolio", "stream"]
 data = ["dep:chrono-tz"]
 inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
 portfolio = ["dep:chrono-tz"]
+stream = ["dep:tokio-tungstenite", "dep:futures-util"]
 dashboard = ["dep:axum"]
 
 # Rust-native TiDE training. Reuses the inference model/data/predict code
@@ -104,6 +105,12 @@ tempfile = { version = "3.27", optional = true }
 
 # train-only (optional; enabled by the `train` feature)
 rand = { version = "0.10", optional = true }
+
+# stream-only (optional; enabled by the `stream` feature)
+tokio-tungstenite = { version = "0.26", features = [
+  "native-tls",
+], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # dashboard-only (optional; enabled by the `dashboard` feature)
 axum = { version = "0.8", optional = true }
