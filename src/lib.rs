@@ -21,5 +21,8 @@ pub mod inference;
 #[cfg(feature = "portfolio")]
 pub mod portfolio;
 
+#[cfg(feature = "stream")]
+pub mod stream;
+
 #[cfg(feature = "dashboard")]
 pub mod dashboard;

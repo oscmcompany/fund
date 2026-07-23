@@ -6,9 +6,14 @@
 //! own log stream and TUI panel while still sharing the same PostgreSQL
 //! event bus for inter-service coordination.
 
+use std::sync::Arc;
+
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+use fund::stream::buffer::MarketDataBuffer;
+use fund::stream::connection::MessagePayload;
 
 const USAGE: &str = "Usage: fund [--module <data|inference|portfolio>]";
 
@@ -101,6 +106,18 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // The market data buffer is the in-memory broadcast channel for live
+    // quotes and ticks. All data here is ephemeral (DataBoundary::Ephemeral)
+    // and is never written to PostgreSQL. Downstream consumers that detect
+    // durable signals are responsible for crossing the event boundary via
+    // emit_event().
+    let market_data_buffer: Arc<MarketDataBuffer<MessagePayload>> =
+        Arc::new(MarketDataBuffer::new());
+    info!(
+        capacity = market_data_buffer.capacity(),
+        "Market data buffer created"
+    );
 
     let shutdown_token = CancellationToken::new();
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
