@@ -1,15 +1,14 @@
 //! Generic WebSocket connection manager with automatic reconnection.
 //!
-//! [`WebSocketConnection`] manages a single WebSocket connection lifecycle:
-//! connect, subscribe to topics, receive messages in a loop, and reconnect
-//! with exponential backoff on failure. It accepts a [`CancellationToken`]
-//! for graceful shutdown — on cancellation, the connection drains in-flight
-//! messages and closes cleanly.
+//! [`run_connection`] manages a WebSocket connection lifecycle: connect,
+//! send startup messages, receive messages in a loop, and reconnect with
+//! exponential backoff on failure. It accepts a [`CancellationToken`] for
+//! graceful shutdown — on cancellation, the connection closes cleanly.
 //!
 //! This module is feed-agnostic: it handles raw WebSocket frames and
 //! delegates message parsing to a caller-provided handler. Specific feed
 //! integrations (Alpaca equities, Massive options, etc.) are built on top
-//! of this infrastructure in downstream projects.
+//! of this infrastructure.
 
 use std::fmt;
 use std::time::Duration;
@@ -31,18 +30,31 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Backoff multiplier applied after each failed reconnection attempt.
 const BACKOFF_MULTIPLIER: u32 = 2;
 
+/// Timeout for the initial WebSocket connection handshake.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Configuration for a WebSocket connection.
 #[derive(Debug, Clone)]
 pub struct ConnectionConfiguration {
     /// WebSocket URL to connect to (e.g., `wss://stream.example.com/v1`).
-    pub url: String,
+    url: String,
 
     /// Messages to send immediately after connecting (e.g., authentication,
     /// subscription requests). Sent in order before the receive loop begins.
-    pub startup_messages: Vec<String>,
+    startup_messages: Vec<String>,
 }
 
 impl ConnectionConfiguration {
+    /// Returns the WebSocket URL.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Returns the startup messages sent after connecting.
+    pub fn startup_messages(&self) -> &[String] {
+        &self.startup_messages
+    }
+
     /// Creates a new connection configuration.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -75,12 +87,23 @@ pub enum SessionOutcome {
 #[derive(Debug)]
 pub struct ConnectionError {
     message: String,
+    /// Whether the connection was established before the error occurred.
+    /// Used by the supervisor to decide whether to reset backoff.
+    was_connected: bool,
 }
 
 impl ConnectionError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            was_connected: false,
+        }
+    }
+
+    fn after_connected(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            was_connected: true,
         }
     }
 }
@@ -98,7 +121,7 @@ impl std::error::Error for ConnectionError {}
 /// This is the top-level supervisor loop. It connects to the configured
 /// URL, sends startup messages, and enters a receive loop that forwards
 /// messages to the provided handler. On disconnection, it reconnects
-/// with exponential backoff. On cancellation, it drains and exits.
+/// with exponential backoff. On cancellation, it closes cleanly and exits.
 ///
 /// The `handler` receives each text or binary message and returns `true`
 /// to continue receiving or `false` to close the connection (e.g., if the
@@ -145,7 +168,11 @@ pub async fn run_connection<F>(
                     }
                 }
 
-                backoff = std::cmp::min(backoff * BACKOFF_MULTIPLIER, MAXIMUM_BACKOFF);
+                if error.was_connected {
+                    backoff = INITIAL_BACKOFF;
+                } else {
+                    backoff = std::cmp::min(backoff * BACKOFF_MULTIPLIER, MAXIMUM_BACKOFF);
+                }
             }
         }
     }
@@ -182,7 +209,7 @@ where
     // Send startup messages (auth, subscriptions).
     for message in &config.startup_messages {
         if let Err(error) = sink.send(Message::Text(message.clone().into())).await {
-            return SessionOutcome::Disconnected(ConnectionError::new(format!(
+            return SessionOutcome::Disconnected(ConnectionError::after_connected(format!(
                 "Failed to send startup message: {}",
                 error
             )));
@@ -219,10 +246,9 @@ where
             }
             Some(Ok(Message::Ping(data))) => {
                 if let Err(error) = sink.send(Message::Pong(data)).await {
-                    return SessionOutcome::Disconnected(ConnectionError::new(format!(
-                        "Failed to send pong: {}",
-                        error
-                    )));
+                    return SessionOutcome::Disconnected(ConnectionError::after_connected(
+                        format!("Failed to send pong: {}", error),
+                    ));
                 }
             }
             Some(Ok(Message::Pong(_))) => {
@@ -231,7 +257,7 @@ where
             Some(Ok(Message::Close(_))) => {
                 debug!("Server sent close frame");
                 let _ = sink.close().await;
-                return SessionOutcome::Disconnected(ConnectionError::new(
+                return SessionOutcome::Disconnected(ConnectionError::after_connected(
                     "Server closed connection",
                 ));
             }
@@ -239,13 +265,13 @@ where
                 // Raw frames are not expected in normal operation.
             }
             Some(Err(error)) => {
-                return SessionOutcome::Disconnected(ConnectionError::new(format!(
+                return SessionOutcome::Disconnected(ConnectionError::after_connected(format!(
                     "WebSocket error: {}",
                     error
                 )));
             }
             None => {
-                return SessionOutcome::Disconnected(ConnectionError::new(
+                return SessionOutcome::Disconnected(ConnectionError::after_connected(
                     "WebSocket stream ended",
                 ));
             }
@@ -253,19 +279,25 @@ where
     }
 }
 
-/// Establishes the initial WebSocket connection.
+/// Establishes the initial WebSocket connection with a timeout.
 async fn connect(
     config: &ConnectionConfiguration,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ConnectionError> {
-    match connect_async(&config.url).await {
-        Ok((stream, response)) => {
+    let result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(&config.url)).await;
+
+    match result {
+        Err(_elapsed) => {
+            error!("WebSocket connection timed out");
+            Err(ConnectionError::new("Connection timed out"))
+        }
+        Ok(Ok((stream, response))) => {
             info!(
                 status = %response.status(),
                 "WebSocket connected"
             );
             Ok(stream)
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             error!(error = %error, "WebSocket connection failed");
             Err(ConnectionError::new(format!(
                 "Connection failed: {}",

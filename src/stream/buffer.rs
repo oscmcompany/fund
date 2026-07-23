@@ -111,6 +111,8 @@ impl<T> fmt::Display for PublishError<T> {
     }
 }
 
+impl<T: fmt::Debug> std::error::Error for PublishError<T> {}
+
 /// A subscriber to a [`MarketDataBuffer`].
 ///
 /// Wraps a [`broadcast::Receiver`] and handles lag errors transparently
