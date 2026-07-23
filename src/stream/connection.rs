@@ -33,7 +33,7 @@ const BACKOFF_MULTIPLIER: u32 = 2;
 
 /// Configuration for a WebSocket connection.
 #[derive(Debug, Clone)]
-pub struct ConnectionConfig {
+pub struct ConnectionConfiguration {
     /// WebSocket URL to connect to (e.g., `wss://stream.example.com/v1`).
     pub url: String,
 
@@ -42,7 +42,7 @@ pub struct ConnectionConfig {
     pub startup_messages: Vec<String>,
 }
 
-impl ConnectionConfig {
+impl ConnectionConfiguration {
     /// Creates a new connection configuration.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
@@ -104,7 +104,7 @@ impl std::error::Error for ConnectionError {}
 /// to continue receiving or `false` to close the connection (e.g., if the
 /// server sends a terminal message).
 pub async fn run_connection<F>(
-    config: &ConnectionConfig,
+    config: &ConnectionConfiguration,
     shutdown_token: &CancellationToken,
     mut handler: F,
 ) where
@@ -165,7 +165,7 @@ pub enum MessagePayload {
 /// Returns [`SessionOutcome::Shutdown`] if the cancellation token fires,
 /// or [`SessionOutcome::Disconnected`] if the connection drops or errors.
 async fn connect_and_run<F>(
-    config: &ConnectionConfig,
+    config: &ConnectionConfiguration,
     shutdown_token: &CancellationToken,
     handler: &mut F,
 ) -> SessionOutcome
@@ -255,7 +255,7 @@ where
 
 /// Establishes the initial WebSocket connection.
 async fn connect(
-    config: &ConnectionConfig,
+    config: &ConnectionConfiguration,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, ConnectionError> {
     match connect_async(&config.url).await {
         Ok((stream, response)) => {
@@ -281,14 +281,14 @@ mod tests {
 
     #[test]
     fn test_connection_config_new() {
-        let config = ConnectionConfig::new("wss://example.com/v1");
+        let config = ConnectionConfiguration::new("wss://example.com/v1");
         assert_eq!(config.url, "wss://example.com/v1");
         assert!(config.startup_messages.is_empty());
     }
 
     #[test]
     fn test_connection_config_with_startup_messages() {
-        let config = ConnectionConfig::new("wss://example.com/v1")
+        let config = ConnectionConfiguration::new("wss://example.com/v1")
             .with_startup_message(r#"{"action":"auth","key":"test"}"#)
             .with_startup_message(r#"{"action":"subscribe","quotes":["AAPL"]}"#);
 
@@ -347,7 +347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_connection_exits_on_immediate_shutdown() {
-        let config = ConnectionConfig::new("wss://localhost:1/nonexistent");
+        let config = ConnectionConfiguration::new("wss://localhost:1/nonexistent");
         let token = CancellationToken::new();
         token.cancel();
 
@@ -368,14 +368,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_to_invalid_url_returns_error() {
-        let config = ConnectionConfig::new("wss://localhost:1/nonexistent");
+        let config = ConnectionConfiguration::new("wss://localhost:1/nonexistent");
         let result = connect(&config).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_connect_and_run_with_cancelled_token() {
-        let config = ConnectionConfig::new("wss://localhost:1/nonexistent");
+        let config = ConnectionConfiguration::new("wss://localhost:1/nonexistent");
         let token = CancellationToken::new();
         token.cancel();
 
