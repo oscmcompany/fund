@@ -179,7 +179,7 @@ pub async fn run_connection<F>(
 }
 
 /// The payload extracted from a WebSocket message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessagePayload {
     /// UTF-8 text message.
     Text(String),
