@@ -382,7 +382,7 @@ in {
     export AWS_S3_BUCKET_NAME="$1"
     echo "Opening DuckDB lab (bucket: $AWS_S3_BUCKET_NAME)"
 
-    exec duckdb ~/lab.duckdb -init tools/lab_initialization.sql
+    exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
 
   scripts.trigger-rebalance.exec = ''
@@ -767,6 +767,8 @@ in {
       echo "    list-aws-secrets            List fund secrets in AWS"
       echo "    trigger-rebalance           Emit an intraday_check event"
       echo "                                manually"
+      echo "    start-duckdb                Open DuckDB with S3 data lake"
+      echo "                                views pre-loaded (pass bucket name)"
       echo "    bump-rust-dependencies      Update all dependency lockfiles"
       echo ""
       echo "  Tasks (devenv tasks run <name>):"
@@ -786,8 +788,6 @@ in {
       echo "                                arguments for usage)"
       echo "    data:equity-details         Seed equity details (run without"
       echo "                                arguments for usage)"
-      echo "    start-duckdb                Open DuckDB with S3 data lake"
-      echo "                                views pre-loaded (pass bucket name)"
       echo "    models:tide:train           Train TiDE model and upload"
       echo "                                artifacts"
     } >&2

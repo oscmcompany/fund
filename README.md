@@ -50,10 +50,9 @@ ssh oscm-fund-production-trainer.vm.exe.dev
 start-trainer
 
 # Launch DuckDB for a local query interface against S3 with all data lake views
-# pre-loaded, list available commands, and list available views.
+# pre-loaded. Once in the DuckDB shell, run .help for commands and SHOW TABLES
+# to list loaded views.
 start-duckdb oscm-fund-production
-.help
-SHOW TABLES;
 ```
 
 > For development VMs, run the equivalent `development` scripts.

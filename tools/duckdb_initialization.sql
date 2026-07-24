@@ -1,11 +1,12 @@
--- DuckDB lab initialization script
+-- DuckDB initialization script
 --
--- Loaded automatically by the lab-duckdb devenv script. Creates read-only views
--- over the S3 data lake so production and export data is queryable immediately.
+-- Loaded automatically by the start-duckdb devenv script. Creates read-only
+-- views over the S3 data lake so production and export data is queryable
+-- immediately.
 --
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
---   - AWS_S3_BUCKET_NAME set (lab-duckdb passes the bucket argument)
+--   - AWS_S3_BUCKET_NAME set (start-duckdb passes the bucket argument)
 
 INSTALL aws;
 LOAD aws;
@@ -22,6 +23,7 @@ SET VARIABLE bucket = getenv('AWS_S3_BUCKET_NAME');
 -- ---------------------------------------------------------------------------
 
 .print 'Loading equity_bars...'
+DROP VIEW IF EXISTS equity_bars;
 CREATE OR REPLACE VIEW equity_bars AS
 SELECT *
 FROM read_parquet(
@@ -30,6 +32,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_quotes...'
+DROP VIEW IF EXISTS equity_quotes;
 CREATE OR REPLACE VIEW equity_quotes AS
 SELECT *
 FROM read_parquet(
@@ -38,6 +41,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_details...'
+DROP VIEW IF EXISTS equity_details;
 CREATE OR REPLACE VIEW equity_details AS
 SELECT *
 FROM read_csv(
@@ -50,6 +54,7 @@ FROM read_csv(
 -- ---------------------------------------------------------------------------
 
 .print 'Loading equity_predictions...'
+DROP VIEW IF EXISTS equity_predictions;
 CREATE OR REPLACE VIEW equity_predictions AS
 SELECT *
 FROM read_parquet(
@@ -58,6 +63,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_rebalance_sessions...'
+DROP VIEW IF EXISTS equity_rebalance_sessions;
 CREATE OR REPLACE VIEW equity_rebalance_sessions AS
 SELECT *
 FROM read_parquet(
@@ -66,6 +72,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_pairs...'
+DROP VIEW IF EXISTS equity_pairs;
 CREATE OR REPLACE VIEW equity_pairs AS
 SELECT *
 FROM read_parquet(
@@ -74,6 +81,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_allocations...'
+DROP VIEW IF EXISTS equity_allocations;
 CREATE OR REPLACE VIEW equity_allocations AS
 SELECT *
 FROM read_parquet(
@@ -82,6 +90,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_orders...'
+DROP VIEW IF EXISTS equity_orders;
 CREATE OR REPLACE VIEW equity_orders AS
 SELECT *
 FROM read_parquet(
@@ -90,6 +99,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_portfolio_snapshots...'
+DROP VIEW IF EXISTS equity_portfolio_snapshots;
 CREATE OR REPLACE VIEW equity_portfolio_snapshots AS
 SELECT *
 FROM read_parquet(
@@ -98,6 +108,7 @@ FROM read_parquet(
 );
 
 .print 'Loading model_runs...'
+DROP VIEW IF EXISTS model_runs;
 CREATE OR REPLACE VIEW model_runs AS
 SELECT *
 FROM read_parquet(
@@ -106,6 +117,7 @@ FROM read_parquet(
 );
 
 .print 'Loading equity_reconciliation_events...'
+DROP VIEW IF EXISTS equity_reconciliation_events;
 CREATE OR REPLACE VIEW equity_reconciliation_events AS
 SELECT *
 FROM read_parquet(
@@ -114,5 +126,5 @@ FROM read_parquet(
 );
 
 .print ''
-.print 'Lab initialized. Views with errors above were skipped (no data in S3).'
+.print 'DuckDB initialized. Views with errors above were skipped (no data in S3).'
 .print 'Run .help for DuckDB commands, SHOW TABLES to list loaded views.'
