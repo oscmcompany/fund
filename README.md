@@ -48,6 +48,12 @@ ssh exe.dev publish oscm-fund-production-application 8084:8084
 provision-production-trainer-vm
 ssh oscm-fund-production-trainer.vm.exe.dev
 start-trainer
+
+# Launch DuckDB for a local query interface against S3 with all data lake views
+# pre-loaded, list available commands, and list available views.
+start-duckdb oscm-fund-production
+.help
+SHOW TABLES;
 ```
 
 > For development VMs, run the equivalent `development` scripts.
@@ -59,6 +65,7 @@ start-trainer
 - Dashboard is available at `http://<vm-name>.vm.exe.dev:8084`
 - Git sync checks for updates every minute; view logs at `/var/log/fund/sync-application.log`
 - Training runs weekdays at 06:00 UTC; view logs at `/var/log/fund/train-tide-model.log`
+- The local `~/lab.duckdb` file is scratch space. It can be deleted and rebuilt from S3 at any time.
 
 ### Principles
 

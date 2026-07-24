@@ -2,3 +2,4 @@
 target/
 .venv/
 models/tide/.devenv/
+tools/lab_initialization.sql
