@@ -12,6 +12,7 @@ pub mod math;
 pub mod rebalance;
 pub mod reconciliation;
 pub mod regime;
+pub mod risk_gate;
 pub mod sizing;
 pub mod state;
 pub mod statistical_arbitrage;
