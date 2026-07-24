@@ -16,6 +16,9 @@ use crate::domain::portfolio::{
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
 use crate::portfolio::alpaca::{TradableAssets, Trading, TradingClient};
+use crate::portfolio::risk_gate::{
+    MarginUtilizationLimit, MaximumParticipationRate, RiskGateConfiguration, StrategyId,
+};
 use crate::portfolio::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
@@ -32,6 +35,15 @@ const DEFAULT_BETA_TOLERANCE: f64 = 0.10;
 
 /// Default confidence floor: signals below 50% confidence are excluded.
 const DEFAULT_CONFIDENCE_FLOOR: f64 = 0.50;
+
+/// Default margin utilization limit: halt new entries when 80% of buying power is consumed.
+const DEFAULT_MARGIN_UTILIZATION_LIMIT: f64 = 0.80;
+
+/// Default strategy budget for statistical arbitrage: 100% (only strategy currently).
+const DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE: f64 = 1.0;
+
+/// Default maximum participation rate: 5% of remaining session volume for exit feasibility.
+const DEFAULT_MAXIMUM_PARTICIPATION_RATE: f64 = 0.05;
 
 /// Error returned when `AppState::from_env()` cannot read required configuration.
 #[derive(Debug)]
@@ -90,6 +102,48 @@ fn env_usize(key: &str, default: usize) -> Result<usize, ConfigError> {
     }
 }
 
+/// Builds a `RiskGateConfiguration` from environment variables with safe defaults.
+fn build_risk_gate_configuration(
+    concentration_cap: ConcentrationCap,
+) -> Result<RiskGateConfiguration, ConfigError> {
+    let margin_utilization_limit = Percent::new(env_f64(
+        "PORTFOLIO_MARGIN_UTILIZATION_LIMIT",
+        DEFAULT_MARGIN_UTILIZATION_LIMIT,
+    )?)
+    .map(MarginUtilizationLimit::new)
+    .map_err(|_| ConfigError {
+        message: "PORTFOLIO_MARGIN_UTILIZATION_LIMIT must be a fraction in [0, 1]".to_string(),
+    })?;
+
+    let strategy_budget_stat_arb = Percent::new(env_f64(
+        "PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE",
+        DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE,
+    )?)
+    .map_err(|_| ConfigError {
+        message: "PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE must be a fraction in [0, 1]"
+            .to_string(),
+    })?;
+
+    let maximum_participation_rate = Percent::new(env_f64(
+        "PORTFOLIO_MAXIMUM_PARTICIPATION_RATE",
+        DEFAULT_MAXIMUM_PARTICIPATION_RATE,
+    )?)
+    .map(MaximumParticipationRate::new)
+    .map_err(|_| ConfigError {
+        message: "PORTFOLIO_MAXIMUM_PARTICIPATION_RATE must be a fraction in [0, 1]".to_string(),
+    })?;
+
+    let mut strategy_budgets = std::collections::HashMap::new();
+    strategy_budgets.insert(StrategyId::StatisticalArbitrage, strategy_budget_stat_arb);
+
+    Ok(RiskGateConfiguration {
+        margin_utilization_limit,
+        concentration_cap,
+        strategy_budgets,
+        maximum_participation_rate,
+    })
+}
+
 /// Shared application state for the portfolio module.
 ///
 /// Constructed once at startup via `from_env()`. A value of this type proves
@@ -116,6 +170,8 @@ pub struct AppState {
     /// an upstream crash that never emits `equity_predictions_completed` or
     /// `equity_predictions_errored`.
     rebalance_cycle_started_at: Arc<AtomicI64>,
+    /// Pre-trade risk gate configuration for position request validation.
+    risk_gate_configuration: RiskGateConfiguration,
     /// Number of statistical-arbitrage candidate pairs to consider per rebalance.
     /// Decoupled from the required minimum (`constraints.minimum_pairs`) so a
     /// larger pool can absorb sizing attrition. Override per environment with
@@ -147,6 +203,11 @@ impl AppState {
     /// Returns a reference to the portfolio constraints.
     pub fn constraints(&self) -> &Constraints {
         &self.constraints
+    }
+
+    /// Returns the pre-trade risk gate configuration.
+    pub fn risk_gate_configuration(&self) -> &RiskGateConfiguration {
+        &self.risk_gate_configuration
     }
 
     /// Returns the shared tradable asset cache.
@@ -249,6 +310,8 @@ impl AppState {
         let candidate_pool_count = env_usize("PORTFOLIO_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL)?
             .max(minimum_pairs.0.get() as usize);
 
+        let risk_gate_configuration = build_risk_gate_configuration(concentration_cap)?;
+
         Ok(Self {
             pool,
             alpaca_client,
@@ -259,6 +322,7 @@ impl AppState {
                 minimum_pairs,
                 beta_tolerance,
             ),
+            risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
             rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
             rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
@@ -352,6 +416,8 @@ impl AppState {
         let candidate_pool_count = env_usize("PORTFOLIO_CANDIDATE_POOL", DEFAULT_CANDIDATE_POOL)?
             .max(minimum_pairs.0.get() as usize);
 
+        let risk_gate_configuration = build_risk_gate_configuration(concentration_cap)?;
+
         Ok(Self {
             pool,
             alpaca_client,
@@ -362,6 +428,7 @@ impl AppState {
                 minimum_pairs,
                 beta_tolerance,
             ),
+            risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
             rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
             rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
@@ -385,6 +452,22 @@ impl AppState {
         let confidence_floor = ConfidenceFloor(Percent::new(DEFAULT_CONFIDENCE_FLOOR).unwrap());
         let candidate_pool_count = DEFAULT_CANDIDATE_POOL.max(DEFAULT_MINIMUM_PAIRS as usize);
 
+        let mut strategy_budgets = std::collections::HashMap::new();
+        strategy_budgets.insert(
+            StrategyId::StatisticalArbitrage,
+            Percent::new(DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE).unwrap(),
+        );
+        let risk_gate_configuration = RiskGateConfiguration {
+            margin_utilization_limit: MarginUtilizationLimit::new(
+                Percent::new(DEFAULT_MARGIN_UTILIZATION_LIMIT).unwrap(),
+            ),
+            concentration_cap,
+            strategy_budgets,
+            maximum_participation_rate: MaximumParticipationRate::new(
+                Percent::new(DEFAULT_MAXIMUM_PARTICIPATION_RATE).unwrap(),
+            ),
+        };
+
         Self {
             pool,
             alpaca_client: client,
@@ -395,6 +478,7 @@ impl AppState {
                 minimum_pairs,
                 beta_tolerance,
             ),
+            risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
             rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
             rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
@@ -419,6 +503,10 @@ mod tests {
         let original_confidence = env::var("PORTFOLIO_CONFIDENCE_FLOOR").ok();
         let original_beta = env::var("PORTFOLIO_BETA_TOLERANCE").ok();
         let original_candidate_pool = env::var("PORTFOLIO_CANDIDATE_POOL").ok();
+        let original_margin_limit = env::var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT").ok();
+        let original_stat_arb_budget =
+            env::var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE").ok();
+        let original_max_participation = env::var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE").ok();
 
         unsafe {
             env::set_var("ALPACA_API_KEY_ID", "test-key");
@@ -430,6 +518,9 @@ mod tests {
             env::remove_var("PORTFOLIO_CONFIDENCE_FLOOR");
             env::remove_var("PORTFOLIO_BETA_TOLERANCE");
             env::remove_var("PORTFOLIO_CANDIDATE_POOL");
+            env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT");
+            env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE");
+            env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE");
         }
 
         let pool = sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/test").unwrap();
@@ -477,6 +568,20 @@ mod tests {
             match original_candidate_pool {
                 Some(value) => env::set_var("PORTFOLIO_CANDIDATE_POOL", value),
                 None => env::remove_var("PORTFOLIO_CANDIDATE_POOL"),
+            }
+            match original_margin_limit {
+                Some(value) => env::set_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT", value),
+                None => env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT"),
+            }
+            match original_stat_arb_budget {
+                Some(value) => {
+                    env::set_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE", value)
+                }
+                None => env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE"),
+            }
+            match original_max_participation {
+                Some(value) => env::set_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE", value),
+                None => env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE"),
             }
         }
     }
@@ -685,5 +790,129 @@ mod tests {
         let result = env_usize("PORTFOLIO_TEST_WHITESPACE_USIZE", 0).unwrap();
         unsafe { env::remove_var("PORTFOLIO_TEST_WHITESPACE_USIZE") };
         assert_eq!(result, 42);
+    }
+
+    // --- Risk gate configuration tests ---
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_risk_gate_configuration_defaults() {
+        unsafe {
+            env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT");
+            env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE");
+            env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE");
+        }
+
+        let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
+        let config = build_risk_gate_configuration(concentration_cap).unwrap();
+
+        assert!(
+            (config.margin_utilization_limit.value() - DEFAULT_MARGIN_UTILIZATION_LIMIT).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (config.maximum_participation_rate.value() - DEFAULT_MAXIMUM_PARTICIPATION_RATE).abs()
+                < f64::EPSILON
+        );
+        assert!((config.concentration_cap.0.value() - 0.20).abs() < f64::EPSILON);
+
+        let stat_arb_budget = config
+            .strategy_budgets
+            .get(&StrategyId::StatisticalArbitrage)
+            .unwrap();
+        assert!(
+            (stat_arb_budget.value() - DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE).abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_risk_gate_configuration_overrides() {
+        unsafe {
+            env::set_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT", "0.60");
+            env::set_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE", "0.75");
+            env::set_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE", "0.10");
+        }
+
+        let concentration_cap = ConcentrationCap(Percent::new(0.25).unwrap());
+        let config = build_risk_gate_configuration(concentration_cap).unwrap();
+
+        assert!((config.margin_utilization_limit.value() - 0.60).abs() < f64::EPSILON);
+        assert!((config.maximum_participation_rate.value() - 0.10).abs() < f64::EPSILON);
+        assert!((config.concentration_cap.0.value() - 0.25).abs() < f64::EPSILON);
+
+        let stat_arb_budget = config
+            .strategy_budgets
+            .get(&StrategyId::StatisticalArbitrage)
+            .unwrap();
+        assert!((stat_arb_budget.value() - 0.75).abs() < f64::EPSILON);
+
+        unsafe {
+            env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT");
+            env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE");
+            env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_risk_gate_configuration_invalid_margin_limit_rejects() {
+        unsafe { env::set_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT", "1.5") };
+
+        let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
+        let result = build_risk_gate_configuration(concentration_cap);
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("PORTFOLIO_MARGIN_UTILIZATION_LIMIT"));
+
+        unsafe { env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_risk_gate_configuration_invalid_participation_rate_rejects() {
+        unsafe { env::set_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE", "-0.1") };
+
+        let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
+        let result = build_risk_gate_configuration(concentration_cap);
+        assert!(result.is_err());
+
+        unsafe { env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_risk_gate_configuration_invalid_strategy_budget_rejects() {
+        unsafe { env::set_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE", "2.0") };
+
+        let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
+        let result = build_risk_gate_configuration(concentration_cap);
+        assert!(result.is_err());
+
+        unsafe { env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE") };
+    }
+
+    #[tokio::test]
+    async fn test_with_mock_includes_risk_gate_configuration() {
+        let pool = sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/test").unwrap();
+        let mock = Arc::new(crate::portfolio::alpaca::MockTrading::default());
+        let state = AppState::with_mock(pool, mock);
+
+        let config = state.risk_gate_configuration();
+        assert!(
+            (config.margin_utilization_limit.value() - DEFAULT_MARGIN_UTILIZATION_LIMIT).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (config.maximum_participation_rate.value() - DEFAULT_MAXIMUM_PARTICIPATION_RATE).abs()
+                < f64::EPSILON
+        );
+        assert!(config
+            .strategy_budgets
+            .contains_key(&StrategyId::StatisticalArbitrage));
     }
 }
