@@ -113,10 +113,10 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     // durable signals are responsible for crossing the event boundary via
     // emit_event().
     //
-    // Lifecycle: created here at startup, lives for the process duration.
-    // On shutdown, task handles are joined first (draining all consumers),
-    // then this Arc is dropped, which closes the broadcast channel and
-    // causes any remaining subscribers' receive() to return None.
+    // Lifecycle: the broadcast channel closes when all senders are dropped.
+    // Currently no Arc clones are distributed to tasks, so the channel
+    // closes when this binding goes out of scope at the end of run(),
+    // after all task handles have been joined.
     let market_data_buffer: Arc<MarketDataBuffer<MessagePayload>> =
         Arc::new(MarketDataBuffer::new());
     info!(

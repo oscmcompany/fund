@@ -40,9 +40,9 @@ const DEFAULT_RATE: u64 = 1000;
 const DEFAULT_DURATION_SECONDS: u64 = 30;
 const DEFAULT_BATCH_SIZE: u64 = 100;
 
-/// The synthetic event type used for stress testing. Reuses an existing variant
-/// so no schema changes are needed. Events are cleaned up after the test.
-const STRESS_TEST_EVENT_TYPE: EventType = EventType::MarketSessionCheck;
+/// Dedicated variant for stress testing. Uses a text column so no schema
+/// migration needed. Events are cleaned up after the test.
+const STRESS_TEST_EVENT_TYPE: EventType = EventType::StressTest;
 
 #[derive(Debug)]
 struct Arguments {
@@ -191,7 +191,28 @@ async fn main() {
 
     info!("Connected to PostgreSQL");
 
-    if let Err(error) = run_stress_test(&pool, &arguments).await {
+    let test_result = run_stress_test(&pool, &arguments).await;
+
+    // Always clean up synthetic events, even if the test failed.
+    println!("\n--- Cleanup ---");
+    let deleted = sqlx::query_scalar::<_, i64>(
+        "WITH deleted AS (
+            DELETE FROM events
+            WHERE event_type = $1
+              AND payload @> '{\"stress_test\": true}'::jsonb
+            RETURNING 1
+        ) SELECT COUNT(*) FROM deleted",
+    )
+    .bind(STRESS_TEST_EVENT_TYPE.as_str())
+    .fetch_one(&pool)
+    .await;
+
+    match deleted {
+        Ok(count) => println!("Cleaned up {} stress test events", count),
+        Err(error) => eprintln!("Warning: cleanup failed: {}", error),
+    }
+
+    if let Err(error) = test_result {
         error!(error = %error, "Stress test failed");
         eprintln!("Stress test failed: {}", error);
         std::process::exit(1);
@@ -207,6 +228,13 @@ async fn run_stress_test(
 
     let total_messages = arguments.rate * arguments.duration_seconds;
     let batch_count = total_messages / arguments.batch_size;
+    if batch_count == 0 {
+        return Err(format!(
+            "Total events ({}) is less than batch size ({}). Reduce --batch-size or increase --rate/--duration.",
+            total_messages, arguments.batch_size
+        )
+        .into());
+    }
     let interval_per_batch =
         Duration::from_secs_f64(arguments.batch_size as f64 / arguments.rate as f64);
 
@@ -282,11 +310,16 @@ async fn run_stress_test(
             tokio::select! {
                 result = listener.recv() => {
                     match result {
-                        Ok(_notification) => {
-                            if let Ok(sent_at) = receiver.try_recv() {
-                                latencies.push(sent_at.elapsed());
-                                if latencies.len() as u64 >= notify_count {
-                                    break;
+                        Ok(notification) => {
+                            // Filter: only process our probe notifications.
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(notification.payload()) {
+                                if parsed.get("notify_latency_probe").and_then(|value| value.as_bool()) == Some(true) {
+                                    if let Some(sent_at) = receiver.recv().await {
+                                        latencies.push(sent_at.elapsed());
+                                        if latencies.len() as u64 >= notify_count {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -312,13 +345,13 @@ async fn run_stress_test(
     // Emit events one at a time, recording send timestamps.
     for _ in 0..notify_count {
         let sent_at = Instant::now();
+        let _ = sender.send(sent_at).await;
         let payload = serde_json::json!({
             "stress_test": true,
             "notify_latency_probe": true,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
         emit_event(pool, STRESS_TEST_EVENT_TYPE, &payload).await?;
-        let _ = sender.send(sent_at).await;
         // Small delay between probes to avoid batching effects.
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -331,23 +364,6 @@ async fn run_stress_test(
     } else {
         println!("  No NOTIFY latencies recorded");
     }
-
-    // --- Cleanup ---
-    println!("\n--- Cleanup ---");
-
-    let deleted = sqlx::query_scalar::<_, i64>(
-        "WITH deleted AS (
-            DELETE FROM events
-            WHERE event_type = $1
-              AND payload @> '{\"stress_test\": true}'::jsonb
-            RETURNING 1
-        ) SELECT COUNT(*) FROM deleted",
-    )
-    .bind(STRESS_TEST_EVENT_TYPE.as_str())
-    .fetch_one(pool)
-    .await?;
-
-    println!("Cleaned up {} stress test events", deleted);
 
     println!("\n--- Summary ---");
     println!("  Target rate: {} events/sec", arguments.rate);

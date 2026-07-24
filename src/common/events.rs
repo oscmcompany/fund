@@ -83,6 +83,10 @@ pub enum EventType {
     PortfolioLiquidationCompleted,
     /// portfolio: liquidation encountered an error.
     PortfolioLiquidationErrored,
+
+    // --- Stress testing ---
+    /// Dedicated variant for the event bus stress test binary.
+    StressTest,
 }
 
 impl EventType {
@@ -117,6 +121,7 @@ impl EventType {
             Self::PortfolioLiquidationStarted => "portfolio_liquidation_started",
             Self::PortfolioLiquidationCompleted => "portfolio_liquidation_completed",
             Self::PortfolioLiquidationErrored => "portfolio_liquidation_errored",
+            Self::StressTest => "stress_test",
         }
     }
 
@@ -151,6 +156,7 @@ impl EventType {
             "portfolio_liquidation_started" => Some(Self::PortfolioLiquidationStarted),
             "portfolio_liquidation_completed" => Some(Self::PortfolioLiquidationCompleted),
             "portfolio_liquidation_errored" => Some(Self::PortfolioLiquidationErrored),
+            "stress_test" => Some(Self::StressTest),
             _ => None,
         }
     }
@@ -359,6 +365,7 @@ mod tests {
             EventType::PortfolioLiquidationStarted,
             EventType::PortfolioLiquidationCompleted,
             EventType::PortfolioLiquidationErrored,
+            EventType::StressTest,
         ];
         for &event_type in all {
             assert_eq!(
@@ -585,6 +592,7 @@ mod tests {
                 EventType::PortfolioLiquidationErrored,
                 "portfolio_liquidation_errored",
             ),
+            (EventType::StressTest, "stress_test"),
         ];
         for (event_type, expected) in cases {
             assert_eq!(
@@ -628,6 +636,7 @@ mod tests {
             EventType::PortfolioLiquidationStarted,
             EventType::PortfolioLiquidationCompleted,
             EventType::PortfolioLiquidationErrored,
+            EventType::StressTest,
         ];
         for event_type in all {
             assert_eq!(

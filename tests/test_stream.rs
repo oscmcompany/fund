@@ -127,15 +127,15 @@ async fn test_buffer_message_payload_lifecycle() {
         .publish(MessagePayload::Binary(vec![1, 2, 3]))
         .unwrap();
 
-    match subscriber.receive().await {
-        Some(MessagePayload::Text(text)) => assert_eq!(text, "market data"),
-        other => panic!("Expected Text, got {:?}", other),
-    }
+    assert_eq!(
+        subscriber.receive().await,
+        Some(MessagePayload::Text("market data".to_string()))
+    );
 
-    match subscriber.receive().await {
-        Some(MessagePayload::Binary(data)) => assert_eq!(data, vec![1, 2, 3]),
-        other => panic!("Expected Binary, got {:?}", other),
-    }
+    assert_eq!(
+        subscriber.receive().await,
+        Some(MessagePayload::Binary(vec![1, 2, 3]))
+    );
 
     drop(buffer);
     assert_eq!(subscriber.receive().await, None);
