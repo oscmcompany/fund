@@ -29,6 +29,11 @@ path = "src/bin/dashboard.rs"
 required-features = ["dashboard"]
 
 [[bin]]
+name = "stress_test_events"
+path = "src/bin/stress_test_events.rs"
+required-features = ["stress-test"]
+
+[[bin]]
 name = "fund"
 path = "src/bin/fund.rs"
 required-features = ["data", "inference", "portfolio", "stream"]
@@ -40,6 +45,7 @@ inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
 portfolio = ["dep:chrono-tz"]
 stream = ["dep:tokio-tungstenite", "dep:futures-util"]
 dashboard = ["dep:axum"]
+stress-test = []
 
 # Rust-native TiDE training. Reuses the inference model/data/predict code
 # and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`

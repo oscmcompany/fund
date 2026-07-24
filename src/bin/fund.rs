@@ -112,6 +112,11 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     // and is never written to PostgreSQL. Downstream consumers that detect
     // durable signals are responsible for crossing the event boundary via
     // emit_event().
+    //
+    // Lifecycle: the broadcast channel closes when all senders are dropped.
+    // Currently no Arc clones are distributed to tasks, so the channel
+    // closes when this binding goes out of scope at the end of run(),
+    // after all task handles have been joined.
     let market_data_buffer: Arc<MarketDataBuffer<MessagePayload>> =
         Arc::new(MarketDataBuffer::new());
     info!(
