@@ -367,6 +367,24 @@ in {
     echo "  git diff Cargo.lock"
   '';
 
+  scripts.start-duckdb.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${1:-}" ]; then
+      echo "Usage: start-duckdb <bucket-name>" >&2
+      echo "" >&2
+      echo "Examples:" >&2
+      echo "  start-duckdb oscm-fund-production" >&2
+      echo "  start-duckdb oscm-fund-development-john-forstmeier" >&2
+      exit 1
+    fi
+
+    export AWS_S3_BUCKET_NAME="$1"
+    echo "Opening DuckDB lab (bucket: $AWS_S3_BUCKET_NAME)"
+
+    exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
+  '';
+
   scripts.trigger-rebalance.exec = ''
     psql -h localhost -p 5432 -d fund -c "SELECT emit_event('intraday_check',
     '{}')"
@@ -598,6 +616,8 @@ in {
       ${applySchema}
     '';
 
+    # --- Lab tasks ---
+
     "checks:base" = {
       exec = ''
         echo "All base checks passed"
@@ -747,6 +767,8 @@ in {
       echo "    list-aws-secrets            List fund secrets in AWS"
       echo "    trigger-rebalance           Emit an intraday_check event"
       echo "                                manually"
+      echo "    start-duckdb                Open DuckDB with S3 data lake"
+      echo "                                views pre-loaded (pass bucket name)"
       echo "    bump-rust-dependencies      Update all dependency lockfiles"
       echo ""
       echo "  Tasks (devenv tasks run <name>):"
