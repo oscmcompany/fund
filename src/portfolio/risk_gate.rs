@@ -184,6 +184,8 @@ pub enum RejectionReason {
     OutsideTradingSession,
     /// Strategy has no allocated budget.
     StrategyNotAllocated { strategy: StrategyId },
+    /// Position request contains invalid values (negative, zero, or non-finite notional).
+    InvalidRequest { reason: String },
 }
 
 impl std::fmt::Display for RejectionReason {
@@ -241,6 +243,9 @@ impl std::fmt::Display for RejectionReason {
             }
             RejectionReason::StrategyNotAllocated { strategy } => {
                 write!(formatter, "Strategy {strategy} has no allocated budget.")
+            }
+            RejectionReason::InvalidRequest { reason } => {
+                write!(formatter, "Invalid position request: {reason}.")
             }
         }
     }
@@ -428,15 +433,10 @@ fn check_exit_feasibility(
         return Some(RejectionReason::OutsideTradingSession);
     }
 
+    // minutes_remaining is always >= 1 here because is_within_trading_session_at
+    // uses end-exclusive range [9:30, 16:00), so passing that check guarantees
+    // at least one minute remains.
     let minutes_remaining = minutes_remaining_in_session(now);
-    if minutes_remaining == 0 {
-        return Some(RejectionReason::ExitFeasibilityInsufficient {
-            participation_rate: f64::INFINITY,
-            maximum_participation_rate: maximum_participation_rate.value(),
-            minutes_remaining: 0,
-        });
-    }
-
     let remaining_fraction = minutes_remaining as f64 / TOTAL_SESSION_MINUTES as f64;
     let estimated_remaining_volume = liquidity.average_daily_volume_dollars * remaining_fraction;
 
@@ -472,6 +472,17 @@ pub fn evaluate(
     liquidity: &LiquidityMetrics,
     now: DateTime<Utc>,
 ) -> RiskGateDecision {
+    if !request.notional.is_finite() || request.notional <= 0.0 {
+        return RiskGateDecision::Rejected {
+            reasons: vec![RejectionReason::InvalidRequest {
+                reason: format!(
+                    "Notional must be positive and finite, got {}",
+                    request.notional
+                ),
+            }],
+        };
+    }
+
     let mut reasons = Vec::new();
 
     if let Some(reason) =
@@ -1120,6 +1131,78 @@ mod tests {
     fn test_asset_type_display() {
         assert_eq!(format!("{}", AssetType::Equity), "equity");
         assert_eq!(format!("{}", AssetType::Option), "option");
+    }
+
+    #[test]
+    fn test_evaluate_rejects_negative_notional() {
+        let config = default_config();
+        let snapshot = empty_snapshot(100_000.0);
+        let request = PositionRequest {
+            notional: -10_000.0,
+            ..default_request()
+        };
+        let liquidity = default_liquidity();
+        let now = trading_hours();
+        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        match decision {
+            RiskGateDecision::Rejected { reasons } => {
+                assert_eq!(reasons.len(), 1);
+                assert!(matches!(reasons[0], RejectionReason::InvalidRequest { .. }));
+            }
+            RiskGateDecision::Approved => panic!("Expected rejection for negative notional"),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_rejects_zero_notional() {
+        let config = default_config();
+        let snapshot = empty_snapshot(100_000.0);
+        let request = PositionRequest {
+            notional: 0.0,
+            ..default_request()
+        };
+        let liquidity = default_liquidity();
+        let now = trading_hours();
+        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        assert!(!decision.is_approved());
+    }
+
+    #[test]
+    fn test_evaluate_rejects_nan_notional() {
+        let config = default_config();
+        let snapshot = empty_snapshot(100_000.0);
+        let request = PositionRequest {
+            notional: f64::NAN,
+            ..default_request()
+        };
+        let liquidity = default_liquidity();
+        let now = trading_hours();
+        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        assert!(!decision.is_approved());
+    }
+
+    #[test]
+    fn test_evaluate_rejects_infinite_notional() {
+        let config = default_config();
+        let snapshot = empty_snapshot(100_000.0);
+        let request = PositionRequest {
+            notional: f64::INFINITY,
+            ..default_request()
+        };
+        let liquidity = default_liquidity();
+        let now = trading_hours();
+        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        assert!(!decision.is_approved());
+    }
+
+    #[test]
+    fn test_rejection_reason_invalid_request_display() {
+        let reason = RejectionReason::InvalidRequest {
+            reason: "Notional must be positive and finite, got -100".to_string(),
+        };
+        let message = format!("{reason}");
+        assert!(message.contains("Invalid position request"));
+        assert!(message.contains("-100"));
     }
 
     #[test]
