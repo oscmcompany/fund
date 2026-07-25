@@ -115,7 +115,7 @@ fn build_risk_gate_configuration(
         message: "PORTFOLIO_MARGIN_UTILIZATION_LIMIT must be a fraction in [0, 1]".to_string(),
     })?;
 
-    let strategy_budget_stat_arb = Percent::new(env_f64(
+    let strategy_budget_statistical_arbitrage = Percent::new(env_f64(
         "PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE",
         DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE,
     )?)
@@ -134,7 +134,10 @@ fn build_risk_gate_configuration(
     })?;
 
     let mut strategy_budgets = std::collections::HashMap::new();
-    strategy_budgets.insert(StrategyId::StatisticalArbitrage, strategy_budget_stat_arb);
+    strategy_budgets.insert(
+        StrategyId::StatisticalArbitrage,
+        strategy_budget_statistical_arbitrage,
+    );
 
     Ok(RiskGateConfiguration {
         margin_utilization_limit,
@@ -142,6 +145,29 @@ fn build_risk_gate_configuration(
         strategy_budgets,
         maximum_participation_rate,
     })
+}
+
+/// Builds a `RiskGateConfiguration` from compile-time defaults.
+///
+/// Used by test helpers (`with_mock`) that need valid configuration without
+/// reading environment variables.
+#[cfg(test)]
+fn default_risk_gate_configuration(concentration_cap: ConcentrationCap) -> RiskGateConfiguration {
+    let mut strategy_budgets = std::collections::HashMap::new();
+    strategy_budgets.insert(
+        StrategyId::StatisticalArbitrage,
+        Percent::new(DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE).unwrap(),
+    );
+    RiskGateConfiguration {
+        margin_utilization_limit: MarginUtilizationLimit::new(
+            Percent::new(DEFAULT_MARGIN_UTILIZATION_LIMIT).unwrap(),
+        ),
+        concentration_cap,
+        strategy_budgets,
+        maximum_participation_rate: MaximumParticipationRate::new(
+            Percent::new(DEFAULT_MAXIMUM_PARTICIPATION_RATE).unwrap(),
+        ),
+    }
 }
 
 /// Shared application state for the portfolio module.
@@ -452,21 +478,7 @@ impl AppState {
         let confidence_floor = ConfidenceFloor(Percent::new(DEFAULT_CONFIDENCE_FLOOR).unwrap());
         let candidate_pool_count = DEFAULT_CANDIDATE_POOL.max(DEFAULT_MINIMUM_PAIRS as usize);
 
-        let mut strategy_budgets = std::collections::HashMap::new();
-        strategy_budgets.insert(
-            StrategyId::StatisticalArbitrage,
-            Percent::new(DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE).unwrap(),
-        );
-        let risk_gate_configuration = RiskGateConfiguration {
-            margin_utilization_limit: MarginUtilizationLimit::new(
-                Percent::new(DEFAULT_MARGIN_UTILIZATION_LIMIT).unwrap(),
-            ),
-            concentration_cap,
-            strategy_budgets,
-            maximum_participation_rate: MaximumParticipationRate::new(
-                Percent::new(DEFAULT_MAXIMUM_PARTICIPATION_RATE).unwrap(),
-            ),
-        };
+        let risk_gate_configuration = default_risk_gate_configuration(concentration_cap);
 
         Self {
             pool,
@@ -794,9 +806,36 @@ mod tests {
 
     // --- Risk gate configuration tests ---
 
+    /// Saves the three risk-gate env vars, returning their previous values.
+    fn save_risk_gate_env_vars() -> [Option<String>; 3] {
+        [
+            env::var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT").ok(),
+            env::var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE").ok(),
+            env::var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE").ok(),
+        ]
+    }
+
+    /// Restores the three risk-gate env vars from saved values.
+    fn restore_risk_gate_env_vars(saved: [Option<String>; 3]) {
+        let keys = [
+            "PORTFOLIO_MARGIN_UTILIZATION_LIMIT",
+            "PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE",
+            "PORTFOLIO_MAXIMUM_PARTICIPATION_RATE",
+        ];
+        unsafe {
+            for (key, value) in keys.into_iter().zip(saved) {
+                match value {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_build_risk_gate_configuration_defaults() {
+        let saved = save_risk_gate_env_vars();
         unsafe {
             env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT");
             env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE");
@@ -824,11 +863,14 @@ mod tests {
             (stat_arb_budget.value() - DEFAULT_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE).abs()
                 < f64::EPSILON
         );
+
+        restore_risk_gate_env_vars(saved);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_risk_gate_configuration_overrides() {
+        let saved = save_risk_gate_env_vars();
         unsafe {
             env::set_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT", "0.60");
             env::set_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE", "0.75");
@@ -848,16 +890,13 @@ mod tests {
             .unwrap();
         assert!((stat_arb_budget.value() - 0.75).abs() < f64::EPSILON);
 
-        unsafe {
-            env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT");
-            env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE");
-            env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE");
-        }
+        restore_risk_gate_env_vars(saved);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_risk_gate_configuration_invalid_margin_limit_rejects() {
+        let saved = save_risk_gate_env_vars();
         unsafe { env::set_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT", "1.5") };
 
         let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
@@ -869,31 +908,33 @@ mod tests {
             .to_string()
             .contains("PORTFOLIO_MARGIN_UTILIZATION_LIMIT"));
 
-        unsafe { env::remove_var("PORTFOLIO_MARGIN_UTILIZATION_LIMIT") };
+        restore_risk_gate_env_vars(saved);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_risk_gate_configuration_invalid_participation_rate_rejects() {
+        let saved = save_risk_gate_env_vars();
         unsafe { env::set_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE", "-0.1") };
 
         let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
         let result = build_risk_gate_configuration(concentration_cap);
         assert!(result.is_err());
 
-        unsafe { env::remove_var("PORTFOLIO_MAXIMUM_PARTICIPATION_RATE") };
+        restore_risk_gate_env_vars(saved);
     }
 
     #[test]
     #[serial_test::serial]
     fn test_build_risk_gate_configuration_invalid_strategy_budget_rejects() {
+        let saved = save_risk_gate_env_vars();
         unsafe { env::set_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE", "2.0") };
 
         let concentration_cap = ConcentrationCap(Percent::new(0.20).unwrap());
         let result = build_risk_gate_configuration(concentration_cap);
         assert!(result.is_err());
 
-        unsafe { env::remove_var("PORTFOLIO_STRATEGY_BUDGET_STATISTICAL_ARBITRAGE") };
+        restore_risk_gate_env_vars(saved);
     }
 
     #[tokio::test]

@@ -186,7 +186,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     }
 
     // Phase 2: re-fetch state after reconciliation.
-    let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+    let mut alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
         RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
     let open_pairs = fetch_open_pairs(pool).await?;
@@ -219,6 +219,13 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         );
     }
     let pairs_remaining = open_pairs.len() - pairs_closed;
+
+    // Re-fetch positions after exits so the risk gate sees post-exit exposure.
+    if pairs_closed > 0 {
+        alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+            RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
+        })?;
+    }
 
     // Phase 5: drawdown check. Required for both snapshot persistence and entry gating.
     let (current_equity, buying_power) = check_drawdown(
@@ -468,7 +475,7 @@ async fn try_evaluate_entries(
         available_capital,
         exposure_scale,
         state.candidate_pool_count(),
-        required_pairs,
+        vacant_slots,
     )
     .await;
 
@@ -808,8 +815,8 @@ async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
     }
 }
 
-/// Selects candidate pairs, sizes them, applies the risk gate, filters to
-/// shortable tickers, and executes orders.
+/// Selects candidate pairs, sizes them, filters to tradable and shortable
+/// tickers, applies the pre-trade risk gate, and executes approved orders.
 ///
 /// Submitted orders are persisted to the database before polling for fills,
 /// ensuring that a crash between submission and fill confirmation leaves a
@@ -832,12 +839,12 @@ async fn select_size_execute(
     capital: f64,
     exposure_scale: f64,
     candidate_pool: usize,
-    required_pairs: usize,
+    minimum_pairs: usize,
 ) -> Result<Vec<(FilledPair, crate::portfolio::sizing::SizedPair)>, RebalanceError> {
     let candidate_pairs = select_pairs(signals, historical_prices, candidate_pool);
     info!(
         candidates = candidate_pairs.len(),
-        required = required_pairs,
+        minimum = minimum_pairs,
         "Candidate pairs selected"
     );
 
@@ -882,7 +889,7 @@ async fn select_size_execute(
         &market_betas,
         &entry_prices,
         exposure_scale,
-        required_pairs,
+        minimum_pairs,
     )?;
 
     // Resolve the tradable asset universe from the session cache, populating it
@@ -934,45 +941,96 @@ async fn select_size_execute(
         })
         .collect();
 
-    // Build the portfolio snapshot for risk gate evaluation.
-    let snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
+    // Build the portfolio snapshot for risk gate evaluation. The snapshot is
+    // mutated after each approved pair so later candidates see the cumulative
+    // exposure of earlier approvals.
+    let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
     let now_utc = Utc::now();
 
-    // Apply the risk gate to each candidate pair.
-    let eligible_pairs: Vec<_> = tradable_pairs
-        .into_iter()
-        .filter(|pair| {
-            let combined_notional = pair.long_dollar_amount() + pair.short_dollar_amount();
-            // Use the long ticker as the representative for concentration and
-            // exit feasibility. Both legs are evaluated via combined notional.
-            let request = PositionRequest {
-                ticker: pair.long_ticker().to_string(),
-                asset_type: AssetType::Equity,
-                notional: combined_notional,
-                strategy: StrategyId::StatisticalArbitrage,
-            };
-            // Use a conservative ADV estimate: entry price × 1M shares as a
-            // placeholder. A proper ADV data source can be added later.
-            let liquidity = LiquidityMetrics {
-                average_daily_volume_dollars: pair.long_entry_price() * 1_000_000.0,
-            };
-            let decision =
-                risk_gate::evaluate(risk_gate_config, &snapshot, &request, &liquidity, now_utc);
-            match decision {
-                RiskGateDecision::Approved => true,
-                RiskGateDecision::Rejected { reasons } => {
-                    for reason in &reasons {
-                        info!(
-                            pair_id = pair.pair_id().as_str(),
-                            reason = %reason,
-                            "Risk gate rejected pair"
-                        );
-                    }
-                    false
-                }
+    // Apply the risk gate to each candidate pair, evaluating both legs
+    // independently and accumulating approved exposure into the snapshot.
+    let mut eligible_pairs = Vec::new();
+    for pair in tradable_pairs {
+        // Evaluate the long leg.
+        let long_request = PositionRequest {
+            ticker: pair.long_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        // ADV placeholder: entry price × 1M shares. A proper ADV data source
+        // can be added later.
+        let long_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.long_entry_price() * 1_000_000.0,
+        };
+        let long_decision = risk_gate::evaluate(
+            risk_gate_config,
+            &snapshot,
+            &long_request,
+            &long_liquidity,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = long_decision {
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "long",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
             }
-        })
-        .collect();
+            continue;
+        }
+
+        // Temporarily add the approved long leg so the short leg evaluation
+        // sees cumulative exposure.
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.long_ticker().to_string(),
+            market_value_absolute: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        // Evaluate the short leg against the updated snapshot.
+        let short_request = PositionRequest {
+            ticker: pair.short_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        let short_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.short_entry_price() * 1_000_000.0,
+        };
+        let short_decision = risk_gate::evaluate(
+            risk_gate_config,
+            &snapshot,
+            &short_request,
+            &short_liquidity,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = short_decision {
+            // Roll back the tentatively added long leg.
+            snapshot.positions.pop();
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "short",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
+            }
+            continue;
+        }
+
+        // Both legs approved — add the short leg to the snapshot so
+        // subsequent candidates see the full cumulative exposure.
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.short_ticker().to_string(),
+            market_value_absolute: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        eligible_pairs.push(pair);
+    }
 
     let pending = execute_open_pairs(alpaca, pool, &eligible_pairs).await;
 
@@ -991,7 +1049,7 @@ async fn select_size_execute(
         return Err(RebalanceError::InsufficientPairs(
             SizingError::InsufficientPairs {
                 found: 0,
-                required: required_pairs,
+                required: minimum_pairs,
             },
         ));
     }
