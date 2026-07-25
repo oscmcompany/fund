@@ -1,16 +1,18 @@
 //! Main rebalance orchestration pipeline.
 //!
-//! `run_rebalance` follows a build-then-monitor model:
-//! - **Build** (no open pairs): full portfolio construction with invariant validation
-//! - **Monitor** (open pairs exist): evaluate each pair for close signals, close triggered
-//!   ones, leave vacant slots unfilled
+//! `run_rebalance` runs a unified evaluation pass on every cycle:
+//! 1. **Exit evaluation**: check each open pair for close signals (convergence, stop-loss),
+//!    close triggered pairs on Alpaca and in the database.
+//! 2. **Entry evaluation**: if vacant pair slots exist and market conditions allow (fresh
+//!    predictions, non-trending regime), select, size, risk-gate, and execute new pairs
+//!    using available capital proportional to the number of vacant slots.
 //!
 //! Key functions:
-//! 1. `fetch_market_data` — load predictions and price history from the database
-//! 2. `evaluate_open_pairs` — check each open pair for close signals (convergence, stop-loss)
-//! 3. `close_triggered_pairs` — close only pairs that hit a signal on Alpaca and in the DB
-//! 4. `check_drawdown` — gate on account equity vs previous NAV
-//! 5. `select_size_execute` — select, size, and execute new pairs (build path only)
+//! 1. `evaluate_open_pairs` — check each open pair for close signals
+//! 2. `close_triggered_pairs` — close only pairs that hit a signal
+//! 3. `check_drawdown` — gate on account equity vs previous NAV
+//! 4. `try_evaluate_entries` — load predictions, check regime, run entry pipeline
+//! 5. `select_size_execute` — select, size, risk-gate, and execute new pairs
 //! 6. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
 
 use std::collections::HashMap;
@@ -34,7 +36,6 @@ use crate::common::events::{emit_event, EventType};
 use crate::domain::market::Ticker;
 use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
-use crate::domain::predictions::EquityPrediction;
 use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
@@ -55,6 +56,10 @@ use crate::portfolio::execution::{
 use crate::portfolio::math::z_score_last;
 use crate::portfolio::reconciliation;
 use crate::portfolio::regime::classify_regime;
+use crate::portfolio::risk_gate::{
+    self, AssetType, LiquidityMetrics, PortfolioSnapshot, PositionRequest, PositionSnapshot,
+    RiskGateDecision, StrategyId,
+};
 use crate::portfolio::sizing::{size_pairs_with_volatility_parity, SizingError};
 use crate::portfolio::state::AppState;
 use crate::portfolio::statistical_arbitrage::select_pairs;
@@ -138,14 +143,16 @@ impl From<PortfolioError> for RebalanceError {
     }
 }
 
-/// Runs one rebalance cycle using a cold-start / warm-start model.
+/// Runs one rebalance cycle with unified exit monitoring and incremental entry.
 ///
-/// Alpaca positions are the source of truth for deciding the path:
-/// - **Cold start** (no Alpaca positions): build a fresh portfolio using account
-///   equity as the capital base. Entry prices come from the Alpaca REST snapshot API
-///   with daily close prices as fallback.
-/// - **Warm start** (Alpaca has positions): evaluate existing pairs for close signals
-///   (convergence, stop-loss). New pairs are never opened while any positions remain.
+/// Every cycle performs both phases:
+/// 1. **Exit evaluation**: if open pairs exist, evaluate each for close signals
+///    (convergence, stop-loss) and close triggered pairs.
+/// 2. **Entry evaluation**: if vacant pair slots exist and market conditions allow,
+///    select, size, risk-gate, and execute new pairs using available capital.
+///
+/// Entry is gated on fresh predictions, a non-trending regime, and passing the
+/// pre-trade risk gate. Exit evaluation runs unconditionally.
 ///
 /// Returns `RebalanceOutcome` on success or a `RebalanceError` describing
 /// why the cycle was skipped or failed.
@@ -153,7 +160,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let pool = state.pool();
     let alpaca = state.alpaca_client();
 
-    // Phase 1: reconcile DB state against Alpaca positions, then decide path.
+    // Phase 1: reconcile DB state against Alpaca positions.
     let reconciliation_report = match reconciliation::reconcile(pool, alpaca).await {
         Ok(report) => report,
         Err(reconciliation::ReconciliationError::AlpacaFetch(error)) => {
@@ -178,89 +185,125 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         );
     }
 
-    // Re-fetch state after reconciliation to get the corrected view.
-    let alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+    // Phase 2: re-fetch state after reconciliation.
+    let mut alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
         RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
     let open_pairs = fetch_open_pairs(pool).await?;
 
-    if !alpaca_positions.is_empty() {
-        // Alpaca has live positions — enter monitor mode.
-        if open_pairs.is_empty() {
-            // Reconciliation should have resolved this, but if it persists, halt.
-            warn!(
-                alpaca_positions = alpaca_positions.len(),
-                "Alpaca has positions but database has no open pairs after reconciliation"
-            );
-            return Err(RebalanceError::Execution(ExecutionError::StateMismatch {
-                message: "Alpaca has positions but database has no open pairs after reconciliation"
-                    .to_string(),
-            }));
-        }
-
-        // Load historical prices for monitor evaluation.
-        let historical_prices = fetch_historical_equity_prices(pool).await?;
-        return run_monitor_cycle(state, pool, alpaca, &open_pairs, &historical_prices).await;
-    }
-
-    // Cold start: no Alpaca positions, no open DB pairs. Build a fresh portfolio.
-    info!("No Alpaca positions; building fresh portfolio");
-
-    // Phase 2: load predictions and market data.
-    let (predictions, historical_prices, spy_prices, equity_details) =
-        fetch_market_data(pool).await?;
-
-    // Phase 3: classify regime; skip if trending.
-    let regime_result = classify_regime(&spy_prices);
-    let exposure_scale = regime_result.state.exposure_factor();
-    if exposure_scale < 0.6 {
-        info!(
-            regime = ?regime_result.state,
-            confidence = ?regime_result.confidence.value(),
-            "Trending regime detected; skipping rebalance"
+    // Sanity check: Alpaca has positions but DB has none after reconciliation.
+    if !alpaca_positions.is_empty() && open_pairs.is_empty() {
+        warn!(
+            alpaca_positions = alpaca_positions.len(),
+            "Alpaca has positions but database has no open pairs after reconciliation"
         );
-        return Err(RebalanceError::TrendingRegime);
+        return Err(RebalanceError::Execution(ExecutionError::StateMismatch {
+            message: "Alpaca has positions but database has no open pairs after reconciliation"
+                .to_string(),
+        }));
     }
 
-    // Phase 4: consolidate signals.
-    let signals = consolidate_predictions(&predictions, &historical_prices, &equity_details);
-    info!(tickers = signals.len(), "Signals consolidated");
+    // Phase 3: load market data (needed for both exit evaluation and entry selection).
+    let historical_prices = fetch_historical_equity_prices(pool).await?;
 
-    // Phase 5: check drawdown. Use current_equity as the capital base for sizing.
-    let (current_equity, _buying_power) = check_drawdown(
+    // Phase 4: exit evaluation — always runs when open pairs exist.
+    let mut pairs_closed: usize = 0;
+    if !open_pairs.is_empty() {
+        let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices);
+        pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
+        let pairs_kept_after_exits = open_pairs.len() - pairs_closed;
+        info!(
+            pairs_closed = pairs_closed,
+            pairs_kept = pairs_kept_after_exits,
+            "Exit evaluation completed"
+        );
+    }
+    let pairs_remaining = open_pairs.len() - pairs_closed;
+
+    // Re-fetch positions after exits so the risk gate sees post-exit exposure.
+    if pairs_closed > 0 {
+        alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
+            RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
+        })?;
+    }
+
+    // Phase 5: drawdown check. Required for both snapshot persistence and entry gating.
+    let (current_equity, buying_power) = check_drawdown(
         alpaca,
         pool,
         state.constraints().drawdown_threshold().0.value(),
     )
     .await?;
 
-    // Phase 6: select, size, and execute new pairs using current_equity.
+    // Phase 6: entry evaluation — gated on predictions, regime, and vacant slots.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
-    let filled = select_size_execute(
-        pool,
-        alpaca,
-        state.tradable_assets(),
-        &signals,
-        &historical_prices,
-        &spy_prices,
-        current_equity,
-        exposure_scale,
-        state.candidate_pool_count(),
-        required_pairs,
-    )
-    .await?;
+    let vacant_slots = required_pairs.saturating_sub(pairs_remaining);
+
+    let mut filled: Vec<(FilledPair, crate::portfolio::sizing::SizedPair)> = Vec::new();
+
+    if vacant_slots > 0 {
+        // Load entry-specific data: predictions, SPY prices, equity details.
+        let entry_result = try_evaluate_entries(
+            state,
+            pool,
+            alpaca,
+            &historical_prices,
+            &alpaca_positions,
+            current_equity,
+            buying_power,
+            vacant_slots,
+            required_pairs,
+        )
+        .await;
+
+        match entry_result {
+            Ok(new_fills) => {
+                filled = new_fills;
+            }
+            Err(EntrySkipReason::StalePredictions) => {
+                if pairs_remaining == 0 && pairs_closed == 0 {
+                    return Err(RebalanceError::StalePredictions);
+                }
+                warn!("Skipping new entries: stale or absent predictions");
+            }
+            Err(EntrySkipReason::TrendingRegime) => {
+                if pairs_remaining == 0 && pairs_closed == 0 {
+                    return Err(RebalanceError::TrendingRegime);
+                }
+                info!("Skipping new entries: trending regime detected");
+            }
+            Err(EntrySkipReason::InsufficientPairs(error)) => {
+                if pairs_remaining == 0 && pairs_closed == 0 {
+                    return Err(RebalanceError::InsufficientPairs(error));
+                }
+                info!("No new pairs found; continuing with exits only");
+            }
+            Err(EntrySkipReason::Other(error)) => {
+                return Err(error);
+            }
+        }
+    } else {
+        info!(
+            pairs_remaining = pairs_remaining,
+            "No vacant pair slots; skipping entry evaluation"
+        );
+    }
 
     let pairs_opened = filled.len();
+    let pairs_kept = pairs_remaining;
 
-    // Phase 7: validate portfolio invariants on the fresh set.
-    let filled_pairs_only: Vec<FilledPair> = filled
-        .iter()
-        .map(|(filled_pair, _)| filled_pair.clone())
-        .collect();
-    Portfolio::new(filled_pairs_only, state.constraints())?;
+    // Phase 7: validate portfolio invariants when new pairs were opened on a
+    // fresh (cold-start) portfolio. When adding to an existing portfolio, the
+    // risk gate has already validated each individual entry.
+    if pairs_opened > 0 && pairs_remaining == 0 {
+        let filled_pairs_only: Vec<FilledPair> = filled
+            .iter()
+            .map(|(filled_pair, _)| filled_pair.clone())
+            .collect();
+        Portfolio::new(filled_pairs_only, state.constraints())?;
+    }
 
-    // Phase 8: persist session, pairs, allocations, orders, and snapshot
-    // inside a single transaction so a mid-cycle failure rolls back all writes.
+    // Phase 8: persist session, pairs, allocations, orders, and snapshot.
     let session_id = Uuid::new_v4();
     let now = Utc::now();
 
@@ -285,8 +328,11 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     );
     insert_rebalance_session(&mut *transaction, &session).await?;
 
-    let total_slippage_cost =
-        persist_filled_pairs(&mut transaction, session_id, now, &filled).await?;
+    let total_slippage_cost = if filled.is_empty() {
+        Decimal::ZERO
+    } else {
+        persist_filled_pairs(&mut transaction, session_id, now, &filled).await?
+    };
 
     insert_portfolio_snapshot(
         &mut *transaction,
@@ -309,8 +355,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         &serde_json::json!({
             "session_id": session_id.to_string(),
             "pairs_opened": pairs_opened,
-            "pairs_closed": 0,
-            "pairs_kept": 0,
+            "pairs_closed": pairs_closed,
+            "pairs_kept": pairs_kept,
             "net_asset_value": net_asset_value,
         }),
     )
@@ -321,108 +367,125 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     info!(
         session_id = %session_id,
         pairs_opened = pairs_opened,
+        pairs_closed = pairs_closed,
+        pairs_kept = pairs_kept,
         net_asset_value = net_asset_value,
-        "Fresh portfolio built"
+        "Rebalance cycle completed"
     );
 
     Ok(RebalanceOutcome {
         session_id,
         pairs_opened,
-        pairs_closed: 0,
-        pairs_kept: 0,
-        net_asset_value,
-    })
-}
-
-/// Monitor path: evaluate existing open pairs for close signals and persist a snapshot.
-///
-/// Closed pair slots are intentionally left vacant. If all pairs close during
-/// evaluation, the next rebalance tick will trigger a fresh portfolio build.
-async fn run_monitor_cycle(
-    state: &AppState,
-    pool: &sqlx::PgPool,
-    alpaca: &dyn Trading,
-    open_pairs: &[OpenPair],
-    historical_prices: &HashMap<Ticker, Vec<f64>>,
-) -> Result<RebalanceOutcome, RebalanceError> {
-    let close_signals = evaluate_open_pairs(open_pairs, historical_prices);
-    let pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
-    let pairs_kept = open_pairs.len() - pairs_closed;
-
-    info!(
-        pairs_kept = pairs_kept,
-        pairs_closed = pairs_closed,
-        "Monitor cycle: evaluated open pairs"
-    );
-
-    // Persist a snapshot even when no pairs were opened.
-    let (current_equity, _buying_power) = check_drawdown(
-        alpaca,
-        pool,
-        state.constraints().drawdown_threshold().0.value(),
-    )
-    .await?;
-
-    let session_id = Uuid::new_v4();
-    let now = Utc::now();
-
-    let net_asset_value_decimal = Decimal::try_from(current_equity).map_err(|_| {
-        RebalanceError::Conversion("current equity cannot be represented as Decimal".to_string())
-    })?;
-    let net_asset_value = net_asset_value_decimal.to_f64().ok_or_else(|| {
-        RebalanceError::Conversion(
-            "net_asset_value_decimal cannot be represented as f64".to_string(),
-        )
-    })?;
-
-    let mut transaction = pool.begin().await?;
-
-    let session = EquityRebalanceSession::new(
-        session_id,
-        now,
-        "market_session_check".to_string(),
-        None,
-        None,
-        RebalanceSessionStatus::Completed,
-    );
-    insert_rebalance_session(&mut *transaction, &session).await?;
-    insert_portfolio_snapshot(
-        &mut *transaction,
-        now,
-        net_asset_value_decimal,
-        Decimal::ZERO,
-    )
-    .await?;
-    update_rebalance_session_status(
-        &mut *transaction,
-        session_id,
-        &RebalanceSessionStatus::Completed,
-        now,
-    )
-    .await?;
-
-    emit_event(
-        &mut *transaction,
-        EventType::PortfolioRebalanceCompleted,
-        &serde_json::json!({
-            "session_id": session_id.to_string(),
-            "pairs_opened": 0,
-            "pairs_closed": pairs_closed,
-            "pairs_kept": pairs_kept,
-            "net_asset_value": net_asset_value,
-        }),
-    )
-    .await?;
-
-    transaction.commit().await?;
-
-    Ok(RebalanceOutcome {
-        session_id,
-        pairs_opened: 0,
         pairs_closed,
         pairs_kept,
         net_asset_value,
     })
+}
+
+/// Reasons entry evaluation can be skipped without aborting the full cycle.
+enum EntrySkipReason {
+    StalePredictions,
+    TrendingRegime,
+    InsufficientPairs(SizingError),
+    /// A non-recoverable error that should propagate.
+    Other(RebalanceError),
+}
+
+/// Attempts to evaluate and execute new pair entries.
+///
+/// Loads predictions, checks regime, consolidates signals, sizes candidates,
+/// applies the risk gate to each, and executes approved entries.
+///
+/// Returns filled pairs on success, or an `EntrySkipReason` explaining why
+/// entry was skipped (which the caller may treat as non-fatal if exits
+/// already occurred).
+#[allow(clippy::too_many_arguments)]
+async fn try_evaluate_entries(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    alpaca: &dyn Trading,
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
+    alpaca_positions: &[crate::portfolio::alpaca::Position],
+    current_equity: f64,
+    buying_power: f64,
+    vacant_slots: usize,
+    required_pairs: usize,
+) -> Result<Vec<(FilledPair, crate::portfolio::sizing::SizedPair)>, EntrySkipReason> {
+    // Load predictions.
+    let fresh_predictions = fetch_equity_predictions(pool)
+        .await
+        .map_err(|error| EntrySkipReason::Other(RebalanceError::Database(error)))?;
+    let predictions = fresh_predictions
+        .get()
+        .ok_or(EntrySkipReason::StalePredictions)?;
+    if predictions.is_empty() {
+        return Err(EntrySkipReason::StalePredictions);
+    }
+    let predictions = predictions.to_vec();
+
+    // Load remaining market data for entry selection.
+    let (spy_prices, equity_details) =
+        tokio::join!(fetch_spy_equity_prices(pool), fetch_equity_details(pool),);
+    let spy_prices = spy_prices.map_err(|error| EntrySkipReason::Other(error.into()))?;
+    let equity_details = equity_details.map_err(|error| EntrySkipReason::Other(error.into()))?;
+
+    // Regime check: skip entries if trending.
+    let regime_result = classify_regime(&spy_prices);
+    let exposure_scale = regime_result.state.exposure_factor();
+    if exposure_scale < 0.6 {
+        info!(
+            regime = ?regime_result.state,
+            confidence = ?regime_result.confidence.value(),
+            "Trending regime detected; skipping new entries"
+        );
+        return Err(EntrySkipReason::TrendingRegime);
+    }
+
+    // Consolidate signals.
+    let signals = consolidate_predictions(&predictions, historical_prices, &equity_details);
+    info!(
+        tickers = signals.len(),
+        "Signals consolidated for entry evaluation"
+    );
+
+    // Compute available capital: capped at per-slot allocation to prevent
+    // over-concentration when fewer candidates survive than vacant slots.
+    let per_slot_capital = current_equity / required_pairs as f64;
+    let slot_capped_capital = per_slot_capital * vacant_slots as f64;
+    let available_capital = slot_capped_capital.min(current_equity);
+
+    info!(
+        vacant_slots = vacant_slots,
+        available_capital = format!("{:.2}", available_capital),
+        "Entry capital computed"
+    );
+
+    // Select, size, and execute.
+    let result = select_size_execute(
+        pool,
+        alpaca,
+        state.tradable_assets(),
+        state.risk_gate_configuration(),
+        alpaca_positions,
+        current_equity,
+        buying_power,
+        &signals,
+        historical_prices,
+        &spy_prices,
+        available_capital,
+        exposure_scale,
+        state.candidate_pool_count(),
+        vacant_slots,
+    )
+    .await;
+
+    match result {
+        Ok(filled) => Ok(filled),
+        Err(RebalanceError::InsufficientPairs(error)) => {
+            Err(EntrySkipReason::InsufficientPairs(error))
+        }
+        Err(error) => Err(EntrySkipReason::Other(error)),
+    }
 }
 
 /// Closes all open positions at end of day and emits `portfolio_liquidation_completed`.
@@ -511,45 +574,27 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
 // Private pipeline phases
 // ---------------------------------------------------------------------------
 
-/// Fetches and staleness-checks today's predictions, then loads market data.
-///
-/// Returns `(predictions, historical_prices, spy_prices, equity_details)`.
-/// Errors with `StalePredictions` when no valid predictions exist for today.
-async fn fetch_market_data(
-    pool: &sqlx::PgPool,
-) -> Result<
-    (
-        Vec<EquityPrediction>,
-        HashMap<Ticker, Vec<f64>>,
-        Vec<f64>,
-        HashMap<Ticker, String>,
-    ),
-    RebalanceError,
-> {
-    let fresh_predictions = fetch_equity_predictions(pool).await?;
-    let predictions = fresh_predictions
-        .get()
-        .ok_or(RebalanceError::StalePredictions)?;
+/// Builds a `PortfolioSnapshot` from Alpaca account data and current positions
+/// for use by the risk gate.
+fn build_portfolio_snapshot(
+    account_equity: f64,
+    buying_power: f64,
+    positions: &[crate::portfolio::alpaca::Position],
+) -> PortfolioSnapshot {
+    let position_snapshots = positions
+        .iter()
+        .map(|position| PositionSnapshot {
+            ticker: position.symbol.clone(),
+            market_value_absolute: position.market_value.abs(),
+            strategy: StrategyId::StatisticalArbitrage,
+        })
+        .collect();
 
-    if predictions.is_empty() {
-        warn!("No predictions available for today; skipping rebalance");
-        return Err(RebalanceError::StalePredictions);
+    PortfolioSnapshot {
+        account_equity,
+        buying_power,
+        positions: position_snapshots,
     }
-
-    let predictions = predictions.to_vec();
-
-    let (historical_prices_result, spy_prices_result, equity_details_result) = tokio::join!(
-        fetch_historical_equity_prices(pool),
-        fetch_spy_equity_prices(pool),
-        fetch_equity_details(pool),
-    );
-
-    Ok((
-        predictions,
-        historical_prices_result?,
-        spy_prices_result?,
-        equity_details_result?,
-    ))
 }
 
 /// A close signal produced by per-pair evaluation.
@@ -770,7 +815,8 @@ async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
     }
 }
 
-/// Selects candidate pairs, sizes them, filters to shortable tickers, and executes orders.
+/// Selects candidate pairs, sizes them, filters to tradable and shortable
+/// tickers, applies the pre-trade risk gate, and executes approved orders.
 ///
 /// Submitted orders are persisted to the database before polling for fills,
 /// ensuring that a crash between submission and fill confirmation leaves a
@@ -783,18 +829,22 @@ async fn select_size_execute(
     pool: &sqlx::PgPool,
     alpaca: &dyn Trading,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
+    risk_gate_config: &risk_gate::RiskGateConfiguration,
+    alpaca_positions: &[crate::portfolio::alpaca::Position],
+    current_equity: f64,
+    buying_power: f64,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
     spy_prices: &[f64],
     capital: f64,
     exposure_scale: f64,
     candidate_pool: usize,
-    required_pairs: usize,
+    minimum_pairs: usize,
 ) -> Result<Vec<(FilledPair, crate::portfolio::sizing::SizedPair)>, RebalanceError> {
     let candidate_pairs = select_pairs(signals, historical_prices, candidate_pool);
     info!(
         candidates = candidate_pairs.len(),
-        required = required_pairs,
+        minimum = minimum_pairs,
         "Candidate pairs selected"
     );
 
@@ -839,7 +889,7 @@ async fn select_size_execute(
         &market_betas,
         &entry_prices,
         exposure_scale,
-        required_pairs,
+        minimum_pairs,
     )?;
 
     // Resolve the tradable asset universe from the session cache, populating it
@@ -870,7 +920,7 @@ async fn select_size_execute(
 
     // Filter pairs to those where the long leg is tradable on Alpaca and the
     // short leg is both tradable and shortable (easy to borrow).
-    let eligible_pairs: Vec<_> = sized_pairs
+    let tradable_pairs: Vec<_> = sized_pairs
         .into_iter()
         .filter(|pair| {
             let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
@@ -891,6 +941,97 @@ async fn select_size_execute(
         })
         .collect();
 
+    // Build the portfolio snapshot for risk gate evaluation. The snapshot is
+    // mutated after each approved pair so later candidates see the cumulative
+    // exposure of earlier approvals.
+    let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
+    let now_utc = Utc::now();
+
+    // Apply the risk gate to each candidate pair, evaluating both legs
+    // independently and accumulating approved exposure into the snapshot.
+    let mut eligible_pairs = Vec::new();
+    for pair in tradable_pairs {
+        // Evaluate the long leg.
+        let long_request = PositionRequest {
+            ticker: pair.long_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        // ADV placeholder: entry price × 1M shares. A proper ADV data source
+        // can be added later.
+        let long_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.long_entry_price() * 1_000_000.0,
+        };
+        let long_decision = risk_gate::evaluate(
+            risk_gate_config,
+            &snapshot,
+            &long_request,
+            &long_liquidity,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = long_decision {
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "long",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
+            }
+            continue;
+        }
+
+        // Temporarily add the approved long leg so the short leg evaluation
+        // sees cumulative exposure.
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.long_ticker().to_string(),
+            market_value_absolute: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        // Evaluate the short leg against the updated snapshot.
+        let short_request = PositionRequest {
+            ticker: pair.short_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        let short_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.short_entry_price() * 1_000_000.0,
+        };
+        let short_decision = risk_gate::evaluate(
+            risk_gate_config,
+            &snapshot,
+            &short_request,
+            &short_liquidity,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = short_decision {
+            // Roll back the tentatively added long leg.
+            snapshot.positions.pop();
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "short",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
+            }
+            continue;
+        }
+
+        // Both legs approved — add the short leg to the snapshot so
+        // subsequent candidates see the full cumulative exposure.
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.short_ticker().to_string(),
+            market_value_absolute: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        eligible_pairs.push(pair);
+    }
+
     let pending = execute_open_pairs(alpaca, pool, &eligible_pairs).await;
 
     // Persist submitted order records before polling for fills. Each order gets
@@ -908,7 +1049,7 @@ async fn select_size_execute(
         return Err(RebalanceError::InsufficientPairs(
             SizingError::InsufficientPairs {
                 found: 0,
-                required: required_pairs,
+                required: minimum_pairs,
             },
         ));
     }
@@ -1419,5 +1560,53 @@ mod tests {
         let message = format!("{error}");
         assert!(message.contains("Numeric conversion"));
         assert!(message.contains("z_score"));
+    }
+
+    // --- build_portfolio_snapshot tests ---
+
+    #[test]
+    fn test_build_portfolio_snapshot_empty_positions() {
+        let snapshot = build_portfolio_snapshot(100_000.0, 400_000.0, &[]);
+        assert!((snapshot.account_equity - 100_000.0).abs() < f64::EPSILON);
+        assert!((snapshot.buying_power - 400_000.0).abs() < f64::EPSILON);
+        assert!(snapshot.positions.is_empty());
+    }
+
+    #[test]
+    fn test_build_portfolio_snapshot_with_positions() {
+        let positions = vec![
+            crate::portfolio::alpaca::Position {
+                symbol: "AAPL".to_string(),
+                side: "long".to_string(),
+                quantity: 100.0,
+                market_value: 15_000.0,
+                unrealized_profit_and_loss: 500.0,
+            },
+            crate::portfolio::alpaca::Position {
+                symbol: "MSFT".to_string(),
+                side: "short".to_string(),
+                quantity: 50.0,
+                market_value: -10_000.0,
+                unrealized_profit_and_loss: -200.0,
+            },
+        ];
+        let snapshot = build_portfolio_snapshot(100_000.0, 350_000.0, &positions);
+        assert_eq!(snapshot.positions.len(), 2);
+        assert_eq!(snapshot.positions[0].ticker, "AAPL");
+        assert!((snapshot.positions[0].market_value_absolute - 15_000.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.positions[1].ticker, "MSFT");
+        // Short market_value is negative; absolute value should be positive.
+        assert!((snapshot.positions[1].market_value_absolute - 10_000.0).abs() < f64::EPSILON);
+        assert!(matches!(
+            snapshot.positions[0].strategy,
+            StrategyId::StatisticalArbitrage
+        ));
+    }
+
+    #[test]
+    fn test_build_portfolio_snapshot_preserves_equity_and_buying_power() {
+        let snapshot = build_portfolio_snapshot(250_000.0, 800_000.0, &[]);
+        assert!((snapshot.account_equity - 250_000.0).abs() < f64::EPSILON);
+        assert!((snapshot.buying_power - 800_000.0).abs() < f64::EPSILON);
     }
 }
