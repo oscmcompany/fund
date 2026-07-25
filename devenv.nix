@@ -372,6 +372,10 @@ in {
     '{}')"
   '';
 
+  scripts.build-release.exec = ''
+    cargo +1.94.1 build --release --bin fund --bin dashboard
+  '';
+
   scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm --environment development";
   scripts.provision-production-application-vm.exec = "bash tools/provision-application-vm --environment production";
   scripts.provision-development-trainer-vm.exec = "bash tools/provision-trainer-vm --environment development";
@@ -660,7 +664,7 @@ in {
       exec = ''
         set -euo pipefail
         ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module data
+        exec secretspec run -- ./target/release/fund --module data
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
       process-compose.shutdown.signal = 15;
@@ -671,7 +675,7 @@ in {
       exec = ''
         set -euo pipefail
         ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module inference
+        exec secretspec run -- ./target/release/fund --module inference
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
       process-compose.shutdown.signal = 15;
@@ -682,7 +686,7 @@ in {
       exec = ''
         set -euo pipefail
         ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module portfolio
+        exec secretspec run -- ./target/release/fund --module portfolio
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
       process-compose.shutdown.signal = 15;
@@ -693,7 +697,7 @@ in {
       exec = ''
         set -euo pipefail
         export DATABASE_URL="postgresql://dashboard_reader@localhost:5432/fund"
-        exec cargo run --release --features dashboard --bin dashboard
+        exec ./target/release/dashboard
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
     };
