@@ -12,8 +12,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use fund::domain::market::EquityQuote;
+use fund::stream::alpaca_equities::QuoteStreamConfiguration;
 use fund::stream::buffer::MarketDataBuffer;
-use fund::stream::connection::MessagePayload;
 
 const USAGE: &str = "Usage: fund [--module <data|inference|portfolio>]";
 
@@ -107,18 +108,28 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Both reads happen here, before any task is spawned, for the reason stated
+    // above: a fallible read after spawning would return without cancelling the
+    // shutdown token or awaiting the handles. The symbol cap is also validated
+    // here, so a pair count that cannot fit fails at startup rather than as an
+    // Alpaca error 405 mid-session.
+    let quote_stream_setup = match &portfolio_state {
+        Some(state) => Some((
+            QuoteStreamConfiguration::from_env(state.constraints().minimum_pairs())?,
+            fund::common::alpaca::AlpacaCredentials::from_env()?,
+        )),
+        None => None,
+    };
+
     // The market data buffer is the in-memory broadcast channel for live
-    // quotes and ticks. All data here is ephemeral (DataBoundary::Ephemeral)
-    // and is never written to PostgreSQL. Downstream consumers that detect
-    // durable signals are responsible for crossing the event boundary via
-    // emit_event().
+    // quotes. All data here is ephemeral (DataBoundary::Ephemeral) and is never
+    // written to PostgreSQL. Downstream consumers that detect durable signals
+    // are responsible for crossing the event boundary via emit_event().
     //
-    // Lifecycle: the broadcast channel closes when all senders are dropped.
-    // Currently no Arc clones are distributed to tasks, so the channel
-    // closes when this binding goes out of scope at the end of run(),
-    // after all task handles have been joined.
-    let market_data_buffer: Arc<MarketDataBuffer<MessagePayload>> =
-        Arc::new(MarketDataBuffer::new());
+    // Lifecycle: the broadcast channel closes when all senders are dropped. The
+    // quote stream producer holds a clone while it runs, so the channel stays
+    // open until that task finishes draining on shutdown.
+    let market_data_buffer: Arc<MarketDataBuffer<EquityQuote>> = Arc::new(MarketDataBuffer::new());
     info!(
         capacity = market_data_buffer.capacity(),
         "Market data buffer created"
@@ -152,6 +163,35 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(state) = portfolio_state {
+        if let Some((configuration, credentials)) = quote_stream_setup {
+            // The cache subscribes before the producer starts so no quote is
+            // published into a channel with no readers.
+            handles.push(fund::portfolio::live_prices::spawn_live_price_cache(
+                state.live_prices().clone(),
+                Arc::clone(&market_data_buffer),
+                shutdown_token.clone(),
+            ));
+
+            handles.push(tokio::spawn(
+                fund::stream::alpaca_equities::run_quote_stream(
+                    configuration,
+                    credentials,
+                    pool.clone(),
+                    Arc::clone(&market_data_buffer),
+                    shutdown_token.clone(),
+                ),
+            ));
+
+            // Turns a live threshold crossing into an evaluation request so an
+            // exit is acted on within seconds rather than at the next heartbeat.
+            handles.push(fund::portfolio::live_evaluator::spawn_live_evaluator(
+                pool.clone(),
+                state.live_prices().clone(),
+                shutdown_token.clone(),
+            ));
+            info!("Quote stream producer started");
+        }
+
         handles.push(fund::portfolio::consumer::spawn_event_consumer(
             state,
             shutdown_token.clone(),

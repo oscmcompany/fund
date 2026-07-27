@@ -5,11 +5,115 @@
 //! quote-stream window used by `data` to capture quotes around open
 //! and close.
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::US::Eastern;
+
+/// A regular US equity trading session, anchored on Alpaca's reported close time.
+///
+/// The close comes from Alpaca rather than a hardcoded 16:00, so early-close days
+/// (13:00 Eastern around Independence Day, the day after Thanksgiving, and
+/// Christmas Eve) are handled without maintaining a local holiday calendar.
+///
+/// The open is derived as 09:30 Eastern on the close's Eastern date. US equity
+/// early closes shorten the end of a session and never delay its start, so the
+/// derivation holds for every scheduled session. Deriving it also avoids a second
+/// endpoint: Alpaca's clock reports `next_open` as the *following* session's open
+/// once the market is already open, which is not the value this type needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketSession {
+    is_open: bool,
+    open: DateTime<Utc>,
+    close: DateTime<Utc>,
+}
+
+impl MarketSession {
+    /// Constructs a session from Alpaca's `is_open` flag and `next_close` timestamp.
+    ///
+    /// Returns `None` when 09:30 on the close's Eastern date does not resolve to a
+    /// single instant, or when the derived open is not strictly before the close.
+    pub fn new(is_open: bool, close: DateTime<Utc>) -> Option<Self> {
+        let close_date = close.with_timezone(&Eastern).date_naive();
+        let open_naive = close_date.and_time(NaiveTime::from_hms_opt(9, 30, 0)?);
+        let open = Eastern
+            .from_local_datetime(&open_naive)
+            .single()?
+            .with_timezone(&Utc);
+
+        if open >= close {
+            return None;
+        }
+
+        Some(Self {
+            is_open,
+            open,
+            close,
+        })
+    }
+
+    /// Returns whether the market is currently open for trading.
+    pub fn is_open(&self) -> bool {
+        self.is_open
+    }
+
+    /// Returns the session close instant.
+    pub fn close(&self) -> DateTime<Utc> {
+        self.close
+    }
+
+    /// Returns `true` when this session closes on the same Eastern date as `now`.
+    ///
+    /// Answers "does the market trade today?" only for a session built from
+    /// Alpaca's *next* close, which is the precondition callers must satisfy.
+    /// Under it, asking before the open on a trading day compares today against
+    /// today and returns `true`; on a holiday the reported close has rolled to
+    /// the next trading day and it returns `false`; and after the close the
+    /// reported close has rolled to tomorrow, so it returns `false` as well.
+    ///
+    /// The comparison is purely of dates, so a session whose close has already
+    /// passed on the same date still returns `true`. That state does not arise
+    /// from [`MarketSession::new`] fed by the clock endpoint, but a caller
+    /// constructing a session some other way must not rely on this to mean the
+    /// market is still open — use [`MarketSession::contains`] for that.
+    pub fn trades_on_date_of(&self, now: DateTime<Utc>) -> bool {
+        self.close.with_timezone(&Eastern).date_naive() == now.with_timezone(&Eastern).date_naive()
+    }
+
+    /// Returns `true` when `now` falls within `[open, close)`.
+    pub fn contains(&self, now: DateTime<Utc>) -> bool {
+        now >= self.open && now < self.close
+    }
+
+    /// Returns the time remaining until the close, or `Duration::zero()` once past it.
+    pub fn time_until_close(&self, now: DateTime<Utc>) -> Duration {
+        let remaining = self.close.signed_duration_since(now);
+        if remaining < Duration::zero() {
+            Duration::zero()
+        } else {
+            remaining
+        }
+    }
+
+    /// Returns the total length of the session in minutes.
+    ///
+    /// A regular session is 390 minutes; an early close is 210.
+    pub fn total_minutes(&self) -> u32 {
+        self.close
+            .signed_duration_since(self.open)
+            .num_minutes()
+            .max(0) as u32
+    }
+
+    /// Returns whole minutes remaining until the close, saturating at zero.
+    pub fn minutes_remaining(&self, now: DateTime<Utc>) -> u32 {
+        self.time_until_close(now).num_minutes().max(0) as u32
+    }
+}
 
 /// Returns `true` when `now` falls within the regular US equity trading session
 /// (09:30–16:00 Eastern, weekdays only). DST-safe.
+///
+/// Assumes a regular close and so does not account for early-close days. Paths
+/// that must respect the actual close use [`MarketSession`] instead.
 pub fn is_within_trading_session_at(now: DateTime<Utc>) -> bool {
     is_weekday_minutes_in_range(now, 9 * 60 + 30, 16 * 60)
 }
@@ -102,6 +206,82 @@ mod tests {
         DateTime::parse_from_rfc3339(rfc3339)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    // --- MarketSession ---
+
+    #[test]
+    fn test_session_derives_regular_open_from_close() {
+        // 20:00 UTC = 16:00 EDT on 2024-07-15.
+        let session = MarketSession::new(true, utc("2024-07-15T20:00:00Z")).unwrap();
+        assert_eq!(session.total_minutes(), 390);
+        assert!(session.is_open());
+    }
+
+    #[test]
+    fn test_session_derives_early_close_length() {
+        // 17:00 UTC = 13:00 EDT, the standard early close.
+        let session = MarketSession::new(false, utc("2024-07-03T17:00:00Z")).unwrap();
+        assert_eq!(session.total_minutes(), 210);
+        assert!(!session.is_open());
+    }
+
+    #[test]
+    fn test_session_handles_standard_time_close() {
+        // 21:00 UTC = 16:00 EST in December; the open derives to 14:30 UTC.
+        let session = MarketSession::new(true, utc("2024-12-16T21:00:00Z")).unwrap();
+        assert_eq!(session.total_minutes(), 390);
+    }
+
+    #[test]
+    fn test_session_rejects_close_before_open() {
+        // 13:00 UTC = 09:00 EDT, before the 09:30 open on the same date.
+        assert!(MarketSession::new(true, utc("2024-07-15T13:00:00Z")).is_none());
+    }
+
+    #[test]
+    fn test_session_contains_is_end_exclusive() {
+        let session = MarketSession::new(true, utc("2024-07-15T20:00:00Z")).unwrap();
+        assert!(session.contains(utc("2024-07-15T13:30:00Z")));
+        assert!(session.contains(utc("2024-07-15T19:59:00Z")));
+        assert!(!session.contains(utc("2024-07-15T20:00:00Z")));
+        assert!(!session.contains(utc("2024-07-15T13:29:00Z")));
+    }
+
+    #[test]
+    fn test_session_trades_on_date_of() {
+        let session = MarketSession::new(false, utc("2024-07-15T20:00:00Z")).unwrap();
+        // Pre-market on the session date: the market trades today.
+        assert!(session.trades_on_date_of(utc("2024-07-15T13:00:00Z")));
+        // The previous trading day: this session is not today's.
+        assert!(!session.trades_on_date_of(utc("2024-07-12T13:00:00Z")));
+    }
+
+    #[test]
+    fn test_session_trades_on_date_of_rejects_holiday_rollover() {
+        // Asked at 09:00 ET on Thursday July 4th, Alpaca reports Friday's close.
+        let session = MarketSession::new(false, utc("2024-07-05T20:00:00Z")).unwrap();
+        assert!(!session.trades_on_date_of(utc("2024-07-04T13:00:00Z")));
+    }
+
+    #[test]
+    fn test_session_time_until_close_saturates_at_zero() {
+        let session = MarketSession::new(true, utc("2024-07-15T20:00:00Z")).unwrap();
+        assert_eq!(
+            session.time_until_close(utc("2024-07-15T19:45:00Z")),
+            Duration::minutes(15)
+        );
+        assert_eq!(
+            session.time_until_close(utc("2024-07-15T21:00:00Z")),
+            Duration::zero()
+        );
+    }
+
+    #[test]
+    fn test_session_minutes_remaining_matches_early_close() {
+        let session = MarketSession::new(true, utc("2024-07-03T17:00:00Z")).unwrap();
+        // 16:50 UTC = 12:50 EDT: ten minutes to a 13:00 close, not 190 to 16:00.
+        assert_eq!(session.minutes_remaining(utc("2024-07-03T16:50:00Z")), 10);
     }
 
     // --- is_within_trading_session_at ---

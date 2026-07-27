@@ -10,6 +10,7 @@
 //! `events` table via [`crate::common::events::emit_event`] and become
 //! durable, replayable events visible to all consumers.
 
+pub mod alpaca_equities;
 pub mod buffer;
 pub mod connection;
 pub mod data_boundary;

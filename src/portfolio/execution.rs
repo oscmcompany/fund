@@ -37,6 +37,8 @@ pub enum ExecutionError {
     PositionClose { ticker: String, source: ClientError },
     /// Alpaca returned an error when fetching positions or account info.
     PositionFetch { source: ClientError },
+    /// Alpaca returned an error when fetching the market session clock.
+    SessionFetch { source: ClientError },
     /// Alpaca and database state are inconsistent.
     StateMismatch { message: String },
 }
@@ -61,6 +63,9 @@ impl std::fmt::Display for ExecutionError {
             }
             ExecutionError::PositionFetch { source } => {
                 write!(formatter, "Position fetch failed: {source}")
+            }
+            ExecutionError::SessionFetch { source } => {
+                write!(formatter, "Market session fetch failed: {source}")
             }
             ExecutionError::StateMismatch { message } => {
                 write!(formatter, "State mismatch: {message}")

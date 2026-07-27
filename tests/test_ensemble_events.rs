@@ -56,9 +56,13 @@ async fn test_latest_event_after_matches_only_requested_type() {
     assert!(requested_id > before);
 
     // A later event of a different type must not be returned.
-    emit_event(&pool, EventType::MarketSessionCheck, &serde_json::json!({}))
-        .await
-        .unwrap();
+    emit_event(
+        &pool,
+        EventType::PortfolioEvaluationRequested,
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         latest_event_after(&pool, EventType::EquityPredictionsRequested, requested_id)
             .await

@@ -8,10 +8,9 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Timelike, Utc};
-use chrono_tz::US::Eastern;
+use chrono::{DateTime, Utc};
 
-use crate::common::market_hours::is_within_trading_session_at;
+use crate::common::market_hours::MarketSession;
 use crate::domain::portfolio::ConcentrationCap;
 use crate::domain::primitives::Percent;
 
@@ -20,9 +19,6 @@ use crate::domain::primitives::Percent;
 /// Under Reg T with PDT status, buying power = 4 × (equity − initial_margin).
 /// All fund positions are intraday (EOD liquidation), so the 4× multiplier applies.
 const BUYING_POWER_MULTIPLIER: f64 = 4.0;
-
-/// Total minutes in a regular US equity trading session (09:30–16:00 Eastern).
-const TOTAL_SESSION_MINUTES: u32 = 390;
 
 /// Identifies a trading strategy for budget allocation and attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -404,40 +400,38 @@ fn check_strategy_budget(
     }
 }
 
-/// Computes minutes remaining in the current trading session.
-///
-/// Returns 0 if the current Eastern time is at or past 16:00.
-fn minutes_remaining_in_session(now: DateTime<Utc>) -> u32 {
-    let eastern = now.with_timezone(&Eastern);
-    let current_minutes = eastern.hour() * 60 + eastern.minute();
-    let close_minutes: u32 = 16 * 60;
-    close_minutes.saturating_sub(current_minutes)
-}
-
 /// Checks whether the proposed position can be exited before market close.
 ///
 /// Uses a linear volume distribution model: remaining session volume is
-/// estimated as `average_daily_volume × (minutes_remaining / 390)`. The
-/// position's participation rate (notional / estimated remaining volume) must
-/// be below the configured maximum.
+/// estimated as `average_daily_volume × (minutes_remaining / total_minutes)`.
+/// The position's participation rate (notional / estimated remaining volume)
+/// must be below the configured maximum.
 ///
 /// The check becomes naturally stricter as the session progresses because the
-/// remaining volume shrinks while the position size stays constant.
+/// remaining volume shrinks while the position size stays constant. Both the
+/// remaining and total minutes come from `session`, so an early close tightens
+/// the gate for the whole day rather than letting it approve entries against
+/// hours of liquidity that will never arrive.
 fn check_exit_feasibility(
+    session: &MarketSession,
     now: DateTime<Utc>,
     request: &PositionRequest,
     liquidity: &LiquidityMetrics,
     maximum_participation_rate: MaximumParticipationRate,
 ) -> Option<RejectionReason> {
-    if !is_within_trading_session_at(now) {
+    if !session.contains(now) {
         return Some(RejectionReason::OutsideTradingSession);
     }
 
-    // minutes_remaining is always >= 1 here because is_within_trading_session_at
-    // uses end-exclusive range [9:30, 16:00), so passing that check guarantees
-    // at least one minute remains.
-    let minutes_remaining = minutes_remaining_in_session(now);
-    let remaining_fraction = minutes_remaining as f64 / TOTAL_SESSION_MINUTES as f64;
+    let total_minutes = session.total_minutes();
+    if total_minutes == 0 {
+        return Some(RejectionReason::OutsideTradingSession);
+    }
+
+    // minutes_remaining is always >= 1 here because `contains` uses the
+    // end-exclusive range [open, close), so passing it guarantees time remains.
+    let minutes_remaining = session.minutes_remaining(now);
+    let remaining_fraction = minutes_remaining as f64 / total_minutes as f64;
     let estimated_remaining_volume = liquidity.average_daily_volume_dollars * remaining_fraction;
 
     if estimated_remaining_volume <= 0.0 {
@@ -470,6 +464,7 @@ pub fn evaluate(
     snapshot: &PortfolioSnapshot,
     request: &PositionRequest,
     liquidity: &LiquidityMetrics,
+    session: &MarketSession,
     now: DateTime<Utc>,
 ) -> RiskGateDecision {
     if !request.notional.is_finite() || request.notional <= 0.0 {
@@ -496,9 +491,13 @@ pub fn evaluate(
     if let Some(reason) = check_strategy_budget(snapshot, request, &config.strategy_budgets) {
         reasons.push(reason);
     }
-    if let Some(reason) =
-        check_exit_feasibility(now, request, liquidity, config.maximum_participation_rate)
-    {
+    if let Some(reason) = check_exit_feasibility(
+        session,
+        now,
+        request,
+        liquidity,
+        config.maximum_participation_rate,
+    ) {
         reasons.push(reason);
     }
 
@@ -831,39 +830,65 @@ mod tests {
         assert!(check_strategy_budget(&snapshot, &request, &budgets).is_some());
     }
 
-    // ---- minutes_remaining_in_session ----
+    // ---- session-derived minutes ----
+
+    /// Regular session on Monday 2024-07-15: 09:30–16:00 EDT.
+    fn regular_session() -> MarketSession {
+        MarketSession::new(true, utc("2024-07-15T20:00:00Z"))
+            .expect("regular session should construct")
+    }
+
+    /// Early-close session on the same date: 09:30–13:00 EDT, 210 minutes.
+    fn early_close_session() -> MarketSession {
+        MarketSession::new(true, utc("2024-07-15T17:00:00Z"))
+            .expect("early close session should construct")
+    }
+
+    fn utc(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .expect("valid RFC3339 timestamp")
+            .with_timezone(&Utc)
+    }
 
     #[test]
     fn test_minutes_remaining_mid_session() {
         // 10:00 AM EDT = 14:00 UTC → 360 minutes until 16:00 ET
-        assert_eq!(minutes_remaining_in_session(trading_hours()), 360);
+        assert_eq!(regular_session().minutes_remaining(trading_hours()), 360);
     }
 
     #[test]
     fn test_minutes_remaining_near_close() {
         // 3:55 PM EDT = 19:55 UTC → 5 minutes
-        let now = DateTime::parse_from_rfc3339("2024-07-15T19:55:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(minutes_remaining_in_session(now), 5);
+        assert_eq!(
+            regular_session().minutes_remaining(utc("2024-07-15T19:55:00Z")),
+            5
+        );
     }
 
     #[test]
     fn test_minutes_remaining_at_close() {
         // 4:00 PM EDT = 20:00 UTC → 0 minutes
-        let now = DateTime::parse_from_rfc3339("2024-07-15T20:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(minutes_remaining_in_session(now), 0);
+        assert_eq!(
+            regular_session().minutes_remaining(utc("2024-07-15T20:00:00Z")),
+            0
+        );
     }
 
     #[test]
     fn test_minutes_remaining_at_open() {
         // 9:30 AM EDT = 13:30 UTC → 390 minutes
-        let now = DateTime::parse_from_rfc3339("2024-07-15T13:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(minutes_remaining_in_session(now), 390);
+        assert_eq!(
+            regular_session().minutes_remaining(utc("2024-07-15T13:30:00Z")),
+            390
+        );
+    }
+
+    #[test]
+    fn test_early_close_session_is_shorter() {
+        let session = early_close_session();
+        assert_eq!(session.total_minutes(), 210);
+        // 12:50 PM EDT = 16:50 UTC → only 10 minutes left, not 190.
+        assert_eq!(session.minutes_remaining(utc("2024-07-15T16:50:00Z")), 10);
     }
 
     // ---- check_exit_feasibility ----
@@ -879,15 +904,16 @@ mod tests {
             average_daily_volume_dollars: 50_000_000.0,
         };
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
-        assert!(check_exit_feasibility(now, &request, &liquidity, max_rate).is_none());
+        assert!(
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate)
+                .is_none()
+        );
     }
 
     #[test]
     fn test_exit_feasibility_late_session_large_position_rejects() {
         // 3:30 PM EDT = 19:30 UTC, 30 minutes remaining
-        let now = DateTime::parse_from_rfc3339("2024-07-15T19:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = utc("2024-07-15T19:30:00Z");
         let request = PositionRequest {
             notional: 1_000_000.0,
             ..default_request()
@@ -896,7 +922,8 @@ mod tests {
             average_daily_volume_dollars: 5_000_000.0,
         };
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
-        let result = check_exit_feasibility(now, &request, &liquidity, max_rate);
+        let result =
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate);
         assert!(result.is_some());
         match result.unwrap() {
             RejectionReason::ExitFeasibilityInsufficient {
@@ -917,13 +944,12 @@ mod tests {
     #[test]
     fn test_exit_feasibility_outside_trading_hours_rejects() {
         // 8:00 AM EDT = 12:00 UTC, before market open
-        let now = DateTime::parse_from_rfc3339("2024-07-15T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now = utc("2024-07-15T12:00:00Z");
         let request = default_request();
         let liquidity = default_liquidity();
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
-        let result = check_exit_feasibility(now, &request, &liquidity, max_rate);
+        let result =
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate);
         assert!(result.is_some());
         assert!(matches!(
             result.unwrap(),
@@ -932,15 +958,14 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_feasibility_weekend_rejects() {
-        // Saturday 10:00 AM EDT
-        let now = DateTime::parse_from_rfc3339("2024-07-13T14:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+    fn test_exit_feasibility_before_session_date_rejects() {
+        // Saturday 10:00 AM EDT, two days before the session being evaluated.
+        let now = utc("2024-07-13T14:00:00Z");
         let request = default_request();
         let liquidity = default_liquidity();
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
-        let result = check_exit_feasibility(now, &request, &liquidity, max_rate);
+        let result =
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate);
         assert!(result.is_some());
         assert!(matches!(
             result.unwrap(),
@@ -956,7 +981,10 @@ mod tests {
             average_daily_volume_dollars: 0.0,
         };
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
-        assert!(check_exit_feasibility(now, &request, &liquidity, max_rate).is_some());
+        assert!(
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate)
+                .is_some()
+        );
     }
 
     #[test]
@@ -971,18 +999,61 @@ mod tests {
             average_daily_volume_dollars: 10_000_000.0,
         };
         let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
+        let session = regular_session();
 
         // 10:00 AM EDT: 360 min remaining, est volume = 10M × 360/390 ≈ 9.23M
         // participation = 500k / 9.23M ≈ 5.4% < 10% → pass
         let early = trading_hours();
-        assert!(check_exit_feasibility(early, &request, &liquidity, max_rate).is_none());
+        assert!(check_exit_feasibility(&session, early, &request, &liquidity, max_rate).is_none());
 
         // 3:50 PM EDT: 10 min remaining, est volume = 10M × 10/390 ≈ 25.6k
         // participation = 500k / 25.6k ≈ 19.5 > 10% → fail
-        let late = DateTime::parse_from_rfc3339("2024-07-15T19:50:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert!(check_exit_feasibility(late, &request, &liquidity, max_rate).is_some());
+        let late = utc("2024-07-15T19:50:00Z");
+        assert!(check_exit_feasibility(&session, late, &request, &liquidity, max_rate).is_some());
+    }
+
+    #[test]
+    fn test_exit_feasibility_early_close_rejects_what_regular_close_allows() {
+        // 12:50 PM EDT. Under a regular close 190 minutes remain and the position
+        // is comfortably feasible; under a 13:00 close only 10 minutes remain and
+        // it is not. This is the case the old hardcoded 390-minute session got
+        // wrong: it approved entries against liquidity that would never arrive.
+        let now = utc("2024-07-15T16:50:00Z");
+        let request = PositionRequest {
+            notional: 400_000.0,
+            ..default_request()
+        };
+        let liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: 10_000_000.0,
+        };
+        let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
+
+        assert!(
+            check_exit_feasibility(&regular_session(), now, &request, &liquidity, max_rate)
+                .is_none()
+        );
+        assert!(check_exit_feasibility(
+            &early_close_session(),
+            now,
+            &request,
+            &liquidity,
+            max_rate
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn test_exit_feasibility_after_early_close_rejects() {
+        // 2:00 PM EDT is inside a regular session but past a 13:00 close.
+        let now = utc("2024-07-15T18:00:00Z");
+        let request = default_request();
+        let liquidity = default_liquidity();
+        let max_rate = MaximumParticipationRate::new(Percent::new(0.10).unwrap());
+
+        assert!(matches!(
+            check_exit_feasibility(&early_close_session(), now, &request, &liquidity, max_rate),
+            Some(RejectionReason::OutsideTradingSession)
+        ));
     }
 
     // ---- evaluate (full gate) ----
@@ -994,7 +1065,14 @@ mod tests {
         let request = default_request();
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         assert!(decision.is_approved());
     }
 
@@ -1018,7 +1096,14 @@ mod tests {
         };
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         match decision {
             RiskGateDecision::Rejected { reasons } => {
                 // Margin (projected 25% > 1%), concentration (50% > 1%), budget (50% > 5%)
@@ -1038,7 +1123,14 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2024-07-15T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         match decision {
             RiskGateDecision::Rejected { reasons } => {
                 assert!(reasons
@@ -1143,7 +1235,14 @@ mod tests {
         };
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         match decision {
             RiskGateDecision::Rejected { reasons } => {
                 assert_eq!(reasons.len(), 1);
@@ -1163,7 +1262,14 @@ mod tests {
         };
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         assert!(!decision.is_approved());
     }
 
@@ -1177,7 +1283,14 @@ mod tests {
         };
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         assert!(!decision.is_approved());
     }
 
@@ -1191,7 +1304,14 @@ mod tests {
         };
         let liquidity = default_liquidity();
         let now = trading_hours();
-        let decision = evaluate(&config, &snapshot, &request, &liquidity, now);
+        let decision = evaluate(
+            &config,
+            &snapshot,
+            &request,
+            &liquidity,
+            &regular_session(),
+            now,
+        );
         assert!(!decision.is_approved());
     }
 

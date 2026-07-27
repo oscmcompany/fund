@@ -8,6 +8,8 @@ pub mod consolidation;
 pub mod consumer;
 pub mod database;
 pub mod execution;
+pub mod live_evaluator;
+pub mod live_prices;
 pub mod math;
 pub mod rebalance;
 pub mod reconciliation;
