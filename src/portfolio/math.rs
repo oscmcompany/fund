@@ -109,6 +109,32 @@ pub fn z_score_last(spread: &[f64]) -> f64 {
     (spread[spread.len() - 1] - mean_value) / deviation
 }
 
+/// Computes the z-score of `observation` against the distribution of `history`.
+///
+/// Unlike [`z_score_last`], the observation is **not** part of the series it is
+/// measured against. Including it would let a large move pull the mean toward
+/// itself and inflate the deviation, shrinking its own z-score — the bigger the
+/// move, the more it is discounted.
+///
+/// Uses population standard deviation (`ddof=0`) so a live observation is scored
+/// on the same estimator [`z_score_last`] used to record the position's entry
+/// z-score. A mismatch there would make entry and exit measurements
+/// incomparable.
+///
+/// Returns `0.0` when `history` has fewer than two elements or zero standard
+/// deviation, matching [`z_score_last`]'s treatment of a degenerate series.
+pub fn z_score_against(history: &[f64], observation: f64) -> f64 {
+    if history.len() < 2 {
+        return 0.0;
+    }
+    let mean_value = mean(history);
+    let deviation = standard_deviation(history, 0);
+    if deviation.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (observation - mean_value) / deviation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +288,61 @@ mod tests {
     #[test]
     fn test_z_score_last_zero_standard_deviation() {
         assert_eq!(z_score_last(&[3.0, 3.0, 3.0]), 0.0);
+    }
+
+    #[test]
+    fn test_z_score_against_history() {
+        // History mean 10, population standard deviation 2.
+        assert!((z_score_against(&[8.0, 12.0], 16.0) - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_z_score_against_excludes_the_observation() {
+        // The defining difference from z_score_last: appending the observation
+        // first would pull the mean toward it and inflate the deviation, so the
+        // observation would discount its own magnitude.
+        let history = [8.0, 12.0];
+        let against = z_score_against(&history, 100.0);
+
+        let mut appended = history.to_vec();
+        appended.push(100.0);
+        let included = z_score_last(&appended);
+
+        assert!(against > included);
+    }
+
+    #[test]
+    fn test_z_score_against_grows_with_the_observation() {
+        let history = [8.0, 12.0];
+        assert!(z_score_against(&history, 40.0) > z_score_against(&history, 20.0));
+    }
+
+    #[test]
+    fn test_z_score_against_too_few_values() {
+        assert_eq!(z_score_against(&[], 5.0), 0.0);
+        assert_eq!(z_score_against(&[5.0], 5.0), 0.0);
+    }
+
+    #[test]
+    fn test_z_score_against_zero_standard_deviation() {
+        assert_eq!(z_score_against(&[3.0, 3.0, 3.0], 99.0), 0.0);
+    }
+
+    #[test]
+    fn test_z_score_against_matches_z_score_last_estimator() {
+        // Both use ddof=0, so scoring a series' own last element either way
+        // agrees. Entry z-scores come from z_score_last, so an exit measured
+        // with a different estimator would not be comparable to its entry.
+        let series = [8.0, 12.0, 9.0, 11.0];
+        let last = series[series.len() - 1];
+        let history = &series[..series.len() - 1];
+
+        let mut with_last = history.to_vec();
+        with_last.push(last);
+
+        let deviation = standard_deviation(&with_last, 0);
+        let expected = (last - mean(&with_last)) / deviation;
+        assert!((z_score_last(&series) - expected).abs() < 1e-12);
     }
 
     #[test]

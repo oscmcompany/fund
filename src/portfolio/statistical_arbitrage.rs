@@ -1304,13 +1304,55 @@ mod tests {
         }
     }
 
+    /// Builds a two-ticker universe that actually clears the screen.
+    ///
+    /// Correlation must land inside `[0.5, 0.95]` *and* the terminal spread
+    /// z-score must reach `2.0`, which most synthetic series miss: a single
+    /// terminal shock large enough to move the z-score also destroys the
+    /// correlation. Here the legs share a common factor, and the long leg picks
+    /// up a small drift over the final few days — enough to push the spread out
+    /// without breaking the relationship. Yields correlation ≈ 0.80 and z ≈ 3.4.
+    fn screening_universe() -> (Vec<ConsolidatedSignal>, HashMap<Ticker, Vec<f64>>) {
+        let mut long_prices = vec![100.0_f64];
+        let mut short_prices = vec![100.0_f64];
+        let length = CORRELATION_WINDOW_DAYS + 1;
+
+        for index in 1..length {
+            let position = index as f64;
+            let mut long_return = 0.012 * (position * 0.7).sin();
+            let short_return = 0.7 * long_return + 0.006 * (position * 1.3).cos();
+            if index >= length - 5 {
+                long_return += 0.004;
+            }
+            long_prices.push(long_prices[long_prices.len() - 1] * long_return.exp());
+            short_prices.push(short_prices[short_prices.len() - 1] * short_return.exp());
+        }
+
+        let mut closes = HashMap::new();
+        closes.insert(Ticker::new("AAPL").unwrap(), long_prices);
+        closes.insert(Ticker::new("MSFT").unwrap(), short_prices);
+
+        let signals = vec![
+            make_signal("AAPL", 0.03, 0.9, 0.01),
+            make_signal("MSFT", 0.01, 0.9, 0.01),
+        ];
+        (signals, closes)
+    }
+
+    #[test]
+    fn test_screening_universe_yields_a_pair() {
+        // Guards the fixture itself. Without this, the composition test below
+        // could quietly go back to comparing two empty vectors.
+        let (signals, closes) = screening_universe();
+        assert!(
+            !score_candidate_pairs(&signals, &closes).is_empty(),
+            "fixture must clear the correlation band and z-score threshold"
+        );
+    }
+
     #[test]
     fn test_select_pairs_wrapper_composes_both_halves() {
-        let signals = vec![
-            make_signal("AAPL", 0.02, 0.8, 0.01),
-            make_signal("MSFT", 0.01, 0.8, 0.01),
-        ];
-        let closes = HashMap::new();
+        let (signals, closes) = screening_universe();
 
         let wrapper = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
         let manual = select_disjoint_pairs(
@@ -1318,6 +1360,20 @@ mod tests {
             DEFAULT_CANDIDATE_POOL,
             &HashSet::new(),
         );
+
+        assert!(!wrapper.is_empty(), "composition test must not be vacuous");
         assert_eq!(selected_ids(&wrapper), selected_ids(&manual));
+    }
+
+    #[test]
+    fn test_exclusion_is_honoured_on_a_real_screened_pair() {
+        let (signals, closes) = screening_universe();
+        let scored = score_candidate_pairs(&signals, &closes);
+        let selected = select_disjoint_pairs(&scored, DEFAULT_CANDIDATE_POOL, &HashSet::new());
+        assert!(!selected.is_empty());
+
+        let excluded: HashSet<PairID> =
+            selected.iter().map(|pair| pair.pair_id().clone()).collect();
+        assert!(select_disjoint_pairs(&scored, DEFAULT_CANDIDATE_POOL, &excluded).is_empty());
     }
 }

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::common::market_hours::{
@@ -36,7 +36,7 @@ use crate::common::market_hours::{
 };
 use crate::domain::market::{EquityQuote, Ticker};
 use crate::domain::portfolio::MinimumPairs;
-use crate::portfolio::database::fetch_open_pairs;
+use crate::portfolio::database::{fetch_open_pairs, OpenPair};
 use crate::stream::buffer::MarketDataBuffer;
 use crate::stream::connection::{run_connection, ConnectionConfiguration, MessagePayload};
 
@@ -57,6 +57,9 @@ const SUBSCRIPTION_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// How long to wait before retrying when no pairs are open.
 const IDLE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often an active session rechecks the quote-stream window.
+const WINDOW_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Maximum symbols that may be subscribed on one connection.
 ///
 /// A value in scope is proof that the fund's pair capacity fits inside the
@@ -70,10 +73,13 @@ impl SymbolSubscriptionLimit {
     ///
     /// Each pair holds a long and a short position, so a portfolio of
     /// `minimum_pairs` pairs needs `2 × minimum_pairs` symbols streamed.
-    pub fn new(limit: usize, minimum_pairs: MinimumPairs) -> Result<Self, SymbolLimitError> {
+    pub fn new(
+        limit: usize,
+        minimum_pairs: MinimumPairs,
+    ) -> Result<Self, QuoteStreamConfigurationError> {
         let required = 2 * minimum_pairs.0.get() as usize;
         if required > limit {
-            return Err(SymbolLimitError {
+            return Err(QuoteStreamConfigurationError::SymbolLimitTooSmall {
                 required,
                 limit,
                 minimum_pairs: minimum_pairs.0.get(),
@@ -87,27 +93,41 @@ impl SymbolSubscriptionLimit {
     }
 }
 
-/// Returned when the configured pair count cannot fit inside the symbol cap.
+/// Returned when the quote stream configuration cannot be used as given.
 #[derive(Debug, PartialEq, Eq)]
-pub struct SymbolLimitError {
-    required: usize,
-    limit: usize,
-    minimum_pairs: u8,
+pub enum QuoteStreamConfigurationError {
+    /// The configured pair count cannot fit inside the symbol cap.
+    SymbolLimitTooSmall {
+        required: usize,
+        limit: usize,
+        minimum_pairs: u8,
+    },
+    /// An environment variable was present but could not be parsed.
+    InvalidValue { key: String, raw: String },
 }
 
-impl std::fmt::Display for SymbolLimitError {
+impl std::fmt::Display for QuoteStreamConfigurationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{} pairs require {} streamed symbols but the quote stream limit is {}; \
-             lower PORTFOLIO_MINIMUM_PAIRS or raise FUND_QUOTE_STREAM_SYMBOL_LIMIT \
-             (the Alpaca free plan allows 30)",
-            self.minimum_pairs, self.required, self.limit
-        )
+        match self {
+            Self::SymbolLimitTooSmall {
+                required,
+                limit,
+                minimum_pairs,
+            } => write!(
+                formatter,
+                "{minimum_pairs} pairs require {required} streamed symbols but the quote \
+                 stream limit is {limit}; lower PORTFOLIO_MINIMUM_PAIRS or raise \
+                 FUND_QUOTE_STREAM_SYMBOL_LIMIT (the Alpaca free plan allows 30)"
+            ),
+            Self::InvalidValue { key, raw } => write!(
+                formatter,
+                "{key} must be a non-negative integer, got '{raw}'"
+            ),
+        }
     }
 }
 
-impl std::error::Error for SymbolLimitError {}
+impl std::error::Error for QuoteStreamConfigurationError {}
 
 /// Validated configuration for the quote stream producer.
 #[derive(Debug, Clone)]
@@ -121,13 +141,27 @@ impl QuoteStreamConfiguration {
     /// against the configured pair count.
     ///
     /// Reads `FUND_QUOTE_STREAM_FEED_URL` and `FUND_QUOTE_STREAM_SYMBOL_LIMIT`.
-    pub fn from_env(minimum_pairs: MinimumPairs) -> Result<Self, SymbolLimitError> {
+    ///
+    /// A present-but-unparseable symbol limit is a hard error rather than a
+    /// silent fallback to the default, matching `env_usize` in
+    /// `portfolio::state`. Defaulting quietly would also undercut the point of
+    /// validating the cap at startup: a typo would restore exactly the runtime
+    /// 405 the check exists to prevent.
+    pub fn from_env(minimum_pairs: MinimumPairs) -> Result<Self, QuoteStreamConfigurationError> {
+        const SYMBOL_LIMIT_KEY: &str = "FUND_QUOTE_STREAM_SYMBOL_LIMIT";
+
         let feed_url =
             std::env::var("FUND_QUOTE_STREAM_FEED_URL").unwrap_or_else(|_| DEFAULT_FEED_URL.into());
-        let limit = std::env::var("FUND_QUOTE_STREAM_SYMBOL_LIMIT")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_SYMBOL_LIMIT);
+
+        let limit = match std::env::var(SYMBOL_LIMIT_KEY) {
+            Ok(raw) => raw.trim().parse::<usize>().map_err(|_| {
+                QuoteStreamConfigurationError::InvalidValue {
+                    key: SYMBOL_LIMIT_KEY.to_string(),
+                    raw: raw.clone(),
+                }
+            })?,
+            Err(_) => DEFAULT_SYMBOL_LIMIT,
+        };
 
         Ok(Self {
             feed_url,
@@ -207,7 +241,12 @@ fn parse_quotes(payload: &str) -> Vec<EquityQuote> {
         match message.message_type.as_str() {
             "q" => {
                 let Some(quote) = build_quote(&message) else {
-                    warn!(symbol = ?message.symbol, "Skipping incomplete quote");
+                    // Debug rather than warn: a symbol that persistently quotes
+                    // incomplete does so on every frame, which on a busy feed is
+                    // thousands of lines a second through the file appender. The
+                    // "error" arm below stays a warning because it is genuinely
+                    // rare.
+                    debug!(symbol = ?message.symbol, "Skipping incomplete quote");
                     continue;
                 };
                 quotes.push(quote);
@@ -243,36 +282,54 @@ fn build_quote(message: &StreamMessage) -> Option<EquityQuote> {
     ))
 }
 
-/// Returns the set of symbols to subscribe to, capped at the configured limit.
+/// Builds the subscription set from open pairs, capped at whole pairs.
 ///
-/// Pairs are read in database order, so a portfolio exceeding the cap streams a
-/// stable prefix rather than a set that churns between polls. Exceeding the cap
-/// is logged rather than silently truncated.
+/// The cap is applied to **pairs**, not to the flattened legs. Truncating a leg
+/// set would leave a long subscribed with its short dropped, which is useless:
+/// both `evaluate_open_pairs` and `PairBaseline::live_z_score` require a fresh
+/// quote on both legs before they use either, so a half-subscribed pair consumes
+/// a slot and contributes nothing.
+///
+/// Pairs are taken in the order the database returns them, so the retained set
+/// is stable between polls rather than churning. The returned `BTreeSet` orders
+/// the symbols themselves lexicographically, which only affects the subscribe
+/// frame's field order and keeps it identical for an unchanged set.
+///
+/// Dropping is logged rather than silent.
+fn cap_symbols(open_pairs: &[OpenPair], limit: SymbolSubscriptionLimit) -> BTreeSet<String> {
+    let maximum_pairs = limit.value() / 2;
+
+    let retained: &[OpenPair] = if open_pairs.len() > maximum_pairs {
+        warn!(
+            open_pairs = open_pairs.len(),
+            maximum_pairs,
+            symbol_limit = limit.value(),
+            dropped_pairs = open_pairs.len() - maximum_pairs,
+            "Open pairs exceed the quote stream symbol limit; the excess will fall \
+             back to prior-close pricing"
+        );
+        &open_pairs[..maximum_pairs]
+    } else {
+        open_pairs
+    };
+
+    retained
+        .iter()
+        .flat_map(|pair| {
+            [
+                pair.long_ticker().to_string(),
+                pair.short_ticker().to_string(),
+            ]
+        })
+        .collect()
+}
+
+/// Returns the set of symbols to subscribe to for the current open pairs.
 async fn desired_symbols(
     pool: &PgPool,
     limit: SymbolSubscriptionLimit,
 ) -> Result<BTreeSet<String>, sqlx::Error> {
-    let open_pairs = fetch_open_pairs(pool).await?;
-
-    let mut symbols = BTreeSet::new();
-    for pair in &open_pairs {
-        symbols.insert(pair.long_ticker().to_string());
-        symbols.insert(pair.short_ticker().to_string());
-    }
-
-    if symbols.len() > limit.value() {
-        let dropped = symbols.len() - limit.value();
-        warn!(
-            requested = symbols.len(),
-            limit = limit.value(),
-            dropped,
-            "Open pair legs exceed the quote stream symbol limit; some legs will \
-             fall back to prior-close pricing"
-        );
-        symbols = symbols.into_iter().take(limit.value()).collect();
-    }
-
-    Ok(symbols)
+    Ok(cap_symbols(&fetch_open_pairs(pool).await?, limit))
 }
 
 /// Resolves once the open-pair symbol set differs from `current`.
@@ -375,7 +432,27 @@ pub async fn run_quote_stream(
     info!("Quote stream producer stopped");
 }
 
-/// Holds one subscription until the symbol set changes or shutdown fires.
+/// Resolves once the quote-stream window closes.
+///
+/// Bounds a session to the trading window so a portfolio with a stable symbol
+/// set does not hold an Alpaca socket open overnight and through the weekend.
+/// Without this the producer's own window gate is only reached between sessions,
+/// which a stable set never triggers.
+async fn wait_for_window_close(shutdown_token: &CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = sleep(WINDOW_CHECK_INTERVAL) => {}
+            _ = shutdown_token.cancelled() => return,
+        }
+        if !is_within_quote_stream_window() {
+            info!("Quote stream window closed; ending subscription");
+            return;
+        }
+    }
+}
+
+/// Holds one subscription until the symbol set changes, the window closes, or
+/// shutdown fires.
 async fn run_subscription_session(
     configuration: &QuoteStreamConfiguration,
     credentials: &AlpacaCredentials,
@@ -390,9 +467,6 @@ async fn run_subscription_session(
 
     info!(symbols = symbols.len(), "Subscribing to quote stream");
 
-    // A child token ends only this session, leaving the producer loop free to
-    // reconnect with the new symbol set.
-    let session_token = shutdown_token.child_token();
     let publish_buffer = Arc::clone(buffer);
 
     let handler = move |payload: MessagePayload| {
@@ -414,22 +488,26 @@ async fn run_subscription_session(
         true
     };
 
+    // Whichever arm finishes first, `select!` drops the others — that drop is
+    // what closes the socket, not a cancellation token. An earlier version
+    // cancelled a child token in the losing branch, which was a no-op because
+    // the connection future was already gone by then.
     tokio::select! {
-        _ = run_connection(&config, &session_token, handler) => {}
+        _ = run_connection(&config, shutdown_token, handler) => {}
         _ = wait_for_subscription_change(
             pool,
             symbols,
             configuration.symbol_limit(),
             shutdown_token,
-        ) => {
-            session_token.cancel();
-        }
+        ) => {}
+        _ = wait_for_window_close(shutdown_token) => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::market::PairID;
     use std::num::NonZeroU8;
 
     fn minimum_pairs(count: u8) -> MinimumPairs {
@@ -455,8 +533,14 @@ mod tests {
         // Sixteen pairs need thirty-two symbols; this must fail at startup
         // rather than as an Alpaca error 405 mid-session.
         let error = SymbolSubscriptionLimit::new(30, minimum_pairs(16)).unwrap_err();
-        assert_eq!(error.required, 32);
-        assert_eq!(error.limit, 30);
+        assert_eq!(
+            error,
+            QuoteStreamConfigurationError::SymbolLimitTooSmall {
+                required: 32,
+                limit: 30,
+                minimum_pairs: 16,
+            }
+        );
     }
 
     #[test]
@@ -465,6 +549,110 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("PORTFOLIO_MINIMUM_PAIRS"));
         assert!(rendered.contains("FUND_QUOTE_STREAM_SYMBOL_LIMIT"));
+    }
+
+    #[test]
+    fn test_symbol_limit_rejects_unparseable_value() {
+        let error = QuoteStreamConfigurationError::InvalidValue {
+            key: "FUND_QUOTE_STREAM_SYMBOL_LIMIT".to_string(),
+            raw: "thirty".to_string(),
+        };
+        assert!(error.to_string().contains("thirty"));
+        assert!(error.to_string().contains("FUND_QUOTE_STREAM_SYMBOL_LIMIT"));
+    }
+
+    // --- cap_symbols ---
+
+    fn open_pair(long: &str, short: &str) -> OpenPair {
+        OpenPair::new_for_test(
+            uuid::Uuid::new_v4(),
+            PairID::new(Ticker::new(long).unwrap(), Ticker::new(short).unwrap()),
+            Ticker::new(long).unwrap(),
+            Ticker::new(short).unwrap(),
+            2.5,
+            1.0,
+        )
+    }
+
+    #[test]
+    fn test_cap_symbols_expands_both_legs() {
+        let pairs = vec![open_pair("AAPL", "MSFT"), open_pair("GOOG", "AMZN")];
+        let symbols = cap_symbols(&pairs, SymbolSubscriptionLimit(30));
+
+        assert_eq!(symbols.len(), 4);
+        for symbol in ["AAPL", "MSFT", "GOOG", "AMZN"] {
+            assert!(symbols.contains(symbol));
+        }
+    }
+
+    #[test]
+    fn test_cap_symbols_keeps_pairs_whole_when_over_cap() {
+        // The bug this guards: capping the flattened legs could subscribe a long
+        // whose short was dropped. Both evaluate_open_pairs and
+        // PairBaseline::live_z_score need both legs, so a half-subscribed pair
+        // burns a slot and contributes nothing.
+        let pairs = vec![
+            open_pair("AAPL", "MSFT"),
+            open_pair("GOOG", "AMZN"),
+            open_pair("NVDA", "TSLA"),
+        ];
+        // Room for two pairs only.
+        let symbols = cap_symbols(&pairs, SymbolSubscriptionLimit(4));
+
+        assert_eq!(symbols.len(), 4);
+        for pair in &pairs {
+            let long = pair.long_ticker().as_str();
+            let short = pair.short_ticker().as_str();
+            assert_eq!(
+                symbols.contains(long),
+                symbols.contains(short),
+                "pair {long}-{short} must be subscribed whole or not at all"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cap_symbols_never_exceeds_the_limit() {
+        let pairs: Vec<OpenPair> = ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH"]
+            .iter()
+            .zip(["II", "JJ", "KK", "LL", "MM", "NN", "OO", "PP"].iter())
+            .map(|(long, short)| open_pair(long, short))
+            .collect();
+
+        for limit in [2usize, 4, 6, 30] {
+            let symbols = cap_symbols(&pairs, SymbolSubscriptionLimit(limit));
+            assert!(symbols.len() <= limit, "limit {limit} exceeded");
+        }
+    }
+
+    #[test]
+    fn test_cap_symbols_drops_all_when_limit_cannot_hold_one_pair() {
+        // An odd limit of one leaves room for zero whole pairs. Startup
+        // validation makes this unreachable in production, but the helper must
+        // not subscribe a lone leg.
+        let pairs = vec![open_pair("AAPL", "MSFT")];
+        assert!(cap_symbols(&pairs, SymbolSubscriptionLimit(1)).is_empty());
+    }
+
+    #[test]
+    fn test_cap_symbols_empty_portfolio() {
+        assert!(cap_symbols(&[], SymbolSubscriptionLimit(30)).is_empty());
+    }
+
+    #[test]
+    fn test_cap_symbols_retains_a_stable_prefix() {
+        // Taken in database order, so an unchanged portfolio yields the same set
+        // between polls rather than churning the subscription.
+        let pairs = vec![
+            open_pair("AAPL", "MSFT"),
+            open_pair("GOOG", "AMZN"),
+            open_pair("NVDA", "TSLA"),
+        ];
+        let first = cap_symbols(&pairs, SymbolSubscriptionLimit(4));
+        let second = cap_symbols(&pairs, SymbolSubscriptionLimit(4));
+
+        assert_eq!(first, second);
+        assert!(first.contains("AAPL") && first.contains("MSFT"));
     }
 
     // --- message construction ---

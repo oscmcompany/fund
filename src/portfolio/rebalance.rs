@@ -54,7 +54,7 @@ use crate::portfolio::database::{
 use crate::portfolio::execution::{
     close_positions, confirm_fills, execute_open_pairs, ExecutionError,
 };
-use crate::portfolio::math::z_score_last;
+use crate::portfolio::math::{z_score_against, z_score_last};
 use crate::portfolio::reconciliation;
 use crate::portfolio::regime::classify_regime;
 use crate::portfolio::risk_gate::{
@@ -209,12 +209,6 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     // Phase 3: load market data (needed for both exit evaluation and entry selection).
     let historical_prices = fetch_historical_equity_prices(pool).await?;
 
-    // The session carries the real close time, so the risk gate's exit-feasibility
-    // check measures against an early close rather than assuming 16:00.
-    let session = alpaca.fetch_market_session().await.map_err(|error| {
-        RebalanceError::Execution(ExecutionError::SessionFetch { source: error })
-    })?;
-
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
     if !open_pairs.is_empty() {
@@ -257,12 +251,20 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let mut filled: Vec<(FilledPair, crate::portfolio::sizing::SizedPair)> = Vec::new();
 
     if vacant_slots > 0 {
+        // Fetched here rather than before the exit phase so a transient clock
+        // failure blocks only entries. Exits reduce risk and do not need the
+        // session; aborting the pass on a clock error would leave converged and
+        // stopped-out positions open for want of a timestamp.
+        let market_session = alpaca.fetch_market_session().await.map_err(|error| {
+            RebalanceError::Execution(ExecutionError::SessionFetch { source: error })
+        })?;
+
         // Load entry-specific data: predictions, SPY prices, equity details.
         let entry_result = try_evaluate_entries(
             state,
             pool,
             alpaca,
-            &session,
+            &market_session,
             &historical_prices,
             &alpaca_positions,
             current_equity,
@@ -334,7 +336,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     let mut transaction = pool.begin().await?;
 
-    let session = EquityRebalanceSession::new(
+    let rebalance_session = EquityRebalanceSession::new(
         session_id,
         now,
         "portfolio_evaluation".to_string(),
@@ -342,7 +344,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         None,
         RebalanceSessionStatus::Completed,
     );
-    insert_rebalance_session(&mut *transaction, &session).await?;
+    insert_rebalance_session(&mut *transaction, &rebalance_session).await?;
 
     let total_slippage_cost = if filled.is_empty() {
         Decimal::ZERO
@@ -420,7 +422,7 @@ async fn try_evaluate_entries(
     state: &AppState,
     pool: &sqlx::PgPool,
     alpaca: &dyn Trading,
-    session: &MarketSession,
+    market_session: &MarketSession,
     historical_prices: &HashMap<Ticker, Vec<f64>>,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
@@ -483,7 +485,7 @@ async fn try_evaluate_entries(
         alpaca,
         state.tradable_assets(),
         state.risk_gate_configuration(),
-        session,
+        market_session,
         alpaca_positions,
         current_equity,
         buying_power,
@@ -673,7 +675,7 @@ fn evaluate_open_pairs(
         let long_slice = &long_prices[long_prices.len() - common_length..];
         let short_slice = &short_prices[short_prices.len() - common_length..];
 
-        let mut spread: Vec<f64> = long_slice
+        let spread: Vec<f64> = long_slice
             .iter()
             .zip(short_slice.iter())
             .map(|(long, short)| long - pair.hedge_ratio() * short)
@@ -682,25 +684,30 @@ fn evaluate_open_pairs(
         // Both legs must be fresh or neither is used: pricing one leg live
         // against the other's prior close would move the spread by a day of
         // drift in that leg alone and read as a signal.
-        match (
+        let current_z = match (
             live_mid_prices.get(pair.long_ticker()),
             live_mid_prices.get(pair.short_ticker()),
         ) {
             (Some(long_mid), Some(short_mid)) => {
-                // Appended rather than substituted: the prior close is real
-                // data, and the live observation is an additional point, so the
-                // mean and standard deviation account for both.
-                spread.push(long_mid - pair.hedge_ratio() * short_mid);
+                // Measured against the historical distribution, not one that
+                // includes it. Appending the live point first would let a large
+                // move pull the mean toward itself and inflate the deviation,
+                // shrinking its own z-score, and would put this pass on a
+                // different scale from `PairBaseline::live_z_score`, which
+                // standardizes against history only. The trigger would then fire
+                // on a larger magnitude than this pass computes, keep the pair
+                // open, and fire again after the debounce.
+                let live_spread = long_mid - pair.hedge_ratio() * short_mid;
+                z_score_against(&spread, live_spread)
             }
             _ => {
                 info!(
                     pair_id = pair.pair_id().as_str(),
                     "No fresh quotes for both legs; evaluating on daily closes"
                 );
+                z_score_last(&spread)
             }
-        }
-
-        let current_z = z_score_last(&spread);
+        };
 
         match close_reason_for(pair.entry_z_score(), current_z) {
             Some(CloseReason::ProfitTaken) => {
@@ -896,7 +903,7 @@ async fn select_size_execute(
     alpaca: &dyn Trading,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     risk_gate_config: &risk_gate::RiskGateConfiguration,
-    session: &MarketSession,
+    market_session: &MarketSession,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
     buying_power: f64,
@@ -924,7 +931,7 @@ async fn select_size_execute(
     let eligible_pairs = converge_entry_set(
         alpaca,
         risk_gate_config,
-        session,
+        market_session,
         &scored_pairs,
         &tradable_assets,
         &market_betas,
@@ -964,12 +971,14 @@ async fn select_size_execute(
     Ok(filled)
 }
 
-/// Maximum convergence iterations before the entry set is accepted as-is.
+/// Iterations allowed beyond one per candidate in the working set.
 ///
-/// Each iteration either lowers the target or excludes at least one pair, both
-/// of which are monotone, so the loop terminates on its own. This is a backstop
-/// against an unforeseen cycle, not the normal exit.
-const MAXIMUM_CONVERGENCE_ITERATIONS: usize = 8;
+/// Each iteration either excludes at least one pair or lowers the target, both
+/// monotone, so the loop terminates on its own; the budget is a backstop against
+/// an unforeseen cycle. Sizing every candidate out one at a time needs one
+/// iteration each, and target reductions consume an iteration without excluding
+/// anything, so the budget is the working set plus this headroom.
+const CONVERGENCE_ITERATION_HEADROOM: usize = 4;
 
 /// Resolves the tradable asset universe, populating the session cache on first use.
 ///
@@ -1078,7 +1087,7 @@ fn partition_tradable_pairs(
 /// Order therefore matters, which is why selection hands pairs over ranked.
 fn partition_risk_gated_pairs(
     risk_gate_config: &risk_gate::RiskGateConfiguration,
-    session: &MarketSession,
+    market_session: &MarketSession,
     snapshot: &mut PortfolioSnapshot,
     pairs: Vec<crate::portfolio::sizing::SizedPair>,
     now_utc: DateTime<Utc>,
@@ -1103,7 +1112,7 @@ fn partition_risk_gated_pairs(
             snapshot,
             &long_request,
             &long_liquidity,
-            session,
+            market_session,
             now_utc,
         );
         if let RiskGateDecision::Rejected { reasons } = long_decision {
@@ -1141,7 +1150,7 @@ fn partition_risk_gated_pairs(
             snapshot,
             &short_request,
             &short_liquidity,
-            session,
+            market_session,
             now_utc,
         );
         if let RiskGateDecision::Rejected { reasons } = short_decision {
@@ -1200,7 +1209,7 @@ fn partition_risk_gated_pairs(
 async fn converge_entry_set(
     alpaca: &dyn Trading,
     risk_gate_config: &risk_gate::RiskGateConfiguration,
-    session: &MarketSession,
+    market_session: &MarketSession,
     scored_pairs: &[ScoredPair],
     tradable_assets: &TradableAssets,
     market_betas: &HashMap<Ticker, f64>,
@@ -1216,9 +1225,16 @@ async fn converge_entry_set(
     let mut excluded: HashSet<PairID> = HashSet::new();
     let mut entry_prices: HashMap<Ticker, f64> = HashMap::new();
     let mut target = target_pairs;
-    let now_utc = Utc::now();
 
-    for iteration in 1..=MAXIMUM_CONVERGENCE_ITERATIONS {
+    // The iteration budget scales with the working set because each iteration
+    // excludes only the pairs rejected in that pass. Rejections arriving a pair
+    // at a time would otherwise exhaust a fixed budget routinely rather than
+    // exceptionally, silently costing a whole entry pass. The extra headroom
+    // covers target reductions, which consume an iteration without excluding
+    // anything.
+    let maximum_iterations = working_set_limit + CONVERGENCE_ITERATION_HEADROOM;
+
+    for iteration in 1..=maximum_iterations {
         if target == 0 {
             info!("Entry target reduced to zero; no pairs will be opened");
             return Ok(Vec::new());
@@ -1258,9 +1274,12 @@ async fn converge_entry_set(
                 // Lowering the target also raises the per-pair affordability
                 // allowance, so this can recover pairs the previous pass priced
                 // out rather than simply shrinking the portfolio.
-                info!(
+                warn!(
                     iteration,
-                    found, required, "Fewer feasible pairs than target; lowering target"
+                    found,
+                    required,
+                    requested_target = target_pairs,
+                    "Entry target lowered: fewer feasible pairs than requested"
                 );
                 target = found;
                 continue;
@@ -1275,10 +1294,10 @@ async fn converge_entry_set(
         let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
         let (approved, gate_rejected) = partition_risk_gated_pairs(
             risk_gate_config,
-            session,
+            market_session,
             &mut snapshot,
             tradable_pairs,
-            now_utc,
+            Utc::now(),
         );
 
         if untradable.is_empty() && gate_rejected.is_empty() {
@@ -1291,11 +1310,13 @@ async fn converge_entry_set(
             return Ok(approved);
         }
 
+        let newly_excluded = untradable.len() + gate_rejected.len();
         excluded.extend(untradable);
         excluded.extend(gate_rejected);
         info!(
             iteration,
-            excluded = excluded.len(),
+            newly_excluded,
+            excluded_total = excluded.len(),
             "Entry set rejected pairs; re-selecting and resizing"
         );
     }
@@ -1303,8 +1324,14 @@ async fn converge_entry_set(
     // Falling through means the set never stabilized. Returning nothing is the
     // safe outcome: the alternative is executing a basket whose sizing assumed
     // pairs that were rejected, which is the defect this loop exists to remove.
+    // Logged at warn with the exclusion count so exhaustion is distinguishable
+    // from a genuine absence of candidates, which otherwise look identical from
+    // the caller's side — both return no pairs.
     warn!(
-        iterations = MAXIMUM_CONVERGENCE_ITERATIONS,
+        iterations = maximum_iterations,
+        excluded_total = excluded.len(),
+        requested_target = target_pairs,
+        final_target = target,
         "Entry set did not converge; opening no pairs this pass"
     );
     Ok(Vec::new())
@@ -1781,6 +1808,33 @@ mod tests {
         let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_larger_live_divergence_yields_larger_z_score() {
+        // The live point is standardized against history, not against a series
+        // containing itself. Appending it first let a big move pull the mean
+        // toward itself and inflate the deviation, so a larger divergence
+        // produced a *smaller* z-score — the move discounting itself.
+        let prices = diverged_daily_prices();
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+
+        let long_prices = prices.get(&Ticker::new("AAPL").unwrap()).unwrap();
+        let short_prices = prices.get(&Ticker::new("MSFT").unwrap()).unwrap();
+        let common_length = long_prices.len().min(short_prices.len());
+        let history: Vec<f64> = long_prices[long_prices.len() - common_length..]
+            .iter()
+            .zip(short_prices[short_prices.len() - common_length..].iter())
+            .map(|(long, short)| long - pair.hedge_ratio() * short)
+            .collect();
+
+        let moderate = z_score_against(&history, 200.0);
+        let extreme = z_score_against(&history, 400.0);
+
+        assert!(
+            extreme > moderate,
+            "a larger divergence must not shrink its own z-score: {extreme} vs {moderate}"
+        );
     }
 
     #[test]

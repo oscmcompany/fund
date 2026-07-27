@@ -62,10 +62,18 @@ impl MarketSession {
 
     /// Returns `true` when this session closes on the same Eastern date as `now`.
     ///
-    /// Called before the open, this answers "does the market trade today?" — on a
-    /// holiday the reported close rolls to the next trading day and this returns
-    /// `false`. Called after the close it also returns `false`, because that day's
-    /// session has already ended.
+    /// Answers "does the market trade today?" only for a session built from
+    /// Alpaca's *next* close, which is the precondition callers must satisfy.
+    /// Under it, asking before the open on a trading day compares today against
+    /// today and returns `true`; on a holiday the reported close has rolled to
+    /// the next trading day and it returns `false`; and after the close the
+    /// reported close has rolled to tomorrow, so it returns `false` as well.
+    ///
+    /// The comparison is purely of dates, so a session whose close has already
+    /// passed on the same date still returns `true`. That state does not arise
+    /// from [`MarketSession::new`] fed by the clock endpoint, but a caller
+    /// constructing a session some other way must not rely on this to mean the
+    /// market is still open — use [`MarketSession::contains`] for that.
     pub fn trades_on_date_of(&self, now: DateTime<Utc>) -> bool {
         self.close.with_timezone(&Eastern).date_naive() == now.with_timezone(&Eastern).date_naive()
     }

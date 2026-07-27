@@ -163,6 +163,55 @@ pub async fn predictions_exist_for_today(pool: &PgPool) -> Result<bool, sqlx::Er
     Ok(row.exists)
 }
 
+/// Fetches historical close prices for the given tickers over the trailing 90-day window.
+///
+/// Returns a map from ticker symbol to ordered close prices (oldest to newest).
+/// Tickers with partial data are included as-is; callers are responsible for
+/// filtering by minimum length.
+///
+/// Prefer this over [`fetch_historical_equity_prices`] on any path that runs
+/// repeatedly: the unfiltered query materializes the whole price table, which is
+/// wasteful when only a handful of open-position legs are needed.
+pub async fn fetch_historical_equity_prices_for(
+    pool: &PgPool,
+    tickers: &[Ticker],
+) -> Result<HashMap<Ticker, Vec<f64>>, sqlx::Error> {
+    if tickers.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let end_date = Utc::now();
+    let start_date = end_date - Duration::days(HISTORICAL_PRICE_LOOKBACK_DAYS);
+    let ticker_strings: Vec<String> = tickers.iter().map(Ticker::to_string).collect();
+
+    let rows = sqlx::query!(
+        "SELECT ticker, close_price \
+         FROM equity_bars \
+         WHERE ticker = ANY($1::text[]) AND timestamp >= $2 AND timestamp <= $3 \
+         ORDER BY ticker, timestamp",
+        &ticker_strings as &[String],
+        start_date,
+        end_date
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut closes: HashMap<Ticker, Vec<f64>> = HashMap::new();
+    for row in rows {
+        let Some(ticker) = Ticker::new(&row.ticker) else {
+            warn!(ticker = %row.ticker, "Skipping invalid ticker in equity_bars");
+            continue;
+        };
+        closes.entry(ticker).or_default().push(row.close_price);
+    }
+
+    info!(
+        tickers = closes.len(),
+        "Historical prices fetched from PostgreSQL for requested tickers"
+    );
+    Ok(closes)
+}
+
 /// Fetches historical close prices for all tickers over the trailing 90-day window.
 ///
 /// Returns a map from ticker symbol to ordered close prices (oldest to newest).

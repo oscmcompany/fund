@@ -285,21 +285,50 @@ impl AppState {
         self.rebalance_in_progress.store(false, Ordering::SeqCst);
     }
 
-    /// Returns `true` when enough time has passed to re-request predictions.
+    /// Claims the right to emit `equity_predictions_requested`, returning `true`
+    /// when the caller acquired it.
     ///
-    /// Always `true` before the first request of the process.
-    pub fn prediction_request_is_due(&self) -> bool {
-        let last = self.last_prediction_request_at.load(Ordering::SeqCst);
-        if last == 0 {
-            return true;
+    /// A compare-and-exchange rather than a separate check and record, for the
+    /// same reason [`try_begin_rebalance`](Self::try_begin_rebalance) uses one:
+    /// two callers observing the backoff as elapsed would both emit, and a
+    /// duplicate inference run is the expensive outcome the backoff exists to
+    /// prevent. The claim cannot be serialized by the rebalance slot because it
+    /// is made before that slot is taken.
+    ///
+    /// Always succeeds before the first claim of the process.
+    pub fn try_claim_prediction_request(&self) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        loop {
+            let last = self.last_prediction_request_at.load(Ordering::SeqCst);
+            if last != 0 && now - last < PREDICTION_REQUEST_RETRY_SECONDS {
+                return false;
+            }
+            // Only the caller that swaps the observed value wins; a loser
+            // re-reads and finds the backoff freshly started.
+            match self.last_prediction_request_at.compare_exchange(
+                last,
+                now,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue,
+            }
         }
-        chrono::Utc::now().timestamp() - last >= PREDICTION_REQUEST_RETRY_SECONDS
     }
 
-    /// Records that an `equity_predictions_requested` event was just emitted.
-    pub fn record_prediction_request(&self) {
+    /// Releases a prediction-request claim that was never emitted.
+    ///
+    /// Restores `previous` so a failed emission does not consume the backoff
+    /// window and leave the day without predictions.
+    pub fn release_prediction_request(&self, previous: i64) {
         self.last_prediction_request_at
-            .store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
+            .store(previous, Ordering::SeqCst);
+    }
+
+    /// Returns the timestamp of the most recent prediction request claim.
+    pub fn last_prediction_request_at(&self) -> i64 {
+        self.last_prediction_request_at.load(Ordering::SeqCst)
     }
 
     /// Returns a reference to the raw atomic storing the last request timestamp.
@@ -578,7 +607,7 @@ mod tests {
             (state.confidence_floor().0.value() - DEFAULT_CONFIDENCE_FLOOR).abs() < f64::EPSILON
         );
         assert!(!state.rebalance_in_progress());
-        assert!(state.prediction_request_is_due());
+        assert_eq!(state.last_prediction_request_at(), 0);
 
         unsafe {
             match original_alpaca_key_id {

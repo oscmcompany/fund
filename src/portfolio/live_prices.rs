@@ -17,11 +17,33 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use crate::domain::freshness::StalenessWindow;
 use crate::domain::market::{EquityQuote, Ticker};
 use crate::stream::buffer::MarketDataBuffer;
+
+/// Returns the mid-price when both sides of the book are usable.
+///
+/// Each side is validated independently. Checking only the average would accept
+/// a one-sided book such as `bid = 0, ask = 200`, whose mean is a plausible-looking
+/// 100 but is really half a real price — and it would then feed every spread that
+/// leg appears in.
+///
+/// A crossed book (`bid > ask`) is rejected as well: it is either a stale frame
+/// or a feed artifact, and its midpoint is not a price anything traded at.
+fn usable_mid_price(bid_price: f64, ask_price: f64) -> Option<f64> {
+    if !bid_price.is_finite() || bid_price <= 0.0 {
+        return None;
+    }
+    if !ask_price.is_finite() || ask_price <= 0.0 {
+        return None;
+    }
+    if bid_price > ask_price {
+        return None;
+    }
+    Some((bid_price + ask_price) / 2.0)
+}
 
 /// The most recent quote observed for a ticker.
 #[derive(Debug, Clone, Copy)]
@@ -59,16 +81,18 @@ impl LivePriceCache {
     /// reconnects, and rewinding a price would flip a spread back across a
     /// threshold it had already crossed.
     pub async fn record(&self, quote: &EquityQuote) {
-        let mid_price = (quote.bid_price() + quote.ask_price()) / 2.0;
-        if !mid_price.is_finite() || mid_price <= 0.0 {
-            warn!(
+        let Some(mid_price) = usable_mid_price(quote.bid_price(), quote.ask_price()) else {
+            // Debug rather than warn: a symbol quoting one-sided does so on
+            // every frame, which on a busy feed is thousands of warnings a
+            // second through the file appender.
+            debug!(
                 ticker = quote.ticker().as_str(),
                 bid = quote.bid_price(),
                 ask = quote.ask_price(),
-                "Ignoring quote with an unusable mid-price"
+                "Ignoring quote with an unusable book"
             );
             return;
-        }
+        };
 
         let mut prices = self.prices.write().await;
         match prices.get(quote.ticker()) {
@@ -237,14 +261,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unusable_mid_price_is_rejected() {
-        // A zero or negative book would silently corrupt every spread it feeds.
+    async fn test_unusable_book_is_rejected() {
         let now = Utc::now();
         let cache = LivePriceCache::default();
         cache.record(&quote_at("AAPL", 0.0, 0.0, now)).await;
         cache.record(&quote_at("MSFT", -1.0, 1.0, now)).await;
+        // The case the previous fixtures missed: a one-sided book whose average
+        // is a plausible-looking positive number. Validating only the mid would
+        // cache 100.0 for a symbol with no bid.
+        cache.record(&quote_at("GOOG", 0.0, 200.0, now)).await;
+        cache.record(&quote_at("TSLA", 200.0, 0.0, now)).await;
 
         assert!(cache.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn test_crossed_book_is_rejected() {
+        // Bid above ask is a stale frame or a feed artifact; its midpoint is not
+        // a price anything traded at.
+        let now = Utc::now();
+        let cache = LivePriceCache::default();
+        cache.record(&quote_at("AAPL", 181.0, 180.0, now)).await;
+
+        assert!(cache.is_empty().await);
+    }
+
+    #[test]
+    fn test_usable_mid_price_validates_each_side() {
+        assert_eq!(usable_mid_price(180.0, 180.2), Some(180.1));
+        // Touching book: bid equals ask is valid, not crossed.
+        assert_eq!(usable_mid_price(180.0, 180.0), Some(180.0));
+
+        assert_eq!(usable_mid_price(0.0, 200.0), None);
+        assert_eq!(usable_mid_price(200.0, 0.0), None);
+        assert_eq!(usable_mid_price(-1.0, 200.0), None);
+        assert_eq!(usable_mid_price(181.0, 180.0), None);
+        assert_eq!(usable_mid_price(f64::NAN, 180.0), None);
+        assert_eq!(usable_mid_price(180.0, f64::INFINITY), None);
     }
 
     #[tokio::test]

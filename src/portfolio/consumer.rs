@@ -292,23 +292,27 @@ async fn ensure_predictions_requested(state: &AppState, pool: &PgPool) {
         }
     }
 
-    if !state.prediction_request_is_due() {
+    // Claimed before emitting, so a concurrent caller cannot also decide the
+    // backoff has elapsed and request a second inference run.
+    let previous_claim = state.last_prediction_request_at();
+    if !state.try_claim_prediction_request() {
         info!("Predictions absent for today but a request is already pending");
         return;
     }
 
     info!("No predictions recorded for today; requesting a run");
-    match emit_event(
+    if let Err(error) = emit_event(
         pool,
         EventType::EquityPredictionsRequested,
         &serde_json::json!({"reason": "missing_for_session"}),
     )
     .await
     {
-        Ok(_) => state.record_prediction_request(),
-        Err(error) => {
-            warn!(error = %error, "Failed to emit equity_predictions_requested");
-        }
+        // Give the claim back: nothing was emitted, so consuming the backoff
+        // window would leave the session without predictions for ten minutes
+        // over a transient failure.
+        state.release_prediction_request(previous_claim);
+        warn!(error = %error, "Failed to emit equity_predictions_requested");
     }
 }
 
@@ -638,29 +642,30 @@ mod tests {
     // --- prediction request backoff ---
 
     #[tokio::test]
-    async fn test_prediction_request_due_before_first_request() {
+    async fn test_prediction_request_claimable_before_first_request() {
         let mock = MockTrading::default();
         let state = make_test_state(mock);
 
-        assert!(state.prediction_request_is_due());
+        assert!(state.try_claim_prediction_request());
     }
 
     #[tokio::test]
-    async fn test_prediction_request_not_due_immediately_after_request() {
+    async fn test_prediction_request_claim_is_exclusive() {
+        // The duplicate-inference guard: a second caller inside the backoff
+        // window must not also emit.
         let mock = MockTrading::default();
         let state = make_test_state(mock);
 
-        state.record_prediction_request();
-
-        assert!(!state.prediction_request_is_due());
+        assert!(state.try_claim_prediction_request());
+        assert!(!state.try_claim_prediction_request());
     }
 
     #[tokio::test]
-    async fn test_prediction_request_due_again_after_backoff() {
+    async fn test_prediction_request_claimable_again_after_backoff() {
         let mock = MockTrading::default();
         let state = make_test_state(mock);
 
-        state.record_prediction_request();
+        assert!(state.try_claim_prediction_request());
         // Backdate past the retry window: a run that died without emitting a
         // terminal event must not wedge the day.
         state.last_prediction_request_at_atomic().store(
@@ -668,6 +673,44 @@ mod tests {
             std::sync::atomic::Ordering::SeqCst,
         );
 
-        assert!(state.prediction_request_is_due());
+        assert!(state.try_claim_prediction_request());
+    }
+
+    #[tokio::test]
+    async fn test_released_claim_is_immediately_reclaimable() {
+        // A failed emission gives the window back rather than costing the
+        // session ten minutes of predictions over a transient error.
+        let mock = MockTrading::default();
+        let state = make_test_state(mock);
+
+        let previous = state.last_prediction_request_at();
+        assert!(state.try_claim_prediction_request());
+        assert!(!state.try_claim_prediction_request());
+
+        state.release_prediction_request(previous);
+
+        assert!(state.try_claim_prediction_request());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_claims_admit_exactly_one() {
+        let mock = MockTrading::default();
+        let state = make_test_state(mock);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            handles.push(tokio::spawn(
+                async move { state.try_claim_prediction_request() },
+            ));
+        }
+
+        let mut granted = 0;
+        for handle in handles {
+            if handle.await.expect("task should not panic") {
+                granted += 1;
+            }
+        }
+        assert_eq!(granted, 1, "exactly one caller may request predictions");
     }
 }

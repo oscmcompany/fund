@@ -108,13 +108,16 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Validated before any task is spawned, alongside the other configuration,
-    // so a pair count that cannot fit inside the broker's symbol cap fails at
-    // startup rather than as an Alpaca error 405 during the session.
-    let quote_stream_configuration = match &portfolio_state {
-        Some(state) => Some(QuoteStreamConfiguration::from_env(
-            state.constraints().minimum_pairs(),
-        )?),
+    // Both reads happen here, before any task is spawned, for the reason stated
+    // above: a fallible read after spawning would return without cancelling the
+    // shutdown token or awaiting the handles. The symbol cap is also validated
+    // here, so a pair count that cannot fit fails at startup rather than as an
+    // Alpaca error 405 mid-session.
+    let quote_stream_setup = match &portfolio_state {
+        Some(state) => Some((
+            QuoteStreamConfiguration::from_env(state.constraints().minimum_pairs())?,
+            fund::common::alpaca::AlpacaCredentials::from_env()?,
+        )),
         None => None,
     };
 
@@ -160,9 +163,7 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(state) = portfolio_state {
-        if let Some(configuration) = quote_stream_configuration {
-            let credentials = fund::common::alpaca::AlpacaCredentials::from_env()?;
-
+        if let Some((configuration, credentials)) = quote_stream_setup {
             // The cache subscribes before the producer starts so no quote is
             // published into a channel with no readers.
             handles.push(fund::portfolio::live_prices::spawn_live_price_cache(

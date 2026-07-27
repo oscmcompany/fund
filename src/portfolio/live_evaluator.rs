@@ -10,14 +10,19 @@
 //! the `DataBoundary` contract — raw quotes stay ephemeral and only a decision
 //! crosses into PostgreSQL.
 //!
-//! This is a trigger, not a decision. It answers "something may have crossed,
-//! go look" and the authoritative close is made by `evaluate_open_pairs` inside
-//! the rebalance pass, which recomputes the z-score over the full daily series.
-//! Both sides share [`close_reason_for`] so they can never disagree about what a
-//! given z-score means, but the trigger's z-score is deliberately the cheaper
-//! approximation: it measures the live spread against baseline statistics rather
-//! than recomputing them. Being slightly eager is the correct bias for a trigger
-//! whose only cost is one extra evaluation pass.
+//! This is a trigger, not a decision. It answers "something may have crossed, go
+//! look"; the authoritative close is made by `evaluate_open_pairs` inside the
+//! rebalance pass.
+//!
+//! The two must agree on both the rule and the measurement. They share
+//! [`close_reason_for`] for the rule and [`z_score_against`] for the
+//! measurement, each standardizing the live spread against the historical daily
+//! distribution. An earlier version let them diverge — the pass appended the
+//! live point to the series it was scored against while the trigger did not —
+//! which made the trigger's magnitude systematically larger. That livelocks:
+//! the trigger fires, the pass computes a smaller magnitude and keeps the pair
+//! open, the debounce expires, and it fires again, forever. The only intended
+//! difference is *when* each runs, never what either computes.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -30,10 +35,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::common::events::{emit_event, EventType};
+use crate::common::market_hours::{
+    duration_until_quote_stream_window, is_within_quote_stream_window,
+};
 use crate::domain::market::{PairID, Ticker};
-use crate::portfolio::database::{fetch_historical_equity_prices, fetch_open_pairs};
+use crate::portfolio::database::{fetch_historical_equity_prices_for, fetch_open_pairs, OpenPair};
 use crate::portfolio::live_prices::LivePriceCache;
-use crate::portfolio::math::{mean, standard_deviation};
+use crate::portfolio::math::{standard_deviation, z_score_against};
 use crate::portfolio::rebalance::close_reason_for;
 
 /// How often baselines are rebuilt from the database.
@@ -71,8 +79,11 @@ struct PairBaseline {
     short_ticker: Ticker,
     hedge_ratio: f64,
     entry_z_score: f64,
-    spread_mean: f64,
-    spread_standard_deviation: f64,
+    /// Historical daily spread, retained so the trigger standardizes through the
+    /// same [`z_score_against`] the authoritative pass uses. Storing a
+    /// precomputed mean and deviation instead would leave two places to keep the
+    /// estimator in sync, which is how they diverged before.
+    spread_history: Vec<f64>,
 }
 
 impl PairBaseline {
@@ -84,8 +95,8 @@ impl PairBaseline {
     fn live_z_score(&self, live_mid_prices: &HashMap<Ticker, f64>) -> Option<f64> {
         let long_mid = live_mid_prices.get(&self.long_ticker)?;
         let short_mid = live_mid_prices.get(&self.short_ticker)?;
-        let spread = long_mid - self.hedge_ratio * short_mid;
-        Some((spread - self.spread_mean) / self.spread_standard_deviation)
+        let live_spread = long_mid - self.hedge_ratio * short_mid;
+        Some(z_score_against(&self.spread_history, live_spread))
     }
 }
 
@@ -95,47 +106,65 @@ async fn load_baselines(pool: &PgPool) -> Result<Vec<PairBaseline>, sqlx::Error>
     if open_pairs.is_empty() {
         return Ok(Vec::new());
     }
-    let historical_prices = fetch_historical_equity_prices(pool).await?;
 
-    let mut baselines = Vec::new();
-    for pair in &open_pairs {
-        let (Some(long_prices), Some(short_prices)) = (
-            historical_prices.get(pair.long_ticker()),
-            historical_prices.get(pair.short_ticker()),
-        ) else {
-            continue;
-        };
+    // Scoped to the open legs. This runs once a minute through the session, and
+    // the unfiltered query materializes the full 90-day price table for every
+    // ticker in the universe to use a few dozen of them.
+    let legs: Vec<Ticker> = open_pairs
+        .iter()
+        .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
+        .collect();
+    let historical_prices = fetch_historical_equity_prices_for(pool, &legs).await?;
 
-        let common_length = long_prices.len().min(short_prices.len());
-        if common_length < MINIMUM_SPREAD_SAMPLES {
-            continue;
-        }
-
-        let spread: Vec<f64> = long_prices[long_prices.len() - common_length..]
-            .iter()
-            .zip(short_prices[short_prices.len() - common_length..].iter())
-            .map(|(long, short)| long - pair.hedge_ratio() * short)
-            .collect();
-
-        let spread_standard_deviation = standard_deviation(&spread, 1);
-        // A flat spread cannot produce a meaningful z-score, and dividing by it
-        // would yield infinity and fire the trigger permanently.
-        if spread_standard_deviation <= 0.0 || !spread_standard_deviation.is_finite() {
-            continue;
-        }
-
-        baselines.push(PairBaseline {
-            pair_id: pair.pair_id().clone(),
-            long_ticker: pair.long_ticker().clone(),
-            short_ticker: pair.short_ticker().clone(),
-            hedge_ratio: pair.hedge_ratio(),
-            entry_z_score: pair.entry_z_score(),
-            spread_mean: mean(&spread),
-            spread_standard_deviation,
-        });
-    }
+    let baselines = open_pairs
+        .iter()
+        .filter_map(|pair| {
+            baseline_for(
+                pair,
+                historical_prices.get(pair.long_ticker())?,
+                historical_prices.get(pair.short_ticker())?,
+            )
+        })
+        .collect();
 
     Ok(baselines)
+}
+
+/// Builds one pair's baseline, or `None` when its history cannot support a z-score.
+///
+/// Separated from the query so the discard rules are reachable without a pool.
+fn baseline_for(
+    pair: &OpenPair,
+    long_prices: &[f64],
+    short_prices: &[f64],
+) -> Option<PairBaseline> {
+    let common_length = long_prices.len().min(short_prices.len());
+    if common_length < MINIMUM_SPREAD_SAMPLES {
+        return None;
+    }
+
+    let spread_history: Vec<f64> = long_prices[long_prices.len() - common_length..]
+        .iter()
+        .zip(short_prices[short_prices.len() - common_length..].iter())
+        .map(|(long, short)| long - pair.hedge_ratio() * short)
+        .collect();
+
+    // A flat spread cannot produce a meaningful z-score. z_score_against returns
+    // zero for it, which close_reason_for reads as no signal, but discarding it
+    // here keeps the trigger from re-deriving that on every one-second tick.
+    let deviation = standard_deviation(&spread_history, 0);
+    if deviation <= 0.0 || !deviation.is_finite() {
+        return None;
+    }
+
+    Some(PairBaseline {
+        pair_id: pair.pair_id().clone(),
+        long_ticker: pair.long_ticker().clone(),
+        short_ticker: pair.short_ticker().clone(),
+        hedge_ratio: pair.hedge_ratio(),
+        entry_z_score: pair.entry_z_score(),
+        spread_history,
+    })
 }
 
 /// Returns the pairs whose live spread has crossed a close threshold.
@@ -175,6 +204,25 @@ async fn run_live_evaluator(
     let mut refresh_due = true;
 
     loop {
+        // Outside the quote-stream window the cache is guaranteed empty, because
+        // the producer sleeps through the same window. Refreshing baselines here
+        // would issue queries a minute, all night and all weekend, for a check
+        // that cannot fire.
+        if !is_within_quote_stream_window() {
+            let wait = duration_until_quote_stream_window(Utc::now());
+            info!(
+                wait_seconds = wait.as_secs(),
+                "Outside quote stream window; live exit trigger sleeping"
+            );
+            tokio::select! {
+                _ = sleep(wait) => {}
+                _ = shutdown_token.cancelled() => break,
+            }
+            // The open-pair set will have moved on across a session boundary.
+            refresh_due = true;
+            continue;
+        }
+
         if refresh_due {
             match load_baselines(&pool).await {
                 Ok(loaded) => {
@@ -219,6 +267,12 @@ async fn run_live_evaluator(
             "Live spread crossed a close threshold; requesting evaluation"
         );
 
+        // The debounce is reset on both outcomes. A crossing persists until a
+        // pass closes the position, so leaving it unreset on failure would retry
+        // every second — and with the reload below, that is two queries plus a
+        // failing insert per second, precisely when the database is least able
+        // to absorb them.
+        since_emission = Duration::ZERO;
         match emit_event(
             &pool,
             EventType::PortfolioEvaluationRequested,
@@ -226,14 +280,14 @@ async fn run_live_evaluator(
         )
         .await
         {
-            Ok(_) => since_emission = Duration::ZERO,
+            // Baselines are stale the moment a pass may have closed something.
+            Ok(_) => refresh_due = true,
             Err(error) => {
+                // No reload on failure: nothing acted on the trigger, so the
+                // baselines still describe the open positions accurately.
                 warn!(error = %error, "Failed to emit portfolio_evaluation_requested");
             }
         }
-
-        // Baselines are stale the moment a pass may have closed something.
-        refresh_due = true;
     }
 
     info!("Live exit trigger stopped");
@@ -247,18 +301,23 @@ mod tests {
         Ticker::new(symbol).expect("valid ticker")
     }
 
-    /// Baseline with mean 0 and standard deviation 1, so the live spread value
-    /// is itself the z-score and the tests read directly.
-    fn unit_baseline(entry_z_score: f64) -> PairBaseline {
+    /// Builds a baseline over `history`, which becomes the distribution live
+    /// spreads are standardized against.
+    fn baseline_with(entry_z_score: f64, history: Vec<f64>) -> PairBaseline {
         PairBaseline {
             pair_id: PairID::new(ticker("AAPL"), ticker("MSFT")),
             long_ticker: ticker("AAPL"),
             short_ticker: ticker("MSFT"),
             hedge_ratio: 1.0,
             entry_z_score,
-            spread_mean: 0.0,
-            spread_standard_deviation: 1.0,
+            spread_history: history,
         }
+    }
+
+    /// History with mean 0 and population standard deviation 1, so a live spread
+    /// value reads directly as its own z-score.
+    fn unit_baseline(entry_z_score: f64) -> PairBaseline {
+        baseline_with(entry_z_score, vec![-1.0, 1.0])
     }
 
     fn live(long: f64, short: f64) -> HashMap<Ticker, f64> {
@@ -269,10 +328,9 @@ mod tests {
     }
 
     #[test]
-    fn test_live_z_score_uses_baseline_statistics() {
-        let mut baseline = unit_baseline(2.5);
-        baseline.spread_mean = 10.0;
-        baseline.spread_standard_deviation = 2.0;
+    fn test_live_z_score_uses_history_distribution() {
+        // History mean 10, population standard deviation 2.
+        let baseline = baseline_with(2.5, vec![8.0, 12.0]);
 
         // Spread is 20 - 4 = 16; (16 - 10) / 2 = 3.
         let z_score = baseline.live_z_score(&live(20.0, 4.0)).unwrap();
@@ -335,6 +393,85 @@ mod tests {
     #[test]
     fn test_no_crossing_without_baselines() {
         assert!(crossed_pairs(&[], &live(1.0, 2.0)).is_empty());
+    }
+
+    #[test]
+    fn test_trigger_z_score_matches_authoritative_pass() {
+        // The livelock regression. The trigger standardizes the live spread
+        // against history; so does evaluate_open_pairs. If the two used
+        // different distributions the trigger would fire on a larger magnitude
+        // than the pass computes, the pass would keep the pair open, the
+        // debounce would expire, and the trigger would fire again forever.
+        let history = vec![10.0, 12.0, 11.0, 9.0, 13.0, 8.0];
+        let baseline = baseline_with(2.5, history.clone());
+
+        let long_mid = 30.0;
+        let short_mid = 4.0;
+        let trigger_z = baseline.live_z_score(&live(long_mid, short_mid)).unwrap();
+
+        // What evaluate_open_pairs computes for the same inputs.
+        let live_spread = long_mid - baseline.hedge_ratio * short_mid;
+        let authoritative_z = z_score_against(&history, live_spread);
+
+        assert!(
+            (trigger_z - authoritative_z).abs() < 1e-12,
+            "trigger and authoritative z-scores must be identical: {trigger_z} vs {authoritative_z}"
+        );
+        // And a crossing seen by the trigger is therefore actionable by the pass.
+        assert_eq!(
+            close_reason_for(baseline.entry_z_score, trigger_z),
+            close_reason_for(baseline.entry_z_score, authoritative_z)
+        );
+    }
+
+    #[test]
+    fn test_flat_history_yields_no_signal() {
+        // z_score_against returns zero for a zero-deviation series, which
+        // close_reason_for reads as no signal rather than convergence.
+        let baseline = baseline_with(2.5, vec![5.0, 5.0, 5.0]);
+        assert_eq!(baseline.live_z_score(&live(99.0, 0.0)), Some(0.0));
+        assert!(crossed_pairs(&[baseline], &live(99.0, 0.0)).is_empty());
+    }
+
+    // --- baseline_for discard rules ---
+
+    fn open_pair(hedge_ratio: f64) -> OpenPair {
+        OpenPair::new_for_test(
+            uuid::Uuid::new_v4(),
+            PairID::new(ticker("AAPL"), ticker("MSFT")),
+            ticker("AAPL"),
+            ticker("MSFT"),
+            2.5,
+            hedge_ratio,
+        )
+    }
+
+    #[test]
+    fn test_baseline_built_from_aligned_history() {
+        let baseline = baseline_for(&open_pair(1.0), &[10.0, 12.0, 14.0], &[1.0, 2.0, 3.0])
+            .expect("varying spread should produce a baseline");
+        assert_eq!(baseline.spread_history.len(), 3);
+    }
+
+    #[test]
+    fn test_baseline_truncates_to_common_length() {
+        // Legs with unequal history align on the shorter one.
+        let baseline = baseline_for(&open_pair(1.0), &[1.0, 10.0, 12.0, 14.0], &[1.0, 2.0])
+            .expect("baseline should build from the common tail");
+        assert_eq!(baseline.spread_history.len(), 2);
+    }
+
+    #[test]
+    fn test_baseline_rejects_too_few_samples() {
+        assert!(baseline_for(&open_pair(1.0), &[10.0], &[1.0]).is_none());
+        assert!(baseline_for(&open_pair(1.0), &[], &[]).is_none());
+    }
+
+    #[test]
+    fn test_baseline_rejects_flat_spread() {
+        // A constant spread has zero deviation; dividing by it would yield
+        // infinity and fire the trigger permanently.
+        assert!(baseline_for(&open_pair(1.0), &[10.0, 11.0, 12.0], &[1.0, 2.0, 3.0]).is_none());
     }
 
     #[test]
