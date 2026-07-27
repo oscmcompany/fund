@@ -16,6 +16,7 @@ use crate::domain::portfolio::{
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
 use crate::portfolio::alpaca::{TradableAssets, Trading, TradingClient};
+use crate::portfolio::live_prices::LivePriceCache;
 use crate::portfolio::risk_gate::{
     MarginUtilizationLimit, MaximumParticipationRate, RiskGateConfiguration, StrategyId,
 };
@@ -195,6 +196,11 @@ pub struct AppState {
     /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
     /// The inner `Arc` avoids cloning the full struct on every cache hit.
     tradable_assets: Arc<RwLock<Option<Arc<TradableAssets>>>>,
+    /// Latest streamed mid-price per ticker, read during exit evaluation.
+    ///
+    /// Empty when the quote stream is not running, which degrades evaluation to
+    /// daily closes rather than failing.
+    live_prices: LivePriceCache,
     /// Guards against two rebalance passes running concurrently.
     ///
     /// Scoped to a single evaluation: set when a pass begins and cleared when it
@@ -252,6 +258,11 @@ impl AppState {
     /// Returns the shared tradable asset cache.
     pub fn tradable_assets(&self) -> &Arc<RwLock<Option<Arc<TradableAssets>>>> {
         &self.tradable_assets
+    }
+
+    /// Returns the live price cache shared with the quote stream consumer.
+    pub fn live_prices(&self) -> &LivePriceCache {
+        &self.live_prices
     }
 
     /// Returns `true` when a rebalance pass is already running.
@@ -372,6 +383,7 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
+            live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
@@ -478,6 +490,7 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
+            live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
@@ -514,6 +527,7 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
+            live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,

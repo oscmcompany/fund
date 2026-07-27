@@ -162,6 +162,15 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(state) = portfolio_state {
         if let Some(configuration) = quote_stream_configuration {
             let credentials = fund::common::alpaca::AlpacaCredentials::from_env()?;
+
+            // The cache subscribes before the producer starts so no quote is
+            // published into a channel with no readers.
+            handles.push(fund::portfolio::live_prices::spawn_live_price_cache(
+                state.live_prices().clone(),
+                Arc::clone(&market_data_buffer),
+                shutdown_token.clone(),
+            ));
+
             handles.push(tokio::spawn(
                 fund::stream::alpaca_equities::run_quote_stream(
                     configuration,

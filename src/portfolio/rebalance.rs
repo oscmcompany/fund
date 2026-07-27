@@ -216,7 +216,13 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
     if !open_pairs.is_empty() {
-        let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices);
+        let live_mid_prices = state.live_prices().fresh_mid_prices(Utc::now()).await;
+        info!(
+            live_quotes = live_mid_prices.len(),
+            open_pairs = open_pairs.len(),
+            "Exit evaluation pricing"
+        );
+        let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices, &live_mid_prices);
         pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
         let pairs_kept_after_exits = open_pairs.len() - pairs_closed;
         info!(
@@ -626,9 +632,16 @@ struct PairCloseSignal {
 ///   further against the position.
 ///
 /// Pairs where either leg lacks historical price data are silently skipped (kept open).
+///
+/// `live_mid_prices` carries streamed mid-prices that passed the staleness
+/// guard. When both legs of a pair are present, the current spread is appended
+/// to the daily series so the z-score reflects the intraday book rather than
+/// the prior session's close. Predictions remain the directional alpha; this is
+/// what makes the exit timing intraday.
 fn evaluate_open_pairs(
     open_pairs: &[OpenPair],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
+    live_mid_prices: &HashMap<Ticker, f64>,
 ) -> Vec<PairCloseSignal> {
     let mut signals = Vec::new();
 
@@ -658,11 +671,32 @@ fn evaluate_open_pairs(
         let long_slice = &long_prices[long_prices.len() - common_length..];
         let short_slice = &short_prices[short_prices.len() - common_length..];
 
-        let spread: Vec<f64> = long_slice
+        let mut spread: Vec<f64> = long_slice
             .iter()
             .zip(short_slice.iter())
             .map(|(long, short)| long - pair.hedge_ratio() * short)
             .collect();
+
+        // Both legs must be fresh or neither is used: pricing one leg live
+        // against the other's prior close would move the spread by a day of
+        // drift in that leg alone and read as a signal.
+        match (
+            live_mid_prices.get(pair.long_ticker()),
+            live_mid_prices.get(pair.short_ticker()),
+        ) {
+            (Some(long_mid), Some(short_mid)) => {
+                // Appended rather than substituted: the prior close is real
+                // data, and the live observation is an additional point, so the
+                // mean and standard deviation account for both.
+                spread.push(long_mid - pair.hedge_ratio() * short_mid);
+            }
+            _ => {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    "No fresh quotes for both legs; evaluating on daily closes"
+                );
+            }
+        }
 
         let current_z = z_score_last(&spread);
 
@@ -1359,7 +1393,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, -1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }
@@ -1373,7 +1407,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 100.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 150.0, -1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }
@@ -1393,7 +1427,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
         prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
@@ -1407,7 +1441,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 0.5));
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert!(signals.is_empty());
     }
 
@@ -1416,7 +1450,7 @@ mod tests {
         let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
         let prices = HashMap::new(); // No price data at all.
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert!(signals.is_empty()); // Pair kept open due to missing data.
     }
 
@@ -1440,7 +1474,8 @@ mod tests {
         prices.insert(Ticker::new("E").unwrap(), long_e);
         prices.insert(Ticker::new("F").unwrap(), vec![100.0; 60]);
 
-        let signals = evaluate_open_pairs(&[converging, stable, diverging], &prices);
+        let signals =
+            evaluate_open_pairs(&[converging, stable, diverging], &prices, &HashMap::new());
         assert_eq!(signals.len(), 2);
 
         let reasons: Vec<&CloseReason> = signals.iter().map(|signal| &signal.reason).collect();
@@ -1458,14 +1493,108 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0; 60]);
         prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0; 60]);
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert!(signals.is_empty());
     }
 
     #[test]
     fn test_evaluate_open_pairs_empty_input() {
-        let signals = evaluate_open_pairs(&[], &HashMap::new());
+        let signals = evaluate_open_pairs(&[], &HashMap::new(), &HashMap::new());
         assert!(signals.is_empty());
+    }
+
+    // --- live price influence on exit decisions ---
+
+    /// Daily closes where the spread sits steadily above its mean, so the pair
+    /// has not converged on daily data alone.
+    fn diverged_daily_prices() -> HashMap<Ticker, Vec<f64>> {
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 100.0, 1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 0.5));
+        prices
+    }
+
+    #[test]
+    fn test_live_quotes_can_trigger_convergence_daily_closes_miss() {
+        // This is the whole point of streaming quotes. On daily closes the
+        // spread is still wide and the pair stays open; a live collapse in the
+        // long leg converges it now rather than at tomorrow's bar sync.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let prices = diverged_daily_prices();
+
+        assert!(
+            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &HashMap::new()).is_empty()
+        );
+
+        let mut live = HashMap::new();
+        live.insert(Ticker::new("AAPL").unwrap(), 100.0);
+        live.insert(Ticker::new("MSFT").unwrap(), 200.0);
+
+        let signals = evaluate_open_pairs(&[pair], &prices, &live);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_live_quote_for_one_leg_only_is_ignored() {
+        // Pricing the long leg live against the short leg's prior close would
+        // move the spread by a day of drift in one leg and read as a signal.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let prices = diverged_daily_prices();
+
+        let mut live = HashMap::new();
+        live.insert(Ticker::new("AAPL").unwrap(), 100.0);
+
+        assert_eq!(
+            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &live).len(),
+            evaluate_open_pairs(&[pair], &prices, &HashMap::new()).len()
+        );
+    }
+
+    #[test]
+    fn test_live_quote_for_unrelated_ticker_is_ignored() {
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let prices = diverged_daily_prices();
+
+        let mut live = HashMap::new();
+        live.insert(Ticker::new("TSLA").unwrap(), 250.0);
+
+        assert!(evaluate_open_pairs(&[pair], &prices, &live).is_empty());
+    }
+
+    #[test]
+    fn test_absent_live_quotes_preserve_daily_close_behavior() {
+        // The staleness guard hands back an empty map whenever quotes stop
+        // flowing, so this is the degraded path the system runs in outside the
+        // quote window or on a halted symbol.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let mut prices = HashMap::new();
+        prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, -1.0));
+        prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.0));
+
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
+    }
+
+    #[test]
+    fn test_live_quotes_can_trigger_stop_loss() {
+        // A live divergence past the threshold closes the position intraday
+        // rather than letting it run until the next daily bar.
+        let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
+        let prices = diverged_daily_prices();
+
+        assert!(
+            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &HashMap::new()).is_empty()
+        );
+
+        let mut live = HashMap::new();
+        live.insert(Ticker::new("AAPL").unwrap(), 400.0);
+        live.insert(Ticker::new("MSFT").unwrap(), 100.0);
+
+        let signals = evaluate_open_pairs(&[pair], &prices, &live);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
 
     #[test]
@@ -1484,7 +1613,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0]);
         prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0]);
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert!(signals.is_empty());
     }
 
@@ -1500,7 +1629,7 @@ mod tests {
         // Short: only 30 points increasing.
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(30, 100.0, 1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         // Should still evaluate correctly using the last 30 points.
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
@@ -1514,7 +1643,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         // No MSFT prices.
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert!(signals.is_empty());
     }
 
@@ -1533,7 +1662,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
         prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
@@ -1551,7 +1680,7 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.5));
 
-        let signals = evaluate_open_pairs(&[pair], &prices);
+        let signals = evaluate_open_pairs(&[pair], &prices, &HashMap::new());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }

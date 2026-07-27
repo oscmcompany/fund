@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// `created_at` timestamp.
 pub const PREDICTIONS_STALENESS_WINDOW_HOURS: i64 = 20;
 
+/// Named staleness window for live streamed quotes.
+///
+/// Sixty seconds is long enough that a liquid name quoting steadily always has
+/// a usable mid, and short enough that a halted or thinly traded symbol falls
+/// back to its prior close rather than pricing a spread off a minutes-old book.
+/// The IEX feed carries a few percent of consolidated volume, so sparse quoting
+/// on smaller names is expected rather than exceptional.
+pub const QUOTES_STALENESS_WINDOW_SECONDS: i64 = 60;
+
 /// Error returned when constructing a `StalenessWindow` with a non-positive duration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZeroDurationError;
@@ -39,6 +48,12 @@ impl StalenessWindow {
     pub fn predictions() -> Self {
         StalenessWindow::new(Duration::hours(PREDICTIONS_STALENESS_WINDOW_HOURS))
             .expect("PREDICTIONS_STALENESS_WINDOW_HOURS must be positive")
+    }
+
+    /// Returns the staleness window for live streamed quotes (60 seconds).
+    pub fn quotes() -> Self {
+        StalenessWindow::new(Duration::seconds(QUOTES_STALENESS_WINDOW_SECONDS))
+            .expect("QUOTES_STALENESS_WINDOW_SECONDS must be positive")
     }
 }
 
