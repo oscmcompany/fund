@@ -180,6 +180,14 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
                     shutdown_token.clone(),
                 ),
             ));
+
+            // Turns a live threshold crossing into an evaluation request so an
+            // exit is acted on within seconds rather than at the next heartbeat.
+            handles.push(fund::portfolio::live_evaluator::spawn_live_evaluator(
+                pool.clone(),
+                state.live_prices().clone(),
+                shutdown_token.clone(),
+            ));
             info!("Quote stream producer started");
         }
 

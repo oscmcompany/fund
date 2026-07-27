@@ -700,59 +700,79 @@ fn evaluate_open_pairs(
 
         let current_z = z_score_last(&spread);
 
-        // z_score_last returns 0.0 when the spread has near-zero standard deviation
-        // (degenerate/halted). Treating this as a real z-score would falsely trigger
-        // convergence. Skip evaluation and keep the pair open.
-        if current_z == 0.0 {
-            info!(
-                pair_id = pair.pair_id().as_str(),
-                "Spread has zero variance; skipping evaluation and keeping pair"
-            );
-            continue;
-        }
-
-        // Convergence: z-score crossed back through zero relative to entry direction.
-        let converged = (pair.entry_z_score() > 0.0 && current_z <= 0.0)
-            || (pair.entry_z_score() < 0.0 && current_z >= 0.0);
-
-        // Stop loss: z-score diverged further against the position past the threshold.
-        let stopped_out = current_z.abs() >= STOP_LOSS_Z_SCORE_THRESHOLD
-            && current_z.signum() == pair.entry_z_score().signum();
-
-        if converged {
-            info!(
-                pair_id = pair.pair_id().as_str(),
-                entry_z = pair.entry_z_score(),
-                current_z = current_z,
-                "Pair converged; closing with profit taken"
-            );
-            signals.push(PairCloseSignal {
-                open_pair: pair.clone(),
-                reason: CloseReason::ProfitTaken,
-            });
-        } else if stopped_out {
-            info!(
-                pair_id = pair.pair_id().as_str(),
-                entry_z = pair.entry_z_score(),
-                current_z = current_z,
-                threshold = STOP_LOSS_Z_SCORE_THRESHOLD,
-                "Pair diverged past stop-loss threshold; closing"
-            );
-            signals.push(PairCloseSignal {
-                open_pair: pair.clone(),
-                reason: CloseReason::StopLoss,
-            });
-        } else {
-            info!(
-                pair_id = pair.pair_id().as_str(),
-                entry_z = pair.entry_z_score(),
-                current_z = current_z,
-                "Pair within range; keeping open"
-            );
+        match close_reason_for(pair.entry_z_score(), current_z) {
+            Some(CloseReason::ProfitTaken) => {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    entry_z = pair.entry_z_score(),
+                    current_z = current_z,
+                    "Pair converged; closing with profit taken"
+                );
+                signals.push(PairCloseSignal {
+                    open_pair: pair.clone(),
+                    reason: CloseReason::ProfitTaken,
+                });
+            }
+            Some(reason) => {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    entry_z = pair.entry_z_score(),
+                    current_z = current_z,
+                    threshold = STOP_LOSS_Z_SCORE_THRESHOLD,
+                    "Pair diverged past stop-loss threshold; closing"
+                );
+                signals.push(PairCloseSignal {
+                    open_pair: pair.clone(),
+                    reason,
+                });
+            }
+            None => {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    entry_z = pair.entry_z_score(),
+                    current_z = current_z,
+                    "Pair within range; keeping open"
+                );
+            }
         }
     }
 
     signals
+}
+
+/// Returns the close reason implied by `current_z`, or `None` to keep the pair.
+///
+/// Shared by the authoritative exit evaluation and the live-quote trigger so a
+/// single definition of "this pair should close" governs both. The two differ
+/// only in how they arrive at `current_z`; they must never disagree on what it
+/// means.
+///
+/// A `current_z` of exactly zero is treated as no signal rather than as
+/// convergence: `z_score_last` returns zero when the spread has near-zero
+/// variance, which happens on a halted or degenerate series, and reading that
+/// as convergence would close healthy positions on missing data.
+pub fn close_reason_for(entry_z_score: f64, current_z: f64) -> Option<CloseReason> {
+    if current_z == 0.0 || !current_z.is_finite() {
+        return None;
+    }
+
+    // Convergence: the z-score crossed back through zero relative to the
+    // direction the pair was entered on.
+    let converged =
+        (entry_z_score > 0.0 && current_z <= 0.0) || (entry_z_score < 0.0 && current_z >= 0.0);
+    if converged {
+        return Some(CloseReason::ProfitTaken);
+    }
+
+    // Stop loss: the spread diverged further against the position past the
+    // threshold, in the same direction it was entered on.
+    let stopped_out = current_z.abs() >= STOP_LOSS_Z_SCORE_THRESHOLD
+        && current_z.signum() == entry_z_score.signum();
+    if stopped_out {
+        return Some(CloseReason::StopLoss);
+    }
+
+    None
 }
 
 /// Closes the given pairs on Alpaca and marks them closed in the database.
