@@ -217,10 +217,10 @@ pub struct AppState {
     last_prediction_request_at: Arc<AtomicI64>,
     /// Pre-trade risk gate configuration for position request validation.
     risk_gate_configuration: RiskGateConfiguration,
-    /// Number of statistical-arbitrage candidate pairs to consider per rebalance.
-    /// Decoupled from the required minimum (`constraints.minimum_pairs`) so a
-    /// larger pool can absorb sizing attrition. Override per environment with
-    /// `PORTFOLIO_CANDIDATE_POOL`.
+    /// Cap on how many disjoint pairs the entry pass sizes at once.
+    ///
+    /// Not a reservoir: the entry pass re-selects from the full ranked candidate
+    /// list whenever a pair is rejected. Override with `PORTFOLIO_CANDIDATE_POOL`.
     candidate_pool_count: usize,
 }
 

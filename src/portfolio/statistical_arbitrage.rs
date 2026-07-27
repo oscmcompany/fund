@@ -30,11 +30,17 @@ const CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Minimum number of eligible tickers needed to form any pair.
 const MINIMUM_TICKER_COUNT: usize = 2;
 
-/// Default size of the candidate pool returned by `select_pairs` when not
-/// configured via `PORTFOLIO_CANDIDATE_POOL`. Decoupled from the required
-/// minimum (the `minimum_pairs` constraint) so a larger pool can absorb sizing
-/// attrition without lowering the minimum; defaults to the same value, leaving
-/// behavior unchanged unless overridden per environment.
+/// Default size of the working set handed to sizing, overridable via
+/// `PORTFOLIO_CANDIDATE_POOL`.
+///
+/// This is a cap on how many disjoint pairs [`select_disjoint_pairs`] will take,
+/// not a reservoir. The reservoir is the full ranked output of
+/// [`score_candidate_pairs`], which the entry pass re-selects from whenever a
+/// pair is rejected, so spare capacity does not need to be reserved here.
+///
+/// Kept at the same value as the default `minimum_pairs` because raising it
+/// would widen the basket that volatility parity and the beta-neutral solve run
+/// over, changing position sizing rather than merely adding fallbacks.
 pub const DEFAULT_CANDIDATE_POOL: usize = 10;
 
 /// A candidate long-short pair identified by the statistical arbitrage screener.
@@ -128,7 +134,24 @@ impl CandidatePair {
     }
 }
 
-/// Selects up to `candidate_pool` statistical arbitrage pairs from the signals.
+/// A screened pair together with the score it was ranked on.
+#[derive(Debug, Clone)]
+pub struct ScoredPair {
+    pair: CandidatePair,
+    rank_score: f64,
+}
+
+impl ScoredPair {
+    pub fn pair(&self) -> &CandidatePair {
+        &self.pair
+    }
+
+    pub fn rank_score(&self) -> f64 {
+        self.rank_score
+    }
+}
+
+/// Generates, screens, and ranks every eligible pair.
 ///
 /// Filters signals by `ensemble_confidence >= CONFIDENCE_THRESHOLD` and
 /// `realized_volatility > 0`. Builds a Pearson correlation matrix over the last
@@ -136,20 +159,18 @@ impl CandidatePair {
 /// 1. Correlation in `[CORRELATION_MINIMUM, CORRELATION_MAXIMUM]`
 /// 2. Z-score of the OLS spread >= `Z_SCORE_ENTRY_THRESHOLD`
 ///
-/// Pairs are ranked by `|z_score| × signal_strength` and selected greedily
-/// (no ticker appears in more than one pair), returning the top `candidate_pool`.
-/// A pool larger than the required minimum leaves spare candidates for sizing to
-/// fall back on. Returns an empty `Vec` when insufficient data or fewer than
-/// `MINIMUM_TICKER_COUNT` eligible tickers.
-pub fn select_pairs(
+/// Results are ordered by `|z_score| × signal_strength`, descending. No
+/// disjointness constraint is applied here: the returned list is the full
+/// reservoir, and pairs within it may share tickers.
+///
+/// This is the expensive half of pair selection, quadratic in the number of
+/// eligible tickers with a correlation and an OLS regression per combination.
+/// It is separated from selection so an entry pass that re-selects after a
+/// rejection pays for the ranking only once.
+pub fn score_candidate_pairs(
     signals: &[ConsolidatedSignal],
     historical_closes: &HashMap<Ticker, Vec<f64>>,
-    candidate_pool: usize,
-) -> Vec<CandidatePair> {
-    if candidate_pool == 0 {
-        return Vec::new();
-    }
-
+) -> Vec<ScoredPair> {
     // Filter to confident tickers with valid volatility.
     let eligible: Vec<&ConsolidatedSignal> = signals
         .iter()
@@ -285,10 +306,6 @@ pub fn select_pairs(
         }
     }
 
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
     // Sort by rank score descending.
     candidates.sort_by(|(_, score_a), (_, score_b)| {
         score_b
@@ -296,23 +313,68 @@ pub fn select_pairs(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Greedy selection: each ticker appears in at most one pair.
+    candidates
+        .into_iter()
+        .map(|(pair, rank_score)| ScoredPair { pair, rank_score })
+        .collect()
+}
+
+/// Greedily picks up to `limit` disjoint pairs from a ranked reservoir.
+///
+/// Walks `scored` in rank order, taking each pair whose tickers are still free
+/// and whose identifier is not in `excluded`. No ticker appears in more than one
+/// selected pair.
+///
+/// The disjointness constraint is why a rejected pair changes what is available
+/// below it: excluding one pair frees both of its tickers, so pairs further down
+/// the ranking that were previously skipped for a ticker collision become
+/// selectable. Re-selecting is therefore not the same as taking the next item
+/// off a list.
+///
+/// This half is cheap — a single pass over an already-ranked list — so an entry
+/// pass can repeat it after every rejection.
+pub fn select_disjoint_pairs(
+    scored: &[ScoredPair],
+    limit: usize,
+    excluded: &HashSet<PairID>,
+) -> Vec<CandidatePair> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
     let mut used_tickers: HashSet<Ticker> = HashSet::new();
     let mut selected: Vec<CandidatePair> = Vec::new();
 
-    for (pair, _) in candidates {
+    for scored_pair in scored {
+        let pair = &scored_pair.pair;
+        if excluded.contains(pair.pair_id()) {
+            continue;
+        }
         if used_tickers.contains(pair.long_ticker()) || used_tickers.contains(pair.short_ticker()) {
             continue;
         }
         used_tickers.insert(pair.long_ticker().clone());
         used_tickers.insert(pair.short_ticker().clone());
-        selected.push(pair);
-        if selected.len() >= candidate_pool {
+        selected.push(pair.clone());
+        if selected.len() >= limit {
             break;
         }
     }
 
     selected
+}
+
+/// Selects up to `candidate_pool` disjoint pairs in one shot.
+///
+/// Convenience wrapper over [`score_candidate_pairs`] and
+/// [`select_disjoint_pairs`] for callers that do not re-select.
+pub fn select_pairs(
+    signals: &[ConsolidatedSignal],
+    historical_closes: &HashMap<Ticker, Vec<f64>>,
+    candidate_pool: usize,
+) -> Vec<CandidatePair> {
+    let scored = score_candidate_pairs(signals, historical_closes);
+    select_disjoint_pairs(&scored, candidate_pool, &HashSet::new())
 }
 
 #[cfg(test)]
@@ -1080,5 +1142,182 @@ mod tests {
             vec![100.0_f64; CORRELATION_WINDOW_DAYS],
         );
         assert!(select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL).is_empty());
+    }
+
+    // --- selection over a ranked reservoir ---
+    //
+    // These exercise `select_disjoint_pairs` against a hand-built ranking rather
+    // than a synthetic price universe. The screener's correlation band and
+    // z-score threshold make it hard to guarantee any synthetic universe yields
+    // pairs at all, and selection is a pure function of an already-ranked list,
+    // so feeding it that list directly is both deterministic and the actual unit
+    // under test.
+
+    /// Builds a scored pair with an explicit rank score.
+    fn scored(long: &str, short: &str, rank_score: f64) -> ScoredPair {
+        let long_ticker = Ticker::new(long).unwrap();
+        let short_ticker = Ticker::new(short).unwrap();
+        ScoredPair {
+            pair: CandidatePair::new(
+                PairID::new(long_ticker.clone(), short_ticker.clone()),
+                long_ticker,
+                short_ticker,
+                2.5,
+                1.0,
+                0.01,
+                0.01,
+                0.01,
+            )
+            .expect("test pair should be valid"),
+            rank_score,
+        }
+    }
+
+    /// A reservoir where the top pair competes for tickers with lower ones.
+    ///
+    /// AAPL-MSFT ranks first and GOOG-AMZN is disjoint from it, so both are
+    /// taken. AAPL-GOOG and MSFT-AMZN each collide with one of those and are
+    /// skipped while they stand.
+    fn competing_reservoir() -> Vec<ScoredPair> {
+        vec![
+            scored("AAPL", "MSFT", 0.9),
+            scored("GOOG", "AMZN", 0.8),
+            scored("AAPL", "GOOG", 0.7),
+            scored("MSFT", "AMZN", 0.6),
+        ]
+    }
+
+    fn selected_ids(pairs: &[CandidatePair]) -> Vec<String> {
+        pairs
+            .iter()
+            .map(|pair| pair.pair_id().as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_selection_takes_highest_ranked_disjoint_pairs() {
+        let selected = select_disjoint_pairs(&competing_reservoir(), 10, &HashSet::new());
+        assert_eq!(selected.len(), 2);
+
+        let ids = selected_ids(&selected);
+        assert!(ids
+            .iter()
+            .any(|id| id.contains("AAPL") && id.contains("MSFT")));
+        assert!(ids
+            .iter()
+            .any(|id| id.contains("GOOG") && id.contains("AMZN")));
+    }
+
+    #[test]
+    fn test_exclusion_promotes_previously_skipped_pairs() {
+        // The property the convergence loop depends on: excluding a pair frees
+        // both of its tickers, so pairs further down the ranking that were
+        // skipped for a collision become selectable. Not a list pop.
+        let reservoir = competing_reservoir();
+        let baseline = select_disjoint_pairs(&reservoir, 10, &HashSet::new());
+
+        let excluded: HashSet<PairID> =
+            baseline.iter().map(|pair| pair.pair_id().clone()).collect();
+        let after = select_disjoint_pairs(&reservoir, 10, &excluded);
+
+        assert_eq!(after.len(), 2, "both lower-ranked pairs become selectable");
+        let ids = selected_ids(&after);
+        assert!(ids
+            .iter()
+            .any(|id| id.contains("AAPL") && id.contains("GOOG")));
+        assert!(ids
+            .iter()
+            .any(|id| id.contains("MSFT") && id.contains("AMZN")));
+    }
+
+    #[test]
+    fn test_excluded_pair_is_never_reselected() {
+        let reservoir = competing_reservoir();
+        let baseline = select_disjoint_pairs(&reservoir, 10, &HashSet::new());
+        let mut excluded = HashSet::new();
+        excluded.insert(baseline[0].pair_id().clone());
+
+        let after = select_disjoint_pairs(&reservoir, 10, &excluded);
+        assert!(!after
+            .iter()
+            .any(|pair| pair.pair_id() == baseline[0].pair_id()));
+    }
+
+    #[test]
+    fn test_selection_remains_disjoint_after_exclusions() {
+        let reservoir = competing_reservoir();
+        let mut excluded = HashSet::new();
+        excluded.insert(PairID::new(
+            Ticker::new("AAPL").unwrap(),
+            Ticker::new("MSFT").unwrap(),
+        ));
+
+        let mut seen: HashSet<Ticker> = HashSet::new();
+        for pair in select_disjoint_pairs(&reservoir, 10, &excluded) {
+            assert!(seen.insert(pair.long_ticker().clone()));
+            assert!(seen.insert(pair.short_ticker().clone()));
+        }
+    }
+
+    #[test]
+    fn test_selection_limit_is_respected() {
+        let reservoir = competing_reservoir();
+        assert_eq!(
+            select_disjoint_pairs(&reservoir, 1, &HashSet::new()).len(),
+            1
+        );
+        assert!(select_disjoint_pairs(&reservoir, 0, &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn test_excluding_everything_selects_nothing() {
+        let reservoir = competing_reservoir();
+        let excluded: HashSet<PairID> = reservoir
+            .iter()
+            .map(|scored_pair| scored_pair.pair().pair_id().clone())
+            .collect();
+
+        assert!(select_disjoint_pairs(&reservoir, 10, &excluded).is_empty());
+    }
+
+    #[test]
+    fn test_scored_pairs_are_ranked_descending() {
+        // Selection walks the reservoir in order, so the ranking contract holds
+        // regardless of how many pairs the screener admits.
+        let signals = vec![
+            make_signal("AAPL", 0.02, 0.9, 0.01),
+            make_signal("MSFT", 0.01, 0.9, 0.01),
+            make_signal("GOOG", 0.03, 0.9, 0.01),
+        ];
+        let common_factor: Vec<f64> = (0..70).map(|i| 0.005 * ((i as f64 * 0.3).sin())).collect();
+        let mut closes = HashMap::new();
+        for (index, ticker) in ["AAPL", "MSFT", "GOOG"].iter().enumerate() {
+            closes.insert(
+                Ticker::new(ticker).unwrap(),
+                make_correlated_prices(71, 100.0, &common_factor, index as f64 * 0.0001),
+            );
+        }
+
+        let scored = score_candidate_pairs(&signals, &closes);
+        for window in scored.windows(2) {
+            assert!(window[0].rank_score() >= window[1].rank_score());
+        }
+    }
+
+    #[test]
+    fn test_select_pairs_wrapper_composes_both_halves() {
+        let signals = vec![
+            make_signal("AAPL", 0.02, 0.8, 0.01),
+            make_signal("MSFT", 0.01, 0.8, 0.01),
+        ];
+        let closes = HashMap::new();
+
+        let wrapper = select_pairs(&signals, &closes, DEFAULT_CANDIDATE_POOL);
+        let manual = select_disjoint_pairs(
+            &score_candidate_pairs(&signals, &closes),
+            DEFAULT_CANDIDATE_POOL,
+            &HashSet::new(),
+        );
+        assert_eq!(selected_ids(&wrapper), selected_ids(&manual));
     }
 }

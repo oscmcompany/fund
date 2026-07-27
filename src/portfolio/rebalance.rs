@@ -15,7 +15,7 @@
 //! 5. `select_size_execute` — select, size, risk-gate, and execute new pairs
 //! 6. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Z-score magnitude that triggers a stop-loss close.
@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
 use crate::common::market_hours::MarketSession;
-use crate::domain::market::Ticker;
+use crate::domain::market::{PairID, Ticker};
 use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::trading::{
@@ -63,7 +63,9 @@ use crate::portfolio::risk_gate::{
 };
 use crate::portfolio::sizing::{size_pairs_with_volatility_parity, SizingError};
 use crate::portfolio::state::AppState;
-use crate::portfolio::statistical_arbitrage::select_pairs;
+use crate::portfolio::statistical_arbitrage::{
+    score_candidate_pairs, select_disjoint_pairs, ScoredPair,
+};
 
 /// Outcome of a completed rebalance cycle.
 #[derive(Debug)]
@@ -906,198 +908,36 @@ async fn select_size_execute(
     candidate_pool: usize,
     minimum_pairs: usize,
 ) -> Result<Vec<(FilledPair, crate::portfolio::sizing::SizedPair)>, RebalanceError> {
-    let candidate_pairs = select_pairs(signals, historical_prices, candidate_pool);
+    // Rank the full reservoir once. This is the quadratic half of selection, so
+    // the convergence loop below re-selects from this list rather than rescoring.
+    let scored_pairs = score_candidate_pairs(signals, historical_prices);
     info!(
-        candidates = candidate_pairs.len(),
-        minimum = minimum_pairs,
-        "Candidate pairs selected"
+        scored = scored_pairs.len(),
+        working_set = candidate_pool,
+        target = minimum_pairs,
+        "Candidate pairs ranked"
     );
 
     let market_betas = compute_market_betas(historical_prices, spy_prices);
+    let tradable_assets = resolve_tradable_assets(alpaca, tradable_assets_cache).await?;
 
-    let all_tickers: Vec<Ticker> = candidate_pairs
-        .iter()
-        .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
-        .collect();
-
-    // Fetch live quotes from Alpaca REST API for all candidate tickers.
-    // Fall back to latest daily close price for any ticker without a quote.
-    let ticker_strings: Vec<String> = all_tickers.iter().map(|t| t.to_string()).collect();
-    let latest_quotes = alpaca
-        .fetch_latest_quotes(&ticker_strings)
-        .await
-        .unwrap_or_else(|error| {
-            warn!(error = %error, "Failed to fetch Alpaca quotes; falling back to close prices");
-            Vec::new()
-        });
-
-    let mut entry_prices: HashMap<Ticker, f64> = latest_quotes
-        .into_iter()
-        .filter_map(|quote| Ticker::new(&quote.symbol).map(|ticker| (ticker, quote.mid_price)))
-        .collect();
-
-    // Fill in any missing tickers with the most recent daily close price.
-    for ticker in &all_tickers {
-        if !entry_prices.contains_key(ticker) {
-            if let Some(latest_close) = historical_prices
-                .get(ticker)
-                .and_then(|closes| closes.last())
-            {
-                entry_prices.insert(ticker.clone(), *latest_close);
-            }
-        }
-    }
-
-    let sized_pairs = size_pairs_with_volatility_parity(
-        &candidate_pairs,
-        capital,
+    let eligible_pairs = converge_entry_set(
+        alpaca,
+        risk_gate_config,
+        session,
+        &scored_pairs,
+        &tradable_assets,
         &market_betas,
-        &entry_prices,
+        historical_prices,
+        alpaca_positions,
+        current_equity,
+        buying_power,
+        capital,
         exposure_scale,
+        candidate_pool,
         minimum_pairs,
-    )?;
-
-    // Resolve the tradable asset universe from the session cache, populating it
-    // on first use. Subsequent rebalances within the same service instance reuse
-    // the cached Arc without cloning the underlying struct.
-    let tradable_assets: Arc<TradableAssets> = {
-        let read_guard = tradable_assets_cache.read().await;
-        if let Some(assets) = read_guard.as_ref() {
-            Arc::clone(assets)
-        } else {
-            drop(read_guard);
-            let assets = Arc::new(
-                alpaca
-                    .fetch_tradable_assets()
-                    .await
-                    .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
-            );
-            let mut write_guard = tradable_assets_cache.write().await;
-            *write_guard = Some(Arc::clone(&assets));
-            info!(
-                tradable = assets.tradable_count(),
-                shortable = assets.shortable_count(),
-                "Tradable asset cache populated"
-            );
-            assets
-        }
-    };
-
-    // Filter pairs to those where the long leg is tradable on Alpaca and the
-    // short leg is both tradable and shortable (easy to borrow).
-    let tradable_pairs: Vec<_> = sized_pairs
-        .into_iter()
-        .filter(|pair| {
-            let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
-            let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str());
-            if !long_ok {
-                info!(
-                    ticker = pair.long_ticker().as_str(),
-                    "Long leg not tradable on Alpaca; dropping pair"
-                );
-            }
-            if !short_ok {
-                info!(
-                    ticker = pair.short_ticker().as_str(),
-                    "Short leg not shortable on Alpaca; dropping pair"
-                );
-            }
-            long_ok && short_ok
-        })
-        .collect();
-
-    // Build the portfolio snapshot for risk gate evaluation. The snapshot is
-    // mutated after each approved pair so later candidates see the cumulative
-    // exposure of earlier approvals.
-    let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
-    let now_utc = Utc::now();
-
-    // Apply the risk gate to each candidate pair, evaluating both legs
-    // independently and accumulating approved exposure into the snapshot.
-    let mut eligible_pairs = Vec::new();
-    for pair in tradable_pairs {
-        // Evaluate the long leg.
-        let long_request = PositionRequest {
-            ticker: pair.long_ticker().to_string(),
-            asset_type: AssetType::Equity,
-            notional: pair.long_dollar_amount(),
-            strategy: StrategyId::StatisticalArbitrage,
-        };
-        // ADV placeholder: entry price × 1M shares. A proper ADV data source
-        // can be added later.
-        let long_liquidity = LiquidityMetrics {
-            average_daily_volume_dollars: pair.long_entry_price() * 1_000_000.0,
-        };
-        let long_decision = risk_gate::evaluate(
-            risk_gate_config,
-            &snapshot,
-            &long_request,
-            &long_liquidity,
-            session,
-            now_utc,
-        );
-        if let RiskGateDecision::Rejected { reasons } = long_decision {
-            for reason in &reasons {
-                info!(
-                    pair_id = pair.pair_id().as_str(),
-                    leg = "long",
-                    reason = %reason,
-                    "Risk gate rejected pair"
-                );
-            }
-            continue;
-        }
-
-        // Temporarily add the approved long leg so the short leg evaluation
-        // sees cumulative exposure.
-        snapshot.positions.push(PositionSnapshot {
-            ticker: pair.long_ticker().to_string(),
-            market_value_absolute: pair.long_dollar_amount(),
-            strategy: StrategyId::StatisticalArbitrage,
-        });
-
-        // Evaluate the short leg against the updated snapshot.
-        let short_request = PositionRequest {
-            ticker: pair.short_ticker().to_string(),
-            asset_type: AssetType::Equity,
-            notional: pair.short_dollar_amount(),
-            strategy: StrategyId::StatisticalArbitrage,
-        };
-        let short_liquidity = LiquidityMetrics {
-            average_daily_volume_dollars: pair.short_entry_price() * 1_000_000.0,
-        };
-        let short_decision = risk_gate::evaluate(
-            risk_gate_config,
-            &snapshot,
-            &short_request,
-            &short_liquidity,
-            session,
-            now_utc,
-        );
-        if let RiskGateDecision::Rejected { reasons } = short_decision {
-            // Roll back the tentatively added long leg.
-            snapshot.positions.pop();
-            for reason in &reasons {
-                info!(
-                    pair_id = pair.pair_id().as_str(),
-                    leg = "short",
-                    reason = %reason,
-                    "Risk gate rejected pair"
-                );
-            }
-            continue;
-        }
-
-        // Both legs approved — add the short leg to the snapshot so
-        // subsequent candidates see the full cumulative exposure.
-        snapshot.positions.push(PositionSnapshot {
-            ticker: pair.short_ticker().to_string(),
-            market_value_absolute: pair.short_dollar_amount(),
-            strategy: StrategyId::StatisticalArbitrage,
-        });
-
-        eligible_pairs.push(pair);
-    }
+    )
+    .await?;
 
     let pending = execute_open_pairs(alpaca, pool, &eligible_pairs).await;
 
@@ -1122,6 +962,352 @@ async fn select_size_execute(
     }
 
     Ok(filled)
+}
+
+/// Maximum convergence iterations before the entry set is accepted as-is.
+///
+/// Each iteration either lowers the target or excludes at least one pair, both
+/// of which are monotone, so the loop terminates on its own. This is a backstop
+/// against an unforeseen cycle, not the normal exit.
+const MAXIMUM_CONVERGENCE_ITERATIONS: usize = 8;
+
+/// Resolves the tradable asset universe, populating the session cache on first use.
+///
+/// Subsequent rebalances within the same service instance reuse the cached `Arc`
+/// without cloning the underlying struct.
+async fn resolve_tradable_assets(
+    alpaca: &dyn Trading,
+    cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
+) -> Result<Arc<TradableAssets>, RebalanceError> {
+    let read_guard = cache.read().await;
+    if let Some(assets) = read_guard.as_ref() {
+        return Ok(Arc::clone(assets));
+    }
+    drop(read_guard);
+
+    let assets = Arc::new(
+        alpaca
+            .fetch_tradable_assets()
+            .await
+            .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
+    );
+    let mut write_guard = cache.write().await;
+    *write_guard = Some(Arc::clone(&assets));
+    info!(
+        tradable = assets.tradable_count(),
+        shortable = assets.shortable_count(),
+        "Tradable asset cache populated"
+    );
+    Ok(assets)
+}
+
+/// Fetches entry prices for `tickers`, falling back to the latest daily close.
+///
+/// One batched REST call per invocation. A quote failure degrades to close
+/// prices rather than aborting the pass.
+async fn fetch_entry_prices(
+    alpaca: &dyn Trading,
+    tickers: &[Ticker],
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
+) -> HashMap<Ticker, f64> {
+    let ticker_strings: Vec<String> = tickers.iter().map(Ticker::to_string).collect();
+    let latest_quotes = alpaca
+        .fetch_latest_quotes(&ticker_strings)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(error = %error, "Failed to fetch Alpaca quotes; falling back to close prices");
+            Vec::new()
+        });
+
+    let mut entry_prices: HashMap<Ticker, f64> = latest_quotes
+        .into_iter()
+        .filter_map(|quote| Ticker::new(&quote.symbol).map(|ticker| (ticker, quote.mid_price)))
+        .collect();
+
+    for ticker in tickers {
+        if !entry_prices.contains_key(ticker) {
+            if let Some(latest_close) = historical_prices
+                .get(ticker)
+                .and_then(|closes| closes.last())
+            {
+                entry_prices.insert(ticker.clone(), *latest_close);
+            }
+        }
+    }
+
+    entry_prices
+}
+
+/// Splits sized pairs into those Alpaca will trade and the identifiers of those it will not.
+fn partition_tradable_pairs(
+    sized_pairs: Vec<crate::portfolio::sizing::SizedPair>,
+    tradable_assets: &TradableAssets,
+) -> (Vec<crate::portfolio::sizing::SizedPair>, Vec<PairID>) {
+    let mut kept = Vec::new();
+    let mut rejected = Vec::new();
+
+    for pair in sized_pairs {
+        let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
+        let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str());
+        if !long_ok {
+            info!(
+                ticker = pair.long_ticker().as_str(),
+                "Long leg not tradable on Alpaca; dropping pair"
+            );
+        }
+        if !short_ok {
+            info!(
+                ticker = pair.short_ticker().as_str(),
+                "Short leg not shortable on Alpaca; dropping pair"
+            );
+        }
+        if long_ok && short_ok {
+            kept.push(pair);
+        } else {
+            rejected.push(pair.pair_id().clone());
+        }
+    }
+
+    (kept, rejected)
+}
+
+/// Applies the risk gate to each pair, returning approvals and rejected identifiers.
+///
+/// Legs are evaluated in rank order against a snapshot that accumulates each
+/// approval, so a later pair sees the exposure earlier ones already claimed.
+/// Order therefore matters, which is why selection hands pairs over ranked.
+fn partition_risk_gated_pairs(
+    risk_gate_config: &risk_gate::RiskGateConfiguration,
+    session: &MarketSession,
+    snapshot: &mut PortfolioSnapshot,
+    pairs: Vec<crate::portfolio::sizing::SizedPair>,
+    now_utc: DateTime<Utc>,
+) -> (Vec<crate::portfolio::sizing::SizedPair>, Vec<PairID>) {
+    let mut approved = Vec::new();
+    let mut rejected = Vec::new();
+
+    for pair in pairs {
+        let long_request = PositionRequest {
+            ticker: pair.long_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        // ADV placeholder: entry price × 1M shares. A proper ADV data source
+        // can be added later.
+        let long_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.long_entry_price() * 1_000_000.0,
+        };
+        let long_decision = risk_gate::evaluate(
+            risk_gate_config,
+            snapshot,
+            &long_request,
+            &long_liquidity,
+            session,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = long_decision {
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "long",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
+            }
+            rejected.push(pair.pair_id().clone());
+            continue;
+        }
+
+        // Temporarily add the approved long leg so the short leg evaluation
+        // sees cumulative exposure.
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.long_ticker().to_string(),
+            market_value_absolute: pair.long_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        let short_request = PositionRequest {
+            ticker: pair.short_ticker().to_string(),
+            asset_type: AssetType::Equity,
+            notional: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        };
+        let short_liquidity = LiquidityMetrics {
+            average_daily_volume_dollars: pair.short_entry_price() * 1_000_000.0,
+        };
+        let short_decision = risk_gate::evaluate(
+            risk_gate_config,
+            snapshot,
+            &short_request,
+            &short_liquidity,
+            session,
+            now_utc,
+        );
+        if let RiskGateDecision::Rejected { reasons } = short_decision {
+            // Roll back the tentatively added long leg.
+            snapshot.positions.pop();
+            for reason in &reasons {
+                info!(
+                    pair_id = pair.pair_id().as_str(),
+                    leg = "short",
+                    reason = %reason,
+                    "Risk gate rejected pair"
+                );
+            }
+            rejected.push(pair.pair_id().clone());
+            continue;
+        }
+
+        snapshot.positions.push(PositionSnapshot {
+            ticker: pair.short_ticker().to_string(),
+            market_value_absolute: pair.short_dollar_amount(),
+            strategy: StrategyId::StatisticalArbitrage,
+        });
+
+        approved.push(pair);
+    }
+
+    (approved, rejected)
+}
+
+/// Converges on an entry set whose sizing matches the pairs actually executed.
+///
+/// Sizing is a joint optimization, not a per-pair calculation: volatility parity
+/// weights are normalized across the set and beta neutrality is a whole-basket
+/// constraint, so adding or removing one pair resizes every other. The risk gate
+/// cannot run before sizing because every check needs a notional, and notionals
+/// come from sizing. Running them in sequence therefore produced a basket sized
+/// for N pairs but executed with fewer, whose parity weights no longer summed to
+/// one and whose beta was no longer neutral.
+///
+/// The loop closes that gap. Each pass selects a working set, sizes it, filters
+/// it, and gates it; any rejection excludes those pairs and re-runs the whole
+/// pass, so whatever is finally executed was sized as exactly that set.
+///
+/// Two properties make re-selection worthwhile rather than merely correct:
+///
+/// - Excluding a pair frees both of its tickers, so pairs further down the
+///   ranking that were skipped for a ticker collision become selectable. A
+///   rejection can promote candidates from anywhere below it.
+/// - The affordability threshold divides the per-pair capital allowance by the
+///   target count, so lowering the target raises the threshold and can rescue
+///   pairs that were previously unaffordable.
+///
+/// Degrades gracefully: a target that cannot be met is lowered rather than
+/// aborting the pass, since filling four of ten slots beats filling none.
+#[allow(clippy::too_many_arguments)]
+async fn converge_entry_set(
+    alpaca: &dyn Trading,
+    risk_gate_config: &risk_gate::RiskGateConfiguration,
+    session: &MarketSession,
+    scored_pairs: &[ScoredPair],
+    tradable_assets: &TradableAssets,
+    market_betas: &HashMap<Ticker, f64>,
+    historical_prices: &HashMap<Ticker, Vec<f64>>,
+    alpaca_positions: &[crate::portfolio::alpaca::Position],
+    current_equity: f64,
+    buying_power: f64,
+    capital: f64,
+    exposure_scale: f64,
+    working_set_limit: usize,
+    target_pairs: usize,
+) -> Result<Vec<crate::portfolio::sizing::SizedPair>, RebalanceError> {
+    let mut excluded: HashSet<PairID> = HashSet::new();
+    let mut entry_prices: HashMap<Ticker, f64> = HashMap::new();
+    let mut target = target_pairs;
+    let now_utc = Utc::now();
+
+    for iteration in 1..=MAXIMUM_CONVERGENCE_ITERATIONS {
+        if target == 0 {
+            info!("Entry target reduced to zero; no pairs will be opened");
+            return Ok(Vec::new());
+        }
+
+        let working_set = select_disjoint_pairs(scored_pairs, working_set_limit, &excluded);
+        if working_set.is_empty() {
+            info!(
+                iteration,
+                excluded = excluded.len(),
+                "No candidates remain; no pairs will be opened"
+            );
+            return Ok(Vec::new());
+        }
+
+        // Price any tickers this iteration introduced. Earlier entries are kept
+        // so a re-selection that reuses a pair does not re-fetch its quote.
+        let unpriced: Vec<Ticker> = working_set
+            .iter()
+            .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
+            .filter(|ticker| !entry_prices.contains_key(ticker))
+            .collect();
+        if !unpriced.is_empty() {
+            entry_prices.extend(fetch_entry_prices(alpaca, &unpriced, historical_prices).await);
+        }
+
+        let sized_pairs = match size_pairs_with_volatility_parity(
+            &working_set,
+            capital,
+            market_betas,
+            &entry_prices,
+            exposure_scale,
+            target,
+        ) {
+            Ok(sized) => sized,
+            Err(SizingError::InsufficientPairs { found, required }) if found > 0 => {
+                // Lowering the target also raises the per-pair affordability
+                // allowance, so this can recover pairs the previous pass priced
+                // out rather than simply shrinking the portfolio.
+                info!(
+                    iteration,
+                    found, required, "Fewer feasible pairs than target; lowering target"
+                );
+                target = found;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let (tradable_pairs, untradable) = partition_tradable_pairs(sized_pairs, tradable_assets);
+
+        // Rebuilt every iteration: the snapshot accumulates approvals, so it
+        // must start from real portfolio state rather than a previous attempt.
+        let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
+        let (approved, gate_rejected) = partition_risk_gated_pairs(
+            risk_gate_config,
+            session,
+            &mut snapshot,
+            tradable_pairs,
+            now_utc,
+        );
+
+        if untradable.is_empty() && gate_rejected.is_empty() {
+            info!(
+                iteration,
+                approved = approved.len(),
+                target,
+                "Entry set converged"
+            );
+            return Ok(approved);
+        }
+
+        excluded.extend(untradable);
+        excluded.extend(gate_rejected);
+        info!(
+            iteration,
+            excluded = excluded.len(),
+            "Entry set rejected pairs; re-selecting and resizing"
+        );
+    }
+
+    // Falling through means the set never stabilized. Returning nothing is the
+    // safe outcome: the alternative is executing a basket whose sizing assumed
+    // pairs that were rejected, which is the defect this loop exists to remove.
+    warn!(
+        iterations = MAXIMUM_CONVERGENCE_ITERATIONS,
+        "Entry set did not converge; opening no pairs this pass"
+    );
+    Ok(Vec::new())
 }
 
 /// Persists pairs, allocations, and orders for a completed rebalance cycle.
@@ -1622,6 +1808,50 @@ mod tests {
         // Verify the threshold constant is the expected value (guards against
         // accidental changes without updating documentation).
         assert!((STOP_LOSS_Z_SCORE_THRESHOLD - 4.0).abs() < f64::EPSILON);
+    }
+
+    // --- close rule shared by the trigger and the authoritative evaluation ---
+
+    #[test]
+    fn test_close_reason_convergence_from_positive_entry() {
+        assert_eq!(
+            close_reason_for(2.5, -0.1),
+            Some(CloseReason::ProfitTaken),
+            "a positive-entry spread crossing below zero has converged"
+        );
+    }
+
+    #[test]
+    fn test_close_reason_convergence_from_negative_entry() {
+        assert_eq!(close_reason_for(-2.5, 0.1), Some(CloseReason::ProfitTaken));
+    }
+
+    #[test]
+    fn test_close_reason_stop_loss_requires_matching_direction() {
+        // Diverging further in the entry direction is a stop-loss.
+        assert_eq!(close_reason_for(2.5, 4.5), Some(CloseReason::StopLoss));
+        assert_eq!(close_reason_for(-2.5, -4.5), Some(CloseReason::StopLoss));
+    }
+
+    #[test]
+    fn test_close_reason_within_range_keeps_pair() {
+        assert_eq!(close_reason_for(2.5, 2.0), None);
+        assert_eq!(close_reason_for(-2.5, -2.0), None);
+    }
+
+    #[test]
+    fn test_close_reason_treats_zero_as_no_signal() {
+        // z_score_last returns zero for a near-zero-variance spread, which
+        // happens on a halted or degenerate series. Reading that as convergence
+        // would close healthy positions on missing data.
+        assert_eq!(close_reason_for(2.5, 0.0), None);
+        assert_eq!(close_reason_for(-2.5, 0.0), None);
+    }
+
+    #[test]
+    fn test_close_reason_rejects_non_finite_z_score() {
+        assert_eq!(close_reason_for(2.5, f64::NAN), None);
+        assert_eq!(close_reason_for(2.5, f64::INFINITY), None);
     }
 
     #[test]
