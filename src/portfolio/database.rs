@@ -146,6 +146,23 @@ pub async fn fetch_equity_predictions(
     Ok(Fresh::new(predictions, StalenessWindow::predictions()))
 }
 
+/// Returns whether any predictions were recorded for the current date.
+///
+/// Matches the `created_at::date = CURRENT_DATE` filter that
+/// [`fetch_equity_predictions`] uses to select a run, so a `true` result means
+/// that function will find a set to work with.
+pub async fn predictions_exist_for_today(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query!(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM equity_predictions WHERE created_at::date = CURRENT_DATE
+           ) AS "exists!""#
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.exists)
+}
+
 /// Fetches historical close prices for all tickers over the trailing 90-day window.
 ///
 /// Returns a map from ticker symbol to ordered close prices (oldest to newest).
@@ -984,7 +1001,7 @@ mod tests {
             let session = EquityRebalanceSession::new(
                 Uuid::new_v4(),
                 Utc::now(),
-                "market_session_check".to_string(),
+                "portfolio_evaluation".to_string(),
                 None,
                 None,
                 RebalanceSessionStatus::Completed,
@@ -1092,7 +1109,7 @@ mod tests {
 
             let order = EquityOrder::new(
                 Uuid::new_v4(),
-                Uuid::new_v4(),
+                Some(Uuid::new_v4()),
                 Utc::now(),
                 Ticker::new("MSFT").unwrap(),
                 AllocationSide::Short,

@@ -262,7 +262,7 @@ fn create_equity_allocation_dataframe(
 fn create_equity_order_dataframe(orders: &[EquityOrder]) -> Result<DataFrame, String> {
     df!(
         "id" => orders.iter().map(|order| order.id().to_string()).collect::<Vec<String>>(),
-        "allocation_id" => orders.iter().map(|order| order.allocation_id().to_string()).collect::<Vec<String>>(),
+        "allocation_id" => orders.iter().map(|order| order.allocation_id().map(|id| id.to_string())).collect::<Vec<Option<String>>>(),
         "submitted_at" => orders.iter().map(|order| order.submitted_at().timestamp_millis()).collect::<Vec<i64>>(),
         "ticker" => orders.iter().map(|order| order.ticker().as_str()).collect::<Vec<&str>>(),
         "side" => orders.iter().map(|order| order.side().as_str()).collect::<Vec<&str>>(),
@@ -374,7 +374,7 @@ mod tests {
         vec![EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
             Utc::now(),
-            "market_session_check".to_string(),
+            "portfolio_evaluation".to_string(),
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,
@@ -419,7 +419,7 @@ mod tests {
     fn sample_orders() -> Vec<EquityOrder> {
         vec![EquityOrder::new(
             "550e8400-e29b-41d4-a716-446655440004".parse().unwrap(),
-            "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
+            Some("550e8400-e29b-41d4-a716-446655440003".parse().unwrap()),
             Utc::now(),
             Ticker::new("MSFT").unwrap(),
             AllocationSide::Short,
@@ -740,7 +740,7 @@ mod tests {
         let sessions = vec![crate::domain::trading::EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440099".parse().unwrap(),
             chrono::Utc::now(),
-            "market_session_check".to_string(),
+            "portfolio_evaluation".to_string(),
             None,
             None,
             crate::domain::trading::RebalanceSessionStatus::Completed,
@@ -816,7 +816,7 @@ mod tests {
         // limit_price is Optional — test the None (market order) path
         let orders = vec![crate::domain::trading::EquityOrder::new(
             "550e8400-e29b-41d4-a716-446655440040".parse().unwrap(),
-            "550e8400-e29b-41d4-a716-446655440003".parse().unwrap(),
+            Some("550e8400-e29b-41d4-a716-446655440003".parse().unwrap()),
             chrono::Utc::now(),
             Ticker::new("TSLA").unwrap(),
             crate::domain::trading::AllocationSide::Long,
@@ -833,6 +833,29 @@ mod tests {
             dataframe.column("order_type").unwrap().dtype(),
             &DataType::String
         );
+    }
+
+    #[test]
+    fn test_create_equity_order_dataframe_null_allocation_id() {
+        // insert_submitted_order writes a breadcrumb row with no allocation_id
+        // as soon as an order reaches Alpaca, so reconciliation can find it after
+        // a crash during fill polling. The allocation is created only once the
+        // fill is confirmed. Those rows must export rather than fail the nightly
+        // job, which is what happened while the column was typed as a bare Uuid.
+        let orders = vec![crate::domain::trading::EquityOrder::new(
+            "550e8400-e29b-41d4-a716-446655440041".parse().unwrap(),
+            None,
+            chrono::Utc::now(),
+            Ticker::new("NVDA").unwrap(),
+            crate::domain::trading::AllocationSide::Long,
+            "5".parse().unwrap(),
+            "market".to_string(),
+            None,
+            "alpaca-order-submitted-001".to_string(),
+        )];
+        let dataframe = create_equity_order_dataframe(&orders).unwrap();
+        assert_eq!(dataframe.height(), 1);
+        assert_eq!(dataframe.column("allocation_id").unwrap().null_count(), 1);
     }
 
     #[test]

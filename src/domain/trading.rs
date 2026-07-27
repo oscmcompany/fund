@@ -591,11 +591,18 @@ impl EquityAllocation {
     }
 }
 
-/// An order submitted to Alpaca, linked to an allocation.
+/// An order submitted to Alpaca.
+///
+/// The allocation link is optional because an order is recorded before its
+/// allocation exists. `insert_submitted_order` writes a breadcrumb row as soon
+/// as the order reaches Alpaca so reconciliation can find it after a crash
+/// during fill polling; the allocation is only created once the fill is
+/// confirmed and the pair is persisted. An order with `None` here is therefore
+/// submitted but not yet resolved, not malformed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityOrder {
     id: Uuid,
-    allocation_id: Uuid,
+    allocation_id: Option<Uuid>,
     submitted_at: DateTime<Utc>,
     ticker: Ticker,
     side: AllocationSide,
@@ -610,7 +617,7 @@ impl EquityOrder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: Uuid,
-        allocation_id: Uuid,
+        allocation_id: Option<Uuid>,
         submitted_at: DateTime<Utc>,
         ticker: Ticker,
         side: AllocationSide,
@@ -636,7 +643,9 @@ impl EquityOrder {
         self.id
     }
 
-    pub fn allocation_id(&self) -> Uuid {
+    /// Returns the allocation this order belongs to, or `None` while the order
+    /// is submitted but its fill has not yet been persisted.
+    pub fn allocation_id(&self) -> Option<Uuid> {
         self.allocation_id
     }
 
@@ -1152,12 +1161,12 @@ mod tests {
         let session = EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "market_session_check".to_string(),
+            "portfolio_evaluation".to_string(),
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,
         );
-        assert_eq!(session.trigger_reason(), "market_session_check");
+        assert_eq!(session.trigger_reason(), "portfolio_evaluation");
         assert_eq!(session.status(), &RebalanceSessionStatus::Completed);
         assert!(session.completed_at().is_none());
     }
@@ -1223,7 +1232,7 @@ mod tests {
     fn test_equity_order_construction() {
         let order = EquityOrder::new(
             Uuid::new_v4(),
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             Utc::now(),
             Ticker::new("MSFT").unwrap(),
             AllocationSide::Short,
@@ -1274,7 +1283,7 @@ mod tests {
         EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "market_session_check".to_string(),
+            "portfolio_evaluation".to_string(),
             None,
             None,
             RebalanceSessionStatus::Completed,
@@ -1319,7 +1328,7 @@ mod tests {
     fn sample_order() -> EquityOrder {
         EquityOrder::new(
             Uuid::new_v4(),
-            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
             Utc::now(),
             Ticker::new("MSFT").unwrap(),
             AllocationSide::Short,
@@ -1351,7 +1360,7 @@ mod tests {
         assert!(!sessions.is_empty());
         assert_eq!(
             sessions.as_slice()[0].trigger_reason(),
-            "market_session_check"
+            "portfolio_evaluation"
         );
     }
 
@@ -1398,7 +1407,7 @@ mod tests {
         let session = EquityRebalanceSession::new(
             id,
             now,
-            "market_session_check".to_string(),
+            "portfolio_evaluation".to_string(),
             Some("run-xyz".to_string()),
             Some(now),
             RebalanceSessionStatus::Failed,
@@ -1479,7 +1488,7 @@ mod tests {
         let now = Utc::now();
         let order = EquityOrder::new(
             id,
-            allocation_id,
+            Some(allocation_id),
             now,
             Ticker::new("AAPL").unwrap(),
             AllocationSide::Long,
@@ -1489,7 +1498,7 @@ mod tests {
             "alpaca-001".to_string(),
         );
         assert_eq!(order.id(), id);
-        assert_eq!(order.allocation_id(), allocation_id);
+        assert_eq!(order.allocation_id(), Some(allocation_id));
         assert!(order.submitted_at() <= Utc::now());
         assert_eq!(order.order_type(), "limit");
         assert!(order.limit_price().is_some());

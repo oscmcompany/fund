@@ -329,7 +329,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let session = EquityRebalanceSession::new(
         session_id,
         now,
-        "market_session_check".to_string(),
+        "portfolio_evaluation".to_string(),
         None,
         None,
         RebalanceSessionStatus::Completed,
@@ -1125,9 +1125,9 @@ async fn persist_filled_pairs(
 
         let long_notional_decimal = filled_pair.long_notional.value();
         let long_entry_price_decimal = filled_pair.long.fill_price.unwrap_or(Decimal::ZERO);
-        let long_alloc_id = Uuid::new_v4();
+        let long_allocation_id = Uuid::new_v4();
         let long_allocation = EquityAllocation::new(
-            long_alloc_id,
+            long_allocation_id,
             session_id,
             pair_uuid,
             now,
@@ -1145,9 +1145,9 @@ async fn persist_filled_pairs(
         let short_notional_decimal = filled_pair.short_notional.value();
         let short_entry_price_decimal = filled_pair.short.fill_price.unwrap_or(Decimal::ZERO);
         let short_quantity_decimal = filled_pair.short.quantity;
-        let short_alloc_id = Uuid::new_v4();
+        let short_allocation_id = Uuid::new_v4();
         let short_allocation = EquityAllocation::new(
-            short_alloc_id,
+            short_allocation_id,
             session_id,
             pair_uuid,
             now,
@@ -1166,7 +1166,7 @@ async fn persist_filled_pairs(
             .unwrap_or_else(|| Ticker::new("UNKNOWN").expect("UNKNOWN is a valid ticker"));
         let long_order = EquityOrder::new(
             Uuid::new_v4(),
-            long_alloc_id,
+            Some(long_allocation_id),
             filled_pair.long.submitted_at,
             long_order_ticker,
             AllocationSide::Long,
@@ -1181,7 +1181,7 @@ async fn persist_filled_pairs(
             .unwrap_or_else(|| Ticker::new("UNKNOWN").expect("UNKNOWN is a valid ticker"));
         let short_order = EquityOrder::new(
             Uuid::new_v4(),
-            short_alloc_id,
+            Some(short_allocation_id),
             filled_pair.short.submitted_at,
             short_order_ticker,
             AllocationSide::Short,
@@ -1199,14 +1199,14 @@ async fn persist_filled_pairs(
         mark_order_filled(
             &mut **transaction,
             filled_pair.long.id,
-            Some(long_alloc_id),
+            Some(long_allocation_id),
             now,
         )
         .await?;
         mark_order_filled(
             &mut **transaction,
             filled_pair.short.id,
-            Some(short_alloc_id),
+            Some(short_allocation_id),
             now,
         )
         .await?;
