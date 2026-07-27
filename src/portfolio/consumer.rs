@@ -493,7 +493,7 @@ mod tests {
     use crate::common::market_hours::MarketSession;
     use crate::portfolio::alpaca::MockTrading;
     use crate::portfolio::state::AppState;
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Utc};
     use std::sync::Arc;
 
     fn utc(rfc3339: &str) -> DateTime<Utc> {
