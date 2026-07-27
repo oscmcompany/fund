@@ -33,6 +33,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
+use crate::common::market_hours::MarketSession;
 use crate::domain::market::Ticker;
 use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
@@ -206,6 +207,12 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     // Phase 3: load market data (needed for both exit evaluation and entry selection).
     let historical_prices = fetch_historical_equity_prices(pool).await?;
 
+    // The session carries the real close time, so the risk gate's exit-feasibility
+    // check measures against an early close rather than assuming 16:00.
+    let session = alpaca.fetch_market_session().await.map_err(|error| {
+        RebalanceError::Execution(ExecutionError::SessionFetch { source: error })
+    })?;
+
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
     if !open_pairs.is_empty() {
@@ -247,6 +254,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
             state,
             pool,
             alpaca,
+            &session,
             &historical_prices,
             &alpaca_positions,
             current_equity,
@@ -404,6 +412,7 @@ async fn try_evaluate_entries(
     state: &AppState,
     pool: &sqlx::PgPool,
     alpaca: &dyn Trading,
+    session: &MarketSession,
     historical_prices: &HashMap<Ticker, Vec<f64>>,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
@@ -466,6 +475,7 @@ async fn try_evaluate_entries(
         alpaca,
         state.tradable_assets(),
         state.risk_gate_configuration(),
+        session,
         alpaca_positions,
         current_equity,
         buying_power,
@@ -830,6 +840,7 @@ async fn select_size_execute(
     alpaca: &dyn Trading,
     tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
     risk_gate_config: &risk_gate::RiskGateConfiguration,
+    session: &MarketSession,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
     buying_power: f64,
@@ -968,6 +979,7 @@ async fn select_size_execute(
             &snapshot,
             &long_request,
             &long_liquidity,
+            session,
             now_utc,
         );
         if let RiskGateDecision::Rejected { reasons } = long_decision {
@@ -1005,6 +1017,7 @@ async fn select_size_execute(
             &snapshot,
             &short_request,
             &short_liquidity,
+            session,
             now_utc,
         );
         if let RiskGateDecision::Rejected { reasons } = short_decision {

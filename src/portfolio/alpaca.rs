@@ -6,11 +6,13 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::common::alpaca::AlpacaCredentials;
+use crate::common::market_hours::MarketSession;
 
 /// Base URL for paper trading (sandbox environment).
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets";
@@ -148,8 +150,8 @@ pub trait Trading: Send + Sync {
     /// Attempts to cancel an open order. Returns `true` when cancelled, `false` when already terminal.
     async fn cancel_order(&self, alpaca_order_id: &str) -> Result<bool, ClientError>;
 
-    /// Returns whether the market is currently open.
-    async fn is_market_open(&self) -> Result<bool, ClientError>;
+    /// Fetches the current trading session, including the real close time.
+    async fn fetch_market_session(&self) -> Result<MarketSession, ClientError>;
 
     /// Fetches all open positions from the Alpaca account.
     async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError>;
@@ -503,8 +505,11 @@ impl TradingClient {
         Ok(true)
     }
 
-    /// Returns whether the market is currently open.
-    pub async fn is_market_open(&self) -> Result<bool, ClientError> {
+    /// Fetches the current trading session from the Alpaca clock endpoint.
+    ///
+    /// The reported close reflects early-close days, so callers get the real
+    /// session end without consulting a local holiday calendar.
+    pub async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
         let url = format!("{}/v2/clock", self.base_url);
         let response = self
             .http_client
@@ -524,7 +529,12 @@ impl TradingClient {
             ClientError::Parse(format!("Failed to parse clock response: {error}"))
         })?;
 
-        Ok(clock.is_open)
+        MarketSession::new(clock.is_open, clock.next_close).ok_or_else(|| {
+            ClientError::Parse(format!(
+                "Clock returned an unusable session close: {}",
+                clock.next_close
+            ))
+        })
     }
 
     /// Fetches all open positions from the Alpaca account.
@@ -675,8 +685,8 @@ impl Trading for TradingClient {
         self.cancel_order(alpaca_order_id).await
     }
 
-    async fn is_market_open(&self) -> Result<bool, ClientError> {
-        self.is_market_open().await
+    async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
+        self.fetch_market_session().await
     }
 
     async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
@@ -768,6 +778,7 @@ struct AssetResponse {
 #[derive(Deserialize)]
 struct ClockResponse {
     is_open: bool,
+    next_close: DateTime<Utc>,
 }
 
 #[derive(Deserialize)]
@@ -809,8 +820,26 @@ pub struct MockTrading {
     pub should_fail_cancel: bool,
     pub should_fail_close: bool,
     pub market_open: bool,
+    /// Session close returned by `fetch_market_session`. Defaults to 16:00
+    /// Eastern today; set it earlier to exercise early-close behavior.
+    pub session_close: DateTime<Utc>,
     pub tradable_assets: TradableAssets,
     pub latest_quotes: Vec<LatestQuote>,
+}
+
+/// Returns 16:00 Eastern on today's date, the default mock session close.
+#[cfg(test)]
+fn default_mock_session_close() -> DateTime<Utc> {
+    use chrono::{NaiveTime, TimeZone};
+    use chrono_tz::US::Eastern;
+
+    let today = Utc::now().with_timezone(&Eastern).date_naive();
+    let close = today.and_time(NaiveTime::from_hms_opt(16, 0, 0).expect("16:00:00 is valid"));
+    Eastern
+        .from_local_datetime(&close)
+        .single()
+        .expect("16:00 Eastern is unambiguous")
+        .with_timezone(&Utc)
 }
 
 #[cfg(test)]
@@ -830,6 +859,7 @@ impl Default for MockTrading {
             should_fail_cancel: false,
             should_fail_close: false,
             market_open: true,
+            session_close: default_mock_session_close(),
             tradable_assets: TradableAssets {
                 tradable: std::collections::HashSet::new(),
                 shortable: std::collections::HashSet::new(),
@@ -922,8 +952,13 @@ impl Trading for MockTrading {
         Ok(true)
     }
 
-    async fn is_market_open(&self) -> Result<bool, ClientError> {
-        Ok(self.market_open)
+    async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
+        MarketSession::new(self.market_open, self.session_close).ok_or_else(|| {
+            ClientError::Parse(format!(
+                "Mock session close is unusable: {}",
+                self.session_close
+            ))
+        })
     }
 
     async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
@@ -1149,32 +1184,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_market_open_true() {
+    async fn test_fetch_market_session_open() {
         let mut server = Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/clock")
             .with_status(200)
-            .with_body(r#"{"is_open": true, "next_open": "2026-01-01T09:30:00Z", "next_close": "2026-01-01T16:00:00Z"}"#)
+            .with_body(r#"{"is_open": true, "next_open": "2026-07-07T13:30:00Z", "next_close": "2026-07-06T20:00:00Z"}"#)
             .create_async()
             .await;
 
         let client = TradingClient::with_base_url(make_credentials(), server.url());
-        assert!(client.is_market_open().await.unwrap());
+        let session = client.fetch_market_session().await.unwrap();
+
+        assert!(session.is_open());
+        // 20:00 UTC is 16:00 EDT, a regular close.
+        assert_eq!(session.total_minutes(), 390);
         mock.assert_async().await;
     }
 
     #[tokio::test]
-    async fn test_is_market_open_false() {
+    async fn test_fetch_market_session_closed() {
         let mut server = Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/clock")
             .with_status(200)
-            .with_body(r#"{"is_open": false, "next_open": "2026-01-02T09:30:00Z", "next_close": "2026-01-02T16:00:00Z"}"#)
+            .with_body(r#"{"is_open": false, "next_open": "2026-07-07T13:30:00Z", "next_close": "2026-07-07T20:00:00Z"}"#)
             .create_async()
             .await;
 
         let client = TradingClient::with_base_url(make_credentials(), server.url());
-        assert!(!client.is_market_open().await.unwrap());
+        let session = client.fetch_market_session().await.unwrap();
+
+        assert!(!session.is_open());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_market_session_early_close() {
+        let mut server = Server::new_async().await;
+        // 17:00 UTC is 13:00 EDT, the standard early close.
+        let mock = server
+            .mock("GET", "/v2/clock")
+            .with_status(200)
+            .with_body(r#"{"is_open": true, "next_open": "2026-07-06T13:30:00Z", "next_close": "2026-07-03T17:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let session = client.fetch_market_session().await.unwrap();
+
+        assert_eq!(session.total_minutes(), 210);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_market_session_rejects_unusable_close() {
+        let mut server = Server::new_async().await;
+        // A close before 09:30 Eastern on its own date cannot form a session.
+        let mock = server
+            .mock("GET", "/v2/clock")
+            .with_status(200)
+            .with_body(r#"{"is_open": false, "next_open": "2026-07-07T13:30:00Z", "next_close": "2026-07-06T12:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let result = client.fetch_market_session().await;
+
+        assert!(matches!(result, Err(ClientError::Parse(_))));
         mock.assert_async().await;
     }
 

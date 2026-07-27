@@ -208,7 +208,12 @@ async fn handle_market_session_check(state: &AppState, pool: &PgPool) {
         state.set_rebalance_cycle_in_progress(false);
     }
 
-    match state.alpaca_client().is_market_open().await {
+    match state
+        .alpaca_client()
+        .fetch_market_session()
+        .await
+        .map(|session| session.is_open())
+    {
         Ok(true) => {}
         Ok(false) => {
             info!("Skipping market session check: market is not open");
