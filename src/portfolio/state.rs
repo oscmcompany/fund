@@ -30,6 +30,14 @@ const DEFAULT_CONCENTRATION_CAP: f64 = 0.20;
 /// Minimum pairs required in a valid portfolio.
 const DEFAULT_MINIMUM_PAIRS: u8 = 10;
 
+/// Seconds to wait before re-emitting `equity_predictions_requested` when the
+/// day still has no predictions.
+///
+/// Sized to comfortably exceed a normal inference run so a healthy pipeline is
+/// never asked twice, while still recovering within the session if a run dies
+/// without emitting `equity_predictions_errored`.
+const PREDICTION_REQUEST_RETRY_SECONDS: i64 = 10 * 60;
+
 /// Default beta tolerance: net portfolio beta must be within ±0.1 of zero.
 const DEFAULT_BETA_TOLERANCE: f64 = 0.10;
 
@@ -187,15 +195,20 @@ pub struct AppState {
     /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
     /// The inner `Arc` avoids cloning the full struct on every cache hit.
     tradable_assets: Arc<RwLock<Option<Arc<TradableAssets>>>>,
-    /// Guards against concurrent rebalance cycles when the prediction pipeline
-    /// takes longer than the 5-minute `market_session_check` interval.
-    rebalance_cycle_in_progress: Arc<AtomicBool>,
-    /// Unix timestamp (seconds) when the current rebalance cycle started.
+    /// Guards against two rebalance passes running concurrently.
     ///
-    /// `0` when no cycle is in progress. Used to detect stale flags caused by
-    /// an upstream crash that never emits `equity_predictions_completed` or
-    /// `equity_predictions_errored`.
-    rebalance_cycle_started_at: Arc<AtomicI64>,
+    /// Scoped to a single evaluation: set when a pass begins and cleared when it
+    /// finishes. It no longer spans the prediction pipeline, so a slow inference
+    /// run cannot block exit monitoring.
+    rebalance_in_progress: Arc<AtomicBool>,
+    /// Unix timestamp (seconds) of the most recent `equity_predictions_requested`
+    /// emission, or `0` if none has been sent by this process.
+    ///
+    /// Acts as a retry backoff rather than an in-progress flag: a request is
+    /// re-emitted only once [`PREDICTION_REQUEST_RETRY_SECONDS`] have elapsed, so
+    /// an inference run that dies without emitting a terminal event self-heals
+    /// instead of wedging the day.
+    last_prediction_request_at: Arc<AtomicI64>,
     /// Pre-trade risk gate configuration for position request validation.
     risk_gate_configuration: RiskGateConfiguration,
     /// Number of statistical-arbitrage candidate pairs to consider per rebalance.
@@ -241,40 +254,49 @@ impl AppState {
         &self.tradable_assets
     }
 
-    /// Returns `true` when a rebalance cycle is already in progress.
-    pub fn rebalance_cycle_in_progress(&self) -> bool {
-        self.rebalance_cycle_in_progress.load(Ordering::SeqCst)
+    /// Returns `true` when a rebalance pass is already running.
+    pub fn rebalance_in_progress(&self) -> bool {
+        self.rebalance_in_progress.load(Ordering::SeqCst)
     }
 
-    /// Returns the Unix timestamp (seconds) when the current rebalance cycle started,
-    /// or `0` if no cycle is in progress.
-    pub fn rebalance_cycle_started_at(&self) -> i64 {
-        self.rebalance_cycle_started_at.load(Ordering::SeqCst)
-    }
-
-    /// Returns a reference to the raw atomic storing the cycle-start timestamp.
+    /// Claims the rebalance slot, returning `true` when the caller acquired it.
     ///
-    /// Exposed for tests that need to simulate a stale cycle by backdating
-    /// the timestamp directly.
+    /// A compare-and-exchange rather than a load-then-store so two evaluation
+    /// events arriving together cannot both enter the pass.
+    pub fn try_begin_rebalance(&self) -> bool {
+        self.rebalance_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Releases the rebalance slot.
+    pub fn finish_rebalance(&self) {
+        self.rebalance_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns `true` when enough time has passed to re-request predictions.
+    ///
+    /// Always `true` before the first request of the process.
+    pub fn prediction_request_is_due(&self) -> bool {
+        let last = self.last_prediction_request_at.load(Ordering::SeqCst);
+        if last == 0 {
+            return true;
+        }
+        chrono::Utc::now().timestamp() - last >= PREDICTION_REQUEST_RETRY_SECONDS
+    }
+
+    /// Records that an `equity_predictions_requested` event was just emitted.
+    pub fn record_prediction_request(&self) {
+        self.last_prediction_request_at
+            .store(chrono::Utc::now().timestamp(), Ordering::SeqCst);
+    }
+
+    /// Returns a reference to the raw atomic storing the last request timestamp.
+    ///
+    /// Exposed for tests that need to backdate the timestamp directly.
     #[cfg(test)]
-    pub fn rebalance_cycle_started_at_atomic(&self) -> &AtomicI64 {
-        &self.rebalance_cycle_started_at
-    }
-
-    /// Sets or clears the rebalance-cycle-in-progress flag.
-    ///
-    /// When `in_progress` is `true`, also records the current time so callers
-    /// can detect stale flags after upstream crashes.
-    pub fn set_rebalance_cycle_in_progress(&self, in_progress: bool) {
-        self.rebalance_cycle_in_progress
-            .store(in_progress, Ordering::SeqCst);
-        let timestamp = if in_progress {
-            chrono::Utc::now().timestamp()
-        } else {
-            0
-        };
-        self.rebalance_cycle_started_at
-            .store(timestamp, Ordering::SeqCst);
+    pub fn last_prediction_request_at_atomic(&self) -> &AtomicI64 {
+        &self.last_prediction_request_at
     }
 
     /// Constructs an `AppState` with a pre-existing database pool.
@@ -350,8 +372,8 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
-            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
-            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            rebalance_in_progress: Arc::new(AtomicBool::new(false)),
+            last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
         })
     }
@@ -456,8 +478,8 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
-            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
-            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            rebalance_in_progress: Arc::new(AtomicBool::new(false)),
+            last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
         })
     }
@@ -492,8 +514,8 @@ impl AppState {
             ),
             risk_gate_configuration,
             tradable_assets: Arc::new(RwLock::new(None)),
-            rebalance_cycle_in_progress: Arc::new(AtomicBool::new(false)),
-            rebalance_cycle_started_at: Arc::new(AtomicI64::new(0)),
+            rebalance_in_progress: Arc::new(AtomicBool::new(false)),
+            last_prediction_request_at: Arc::new(AtomicI64::new(0)),
             candidate_pool_count,
         }
     }
@@ -541,8 +563,8 @@ mod tests {
         assert!(
             (state.confidence_floor().0.value() - DEFAULT_CONFIDENCE_FLOOR).abs() < f64::EPSILON
         );
-        assert!(!state.rebalance_cycle_in_progress());
-        assert_eq!(state.rebalance_cycle_started_at(), 0);
+        assert!(!state.rebalance_in_progress());
+        assert!(state.prediction_request_is_due());
 
         unsafe {
             match original_alpaca_key_id {

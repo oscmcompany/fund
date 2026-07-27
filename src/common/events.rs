@@ -55,9 +55,12 @@ pub enum EventType {
     DatabasePurgeErrored,
 
     // --- Prediction pipeline ---
-    /// pg_cron periodic trigger: intraday market session check.
-    MarketSessionCheck,
-    /// portfolio: equity prediction run requested in response to a market session check.
+    /// pg_cron trigger: pre-market request for the day's equity predictions.
+    ///
+    /// Predictions are derived from daily bars, so one run per session produces
+    /// every distinct value the day will have. The portfolio consumer re-emits
+    /// this event when a session begins with no predictions recorded, which
+    /// covers a failed or missed pre-market run.
     EquityPredictionsRequested,
     /// inference: equity prediction run has started.
     EquityPredictionsStarted,
@@ -67,6 +70,13 @@ pub enum EventType {
     EquityPredictionsErrored,
 
     // --- Portfolio rebalance ---
+    /// pg_cron periodic trigger: evaluate open positions for exits and idle
+    /// capital for entries.
+    ///
+    /// Also emitted by the live-quote evaluator when a spread crosses a close
+    /// threshold, so the cron acts as a heartbeat and recovery path rather than
+    /// the sole driver.
+    PortfolioEvaluationRequested,
     /// portfolio: rebalance has started.
     PortfolioRebalanceStarted,
     /// portfolio: rebalance completed successfully.
@@ -109,11 +119,11 @@ impl EventType {
             Self::DatabasePurgeStarted => "database_purge_started",
             Self::DatabasePurgeCompleted => "database_purge_completed",
             Self::DatabasePurgeErrored => "database_purge_errored",
-            Self::MarketSessionCheck => "market_session_check",
             Self::EquityPredictionsRequested => "equity_predictions_requested",
             Self::EquityPredictionsStarted => "equity_predictions_started",
             Self::EquityPredictionsCompleted => "equity_predictions_completed",
             Self::EquityPredictionsErrored => "equity_predictions_errored",
+            Self::PortfolioEvaluationRequested => "portfolio_evaluation_requested",
             Self::PortfolioRebalanceStarted => "portfolio_rebalance_started",
             Self::PortfolioRebalanceCompleted => "portfolio_rebalance_completed",
             Self::PortfolioRebalanceErrored => "portfolio_rebalance_errored",
@@ -144,11 +154,11 @@ impl EventType {
             "database_purge_started" => Some(Self::DatabasePurgeStarted),
             "database_purge_completed" => Some(Self::DatabasePurgeCompleted),
             "database_purge_errored" => Some(Self::DatabasePurgeErrored),
-            "market_session_check" => Some(Self::MarketSessionCheck),
             "equity_predictions_requested" => Some(Self::EquityPredictionsRequested),
             "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
             "equity_predictions_completed" => Some(Self::EquityPredictionsCompleted),
             "equity_predictions_errored" => Some(Self::EquityPredictionsErrored),
+            "portfolio_evaluation_requested" => Some(Self::PortfolioEvaluationRequested),
             "portfolio_rebalance_started" => Some(Self::PortfolioRebalanceStarted),
             "portfolio_rebalance_completed" => Some(Self::PortfolioRebalanceCompleted),
             "portfolio_rebalance_errored" => Some(Self::PortfolioRebalanceErrored),
@@ -353,11 +363,11 @@ mod tests {
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
             EventType::DatabasePurgeErrored,
-            EventType::MarketSessionCheck,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
             EventType::EquityPredictionsErrored,
+            EventType::PortfolioEvaluationRequested,
             EventType::PortfolioRebalanceStarted,
             EventType::PortfolioRebalanceCompleted,
             EventType::PortfolioRebalanceErrored,
@@ -403,8 +413,8 @@ mod tests {
             "portfolio_liquidation_completed"
         );
         assert_eq!(
-            EventType::MarketSessionCheck.as_str(),
-            "market_session_check"
+            EventType::PortfolioEvaluationRequested.as_str(),
+            "portfolio_evaluation_requested"
         );
         assert_eq!(
             EventType::EquityPredictionsErrored.as_str(),
@@ -547,7 +557,10 @@ mod tests {
                 "database_purge_completed",
             ),
             (EventType::DatabasePurgeErrored, "database_purge_errored"),
-            (EventType::MarketSessionCheck, "market_session_check"),
+            (
+                EventType::PortfolioEvaluationRequested,
+                "portfolio_evaluation_requested",
+            ),
             (
                 EventType::EquityPredictionsRequested,
                 "equity_predictions_requested",
@@ -624,11 +637,11 @@ mod tests {
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
             EventType::DatabasePurgeErrored,
-            EventType::MarketSessionCheck,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
             EventType::EquityPredictionsErrored,
+            EventType::PortfolioEvaluationRequested,
             EventType::PortfolioRebalanceStarted,
             EventType::PortfolioRebalanceCompleted,
             EventType::PortfolioRebalanceErrored,
@@ -650,9 +663,12 @@ mod tests {
 
     #[test]
     fn test_event_type_equality() {
-        assert_eq!(EventType::MarketSessionCheck, EventType::MarketSessionCheck);
+        assert_eq!(
+            EventType::PortfolioEvaluationRequested,
+            EventType::PortfolioEvaluationRequested
+        );
         assert_ne!(
-            EventType::MarketSessionCheck,
+            EventType::PortfolioEvaluationRequested,
             EventType::EquityPredictionsStarted
         );
     }

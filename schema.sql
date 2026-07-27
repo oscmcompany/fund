@@ -350,18 +350,45 @@ SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 -- Consumers (e.g., the portfolio service) listen on the 'events' channel and query equity_quotes directly.
 DO $do$
 BEGIN
-    -- Remove old intraday-check job and always recreate market-session-check so
-    -- the schedule and WHERE clause stay current across DST and schema re-applies.
+    -- Remove superseded tick jobs. market-session-check emitted a prediction
+    -- request every five minutes; predictions derive from daily bars, so those
+    -- runs recomputed an identical answer up to 78 times per session. It is
+    -- replaced by one pre-market request plus an evaluation heartbeat.
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
         PERFORM cron.unschedule('intraday-check');
     END IF;
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-session-check') THEN
         PERFORM cron.unschedule('market-session-check');
     END IF;
+
+    -- Pre-market prediction request: weekdays at 09:00 Eastern, 30 minutes ahead
+    -- of a regular open so predictions are ready for the first evaluation pass.
+    -- Fires in UTC hours 13-14 to cover both EDT and EST, gated on the actual
+    -- Eastern time so DST needs no schema re-apply. Holidays are handled by the
+    -- inference consumer, not here.
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-predictions-request') THEN
+        PERFORM cron.unschedule('equity-predictions-request');
+    END IF;
     PERFORM cron.schedule(
-        'market-session-check',
+        'equity-predictions-request',
+        '0 13,14 * * 1-5',
+        $$SELECT emit_event('equity_predictions_requested', '{"reason": "pre_market"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:05'$$
+    );
+
+    -- Portfolio evaluation heartbeat: every five minutes through the session.
+    -- The portfolio consumer checks the real session before acting, so this
+    -- window may safely span a regular close even on early-close days. Live
+    -- quote threshold crossings emit the same event, making this a recovery
+    -- path rather than the sole driver.
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-evaluation-requested') THEN
+        PERFORM cron.unschedule('portfolio-evaluation-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'portfolio-evaluation-requested',
         '*/5 13-20 * * 1-5',
-        $$SELECT emit_event('market_session_check', '{}')
+        $$SELECT emit_event('portfolio_evaluation_requested', '{"reason": "heartbeat"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:00'$$
     );
@@ -409,8 +436,11 @@ $$;
 -- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
 -- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
 -- to re-apply the schema after a DST transition.
--- Fires before the market-session-check window ends so the rebalance lockout window in the portfolio service
--- prevents any new pairs from being opened after this point.
+-- This is the fail-safe path only. The portfolio consumer derives the real close from Alpaca on every
+-- evaluation pass and requests liquidation once it is within the lead time, which pulls liquidation
+-- forward on early-close days when this fixed 15:45 schedule would fire hours after the market shut.
+-- This job still fires unconditionally so an unreachable Alpaca clock cannot leave positions open
+-- overnight; liquidation is idempotent, so both paths firing is harmless.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN

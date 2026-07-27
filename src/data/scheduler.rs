@@ -32,7 +32,8 @@ const GAP_DETECTION_LOOKBACK_DAYS: i64 = 90;
 /// pg_cron job names that must be present for the nightly pipeline to function.
 const EXPECTED_CRON_JOBS: &[&str] = &[
     "equity-bars-sync-requested",
-    "market-session-check",
+    "equity-predictions-request",
+    "portfolio-evaluation-requested",
     "portfolio-liquidation-requested",
     "database-export-requested",
     "cron-run-details-cleanup",
@@ -40,8 +41,9 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
 
 /// Nightly event types and their maximum expected age in hours. Events older
 /// than their threshold trigger a warning on startup. Market-hours-only events
-/// (market_session_check, portfolio_liquidation_requested) are excluded because
-/// they would produce false positives outside trading windows.
+/// (portfolio_evaluation_requested, equity_predictions_requested,
+/// portfolio_liquidation_requested) are excluded because they would produce
+/// false positives outside trading windows.
 const EVENT_FRESHNESS_THRESHOLDS: &[(&str, i64)] = &[
     ("equity_bars_sync_requested", 26),
     ("database_export_requested", 26),
@@ -1552,9 +1554,10 @@ mod tests {
 
     #[test]
     fn test_expected_cron_jobs_list_is_complete() {
-        assert_eq!(EXPECTED_CRON_JOBS.len(), 5);
+        assert_eq!(EXPECTED_CRON_JOBS.len(), 6);
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"market-session-check"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"equity-predictions-request"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-evaluation-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"database-export-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
