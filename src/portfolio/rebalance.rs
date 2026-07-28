@@ -10,7 +10,7 @@
 //! Key functions:
 //! 1. `evaluate_open_pairs` — check each open pair for close signals
 //! 2. `close_triggered_pairs` — close only pairs that hit a signal
-//! 3. `check_drawdown` — gate on account equity vs previous NAV
+//! 3. `check_drawdown` — gate account equity against the previous NAV
 //! 4. `try_evaluate_entries` — load predictions, check regime, run entry pipeline
 //! 5. `select_size_execute` — select, size, risk-gate, and execute new pairs
 //! 6. `persist_filled_pairs` — write session, pairs, allocations, orders, and snapshot
@@ -206,15 +206,29 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         }));
     }
 
-    // Phase 3: load market data. Needed by exit evaluation, entry selection, and
-    // the per-pass exposure measurement, so both series load unconditionally.
+    // Phase 3: load market data. Historical closes feed exit evaluation, so a
+    // failure there genuinely aborts the pass.
+    //
+    // SPY closes feed entry sizing, the regime check, and the exposure
+    // measurement — never exit evaluation. Its error is held rather than
+    // propagated so that a failure isolated to this one query cannot abort the
+    // pass that closes converged and stopped-out positions; it is re-raised in
+    // the entry branch below, where it does matter.
     let (historical_prices, spy_prices) = tokio::join!(
         fetch_historical_equity_prices(pool),
         fetch_spy_equity_prices(pool)
     );
     let historical_prices = historical_prices?;
-    let spy_prices = spy_prices?;
-    let market_betas = compute_market_betas(&historical_prices, &spy_prices);
+    let market_betas = match &spy_prices {
+        Ok(prices) => compute_market_betas(&historical_prices, prices),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "SPY price fetch failed; net beta unmeasured and entries blocked this pass"
+            );
+            HashMap::new()
+        }
+    };
 
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
@@ -244,12 +258,15 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     }
 
     // Phase 5: drawdown check. Required for both snapshot persistence and entry gating.
+    let account = alpaca.get_account().await.map_err(|error| {
+        RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
+    })?;
+    let previous_net_asset_value = fetch_latest_portfolio_net_asset_value(pool).await?;
     let account = check_drawdown(
-        alpaca,
-        pool,
+        account,
+        previous_net_asset_value,
         state.constraints().drawdown_threshold().0.value(),
-    )
-    .await?;
+    )?;
     let current_equity = account.equity;
     let buying_power = account.buying_power;
 
@@ -283,7 +300,12 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
             RebalanceError::Execution(ExecutionError::SessionFetch { source: error })
         })?;
 
-        // Load entry-specific data: predictions, SPY prices, equity details.
+        // Re-raise the held SPY error. Entries need it for both the regime check
+        // and the beta-neutral solve; proceeding without it would size a basket
+        // against no betas at all, which is worse than skipping the pass.
+        let spy_prices = spy_prices?;
+
+        // Load entry-specific data: predictions and equity details.
         let entry_result = try_evaluate_entries(
             state,
             pool,
@@ -934,23 +956,28 @@ async fn close_triggered_pairs(
     Ok(signals.len())
 }
 
-/// Fetches current account state and checks the drawdown guard.
+/// Checks account equity against the previous net asset value.
 ///
-/// Returns the full `AccountInfo` when within the allowed drawdown. Errors with
-/// `DrawdownBreached` when the drop from the previous NAV exceeds the configured
-/// threshold.
-async fn check_drawdown(
-    alpaca: &dyn Trading,
-    pool: &sqlx::PgPool,
+/// Returns `account` unchanged when within the allowed drawdown. Errors with
+/// `DrawdownBreached` when the drop from `previous_net_asset_value` exceeds
+/// `threshold`. A `None` previous value means there is no prior snapshot to
+/// compare against, so the guard does not apply.
+///
+/// Pure by construction: the caller performs the account and snapshot reads and
+/// hands the results in, matching how `risk_gate` keeps every check free of I/O.
+/// Folding the fetches in here would make the passing path reachable only with a
+/// live database, which is what left the guard untested before.
+fn check_drawdown(
+    account: AccountInfo,
+    previous_net_asset_value: Option<f64>,
     threshold: f64,
 ) -> Result<AccountInfo, RebalanceError> {
-    let account = alpaca.get_account().await.map_err(|error| {
-        RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
-    })?;
-
     let current_equity = account.equity;
 
-    if let Some(previous_nav) = fetch_latest_portfolio_net_asset_value(pool).await? {
+    if let Some(previous_nav) = previous_net_asset_value {
+        // A non-positive previous value cannot express a meaningful fraction and
+        // would divide by zero, so it is treated as no drawdown rather than as a
+        // total loss.
         let drop_fraction = if previous_nav > 0.0 {
             (previous_nav - current_equity) / previous_nav
         } else {
@@ -2277,6 +2304,67 @@ mod tests {
         assert!(utilization.idle_cash_fraction.abs() < f64::EPSILON);
         assert!(utilization.net_beta.abs() < f64::EPSILON);
         assert!((utilization.margin_utilization - 1.0).abs() < f64::EPSILON);
+    }
+
+    // --- check_drawdown tests ---
+
+    #[test]
+    fn test_check_drawdown_within_threshold_preserves_account() {
+        // 5% below the previous NAV against a 10% threshold: the pass proceeds
+        // and the account is handed back untouched for downstream sizing.
+        let result = check_drawdown(
+            account(20_000.0, 350_000.0, 95_000.0),
+            Some(100_000.0),
+            0.10,
+        );
+        let returned = result.expect("5% drop is within a 10% threshold");
+        assert!((returned.equity - 95_000.0).abs() < f64::EPSILON);
+        assert!((returned.buying_power - 350_000.0).abs() < f64::EPSILON);
+        assert!((returned.cash_amount - 20_000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_check_drawdown_no_previous_snapshot_passes() {
+        // First pass ever: nothing to compare against, so the guard cannot apply.
+        let result = check_drawdown(account(100_000.0, 400_000.0, 100_000.0), None, 0.10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_drawdown_exactly_at_threshold_passes() {
+        // The comparison is strictly greater-than, so a drop landing exactly on
+        // the threshold is allowed.
+        let result = check_drawdown(account(0.0, 200_000.0, 90_000.0), Some(100_000.0), 0.10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_drawdown_beyond_threshold_breaches() {
+        let result = check_drawdown(account(0.0, 200_000.0, 85_000.0), Some(100_000.0), 0.10);
+        match result {
+            Err(RebalanceError::DrawdownBreached { current, threshold }) => {
+                assert!((current - 85_000.0).abs() < f64::EPSILON);
+                assert!((threshold - 0.10).abs() < f64::EPSILON);
+            }
+            other => panic!("expected DrawdownBreached, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn test_check_drawdown_gain_passes() {
+        // A gain yields a negative fraction, which must not read as a breach.
+        let result = check_drawdown(account(0.0, 500_000.0, 120_000.0), Some(100_000.0), 0.10);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_drawdown_non_positive_previous_nav_passes() {
+        // Guards the divide: a zero previous NAV would otherwise produce infinity
+        // and halt every subsequent pass.
+        let zero = check_drawdown(account(0.0, 200_000.0, 50_000.0), Some(0.0), 0.10);
+        assert!(zero.is_ok());
+        let negative = check_drawdown(account(0.0, 200_000.0, 50_000.0), Some(-1_000.0), 0.10);
+        assert!(negative.is_ok());
     }
 
     #[test]

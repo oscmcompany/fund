@@ -134,8 +134,16 @@ pub async fn export_database(state: &State, date: NaiveDate) -> Result<usize, St
     }
 
     info!(
-        "Exported database to S3: {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs, {} reconciliation events",
-        prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count, reconciliation_event_count
+        date = %date,
+        predictions = prediction_count,
+        sessions = session_count,
+        pairs = pair_count,
+        allocations = allocation_count,
+        orders = order_count,
+        snapshots = snapshot_count,
+        model_runs = model_run_count,
+        reconciliation_events = reconciliation_event_count,
+        "Database export completed"
     );
 
     Ok(prediction_count
