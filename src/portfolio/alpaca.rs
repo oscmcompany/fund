@@ -783,6 +783,21 @@ pub struct TradableAssets {
 }
 
 impl TradableAssets {
+    /// Builds a universe directly from two symbol sets.
+    ///
+    /// Test-only: production values come from [`TradingClient::fetch_tradable_assets`],
+    /// which derives both sets from the broker's own asset flags.
+    #[cfg(test)]
+    pub fn from_sets(
+        tradable: std::collections::HashSet<String>,
+        shortable: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            tradable,
+            shortable,
+        }
+    }
+
     /// Returns `true` when the symbol can be bought (long leg eligibility).
     pub fn is_tradable(&self, symbol: &str) -> bool {
         self.tradable.contains(symbol)

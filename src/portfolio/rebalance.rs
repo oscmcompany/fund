@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
@@ -1066,14 +1066,23 @@ async fn select_size_execute(
 
     let tradable_assets = resolve_tradable_assets(alpaca, tradable_assets_cache).await?;
 
+    // Settle tradability and quote quality before the convergence loop. Both are
+    // properties of the symbols rather than of how a set was sized, so neither
+    // belongs inside a loop whose purpose is resolving the joint sizing problem.
+    let (eligible_candidates, entry_prices) =
+        screen_entry_candidates(alpaca, &scored_pairs, &tradable_assets).await;
+
+    if eligible_candidates.is_empty() {
+        info!("No candidates survived screening; no pairs will be opened");
+        return Ok(Vec::new());
+    }
+
     let eligible_pairs = converge_entry_set(
-        alpaca,
         risk_gate_config,
         market_session,
-        &scored_pairs,
-        &tradable_assets,
+        &eligible_candidates,
+        &entry_prices,
         market_betas,
-        historical_prices,
         alpaca_positions,
         current_equity,
         buying_power,
@@ -1081,8 +1090,7 @@ async fn select_size_execute(
         exposure_scale,
         candidate_pool,
         minimum_pairs,
-    )
-    .await?;
+    )?;
 
     let pending = execute_open_pairs(alpaca, pool, &eligible_pairs).await;
 
@@ -1148,29 +1156,32 @@ async fn resolve_tradable_assets(
     Ok(assets)
 }
 
-/// Fetches entry prices for `tickers`, falling back to the latest daily close.
+/// Fetches validated entry prices for `tickers`.
 ///
 /// Quotes are gated through [`UsableQuote`] and the REST staleness window, so a
-/// book too wide or too old to price against is discarded rather than averaged
-/// into a midpoint. Rejections are counted and logged: they are the measurement
-/// that tells us whether the book-quality bound is set sensibly.
+/// book too wide, too thin, or too old to price against is absent from the
+/// result rather than averaged into a midpoint. A ticker missing from the
+/// returned map has no usable price, and callers must drop it rather than
+/// substitute one — see [`screen_quoted_candidates`].
 ///
-/// The close-price fallback remains for now so that sizing always has a number
-/// to work with. It is the weak point — a symbol rejected for a 3,000 basis
-/// point book still gets sized off its prior close and can still be entered.
-/// Closing that hole belongs to the candidate filter, which excludes such
-/// symbols before they are ever scored, not to this function.
-async fn fetch_entry_prices(
-    alpaca: &dyn Trading,
-    tickers: &[Ticker],
-    historical_prices: &HashMap<Ticker, Vec<f64>>,
-) -> HashMap<Ticker, f64> {
+/// Rejections are counted and logged by cause. They are the measurement that
+/// says whether the book-quality bound is set sensibly, and there is no
+/// production history for this yet.
+///
+/// A failed request yields no prices, which screens out every candidate and
+/// opens nothing this pass. That is the intended outcome: entering a basket
+/// priced off unavailable market data is worse than entering nothing.
+async fn fetch_entry_prices(alpaca: &dyn Trading, tickers: &[Ticker]) -> HashMap<Ticker, f64> {
+    if tickers.is_empty() {
+        return HashMap::new();
+    }
+
     let ticker_strings: Vec<String> = tickers.iter().map(Ticker::to_string).collect();
     let latest_quotes = alpaca
         .fetch_latest_quotes(&ticker_strings)
         .await
         .unwrap_or_else(|error| {
-            warn!(error = %error, "Failed to fetch Alpaca quotes; falling back to close prices");
+            warn!(error = %error, "Failed to fetch Alpaca quotes; no entries will be opened this pass");
             Vec::new()
         });
 
@@ -1206,51 +1217,124 @@ async fn fetch_entry_prices(
         "Entry quote pricing"
     );
 
-    for ticker in tickers {
-        if !entry_prices.contains_key(ticker) {
-            if let Some(latest_close) = historical_prices
-                .get(ticker)
-                .and_then(|closes| closes.last())
-            {
-                entry_prices.insert(ticker.clone(), *latest_close);
-            }
-        }
-    }
-
     entry_prices
 }
-
-/// Splits sized pairs into those Alpaca will trade and the identifiers of those it will not.
-fn partition_tradable_pairs(
-    sized_pairs: Vec<crate::portfolio::sizing::SizedPair>,
+/// Keeps candidates whose long leg is tradable and short leg shortable.
+///
+/// Runs before sizing rather than after. Tradability is a property of the
+/// symbol, fixed for the session and known from a cached asset list, so
+/// discovering it after the joint sizing optimization wasted the whole
+/// computation: a working set of ten could size successfully and then lose six
+/// pairs here, leaving too few to meet the target and aborting the pass.
+fn screen_tradable_candidates(
+    scored_pairs: &[ScoredPair],
     tradable_assets: &TradableAssets,
-) -> (Vec<crate::portfolio::sizing::SizedPair>, Vec<PairID>) {
+) -> (Vec<ScoredPair>, usize) {
     let mut kept = Vec::new();
-    let mut rejected = Vec::new();
+    let mut rejected: usize = 0;
 
-    for pair in sized_pairs {
+    for scored in scored_pairs {
+        let pair = scored.pair();
         let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
         let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str());
-        if !long_ok {
-            info!(
-                ticker = pair.long_ticker().as_str(),
-                "Long leg not tradable on Alpaca; dropping pair"
-            );
-        }
-        if !short_ok {
-            info!(
-                ticker = pair.short_ticker().as_str(),
-                "Short leg not shortable on Alpaca; dropping pair"
-            );
-        }
         if long_ok && short_ok {
-            kept.push(pair);
+            kept.push(scored.clone());
         } else {
-            rejected.push(pair.pair_id().clone());
+            // Debug rather than info: the untradable set is stable across a
+            // session, so this repeats identically on every pass.
+            debug!(
+                pair_id = pair.pair_id().as_str(),
+                long_tradable = long_ok,
+                short_shortable = short_ok,
+                "Candidate dropped: leg not tradable on Alpaca"
+            );
+            rejected += 1;
         }
     }
 
     (kept, rejected)
+}
+
+/// Keeps candidates whose legs both carry a usable, current quote.
+///
+/// A pair is dropped when either leg fails the book-quality gate or the REST
+/// staleness window. It is dropped for this pass only: the snapshot is retaken
+/// every pass, so a symbol quoting temporarily wide becomes eligible again once
+/// it tightens, and no persistent state has to be reconciled when it does.
+///
+/// Dropping is the point. The previous behaviour substituted the prior daily
+/// close whenever a quote was unusable, which meant a symbol rejected for a
+/// three thousand basis point book was still sized and still entered, priced off
+/// a number from the day before. Entering a position that cannot be priced is
+/// entering one that cannot be exited.
+fn screen_quoted_candidates(
+    scored_pairs: Vec<ScoredPair>,
+    entry_prices: &HashMap<Ticker, f64>,
+) -> (Vec<ScoredPair>, usize) {
+    let mut kept = Vec::new();
+    let mut rejected: usize = 0;
+
+    for scored in scored_pairs {
+        let pair = scored.pair();
+        let long_priced = entry_prices.contains_key(pair.long_ticker());
+        let short_priced = entry_prices.contains_key(pair.short_ticker());
+        if long_priced && short_priced {
+            kept.push(scored);
+        } else {
+            debug!(
+                pair_id = pair.pair_id().as_str(),
+                long_priced, short_priced, "Candidate dropped: leg lacks a usable current quote"
+            );
+            rejected += 1;
+        }
+    }
+
+    (kept, rejected)
+}
+
+/// Screens candidates down to those that can actually be opened, and prices them.
+///
+/// One batched snapshot call covers every distinct leg of every surviving
+/// candidate; the client chunks internally, so the whole set goes in one call
+/// from here regardless of size. The former arrangement fetched incrementally
+/// inside the convergence loop, re-entering the network on each iteration, which
+/// only made sense while the request was believed to be symbol-capped.
+async fn screen_entry_candidates(
+    alpaca: &dyn Trading,
+    scored_pairs: &[ScoredPair],
+    tradable_assets: &TradableAssets,
+) -> (Vec<ScoredPair>, HashMap<Ticker, f64>) {
+    let considered = scored_pairs.len();
+    let (tradable_candidates, rejected_untradable) =
+        screen_tradable_candidates(scored_pairs, tradable_assets);
+
+    let legs: Vec<Ticker> = tradable_candidates
+        .iter()
+        .flat_map(|scored| {
+            [
+                scored.pair().long_ticker().clone(),
+                scored.pair().short_ticker().clone(),
+            ]
+        })
+        .collect::<HashSet<Ticker>>()
+        .into_iter()
+        .collect();
+
+    let entry_prices = fetch_entry_prices(alpaca, &legs).await;
+    let (eligible, rejected_unquoted) =
+        screen_quoted_candidates(tradable_candidates, &entry_prices);
+
+    info!(
+        considered,
+        rejected_untradable,
+        rejected_unquoted,
+        eligible = eligible.len(),
+        legs_priced = entry_prices.len(),
+        legs_requested = legs.len(),
+        "Entry candidates screened"
+    );
+
+    (eligible, entry_prices)
 }
 
 /// Applies the risk gate to each pair, returning approvals and rejected identifiers.
@@ -1363,9 +1447,15 @@ fn partition_risk_gated_pairs(
 /// for N pairs but executed with fewer, whose parity weights no longer summed to
 /// one and whose beta was no longer neutral.
 ///
-/// The loop closes that gap. Each pass selects a working set, sizes it, filters
-/// it, and gates it; any rejection excludes those pairs and re-runs the whole
-/// pass, so whatever is finally executed was sized as exactly that set.
+/// The loop closes that gap. Each pass selects a working set, sizes it, and
+/// gates it; any rejection excludes those pairs and re-runs the whole pass, so
+/// whatever is finally executed was sized as exactly that set.
+///
+/// Only the risk gate can reject here. Tradability and quote quality are settled
+/// by [`screen_entry_candidates`] before the loop starts, because neither
+/// depends on how a pair was sized — feeding them through the joint optimization
+/// only to discard the result was wasted work, and losing enough pairs that way
+/// aborted the whole pass.
 ///
 /// Two properties make re-selection worthwhile rather than merely correct:
 ///
@@ -1379,14 +1469,12 @@ fn partition_risk_gated_pairs(
 /// Degrades gracefully: a target that cannot be met is lowered rather than
 /// aborting the pass, since filling four of ten slots beats filling none.
 #[allow(clippy::too_many_arguments)]
-async fn converge_entry_set(
-    alpaca: &dyn Trading,
+fn converge_entry_set(
     risk_gate_config: &risk_gate::RiskGateConfiguration,
     market_session: &MarketSession,
     scored_pairs: &[ScoredPair],
-    tradable_assets: &TradableAssets,
+    entry_prices: &HashMap<Ticker, f64>,
     market_betas: &HashMap<Ticker, f64>,
-    historical_prices: &HashMap<Ticker, Vec<f64>>,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
     buying_power: f64,
@@ -1396,7 +1484,6 @@ async fn converge_entry_set(
     target_pairs: usize,
 ) -> Result<Vec<crate::portfolio::sizing::SizedPair>, RebalanceError> {
     let mut excluded: HashSet<PairID> = HashSet::new();
-    let mut entry_prices: HashMap<Ticker, f64> = HashMap::new();
     let mut target = target_pairs;
 
     // The iteration budget scales with the working set because each iteration
@@ -1423,22 +1510,11 @@ async fn converge_entry_set(
             return Ok(Vec::new());
         }
 
-        // Price any tickers this iteration introduced. Earlier entries are kept
-        // so a re-selection that reuses a pair does not re-fetch its quote.
-        let unpriced: Vec<Ticker> = working_set
-            .iter()
-            .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
-            .filter(|ticker| !entry_prices.contains_key(ticker))
-            .collect();
-        if !unpriced.is_empty() {
-            entry_prices.extend(fetch_entry_prices(alpaca, &unpriced, historical_prices).await);
-        }
-
         let sized_pairs = match size_pairs_with_volatility_parity(
             &working_set,
             capital,
             market_betas,
-            &entry_prices,
+            entry_prices,
             exposure_scale,
             target,
         ) {
@@ -1460,8 +1536,6 @@ async fn converge_entry_set(
             Err(error) => return Err(error.into()),
         };
 
-        let (tradable_pairs, untradable) = partition_tradable_pairs(sized_pairs, tradable_assets);
-
         // Rebuilt every iteration: the snapshot accumulates approvals, so it
         // must start from real portfolio state rather than a previous attempt.
         let mut snapshot = build_portfolio_snapshot(current_equity, buying_power, alpaca_positions);
@@ -1469,11 +1543,11 @@ async fn converge_entry_set(
             risk_gate_config,
             market_session,
             &mut snapshot,
-            tradable_pairs,
+            sized_pairs,
             Utc::now(),
         );
 
-        if untradable.is_empty() && gate_rejected.is_empty() {
+        if gate_rejected.is_empty() {
             info!(
                 iteration,
                 approved = approved.len(),
@@ -1483,8 +1557,7 @@ async fn converge_entry_set(
             return Ok(approved);
         }
 
-        let newly_excluded = untradable.len() + gate_rejected.len();
-        excluded.extend(untradable);
+        let newly_excluded = gate_rejected.len();
         excluded.extend(gate_rejected);
         info!(
             iteration,
@@ -1663,6 +1736,177 @@ async fn persist_filled_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Entry candidate screening ---
+
+    mod screening {
+        use super::*;
+        use crate::portfolio::alpaca::{LatestQuote, MockTrading};
+        use crate::portfolio::statistical_arbitrage::CandidatePair;
+        use chrono::Duration;
+
+        fn ticker(symbol: &str) -> Ticker {
+            Ticker::new(symbol).expect("valid ticker")
+        }
+
+        fn candidate(long: &str, short: &str) -> ScoredPair {
+            let pair = CandidatePair::new(
+                PairID::new(ticker(long), ticker(short)),
+                ticker(long),
+                ticker(short),
+                2.0,
+                1.0,
+                0.05,
+                0.02,
+                0.02,
+            )
+            .expect("valid candidate pair");
+            ScoredPair::new(pair, 1.0)
+        }
+
+        /// Builds an asset universe where every listed symbol is both tradable
+        /// and shortable, and nothing else is.
+        fn assets(symbols: &[&str]) -> TradableAssets {
+            TradableAssets::from_sets(
+                symbols.iter().map(|s| s.to_string()).collect(),
+                symbols.iter().map(|s| s.to_string()).collect(),
+            )
+        }
+
+        fn quote(symbol: &str, bid: f64, ask: f64, age: Duration) -> LatestQuote {
+            LatestQuote {
+                symbol: symbol.to_string(),
+                bid_price: bid,
+                ask_price: ask,
+                bid_size: crate::domain::market::MINIMUM_QUOTE_SIZE,
+                ask_size: crate::domain::market::MINIMUM_QUOTE_SIZE,
+                observed_at: Utc::now() - age,
+            }
+        }
+
+        #[test]
+        fn test_screen_tradable_drops_pair_when_either_leg_ineligible() {
+            let candidates = vec![
+                candidate("AAPL", "MSFT"),
+                candidate("GOOG", "META"),
+                candidate("NVDA", "TSLA"),
+            ];
+            // META is absent, so GOOG-META loses its short leg.
+            let universe = assets(&["AAPL", "MSFT", "GOOG", "NVDA", "TSLA"]);
+
+            let (kept, rejected) = screen_tradable_candidates(&candidates, &universe);
+
+            assert_eq!(rejected, 1);
+            assert_eq!(kept.len(), 2);
+            assert!(kept
+                .iter()
+                .all(|scored| scored.pair().pair_id().as_str() != "GOOG-META"));
+        }
+
+        #[test]
+        fn test_screen_quoted_drops_pair_missing_either_price() {
+            let candidates = vec![candidate("AAPL", "MSFT"), candidate("GOOG", "META")];
+            let mut prices = HashMap::new();
+            prices.insert(ticker("AAPL"), 180.0);
+            prices.insert(ticker("MSFT"), 400.0);
+            // GOOG priced, META not: the pair must go, not just the leg.
+            prices.insert(ticker("GOOG"), 150.0);
+
+            let (kept, rejected) = screen_quoted_candidates(candidates, &prices);
+
+            assert_eq!(rejected, 1);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].pair().pair_id().as_str(), "AAPL-MSFT");
+        }
+
+        #[tokio::test]
+        async fn test_fetch_entry_prices_rejects_wide_and_stale_books() {
+            let mock = MockTrading {
+                latest_quotes: vec![
+                    // Tight and current: accepted.
+                    quote("AAPL", 180.00, 180.20, Duration::seconds(5)),
+                    // 1,053 basis points wide: rejected on book quality.
+                    quote("WIDE", 180.00, 200.00, Duration::seconds(5)),
+                    // Tight but older than the five-minute REST window.
+                    quote("OLD", 180.00, 180.20, Duration::seconds(400)),
+                ],
+                ..MockTrading::default()
+            };
+
+            let prices =
+                fetch_entry_prices(&mock, &[ticker("AAPL"), ticker("WIDE"), ticker("OLD")]).await;
+
+            assert_eq!(prices.len(), 1);
+            assert!((prices[&ticker("AAPL")] - 180.1).abs() < 1e-9);
+            assert!(!prices.contains_key(&ticker("WIDE")));
+            assert!(!prices.contains_key(&ticker("OLD")));
+        }
+
+        #[tokio::test]
+        async fn test_fetch_entry_prices_does_not_substitute_a_close() {
+            // The behaviour this replaces: an unusable quote fell back to the
+            // prior daily close, so a symbol rejected for its book was still
+            // sized and still entered.
+            let mock = MockTrading {
+                latest_quotes: vec![quote("WIDE", 180.00, 200.00, Duration::seconds(5))],
+                ..MockTrading::default()
+            };
+
+            let prices = fetch_entry_prices(&mock, &[ticker("WIDE")]).await;
+
+            assert!(prices.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_fetch_entry_prices_returns_empty_for_no_tickers() {
+            let mock = MockTrading::default();
+            assert!(fetch_entry_prices(&mock, &[]).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_screen_entry_candidates_applies_both_screens() {
+            let candidates = vec![
+                candidate("AAPL", "MSFT"),
+                // Tradable, but NOQT quotes too wide to price.
+                candidate("GOOG", "NOQT"),
+                // TSLA is not in the tradable universe at all.
+                candidate("NVDA", "TSLA"),
+            ];
+            let universe = assets(&["AAPL", "MSFT", "GOOG", "NOQT", "NVDA"]);
+            let mock = MockTrading {
+                latest_quotes: vec![
+                    quote("AAPL", 180.00, 180.20, Duration::seconds(5)),
+                    quote("MSFT", 400.00, 400.30, Duration::seconds(5)),
+                    quote("GOOG", 150.00, 150.10, Duration::seconds(5)),
+                    quote("NOQT", 10.00, 12.00, Duration::seconds(5)),
+                ],
+                ..MockTrading::default()
+            };
+
+            let (eligible, prices) = screen_entry_candidates(&mock, &candidates, &universe).await;
+
+            assert_eq!(eligible.len(), 1);
+            assert_eq!(eligible[0].pair().pair_id().as_str(), "AAPL-MSFT");
+            // NVDA never reached pricing: its pair failed the tradable screen,
+            // so it must not appear in the request at all.
+            assert!(!prices.contains_key(&ticker("NVDA")));
+            assert!(!prices.contains_key(&ticker("NOQT")));
+        }
+
+        #[tokio::test]
+        async fn test_screen_entry_candidates_yields_nothing_when_quotes_unavailable() {
+            // A failed or empty quote response must open nothing rather than
+            // fall through to some other price source.
+            let candidates = vec![candidate("AAPL", "MSFT")];
+            let universe = assets(&["AAPL", "MSFT"]);
+            let mock = MockTrading::default();
+
+            let (eligible, prices) = screen_entry_candidates(&mock, &candidates, &universe).await;
+
+            assert!(eligible.is_empty());
+            assert!(prices.is_empty());
+        }
+    }
 
     #[test]
     fn test_rebalance_error_display_stale_predictions() {

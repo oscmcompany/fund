@@ -142,6 +142,17 @@ pub struct ScoredPair {
 }
 
 impl ScoredPair {
+    /// Pairs one candidate with its rank score.
+    ///
+    /// Test-only: production values come from [`score_candidate_pairs`], which
+    /// derives the score from the whole reservoir. Exposing an unrestricted
+    /// constructor would let a caller invent a ranking that never went through
+    /// screening.
+    #[cfg(test)]
+    pub fn new(pair: CandidatePair, rank_score: f64) -> Self {
+        Self { pair, rank_score }
+    }
+
     pub fn pair(&self) -> &CandidatePair {
         &self.pair
     }
