@@ -56,6 +56,20 @@ in {
   };
 
   git-hooks.hooks = {
+    # Ordered before check-rust deliberately. The sqlx check takes about four
+    # seconds against a warm build; check-rust runs fmt, clippy over all targets,
+    # and the test suite with coverage. Schema drift is the failure most likely
+    # to be caught here, so surfacing it in seconds rather than after minutes of
+    # unrelated work is worth the ordering.
+    check-sqlx = {
+      enable = true;
+      name = "Check sqlx query metadata cache";
+      entry = "check-sqlx";
+      files = "\\.rs$|schema\\.sql$";
+      pass_filenames = false;
+      language = "system";
+      fail_fast = true;
+    };
     check-rust = {
       enable = true;
       name = "Check all Rust code";
@@ -106,15 +120,6 @@ in {
       name = "Check all Nix code";
       entry = "check-nix";
       files = "\\.nix$";
-      pass_filenames = false;
-      language = "system";
-      fail_fast = true;
-    };
-    check-sqlx = {
-      enable = true;
-      name = "Check sqlx query metadata cache";
-      entry = "check-sqlx";
-      files = "\\.rs$|schema\\.sql$";
       pass_filenames = false;
       language = "system";
       fail_fast = true;
@@ -317,10 +322,25 @@ in {
 
   scripts.check-sqlx.exec = ''
     set -euo pipefail
+    # The committed .sqlx/ cache can disagree with schema.sql, and every offline
+    # build believes the cache. Only a live connection catches that, so a
+    # missing database is a failure rather than a pass: exiting 0 here reported
+    # success for a check that had not run, which is worse than not having it.
     if ! pg_isready -q 2>/dev/null; then
-      echo "sqlx prepare check skipped: database not available"
-      echo "Run 'devenv --profile application up' then 'cargo sqlx prepare -- --all-features' to verify the cache"
-      exit 0
+      echo "Starting PostgreSQL to verify the sqlx query metadata cache"
+      devenv up postgres --detach >/dev/null 2>&1 || true
+      for attempt in $(seq 1 30); do
+        if pg_isready -q 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+    fi
+    if ! pg_isready -q 2>/dev/null; then
+      echo "sqlx prepare check FAILED: no database after 30s"
+      echo "Start it with 'devenv up postgres --detach', then re-run the commit."
+      echo "The .sqlx/ cache cannot be validated against schema.sql without one."
+      exit 1
     fi
     echo "Checking sqlx query metadata cache is up to date"
     cargo sqlx prepare --check -- --all-features
