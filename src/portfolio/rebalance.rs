@@ -1236,7 +1236,14 @@ fn screen_tradable_candidates(
     for scored in scored_pairs {
         let pair = scored.pair();
         let long_ok = tradable_assets.is_tradable(pair.long_ticker().as_str());
-        let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str());
+        // The short leg is checked for tradability as well as shortability.
+        // `fetch_tradable_assets` only ever inserts into the shortable set from
+        // inside the tradable branch, so shortable is a subset of tradable and
+        // this rejects nothing today. It is here so that the subset property
+        // has to hold for the screen to pass, rather than being an invariant of
+        // a different function that this one silently depends on.
+        let short_ok = tradable_assets.is_shortable(pair.short_ticker().as_str())
+            && tradable_assets.is_tradable(pair.short_ticker().as_str());
         if long_ok && short_ok {
             kept.push(scored.clone());
         } else {
@@ -1245,7 +1252,7 @@ fn screen_tradable_candidates(
             debug!(
                 pair_id = pair.pair_id().as_str(),
                 long_tradable = long_ok,
-                short_shortable = short_ok,
+                short_eligible = short_ok,
                 "Candidate dropped: leg not tradable on Alpaca"
             );
             rejected += 1;
@@ -1801,6 +1808,24 @@ mod tests {
             assert!(kept
                 .iter()
                 .all(|scored| scored.pair().pair_id().as_str() != "GOOG-META"));
+        }
+
+        #[test]
+        fn test_screen_tradable_requires_short_leg_to_be_tradable_too() {
+            // A symbol marked shortable but not tradable cannot arise from
+            // `fetch_tradable_assets`, which only fills the shortable set from
+            // inside the tradable branch. The screen must not depend on that
+            // invariant holding elsewhere.
+            let candidates = vec![candidate("AAPL", "MSFT")];
+            let universe = TradableAssets::from_sets(
+                ["AAPL".to_string()].into_iter().collect(),
+                ["MSFT".to_string()].into_iter().collect(),
+            );
+
+            let (kept, rejected) = screen_tradable_candidates(&candidates, &universe);
+
+            assert!(kept.is_empty());
+            assert_eq!(rejected, 1);
         }
 
         #[test]

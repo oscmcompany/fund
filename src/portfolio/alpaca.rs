@@ -712,13 +712,13 @@ impl TradingClient {
                 let quote = snapshot.latest_quote?;
                 Some(LatestQuote {
                     symbol,
-                    bid_price: quote.bp?,
-                    ask_price: quote.ap?,
+                    bid_price: quote.bid_price?,
+                    ask_price: quote.ask_price?,
                     // A quote reporting a price but no size is treated as
                     // zero size, which the book-quality gate then rejects.
-                    bid_size: quote.bs.unwrap_or(0),
+                    bid_size: quote.bid_size.unwrap_or(0),
                     ask_size: quote.ask_size.unwrap_or(0),
-                    observed_at: quote.t?,
+                    observed_at: quote.timestamp?,
                 })
             })
             .collect())
@@ -884,19 +884,27 @@ struct SnapshotResponse {
 
 /// The `latestQuote` object from a snapshot response.
 ///
-/// Field names are Alpaca's and are not renamed: `bp`/`ap` are bid and ask
-/// price, `bs`/`as` their sizes, and `t` the exchange timestamp. The timestamp
-/// and sizes were previously discarded, which left the REST path unable to tell
-/// a quote posted a second ago from one posted at the open, and unable to
-/// distinguish a tight book from a tight book quoted for five shares.
+/// Alpaca's wire names are pinned in the `serde` attributes, which is what the
+/// external contract actually is; the Rust fields spell them out. This matches
+/// how `stream::alpaca_equities::StreamMessage` deserializes the identical
+/// fields from the WebSocket feed, so the two representations of an Alpaca
+/// quote read the same way.
+///
+/// The timestamp and sizes were previously discarded, which left the REST path
+/// unable to tell a quote posted a second ago from one posted at the open, and
+/// unable to distinguish a tight book from a tight book quoted for five shares.
 #[derive(Deserialize)]
 struct SnapshotQuote {
-    bp: Option<f64>,
-    ap: Option<f64>,
-    bs: Option<i32>,
+    #[serde(rename = "bp")]
+    bid_price: Option<f64>,
+    #[serde(rename = "ap")]
+    ask_price: Option<f64>,
+    #[serde(rename = "bs")]
+    bid_size: Option<i32>,
     #[serde(rename = "as")]
     ask_size: Option<i32>,
-    t: Option<DateTime<Utc>>,
+    #[serde(rename = "t")]
+    timestamp: Option<DateTime<Utc>>,
 }
 
 /// Test-only mock implementation of the [`Trading`] trait.
