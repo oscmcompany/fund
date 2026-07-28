@@ -17,7 +17,8 @@
 //! at connect time, and the portfolio turns over a handful of times per day, so
 //! a one-second reconnect on change is cheaper than threading an outbound
 //! channel through shared connection infrastructure. The gap is covered by the
-//! consumer's staleness guard, which falls back to the prior close.
+//! exit pricing cascade, which fills unstreamed legs from a REST snapshot and
+//! holds any pair it still cannot price.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -32,10 +33,11 @@ use tracing::{debug, info, warn};
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::common::market_hours::{
-    duration_until_quote_stream_window, is_within_quote_stream_window,
+    duration_until_quote_stream_window, is_within_quote_stream_window_at,
 };
 use crate::domain::market::{EquityQuote, Ticker};
 use crate::domain::portfolio::MinimumPairs;
+use crate::portfolio::alpaca::Trading;
 use crate::portfolio::database::{fetch_open_pairs, OpenPair};
 use crate::stream::buffer::MarketDataBuffer;
 use crate::stream::connection::{run_connection, ConnectionConfiguration, MessagePayload};
@@ -59,6 +61,13 @@ const IDLE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How often an active session rechecks the quote-stream window.
 const WINDOW_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Pause between dropping one subscription and opening the next.
+///
+/// The plan allows a single concurrent connection and the drop that ends a
+/// session is abrupt rather than a close handshake, so reconnecting immediately
+/// risks Alpaca still counting the old connection as live.
+const RESUBSCRIBE_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 /// Maximum symbols that may be subscribed on one connection.
 ///
@@ -366,6 +375,68 @@ async fn wait_for_subscription_change(
     }
 }
 
+/// How long the window decision is reused before the clock is re-read.
+///
+/// The session boundaries move only across a session, so re-reading per loop
+/// iteration would spend a request to learn the same close time repeatedly.
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Whether to stream right now, and how long to wait when the answer is no.
+enum WindowDecision {
+    Open,
+    Closed { wait: Duration },
+}
+
+/// Decides whether the quote-stream window is open, preferring Alpaca's clock.
+///
+/// Falls back to the fixed 09:25–16:05 weekday window when the clock cannot be
+/// reached. This fails *open*, which is the opposite of how the trading paths
+/// treat a clock failure, and deliberately so: the producer submits no orders,
+/// it only reads prices. Refusing to stream on a clock error would silently
+/// degrade every exit decision to snapshot pricing, whereas streaming on a
+/// holiday costs an idle socket.
+async fn decide_window(alpaca: &dyn Trading, now: DateTime<Utc>) -> WindowDecision {
+    match alpaca.fetch_market_session().await {
+        Ok(session) => {
+            if session.trades_on_date_of(now) && session.contains_quote_stream_window(now) {
+                return WindowDecision::Open;
+            }
+            // A holiday, a weekend, or a date whose session has ended all report
+            // a close on a later date, so the wait derives from that session's
+            // open rather than from a local calendar.
+            let wait = session
+                .time_until_quote_stream_window(now)
+                .to_std()
+                .unwrap_or(SESSION_REFRESH_INTERVAL);
+            WindowDecision::Closed {
+                // Bounded so a session whose window has already passed does not
+                // resolve to a zero wait and spin.
+                wait: wait.max(SESSION_REFRESH_INTERVAL).min(MAXIMUM_IDLE_SLEEP),
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Market session fetch failed; falling back to the fixed quote stream window"
+            );
+            if is_within_quote_stream_window_at(now) {
+                WindowDecision::Open
+            } else {
+                WindowDecision::Closed {
+                    wait: duration_until_quote_stream_window(now).min(MAXIMUM_IDLE_SLEEP),
+                }
+            }
+        }
+    }
+}
+
+/// Longest the producer sleeps before re-checking the window.
+///
+/// Caps the weekend sleep so a session that becomes tradeable earlier than the
+/// clock reported — an unscheduled open, a corrected holiday calendar — is
+/// picked up within the hour rather than at the originally computed instant.
+const MAXIMUM_IDLE_SLEEP: Duration = Duration::from_secs(3_600);
+
 /// Runs the quote stream producer until shutdown.
 ///
 /// Sleeps outside the quote-stream window, waits for open pairs to exist, then
@@ -373,6 +444,7 @@ async fn wait_for_subscription_change(
 pub async fn run_quote_stream(
     configuration: QuoteStreamConfiguration,
     credentials: AlpacaCredentials,
+    alpaca: Arc<dyn Trading>,
     pool: PgPool,
     buffer: Arc<MarketDataBuffer<EquityQuote>>,
     shutdown_token: CancellationToken,
@@ -384,8 +456,7 @@ pub async fn run_quote_stream(
     );
 
     while !shutdown_token.is_cancelled() {
-        if !is_within_quote_stream_window() {
-            let wait = duration_until_quote_stream_window(Utc::now());
+        if let WindowDecision::Closed { wait } = decide_window(alpaca.as_ref(), Utc::now()).await {
             info!(
                 wait_seconds = wait.as_secs(),
                 "Outside quote stream window; sleeping"
@@ -421,12 +492,27 @@ pub async fn run_quote_stream(
         run_subscription_session(
             &configuration,
             &credentials,
+            alpaca.as_ref(),
             &pool,
             &buffer,
             &symbols,
             &shutdown_token,
         )
         .await;
+
+        // Let the dropped socket close before the next iteration dials again.
+        // The plan permits one concurrent connection, and the drop that ends a
+        // session is an abrupt close rather than a WebSocket close handshake, so
+        // Alpaca can still count the old connection as live and reject the new
+        // one with error 406. Precautionary: the reconnect backoff in
+        // `run_connection` would recover anyway, and the race has not been
+        // observed — there are no production logs from this subsystem yet.
+        if !shutdown_token.is_cancelled() {
+            tokio::select! {
+                _ = sleep(RESUBSCRIBE_SETTLE_DELAY) => {}
+                _ = shutdown_token.cancelled() => break,
+            }
+        }
     }
 
     info!("Quote stream producer stopped");
@@ -438,13 +524,13 @@ pub async fn run_quote_stream(
 /// set does not hold an Alpaca socket open overnight and through the weekend.
 /// Without this the producer's own window gate is only reached between sessions,
 /// which a stable set never triggers.
-async fn wait_for_window_close(shutdown_token: &CancellationToken) {
+async fn wait_for_window_close(alpaca: &dyn Trading, shutdown_token: &CancellationToken) {
     loop {
         tokio::select! {
             _ = sleep(WINDOW_CHECK_INTERVAL) => {}
             _ = shutdown_token.cancelled() => return,
         }
-        if !is_within_quote_stream_window() {
+        if let WindowDecision::Closed { .. } = decide_window(alpaca, Utc::now()).await {
             info!("Quote stream window closed; ending subscription");
             return;
         }
@@ -456,6 +542,7 @@ async fn wait_for_window_close(shutdown_token: &CancellationToken) {
 async fn run_subscription_session(
     configuration: &QuoteStreamConfiguration,
     credentials: &AlpacaCredentials,
+    alpaca: &dyn Trading,
     pool: &PgPool,
     buffer: &Arc<MarketDataBuffer<EquityQuote>>,
     symbols: &BTreeSet<String>,
@@ -500,7 +587,7 @@ async fn run_subscription_session(
             configuration.symbol_limit(),
             shutdown_token,
         ) => {}
-        _ = wait_for_window_close(shutdown_token) => {}
+        _ = wait_for_window_close(alpaca, shutdown_token) => {}
     }
 }
 
@@ -512,6 +599,121 @@ mod tests {
 
     fn minimum_pairs(count: u8) -> MinimumPairs {
         MinimumPairs(NonZeroU8::new(count).expect("count must be non-zero"))
+    }
+
+    // --- Session-derived quote stream window ---
+
+    mod window {
+        use super::*;
+        use crate::portfolio::alpaca::MockTrading;
+
+        fn utc(rfc3339: &str) -> DateTime<Utc> {
+            DateTime::parse_from_rfc3339(rfc3339)
+                .expect("valid timestamp")
+                .with_timezone(&Utc)
+        }
+
+        fn clock(market_open: bool, close: DateTime<Utc>) -> MockTrading {
+            MockTrading {
+                market_open,
+                session_close: close,
+                ..MockTrading::default()
+            }
+        }
+
+        fn is_open(decision: &WindowDecision) -> bool {
+            matches!(decision, WindowDecision::Open)
+        }
+
+        #[tokio::test]
+        async fn test_window_open_inside_the_reported_session() {
+            // 20:00Z close = 16:00 EDT. 14:00Z = 10:00 EDT, mid-session.
+            let alpaca = clock(true, utc("2024-07-15T20:00:00Z"));
+            assert!(is_open(
+                &decide_window(&alpaca, utc("2024-07-15T14:00:00Z")).await
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_window_opens_before_the_bell_and_closes_after() {
+            let alpaca = clock(false, utc("2024-07-15T20:00:00Z"));
+            // 13:26Z = 09:26 EDT, inside the five-minute lead.
+            assert!(is_open(
+                &decide_window(&alpaca, utc("2024-07-15T13:26:00Z")).await
+            ));
+            // 13:24Z = 09:24 EDT, one minute too early.
+            assert!(!is_open(
+                &decide_window(&alpaca, utc("2024-07-15T13:24:00Z")).await
+            ));
+            // 20:03Z = 16:03 EDT, inside the trailing lead.
+            assert!(is_open(
+                &decide_window(&alpaca, utc("2024-07-15T20:03:00Z")).await
+            ));
+            // 20:06Z = 16:06 EDT, past it.
+            assert!(!is_open(
+                &decide_window(&alpaca, utc("2024-07-15T20:06:00Z")).await
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_window_follows_an_early_close() {
+            // 17:00Z = 13:00 EDT, the standard early close. The fixed window
+            // would still report open until 16:05 EDT; this must not.
+            let alpaca = clock(true, utc("2024-07-03T17:00:00Z"));
+            assert!(is_open(
+                &decide_window(&alpaca, utc("2024-07-03T16:50:00Z")).await
+            ));
+            assert!(!is_open(
+                &decide_window(&alpaca, utc("2024-07-03T17:30:00Z")).await
+            ));
+            // The fixed fallback disagrees, which is the whole point of deriving.
+            assert!(is_within_quote_stream_window_at(utc(
+                "2024-07-03T17:30:00Z"
+            )));
+        }
+
+        #[tokio::test]
+        async fn test_window_closed_on_a_holiday() {
+            // Asked at 09:00 ET on Thursday July 4th, Alpaca reports Friday's
+            // close, so no session trades today and the producer must not dial.
+            let alpaca = clock(false, utc("2024-07-05T20:00:00Z"));
+            assert!(!is_open(
+                &decide_window(&alpaca, utc("2024-07-04T13:00:00Z")).await
+            ));
+        }
+
+        #[tokio::test]
+        async fn test_closed_window_never_yields_a_zero_wait() {
+            // A zero wait would spin the producer's loop against the clock
+            // endpoint. Every closed decision must carry a real delay.
+            let alpaca = clock(false, utc("2024-07-05T20:00:00Z"));
+            match decide_window(&alpaca, utc("2024-07-04T13:00:00Z")).await {
+                WindowDecision::Closed { wait } => {
+                    assert!(wait >= SESSION_REFRESH_INTERVAL);
+                    assert!(wait <= MAXIMUM_IDLE_SLEEP);
+                }
+                WindowDecision::Open => panic!("expected a closed window"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_clock_failure_fails_open_to_the_fixed_window() {
+            // The producer submits no orders, so refusing to stream on a clock
+            // error would silently degrade every exit to snapshot pricing.
+            // Streaming on a holiday only costs an idle socket.
+            let alpaca = MockTrading {
+                should_fail_session_fetch: true,
+                ..MockTrading::default()
+            };
+            // 14:00Z Monday = 10:00 EDT, inside the fixed window.
+            assert!(is_open(
+                &decide_window(&alpaca, utc("2024-07-15T14:00:00Z")).await
+            ));
+            // 02:00Z = 22:00 EDT the previous evening, outside it.
+            assert!(!is_open(
+                &decide_window(&alpaca, utc("2024-07-15T02:00:00Z")).await
+            ));
+        }
     }
 
     // --- SymbolSubscriptionLimit ---

@@ -205,9 +205,18 @@ async fn run_live_evaluator(
 
     loop {
         // Outside the quote-stream window the cache is guaranteed empty, because
-        // the producer sleeps through the same window. Refreshing baselines here
-        // would issue queries a minute, all night and all weekend, for a check
-        // that cannot fire.
+        // the producer sleeps through it too. Refreshing baselines here would
+        // issue queries a minute, all night and all weekend, for a check that
+        // cannot fire.
+        //
+        // The fixed window is used rather than Alpaca's real session, unlike the
+        // producer, which derives its own. That is safe because the fixed window
+        // is a strict superset: every real session falls inside 09:25–16:05 on a
+        // weekday, so this never sleeps through live quotes. It only costs
+        // unnecessary polling on a holiday or after an early close, where the
+        // producer has already stopped and the cache stays empty. Deriving the
+        // session here would need the Alpaca client threaded into this task for
+        // a saving that is entirely in idle queries.
         if !is_within_quote_stream_window() {
             let wait = duration_until_quote_stream_window(Utc::now());
             info!(

@@ -924,6 +924,9 @@ pub struct MockTrading {
     pub should_fail_short_order: bool,
     pub should_fail_cancel: bool,
     pub should_fail_close: bool,
+    /// Makes `fetch_market_session` return an API error, for exercising the
+    /// clock-unavailable paths.
+    pub should_fail_session_fetch: bool,
     pub market_open: bool,
     /// Session close returned by `fetch_market_session`. Defaults to 16:00
     /// Eastern today; set it earlier to exercise early-close behavior.
@@ -963,6 +966,7 @@ impl Default for MockTrading {
             should_fail_short_order: false,
             should_fail_cancel: false,
             should_fail_close: false,
+            should_fail_session_fetch: false,
             market_open: true,
             session_close: default_mock_session_close(),
             tradable_assets: TradableAssets {
@@ -1058,6 +1062,12 @@ impl Trading for MockTrading {
     }
 
     async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
+        if self.should_fail_session_fetch {
+            return Err(ClientError::Api {
+                status: 503,
+                body: "mock clock unavailable".to_string(),
+            });
+        }
         MarketSession::new(self.market_open, self.session_close).ok_or_else(|| {
             ClientError::Parse(format!(
                 "Mock session close is unusable: {}",

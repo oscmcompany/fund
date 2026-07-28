@@ -176,6 +176,7 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
                 fund::stream::alpaca_equities::run_quote_stream(
                     configuration,
                     credentials,
+                    state.alpaca_client_handle(),
                     pool.clone(),
                     Arc::clone(&market_data_buffer),
                     shutdown_token.clone(),
