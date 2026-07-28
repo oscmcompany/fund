@@ -269,7 +269,12 @@ impl RiskGateDecision {
 ///
 /// Returns a value in `[0.0, 1.0]` where 0.0 means fully cash and 1.0 means
 /// all buying power is consumed. Returns 1.0 for zero or negative equity.
-fn margin_utilization(equity: f64, buying_power: f64) -> f64 {
+///
+/// Exposed to the crate so per-pass observability reports the same number the
+/// gate enforces against. Two definitions would drift, and a logged utilization
+/// that disagreed with the one blocking entries would misdirect every
+/// investigation that started from the logs.
+pub(crate) fn margin_utilization(equity: f64, buying_power: f64) -> f64 {
     if equity <= 0.0 {
         return 1.0;
     }

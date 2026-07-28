@@ -1,4 +1,4 @@
-use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, PairID, Ticker};
+use crate::domain::market::{EquityBar, EquityDetail, PairID, Ticker};
 use crate::domain::predictions::{EquityPrediction, ModelRun, ModelRunStatus};
 use crate::domain::trading::{
     AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
@@ -79,44 +79,6 @@ pub async fn insert_equity_bars(pool: &PgPool, bars: &[EquityBar]) -> Result<u64
     Ok(rows_affected)
 }
 
-pub async fn insert_equity_quotes(
-    pool: &PgPool,
-    quotes: &[EquityQuote],
-) -> Result<u64, sqlx::Error> {
-    if quotes.is_empty() {
-        return Ok(0);
-    }
-
-    let mut rows_affected: u64 = 0;
-    let mut transaction = pool.begin().await?;
-
-    for chunk in quotes.chunks(1000) {
-        let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO equity_quotes (timestamp, ticker, bid_price, ask_price, bid_size, ask_size) ",
-        );
-
-        query_builder.push_values(chunk, |mut builder, quote| {
-            builder
-                .push_bind(quote.timestamp())
-                .push_bind(quote.ticker())
-                .push_bind(quote.bid_price())
-                .push_bind(quote.ask_price())
-                .push_bind(quote.bid_size())
-                .push_bind(quote.ask_size());
-        });
-
-        let result = query_builder.build().execute(&mut *transaction).await?;
-        rows_affected += result.rows_affected();
-    }
-
-    transaction.commit().await?;
-    debug!(
-        rows = rows_affected,
-        "Inserted equity quotes into PostgreSQL"
-    );
-    Ok(rows_affected)
-}
-
 pub async fn get_active_tickers(pool: &PgPool) -> Result<Vec<Ticker>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"SELECT DISTINCT ea.ticker
@@ -190,44 +152,6 @@ fn date_to_utc_range(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     (start, end)
 }
 
-pub async fn query_equity_quotes_for_date(
-    pool: &PgPool,
-    date: NaiveDate,
-) -> Result<Vec<EquityQuote>, sqlx::Error> {
-    let (date_start, date_end) = date_to_utc_range(date);
-
-    let rows = sqlx::query!(
-        "SELECT timestamp, ticker, bid_price, ask_price, bid_size, ask_size
-         FROM equity_quotes
-         WHERE timestamp >= $1 AND timestamp < $2
-         ORDER BY timestamp ASC",
-        date_start,
-        date_end
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let quotes: Vec<EquityQuote> = rows
-        .into_iter()
-        .map(|row| {
-            let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
-                sqlx::Error::Decode(format!("Invalid ticker: {}", row.ticker).into())
-            })?;
-            Ok(EquityQuote::new(
-                row.timestamp,
-                ticker,
-                row.bid_price,
-                row.ask_price,
-                row.bid_size,
-                row.ask_size,
-            ))
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()?;
-
-    debug!(rows = quotes.len(), date = %date, "Queried equity quotes from PostgreSQL");
-    Ok(quotes)
-}
-
 /// Summary of rows deleted during a database purge.
 pub struct PurgeSummary {
     /// Each entry is `(table_name, rows_deleted)`.
@@ -255,7 +179,6 @@ pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
         ("equity_pairs", "opened_at", None),
         ("equity_rebalance_sessions", "triggered_at", None),
         ("equity_portfolio_snapshots", "created_at", None),
-        ("equity_quotes", "timestamp", None),
         ("equity_predictions", "timestamp", None),
         ("events", "created_at", None),
         ("model_runs", "started_at", None),
@@ -787,20 +710,6 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_empty_quotes_returns_zero() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            let pool = test_pool();
-            let result = insert_equity_quotes(&pool, &[]).await;
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), 0);
-        });
-    }
-
-    #[test]
     fn test_get_active_tickers_compiles() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -809,21 +718,6 @@ mod tests {
         runtime.block_on(async {
             let pool = test_pool();
             let result = get_active_tickers(&pool).await;
-            assert!(result.is_err());
-        });
-    }
-
-    #[test]
-    fn test_query_equity_quotes_for_date_compiles() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use chrono::NaiveDate;
-            let pool = test_pool();
-            let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-            let result = query_equity_quotes_for_date(&pool, date).await;
             assert!(result.is_err());
         });
     }

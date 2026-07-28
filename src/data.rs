@@ -4,7 +4,6 @@
 pub mod database;
 pub mod equity_bars;
 pub mod equity_details;
-pub mod equity_quotes;
 pub mod errors;
 pub mod export;
 pub mod manifest;

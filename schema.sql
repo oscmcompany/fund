@@ -25,20 +25,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_
 CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC); -- noqa: PG01
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- equity_quotes: intraday bid/ask buffer
--- Exported to S3 Parquet nightly and purged by the unified database purge handler.
-CREATE TABLE IF NOT EXISTS equity_quotes (
-    timestamp   TIMESTAMPTZ NOT NULL,
-    ticker      TEXT        NOT NULL,
-    bid_price   DOUBLE PRECISION NOT NULL,
-    ask_price   DOUBLE PRECISION NOT NULL,
-    bid_size    INTEGER     NOT NULL,
-    ask_size    INTEGER     NOT NULL
-);
-SELECT create_hypertable('equity_quotes', by_range('timestamp'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_quotes_ticker_timestamp ON equity_quotes (ticker, timestamp DESC); -- noqa: PG01
-SELECT remove_retention_policy('equity_quotes', if_exists => TRUE);
-
 -- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
 CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
     id              UUID        PRIMARY KEY,
@@ -343,11 +329,10 @@ CREATE TABLE IF NOT EXISTS equity_predictions (
 SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 
--- Market session check: every 5 minutes during market hours (14:00–20:55 UTC, weekdays).
--- 5 minutes is a conservative starting point; tighten to 1 minute if signal latency becomes an issue.
--- IMPORTANT: this interval must be >= FLUSH_INTERVAL_SECS in equity_quotes.rs (currently 5s).
--- A compile-time assertion in that file enforces the invariant — update both together.
--- Consumers (e.g., the portfolio service) listen on the 'events' channel and query equity_quotes directly.
+-- Session cron jobs: one pre-market prediction request plus a portfolio
+-- evaluation heartbeat. Consumers listen on the 'events' channel; live quotes
+-- reach the portfolio service over the in-memory broadcast channel and are
+-- never persisted, so no table mediates this path.
 DO $do$
 BEGIN
     -- Remove superseded tick jobs. market-session-check emitted a prediction

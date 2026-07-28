@@ -31,15 +31,6 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
-.print 'Loading equity_quotes...'
-DROP VIEW IF EXISTS equity_quotes;
-CREATE OR REPLACE VIEW equity_quotes AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/data/equity/quotes/**/*.parquet',
-    hive_partitioning = true
-);
-
 .print 'Loading equity_details...'
 DROP VIEW IF EXISTS equity_details;
 CREATE OR REPLACE VIEW equity_details AS
