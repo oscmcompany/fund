@@ -3,8 +3,7 @@ mod common;
 use chrono::{NaiveDate, Utc};
 use fund::data::database::{
     insert_equity_bars, query_equity_allocations, query_equity_bars_for_date, query_equity_orders,
-    query_equity_pairs, query_equity_portfolio_snapshots, query_equity_quotes_for_date,
-    query_equity_rebalance_sessions,
+    query_equity_pairs, query_equity_portfolio_snapshots, query_equity_rebalance_sessions,
 };
 use fund::data::types::{EquityBar, Ticker};
 use serial_test::serial;
@@ -188,16 +187,6 @@ async fn test_upsert_updates_existing_bar() {
         160.0,
         "Upsert should have updated close_price"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn test_query_equity_quotes_for_date_returns_empty() {
-    let pool = common::get_pg_pool().await;
-    clean_tables(&pool).await;
-    let date = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
-    let quotes = query_equity_quotes_for_date(&pool, date).await.unwrap();
-    assert!(quotes.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -41,7 +41,7 @@ use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
     EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
 };
-use crate::portfolio::alpaca::{TradableAssets, Trading};
+use crate::portfolio::alpaca::{AccountInfo, TradableAssets, Trading};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
 use crate::portfolio::database::{
@@ -206,8 +206,15 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         }));
     }
 
-    // Phase 3: load market data (needed for both exit evaluation and entry selection).
-    let historical_prices = fetch_historical_equity_prices(pool).await?;
+    // Phase 3: load market data. Needed by exit evaluation, entry selection, and
+    // the per-pass exposure measurement, so both series load unconditionally.
+    let (historical_prices, spy_prices) = tokio::join!(
+        fetch_historical_equity_prices(pool),
+        fetch_spy_equity_prices(pool)
+    );
+    let historical_prices = historical_prices?;
+    let spy_prices = spy_prices?;
+    let market_betas = compute_market_betas(&historical_prices, &spy_prices);
 
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
@@ -237,12 +244,29 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     }
 
     // Phase 5: drawdown check. Required for both snapshot persistence and entry gating.
-    let (current_equity, buying_power) = check_drawdown(
+    let account = check_drawdown(
         alpaca,
         pool,
         state.constraints().drawdown_threshold().0.value(),
     )
     .await?;
+    let current_equity = account.equity;
+    let buying_power = account.buying_power;
+
+    // Measured after exits so the figures describe the capital actually
+    // available to the entry phase that follows, not the pre-exit book.
+    let utilization = measure_capital_utilization(&account, &alpaca_positions, &market_betas);
+    info!(
+        idle_cash = format!("{:.2}", utilization.idle_cash),
+        idle_cash_percent = format!("{:.2}", utilization.idle_cash_fraction * 100.0),
+        gross_exposure = format!("{:.2}", utilization.gross_exposure),
+        net_exposure = format!("{:.2}", utilization.net_exposure),
+        margin_utilization_percent = format!("{:.2}", utilization.margin_utilization * 100.0),
+        net_beta = format!("{:.4}", utilization.net_beta),
+        beta_coverage_percent = format!("{:.2}", utilization.beta_coverage_fraction * 100.0),
+        open_positions = alpaca_positions.len(),
+        "Capital utilization measured"
+    );
 
     // Phase 6: entry evaluation — gated on predictions, regime, and vacant slots.
     let required_pairs = state.constraints().minimum_pairs().0.get() as usize;
@@ -266,6 +290,8 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
             alpaca,
             &market_session,
             &historical_prices,
+            &spy_prices,
+            &market_betas,
             &alpaca_positions,
             current_equity,
             buying_power,
@@ -424,6 +450,8 @@ async fn try_evaluate_entries(
     alpaca: &dyn Trading,
     market_session: &MarketSession,
     historical_prices: &HashMap<Ticker, Vec<f64>>,
+    spy_prices: &[f64],
+    market_betas: &HashMap<Ticker, f64>,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
     current_equity: f64,
     buying_power: f64,
@@ -443,13 +471,12 @@ async fn try_evaluate_entries(
     let predictions = predictions.to_vec();
 
     // Load remaining market data for entry selection.
-    let (spy_prices, equity_details) =
-        tokio::join!(fetch_spy_equity_prices(pool), fetch_equity_details(pool),);
-    let spy_prices = spy_prices.map_err(|error| EntrySkipReason::Other(error.into()))?;
-    let equity_details = equity_details.map_err(|error| EntrySkipReason::Other(error.into()))?;
+    let equity_details = fetch_equity_details(pool)
+        .await
+        .map_err(|error| EntrySkipReason::Other(error.into()))?;
 
     // Regime check: skip entries if trending.
-    let regime_result = classify_regime(&spy_prices);
+    let regime_result = classify_regime(spy_prices);
     let exposure_scale = regime_result.state.exposure_factor();
     if exposure_scale < 0.6 {
         info!(
@@ -491,7 +518,7 @@ async fn try_evaluate_entries(
         buying_power,
         &signals,
         historical_prices,
-        &spy_prices,
+        market_betas,
         available_capital,
         exposure_scale,
         state.candidate_pool_count(),
@@ -614,6 +641,91 @@ fn build_portfolio_snapshot(
         account_equity,
         buying_power,
         positions: position_snapshots,
+    }
+}
+
+/// Capital deployment and market exposure measured at one point in a pass.
+///
+/// Every field is a ratio or a dollar amount derived from Alpaca account state
+/// and current positions; nothing here influences a decision. It exists so the
+/// two properties this project set out to control — that capital does not sit
+/// idle, and that net beta does not drift as pairs exit at staggered times —
+/// are observable per pass rather than inferred after the fact.
+struct CapitalUtilization {
+    /// Uninvested settled cash.
+    idle_cash: f64,
+    /// Idle cash as a fraction of account equity.
+    idle_cash_fraction: f64,
+    /// Sum of absolute position market values.
+    gross_exposure: f64,
+    /// Signed sum of position market values; long minus short.
+    net_exposure: f64,
+    /// Fraction of buying power consumed, per the risk gate's own definition.
+    margin_utilization: f64,
+    /// Beta-weighted net exposure divided by account equity.
+    net_beta: f64,
+    /// Share of gross exposure whose ticker had an estimable beta.
+    ///
+    /// `net_beta` is computed only over positions with a beta, so a low
+    /// coverage figure means the reported beta describes a fraction of the
+    /// book. Without it a near-zero `net_beta` reads as neutrality when it may
+    /// only mean the exposed names were the ones that could not be estimated.
+    beta_coverage_fraction: f64,
+}
+
+/// Measures capital deployment and net market exposure for the current pass.
+///
+/// `market_betas` maps ticker to estimated beta; positions whose ticker is
+/// absent contribute to `gross_exposure` but not to `net_beta`, and lower
+/// `beta_coverage_fraction` accordingly.
+fn measure_capital_utilization(
+    account: &AccountInfo,
+    positions: &[crate::portfolio::alpaca::Position],
+    market_betas: &HashMap<Ticker, f64>,
+) -> CapitalUtilization {
+    let gross_exposure: f64 = positions
+        .iter()
+        .map(|position| position.market_value.abs())
+        .sum();
+    let net_exposure: f64 = positions.iter().map(|position| position.market_value).sum();
+
+    let mut beta_weighted_exposure = 0.0;
+    let mut covered_exposure = 0.0;
+    for position in positions {
+        let Some(ticker) = Ticker::new(&position.symbol) else {
+            continue;
+        };
+        let Some(beta) = market_betas.get(&ticker) else {
+            continue;
+        };
+        beta_weighted_exposure += position.market_value * beta;
+        covered_exposure += position.market_value.abs();
+    }
+
+    let equity = account.equity;
+    let (idle_cash_fraction, net_beta) = if equity > 0.0 {
+        (
+            account.cash_amount / equity,
+            beta_weighted_exposure / equity,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+
+    let beta_coverage_fraction = if gross_exposure > 0.0 {
+        covered_exposure / gross_exposure
+    } else {
+        1.0
+    };
+
+    CapitalUtilization {
+        idle_cash: account.cash_amount,
+        idle_cash_fraction,
+        gross_exposure,
+        net_exposure,
+        margin_utilization: risk_gate::margin_utilization(equity, account.buying_power),
+        net_beta,
+        beta_coverage_fraction,
     }
 }
 
@@ -822,22 +934,21 @@ async fn close_triggered_pairs(
     Ok(signals.len())
 }
 
-/// Fetches current account equity and checks the drawdown guard.
+/// Fetches current account state and checks the drawdown guard.
 ///
-/// Returns `(current_equity, buying_power)` when within the allowed drawdown.
-/// Errors with `DrawdownBreached` when the drop from the previous NAV exceeds
-/// the configured threshold.
+/// Returns the full `AccountInfo` when within the allowed drawdown. Errors with
+/// `DrawdownBreached` when the drop from the previous NAV exceeds the configured
+/// threshold.
 async fn check_drawdown(
     alpaca: &dyn Trading,
     pool: &sqlx::PgPool,
     threshold: f64,
-) -> Result<(f64, f64), RebalanceError> {
+) -> Result<AccountInfo, RebalanceError> {
     let account = alpaca.get_account().await.map_err(|error| {
         RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
     })?;
 
     let current_equity = account.equity;
-    let buying_power = account.buying_power;
 
     if let Some(previous_nav) = fetch_latest_portfolio_net_asset_value(pool).await? {
         let drop_fraction = if previous_nav > 0.0 {
@@ -860,7 +971,7 @@ async fn check_drawdown(
         }
     }
 
-    Ok((current_equity, buying_power))
+    Ok(account)
 }
 
 /// Persists a single submitted order record for durable tracking.
@@ -909,7 +1020,7 @@ async fn select_size_execute(
     buying_power: f64,
     signals: &[ConsolidatedSignal],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
-    spy_prices: &[f64],
+    market_betas: &HashMap<Ticker, f64>,
     capital: f64,
     exposure_scale: f64,
     candidate_pool: usize,
@@ -925,7 +1036,6 @@ async fn select_size_execute(
         "Candidate pairs ranked"
     );
 
-    let market_betas = compute_market_betas(historical_prices, spy_prices);
     let tradable_assets = resolve_tradable_assets(alpaca, tradable_assets_cache).await?;
 
     let eligible_pairs = converge_entry_set(
@@ -934,7 +1044,7 @@ async fn select_size_execute(
         market_session,
         &scored_pairs,
         &tradable_assets,
-        &market_betas,
+        market_betas,
         historical_prices,
         alpaca_positions,
         current_equity,
@@ -2054,5 +2164,130 @@ mod tests {
         let snapshot = build_portfolio_snapshot(250_000.0, 800_000.0, &[]);
         assert!((snapshot.account_equity - 250_000.0).abs() < f64::EPSILON);
         assert!((snapshot.buying_power - 800_000.0).abs() < f64::EPSILON);
+    }
+
+    // --- measure_capital_utilization tests ---
+
+    fn account(cash_amount: f64, buying_power: f64, equity: f64) -> AccountInfo {
+        AccountInfo {
+            cash_amount,
+            buying_power,
+            equity,
+        }
+    }
+
+    fn position(symbol: &str, market_value: f64) -> crate::portfolio::alpaca::Position {
+        crate::portfolio::alpaca::Position {
+            symbol: symbol.to_string(),
+            side: if market_value >= 0.0 { "long" } else { "short" }.to_string(),
+            quantity: 100.0,
+            market_value,
+            unrealized_profit_and_loss: 0.0,
+        }
+    }
+
+    fn betas(entries: &[(&str, f64)]) -> HashMap<Ticker, f64> {
+        entries
+            .iter()
+            .map(|(symbol, beta)| (Ticker::new(symbol).unwrap(), *beta))
+            .collect()
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_fully_idle_portfolio() {
+        let utilization = measure_capital_utilization(
+            &account(100_000.0, 400_000.0, 100_000.0),
+            &[],
+            &betas(&[]),
+        );
+        assert!((utilization.idle_cash - 100_000.0).abs() < f64::EPSILON);
+        assert!((utilization.idle_cash_fraction - 1.0).abs() < f64::EPSILON);
+        assert!(utilization.gross_exposure.abs() < f64::EPSILON);
+        assert!(utilization.net_exposure.abs() < f64::EPSILON);
+        assert!(utilization.margin_utilization.abs() < f64::EPSILON);
+        assert!(utilization.net_beta.abs() < f64::EPSILON);
+        // No exposure means nothing was left unmeasured.
+        assert!((utilization.beta_coverage_fraction - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_exposure_is_gross_and_net() {
+        let positions = vec![position("AAPL", 15_000.0), position("MSFT", -10_000.0)];
+        let utilization = measure_capital_utilization(
+            &account(20_000.0, 350_000.0, 100_000.0),
+            &positions,
+            &betas(&[("AAPL", 1.0), ("MSFT", 1.0)]),
+        );
+        assert!((utilization.gross_exposure - 25_000.0).abs() < f64::EPSILON);
+        assert!((utilization.net_exposure - 5_000.0).abs() < f64::EPSILON);
+        assert!((utilization.idle_cash_fraction - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_offsetting_betas_net_to_zero() {
+        // Equal notional legs with equal beta are market neutral by construction.
+        let positions = vec![position("AAPL", 10_000.0), position("MSFT", -10_000.0)];
+        let utilization = measure_capital_utilization(
+            &account(0.0, 200_000.0, 100_000.0),
+            &positions,
+            &betas(&[("AAPL", 1.2), ("MSFT", 1.2)]),
+        );
+        assert!(utilization.net_beta.abs() < 1e-12);
+        assert!((utilization.beta_coverage_fraction - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_beta_mismatch_leaves_residual() {
+        // A high-beta long against a low-beta short is dollar neutral but not
+        // beta neutral: (10_000 × 1.5 - 10_000 × 0.5) / 100_000 = 0.10.
+        let positions = vec![position("AAPL", 10_000.0), position("MSFT", -10_000.0)];
+        let utilization = measure_capital_utilization(
+            &account(0.0, 200_000.0, 100_000.0),
+            &positions,
+            &betas(&[("AAPL", 1.5), ("MSFT", 0.5)]),
+        );
+        assert!((utilization.net_beta - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_missing_beta_lowers_coverage() {
+        // MSFT has no estimable beta, so it counts toward gross exposure but not
+        // toward net beta. Reporting 0.15 without the coverage figure would imply
+        // a measured neutrality that half the book never contributed to.
+        let positions = vec![position("AAPL", 15_000.0), position("MSFT", -15_000.0)];
+        let utilization = measure_capital_utilization(
+            &account(0.0, 200_000.0, 100_000.0),
+            &positions,
+            &betas(&[("AAPL", 1.0)]),
+        );
+        assert!((utilization.net_beta - 0.15).abs() < 1e-12);
+        assert!((utilization.beta_coverage_fraction - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_zero_equity_reports_zero_ratios() {
+        // A wiped-out account must not divide by zero; margin utilization still
+        // reports fully consumed, matching the risk gate's own treatment.
+        let positions = vec![position("AAPL", 5_000.0)];
+        let utilization = measure_capital_utilization(
+            &account(0.0, 0.0, 0.0),
+            &positions,
+            &betas(&[("AAPL", 1.0)]),
+        );
+        assert!(utilization.idle_cash_fraction.abs() < f64::EPSILON);
+        assert!(utilization.net_beta.abs() < f64::EPSILON);
+        assert!((utilization.margin_utilization - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_measure_capital_utilization_margin_matches_risk_gate() {
+        // The logged figure must be the gate's figure, not a parallel definition.
+        let utilization =
+            measure_capital_utilization(&account(0.0, 200_000.0, 100_000.0), &[], &betas(&[]));
+        assert!(
+            (utilization.margin_utilization - risk_gate::margin_utilization(100_000.0, 200_000.0))
+                .abs()
+                < f64::EPSILON
+        );
     }
 }

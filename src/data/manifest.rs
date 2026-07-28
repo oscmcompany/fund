@@ -59,11 +59,7 @@ pub fn build_manifest() -> Manifest {
     Manifest {
         version: 1,
         updated_at: Utc::now(),
-        datasets: vec![
-            equity_bars_descriptor(),
-            equity_quotes_descriptor(),
-            equity_details_descriptor(),
-        ],
+        datasets: vec![equity_bars_descriptor(), equity_details_descriptor()],
     }
 }
 
@@ -105,54 +101,6 @@ fn equity_bars_descriptor() -> DatasetDescriptor {
         format: "parquet".to_string(),
         partitioning: vec!["year".to_string(), "month".to_string(), "day".to_string()],
         columns: columns_from_schema(EQUITY_BARS_COLUMNS, descriptions),
-    }
-}
-
-fn equity_quotes_descriptor() -> DatasetDescriptor {
-    DatasetDescriptor {
-        name: "equity_quotes".to_string(),
-        description: "Intraday bid/ask equity quotes".to_string(),
-        prefix: "data/equity/quotes".to_string(),
-        format: "parquet".to_string(),
-        partitioning: vec!["year".to_string(), "month".to_string(), "day".to_string()],
-        columns: vec![
-            ColumnDescriptor {
-                name: "timestamp".to_string(),
-                data_type: "Int64".to_string(),
-                nullable: false,
-                description: Some("Unix timestamp in milliseconds".to_string()),
-            },
-            ColumnDescriptor {
-                name: "ticker".to_string(),
-                data_type: "String".to_string(),
-                nullable: false,
-                description: Some("Uppercase ticker symbol".to_string()),
-            },
-            ColumnDescriptor {
-                name: "bid_price".to_string(),
-                data_type: "Float64".to_string(),
-                nullable: false,
-                description: None,
-            },
-            ColumnDescriptor {
-                name: "ask_price".to_string(),
-                data_type: "Float64".to_string(),
-                nullable: false,
-                description: None,
-            },
-            ColumnDescriptor {
-                name: "bid_size".to_string(),
-                data_type: "Int32".to_string(),
-                nullable: false,
-                description: None,
-            },
-            ColumnDescriptor {
-                name: "ask_size".to_string(),
-                data_type: "Int32".to_string(),
-                nullable: false,
-                description: None,
-            },
-        ],
     }
 }
 
@@ -217,10 +165,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_manifest_has_three_datasets() {
+    fn test_build_manifest_has_two_datasets() {
         let manifest = build_manifest();
         assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.datasets.len(), 3);
+        assert_eq!(manifest.datasets.len(), 2);
     }
 
     #[test]
@@ -253,13 +201,6 @@ mod tests {
     }
 
     #[test]
-    fn test_equity_quotes_descriptor_has_six_columns() {
-        let descriptor = equity_quotes_descriptor();
-        assert_eq!(descriptor.name, "equity_quotes");
-        assert_eq!(descriptor.columns.len(), 6);
-    }
-
-    #[test]
     fn test_equity_details_descriptor_is_csv() {
         let descriptor = equity_details_descriptor();
         assert_eq!(descriptor.format, "csv");
@@ -273,7 +214,6 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         assert!(json.contains("\"version\": 1"));
         assert!(json.contains("\"equity_bars\""));
-        assert!(json.contains("\"equity_quotes\""));
         assert!(json.contains("\"equity_details\""));
     }
 

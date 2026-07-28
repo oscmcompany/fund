@@ -6,7 +6,6 @@
 
 use crate::common::aws::date_partitioned_key;
 use crate::data::{database, state::State};
-use crate::domain::market::EquityQuote;
 use crate::domain::predictions::{EquityPrediction, ModelRun};
 use crate::domain::trading::{
     EquityAllocation, EquityOrder, EquityPair, EquityPortfolioSnapshot, EquityRebalanceSession,
@@ -19,7 +18,7 @@ use tracing::info;
 
 /// Exports all database tables to S3 Parquet.
 ///
-/// Exports equity_quotes, equity_predictions, equity_rebalance_sessions, equity_pairs,
+/// Exports equity_predictions, equity_rebalance_sessions, equity_pairs,
 /// equity_allocations, equity_orders, equity_portfolio_snapshots, model_runs, and
 /// equity_reconciliation_events. Rows are not deleted here — the unified purge handler
 /// cleans up old data after backup completes.
@@ -28,22 +27,6 @@ pub async fn export_database(state: &State, date: NaiveDate) -> Result<usize, St
         .database
         .pool()
         .ok_or_else(|| "database not connected".to_string())?;
-
-    let quotes = database::query_equity_quotes_for_date(pool, date)
-        .await
-        .map_err(|error| format!("Failed to query equity quotes: {}", error))?;
-    let quote_count = quotes.len();
-    if quote_count > 0 {
-        let mut quote_dataframe = create_equity_quote_dataframe(&quotes)?;
-        write_dataframe_to_s3(
-            state,
-            &mut quote_dataframe,
-            &date_partitioned_key("data/equity/quotes", date),
-        )
-        .await?;
-    } else {
-        info!(date = %date, "No equity quotes to export");
-    }
 
     let predictions = database::query_equity_predictions_for_date(pool, date)
         .await
@@ -151,12 +134,11 @@ pub async fn export_database(state: &State, date: NaiveDate) -> Result<usize, St
     }
 
     info!(
-        "Exported database to S3: {} quotes, {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs, {} reconciliation events",
-        quote_count, prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count, reconciliation_event_count
+        "Exported database to S3: {} predictions, {} sessions, {} pairs, {} allocations, {} orders, {} snapshots, {} model runs, {} reconciliation events",
+        prediction_count, session_count, pair_count, allocation_count, order_count, snapshot_count, model_run_count, reconciliation_event_count
     );
 
-    Ok(quote_count
-        + prediction_count
+    Ok(prediction_count
         + session_count
         + pair_count
         + allocation_count
@@ -187,18 +169,6 @@ async fn write_dataframe_to_s3(
         .map_err(|error| format!("Failed to upload to S3 {}: {}", key, error))?;
 
     Ok(())
-}
-
-fn create_equity_quote_dataframe(quotes: &[EquityQuote]) -> Result<DataFrame, String> {
-    df!(
-        "timestamp" => quotes.iter().map(|quote| quote.timestamp().timestamp_millis()).collect::<Vec<i64>>(),
-        "ticker" => quotes.iter().map(|quote| quote.ticker().as_str()).collect::<Vec<&str>>(),
-        "bid_price" => quotes.iter().map(|quote| quote.bid_price()).collect::<Vec<f64>>(),
-        "ask_price" => quotes.iter().map(|quote| quote.ask_price()).collect::<Vec<f64>>(),
-        "bid_size" => quotes.iter().map(|quote| quote.bid_size()).collect::<Vec<i32>>(),
-        "ask_size" => quotes.iter().map(|quote| quote.ask_size()).collect::<Vec<i32>>(),
-    )
-    .map_err(|error| format!("Failed to create equity quote DataFrame: {}", error))
 }
 
 fn create_equity_rebalance_session_dataframe(
@@ -362,14 +332,6 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
 
-    fn sample_quotes() -> Vec<EquityQuote> {
-        let now = Utc::now();
-        vec![
-            EquityQuote::new(now, Ticker::new("AAPL").unwrap(), 150.50, 150.55, 10, 5),
-            EquityQuote::new(now, Ticker::new("MSFT").unwrap(), 420.10, 420.20, 2, 4),
-        ]
-    }
-
     fn sample_sessions() -> Vec<EquityRebalanceSession> {
         vec![EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
@@ -441,27 +403,6 @@ mod tests {
             "50".parse().unwrap(),
             Utc::now(),
         )]
-    }
-
-    #[test]
-    fn test_create_equity_quote_dataframe_columns_and_rows() {
-        let quotes = sample_quotes();
-        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
-        assert_eq!(dataframe.height(), 2);
-        assert_eq!(dataframe.width(), 6);
-        assert!(dataframe.column("timestamp").is_ok());
-        assert!(dataframe.column("ticker").is_ok());
-        assert!(dataframe.column("bid_price").is_ok());
-        assert!(dataframe.column("ask_price").is_ok());
-        assert!(dataframe.column("bid_size").is_ok());
-        assert!(dataframe.column("ask_size").is_ok());
-    }
-
-    #[test]
-    fn test_create_equity_quote_dataframe_empty() {
-        let dataframe = create_equity_quote_dataframe(&[]).unwrap();
-        assert_eq!(dataframe.height(), 0);
-        assert_eq!(dataframe.width(), 6);
     }
 
     #[test]
@@ -699,39 +640,6 @@ mod tests {
         let dataframe = create_model_run_dataframe(&model_runs).unwrap();
         let stage_counts_series = dataframe.column("stage_counts").unwrap();
         assert_eq!(stage_counts_series.dtype(), &DataType::String);
-    }
-
-    #[test]
-    fn test_create_equity_quote_dataframe_values_are_correct() {
-        let now = chrono::Utc::now();
-        let quotes = vec![crate::domain::market::EquityQuote::new(
-            now,
-            Ticker::new("GOOG").unwrap(),
-            180.10,
-            180.20,
-            3,
-            7,
-        )];
-        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
-        assert_eq!(dataframe.height(), 1);
-        // Confirm bid and ask price columns carry Float64 values
-        assert_eq!(
-            dataframe.column("bid_price").unwrap().dtype(),
-            &DataType::Float64
-        );
-        assert_eq!(
-            dataframe.column("ask_price").unwrap().dtype(),
-            &DataType::Float64
-        );
-        // bid_size and ask_size are Int32
-        assert_eq!(
-            dataframe.column("bid_size").unwrap().dtype(),
-            &DataType::Int32
-        );
-        assert_eq!(
-            dataframe.column("ask_size").unwrap().dtype(),
-            &DataType::Int32
-        );
     }
 
     #[test]
@@ -1015,26 +923,6 @@ mod tests {
             assert!(result.is_err());
             assert!(result.unwrap_err().contains("database not connected"));
         });
-    }
-
-    #[test]
-    fn test_create_equity_quote_dataframe_timestamp_is_int64() {
-        let quotes = sample_quotes();
-        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
-        assert_eq!(
-            dataframe.column("timestamp").unwrap().dtype(),
-            &DataType::Int64
-        );
-    }
-
-    #[test]
-    fn test_create_equity_quote_dataframe_ticker_is_string() {
-        let quotes = sample_quotes();
-        let dataframe = create_equity_quote_dataframe(&quotes).unwrap();
-        assert_eq!(
-            dataframe.column("ticker").unwrap().dtype(),
-            &DataType::String
-        );
     }
 
     #[test]

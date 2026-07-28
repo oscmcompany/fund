@@ -301,51 +301,6 @@ pub async fn fetch_equity_details(pool: &PgPool) -> Result<HashMap<Ticker, Strin
     Ok(details)
 }
 
-/// Fetches the latest mid-price for each requested ticker from `equity_quotes`.
-///
-/// Mid-price is computed as `(bid_price + ask_price) / 2`. Returns a map
-/// containing only tickers for which a recent quote exists. Tickers without a
-/// quote are absent from the result.
-///
-/// Returns an empty map immediately when `tickers` is empty.
-pub async fn fetch_live_quote_mid_prices(
-    pool: &PgPool,
-    tickers: &[Ticker],
-) -> Result<HashMap<Ticker, f64>, sqlx::Error> {
-    if tickers.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let ticker_strings: Vec<String> = tickers.iter().map(Ticker::to_string).collect();
-
-    let rows = sqlx::query!(
-        r#"SELECT DISTINCT ON (ticker) ticker, (bid_price + ask_price) / 2.0 AS "mid_price!"
-           FROM equity_quotes
-           WHERE ticker = ANY($1::text[])
-           ORDER BY ticker, timestamp DESC"#,
-        &ticker_strings as &[String]
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut prices: HashMap<Ticker, f64> = HashMap::new();
-    for row in rows {
-        let ticker = Ticker::new(&row.ticker).ok_or_else(|| {
-            sqlx::Error::Decode(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid ticker from database: {}", row.ticker),
-            )))
-        })?;
-        prices.insert(ticker, row.mid_price);
-    }
-
-    info!(
-        tickers = prices.len(),
-        "Live quote mid prices fetched from PostgreSQL"
-    );
-    Ok(prices)
-}
-
 /// Fetches all currently open equity pair positions, ordered by `opened_at` ascending.
 ///
 /// Includes `z_score` and `hedge_ratio` from the pair opening so the per-pair
@@ -974,27 +929,6 @@ mod tests {
         );
         assert!((cloned.entry_z_score() - open_pair.entry_z_score()).abs() < f64::EPSILON);
         assert!((cloned.hedge_ratio() - open_pair.hedge_ratio()).abs() < f64::EPSILON);
-    }
-
-    // --- fetch_live_quote_mid_prices empty-tickers fast path ---
-
-    #[test]
-    fn test_fetch_live_quote_mid_prices_empty_tickers_returns_empty() {
-        make_runtime().block_on(async {
-            let result = fetch_live_quote_mid_prices(&lazy_pool(), &[]).await;
-            assert!(result.is_ok());
-            assert!(result.unwrap().is_empty());
-        });
-    }
-
-    #[test]
-    fn test_fetch_live_quote_mid_prices_compiles_with_ticker_slice() {
-        make_runtime().block_on(async {
-            let tickers = vec![Ticker::new("AAPL").unwrap()];
-            assert!(fetch_live_quote_mid_prices(&lazy_pool(), &tickers)
-                .await
-                .is_err());
-        });
     }
 
     // --- compile / connection-error coverage for all DB functions ---

@@ -4,7 +4,7 @@ use chrono::NaiveDate;
 use polars::prelude::*;
 use tracing::{debug, info};
 
-pub use crate::domain::market::{EquityBar, EquityDetail, EquityQuote, Ticker};
+pub use crate::domain::market::{EquityBar, EquityDetail, Ticker};
 
 /// A validated US market trading date (weekday and not a known holiday).
 ///
