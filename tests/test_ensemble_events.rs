@@ -1,6 +1,9 @@
 //! Integration tests for the ensemble service's event-system SQL: consumer
 //! offsets, event catch-up lookup, model_runs lineage upsert, and prediction
-//! inserts — run against a real Postgres via testcontainers.
+//! inserts.
+//!
+//! Run against the devenv-managed Postgres, which persists between runs. Tests
+//! must therefore be idempotent rather than assuming empty tables.
 
 mod common;
 
@@ -15,7 +18,12 @@ use uuid::Uuid;
 #[serial]
 async fn test_consumer_offset_round_trip() {
     let pool = common::get_pg_pool().await;
-    let consumer = "ensemble-offset-test";
+    // Unique per run. The test database persists between runs now that it is
+    // the devenv Postgres rather than a fresh container, so a fixed consumer
+    // name carried its offset forward and the "starts at zero" assertion only
+    // held the first time.
+    let consumer = format!("ensemble-offset-test-{}", Uuid::new_v4());
+    let consumer = consumer.as_str();
 
     assert_eq!(get_consumer_offset(&pool, consumer).await.unwrap(), 0);
 
@@ -127,8 +135,11 @@ async fn test_upsert_model_run_inserts_then_updates() {
 async fn test_insert_predictions_writes_rows() {
     let pool = common::get_pg_pool().await;
 
+    // Five characters: `Ticker` allows a 1-5 letter base, so the former
+    // eight-character "PREDTEST" fixture was rejected by the decoder. The file
+    // was never executed, so the invalid fixture went unnoticed.
     let predictions = vec![serde_json::json!({
-        "ticker": "PREDTEST",
+        "ticker": "PREDT",
         "timestamp": 1_735_689_600_000_i64,
         "quantile_10": -0.01,
         "quantile_50": 0.0,
@@ -141,7 +152,7 @@ async fn test_insert_predictions_writes_rows() {
     assert_eq!(rows, 1);
 
     let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM equity_predictions WHERE ticker = 'PREDTEST'")
+        sqlx::query_scalar("SELECT count(*) FROM equity_predictions WHERE ticker = 'PREDT'")
             .fetch_one(&pool)
             .await
             .unwrap();

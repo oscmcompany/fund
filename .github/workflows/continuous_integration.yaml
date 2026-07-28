@@ -54,6 +54,26 @@ jobs:
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
           tasks run checks:base
+      # The integration test targets run against a real Postgres. Only the
+      # database is started, not the fund services: those would connect to
+      # Alpaca and are not what is under test here.
+      - name: Start PostgreSQL
+        if: steps.changes.outputs.rust == 'true'
+        run: >-
+          devenv --secretspec-provider env --secretspec-profile development
+          up postgres --detach
+      - name: Wait for PostgreSQL
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          for attempt in $(seq 1 60); do
+            if pg_isready -h localhost -p 5432 -q; then
+              echo "PostgreSQL accepting connections after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "PostgreSQL did not accept connections within 60s"
+          exit 1
       - name: Run Rust checks
         if: steps.changes.outputs.rust == 'true'
         env:

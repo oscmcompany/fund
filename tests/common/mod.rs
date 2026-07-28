@@ -7,7 +7,6 @@ use sqlx::PgPool;
 use std::{sync::OnceLock, time::Duration as StdDuration};
 use testcontainers::{runners::AsyncRunner, ContainerAsync};
 use testcontainers_modules::localstack::LocalStack;
-use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -213,79 +212,134 @@ pub fn test_bucket_name() -> String {
 
 const SCHEMA_SQL: &str = include_str!("../../schema.sql");
 
-static PG_POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const_new();
-static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new();
+/// Database the integration tests own outright.
+///
+/// Deliberately not the development database: these tests truncate tables, and
+/// pointing them at `fund` would destroy local data on every run.
+const TEST_DATABASE: &str = "fund_test";
 
-/// Strips lines that require pg_cron or TimescaleDB (unavailable in vanilla Postgres).
+/// Marks that the test database exists and carries the schema.
+///
+/// Stores `()` rather than the pool on purpose. A `PgPool` is bound to the
+/// tokio runtime that created it, and every `#[tokio::test]` builds its own
+/// runtime; caching a pool here meant the second test to run inherited a handle
+/// whose background reaper had already died with the first test's runtime, and
+/// every acquire from it failed with `PoolTimedOut`. Caching only the setup
+/// keeps the expensive work once-per-binary while leaving each test to own a
+/// pool tied to its own runtime.
+static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Connections per test pool.
+///
+/// Small because each test builds its own pool and the server allows 100 in
+/// total; the tests are `#[serial]` and none needs concurrency within a pool.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 4;
+
+/// Returns the base connection URL, minus the database name.
+///
+/// Honours `TEST_DATABASE_URL_BASE` so CI can point at a different host without
+/// editing this file; defaults to the devenv-managed local Postgres.
+fn database_url_base() -> String {
+    std::env::var("TEST_DATABASE_URL_BASE")
+        .unwrap_or_else(|_| "postgresql://localhost:5432".to_string())
+}
+
+/// Strips the parts of `schema.sql` that cannot be applied to a second database.
+///
+/// Only pg_cron is removed, and not because it is unavailable in general: the
+/// extension is restricted by `cron.database_name` to a single database, so
+/// `CREATE EXTENSION` fails anywhere else. That covers the extension itself, the
+/// `DO` blocks that schedule jobs, and `cron.schedule_in_timezone`.
+///
+/// TimescaleDB is deliberately *not* stripped. It was, back when these tests ran
+/// against a vanilla Postgres container, which meant every assertion ran against
+/// a schema with no hypertables and no retention policies — measurably not the
+/// schema being shipped. The devenv Postgres carries the extension, so the real
+/// one applies.
 fn filter_schema_for_test(schema: &str) -> String {
-    let mut inside_cron_block = false;
+    let mut inside_do_block = false;
+    let mut inside_cron_function = false;
     schema
         .lines()
         .filter(|line| {
             let trimmed = line.trim().to_lowercase();
+
             if trimmed.starts_with("do $do$") {
-                inside_cron_block = true;
+                inside_do_block = true;
             }
-            if inside_cron_block {
+            if inside_do_block {
                 if trimmed.starts_with("$do$;") {
-                    inside_cron_block = false;
+                    inside_do_block = false;
                 }
                 return false;
             }
+
+            if trimmed.starts_with("create or replace function cron.") {
+                inside_cron_function = true;
+            }
+            if inside_cron_function {
+                if trimmed == "$$;" {
+                    inside_cron_function = false;
+                }
+                return false;
+            }
+
             !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("create extension if not exists timescaledb")
                 && !trimmed.starts_with("select cron.schedule")
-                && !trimmed.starts_with("select create_hypertable")
-                && !trimmed.starts_with("select add_retention_policy")
-                && !trimmed.starts_with("select remove_retention_policy")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Returns a connection pool to a shared testcontainers Postgres instance.
+/// Returns a connection pool to the shared test database.
 ///
-/// The first call starts the container, applies the filtered schema, and leaks
-/// the container handle so it lives for the entire test-binary process. Subsequent
-/// calls return a clone of the same pool, avoiding redundant connections.
+/// Creates the database if absent and applies the schema on first use, then
+/// hands back clones of the same pool. Uses the devenv-managed Postgres rather
+/// than a container, so the suite needs no Docker daemon and runs against a
+/// server carrying the same extensions as production.
 pub async fn get_pg_pool() -> PgPool {
-    PG_POOL
+    let base = database_url_base();
+
+    SCHEMA_READY
         .get_or_init(|| async {
-            let container = Postgres::default()
-                .start()
+            // Connect to the maintenance database to create the test one. This
+            // cannot run through a pool aimed at a database that may not exist.
+            let admin = PgPool::connect(&format!("{base}/postgres"))
                 .await
-                .expect("Failed to start PostgreSQL container — is Docker running?");
+                .expect("Failed to connect to Postgres — is `devenv up` running?");
 
-            let host = container.get_host().await.unwrap();
-            let port = container.get_host_port_ipv4(5432).await.unwrap();
-            let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
+            let exists: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
+                    .bind(TEST_DATABASE)
+                    .fetch_optional(&admin)
+                    .await
+                    .expect("Failed to query for the test database");
+            if exists.is_none() {
+                // CREATE DATABASE cannot be parameterised or run in a
+                // transaction, and TEST_DATABASE is a compile-time constant.
+                sqlx::raw_sql(&format!("CREATE DATABASE {TEST_DATABASE}"))
+                    .execute(&admin)
+                    .await
+                    .expect("Failed to create the test database");
+            }
+            admin.close().await;
 
-            let connect_deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
-            let pool = loop {
-                match PgPool::connect(&url).await {
-                    Ok(pool) => break pool,
-                    Err(error) => {
-                        if tokio::time::Instant::now() >= connect_deadline {
-                            panic!("Failed to connect to PostgreSQL within timeout: {error}");
-                        }
-                        tokio::time::sleep(StdDuration::from_millis(250)).await;
-                    }
-                }
-            };
-
-            let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
-            sqlx::raw_sql(&filtered_schema)
-                .execute(&pool)
+            let setup = PgPool::connect(&format!("{base}/{TEST_DATABASE}"))
                 .await
-                .unwrap();
-
-            let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
-            let _ = PG_CONTAINER.set(leaked);
-
-            pool
+                .expect("Failed to connect to the test database");
+            sqlx::raw_sql(&filter_schema_for_test(SCHEMA_SQL))
+                .execute(&setup)
+                .await
+                .expect("Failed to apply schema.sql to the test database");
+            setup.close().await;
         })
+        .await;
+
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
+        .connect(&format!("{base}/{TEST_DATABASE}"))
         .await
-        .clone()
+        .expect("Failed to connect to the test database")
 }
 
 /// Truncates all portfolio-related tables in dependency order.

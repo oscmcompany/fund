@@ -278,7 +278,19 @@ in {
     set -euo pipefail
     echo "Running Rust tests"
 
+    # Integration test targets are named individually rather than passing
+    # --tests. Every target listed here runs against the devenv-managed
+    # Postgres and needs no container runtime. test_backfill is deliberately
+    # absent: it still starts LocalStack through testcontainers and so requires
+    # a Docker daemon, which neither this shell nor CI provides.
+    #
+    # Before this, target selection was --lib --bins, which silently excluded
+    # every file under tests/ — around 1,300 lines that compiled under clippy
+    # but whose assertions had never been executed.
     TEST_ARGS="--lib --bins --all-features"
+    TEST_ARGS="$TEST_ARGS --test test_data --test test_database"
+    TEST_ARGS="$TEST_ARGS --test test_ensemble_events --test test_errors"
+    TEST_ARGS="$TEST_ARGS --test test_handlers --test test_stream"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)

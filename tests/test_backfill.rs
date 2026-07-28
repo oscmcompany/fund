@@ -1,3 +1,13 @@
+//! S3 backfill integration test.
+//!
+//! NOT in the default `checks:rust:test` target list. It reaches S3 through
+//! LocalStack via testcontainers, so it needs a Docker daemon, which neither the
+//! devenv shell nor CI provides. Run it explicitly with
+//! `cargo test --test test_backfill --all-features` on a machine with Docker.
+//!
+//! Migrating this to a devenv-managed MinIO service would let it join the
+//! default run and retire the last testcontainers dependency.
+
 mod common;
 
 use chrono::NaiveDate;
