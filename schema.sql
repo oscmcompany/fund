@@ -329,10 +329,10 @@ CREATE TABLE IF NOT EXISTS equity_predictions (
 SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
 SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 
--- Session cron jobs: one pre-market prediction request plus a portfolio
--- evaluation heartbeat. Consumers listen on the 'events' channel; live quotes
--- reach the portfolio service over the in-memory broadcast channel and are
--- never persisted, so no table mediates this path.
+-- Session cron jobs: one pre-market prediction request plus a session-start
+-- trigger. Consumers listen on the 'events' channel; live quotes reach the
+-- portfolio service over the in-memory broadcast channel and are never
+-- persisted, so no table mediates this path.
 DO $do$
 BEGIN
     -- Remove superseded tick jobs. market-session-check emitted a prediction
@@ -362,20 +362,32 @@ BEGIN
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:05'$$
     );
 
-    -- Portfolio evaluation heartbeat: every five minutes through the session.
-    -- The portfolio consumer checks the real session before acting, so this
-    -- window may safely span a regular close even on early-close days. Live
-    -- quote threshold crossings emit the same event, making this a recovery
-    -- path rather than the sole driver.
+    -- Retire the five-minute evaluation heartbeat. It ran a full rebalance pass
+    -- every five minutes whether or not anything had changed: up to 78 passes a
+    -- session, each re-ranking the candidate reservoir and re-pricing every open
+    -- leg to usually conclude that nothing should happen. Intraday work is now
+    -- driven by the live-quote evaluator, which emits
+    -- portfolio_evaluation_requested only when a spread actually crosses a close
+    -- threshold, and the session is opened and closed by the two jobs below.
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-evaluation-requested') THEN
         PERFORM cron.unschedule('portfolio-evaluation-requested');
     END IF;
+
+    -- Session start: weekdays at 09:25 Eastern, five minutes ahead of a regular
+    -- open. The portfolio consumer confirms against Alpaca's clock that the
+    -- market actually trades today, so a holiday costs one no-op event; the
+    -- schedule itself only needs to exclude weekends. Fires in UTC hours 13-14
+    -- to cover both EDT and EST, gated on the actual Eastern time so DST needs
+    -- no schema re-apply.
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'trading-session-started') THEN
+        PERFORM cron.unschedule('trading-session-started');
+    END IF;
     PERFORM cron.schedule(
-        'portfolio-evaluation-requested',
-        '*/5 13-20 * * 1-5',
-        $$SELECT emit_event('portfolio_evaluation_requested', '{"reason": "heartbeat"}'::jsonb)
-          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:00'$$
+        'trading-session-started',
+        '25 13,14 * * 1-5',
+        $$SELECT emit_event('trading_session_started', '{"reason": "scheduled_open"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:25'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:30'$$
     );
 END;
 $do$;
@@ -421,8 +433,8 @@ $$;
 -- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
 -- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
 -- to re-apply the schema after a DST transition.
--- This is the fail-safe path only. The portfolio consumer derives the real close from Alpaca on every
--- evaluation pass and requests liquidation once it is within the lead time, which pulls liquidation
+-- This is the fail-safe path only. On trading_session_started the portfolio consumer reads the real
+-- close from Alpaca and arms a one-shot timer for 15 minutes before it, which pulls liquidation
 -- forward on early-close days when this fixed 15:45 schedule would fire hours after the market shut.
 -- This job still fires unconditionally so an unreachable Alpaca clock cannot leave positions open
 -- overnight; liquidation is idempotent, so both paths firing is harmless.
