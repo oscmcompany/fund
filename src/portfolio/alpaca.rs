@@ -13,6 +13,7 @@ use tracing::info;
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::common::market_hours::MarketSession;
+use crate::domain::market::{EquityQuote, Ticker};
 
 /// Base URL for paper trading (sandbox environment).
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets";
@@ -28,6 +29,14 @@ const HEADER_KEY_ID: &str = "APCA-API-KEY-ID";
 
 /// Header name for the Alpaca API secret key.
 const HEADER_SECRET_KEY: &str = "APCA-API-SECRET-KEY";
+
+/// Symbols requested per snapshot call.
+///
+/// The endpoint imposes no documented symbol ceiling and was measured accepting
+/// 2,000 symbols in a 9,424-character URL. The cap here is not the API's limit
+/// but a bound on request-line length, which intermediaries do restrict, and it
+/// keeps a single failed request from losing the whole universe.
+const SNAPSHOT_SYMBOLS_PER_REQUEST: usize = 1_000;
 
 /// Account information returned by the Alpaca account endpoint.
 ///
@@ -71,12 +80,40 @@ pub struct Position {
 }
 
 /// Latest quote snapshot for a single symbol from the Alpaca data API.
+///
+/// Carries the raw two-sided book rather than a precomputed mid so callers can
+/// apply [`UsableQuote`] and a staleness window themselves. Returning only a mid
+/// discarded the information needed to tell a tradeable book from a book
+/// hundreds of basis points wide, and a quote posted a second ago from one
+/// posted hours earlier — both of which the snapshot reports identically.
 #[derive(Debug, Clone)]
 pub struct LatestQuote {
     /// Ticker symbol.
     pub symbol: String,
-    /// Mid price computed as `(bid + ask) / 2`.
-    pub mid_price: f64,
+    /// Best bid price.
+    pub bid_price: f64,
+    /// Best ask price.
+    pub ask_price: f64,
+    /// Size quoted at the bid.
+    pub bid_size: i32,
+    /// Size quoted at the ask.
+    pub ask_size: i32,
+    /// Exchange timestamp of the quote.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl LatestQuote {
+    /// Converts to the domain quote type, returning `None` for an invalid ticker.
+    pub fn to_equity_quote(&self) -> Option<EquityQuote> {
+        Some(EquityQuote::new(
+            self.observed_at,
+            Ticker::new(&self.symbol)?,
+            self.bid_price,
+            self.ask_price,
+            self.bid_size,
+            self.ask_size,
+        ))
+    }
 }
 
 /// The fill information for a submitted order.
@@ -450,8 +487,20 @@ impl TradingClient {
 
         let mut tradable = std::collections::HashSet::new();
         let mut shortable = std::collections::HashSet::new();
+        let mut inactive_rejected: usize = 0;
 
         for asset in assets {
+            // Checked here as well as in the query string. The `status=active`
+            // parameter above already filters server-side, so this rejects
+            // nothing today — it exists so that a change to the URL cannot
+            // silently admit delisted or suspended symbols into the universe.
+            if asset.status.as_deref() != Some("active") {
+                inactive_rejected += 1;
+                continue;
+            }
+            // `fractionable` is required, not incidental: beta-neutral sizing
+            // solves for fractional weights on the long leg, so a symbol that
+            // only trades in whole shares cannot express the resulting position.
             if asset.tradable.unwrap_or(false) && asset.fractionable.unwrap_or(false) {
                 tradable.insert(asset.symbol.clone());
                 if asset.shortable.unwrap_or(false) && asset.easy_to_borrow.unwrap_or(false) {
@@ -463,6 +512,7 @@ impl TradingClient {
         info!(
             tradable = tradable.len(),
             shortable = shortable.len(),
+            inactive_rejected,
             "Tradable asset universe fetched"
         );
 
@@ -596,8 +646,15 @@ impl TradingClient {
 
     /// Fetches latest quote snapshots for the given symbols from the Alpaca data API.
     ///
-    /// Returns a list of mid prices `(bid + ask) / 2`. Symbols without
-    /// a valid quote are omitted from the result.
+    /// Symbols are requested in chunks of [`SNAPSHOT_SYMBOLS_PER_REQUEST`] and
+    /// the results concatenated, so a caller may pass the whole filtered
+    /// universe without splitting it. No book validation happens here: the raw
+    /// two-sided quote is returned and callers gate it through
+    /// [`UsableQuote`], which is the same gate the streamed path uses.
+    ///
+    /// Symbols the API returns without a usable `latestQuote` object are
+    /// omitted rather than defaulted, because a missing side is indistinguishable
+    /// from a zero one after the fact.
     pub async fn fetch_latest_quotes(
         &self,
         symbols: &[String],
@@ -606,6 +663,25 @@ impl TradingClient {
             return Ok(Vec::new());
         }
 
+        let mut quotes: Vec<LatestQuote> = Vec::new();
+        for chunk in symbols.chunks(SNAPSHOT_SYMBOLS_PER_REQUEST) {
+            quotes.extend(self.fetch_latest_quotes_chunk(chunk).await?);
+        }
+
+        info!(
+            requested = symbols.len(),
+            returned = quotes.len(),
+            requests = symbols.len().div_ceil(SNAPSHOT_SYMBOLS_PER_REQUEST),
+            "Latest quotes fetched from Alpaca data API"
+        );
+        Ok(quotes)
+    }
+
+    /// Fetches one chunk of symbols, small enough to fit a single request URL.
+    async fn fetch_latest_quotes_chunk(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError> {
         let symbols_param = symbols.join(",");
         let url = format!(
             "{}/v2/stocks/snapshots?symbols={}&feed=iex",
@@ -630,28 +706,22 @@ impl TradingClient {
                 ClientError::Parse(format!("Failed to parse snapshots response: {error}"))
             })?;
 
-        let quotes: Vec<LatestQuote> = snapshots
+        Ok(snapshots
             .into_iter()
             .filter_map(|(symbol, snapshot)| {
                 let quote = snapshot.latest_quote?;
-                let bid = quote.bp?;
-                let ask = quote.ap?;
-                if bid <= 0.0 || ask <= 0.0 {
-                    return None;
-                }
                 Some(LatestQuote {
                     symbol,
-                    mid_price: (bid + ask) / 2.0,
+                    bid_price: quote.bp?,
+                    ask_price: quote.ap?,
+                    // A quote reporting a price but no size is treated as
+                    // zero size, which the book-quality gate then rejects.
+                    bid_size: quote.bs.unwrap_or(0),
+                    ask_size: quote.ask_size.unwrap_or(0),
+                    observed_at: quote.t?,
                 })
             })
-            .collect();
-
-        info!(
-            requested = symbols.len(),
-            returned = quotes.len(),
-            "Latest quotes fetched from Alpaca data API"
-        );
-        Ok(quotes)
+            .collect())
     }
 }
 
@@ -769,6 +839,7 @@ struct OrderResponse {
 #[derive(Deserialize)]
 struct AssetResponse {
     symbol: String,
+    status: Option<String>,
     tradable: Option<bool>,
     fractionable: Option<bool>,
     shortable: Option<bool>,
@@ -796,10 +867,21 @@ struct SnapshotResponse {
     latest_quote: Option<SnapshotQuote>,
 }
 
+/// The `latestQuote` object from a snapshot response.
+///
+/// Field names are Alpaca's and are not renamed: `bp`/`ap` are bid and ask
+/// price, `bs`/`as` their sizes, and `t` the exchange timestamp. The timestamp
+/// and sizes were previously discarded, which left the REST path unable to tell
+/// a quote posted a second ago from one posted at the open, and unable to
+/// distinguish a tight book from a tight book quoted for five shares.
 #[derive(Deserialize)]
 struct SnapshotQuote {
     bp: Option<f64>,
     ap: Option<f64>,
+    bs: Option<i32>,
+    #[serde(rename = "as")]
+    ask_size: Option<i32>,
+    t: Option<DateTime<Utc>>,
 }
 
 /// Test-only mock implementation of the [`Trading`] trait.
@@ -1131,12 +1213,12 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"[
-                {"symbol": "AAPL", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "MSFT", "tradable": true,  "fractionable": true,  "shortable": false, "easy_to_borrow": true},
-                {"symbol": "GOOG", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": false},
-                {"symbol": "NVDA", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "AMZN", "tradable": true,  "fractionable": false, "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "META", "tradable": false, "fractionable": true,  "shortable": true,  "easy_to_borrow": true}
+                {"symbol": "AAPL", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "MSFT", "status": "active", "tradable": true,  "fractionable": true,  "shortable": false, "easy_to_borrow": true},
+                {"symbol": "GOOG", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": false},
+                {"symbol": "NVDA", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "AMZN", "status": "active", "tradable": true,  "fractionable": false, "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "META", "status": "active", "tradable": false, "fractionable": true,  "shortable": true,  "easy_to_borrow": true}
             ]"#,
             )
             .create_async()
@@ -1163,6 +1245,36 @@ mod tests {
 
         assert_eq!(assets.tradable_count(), 4);
         assert_eq!(assets.shortable_count(), 2);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_tradable_assets_rejects_non_active_status() {
+        // The query string already filters server-side, so this can only fire
+        // if that parameter is changed or dropped. It is the guard that keeps a
+        // delisted or suspended symbol out of the universe when it does.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/assets?status=active&asset_class=us_equity")
+            .with_status(200)
+            .with_body(
+                r#"[
+                {"symbol": "AAPL", "status": "active",   "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true},
+                {"symbol": "DEAD", "status": "inactive", "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true},
+                {"symbol": "NONE",                       "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true}
+            ]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let assets = client.fetch_tradable_assets().await.unwrap();
+
+        assert!(assets.is_tradable("AAPL"));
+        assert!(!assets.is_tradable("DEAD"));
+        // A missing status is treated as not active rather than assumed good.
+        assert!(!assets.is_tradable("NONE"));
+        assert_eq!(assets.tradable_count(), 1);
         mock.assert_async().await;
     }
 
@@ -1380,8 +1492,10 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"{
-                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20}},
-                "MSFT": {"latestQuote": {"bp": 420.00, "ap": 420.40}}
+                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 300, "as": 400,
+                                          "t": "2026-07-28T18:13:05.263989222Z"}},
+                "MSFT": {"latestQuote": {"bp": 420.00, "ap": 420.40, "bs": 100, "as": 200,
+                                          "t": "2026-07-28T18:13:04.100000000Z"}}
             }"#,
             )
             .create_async()
@@ -1393,10 +1507,102 @@ mod tests {
 
         assert_eq!(quotes.len(), 2);
         quotes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+
         assert_eq!(quotes[0].symbol, "AAPL");
-        assert!((quotes[0].mid_price - 150.10).abs() < 1e-6);
+        assert!((quotes[0].bid_price - 150.00).abs() < 1e-6);
+        assert!((quotes[0].ask_price - 150.20).abs() < 1e-6);
+        assert_eq!(quotes[0].bid_size, 300);
+        assert_eq!(quotes[0].ask_size, 400);
+
         assert_eq!(quotes[1].symbol, "MSFT");
-        assert!((quotes[1].mid_price - 420.20).abs() < 1e-6);
+        assert!((quotes[1].bid_price - 420.00).abs() < 1e-6);
+        assert_eq!(quotes[1].ask_size, 200);
+
+        // Nanosecond precision must survive deserialization: the timestamp is
+        // what the staleness window is measured against.
+        assert!(quotes[0].observed_at > quotes[1].observed_at);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_converts_to_domain_quote() {
+        // The REST path must produce a quote the shared book-quality gate can
+        // read, so both pricing paths accept and reject identically.
+        let latest = LatestQuote {
+            symbol: "AAPL".to_string(),
+            bid_price: 150.00,
+            ask_price: 150.20,
+            bid_size: 300,
+            ask_size: 400,
+            observed_at: Utc::now(),
+        };
+        let quote = latest.to_equity_quote().expect("valid ticker");
+        assert_eq!(quote.ticker().as_str(), "AAPL");
+        assert_eq!(quote.bid_size(), 300);
+
+        let usable = crate::domain::market::UsableQuote::new(
+            &quote,
+            crate::domain::market::BookQualityLimits::default(),
+        )
+        .expect("tight, round-lot book is usable");
+        assert!((usable.mid_price() - 150.10).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_skips_quote_without_timestamp() {
+        // A quote with no exchange timestamp cannot be aged, and an unaged
+        // quote is exactly what the staleness window exists to exclude.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes(&["AAPL".to_string()])
+            .await
+            .unwrap();
+
+        assert!(quotes.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_defaults_missing_sizes_to_zero() {
+        // Zero size is then rejected by the book-quality gate rather than being
+        // silently treated as unlimited depth.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20,
+                                              "t": "2026-07-28T18:13:05Z"}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes(&["AAPL".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].bid_size, 0);
+        assert_eq!(quotes[0].ask_size, 0);
+
+        let quote = quotes[0].to_equity_quote().expect("valid ticker");
+        assert!(crate::domain::market::UsableQuote::new(
+            &quote,
+            crate::domain::market::BookQualityLimits::default()
+        )
+        .is_none());
         mock.assert_async().await;
     }
 
@@ -1437,7 +1643,8 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"{
-                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20}},
+                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100,
+                                          "t": "2026-07-28T18:13:05Z"}},
                 "MSFT": {"latestQuote": null}
             }"#,
             )
@@ -1450,7 +1657,7 @@ mod tests {
 
         assert_eq!(quotes.len(), 1);
         assert_eq!(quotes[0].symbol, "AAPL");
-        assert!((quotes[0].mid_price - 150.10).abs() < 1e-6);
+        assert!((quotes[0].bid_price - 150.00).abs() < 1e-6);
         mock.assert_async().await;
     }
 

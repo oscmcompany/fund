@@ -19,6 +19,22 @@ pub const PREDICTIONS_STALENESS_WINDOW_HOURS: i64 = 20;
 /// on smaller names is expected rather than exceptional.
 pub const QUOTES_STALENESS_WINDOW_SECONDS: i64 = 60;
 
+/// Named staleness window for quotes pulled from the REST snapshot endpoint.
+///
+/// Deliberately wider than [`QUOTES_STALENESS_WINDOW_SECONDS`], and the reason
+/// is not that REST data is more trustworthy — it is the same IEX feed. A symbol
+/// quiet on the stream is quiet in the snapshot for exactly the same reason, so
+/// reusing the sixty-second window would reject the snapshot in precisely the
+/// cases it was added to cover, leaving it useful only when the subscription
+/// dropped a symbol that is otherwise quoting normally.
+///
+/// Five minutes was chosen against a measured sample of the traded universe:
+/// 64% of symbols had quoted within sixty seconds, 80% within five minutes, and
+/// 86% within fifteen. The marginal six points between five and fifteen minutes
+/// come from names whose books are too wide to price against anyway, so the
+/// book-quality gate rejects them regardless of how recent the quote is.
+pub const REST_QUOTES_STALENESS_WINDOW_SECONDS: i64 = 300;
+
 /// Error returned when constructing a `StalenessWindow` with a non-positive duration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZeroDurationError;
@@ -54,6 +70,12 @@ impl StalenessWindow {
     pub fn quotes() -> Self {
         StalenessWindow::new(Duration::seconds(QUOTES_STALENESS_WINDOW_SECONDS))
             .expect("QUOTES_STALENESS_WINDOW_SECONDS must be positive")
+    }
+
+    /// Returns the staleness window for REST snapshot quotes (5 minutes).
+    pub fn rest_quotes() -> Self {
+        StalenessWindow::new(Duration::seconds(REST_QUOTES_STALENESS_WINDOW_SECONDS))
+            .expect("REST_QUOTES_STALENESS_WINDOW_SECONDS must be positive")
     }
 }
 

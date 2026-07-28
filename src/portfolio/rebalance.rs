@@ -34,7 +34,8 @@ use uuid::Uuid;
 
 use crate::common::events::{emit_event, EventType};
 use crate::common::market_hours::MarketSession;
-use crate::domain::market::{PairID, Ticker};
+use crate::domain::freshness::StalenessWindow;
+use crate::domain::market::{BookQualityLimits, PairID, Ticker, UsableQuote};
 use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::trading::{
@@ -1149,8 +1150,16 @@ async fn resolve_tradable_assets(
 
 /// Fetches entry prices for `tickers`, falling back to the latest daily close.
 ///
-/// One batched REST call per invocation. A quote failure degrades to close
-/// prices rather than aborting the pass.
+/// Quotes are gated through [`UsableQuote`] and the REST staleness window, so a
+/// book too wide or too old to price against is discarded rather than averaged
+/// into a midpoint. Rejections are counted and logged: they are the measurement
+/// that tells us whether the book-quality bound is set sensibly.
+///
+/// The close-price fallback remains for now so that sizing always has a number
+/// to work with. It is the weak point — a symbol rejected for a 3,000 basis
+/// point book still gets sized off its prior close and can still be entered.
+/// Closing that hole belongs to the candidate filter, which excludes such
+/// symbols before they are ever scored, not to this function.
 async fn fetch_entry_prices(
     alpaca: &dyn Trading,
     tickers: &[Ticker],
@@ -1165,10 +1174,37 @@ async fn fetch_entry_prices(
             Vec::new()
         });
 
-    let mut entry_prices: HashMap<Ticker, f64> = latest_quotes
-        .into_iter()
-        .filter_map(|quote| Ticker::new(&quote.symbol).map(|ticker| (ticker, quote.mid_price)))
-        .collect();
+    let book_limits = BookQualityLimits::default();
+    let staleness_window = StalenessWindow::rest_quotes();
+    let now = Utc::now();
+    let returned = latest_quotes.len();
+    let mut rejected_book: usize = 0;
+    let mut rejected_stale: usize = 0;
+
+    let mut entry_prices: HashMap<Ticker, f64> = HashMap::new();
+    for latest in latest_quotes {
+        let Some(quote) = latest.to_equity_quote() else {
+            continue;
+        };
+        let Some(usable) = UsableQuote::new(&quote, book_limits) else {
+            rejected_book += 1;
+            continue;
+        };
+        if now.signed_duration_since(usable.observed_at()) > staleness_window.0 {
+            rejected_stale += 1;
+            continue;
+        }
+        entry_prices.insert(quote.ticker().clone(), usable.mid_price());
+    }
+
+    info!(
+        requested = tickers.len(),
+        returned,
+        accepted = entry_prices.len(),
+        rejected_book,
+        rejected_stale,
+        "Entry quote pricing"
+    );
 
     for ticker in tickers {
         if !entry_prices.contains_key(ticker) {
