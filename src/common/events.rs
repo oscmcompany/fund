@@ -69,13 +69,27 @@ pub enum EventType {
     /// inference: equity prediction run encountered an error.
     EquityPredictionsErrored,
 
-    // --- Portfolio rebalance ---
-    /// pg_cron periodic trigger: evaluate open positions for exits and idle
-    /// capital for entries.
+    // --- Trading session ---
+    /// pg_cron trigger: the trading session is about to begin.
     ///
-    /// Also emitted by the live-quote evaluator when a spread crosses a close
-    /// threshold, so the cron acts as a heartbeat and recovery path rather than
-    /// the sole driver.
+    /// Emitted once, shortly before the regular open. Starts the session: the
+    /// portfolio consumer reconciles against the broker, confirms the market
+    /// actually trades today, builds the initial portfolio, and arms the
+    /// liquidation timer from the real session close.
+    ///
+    /// This replaced a five-minute evaluation heartbeat that ran a full
+    /// rebalance whether or not anything had changed. Intraday work is driven by
+    /// the live-quote evaluator instead, which emits
+    /// [`EventType::PortfolioEvaluationRequested`] only when a spread actually
+    /// crosses a close threshold.
+    TradingSessionStarted,
+
+    // --- Portfolio rebalance ---
+    /// Evaluate open positions for exits and idle capital for entries.
+    ///
+    /// Emitted by the live-quote evaluator on a threshold crossing. No longer
+    /// emitted on a timer: a pass that finds nothing changed is pure cost, and
+    /// the events that genuinely need one now emit it directly.
     PortfolioEvaluationRequested,
     /// portfolio: rebalance has started.
     PortfolioRebalanceStarted,
@@ -123,6 +137,7 @@ impl EventType {
             Self::EquityPredictionsStarted => "equity_predictions_started",
             Self::EquityPredictionsCompleted => "equity_predictions_completed",
             Self::EquityPredictionsErrored => "equity_predictions_errored",
+            Self::TradingSessionStarted => "trading_session_started",
             Self::PortfolioEvaluationRequested => "portfolio_evaluation_requested",
             Self::PortfolioRebalanceStarted => "portfolio_rebalance_started",
             Self::PortfolioRebalanceCompleted => "portfolio_rebalance_completed",
@@ -158,6 +173,7 @@ impl EventType {
             "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
             "equity_predictions_completed" => Some(Self::EquityPredictionsCompleted),
             "equity_predictions_errored" => Some(Self::EquityPredictionsErrored),
+            "trading_session_started" => Some(Self::TradingSessionStarted),
             "portfolio_evaluation_requested" => Some(Self::PortfolioEvaluationRequested),
             "portfolio_rebalance_started" => Some(Self::PortfolioRebalanceStarted),
             "portfolio_rebalance_completed" => Some(Self::PortfolioRebalanceCompleted),
@@ -191,6 +207,12 @@ pub const CONSUMER_PORTFOLIO: &str = "portfolio";
 /// Tracks the last processed `portfolio_liquidation_requested` event separately
 /// so the predictions offset cannot mask a missed end-of-day liquidation.
 pub const CONSUMER_PORTFOLIO_LIQUIDATION: &str = "portfolio-liquidation";
+
+/// Consumer name for the portfolio session-start consumer.
+/// Tracks the last processed `trading_session_started` event so a process that
+/// was down at the open can still build the portfolio when it comes back, for
+/// as long as the session is still trading.
+pub const CONSUMER_PORTFOLIO_SESSION: &str = "portfolio-session";
 
 /// Consumer name for the data equity bars sync consumer.
 pub const CONSUMER_DATA_EQUITY_BARS_SYNC: &str = "data-equity-bars-sync";
@@ -367,6 +389,7 @@ mod tests {
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
             EventType::EquityPredictionsErrored,
+            EventType::TradingSessionStarted,
             EventType::PortfolioEvaluationRequested,
             EventType::PortfolioRebalanceStarted,
             EventType::PortfolioRebalanceCompleted,
@@ -557,6 +580,7 @@ mod tests {
                 "database_purge_completed",
             ),
             (EventType::DatabasePurgeErrored, "database_purge_errored"),
+            (EventType::TradingSessionStarted, "trading_session_started"),
             (
                 EventType::PortfolioEvaluationRequested,
                 "portfolio_evaluation_requested",
@@ -641,6 +665,7 @@ mod tests {
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
             EventType::EquityPredictionsErrored,
+            EventType::TradingSessionStarted,
             EventType::PortfolioEvaluationRequested,
             EventType::PortfolioRebalanceStarted,
             EventType::PortfolioRebalanceCompleted,
@@ -670,6 +695,10 @@ mod tests {
         assert_ne!(
             EventType::PortfolioEvaluationRequested,
             EventType::EquityPredictionsStarted
+        );
+        assert_ne!(
+            EventType::TradingSessionStarted,
+            EventType::PortfolioEvaluationRequested
         );
     }
 

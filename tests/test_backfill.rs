@@ -1,3 +1,10 @@
+//! S3 backfill integration test.
+//!
+//! Runs against the devenv-managed SeaweedFS process, which serves an
+//! S3-compatible API. Start it with
+//! `devenv --profile test up object-store --detach`; `TEST_S3_ENDPOINT`
+//! overrides the address if it is running elsewhere.
+
 mod common;
 
 use chrono::NaiveDate;
@@ -47,8 +54,9 @@ async fn create_state(massive_base: String, s3_endpoint: &str) -> State {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn test_seed_start_after_end_returns_error() {
-    let (endpoint, _s3) = setup_test_bucket().await;
-    let state = create_state("http://127.0.0.1:1".to_string(), &endpoint).await;
+    // No bucket setup: the date range is rejected before any S3 call, so this
+    // test needs no object store at all. It used to start one regardless.
+    let state = create_state("http://127.0.0.1:1".to_string(), "http://127.0.0.1:1").await;
 
     let result = seed(
         &state,

@@ -397,6 +397,160 @@ impl EquityQuote {
     }
 }
 
+/// Widest book, as a fraction of the midpoint, whose mid is treated as a price.
+///
+/// Derived from trade economics rather than from the observed distribution. A
+/// pair crosses the spread on both legs entering and both legs exiting, so the
+/// round-trip cost is roughly the sum of the two legs' spreads: at 25 basis
+/// points a leg that is about 50 basis points a round turn, which the strategy's
+/// edge has to clear before anything is left. Measured liquid names quote 1–15
+/// basis points, so this leaves generous room while excluding the several
+/// hundred to several thousand basis point books seen on thin symbols.
+pub const MAXIMUM_RELATIVE_SPREAD: f64 = 0.0025;
+
+/// Smallest quoted size, per side, accepted as real liquidity.
+///
+/// One round lot. This excludes odd-lot-only books rather than expressing a view
+/// on depth: the observed sample quoted exactly 100 on both sides often enough
+/// that a higher floor would cut aggressively for reasons no measurement here
+/// supports. Raising it should follow a study of the size distribution across
+/// the traded universe, not intuition.
+pub const MINIMUM_QUOTE_SIZE: i32 = 100;
+
+/// Bounds a two-sided book must satisfy before its midpoint is treated as a price.
+///
+/// Both limits exist because a quote can be arithmetically valid and still
+/// economically meaningless. The IEX feed carries a few percent of consolidated
+/// volume, so a thinly quoted name routinely shows a book hundreds of basis
+/// points wide whose midpoint sits nowhere near any price the symbol traded at.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BookQualityLimits {
+    maximum_relative_spread: f64,
+    minimum_size: i32,
+}
+
+/// Error returned when constructing [`BookQualityLimits`] with unusable bounds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvalidBookQualityLimits;
+
+impl std::fmt::Display for InvalidBookQualityLimits {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Maximum relative spread must be positive and finite, and minimum size non-negative."
+        )
+    }
+}
+
+impl std::error::Error for InvalidBookQualityLimits {}
+
+impl BookQualityLimits {
+    /// Creates limits, rejecting a non-positive or non-finite spread bound.
+    pub fn new(
+        maximum_relative_spread: f64,
+        minimum_size: i32,
+    ) -> Result<Self, InvalidBookQualityLimits> {
+        if !maximum_relative_spread.is_finite() || maximum_relative_spread <= 0.0 {
+            return Err(InvalidBookQualityLimits);
+        }
+        if minimum_size < 0 {
+            return Err(InvalidBookQualityLimits);
+        }
+        Ok(Self {
+            maximum_relative_spread,
+            minimum_size,
+        })
+    }
+
+    pub fn maximum_relative_spread(&self) -> f64 {
+        self.maximum_relative_spread
+    }
+
+    pub fn minimum_size(&self) -> i32 {
+        self.minimum_size
+    }
+}
+
+impl Default for BookQualityLimits {
+    fn default() -> Self {
+        Self::new(MAXIMUM_RELATIVE_SPREAD, MINIMUM_QUOTE_SIZE)
+            .expect("MAXIMUM_RELATIVE_SPREAD and MINIMUM_QUOTE_SIZE must be valid bounds")
+    }
+}
+
+/// An [`EquityQuote`] proven to carry a book worth pricing against.
+///
+/// Holding one is proof that every check in [`UsableQuote::new`] passed, so
+/// [`UsableQuote::mid_price`] is a price rather than a candidate for
+/// re-validation downstream. Both the streamed and the REST-snapshot paths
+/// construct through here, which is what keeps them from drifting apart: an
+/// earlier arrangement validated `bid > 0 && ask > 0` on one path and
+/// additionally rejected crossed books on the other, so the same quote could be
+/// usable or not depending on which code reached it first.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UsableQuote {
+    mid_price: f64,
+    relative_spread: f64,
+    observed_at: DateTime<Utc>,
+}
+
+impl UsableQuote {
+    /// Returns the validated quote, or `None` when the book fails any check.
+    ///
+    /// Each side is validated independently before the midpoint is formed.
+    /// Checking only the average would accept a one-sided book such as
+    /// `bid = 0, ask = 200`, whose mean is a plausible-looking 100 but is really
+    /// half a real price — and it would then feed every spread that leg appears
+    /// in. A crossed book (`bid > ask`) is rejected for a related reason: it is
+    /// a stale frame or a feed artifact, and its midpoint is not a price
+    /// anything traded at.
+    ///
+    /// Size is checked because a tight spread quoted for a handful of shares is
+    /// not liquidity a real position can cross.
+    pub fn new(quote: &EquityQuote, limits: BookQualityLimits) -> Option<Self> {
+        let bid_price = quote.bid_price();
+        let ask_price = quote.ask_price();
+
+        if !bid_price.is_finite() || bid_price <= 0.0 {
+            return None;
+        }
+        if !ask_price.is_finite() || ask_price <= 0.0 {
+            return None;
+        }
+        if bid_price > ask_price {
+            return None;
+        }
+        if quote.bid_size() < limits.minimum_size() || quote.ask_size() < limits.minimum_size() {
+            return None;
+        }
+
+        let mid_price = (bid_price + ask_price) / 2.0;
+        let relative_spread = (ask_price - bid_price) / mid_price;
+        if relative_spread > limits.maximum_relative_spread() {
+            return None;
+        }
+
+        Some(Self {
+            mid_price,
+            relative_spread,
+            observed_at: quote.timestamp(),
+        })
+    }
+
+    pub fn mid_price(&self) -> f64 {
+        self.mid_price
+    }
+
+    /// Spread as a fraction of the midpoint; multiply by 10,000 for basis points.
+    pub fn relative_spread(&self) -> f64 {
+        self.relative_spread
+    }
+
+    pub fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+}
+
 /// Ticker metadata record seeded from the S3 details CSV.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityDetail {
@@ -935,5 +1089,129 @@ mod tests {
         let mut map: HashMap<PairID, i32> = HashMap::new();
         map.insert(key.clone(), 42);
         assert_eq!(map.get(&key), Some(&42));
+    }
+
+    // --- BookQualityLimits / UsableQuote ---
+
+    fn book(bid: f64, ask: f64, bid_size: i32, ask_size: i32) -> EquityQuote {
+        EquityQuote::new(
+            Utc::now(),
+            Ticker::new("AAPL").expect("valid ticker"),
+            bid,
+            ask,
+            bid_size,
+            ask_size,
+        )
+    }
+
+    /// Limits that admit any width, isolating the price and size rules.
+    fn any_width() -> BookQualityLimits {
+        BookQualityLimits::new(f64::MAX, 0).expect("valid limits")
+    }
+
+    #[test]
+    fn test_book_quality_limits_reject_non_positive_spread() {
+        assert_eq!(
+            BookQualityLimits::new(0.0, 100).unwrap_err(),
+            InvalidBookQualityLimits
+        );
+        assert_eq!(
+            BookQualityLimits::new(-0.01, 100).unwrap_err(),
+            InvalidBookQualityLimits
+        );
+        assert_eq!(
+            BookQualityLimits::new(f64::NAN, 100).unwrap_err(),
+            InvalidBookQualityLimits
+        );
+    }
+
+    #[test]
+    fn test_book_quality_limits_reject_negative_size() {
+        assert_eq!(
+            BookQualityLimits::new(0.0025, -1).unwrap_err(),
+            InvalidBookQualityLimits
+        );
+    }
+
+    #[test]
+    fn test_book_quality_limits_default_matches_constants() {
+        let limits = BookQualityLimits::default();
+        assert_eq!(limits.maximum_relative_spread(), MAXIMUM_RELATIVE_SPREAD);
+        assert_eq!(limits.minimum_size(), MINIMUM_QUOTE_SIZE);
+    }
+
+    #[test]
+    fn test_usable_quote_accepts_tight_book() {
+        let quote = UsableQuote::new(&book(180.0, 180.2, 100, 100), BookQualityLimits::default())
+            .expect("tight book is usable");
+        assert!((quote.mid_price() - 180.1).abs() < 1e-9);
+        // (180.2 - 180.0) / 180.1 = 11.1 basis points.
+        assert!((quote.relative_spread() * 10_000.0 - 11.105).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_usable_quote_accepts_touching_book() {
+        // Bid equal to ask is valid, not crossed, and has zero spread.
+        let quote = UsableQuote::new(&book(180.0, 180.0, 100, 100), BookQualityLimits::default())
+            .expect("touching book is usable");
+        assert_eq!(quote.mid_price(), 180.0);
+        assert_eq!(quote.relative_spread(), 0.0);
+    }
+
+    #[test]
+    fn test_usable_quote_validates_each_side_independently() {
+        // A one-sided book averages to a plausible-looking positive number.
+        // Validating only the midpoint would accept 100.0 for a symbol with no
+        // bid, and that value would feed every spread the leg appears in.
+        assert!(UsableQuote::new(&book(0.0, 200.0, 100, 100), any_width()).is_none());
+        assert!(UsableQuote::new(&book(200.0, 0.0, 100, 100), any_width()).is_none());
+        assert!(UsableQuote::new(&book(-1.0, 200.0, 100, 100), any_width()).is_none());
+        assert!(UsableQuote::new(&book(f64::NAN, 180.0, 100, 100), any_width()).is_none());
+        assert!(UsableQuote::new(&book(180.0, f64::INFINITY, 100, 100), any_width()).is_none());
+    }
+
+    #[test]
+    fn test_usable_quote_rejects_crossed_book() {
+        assert!(UsableQuote::new(&book(181.0, 180.0, 100, 100), any_width()).is_none());
+    }
+
+    #[test]
+    fn test_usable_quote_rejects_book_wider_than_limit() {
+        // 180.0 / 200.0 spans 1,053 basis points against a 25 basis point bound.
+        assert!(
+            UsableQuote::new(&book(180.0, 200.0, 100, 100), BookQualityLimits::default()).is_none()
+        );
+    }
+
+    #[test]
+    fn test_usable_quote_accepts_book_exactly_at_spread_limit() {
+        // Boundary is inclusive: rejection requires exceeding the limit.
+        let limits = BookQualityLimits::new(0.01, 0).expect("valid limits");
+        let quote = UsableQuote::new(&book(99.5, 100.5, 0, 0), limits)
+            .expect("a book exactly at the limit is usable");
+        assert!((quote.relative_spread() - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_usable_quote_rejects_undersized_side() {
+        let limits = BookQualityLimits::new(1.0, 100).expect("valid limits");
+        assert!(UsableQuote::new(&book(180.0, 180.2, 1, 100), limits).is_none());
+        assert!(UsableQuote::new(&book(180.0, 180.2, 100, 1), limits).is_none());
+        assert!(UsableQuote::new(&book(180.0, 180.2, 100, 100), limits).is_some());
+    }
+
+    #[test]
+    fn test_usable_quote_preserves_observation_time() {
+        let observed_at = Utc::now();
+        let quote = EquityQuote::new(
+            observed_at,
+            Ticker::new("AAPL").expect("valid ticker"),
+            180.0,
+            180.2,
+            100,
+            100,
+        );
+        let usable = UsableQuote::new(&quote, BookQualityLimits::default()).expect("usable");
+        assert_eq!(usable.observed_at(), observed_at);
     }
 }

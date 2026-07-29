@@ -1,12 +1,23 @@
 //! US equity market session helpers.
 //!
-//! Provides timezone-aware checks for whether the current time falls within
-//! the regular US equity trading session (09:30–16:00 Eastern) or the wider
-//! quote-stream window used by `data` to capture quotes around open
-//! and close.
+//! Provides timezone-aware checks for whether the current time falls within the
+//! regular US equity trading session or the wider quote-stream window that the
+//! portfolio's quote producer and live exit trigger run inside.
+//!
+//! Two families of check live here, and the difference matters. [`MarketSession`]
+//! is built from Alpaca's reported close, so it handles early closes and market
+//! holidays without a local calendar. The free functions below assume a regular
+//! 09:30–16:00 session and only exclude weekends; they exist as a fallback for
+//! paths that must keep working when the clock endpoint is unreachable.
 
 use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::US::Eastern;
+
+/// Minutes the quote-stream window extends either side of the trading session.
+///
+/// Opening early means quotes are already flowing when the first evaluation pass
+/// runs; closing late covers fills landing just after the bell.
+pub const QUOTE_STREAM_LEAD_MINUTES: i64 = 5;
 
 /// A regular US equity trading session, anchored on Alpaca's reported close time.
 ///
@@ -55,9 +66,39 @@ impl MarketSession {
         self.is_open
     }
 
+    /// Returns the session open instant, derived as 09:30 Eastern on the close's date.
+    pub fn open(&self) -> DateTime<Utc> {
+        self.open
+    }
+
     /// Returns the session close instant.
     pub fn close(&self) -> DateTime<Utc> {
         self.close
+    }
+
+    /// Returns `true` when `now` falls inside the quote-stream window for this session.
+    ///
+    /// The window brackets the real session by [`QUOTE_STREAM_LEAD_MINUTES`] on
+    /// each side, so quotes are already flowing when the first evaluation runs
+    /// and late fills are still covered after the close. Because both edges come
+    /// from Alpaca's reported close, an early close pulls the whole window
+    /// forward and a holiday never opens one at all — neither of which a fixed
+    /// wall-clock window can express.
+    pub fn contains_quote_stream_window(&self, now: DateTime<Utc>) -> bool {
+        let lead = Duration::minutes(QUOTE_STREAM_LEAD_MINUTES);
+        now >= self.open - lead && now < self.close + lead
+    }
+
+    /// Returns the duration from `now` until this session's quote-stream window
+    /// opens, or `Duration::zero()` when it is already open or has passed.
+    pub fn time_until_quote_stream_window(&self, now: DateTime<Utc>) -> Duration {
+        let window_open = self.open - Duration::minutes(QUOTE_STREAM_LEAD_MINUTES);
+        let remaining = window_open.signed_duration_since(now);
+        if remaining < Duration::zero() {
+            Duration::zero()
+        } else {
+            remaining
+        }
     }
 
     /// Returns `true` when this session closes on the same Eastern date as `now`.
@@ -126,9 +167,10 @@ pub fn is_within_trading_session() -> bool {
 /// Returns `true` when `now` falls within the quote-stream window
 /// (09:25–16:05 Eastern, weekdays only). DST-safe.
 ///
-/// The window opens 5 minutes before market open so quotes are already flowing
-/// when the first rebalance cycle runs, and closes 5 minutes after market close
-/// to capture any late fills and the liquidation event.
+/// Assumes a regular close and knows nothing about market holidays, so on a
+/// holiday it reports a window that will carry no quotes. Callers that can reach
+/// Alpaca's clock should prefer [`MarketSession::contains_quote_stream_window`];
+/// this remains the fallback for when that fetch fails.
 pub fn is_within_quote_stream_window_at(now: DateTime<Utc>) -> bool {
     is_weekday_minutes_in_range(now, 9 * 60 + 25, 16 * 60 + 5)
 }
@@ -246,6 +288,53 @@ mod tests {
         assert!(session.contains(utc("2024-07-15T19:59:00Z")));
         assert!(!session.contains(utc("2024-07-15T20:00:00Z")));
         assert!(!session.contains(utc("2024-07-15T13:29:00Z")));
+    }
+
+    #[test]
+    fn test_session_open_is_derived_at_nine_thirty_eastern() {
+        // 20:00 UTC = 16:00 EDT, so the open derives to 13:30 UTC.
+        let session = MarketSession::new(true, utc("2024-07-15T20:00:00Z")).unwrap();
+        assert_eq!(session.open(), utc("2024-07-15T13:30:00Z"));
+
+        // In December the same 09:30 Eastern is 14:30 UTC.
+        let winter = MarketSession::new(true, utc("2024-12-16T21:00:00Z")).unwrap();
+        assert_eq!(winter.open(), utc("2024-12-16T14:30:00Z"));
+    }
+
+    #[test]
+    fn test_quote_stream_window_brackets_the_session() {
+        let session = MarketSession::new(true, utc("2024-07-15T20:00:00Z")).unwrap();
+
+        // Five minutes before the open, and one minute before that.
+        assert!(session.contains_quote_stream_window(utc("2024-07-15T13:25:00Z")));
+        assert!(!session.contains_quote_stream_window(utc("2024-07-15T13:24:00Z")));
+
+        // Five minutes past the close is the exclusive edge.
+        assert!(session.contains_quote_stream_window(utc("2024-07-15T20:04:59Z")));
+        assert!(!session.contains_quote_stream_window(utc("2024-07-15T20:05:00Z")));
+    }
+
+    #[test]
+    fn test_quote_stream_window_shifts_with_an_early_close() {
+        // 17:00 UTC = 13:00 EDT. The window must end at 13:05 Eastern, not 16:05.
+        let session = MarketSession::new(true, utc("2024-07-03T17:00:00Z")).unwrap();
+        assert!(session.contains_quote_stream_window(utc("2024-07-03T17:04:00Z")));
+        assert!(!session.contains_quote_stream_window(utc("2024-07-03T17:06:00Z")));
+    }
+
+    #[test]
+    fn test_time_until_quote_stream_window_saturates_at_zero() {
+        let session = MarketSession::new(false, utc("2024-07-15T20:00:00Z")).unwrap();
+        // 12:00 UTC = 08:00 EDT: 85 minutes until the 09:25 window open.
+        assert_eq!(
+            session.time_until_quote_stream_window(utc("2024-07-15T12:00:00Z")),
+            Duration::minutes(85)
+        );
+        // Already inside the session: the window opened long ago.
+        assert_eq!(
+            session.time_until_quote_stream_window(utc("2024-07-15T15:00:00Z")),
+            Duration::zero()
+        );
     }
 
     #[test]

@@ -169,7 +169,11 @@ fn test_equity_bar_dataframe_parquet_roundtrip() {
     let cursor = Cursor::new(buffer);
     let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
 
-    assert_eq!(deserialized_df.width(), 10);
+    // Nine columns, not ten: `inserted_at` is deliberately excluded so the S3
+    // parquet matches the equity_bars_schema pandera contract. Including it
+    // made backfilled files ten wide and broke the tide reader's per-day
+    // concat. This assertion still said ten because the file was never run.
+    assert_eq!(deserialized_df.width(), 9);
     assert_eq!(deserialized_df.height(), 1);
 
     assert!(deserialized_df.column("ticker").is_ok());
@@ -205,6 +209,6 @@ fn test_parquet_empty_dataframe_roundtrip() {
     let cursor = Cursor::new(buffer);
     let deserialized_df = ParquetReader::new(cursor).finish().unwrap();
 
-    assert_eq!(deserialized_df.width(), 10);
+    assert_eq!(deserialized_df.width(), 9);
     assert_eq!(deserialized_df.height(), 0);
 }

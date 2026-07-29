@@ -9,10 +9,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::common::market_hours::MarketSession;
+use crate::domain::market::{EquityQuote, Ticker};
 
 /// Base URL for paper trading (sandbox environment).
 const PAPER_BASE_URL: &str = "https://paper-api.alpaca.markets";
@@ -28,6 +29,18 @@ const HEADER_KEY_ID: &str = "APCA-API-KEY-ID";
 
 /// Header name for the Alpaca API secret key.
 const HEADER_SECRET_KEY: &str = "APCA-API-SECRET-KEY";
+
+/// Symbols requested per snapshot call.
+///
+/// The endpoint imposes no documented symbol ceiling and was measured accepting
+/// 2,000 symbols in a 9,424-character URL. The cap here is not the API's limit
+/// but a bound on request-line length, which intermediaries do restrict.
+///
+/// Chunking also limits the blast radius of a single failed request, but only
+/// because [`TradingClient::fetch_latest_quotes`] keeps the chunks that
+/// succeeded. Propagating the first error instead would have made a smaller cap
+/// strictly worse, by giving one failure more chunks to take down with it.
+const SNAPSHOT_SYMBOLS_PER_REQUEST: usize = 1_000;
 
 /// Account information returned by the Alpaca account endpoint.
 ///
@@ -71,12 +84,41 @@ pub struct Position {
 }
 
 /// Latest quote snapshot for a single symbol from the Alpaca data API.
+///
+/// Carries the raw two-sided book rather than a precomputed mid so callers can
+/// apply [`crate::domain::market::UsableQuote`] and a staleness window
+/// themselves. Returning only a mid discarded the information needed to tell a
+/// tradeable book from a book hundreds of basis points wide, and a quote posted
+/// a second ago from one posted hours earlier — both of which the snapshot
+/// reports identically.
 #[derive(Debug, Clone)]
 pub struct LatestQuote {
     /// Ticker symbol.
     pub symbol: String,
-    /// Mid price computed as `(bid + ask) / 2`.
-    pub mid_price: f64,
+    /// Best bid price.
+    pub bid_price: f64,
+    /// Best ask price.
+    pub ask_price: f64,
+    /// Size quoted at the bid.
+    pub bid_size: i32,
+    /// Size quoted at the ask.
+    pub ask_size: i32,
+    /// Exchange timestamp of the quote.
+    pub observed_at: DateTime<Utc>,
+}
+
+impl LatestQuote {
+    /// Converts to the domain quote type, returning `None` for an invalid ticker.
+    pub fn to_equity_quote(&self) -> Option<EquityQuote> {
+        Some(EquityQuote::new(
+            self.observed_at,
+            Ticker::new(&self.symbol)?,
+            self.bid_price,
+            self.ask_price,
+            self.bid_size,
+            self.ask_size,
+        ))
+    }
 }
 
 /// The fill information for a submitted order.
@@ -450,8 +492,20 @@ impl TradingClient {
 
         let mut tradable = std::collections::HashSet::new();
         let mut shortable = std::collections::HashSet::new();
+        let mut inactive_rejected: usize = 0;
 
         for asset in assets {
+            // Checked here as well as in the query string. The `status=active`
+            // parameter above already filters server-side, so this rejects
+            // nothing today — it exists so that a change to the URL cannot
+            // silently admit delisted or suspended symbols into the universe.
+            if asset.status.as_deref() != Some("active") {
+                inactive_rejected += 1;
+                continue;
+            }
+            // `fractionable` is required, not incidental: beta-neutral sizing
+            // solves for fractional weights on the long leg, so a symbol that
+            // only trades in whole shares cannot express the resulting position.
             if asset.tradable.unwrap_or(false) && asset.fractionable.unwrap_or(false) {
                 tradable.insert(asset.symbol.clone());
                 if asset.shortable.unwrap_or(false) && asset.easy_to_borrow.unwrap_or(false) {
@@ -463,6 +517,7 @@ impl TradingClient {
         info!(
             tradable = tradable.len(),
             shortable = shortable.len(),
+            inactive_rejected,
             "Tradable asset universe fetched"
         );
 
@@ -596,16 +651,84 @@ impl TradingClient {
 
     /// Fetches latest quote snapshots for the given symbols from the Alpaca data API.
     ///
-    /// Returns a list of mid prices `(bid + ask) / 2`. Symbols without
-    /// a valid quote are omitted from the result.
+    /// Symbols are requested in bounded chunks and
+    /// the results concatenated, so a caller may pass the whole filtered
+    /// universe without splitting it. No book validation happens here: the raw
+    /// two-sided quote is returned and callers gate it through
+    /// [`crate::domain::market::UsableQuote`], the same gate the streamed path
+    /// uses.
+    ///
+    /// Symbols the API returns without a usable `latestQuote` object are
+    /// omitted rather than defaulted, because a missing side is indistinguishable
+    /// from a zero one after the fact.
     pub async fn fetch_latest_quotes(
         &self,
         symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError> {
+        self.fetch_latest_quotes_over_chunks(symbols, SNAPSHOT_SYMBOLS_PER_REQUEST)
+            .await
+    }
+
+    /// Fetches `symbols` in chunks of `chunk_size`.
+    ///
+    /// Split out so the partial-failure behaviour is testable without building
+    /// a symbol list large enough to span the production chunk size.
+    async fn fetch_latest_quotes_over_chunks(
+        &self,
+        symbols: &[String],
+        chunk_size: usize,
     ) -> Result<Vec<LatestQuote>, ClientError> {
         if symbols.is_empty() {
             return Ok(Vec::new());
         }
 
+        let mut quotes: Vec<LatestQuote> = Vec::new();
+        let mut failed_chunks: usize = 0;
+        let mut last_error: Option<ClientError> = None;
+        let mut requests: usize = 0;
+
+        for chunk in symbols.chunks(chunk_size) {
+            requests += 1;
+            match self.fetch_latest_quotes_chunk(chunk).await {
+                Ok(chunk_quotes) => quotes.extend(chunk_quotes),
+                Err(error) => {
+                    // One bad request must not discard the chunks that
+                    // succeeded. Partial pricing narrows the entry set and
+                    // holds the exits it cannot price, both of which beat
+                    // pricing nothing at all.
+                    warn!(
+                        error = %error,
+                        symbols = chunk.len(),
+                        "Snapshot chunk failed; its symbols stay unpriced"
+                    );
+                    failed_chunks += 1;
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        // Only a total failure is an error. Reporting one keeps the caller's
+        // own warning meaningful for the common single-chunk case, which would
+        // otherwise become unreachable and take that log line with it.
+        if failed_chunks == requests {
+            return Err(last_error.expect("a failed chunk records its error"));
+        }
+
+        info!(
+            requested = symbols.len(),
+            returned = quotes.len(),
+            requests,
+            failed_chunks,
+            "Latest quotes fetched from Alpaca data API"
+        );
+        Ok(quotes)
+    }
+
+    /// Fetches one chunk of symbols, small enough to fit a single request URL.
+    async fn fetch_latest_quotes_chunk(
+        &self,
+        symbols: &[String],
+    ) -> Result<Vec<LatestQuote>, ClientError> {
         let symbols_param = symbols.join(",");
         let url = format!(
             "{}/v2/stocks/snapshots?symbols={}&feed=iex",
@@ -630,28 +753,22 @@ impl TradingClient {
                 ClientError::Parse(format!("Failed to parse snapshots response: {error}"))
             })?;
 
-        let quotes: Vec<LatestQuote> = snapshots
+        Ok(snapshots
             .into_iter()
             .filter_map(|(symbol, snapshot)| {
                 let quote = snapshot.latest_quote?;
-                let bid = quote.bp?;
-                let ask = quote.ap?;
-                if bid <= 0.0 || ask <= 0.0 {
-                    return None;
-                }
                 Some(LatestQuote {
                     symbol,
-                    mid_price: (bid + ask) / 2.0,
+                    bid_price: quote.bid_price?,
+                    ask_price: quote.ask_price?,
+                    // A quote reporting a price but no size is treated as
+                    // zero size, which the book-quality gate then rejects.
+                    bid_size: quote.bid_size.unwrap_or(0),
+                    ask_size: quote.ask_size.unwrap_or(0),
+                    observed_at: quote.timestamp?,
                 })
             })
-            .collect();
-
-        info!(
-            requested = symbols.len(),
-            returned = quotes.len(),
-            "Latest quotes fetched from Alpaca data API"
-        );
-        Ok(quotes)
+            .collect())
     }
 }
 
@@ -713,6 +830,21 @@ pub struct TradableAssets {
 }
 
 impl TradableAssets {
+    /// Builds a universe directly from two symbol sets.
+    ///
+    /// Test-only: production values come from [`TradingClient::fetch_tradable_assets`],
+    /// which derives both sets from the broker's own asset flags.
+    #[cfg(test)]
+    pub fn from_sets(
+        tradable: std::collections::HashSet<String>,
+        shortable: std::collections::HashSet<String>,
+    ) -> Self {
+        Self {
+            tradable,
+            shortable,
+        }
+    }
+
     /// Returns `true` when the symbol can be bought (long leg eligibility).
     pub fn is_tradable(&self, symbol: &str) -> bool {
         self.tradable.contains(symbol)
@@ -769,6 +901,7 @@ struct OrderResponse {
 #[derive(Deserialize)]
 struct AssetResponse {
     symbol: String,
+    status: Option<String>,
     tradable: Option<bool>,
     fractionable: Option<bool>,
     shortable: Option<bool>,
@@ -796,10 +929,29 @@ struct SnapshotResponse {
     latest_quote: Option<SnapshotQuote>,
 }
 
+/// The `latestQuote` object from a snapshot response.
+///
+/// Alpaca's wire names are pinned in the `serde` attributes, which is what the
+/// external contract actually is; the Rust fields spell them out. This matches
+/// how `stream::alpaca_equities::StreamMessage` deserializes the identical
+/// fields from the WebSocket feed, so the two representations of an Alpaca
+/// quote read the same way.
+///
+/// The timestamp and sizes were previously discarded, which left the REST path
+/// unable to tell a quote posted a second ago from one posted at the open, and
+/// unable to distinguish a tight book from a tight book quoted for five shares.
 #[derive(Deserialize)]
 struct SnapshotQuote {
-    bp: Option<f64>,
-    ap: Option<f64>,
+    #[serde(rename = "bp")]
+    bid_price: Option<f64>,
+    #[serde(rename = "ap")]
+    ask_price: Option<f64>,
+    #[serde(rename = "bs")]
+    bid_size: Option<i32>,
+    #[serde(rename = "as")]
+    ask_size: Option<i32>,
+    #[serde(rename = "t")]
+    timestamp: Option<DateTime<Utc>>,
 }
 
 /// Test-only mock implementation of the [`Trading`] trait.
@@ -819,6 +971,9 @@ pub struct MockTrading {
     pub should_fail_short_order: bool,
     pub should_fail_cancel: bool,
     pub should_fail_close: bool,
+    /// Makes `fetch_market_session` return an API error, for exercising the
+    /// clock-unavailable paths.
+    pub should_fail_session_fetch: bool,
     pub market_open: bool,
     /// Session close returned by `fetch_market_session`. Defaults to 16:00
     /// Eastern today; set it earlier to exercise early-close behavior.
@@ -858,6 +1013,7 @@ impl Default for MockTrading {
             should_fail_short_order: false,
             should_fail_cancel: false,
             should_fail_close: false,
+            should_fail_session_fetch: false,
             market_open: true,
             session_close: default_mock_session_close(),
             tradable_assets: TradableAssets {
@@ -953,6 +1109,12 @@ impl Trading for MockTrading {
     }
 
     async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
+        if self.should_fail_session_fetch {
+            return Err(ClientError::Api {
+                status: 503,
+                body: "mock clock unavailable".to_string(),
+            });
+        }
         MarketSession::new(self.market_open, self.session_close).ok_or_else(|| {
             ClientError::Parse(format!(
                 "Mock session close is unusable: {}",
@@ -1131,12 +1293,12 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"[
-                {"symbol": "AAPL", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "MSFT", "tradable": true,  "fractionable": true,  "shortable": false, "easy_to_borrow": true},
-                {"symbol": "GOOG", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": false},
-                {"symbol": "NVDA", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "AMZN", "tradable": true,  "fractionable": false, "shortable": true,  "easy_to_borrow": true},
-                {"symbol": "META", "tradable": false, "fractionable": true,  "shortable": true,  "easy_to_borrow": true}
+                {"symbol": "AAPL", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "MSFT", "status": "active", "tradable": true,  "fractionable": true,  "shortable": false, "easy_to_borrow": true},
+                {"symbol": "GOOG", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": false},
+                {"symbol": "NVDA", "status": "active", "tradable": true,  "fractionable": true,  "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "AMZN", "status": "active", "tradable": true,  "fractionable": false, "shortable": true,  "easy_to_borrow": true},
+                {"symbol": "META", "status": "active", "tradable": false, "fractionable": true,  "shortable": true,  "easy_to_borrow": true}
             ]"#,
             )
             .create_async()
@@ -1163,6 +1325,36 @@ mod tests {
 
         assert_eq!(assets.tradable_count(), 4);
         assert_eq!(assets.shortable_count(), 2);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_tradable_assets_rejects_non_active_status() {
+        // The query string already filters server-side, so this can only fire
+        // if that parameter is changed or dropped. It is the guard that keeps a
+        // delisted or suspended symbol out of the universe when it does.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/assets?status=active&asset_class=us_equity")
+            .with_status(200)
+            .with_body(
+                r#"[
+                {"symbol": "AAPL", "status": "active",   "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true},
+                {"symbol": "DEAD", "status": "inactive", "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true},
+                {"symbol": "NONE",                       "tradable": true, "fractionable": true, "shortable": true, "easy_to_borrow": true}
+            ]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let assets = client.fetch_tradable_assets().await.unwrap();
+
+        assert!(assets.is_tradable("AAPL"));
+        assert!(!assets.is_tradable("DEAD"));
+        // A missing status is treated as not active rather than assumed good.
+        assert!(!assets.is_tradable("NONE"));
+        assert_eq!(assets.tradable_count(), 1);
         mock.assert_async().await;
     }
 
@@ -1380,8 +1572,10 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"{
-                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20}},
-                "MSFT": {"latestQuote": {"bp": 420.00, "ap": 420.40}}
+                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 300, "as": 400,
+                                          "t": "2026-07-28T18:13:05.263989222Z"}},
+                "MSFT": {"latestQuote": {"bp": 420.00, "ap": 420.40, "bs": 100, "as": 200,
+                                          "t": "2026-07-28T18:13:04.100000000Z"}}
             }"#,
             )
             .create_async()
@@ -1393,10 +1587,162 @@ mod tests {
 
         assert_eq!(quotes.len(), 2);
         quotes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+
         assert_eq!(quotes[0].symbol, "AAPL");
-        assert!((quotes[0].mid_price - 150.10).abs() < 1e-6);
+        assert!((quotes[0].bid_price - 150.00).abs() < 1e-6);
+        assert!((quotes[0].ask_price - 150.20).abs() < 1e-6);
+        assert_eq!(quotes[0].bid_size, 300);
+        assert_eq!(quotes[0].ask_size, 400);
+
         assert_eq!(quotes[1].symbol, "MSFT");
-        assert!((quotes[1].mid_price - 420.20).abs() < 1e-6);
+        assert!((quotes[1].bid_price - 420.00).abs() < 1e-6);
+        assert_eq!(quotes[1].ask_size, 200);
+
+        // Nanosecond precision must survive deserialization: the timestamp is
+        // what the staleness window is measured against.
+        assert!(quotes[0].observed_at > quotes[1].observed_at);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_keeps_chunks_that_succeeded() {
+        // A universe split across requests must not be lost to one bad
+        // response. Chunk size is forced to 1 by requesting two symbols so the
+        // mock can fail exactly one of the two calls.
+        let mut server = Server::new_async().await;
+        let ok = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100,
+                                              "t": "2026-07-28T18:13:05Z"}}}"#,
+            )
+            .create_async()
+            .await;
+        let failed = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=MSFT&feed=iex")
+            .with_status(500)
+            .with_body(r#"{"message": "Internal Server Error"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes_over_chunks(&["AAPL".to_string(), "MSFT".to_string()], 1)
+            .await
+            .expect("a partial failure is not a total failure");
+
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].symbol, "AAPL");
+        ok.assert_async().await;
+        failed.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_errors_only_when_every_chunk_fails() {
+        let mut server = Server::new_async().await;
+        let first = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(500)
+            .with_body(r#"{"message": "Internal Server Error"}"#)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=MSFT&feed=iex")
+            .with_status(503)
+            .with_body(r#"{"message": "Service Unavailable"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let result = client
+            .fetch_latest_quotes_over_chunks(&["AAPL".to_string(), "MSFT".to_string()], 1)
+            .await;
+
+        assert!(matches!(result, Err(ClientError::Api { .. })));
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_converts_to_domain_quote() {
+        // The REST path must produce a quote the shared book-quality gate can
+        // read, so both pricing paths accept and reject identically.
+        let latest = LatestQuote {
+            symbol: "AAPL".to_string(),
+            bid_price: 150.00,
+            ask_price: 150.20,
+            bid_size: 300,
+            ask_size: 400,
+            observed_at: Utc::now(),
+        };
+        let quote = latest.to_equity_quote().expect("valid ticker");
+        assert_eq!(quote.ticker().as_str(), "AAPL");
+        assert_eq!(quote.bid_size(), 300);
+
+        let usable = crate::domain::market::UsableQuote::new(
+            &quote,
+            crate::domain::market::BookQualityLimits::default(),
+        )
+        .expect("tight, round-lot book is usable");
+        assert!((usable.mid_price() - 150.10).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_skips_quote_without_timestamp() {
+        // A quote with no exchange timestamp cannot be aged, and an unaged
+        // quote is exactly what the staleness window exists to exclude.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes(&["AAPL".to_string()])
+            .await
+            .unwrap();
+
+        assert!(quotes.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_defaults_missing_sizes_to_zero() {
+        // Zero size is then rejected by the book-quality gate rather than being
+        // silently treated as unlimited depth.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20,
+                                              "t": "2026-07-28T18:13:05Z"}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes(&["AAPL".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].bid_size, 0);
+        assert_eq!(quotes[0].ask_size, 0);
+
+        let quote = quotes[0].to_equity_quote().expect("valid ticker");
+        assert!(crate::domain::market::UsableQuote::new(
+            &quote,
+            crate::domain::market::BookQualityLimits::default()
+        )
+        .is_none());
         mock.assert_async().await;
     }
 
@@ -1437,7 +1783,8 @@ mod tests {
             .with_status(200)
             .with_body(
                 r#"{
-                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20}},
+                "AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100,
+                                          "t": "2026-07-28T18:13:05Z"}},
                 "MSFT": {"latestQuote": null}
             }"#,
             )
@@ -1450,7 +1797,7 @@ mod tests {
 
         assert_eq!(quotes.len(), 1);
         assert_eq!(quotes[0].symbol, "AAPL");
-        assert!((quotes[0].mid_price - 150.10).abs() < 1e-6);
+        assert!((quotes[0].bid_price - 150.00).abs() < 1e-6);
         mock.assert_async().await;
     }
 

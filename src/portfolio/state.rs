@@ -235,6 +235,14 @@ impl AppState {
         self.alpaca_client.as_ref()
     }
 
+    /// Returns a shared handle to the Alpaca client.
+    ///
+    /// For tasks that outlive a borrow of the state — the quote stream producer
+    /// reads the market session from its own spawned task.
+    pub fn alpaca_client_handle(&self) -> Arc<dyn Trading> {
+        Arc::clone(&self.alpaca_client)
+    }
+
     /// Returns the confidence floor used to gate signals.
     pub fn confidence_floor(&self) -> ConfidenceFloor {
         self.confidence_floor

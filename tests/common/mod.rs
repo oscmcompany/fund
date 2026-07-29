@@ -4,24 +4,34 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
-use std::{sync::OnceLock, time::Duration as StdDuration};
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
-use testcontainers_modules::localstack::LocalStack;
-use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// S3 / LocalStack
+// S3 (devenv-managed SeaweedFS)
 // ---------------------------------------------------------------------------
 
 const TEST_BUCKET: &str = "test-bucket";
-const TEST_ACCESS_KEY: &str = "test";
-const TEST_SECRET_KEY: &str = "test";
 const TEST_REGION: &str = "us-east-1";
 
-static LOCALSTACK_ENDPOINT: OnceLock<String> = OnceLock::new();
-static LOCALSTACK_CONTAINER: OnceLock<&'static ContainerAsync<LocalStack>> = OnceLock::new();
 static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Returns the S3-compatible endpoint, defaulting to the devenv object store.
+///
+/// The suite previously started a LocalStack container through testcontainers,
+/// which required a Docker daemon that neither the devenv shell nor CI has. It
+/// never needed Docker as such — only an HTTP endpoint speaking S3 — so it now
+/// points at a SeaweedFS process devenv runs directly.
+fn s3_endpoint() -> String {
+    std::env::var("TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8333".to_string())
+}
+
+fn s3_access_key() -> String {
+    std::env::var("TEST_S3_ACCESS_KEY").unwrap_or_else(|_| "fundtest".to_string())
+}
+
+fn s3_secret_key() -> String {
+    std::env::var("TEST_S3_SECRET_KEY").unwrap_or_else(|_| "fundtestsecret".to_string())
+}
 
 pub struct EnvironmentVariableGuard {
     name: String,
@@ -76,57 +86,8 @@ pub fn initialize_test_tracing() {
     });
 }
 
-pub async fn get_localstack_endpoint() -> String {
-    if let Some(endpoint) = LOCALSTACK_ENDPOINT.get() {
-        return endpoint.clone();
-    }
-
-    let container = LocalStack::default()
-        .start()
-        .await
-        .expect("Failed to start LocalStack container — is Docker running?");
-
-    // Give LocalStack additional time to fully initialize services
-    tokio::time::sleep(StdDuration::from_secs(5)).await;
-
-    let host = container.get_host().await.unwrap();
-    let port = {
-        let mut attempts = 0u32;
-        loop {
-            match container.get_host_port_ipv4(4566).await {
-                Ok(port) => break port,
-                Err(_) if attempts < 10 => {
-                    attempts += 1;
-                    tokio::time::sleep(StdDuration::from_millis(500)).await;
-                }
-                Err(error) => panic!(
-                    "LocalStack port 4566 not available after retries: {}",
-                    error
-                ),
-            }
-        }
-    };
-    let endpoint = format!("http://{}:{}", host, port);
-
-    // INTENTIONAL LEAK: Container is leaked to keep it alive for entire test run.
-    //
-    // Rationale:
-    // - Tests use #[serial] for sequential execution within this process
-    // - All tests share the same LocalStack container for performance
-    // - Container cleanup happens automatically when process exits
-    // - Storing container reference prevents testcontainers from losing port mapping
-    //
-    // Trade-off: Small memory leak during test execution vs architectural complexity
-    // Impact: Container memory is reclaimed when test process terminates
-    let leaked_container: &'static ContainerAsync<LocalStack> = Box::leak(Box::new(container));
-    let _ = LOCALSTACK_CONTAINER.set(leaked_container);
-    let _ = LOCALSTACK_ENDPOINT.set(endpoint.clone());
-
-    endpoint
-}
-
 pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
-    let credentials = Credentials::new(TEST_ACCESS_KEY, TEST_SECRET_KEY, None, None, "tests");
+    let credentials = Credentials::new(s3_access_key(), s3_secret_key(), None, None, "tests");
 
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(TEST_REGION))
@@ -142,17 +103,31 @@ pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
     S3Client::from_conf(s3_config)
 }
 
-/// Start LocalStack, create the test bucket, clean it, and return the endpoint URL
-/// and a ready-to-use S3 client.
+/// Creates the test bucket, empties it, and returns the endpoint and a client.
+///
+/// Reachability is asserted explicitly. `create_bucket` tolerates an
+/// already-exists error and `clean_bucket` swallows listing failures, so an
+/// absent object store would otherwise surface much later as a confusing
+/// assertion failure rather than as "the service is not running".
 pub async fn setup_test_bucket() -> (String, S3Client) {
     initialize_test_tracing();
 
-    let endpoint = get_localstack_endpoint().await;
+    let endpoint = s3_endpoint();
     let s3_client = create_test_s3_client(&endpoint).await;
 
-    // Create bucket (ignore AlreadyExists / BucketAlreadyOwnedByYou)
+    match s3_client.list_buckets().send().await {
+        Ok(_) => {}
+        Err(error) => panic!(
+            "S3-compatible endpoint at {endpoint} is unreachable: {error}\n\
+             Start it with `devenv --profile test up object-store --detach`."
+        ),
+    }
+
+    // Tolerates AlreadyExists / BucketAlreadyOwnedByYou across repeated runs.
     let _ = s3_client.create_bucket().bucket(TEST_BUCKET).send().await;
 
+    // The store persists between runs, unlike the container that was recreated
+    // each time, so emptying the bucket is load-bearing rather than tidiness.
     clean_bucket(&s3_client).await;
 
     (endpoint, s3_client)
@@ -208,84 +183,139 @@ pub fn test_bucket_name() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// PostgreSQL (testcontainers)
+// PostgreSQL (devenv-managed)
 // ---------------------------------------------------------------------------
 
 const SCHEMA_SQL: &str = include_str!("../../schema.sql");
 
-static PG_POOL: tokio::sync::OnceCell<PgPool> = tokio::sync::OnceCell::const_new();
-static PG_CONTAINER: OnceLock<&'static ContainerAsync<Postgres>> = OnceLock::new();
+/// Database the integration tests own outright.
+///
+/// Deliberately not the development database: these tests truncate tables, and
+/// pointing them at `fund` would destroy local data on every run.
+const TEST_DATABASE: &str = "fund_test";
 
-/// Strips lines that require pg_cron or TimescaleDB (unavailable in vanilla Postgres).
+/// Marks that the test database exists and carries the schema.
+///
+/// Stores `()` rather than the pool on purpose. A `PgPool` is bound to the
+/// tokio runtime that created it, and every `#[tokio::test]` builds its own
+/// runtime; caching a pool here meant the second test to run inherited a handle
+/// whose background reaper had already died with the first test's runtime, and
+/// every acquire from it failed with `PoolTimedOut`. Caching only the setup
+/// keeps the expensive work once-per-binary while leaving each test to own a
+/// pool tied to its own runtime.
+static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Connections per test pool.
+///
+/// Small because each test builds its own pool and the server allows 100 in
+/// total; the tests are `#[serial]` and none needs concurrency within a pool.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 4;
+
+/// Returns the base connection URL, minus the database name.
+///
+/// Honours `TEST_DATABASE_URL_BASE` so CI can point at a different host without
+/// editing this file; defaults to the devenv-managed local Postgres.
+fn database_url_base() -> String {
+    std::env::var("TEST_DATABASE_URL_BASE")
+        .unwrap_or_else(|_| "postgresql://localhost:5432".to_string())
+}
+
+/// Strips the parts of `schema.sql` that cannot be applied to a second database.
+///
+/// Only pg_cron is removed, and not because it is unavailable in general: the
+/// extension is restricted by `cron.database_name` to a single database, so
+/// `CREATE EXTENSION` fails anywhere else. That covers the extension itself, the
+/// `DO` blocks that schedule jobs, and `cron.schedule_in_timezone`.
+///
+/// TimescaleDB is deliberately *not* stripped. It was, back when these tests ran
+/// against a vanilla Postgres container, which meant every assertion ran against
+/// a schema with no hypertables and no retention policies — measurably not the
+/// schema being shipped. The devenv Postgres carries the extension, so the real
+/// one applies.
 fn filter_schema_for_test(schema: &str) -> String {
-    let mut inside_cron_block = false;
+    let mut inside_do_block = false;
+    let mut inside_cron_function = false;
     schema
         .lines()
         .filter(|line| {
             let trimmed = line.trim().to_lowercase();
+
             if trimmed.starts_with("do $do$") {
-                inside_cron_block = true;
+                inside_do_block = true;
             }
-            if inside_cron_block {
+            if inside_do_block {
                 if trimmed.starts_with("$do$;") {
-                    inside_cron_block = false;
+                    inside_do_block = false;
                 }
                 return false;
             }
+
+            if trimmed.starts_with("create or replace function cron.") {
+                inside_cron_function = true;
+            }
+            if inside_cron_function {
+                if trimmed == "$$;" {
+                    inside_cron_function = false;
+                }
+                return false;
+            }
+
             !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("create extension if not exists timescaledb")
                 && !trimmed.starts_with("select cron.schedule")
-                && !trimmed.starts_with("select create_hypertable")
-                && !trimmed.starts_with("select add_retention_policy")
-                && !trimmed.starts_with("select remove_retention_policy")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Returns a connection pool to a shared testcontainers Postgres instance.
+/// Returns a connection pool to the shared test database.
 ///
-/// The first call starts the container, applies the filtered schema, and leaks
-/// the container handle so it lives for the entire test-binary process. Subsequent
-/// calls return a clone of the same pool, avoiding redundant connections.
+/// Creates the database if absent and applies the schema on first use, then
+/// hands back clones of the same pool. Uses the devenv-managed Postgres rather
+/// than a container, so the suite needs no Docker daemon and runs against a
+/// server carrying the same extensions as production.
 pub async fn get_pg_pool() -> PgPool {
-    PG_POOL
+    let base = database_url_base();
+
+    SCHEMA_READY
         .get_or_init(|| async {
-            let container = Postgres::default()
-                .start()
+            // Connect to the maintenance database to create the test one. This
+            // cannot run through a pool aimed at a database that may not exist.
+            let admin = PgPool::connect(&format!("{base}/postgres"))
                 .await
-                .expect("Failed to start PostgreSQL container — is Docker running?");
+                .expect("Failed to connect to Postgres — is `devenv up` running?");
 
-            let host = container.get_host().await.unwrap();
-            let port = container.get_host_port_ipv4(5432).await.unwrap();
-            let url = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
+            let exists: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
+                    .bind(TEST_DATABASE)
+                    .fetch_optional(&admin)
+                    .await
+                    .expect("Failed to query for the test database");
+            if exists.is_none() {
+                // CREATE DATABASE cannot be parameterised or run in a
+                // transaction, and TEST_DATABASE is a compile-time constant.
+                sqlx::raw_sql(&format!("CREATE DATABASE {TEST_DATABASE}"))
+                    .execute(&admin)
+                    .await
+                    .expect("Failed to create the test database");
+            }
+            admin.close().await;
 
-            let connect_deadline = tokio::time::Instant::now() + StdDuration::from_secs(30);
-            let pool = loop {
-                match PgPool::connect(&url).await {
-                    Ok(pool) => break pool,
-                    Err(error) => {
-                        if tokio::time::Instant::now() >= connect_deadline {
-                            panic!("Failed to connect to PostgreSQL within timeout: {error}");
-                        }
-                        tokio::time::sleep(StdDuration::from_millis(250)).await;
-                    }
-                }
-            };
-
-            let filtered_schema = filter_schema_for_test(SCHEMA_SQL);
-            sqlx::raw_sql(&filtered_schema)
-                .execute(&pool)
+            let setup = PgPool::connect(&format!("{base}/{TEST_DATABASE}"))
                 .await
-                .unwrap();
-
-            let leaked: &'static ContainerAsync<Postgres> = Box::leak(Box::new(container));
-            let _ = PG_CONTAINER.set(leaked);
-
-            pool
+                .expect("Failed to connect to the test database");
+            sqlx::raw_sql(&filter_schema_for_test(SCHEMA_SQL))
+                .execute(&setup)
+                .await
+                .expect("Failed to apply schema.sql to the test database");
+            setup.close().await;
         })
+        .await;
+
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
+        .connect(&format!("{base}/{TEST_DATABASE}"))
         .await
-        .clone()
+        .expect("Failed to connect to the test database")
 }
 
 /// Truncates all portfolio-related tables in dependency order.
