@@ -54,25 +54,31 @@ jobs:
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
           tasks run checks:base
-      # The integration test targets run against a real Postgres. Only the
-      # database is started, not the fund services: those would connect to
-      # Alpaca and are not what is under test here.
-      - name: Start PostgreSQL
+      # The integration test targets need a database and an S3-compatible
+      # object store. Only those two are started, not the fund services: those
+      # would connect to Alpaca and are not what is under test here.
+      - name: Start test services
         if: steps.changes.outputs.rust == 'true'
         run: >-
           devenv --secretspec-provider env --secretspec-profile development
-          up postgres --detach
-      - name: Wait for PostgreSQL
+          --profile test up postgres object-store --detach
+      - name: Wait for test services
         if: steps.changes.outputs.rust == 'true'
         run: |
-          for attempt in $(seq 1 60); do
-            if pg_isready -h localhost -p 5432 -q; then
-              echo "PostgreSQL accepting connections after ${attempt}s"
+          for attempt in $(seq 1 90); do
+            postgres_ready=false
+            object_store_ready=false
+            pg_isready -h localhost -p 5432 -q && postgres_ready=true
+            curl -sf -o /dev/null http://127.0.0.1:8333 && object_store_ready=true
+            if [ "$postgres_ready" = true ] && [ "$object_store_ready" = true ]; then
+              echo "Test services ready after ${attempt}s"
               exit 0
             fi
             sleep 1
           done
-          echo "PostgreSQL did not accept connections within 60s"
+          echo "Test services not ready within 90s"
+          echo "  postgres:     $postgres_ready"
+          echo "  object-store: $object_store_ready"
           exit 1
       - name: Run Rust checks
         if: steps.changes.outputs.rust == 'true'

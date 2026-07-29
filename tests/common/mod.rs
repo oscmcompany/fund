@@ -4,23 +4,34 @@ use aws_credential_types::Credentials;
 use aws_sdk_s3::{config::Region, primitives::ByteStream, Client as S3Client};
 use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
-use std::{sync::OnceLock, time::Duration as StdDuration};
-use testcontainers::{runners::AsyncRunner, ContainerAsync};
-use testcontainers_modules::localstack::LocalStack;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// S3 / LocalStack
+// S3 (devenv-managed SeaweedFS)
 // ---------------------------------------------------------------------------
 
 const TEST_BUCKET: &str = "test-bucket";
-const TEST_ACCESS_KEY: &str = "test";
-const TEST_SECRET_KEY: &str = "test";
 const TEST_REGION: &str = "us-east-1";
 
-static LOCALSTACK_ENDPOINT: OnceLock<String> = OnceLock::new();
-static LOCALSTACK_CONTAINER: OnceLock<&'static ContainerAsync<LocalStack>> = OnceLock::new();
 static TRACING_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Returns the S3-compatible endpoint, defaulting to the devenv object store.
+///
+/// The suite previously started a LocalStack container through testcontainers,
+/// which required a Docker daemon that neither the devenv shell nor CI has. It
+/// never needed Docker as such — only an HTTP endpoint speaking S3 — so it now
+/// points at a SeaweedFS process devenv runs directly.
+fn s3_endpoint() -> String {
+    std::env::var("TEST_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:8333".to_string())
+}
+
+fn s3_access_key() -> String {
+    std::env::var("TEST_S3_ACCESS_KEY").unwrap_or_else(|_| "fundtest".to_string())
+}
+
+fn s3_secret_key() -> String {
+    std::env::var("TEST_S3_SECRET_KEY").unwrap_or_else(|_| "fundtestsecret".to_string())
+}
 
 pub struct EnvironmentVariableGuard {
     name: String,
@@ -75,57 +86,8 @@ pub fn initialize_test_tracing() {
     });
 }
 
-pub async fn get_localstack_endpoint() -> String {
-    if let Some(endpoint) = LOCALSTACK_ENDPOINT.get() {
-        return endpoint.clone();
-    }
-
-    let container = LocalStack::default()
-        .start()
-        .await
-        .expect("Failed to start LocalStack container — is Docker running?");
-
-    // Give LocalStack additional time to fully initialize services
-    tokio::time::sleep(StdDuration::from_secs(5)).await;
-
-    let host = container.get_host().await.unwrap();
-    let port = {
-        let mut attempts = 0u32;
-        loop {
-            match container.get_host_port_ipv4(4566).await {
-                Ok(port) => break port,
-                Err(_) if attempts < 10 => {
-                    attempts += 1;
-                    tokio::time::sleep(StdDuration::from_millis(500)).await;
-                }
-                Err(error) => panic!(
-                    "LocalStack port 4566 not available after retries: {}",
-                    error
-                ),
-            }
-        }
-    };
-    let endpoint = format!("http://{}:{}", host, port);
-
-    // INTENTIONAL LEAK: Container is leaked to keep it alive for entire test run.
-    //
-    // Rationale:
-    // - Tests use #[serial] for sequential execution within this process
-    // - All tests share the same LocalStack container for performance
-    // - Container cleanup happens automatically when process exits
-    // - Storing container reference prevents testcontainers from losing port mapping
-    //
-    // Trade-off: Small memory leak during test execution vs architectural complexity
-    // Impact: Container memory is reclaimed when test process terminates
-    let leaked_container: &'static ContainerAsync<LocalStack> = Box::leak(Box::new(container));
-    let _ = LOCALSTACK_CONTAINER.set(leaked_container);
-    let _ = LOCALSTACK_ENDPOINT.set(endpoint.clone());
-
-    endpoint
-}
-
 pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
-    let credentials = Credentials::new(TEST_ACCESS_KEY, TEST_SECRET_KEY, None, None, "tests");
+    let credentials = Credentials::new(s3_access_key(), s3_secret_key(), None, None, "tests");
 
     let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(TEST_REGION))
@@ -141,17 +103,31 @@ pub async fn create_test_s3_client(endpoint_url: &str) -> S3Client {
     S3Client::from_conf(s3_config)
 }
 
-/// Start LocalStack, create the test bucket, clean it, and return the endpoint URL
-/// and a ready-to-use S3 client.
+/// Creates the test bucket, empties it, and returns the endpoint and a client.
+///
+/// Reachability is asserted explicitly. `create_bucket` tolerates an
+/// already-exists error and `clean_bucket` swallows listing failures, so an
+/// absent object store would otherwise surface much later as a confusing
+/// assertion failure rather than as "the service is not running".
 pub async fn setup_test_bucket() -> (String, S3Client) {
     initialize_test_tracing();
 
-    let endpoint = get_localstack_endpoint().await;
+    let endpoint = s3_endpoint();
     let s3_client = create_test_s3_client(&endpoint).await;
 
-    // Create bucket (ignore AlreadyExists / BucketAlreadyOwnedByYou)
+    match s3_client.list_buckets().send().await {
+        Ok(_) => {}
+        Err(error) => panic!(
+            "S3-compatible endpoint at {endpoint} is unreachable: {error}\n\
+             Start it with `devenv --profile test up object-store --detach`."
+        ),
+    }
+
+    // Tolerates AlreadyExists / BucketAlreadyOwnedByYou across repeated runs.
     let _ = s3_client.create_bucket().bucket(TEST_BUCKET).send().await;
 
+    // MinIO persists between runs, unlike the container that was recreated each
+    // time, so emptying the bucket is now load-bearing rather than tidiness.
     clean_bucket(&s3_client).await;
 
     (endpoint, s3_client)
@@ -207,7 +183,7 @@ pub fn test_bucket_name() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// PostgreSQL (testcontainers)
+// PostgreSQL (devenv-managed)
 // ---------------------------------------------------------------------------
 
 const SCHEMA_SQL: &str = include_str!("../../schema.sql");

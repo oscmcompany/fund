@@ -47,6 +47,24 @@
   # The runtimeEnv block above detects when that path is not writable (e.g.
   # local laptop without bootstrap) and falls back to an XDG state path.
   fundLogDir = "/var/log/fund";
+
+  # S3-compatible object store for the integration test suite. Defined here so
+  # the process definition and the environment handed to the tests cannot drift
+  # apart; `tests/common` reads these values from the environment.
+  #
+  # SeaweedFS rather than MinIO: MinIO is marked insecure in this nixpkgs
+  # (CVE-2026-40344 and CVE-2026-41145 are unauthenticated object-write
+  # bypasses), and using it would mean adding it to permittedInsecurePackages —
+  # a project-wide statement that a known-vulnerable package is acceptable, to
+  # gain nothing SeaweedFS does not already provide here.
+  #
+  # The credentials are arbitrary. SeaweedFS with no S3 configuration file
+  # accepts any signature, but the AWS SDK still requires non-empty values to
+  # sign a request, so the tests must send something.
+  objectStorePort = 8333;
+  objectStoreAccessKey = "fundtest";
+  objectStoreSecretKey = "fundtestsecret";
+  objectStoreEndpoint = "http://127.0.0.1:${toString objectStorePort}";
 in {
   dotenv.enable = true;
 
@@ -153,6 +171,14 @@ in {
 
     # Disable AWS CLI pager so secrets output is not paged
     AWS_PAGER = "";
+
+    # S3-compatible endpoint and credentials for the integration test suite.
+    # Set unconditionally rather than inside the test profile so `cargo test`
+    # works from a plain devenv shell; only the MinIO process itself is
+    # profile-scoped.
+    TEST_S3_ENDPOINT = objectStoreEndpoint;
+    TEST_S3_ACCESS_KEY = objectStoreAccessKey;
+    TEST_S3_SECRET_KEY = objectStoreSecretKey;
   };
 
   services.postgres = {
@@ -196,6 +222,7 @@ in {
     markdownlint-cli
     postgresql_16
     rustup
+    seaweedfs
     (sqlfluff.overridePythonAttrs (_: {
       # The aarch64-darwin binary is not cached on cache.nixos.org for this
       # nixpkgs revision; building from source runs the full pytest suite which
@@ -279,23 +306,59 @@ in {
     echo "No unused dependencies found"
   '';
 
+  # Brings up the services the integration targets need, if they are not
+  # already listening. Mirrors what check-sqlx does for the database: a check
+  # that cannot run is worse than no check, and the alternative is every
+  # developer remembering to start two processes before every commit.
+  scripts.ensure-test-services.exec = ''
+    set -euo pipefail
+    needed=""
+    pg_isready -q 2>/dev/null || needed="postgres"
+    curl -sf -o /dev/null "${objectStoreEndpoint}" 2>/dev/null || needed="$needed object-store"
+
+    if [ -z "$needed" ]; then
+      exit 0
+    fi
+
+    echo "Starting test services:$needed"
+    devenv --profile test up $needed --detach >/dev/null 2>&1 || true
+
+    for _ in $(seq 1 60); do
+      pg_ok=false
+      store_ok=false
+      pg_isready -q 2>/dev/null && pg_ok=true
+      curl -sf -o /dev/null "${objectStoreEndpoint}" 2>/dev/null && store_ok=true
+      if [ "$pg_ok" = true ] && [ "$store_ok" = true ]; then
+        exit 0
+      fi
+      sleep 1
+    done
+
+    echo "Test services did not start within 60s"
+    echo "  postgres:     $(pg_isready -q 2>/dev/null && echo ready || echo down)"
+    echo "  object-store: ${objectStoreEndpoint}"
+    echo "Start them with 'devenv --profile test up postgres object-store --detach'."
+    exit 1
+  '';
+
   scripts.test-rust.exec = ''
     set -euo pipefail
+    ensure-test-services
     echo "Running Rust tests"
 
     # Integration test targets are named individually rather than passing
-    # --tests. Every target listed here runs against the devenv-managed
-    # Postgres and needs no container runtime. test_backfill is deliberately
-    # absent: it still starts LocalStack through testcontainers and so requires
-    # a Docker daemon, which neither this shell nor CI provides.
+    # --tests, so adding a target is a deliberate act and a new file cannot
+    # join the gate unnoticed. Every target here runs against the devenv-managed
+    # PostgreSQL and MinIO; none needs a container runtime.
     #
     # Before this, target selection was --lib --bins, which silently excluded
     # every file under tests/ — around 1,300 lines that compiled under clippy
     # but whose assertions had never been executed.
     TEST_ARGS="--lib --bins --all-features"
-    TEST_ARGS="$TEST_ARGS --test test_data --test test_database"
-    TEST_ARGS="$TEST_ARGS --test test_ensemble_events --test test_errors"
-    TEST_ARGS="$TEST_ARGS --test test_handlers --test test_stream"
+    TEST_ARGS="$TEST_ARGS --test test_backfill --test test_data"
+    TEST_ARGS="$TEST_ARGS --test test_database --test test_ensemble_events"
+    TEST_ARGS="$TEST_ARGS --test test_errors --test test_handlers"
+    TEST_ARGS="$TEST_ARGS --test test_stream"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)
@@ -757,6 +820,31 @@ in {
       MLFLOW_TRACKING_URI = "";
       PREFECT_API_URL = "";
     };
+  };
+
+  # Test profile: an S3-compatible object store for the integration suite.
+  #
+  # Scoped to its own profile rather than declared top level, because profile
+  # modules merge with the top level and a top-level process would therefore
+  # start in production, which has no use for it. PostgreSQL is top level by
+  # contrast because production genuinely needs it.
+  #
+  # This replaces the LocalStack container the suite used to start through
+  # testcontainers. The tests never needed Docker as such — they needed an HTTP
+  # endpoint speaking S3, and `create_test_s3_client` already builds its client
+  # with an explicit endpoint and path-style addressing, which is exactly the
+  # configuration an S3-compatible server wants.
+  profiles.test.module = {
+    processes.object-store.exec = ''
+      set -euo pipefail
+      OBJECT_STORE_DIR="''${DEVENV_STATE:-.devenv/state}/object-store"
+      mkdir -p "$OBJECT_STORE_DIR"
+      exec weed server \
+        -dir="$OBJECT_STORE_DIR" \
+        -ip=127.0.0.1 \
+        -s3 \
+        -s3.port=${toString objectStorePort}
+    '';
   };
 
   enterShell = ''
