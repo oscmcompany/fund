@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::common::market_hours::MarketSession;
@@ -34,8 +34,12 @@ const HEADER_SECRET_KEY: &str = "APCA-API-SECRET-KEY";
 ///
 /// The endpoint imposes no documented symbol ceiling and was measured accepting
 /// 2,000 symbols in a 9,424-character URL. The cap here is not the API's limit
-/// but a bound on request-line length, which intermediaries do restrict, and it
-/// keeps a single failed request from losing the whole universe.
+/// but a bound on request-line length, which intermediaries do restrict.
+///
+/// Chunking also limits the blast radius of a single failed request, but only
+/// because [`TradingClient::fetch_latest_quotes`] keeps the chunks that
+/// succeeded. Propagating the first error instead would have made a smaller cap
+/// strictly worse, by giving one failure more chunks to take down with it.
 const SNAPSHOT_SYMBOLS_PER_REQUEST: usize = 1_000;
 
 /// Account information returned by the Alpaca account endpoint.
@@ -82,10 +86,11 @@ pub struct Position {
 /// Latest quote snapshot for a single symbol from the Alpaca data API.
 ///
 /// Carries the raw two-sided book rather than a precomputed mid so callers can
-/// apply [`UsableQuote`] and a staleness window themselves. Returning only a mid
-/// discarded the information needed to tell a tradeable book from a book
-/// hundreds of basis points wide, and a quote posted a second ago from one
-/// posted hours earlier — both of which the snapshot reports identically.
+/// apply [`crate::domain::market::UsableQuote`] and a staleness window
+/// themselves. Returning only a mid discarded the information needed to tell a
+/// tradeable book from a book hundreds of basis points wide, and a quote posted
+/// a second ago from one posted hours earlier — both of which the snapshot
+/// reports identically.
 #[derive(Debug, Clone)]
 pub struct LatestQuote {
     /// Ticker symbol.
@@ -646,11 +651,12 @@ impl TradingClient {
 
     /// Fetches latest quote snapshots for the given symbols from the Alpaca data API.
     ///
-    /// Symbols are requested in chunks of [`SNAPSHOT_SYMBOLS_PER_REQUEST`] and
+    /// Symbols are requested in bounded chunks and
     /// the results concatenated, so a caller may pass the whole filtered
     /// universe without splitting it. No book validation happens here: the raw
     /// two-sided quote is returned and callers gate it through
-    /// [`UsableQuote`], which is the same gate the streamed path uses.
+    /// [`crate::domain::market::UsableQuote`], the same gate the streamed path
+    /// uses.
     ///
     /// Symbols the API returns without a usable `latestQuote` object are
     /// omitted rather than defaulted, because a missing side is indistinguishable
@@ -659,19 +665,60 @@ impl TradingClient {
         &self,
         symbols: &[String],
     ) -> Result<Vec<LatestQuote>, ClientError> {
+        self.fetch_latest_quotes_over_chunks(symbols, SNAPSHOT_SYMBOLS_PER_REQUEST)
+            .await
+    }
+
+    /// Fetches `symbols` in chunks of `chunk_size`.
+    ///
+    /// Split out so the partial-failure behaviour is testable without building
+    /// a symbol list large enough to span the production chunk size.
+    async fn fetch_latest_quotes_over_chunks(
+        &self,
+        symbols: &[String],
+        chunk_size: usize,
+    ) -> Result<Vec<LatestQuote>, ClientError> {
         if symbols.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut quotes: Vec<LatestQuote> = Vec::new();
-        for chunk in symbols.chunks(SNAPSHOT_SYMBOLS_PER_REQUEST) {
-            quotes.extend(self.fetch_latest_quotes_chunk(chunk).await?);
+        let mut failed_chunks: usize = 0;
+        let mut last_error: Option<ClientError> = None;
+        let mut requests: usize = 0;
+
+        for chunk in symbols.chunks(chunk_size) {
+            requests += 1;
+            match self.fetch_latest_quotes_chunk(chunk).await {
+                Ok(chunk_quotes) => quotes.extend(chunk_quotes),
+                Err(error) => {
+                    // One bad request must not discard the chunks that
+                    // succeeded. Partial pricing narrows the entry set and
+                    // holds the exits it cannot price, both of which beat
+                    // pricing nothing at all.
+                    warn!(
+                        error = %error,
+                        symbols = chunk.len(),
+                        "Snapshot chunk failed; its symbols stay unpriced"
+                    );
+                    failed_chunks += 1;
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        // Only a total failure is an error. Reporting one keeps the caller's
+        // own warning meaningful for the common single-chunk case, which would
+        // otherwise become unreachable and take that log line with it.
+        if failed_chunks == requests {
+            return Err(last_error.expect("a failed chunk records its error"));
         }
 
         info!(
             requested = symbols.len(),
             returned = quotes.len(),
-            requests = symbols.len().div_ceil(SNAPSHOT_SYMBOLS_PER_REQUEST),
+            requests,
+            failed_chunks,
             "Latest quotes fetched from Alpaca data API"
         );
         Ok(quotes)
@@ -1555,6 +1602,66 @@ mod tests {
         // what the staleness window is measured against.
         assert!(quotes[0].observed_at > quotes[1].observed_at);
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_keeps_chunks_that_succeeded() {
+        // A universe split across requests must not be lost to one bad
+        // response. Chunk size is forced to 1 by requesting two symbols so the
+        // mock can fail exactly one of the two calls.
+        let mut server = Server::new_async().await;
+        let ok = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL": {"latestQuote": {"bp": 150.00, "ap": 150.20, "bs": 100, "as": 100,
+                                              "t": "2026-07-28T18:13:05Z"}}}"#,
+            )
+            .create_async()
+            .await;
+        let failed = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=MSFT&feed=iex")
+            .with_status(500)
+            .with_body(r#"{"message": "Internal Server Error"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let quotes = client
+            .fetch_latest_quotes_over_chunks(&["AAPL".to_string(), "MSFT".to_string()], 1)
+            .await
+            .expect("a partial failure is not a total failure");
+
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].symbol, "AAPL");
+        ok.assert_async().await;
+        failed.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_quotes_errors_only_when_every_chunk_fails() {
+        let mut server = Server::new_async().await;
+        let first = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(500)
+            .with_body(r#"{"message": "Internal Server Error"}"#)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=MSFT&feed=iex")
+            .with_status(503)
+            .with_body(r#"{"message": "Service Unavailable"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(make_credentials(), server.url());
+        let result = client
+            .fetch_latest_quotes_over_chunks(&["AAPL".to_string(), "MSFT".to_string()], 1)
+            .await;
+
+        assert!(matches!(result, Err(ClientError::Api { .. })));
+        first.assert_async().await;
+        second.assert_async().await;
     }
 
     #[tokio::test]

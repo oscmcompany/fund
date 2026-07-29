@@ -312,9 +312,17 @@ in {
   # developer remembering to start two processes before every commit.
   scripts.ensure-test-services.exec = ''
     set -euo pipefail
+    # Any HTTP response means the object store is listening. `curl -f` would
+    # treat a 403 as down, and an unsigned GET / returns 403 on MinIO and on
+    # real S3 — TEST_S3_ENDPOINT is overridable, so the probe must not depend
+    # on one server answering 200 there.
+    object_store_up() {
+      [ -n "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "${objectStoreEndpoint}" 2>/dev/null | grep -v '^000$')" ]
+    }
+
     needed=""
     pg_isready -q 2>/dev/null || needed="postgres"
-    curl -sf -o /dev/null "${objectStoreEndpoint}" 2>/dev/null || needed="$needed object-store"
+    object_store_up || needed="$needed object-store"
 
     if [ -z "$needed" ]; then
       exit 0
@@ -327,7 +335,7 @@ in {
       pg_ok=false
       store_ok=false
       pg_isready -q 2>/dev/null && pg_ok=true
-      curl -sf -o /dev/null "${objectStoreEndpoint}" 2>/dev/null && store_ok=true
+      object_store_up && store_ok=true
       if [ "$pg_ok" = true ] && [ "$store_ok" = true ]; then
         exit 0
       fi

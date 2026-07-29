@@ -208,6 +208,12 @@ pub const CONSUMER_PORTFOLIO: &str = "portfolio";
 /// so the predictions offset cannot mask a missed end-of-day liquidation.
 pub const CONSUMER_PORTFOLIO_LIQUIDATION: &str = "portfolio-liquidation";
 
+/// Consumer name for the portfolio session-start consumer.
+/// Tracks the last processed `trading_session_started` event so a process that
+/// was down at the open can still build the portfolio when it comes back, for
+/// as long as the session is still trading.
+pub const CONSUMER_PORTFOLIO_SESSION: &str = "portfolio-session";
+
 /// Consumer name for the data equity bars sync consumer.
 pub const CONSUMER_DATA_EQUITY_BARS_SYNC: &str = "data-equity-bars-sync";
 

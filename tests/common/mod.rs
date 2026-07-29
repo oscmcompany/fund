@@ -126,8 +126,8 @@ pub async fn setup_test_bucket() -> (String, S3Client) {
     // Tolerates AlreadyExists / BucketAlreadyOwnedByYou across repeated runs.
     let _ = s3_client.create_bucket().bucket(TEST_BUCKET).send().await;
 
-    // MinIO persists between runs, unlike the container that was recreated each
-    // time, so emptying the bucket is now load-bearing rather than tidiness.
+    // The store persists between runs, unlike the container that was recreated
+    // each time, so emptying the bucket is load-bearing rather than tidiness.
     clean_bucket(&s3_client).await;
 
     (endpoint, s3_client)

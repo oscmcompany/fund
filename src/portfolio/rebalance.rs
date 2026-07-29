@@ -264,7 +264,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
             legs = open_pairs.len() * 2,
             priced_from_stream = streamed,
             priced_from_snapshot = snapshot_filled,
-            unpriced = unpriced_legs.len() - snapshot_filled,
+            unpriced = unpriced_legs.len().saturating_sub(snapshot_filled),
             "Exit evaluation pricing"
         );
         let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices, &exit_mid_prices);

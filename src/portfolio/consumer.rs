@@ -9,11 +9,17 @@
 //!   fresh prediction set is acted on immediately.
 //! - Runs end-of-day liquidation on each `portfolio_liquidation_requested` event.
 //!
-//! Nothing here runs on a timer. A five-minute evaluation heartbeat previously
-//! drove a full rebalance pass whether or not anything had changed, up to 78
-//! times a session. The work that genuinely needs a schedule — opening the
+//! No unconditional timer drives work here. A five-minute evaluation heartbeat
+//! previously ran a full rebalance pass whether or not anything had changed, up
+//! to 78 times a session. The work that genuinely needs a schedule — opening the
 //! session, closing it — is scheduled directly, and the rest is driven by
 //! spreads actually crossing thresholds.
+//!
+//! Two timers do exist, and both are conditional on something having gone
+//! differently than planned: the liquidation timer, armed once per session from
+//! the real close, and the entry retry, armed only when the session-start pass
+//! opened nothing. A session that opens normally and closes normally arms one
+//! timer and fires one rebalance.
 //!
 //! Predictions are requested pre-market by pg_cron. They derive from daily bars,
 //! so a single run produces every distinct value the session will have;
@@ -32,10 +38,10 @@ use tracing::{error, info, warn};
 
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION,
+    CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
 };
 use crate::common::market_hours::MarketSession;
-use crate::portfolio::database::predictions_exist_for_today;
+use crate::portfolio::database::{fetch_open_pairs, predictions_exist_for_today};
 use crate::portfolio::rebalance::{run_end_of_day_liquidation, run_rebalance, RebalanceError};
 use crate::portfolio::reconciliation;
 use crate::portfolio::state::AppState;
@@ -47,6 +53,15 @@ use crate::portfolio::state::AppState;
 /// 15:45 Eastern remains as a fail-safe for the case where the clock endpoint is
 /// unreachable; liquidation is idempotent, so both firing is harmless.
 const LIQUIDATION_LEAD_TIME_MINUTES: i64 = 15;
+
+/// Backoff, in minutes, for re-attempting entry after a session start that
+/// opened nothing.
+///
+/// Bounded rather than indefinite: three failures spread over the first hour of
+/// the session mean the cause is not transient, and continuing to retry would
+/// only add load to whatever is already failing. Spacing widens so the first
+/// attempt catches a brief outage without waiting long.
+const ENTRY_RETRY_BACKOFF_MINUTES: [i64; 3] = [5, 15, 30];
 
 /// Spawns the event consumer as a background task.
 pub fn spawn_event_consumer(state: AppState, shutdown_token: CancellationToken) -> JoinHandle<()> {
@@ -130,6 +145,40 @@ async fn run_consumer(
         handle_equity_predictions_completed(state, pool, event_id).await;
     }
 
+    // Catch up on trading_session_started if we were down when it fired. Without
+    // this a process restarted at any point after 09:25 Eastern would trade
+    // nothing for the rest of the day: the event is emitted once, and the live
+    // evaluator that drives everything else cannot fire until pairs are open.
+    // The retired five-minute heartbeat used to cover this within five minutes.
+    let session_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO_SESSION).await?;
+    if let Some(event_id) =
+        latest_event_after(pool, EventType::TradingSessionStarted, session_offset).await?
+    {
+        // Guarded on the real session so a restart after the close, or on the
+        // day after, does not replay a stale open into a shut market.
+        let session_is_live = match state.alpaca_client().fetch_market_session().await {
+            Ok(session) => session.is_open() && session.trades_on_date_of(Utc::now()),
+            Err(error) => {
+                warn!(error = %error, "Market session fetch failed during session-start catch-up");
+                false
+            }
+        };
+        if session_is_live {
+            info!(event_id, "Catching up on missed trading_session_started");
+            handle_trading_session_started(state, pool, event_id, shutdown_token).await;
+        } else {
+            info!(
+                event_id,
+                "Skipping missed trading_session_started: not inside a live session"
+            );
+            if let Err(error) =
+                update_consumer_offset(pool, CONSUMER_PORTFOLIO_SESSION, event_id).await
+            {
+                warn!(error = %error, "Failed to update session consumer offset");
+            }
+        }
+    }
+
     // Catch up on portfolio_liquidation_requested if we missed it while the
     // market was still open. Guarded by the real session so a restart after an
     // early close does not submit orders into a shut market.
@@ -191,7 +240,7 @@ async fn run_consumer(
 
         if event_type == EventType::TradingSessionStarted.as_str() {
             info!(event_id, "Received trading_session_started");
-            handle_trading_session_started(state, pool, shutdown_token).await;
+            handle_trading_session_started(state, pool, event_id, shutdown_token).await;
         } else if event_type == EventType::PortfolioEvaluationRequested.as_str() {
             handle_portfolio_evaluation(state, pool).await;
         } else if event_type == EventType::EquityPredictionsCompleted.as_str() {
@@ -223,6 +272,7 @@ async fn run_consumer(
 async fn handle_trading_session_started(
     state: &AppState,
     pool: &PgPool,
+    event_id: i64,
     shutdown_token: &CancellationToken,
 ) {
     let session = match state.alpaca_client().fetch_market_session().await {
@@ -238,6 +288,7 @@ async fn handle_trading_session_started(
             session_close = %session.close(),
             "Skipping session start: the market does not trade today"
         );
+        record_session_offset(pool, event_id).await;
         return;
     }
 
@@ -250,10 +301,115 @@ async fn handle_trading_session_started(
 
     if !state.try_begin_rebalance() {
         info!("Skipping session start rebalance: a pass is already running");
+        record_session_offset(pool, event_id).await;
         return;
     }
     run_rebalance_pass(state, pool).await;
     state.finish_rebalance();
+
+    // A pass that opened nothing is the case the retired heartbeat used to
+    // cover. Predictions land before this event, and the live evaluator cannot
+    // fire without open pairs, so without a retry a single transient failure
+    // here costs the whole session.
+    match fetch_open_pairs(pool).await {
+        Ok(pairs) if pairs.is_empty() => {
+            spawn_entry_retry_timer(pool.clone(), session, shutdown_token.clone());
+        }
+        Ok(pairs) => info!(
+            open_pairs = pairs.len(),
+            "Session start opened positions; no entry retry armed"
+        ),
+        Err(error) => {
+            // Arm anyway: not knowing whether the portfolio is empty is not a
+            // reason to give up on the session. The retry re-reads before
+            // acting, so a spurious arm costs one query.
+            warn!(error = %error, "Could not read open pairs after session start; arming entry retry");
+            spawn_entry_retry_timer(pool.clone(), session, shutdown_token.clone());
+        }
+    }
+
+    record_session_offset(pool, event_id).await;
+}
+
+/// Records progress past a `trading_session_started` event.
+async fn record_session_offset(pool: &PgPool, event_id: i64) {
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_PORTFOLIO_SESSION, event_id).await {
+        warn!(error = %error, "Failed to update session consumer offset");
+    }
+}
+
+/// Re-requests an evaluation on a backoff while the portfolio is still empty.
+///
+/// Spawned only when the session-start pass opened nothing, so a healthy session
+/// arms no timer at all. Each attempt re-reads the open pairs first and stops as
+/// soon as any exist, whatever opened them.
+///
+/// Emits `portfolio_evaluation_requested` rather than calling the rebalance
+/// directly, so a retry inherits everything [`handle_portfolio_evaluation`]
+/// already does: the clock check, the close-proximity guard, the prediction
+/// re-request, and the `try_begin_rebalance` exclusion that keeps it from
+/// colliding with a pass already under way. This task holds no rebalance state.
+fn spawn_entry_retry_timer(
+    pool: PgPool,
+    session: MarketSession,
+    shutdown_token: CancellationToken,
+) {
+    info!(
+        attempts = ENTRY_RETRY_BACKOFF_MINUTES.len(),
+        "Session start opened no positions; arming entry retry"
+    );
+
+    tokio::spawn(async move {
+        for (attempt, minutes) in ENTRY_RETRY_BACKOFF_MINUTES.iter().enumerate() {
+            let wait = Duration::from_secs((*minutes as u64) * 60);
+            tokio::select! {
+                _ = sleep(wait) => {}
+                _ = shutdown_token.cancelled() => {
+                    info!("Entry retry cancelled for shutdown");
+                    return;
+                }
+            }
+
+            // Opening positions minutes before the close is what the
+            // exit-feasibility gate exists to prevent, and liquidation is about
+            // to run regardless.
+            if close_is_near(&session, Utc::now()) {
+                info!("Entry retry stopped: session close is near");
+                return;
+            }
+
+            match fetch_open_pairs(&pool).await {
+                Ok(pairs) if !pairs.is_empty() => {
+                    info!(
+                        open_pairs = pairs.len(),
+                        "Entry retry stopped: positions are open"
+                    );
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "Entry retry could not read open pairs; requesting anyway");
+                }
+            }
+
+            info!(
+                attempt = attempt + 1,
+                of = ENTRY_RETRY_BACKOFF_MINUTES.len(),
+                "Portfolio still empty; requesting evaluation"
+            );
+            if let Err(error) = emit_event(
+                &pool,
+                EventType::PortfolioEvaluationRequested,
+                &serde_json::json!({"reason": "entry_retry", "attempt": attempt + 1}),
+            )
+            .await
+            {
+                warn!(error = %error, "Failed to emit entry retry evaluation request");
+            }
+        }
+
+        info!("Entry retry attempts exhausted; portfolio stays empty this session");
+    });
 }
 
 /// Sleeps until [`LIQUIDATION_LEAD_TIME_MINUTES`] before the close, then emits
@@ -551,13 +707,15 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, LIQUIDATION_LEAD_TIME_MINUTES,
+        CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
+        ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
     };
     use crate::common::events::EventType;
 
     #[test]
     fn test_consumer_names_are_stable() {
         assert_eq!(CONSUMER_PORTFOLIO, "portfolio");
+        assert_eq!(CONSUMER_PORTFOLIO_SESSION, "portfolio-session");
         assert_eq!(CONSUMER_PORTFOLIO_LIQUIDATION, "portfolio-liquidation");
     }
 
@@ -594,7 +752,7 @@ mod tests {
 
     use super::{
         close_is_near, handle_portfolio_evaluation, handle_trading_session_started,
-        spawn_liquidation_timer,
+        spawn_entry_retry_timer, spawn_liquidation_timer,
     };
     use crate::common::market_hours::MarketSession;
     use crate::portfolio::alpaca::MockTrading;
@@ -639,7 +797,7 @@ mod tests {
         let state = make_test_state(mock);
         let token = CancellationToken::new();
 
-        handle_trading_session_started(&state, state.pool(), &token).await;
+        handle_trading_session_started(&state, state.pool(), 1, &token).await;
 
         // Returned before claiming the rebalance slot.
         assert!(!state.rebalance_in_progress());
@@ -656,9 +814,46 @@ mod tests {
         let state = make_test_state(mock);
         let token = CancellationToken::new();
 
-        handle_trading_session_started(&state, state.pool(), &token).await;
+        handle_trading_session_started(&state, state.pool(), 1, &token).await;
 
         assert!(!state.rebalance_in_progress());
+    }
+
+    #[tokio::test]
+    async fn test_entry_retry_backoff_widens_and_is_bounded() {
+        // Bounded so a persistent failure does not retry all session, and
+        // widening so the first attempt catches a brief outage quickly.
+        assert_eq!(ENTRY_RETRY_BACKOFF_MINUTES, [5, 15, 30]);
+        let mut previous = 0;
+        for minutes in ENTRY_RETRY_BACKOFF_MINUTES {
+            assert!(minutes > previous, "backoff must widen");
+            previous = minutes;
+        }
+        // Every attempt lands inside the session, so none can be armed only to
+        // be discarded by the close-proximity guard.
+        let total: i64 = ENTRY_RETRY_BACKOFF_MINUTES.iter().sum();
+        assert!(total < 390 - LIQUIDATION_LEAD_TIME_MINUTES);
+    }
+
+    #[tokio::test]
+    async fn test_entry_retry_cancels_on_shutdown() {
+        // The first attempt is five minutes out, so a test can only observe
+        // that cancellation resolves the task rather than waiting it out.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost:1/nonexistent_consumer_test")
+            .expect("lazy pool creation should not fail");
+        let token = CancellationToken::new();
+
+        spawn_entry_retry_timer(pool, regular_session(), token.clone());
+        token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !token.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation should resolve promptly");
     }
 
     #[tokio::test]

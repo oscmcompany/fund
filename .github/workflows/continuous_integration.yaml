@@ -65,11 +65,18 @@ jobs:
       - name: Wait for test services
         if: steps.changes.outputs.rust == 'true'
         run: |
+          # Any HTTP response means the object store is listening. `curl -f`
+          # would treat a 403 as down, and an unsigned GET / returns 403 on
+          # MinIO and on real S3, so the probe must not assume a 200 there.
+          object_store_up() {
+            status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:8333 || true)
+            [ -n "${status}" ] && [ "${status}" != "000" ]
+          }
           for attempt in $(seq 1 90); do
             postgres_ready=false
             object_store_ready=false
             pg_isready -h localhost -p 5432 -q && postgres_ready=true
-            curl -sf -o /dev/null http://127.0.0.1:8333 && object_store_ready=true
+            object_store_up && object_store_ready=true
             if [ "$postgres_ready" = true ] && [ "$object_store_ready" = true ]; then
               echo "Test services ready after ${attempt}s"
               exit 0
