@@ -225,7 +225,7 @@ fn database_url_base() -> String {
 /// Only pg_cron is removed, and not because it is unavailable in general: the
 /// extension is restricted by `cron.database_name` to a single database, so
 /// `CREATE EXTENSION` fails anywhere else. That covers the extension itself, the
-/// `DO` blocks that schedule jobs, and `cron.schedule_in_timezone`.
+/// `DO` blocks that schedule jobs, and any function defined in the `cron` schema.
 ///
 /// TimescaleDB is deliberately *not* stripped. It was, back when these tests ran
 /// against a vanilla Postgres container, which meant every assertion ran against

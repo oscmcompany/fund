@@ -488,9 +488,12 @@ in {
     exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
 
+  # Emits the same event the live-quote evaluator raises on a threshold crossing, so a
+  # manual trigger exercises the identical handler path. The previous 'intraday_check'
+  # type was retired with the five-minute heartbeat and matched no consumer, so this
+  # script inserted a row that nothing acted on.
   scripts.trigger-rebalance.exec = ''
-    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('intraday_check',
-    '{}')"
+    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('portfolio_evaluation_requested', jsonb_build_object('reason', 'manual'))"
   '';
 
   scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm --environment development";

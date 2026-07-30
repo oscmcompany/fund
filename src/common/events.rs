@@ -50,9 +50,11 @@ pub enum EventType {
     /// data: database purge has started.
     DatabasePurgeStarted,
     /// data: database purge completed successfully.
+    ///
+    /// There is no errored counterpart: `purge_ephemeral_tables` returns a summary
+    /// rather than a `Result`, logging and skipping any table that fails, so the
+    /// handler has no failure path to report.
     DatabasePurgeCompleted,
-    /// data: database purge encountered an error.
-    DatabasePurgeErrored,
 
     // --- Prediction pipeline ---
     /// pg_cron trigger: pre-market request for the day's equity predictions.
@@ -132,7 +134,6 @@ impl EventType {
             Self::DatabasePurgeRequested => "database_purge_requested",
             Self::DatabasePurgeStarted => "database_purge_started",
             Self::DatabasePurgeCompleted => "database_purge_completed",
-            Self::DatabasePurgeErrored => "database_purge_errored",
             Self::EquityPredictionsRequested => "equity_predictions_requested",
             Self::EquityPredictionsStarted => "equity_predictions_started",
             Self::EquityPredictionsCompleted => "equity_predictions_completed",
@@ -168,7 +169,6 @@ impl EventType {
             "database_purge_requested" => Some(Self::DatabasePurgeRequested),
             "database_purge_started" => Some(Self::DatabasePurgeStarted),
             "database_purge_completed" => Some(Self::DatabasePurgeCompleted),
-            "database_purge_errored" => Some(Self::DatabasePurgeErrored),
             "equity_predictions_requested" => Some(Self::EquityPredictionsRequested),
             "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
             "equity_predictions_completed" => Some(Self::EquityPredictionsCompleted),
@@ -328,27 +328,6 @@ pub async fn events_after(
         .collect())
 }
 
-/// Returns the payload of a specific event by type and id.
-///
-/// Used during startup catchup to retrieve the JSONB payload (e.g. export date)
-/// for an event that was missed while the consumer was down. Returns an empty
-/// object when the event is not found.
-pub async fn query_event_payload(
-    pool: &PgPool,
-    event_type: EventType,
-    event_id: i64,
-) -> Result<serde_json::Value, sqlx::Error> {
-    use sqlx::Row;
-    let row = sqlx::query("SELECT payload FROM events WHERE event_type = $1 AND id = $2 LIMIT 1")
-        .bind(event_type.as_str())
-        .bind(event_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row
-        .and_then(|row| row.try_get::<serde_json::Value, _>("payload").ok())
-        .unwrap_or_else(|| serde_json::json!({})))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +363,6 @@ mod tests {
             EventType::DatabasePurgeRequested,
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
-            EventType::DatabasePurgeErrored,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
@@ -526,17 +504,6 @@ mod tests {
     }
 
     #[test]
-    fn test_query_event_payload_compiles() {
-        make_runtime().block_on(async {
-            assert!(
-                query_event_payload(&lazy_pool(), EventType::DatabaseExportRequested, 1)
-                    .await
-                    .is_err()
-            );
-        });
-    }
-
-    #[test]
     fn test_event_type_as_str_all_variants() {
         // Exhaustively verify every variant maps to its expected snake_case string.
         let cases: &[(EventType, &str)] = &[
@@ -579,7 +546,6 @@ mod tests {
                 EventType::DatabasePurgeCompleted,
                 "database_purge_completed",
             ),
-            (EventType::DatabasePurgeErrored, "database_purge_errored"),
             (EventType::TradingSessionStarted, "trading_session_started"),
             (
                 EventType::PortfolioEvaluationRequested,
@@ -660,7 +626,6 @@ mod tests {
             EventType::DatabasePurgeRequested,
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
-            EventType::DatabasePurgeErrored,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,

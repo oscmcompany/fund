@@ -6,9 +6,8 @@
 //! heartbeat.
 //!
 //! The hot path is pure arithmetic against cached baselines: no Alpaca calls, no
-//! database reads, no writes. Only a crossing pays for a durable event, which is
-//! the `DataBoundary` contract — raw quotes stay ephemeral and only a decision
-//! crosses into PostgreSQL.
+//! database reads, no writes. Only a crossing pays for a durable event — raw
+//! quotes stay ephemeral and only a decision crosses into PostgreSQL.
 //!
 //! This is a trigger, not a decision. It answers "something may have crossed, go
 //! look"; the authoritative close is made by `evaluate_open_pairs` inside the
