@@ -2,12 +2,13 @@ use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, run_event_listener,
     update_consumer_offset, EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP,
     CONSUMER_DATA_DATABASE_EXPORT, CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
-    CONSUMER_DATA_MODEL_ARTIFACT, CONSUMER_DATA_SCHEDULER_HEALTH,
+    CONSUMER_DATA_MARKET_CALENDAR, CONSUMER_DATA_MODEL_ARTIFACT, CONSUMER_DATA_SCHEDULER_HEALTH,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
 use crate::data::equity_details;
 use crate::data::export;
 use crate::data::market_calendar;
+use crate::data::market_calendar_sync;
 use crate::data::model_artifact;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
@@ -37,6 +38,7 @@ const GAP_DETECTION_LOOKBACK_DAYS: i64 = 90;
 /// That job runs a `DELETE` directly and emits nothing, which is why it does not
 /// carry an event-shaped name.
 const EXPECTED_CRON_JOBS: &[&str] = &[
+    "market-calendar-sync-requested",
     "equity-bars-sync-requested",
     "equity-predictions-requested",
     "trading-session-started",
@@ -546,6 +548,10 @@ async fn run_listener(
                     info!(event_id, "Received database_purge_requested");
                     handle_database_purge(pool, event_id).await;
                 }
+                EventType::MarketCalendarSync(Outcome::Requested) => {
+                    info!(event_id, "Received market_calendar_sync_requested");
+                    handle_market_calendar_sync(state, pool, event_id).await;
+                }
                 EventType::SchedulerHealthCheck(Outcome::Requested) => {
                     info!(event_id, "Received scheduler_health_check_requested");
                     handle_scheduler_health_check(pool, event_id).await;
@@ -569,6 +575,9 @@ async fn run_listener(
                     Outcome::Started | Outcome::Completed | Outcome::Errored,
                 )
                 | EventType::DatabasePurge(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::MarketCalendarSync(
                     Outcome::Started | Outcome::Completed | Outcome::Errored,
                 )
                 | EventType::SchedulerHealthCheck(
@@ -599,6 +608,26 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
     // Validate pg_cron jobs and event freshness on startup. Event freshness
     // is only meaningful when pg_cron is installed (otherwise no cron-triggered
     // events exist and every check would produce a false warning).
+    // Publish the persisted calendar first: everything below asks trading-day
+    // questions, and answering them from the hardcoded fallback when a synced
+    // calendar exists in the database would be a needless downgrade.
+    publish_persisted_calendar(pool).await;
+
+    let calendar_offset = get_consumer_offset(pool, CONSUMER_DATA_MARKET_CALENDAR).await?;
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::MarketCalendarSync(Outcome::Requested),
+        calendar_offset,
+    )
+    .await?
+    {
+        info!(
+            event_id,
+            "Catching up on missed market_calendar_sync_requested"
+        );
+        handle_market_calendar_sync(state, pool, event_id).await;
+    }
+
     let report = validate_cron_jobs(pool).await;
     if report.pg_cron_available {
         check_event_freshness(pool).await;
@@ -687,6 +716,79 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Loads the persisted calendar and publishes it for the process.
+///
+/// Best-effort: a database that has never synced, or a failed read, leaves the
+/// hardcoded holiday fallback in place rather than blocking startup. That
+/// fallback is why every calendar lookup can stay synchronous and infallible.
+pub async fn publish_persisted_calendar(pool: &sqlx::PgPool) {
+    match market_calendar_sync::load_persisted_calendar(pool).await {
+        Ok(calendar) if calendar.is_empty() => {
+            info!(
+                "No persisted market calendar; using the static holiday fallback until first sync"
+            )
+        }
+        Ok(calendar) => {
+            let sessions = calendar.len();
+            let horizon = calendar.horizon();
+            market_calendar::install(calendar);
+            match horizon {
+                Some((start, end)) => info!(
+                    sessions,
+                    %start,
+                    %end,
+                    "Published the persisted market calendar"
+                ),
+                None => info!(sessions, "Published the persisted market calendar"),
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "Could not load the persisted market calendar; using the static holiday fallback")
+        }
+    }
+}
+
+/// Refreshes the published trading calendar from Alpaca.
+///
+/// The calendar is the only source that knows about half-days, so a sync that
+/// fails leaves the system treating every early close as a full session — worth
+/// an event rather than a log line.
+async fn handle_market_calendar_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::MarketCalendarSync(Outcome::Started),
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit market_calendar_sync_started");
+    }
+
+    let (outcome, payload) = match market_calendar_sync::run_market_calendar_sync(state, pool).await
+    {
+        Ok(session_count) => (
+            Outcome::Completed,
+            serde_json::json!({"sessions": session_count}),
+        ),
+        Err(error) => {
+            error!(error = %error, "Market calendar sync errored");
+            (
+                Outcome::Errored,
+                serde_json::json!({"error": error.to_string()}),
+            )
+        }
+    };
+
+    if let Err(error) = emit_event(pool, EventType::MarketCalendarSync(outcome), &payload).await {
+        warn!(error = %error, "Failed to emit the market calendar sync outcome");
+    }
+
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_MARKET_CALENDAR, event_id).await
+    {
+        warn!(error = %error, "Failed to update market-calendar consumer offset");
+    }
 }
 
 /// Re-runs the startup health checks on a schedule and reports the result.
@@ -1768,12 +1870,13 @@ mod tests {
 
     #[test]
     fn test_expected_cron_jobs_list_is_complete() {
-        assert_eq!(EXPECTED_CRON_JOBS.len(), 8);
+        assert_eq!(EXPECTED_CRON_JOBS.len(), 9);
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-predictions-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"trading-session-started"));
         assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"database-export-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"market-calendar-sync-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"scheduler-health-check-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"model-artifact-check-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));

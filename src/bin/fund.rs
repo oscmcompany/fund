@@ -94,6 +94,13 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
+    // Publish the persisted trading calendar before any service starts. Every
+    // module asks trading-day questions — gap detection, artifact staleness, the
+    // session schedule — and the alternative is the hardcoded holiday fallback,
+    // which knows nothing about half-days. Done here rather than per service so
+    // a process running only the portfolio module gets it too.
+    fund::data::scheduler::publish_persisted_calendar(&pool).await;
+
     let run_data = module.is_none() || module == Some(Module::Data);
     let run_inference = module.is_none() || module == Some(Module::Inference);
     let run_portfolio = module.is_none() || module == Some(Module::Portfolio);

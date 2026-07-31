@@ -154,6 +154,7 @@ async fn run_consumer(
                 | EventType::DatabaseExport(_)
                 | EventType::DatabaseBackup(_)
                 | EventType::DatabasePurge(_)
+                | EventType::MarketCalendarSync(_)
                 | EventType::SchedulerHealthCheck(_)
                 | EventType::ModelArtifactCheck(_)
                 | EventType::ModelArtifactPublished

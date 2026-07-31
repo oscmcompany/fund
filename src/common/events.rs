@@ -120,6 +120,16 @@ pub enum EventType {
     /// Liquidation is idempotent, so both firing is harmless.
     PortfolioLiquidation(Outcome),
 
+    /// Daily refresh of the published NYSE trading calendar.
+    ///
+    /// `Requested` comes from pg_cron ahead of the bars sync. The data service
+    /// fetches Alpaca's calendar, persists it, and publishes it in memory.
+    ///
+    /// This is the only source that knows about half-days: the hardcoded holiday
+    /// table cannot express a 13:00 close, and `/v2/clock` knows the shortened
+    /// close only for the session it is currently reporting.
+    MarketCalendarSync(Outcome),
+
     /// Scheduled validation that the pg_cron schedule and event bus are healthy.
     ///
     /// `Requested` comes from pg_cron mid-morning; the data service re-runs the
@@ -201,6 +211,10 @@ impl EventType {
             Self::PortfolioLiquidation(Outcome::Started) => "portfolio_liquidation_started",
             Self::PortfolioLiquidation(Outcome::Completed) => "portfolio_liquidation_completed",
             Self::PortfolioLiquidation(Outcome::Errored) => "portfolio_liquidation_errored",
+            Self::MarketCalendarSync(Outcome::Requested) => "market_calendar_sync_requested",
+            Self::MarketCalendarSync(Outcome::Started) => "market_calendar_sync_started",
+            Self::MarketCalendarSync(Outcome::Completed) => "market_calendar_sync_completed",
+            Self::MarketCalendarSync(Outcome::Errored) => "market_calendar_sync_errored",
             Self::SchedulerHealthCheck(Outcome::Requested) => "scheduler_health_check_requested",
             Self::SchedulerHealthCheck(Outcome::Started) => "scheduler_health_check_started",
             Self::SchedulerHealthCheck(Outcome::Completed) => "scheduler_health_check_completed",
@@ -257,6 +271,10 @@ impl EventType {
                 Some(Self::PortfolioLiquidation(Outcome::Completed))
             }
             "portfolio_liquidation_errored" => Some(Self::PortfolioLiquidation(Outcome::Errored)),
+            "market_calendar_sync_requested" => Some(Self::MarketCalendarSync(Outcome::Requested)),
+            "market_calendar_sync_started" => Some(Self::MarketCalendarSync(Outcome::Started)),
+            "market_calendar_sync_completed" => Some(Self::MarketCalendarSync(Outcome::Completed)),
+            "market_calendar_sync_errored" => Some(Self::MarketCalendarSync(Outcome::Errored)),
             "scheduler_health_check_requested" => {
                 Some(Self::SchedulerHealthCheck(Outcome::Requested))
             }
@@ -294,6 +312,7 @@ impl EventType {
                 | Self::TradingSessionStarted
                 | Self::PortfolioEvaluationRequested
                 | Self::PortfolioLiquidation(Outcome::Requested)
+                | Self::MarketCalendarSync(Outcome::Requested)
                 | Self::SchedulerHealthCheck(Outcome::Requested)
                 | Self::ModelArtifactCheck(Outcome::Requested)
                 | Self::ModelArtifactPublished
@@ -524,6 +543,9 @@ pub const CONSUMER_DATA_DATABASE_BACKUP: &str = "data-database-backup";
 
 /// Consumer name for the data database purge consumer.
 pub const CONSUMER_DATA_DATABASE_PURGE: &str = "data-database-purge";
+
+/// Consumer name for the daily market calendar sync.
+pub const CONSUMER_DATA_MARKET_CALENDAR: &str = "data-market-calendar";
 
 /// Consumer name for the scheduled scheduler health check.
 pub const CONSUMER_DATA_SCHEDULER_HEALTH: &str = "data-scheduler-health";
@@ -777,6 +799,22 @@ mod tests {
             "portfolio_liquidation_errored",
         ),
         (
+            EventType::MarketCalendarSync(Outcome::Requested),
+            "market_calendar_sync_requested",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Started),
+            "market_calendar_sync_started",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Completed),
+            "market_calendar_sync_completed",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Errored),
+            "market_calendar_sync_errored",
+        ),
+        (
             EventType::SchedulerHealthCheck(Outcome::Requested),
             "scheduler_health_check_requested",
         ),
@@ -827,6 +865,7 @@ mod tests {
         EventType::TradingSessionStarted,
         EventType::PortfolioEvaluationRequested,
         EventType::PortfolioLiquidation(Outcome::Requested),
+        EventType::MarketCalendarSync(Outcome::Requested),
         EventType::SchedulerHealthCheck(Outcome::Requested),
         EventType::ModelArtifactCheck(Outcome::Requested),
         EventType::ModelArtifactPublished,
@@ -867,7 +906,8 @@ mod tests {
         //
         // Adding a *family* still needs a line here, which the exhaustive match
         // below turns into a compile error rather than a silent gap.
-        let families: [fn(Outcome) -> EventType; 9] = [
+        let families: [fn(Outcome) -> EventType; 10] = [
+            EventType::MarketCalendarSync,
             EventType::SchedulerHealthCheck,
             EventType::ModelArtifactCheck,
             EventType::EquityBarsSync,
@@ -929,6 +969,7 @@ mod tests {
                 | EventType::EquityPredictions(_)
                 | EventType::PortfolioRebalance(_)
                 | EventType::PortfolioLiquidation(_)
+                | EventType::MarketCalendarSync(_)
                 | EventType::SchedulerHealthCheck(_)
                 | EventType::ModelArtifactCheck(_)
                 | EventType::TradingSessionStarted

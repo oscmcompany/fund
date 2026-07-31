@@ -8,6 +8,7 @@ pub mod errors;
 pub mod export;
 pub mod manifest;
 pub mod market_calendar;
+pub mod market_calendar_sync;
 pub mod model_artifact;
 pub mod scheduler;
 pub mod state;

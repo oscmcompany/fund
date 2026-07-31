@@ -249,6 +249,18 @@ BEGIN
 END;
 $do$;
 
+-- market_calendar: published NYSE trading sessions with their real hours.
+-- One row per trading day; a date with no row does not trade. Times are Eastern local, as Alpaca
+-- publishes them, so a half-day carries its actual 13:00 close rather than an assumed 16:00.
+-- Reference data, not ephemeral: deliberately absent from the nightly purge table list. Purging it
+-- would leave trading-day arithmetic on the hardcoded NYSE_HOLIDAYS fallback until the next sync.
+CREATE TABLE IF NOT EXISTS market_calendar (
+    session_date  DATE        PRIMARY KEY,
+    session_open  TIME        NOT NULL,
+    session_close TIME        NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- events: append-only outbox for cross-service event coordination
 CREATE TABLE IF NOT EXISTS events (
     id          BIGSERIAL   NOT NULL,
@@ -433,6 +445,25 @@ BEGIN
             $$SELECT emit_event('database_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
         );
     END IF;
+END;
+$do$;
+
+-- Market calendar sync: daily at 04:00 UTC, ahead of the 05:00 bars sync that depends on
+-- trading-day arithmetic. Refreshes the published NYSE session calendar from Alpaca, which is the
+-- only source that knows about half-days -- the hardcoded holiday table in market_calendar.rs
+-- cannot express a 13:00 close, and treats every early-close day as a full session.
+-- Daily rather than weekly so a newly published holiday or shortened session is picked up promptly
+-- and the forward horizon rolls with the date, at a cost of one API call a day.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-calendar-sync-requested') THEN
+        PERFORM cron.unschedule('market-calendar-sync-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'market-calendar-sync-requested',
+        '0 4 * * *',
+        $$SELECT emit_event('market_calendar_sync_requested', '{"reason": "scheduled"}'::jsonb)$$
+    );
 END;
 $do$;
 
