@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id!\", activity_type AS \"activity_type!\",\n                  transaction_time AS \"transaction_time!\", ticker, side,\n                  quantity::double precision AS quantity,\n                  price::double precision AS price,\n                  order_id\n           FROM account_activities\n           WHERE (transaction_time AT TIME ZONE 'America/New_York')::date = $1\n           ORDER BY transaction_time",
+  "query": "SELECT id AS \"id!\", activity_type AS \"activity_type!\",\n                  transaction_time AS \"transaction_time!\", ticker, side,\n                  quantity::double precision AS quantity,\n                  price::double precision AS price,\n                  order_id\n           FROM account_activities\n           WHERE transaction_time >= $1 AND transaction_time < $2\n           ORDER BY transaction_time",
   "describe": {
     "columns": [
       {
@@ -46,7 +46,8 @@
     ],
     "parameters": {
       "Left": [
-        "Date"
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -60,5 +61,5 @@
       true
     ]
   },
-  "hash": "6b06b0b3f814c06d940537d42679bcf647da2d9227fbe4a06877ca67d7ff98a7"
+  "hash": "038d3a2e85235b89f1e0d91171ba2c52fb08c5fd32bded4d8ec9fe15922be2eb"
 }

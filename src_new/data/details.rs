@@ -58,9 +58,7 @@ fn parse_details(csv: &str) -> Result<Vec<EquityDetail>, DetailsError> {
         .next()
         .ok_or_else(|| DetailsError::Parse("the CSV is empty".to_string()))?;
 
-    let columns: Vec<&str> = split_csv_line(header).iter().map(|_| "").collect();
     let header_fields = split_csv_line(header);
-    let _ = columns;
 
     let index_of = |name: &str| -> Result<usize, DetailsError> {
         header_fields

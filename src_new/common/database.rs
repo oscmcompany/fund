@@ -15,6 +15,14 @@ use tracing::info;
 /// ten existed for three services sharing a database.
 const MAXIMUM_CONNECTIONS: u32 = 5;
 
+/// How long to wait for a free connection before giving up.
+///
+/// Explicit rather than left at sqlx's 30-second default. A handler that cannot get a connection is
+/// blocked on something that is not going to resolve inside a five-minute evaluation window, and a
+/// prompt error that lands in the `_errored` payload is more useful than a long stall that pushes
+/// the pass past its next firing.
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Errors that prevent the service from reaching PostgreSQL.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -30,10 +38,12 @@ pub async fn connect_pool() -> Result<PgPool, ConnectionError> {
         std::env::var("DATABASE_URL").map_err(|_| ConnectionError::MissingDatabaseUrl)?;
     let pool = PgPoolOptions::new()
         .max_connections(MAXIMUM_CONNECTIONS)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect(&database_url)
         .await?;
     info!(
         maximum_connections = MAXIMUM_CONNECTIONS,
+        acquire_timeout_seconds = ACQUIRE_TIMEOUT.as_secs(),
         "Connected to PostgreSQL"
     );
     Ok(pool)

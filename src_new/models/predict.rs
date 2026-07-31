@@ -287,7 +287,14 @@ pub fn generate_predictions(
     }
     let mut results = Vec::new();
 
-    let ticker_mapping = &model_state.mappings()["ticker"];
+    // Indexing a `HashMap` panics on a missing key. An artifact without a `ticker` mapping is a
+    // malformed artifact, which is a condition to report rather than one to abort the process on --
+    // the pre-open handler can then fall back and record the failure in its errored payload.
+    let ticker_mapping = model_state.mappings().get("ticker").ok_or_else(|| {
+        PredictionError::Inference(
+            "the loaded artifact has no 'ticker' categorical mapping".to_string(),
+        )
+    })?;
     let reverse_ticker_map: std::collections::HashMap<i32, &String> =
         ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
 

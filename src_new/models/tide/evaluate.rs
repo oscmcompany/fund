@@ -73,6 +73,24 @@ pub fn evaluate(
         predictions.append(&mut values);
     }
 
+    // The loop below indexes `predictions` arithmetically from the sample, horizon, and quantile
+    // counts, so a shorter buffer than those imply is an out-of-bounds panic partway through
+    // evaluation rather than an error. That can only happen if the forward pass returned a
+    // different shape than the parameters describe -- a real mismatch, but one worth reporting as
+    // an error the trainer can log rather than as a crash mid-run.
+    let expected_predictions = sample_count * output_length * num_quantiles;
+    if predictions.len() < expected_predictions {
+        return Err(format!(
+            "model returned {} prediction values, expected {} for {} samples x {} horizon x {} quantiles",
+            predictions.len(),
+            expected_predictions,
+            sample_count,
+            output_length,
+            num_quantiles
+        )
+        .into());
+    }
+
     let mut crps_sum = 0.0_f64;
     let mut directional_matches = 0_usize;
     let mut covered = 0_usize;

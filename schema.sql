@@ -117,7 +117,15 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     close_reason              TEXT
         CHECK (close_reason IN ('convergence', 'stop_loss', 'end_of_day', 'position_missing')),
     realized_profit_and_loss  NUMERIC,
-    UNIQUE (pair_id, opened_at)
+    UNIQUE (pair_id, opened_at),
+    -- Closure is three columns that must agree, so the agreement is enforced here rather than in
+    -- the handler that writes them. Without this the table accepts a closed pair with a null
+    -- closed_at, which idx_equity_pairs_closed_at then sorts first under DESC -- so the least
+    -- complete row would present as the most recent close.
+    CONSTRAINT equity_pairs_closure_is_consistent CHECK (
+        (status = 'open' AND closed_at IS NULL AND close_reason IS NULL)
+        OR (status = 'closed' AND closed_at IS NOT NULL AND close_reason IS NOT NULL)
+    )
 );
 
 -- The evaluation pass asks for open pairs every five minutes and for nothing else on this table
@@ -204,17 +212,42 @@ CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id); -- noq
 SELECT remove_retention_policy('events', if_exists => TRUE);
 
 -- notify_event: fires pg_notify on the 'events' channel after each insert.
--- The payload carries event_id, event_type, and the event payload so the consumer can dispatch and
--- read structured data without a second round trip.
+--
+-- The notification carries event_id, event_type, and normally the payload too, so the consumer can
+-- dispatch and read structured data without a second round trip.
+--
+-- "Normally" is load-bearing. pg_notify rejects a payload of 8000 bytes or more, and this trigger
+-- is AFTER INSERT FOR EACH ROW, so that rejection propagates and rolls back the emit_event insert
+-- that caused it. The event row would be lost entirely -- and worse, the startup recovery scan
+-- looks for requests with no terminal outcome, so a completed row lost this way reads as a command
+-- that never finished and gets replayed.
+--
+-- That is reachable rather than theoretical: completed payloads deliberately carry per-run
+-- summaries, and those grow with session activity. So the payload is included only when the whole
+-- notification fits, and omitted with payload_truncated set otherwise. The consumer reads the row
+-- by event_id in that case. The 7900-byte bound leaves room for the enclosing JSON.
 CREATE OR REPLACE FUNCTION notify_event() RETURNS trigger AS $$
+DECLARE
+    full_notification TEXT;
 BEGIN
-    PERFORM pg_notify('events',
-        json_build_object(
-            'event_id',   NEW.id,
-            'event_type', NEW.event_type,
-            'payload',    NEW.payload
-        )::text
-    );
+    full_notification := json_build_object(
+        'event_id',   NEW.id,
+        'event_type', NEW.event_type,
+        'payload',    NEW.payload
+    )::text;
+
+    IF octet_length(full_notification) < 7900 THEN
+        PERFORM pg_notify('events', full_notification);
+    ELSE
+        PERFORM pg_notify('events',
+            json_build_object(
+                'event_id',          NEW.id,
+                'event_type',        NEW.event_type,
+                'payload_truncated', TRUE
+            )::text
+        );
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

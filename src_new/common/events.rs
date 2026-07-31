@@ -312,6 +312,12 @@ pub struct Notification {
     pub event_id: i64,
     pub event_type: EventType,
     pub payload: Value,
+    /// Whether the trigger omitted the payload because the notification would have exceeded
+    /// `pg_notify`'s 8000-byte limit.
+    ///
+    /// When set, `payload` is an empty object and the real payload must be read from the row with
+    /// [`fetch_payload`]. Ignoring this flag would silently treat a large summary as an empty one.
+    pub payload_truncated: bool,
 }
 
 impl Notification {
@@ -324,6 +330,10 @@ impl Notification {
         let value: Value = serde_json::from_str(raw).ok()?;
         let event_id = value.get("event_id")?.as_i64()?;
         let event_type = EventType::parse(value.get("event_type")?.as_str()?)?;
+        let payload_truncated = value
+            .get("payload_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let payload = value
             .get("payload")
             .cloned()
@@ -332,8 +342,20 @@ impl Notification {
             event_id,
             event_type,
             payload,
+            payload_truncated,
         })
     }
+}
+
+/// Reads one event's payload from the row, for notifications that arrived truncated.
+pub async fn fetch_payload(pool: &PgPool, event_id: i64) -> Result<Value, EventError> {
+    let row = sqlx::query!(
+        r#"SELECT payload AS "payload!" FROM events WHERE id = $1"#,
+        event_id
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.payload)
 }
 
 #[cfg(test)]
@@ -430,6 +452,19 @@ mod tests {
         let raw = r#"{"event_id":1,"event_type":"account_sync_requested"}"#;
         let notification = Notification::parse(raw).expect("absent payload is allowed");
         assert_eq!(notification.payload, Value::Object(serde_json::Map::new()));
+        assert!(!notification.payload_truncated);
+    }
+
+    /// A payload too large for `pg_notify` arrives with the flag set and no payload. Treating that
+    /// as an empty summary would silently discard exactly the largest, most interesting runs, so
+    /// the flag has to survive parsing.
+    #[test]
+    fn test_notification_reports_a_truncated_payload() {
+        let raw = r#"{"event_id":7,"event_type":"portfolio_evaluation_completed","payload_truncated":true}"#;
+        let notification = Notification::parse(raw).expect("truncated form must parse");
+        assert!(notification.payload_truncated);
+        assert_eq!(notification.payload, Value::Object(serde_json::Map::new()));
+        assert_eq!(notification.event_id, 7);
     }
 
     /// A malformed or unknown notification must not be an error the listener dies on.

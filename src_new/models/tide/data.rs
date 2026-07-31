@@ -126,6 +126,15 @@ pub(crate) const CATEGORICAL_COLUMNS: &[&str] = &[
 
 pub(crate) const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "industry"];
 
+/// Placeholder for a null categorical value.
+///
+/// `into_no_null_iter` silently *skips* nulls, so building these columns with it produced a vector
+/// shorter than the frame whenever `sector` or `industry` was null — which either failed the column
+/// replacement outright or, worse, shifted every later row onto the wrong ticker. Substituting a
+/// sentinel preserves length and alignment, and for `ticker` the sentinel is the value the filter
+/// immediately below already drops.
+pub(crate) const UNKNOWN_CATEGORY: &str = "UNKNOWN";
+
 /// The model target is the future window of `daily_return`, which is the last
 /// continuous column. Fitting and windowing index into this position.
 pub(crate) const TARGET_COLUMN: &str = "daily_return";
@@ -487,8 +496,8 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .map_err(|e| e.to_string())?
         .str()
         .map_err(|e| e.to_string())?
-        .into_no_null_iter()
-        .map(|s| s.to_uppercase())
+        .into_iter()
+        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
         .collect();
 
     let sector_upper: Vec<String> = data
@@ -496,8 +505,8 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .map_err(|e| e.to_string())?
         .str()
         .map_err(|e| e.to_string())?
-        .into_no_null_iter()
-        .map(|s| s.to_uppercase())
+        .into_iter()
+        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
         .collect();
 
     let industry_upper: Vec<String> = data
@@ -505,8 +514,8 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .map_err(|e| e.to_string())?
         .str()
         .map_err(|e| e.to_string())?
-        .into_no_null_iter()
-        .map(|s| s.to_uppercase())
+        .into_iter()
+        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
         .collect();
 
     data.with_column(Column::new("ticker".into(), ticker_upper))
@@ -522,7 +531,7 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .map_err(|e| e.to_string())?
         .str()
         .map_err(|e| e.to_string())?
-        .not_equal("UNKNOWN");
+        .not_equal(UNKNOWN_CATEGORY);
 
     let cleaned = data.filter(&mask).map_err(|e| e.to_string())?;
 
@@ -614,10 +623,32 @@ pub(crate) fn encode_categoricals(
                         .map_err(|e| e.to_string())
                 })?;
 
+            // A sentinel merges every unmapped value into one id. For the static columns that
+            // includes `ticker`, and `window_frame` groups rows by the encoded ticker id -- so
+            // every unseen ticker would form a single group whose windows span unrelated
+            // instruments, with static features taken from whichever row began the window. The
+            // model would receive fabricated price histories and the predictions would be
+            // attributed to the wrong symbol, silently.
+            //
+            // `filter_to_trained_tickers` removes unmapped tickers before this on the prediction
+            // path, but that guard lives in another module and nothing enforces the ordering, so
+            // the invariant is also enforced here where it is relied upon.
+            let is_static = STATIC_CATEGORICAL_COLUMNS.contains(&col_name);
+            let unmapped = values.iter().filter(|value| value.is_none()).count();
+            let keep: BooleanChunked = values.iter().map(|value| value.is_some()).collect();
             let encoded: Vec<i32> = values.into_iter().map(|v| v.unwrap_or(-1)).collect();
             result
                 .with_column(Column::new(col_name.into(), encoded))
                 .map_err(|e| e.to_string())?;
+
+            if is_static && unmapped > 0 {
+                result = result.filter(&keep).map_err(|e| e.to_string())?;
+                tracing::warn!(
+                    column = col_name,
+                    dropped_rows = unmapped,
+                    "Dropped rows whose static categorical value is absent from the training mapping"
+                );
+            }
         }
     }
 

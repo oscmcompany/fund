@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use tracing::{info, warn};
 
@@ -45,6 +45,35 @@ pub fn eastern_date(instant: DateTime<Utc>) -> NaiveDate {
 /// The Eastern wall-clock time at an instant.
 pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
     instant.with_timezone(&New_York).time()
+}
+
+/// The half-open UTC interval `[start, end)` covering one Eastern calendar date.
+///
+/// This is the inverse of [`eastern_date`], and it exists so queries can bound a timestamp column
+/// directly instead of converting it. A predicate like
+/// `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column behind an expression,
+/// which stops TimescaleDB excluding chunks and stops the B-tree index being used — on a hypertable
+/// that turns a one-day export into a full scan of every chunk. Resolving the bounds here once and
+/// filtering `column >= $start AND column < $end` keeps the predicate sargable.
+///
+/// Spring-forward makes local midnight nonexistent in some timezones; Eastern shifts at 02:00, so
+/// midnight is always well-defined here. `earliest()` is nonetheless used rather than `unwrap()`,
+/// with a UTC-midnight fallback, so a timezone database change cannot panic the export.
+pub fn eastern_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    let start = eastern_midnight(date);
+    let end = eastern_midnight(date + Duration::days(1));
+    (start, end)
+}
+
+fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
+    let local_midnight = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid wall-clock time");
+    New_York
+        .from_local_datetime(&local_midnight)
+        .earliest()
+        .map(|zoned| zoned.with_timezone(&Utc))
+        .unwrap_or_else(|| local_midnight.and_utc())
 }
 
 /// Published trading sessions over a bounded horizon.
@@ -171,15 +200,18 @@ impl CalendarCache {
     }
 
     /// Returns today's calendar, fetching it if the cache is cold or was filled on an earlier date.
+    ///
+    /// The lock is released before the Alpaca call and re-taken only to store the result, so a cold
+    /// fetch does not block every other caller for its duration. Two callers arriving cold may both
+    /// fetch; the request is read-only and the result deterministic, so the duplicate is harmless.
     pub async fn get(
         &self,
         client: &TradingClient,
         now: DateTime<Utc>,
     ) -> Result<TradingCalendar, ClientError> {
         let today = eastern_date(now);
-        let mut guard = self.inner.lock().await;
 
-        if let Some((cached_date, calendar)) = guard.as_ref() {
+        if let Some((cached_date, calendar)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
                 return Ok(calendar.clone());
             }
@@ -199,7 +231,7 @@ impl CalendarCache {
                 trades_today = calendar.is_trading_day(today),
                 "Trading calendar cached"
             );
-            *guard = Some((today, calendar.clone()));
+            *self.inner.lock().await = Some((today, calendar.clone()));
         }
         Ok(calendar)
     }
@@ -388,6 +420,55 @@ mod tests {
             eastern_time(winter),
             NaiveTime::from_hms_opt(8, 30, 0).unwrap()
         );
+    }
+
+    /// The bounds must be half-open and must span exactly 24 hours on an ordinary day. In summer
+    /// Eastern is UTC-4, so the day runs 04:00 to 04:00 UTC.
+    #[test]
+    fn test_eastern_day_bounds_span_the_local_day_in_summer() {
+        let (start, end) = eastern_day_bounds(date(2026, 6, 10));
+        assert_eq!(start.to_rfc3339(), "2026-06-10T04:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-06-11T04:00:00+00:00");
+        assert_eq!((end - start).num_hours(), 24);
+    }
+
+    /// In winter Eastern is UTC-5, so the same local day is offset by an hour. A fixed offset would
+    /// get one of these two cases wrong.
+    #[test]
+    fn test_eastern_day_bounds_span_the_local_day_in_winter() {
+        let (start, end) = eastern_day_bounds(date(2026, 1, 14));
+        assert_eq!(start.to_rfc3339(), "2026-01-14T05:00:00+00:00");
+        assert_eq!(end.to_rfc3339(), "2026-01-15T05:00:00+00:00");
+    }
+
+    /// The transition days are 23 and 25 hours long. Bounds computed by adding a fixed 24 hours
+    /// would silently include or exclude an hour of rows on exactly these two days a year.
+    #[test]
+    fn test_eastern_day_bounds_handle_daylight_saving_transitions() {
+        let (spring_start, spring_end) = eastern_day_bounds(date(2026, 3, 8));
+        assert_eq!(
+            (spring_end - spring_start).num_hours(),
+            23,
+            "spring forward is a 23-hour day"
+        );
+
+        let (autumn_start, autumn_end) = eastern_day_bounds(date(2026, 11, 1));
+        assert_eq!(
+            (autumn_end - autumn_start).num_hours(),
+            25,
+            "fall back is a 25-hour day"
+        );
+    }
+
+    /// The bounds must round-trip against `eastern_date`: every instant inside them is that Eastern
+    /// date, and the exclusive end already belongs to the next one.
+    #[test]
+    fn test_eastern_day_bounds_round_trip_against_eastern_date() {
+        let day = date(2026, 6, 10);
+        let (start, end) = eastern_day_bounds(day);
+        assert_eq!(eastern_date(start), day);
+        assert_eq!(eastern_date(end - Duration::seconds(1)), day);
+        assert_eq!(eastern_date(end), day + Duration::days(1));
     }
 
     #[test]

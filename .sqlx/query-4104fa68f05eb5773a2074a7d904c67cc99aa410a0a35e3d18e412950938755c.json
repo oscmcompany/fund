@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id AS \"id!\", event_type AS \"event_type!\", payload AS \"payload!\",\n                  created_at AS \"created_at!\"\n           FROM events\n           WHERE (created_at AT TIME ZONE 'America/New_York')::date = $1\n           ORDER BY id",
+  "query": "SELECT id AS \"id!\", event_type AS \"event_type!\", payload AS \"payload!\",\n                  created_at AS \"created_at!\"\n           FROM events\n           WHERE created_at >= $1 AND created_at < $2\n           ORDER BY id",
   "describe": {
     "columns": [
       {
@@ -26,7 +26,8 @@
     ],
     "parameters": {
       "Left": [
-        "Date"
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -36,5 +37,5 @@
       false
     ]
   },
-  "hash": "1b3cb79e8debabaebc7c6ecd018eab71a78ded16a1351717269e86d8e74749bc"
+  "hash": "4104fa68f05eb5773a2074a7d904c67cc99aa410a0a35e3d18e412950938755c"
 }

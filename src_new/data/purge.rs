@@ -16,7 +16,10 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 /// Days of history retained in PostgreSQL after export.
-pub const RETENTION_DAYS: i64 = 7;
+///
+/// `i32` rather than `i64` because it is bound directly to `make_interval(days => ...)`, whose
+/// parameter is an `int4`.
+pub const RETENTION_DAYS: i32 = 7;
 
 /// Retention must leave enough nights that a silently failed export is noticed before the rows it
 /// missed become unrecoverable. Enforced at compile time rather than in a test, because the failure
@@ -43,10 +46,15 @@ pub struct PurgeSummary {
 }
 
 impl PurgeSummary {
+    /// Rows deleted across every table that purged cleanly.
+    ///
+    /// Failed tables contribute nothing, so this is what was actually removed rather than what was
+    /// attempted.
     pub fn total_rows(&self) -> u64 {
         self.purged.iter().map(|(_, rows)| rows).sum()
     }
 
+    /// Whether every table purged without error.
     pub fn is_clean(&self) -> bool {
         self.failed.is_empty()
     }
@@ -61,12 +69,14 @@ pub async fn purge_exported_tables(pool: &PgPool) -> PurgeSummary {
 
     for (table, timestamp_column) in PURGED_TABLES {
         // The table and column names come from the constant above, never from input, so formatting
-        // them into the statement is safe. The cutoff is still bound as a parameter.
+        // them into the statement is safe. The cutoff is still bound as a parameter, as an integer
+        // through `make_interval` rather than as a string concatenated into an interval literal --
+        // that keeps the type checking in the database instead of in a string cast.
         let statement = format!(
-            "DELETE FROM {table} WHERE {timestamp_column} < now() - ($1 || ' days')::interval"
+            "DELETE FROM {table} WHERE {timestamp_column} < now() - make_interval(days => $1)"
         );
         match sqlx::query(&statement)
-            .bind(RETENTION_DAYS.to_string())
+            .bind(RETENTION_DAYS)
             .execute(pool)
             .await
         {

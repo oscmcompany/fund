@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT ticker AS \"ticker!\", bar_interval AS \"bar_interval!\",\n                  timestamp AS \"timestamp!\", open_price AS \"open_price!\",\n                  high_price AS \"high_price!\", low_price AS \"low_price!\",\n                  close_price AS \"close_price!\", volume AS \"volume!\",\n                  volume_weighted_average_price, transactions\n           FROM equity_bars\n           WHERE bar_interval = $1\n             AND (timestamp AT TIME ZONE 'America/New_York')::date = $2\n           ORDER BY ticker",
+  "query": "SELECT ticker AS \"ticker!\", bar_interval AS \"bar_interval!\",\n                  timestamp AS \"timestamp!\", open_price AS \"open_price!\",\n                  high_price AS \"high_price!\", low_price AS \"low_price!\",\n                  close_price AS \"close_price!\", volume AS \"volume!\",\n                  volume_weighted_average_price, transactions\n           FROM equity_bars\n           WHERE timestamp >= $1 AND timestamp < $2\n           ORDER BY bar_interval, ticker",
   "describe": {
     "columns": [
       {
@@ -56,8 +56,8 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Date"
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -73,5 +73,5 @@
       true
     ]
   },
-  "hash": "a5b5168ad307c4e5ecfc9d1089c51eba133a5d5483b3aa95c0046e2ceb4b8409"
+  "hash": "a8c648a8d7b1afef684b700fc8a49cc8d87a2a50145f5f451f5a20a40b08e091"
 }

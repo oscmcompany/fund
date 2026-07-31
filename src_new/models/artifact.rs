@@ -24,7 +24,7 @@ use burn::backend::NdArray;
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::models::tide::config::ModelParameters;
 use crate::models::tide::data::{FeatureMappings, Scaler};
@@ -229,7 +229,18 @@ pub async fn resolve_artifact_key(
                 return Ok(key);
             }
             Err(error) => {
-                debug!(key = key, error = %error, "Run folder has no model artifact, trying older");
+                // Only a genuine absence justifies reaching for an older artifact. Treating every
+                // failure as "not there" means an expired credential or a transient network fault
+                // silently resolves yesterday's model and the day trades on it, reported as a
+                // normal run. A 404 is the trainer not having finished; anything else is a problem
+                // with this process, and it is raised.
+                let is_missing = error
+                    .as_service_error()
+                    .is_some_and(|service_error| service_error.is_not_found());
+                if !is_missing {
+                    return Err(ArtifactError::S3(format!("failed to check {key}: {error}")));
+                }
+                debug!(key = key, "Run folder has no model artifact, trying older");
             }
         }
     }
@@ -337,11 +348,20 @@ fn extract_tar_gz(tar_path: &Path, dest: &Path) -> Result<(), ArtifactError> {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
 
-        // Prevent path traversal
-        if path
+        // Every component must be a plain name. Rejecting only `..` was not enough: `Path::join`
+        // discards its base when the argument is absolute, so an entry named `/etc/cron.d/anything`
+        // would have been written to that absolute path rather than inside the extraction
+        // directory. Requiring `Normal` components rejects absolute paths, drive prefixes, `.` and
+        // `..` in one condition, and the archive this reads is flat by construction so nothing
+        // legitimate is excluded.
+        if !path
             .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
+            warn!(
+                entry = %path.display(),
+                "Rejected an artifact entry whose path is not a plain relative name"
+            );
             continue;
         }
 
@@ -475,6 +495,72 @@ pub async fn upload_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Path::join` discards its base when given an absolute path, so an entry named `/tmp/...`
+    /// would previously have been written to that absolute location rather than inside the
+    /// extraction directory. Rejecting non-`Normal` components is what stops it.
+    ///
+    /// The header name is written directly because the `tar` crate refuses to *produce* an absolute
+    /// entry path through its safe API — which is precisely why the reading side has to defend
+    /// itself against archives produced by something else.
+    #[test]
+    fn test_extract_rejects_an_absolute_entry_path() {
+        let escape_target = std::env::temp_dir().join("fund-artifact-escape-probe.txt");
+        let _ = std::fs::remove_file(&escape_target);
+
+        let staging = tempfile::tempdir().unwrap();
+        let archive_path = staging.path().join("evil.tar.gz");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+
+            let contents = b"owned";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            {
+                let absolute = escape_target.to_string_lossy().into_owned();
+                let name_field = &mut header.as_gnu_mut().unwrap().name;
+                let bytes = absolute.as_bytes();
+                assert!(
+                    bytes.len() < name_field.len(),
+                    "probe path must fit the name field"
+                );
+                name_field[..bytes.len()].copy_from_slice(bytes);
+            }
+            header.set_cksum();
+            builder.append(&header, &contents[..]).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        let destination = tempfile::tempdir().unwrap();
+        extract_tar_gz(&archive_path, destination.path()).expect("extraction must not fail");
+
+        let escaped = escape_target.exists();
+        let _ = std::fs::remove_file(&escape_target);
+        assert!(
+            !escaped,
+            "an absolute entry path must not be written outside the destination"
+        );
+    }
+
+    /// The flat, well-formed archive the trainer produces must still extract.
+    #[test]
+    fn test_extract_accepts_a_flat_archive() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("tide_parameters.json"), b"{}").unwrap();
+        let bytes = package_dir_to_tar_gz(staging.path()).unwrap();
+
+        let archive_path = staging.path().join("model.tar.gz");
+        std::fs::write(&archive_path, &bytes).unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        extract_tar_gz(&archive_path, destination.path()).unwrap();
+
+        assert!(destination.path().join("tide_parameters.json").exists());
+    }
 
     #[test]
     fn test_candidate_folders_descending_orders_newest_first() {

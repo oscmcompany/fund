@@ -17,13 +17,13 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::types::BarInterval;
+use crate::data::calendar::eastern_day_bounds;
 
 /// What one nightly export accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -77,16 +77,20 @@ pub async fn export_database(
         };
     }
 
-    export!("events", "exports/events", events_frame(pool, date));
+    // Resolved once and passed to every incremental query. Bounding the timestamp column directly
+    // keeps the predicate sargable; see `eastern_day_bounds`.
+    let (start, end) = eastern_day_bounds(date);
+
+    export!("events", "exports/events", events_frame(pool, start, end));
     export!(
         "equity_predictions",
         "exports/equity/predictions",
-        predictions_frame(pool, date)
+        predictions_frame(pool, start, end)
     );
     export!(
         "equity_bars",
         "exports/equity/bars",
-        bars_frame(pool, date, BarInterval::OneDay)
+        bars_frame(pool, start, end)
     );
     export!("equity_pairs", "exports/equity/pairs", pairs_frame(pool));
     export!(
@@ -97,7 +101,7 @@ pub async fn export_database(
     export!(
         "account_activities",
         "exports/account/activities",
-        account_activities_frame(pool, date)
+        account_activities_frame(pool, start, end)
     );
     export!(
         "equity_details",
@@ -144,14 +148,19 @@ async fn write_frame(
     Ok(())
 }
 
-async fn events_frame(pool: &PgPool, date: NaiveDate) -> Result<DataFrame, PolarsError> {
+async fn events_frame(
+    pool: &PgPool,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
         r#"SELECT id AS "id!", event_type AS "event_type!", payload AS "payload!",
                   created_at AS "created_at!"
            FROM events
-           WHERE (created_at AT TIME ZONE 'America/New_York')::date = $1
+           WHERE created_at >= $1 AND created_at < $2
            ORDER BY id"#,
-        date
+        start,
+        end
     )
     .fetch_all(pool)
     .await
@@ -174,16 +183,21 @@ async fn events_frame(pool: &PgPool, date: NaiveDate) -> Result<DataFrame, Polar
     ])
 }
 
-async fn predictions_frame(pool: &PgPool, date: NaiveDate) -> Result<DataFrame, PolarsError> {
+async fn predictions_frame(
+    pool: &PgPool,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
         r#"SELECT correlation_id AS "correlation_id!", model_run_id AS "model_run_id!",
                   ticker AS "ticker!", timestamp AS "timestamp!",
                   quantile_10 AS "quantile_10!", quantile_50 AS "quantile_50!",
                   quantile_90 AS "quantile_90!"
            FROM equity_predictions
-           WHERE (timestamp AT TIME ZONE 'America/New_York')::date = $1
+           WHERE timestamp >= $1 AND timestamp < $2
            ORDER BY ticker"#,
-        date
+        start,
+        end
     )
     .fetch_all(pool)
     .await
@@ -209,10 +223,15 @@ async fn predictions_frame(pool: &PgPool, date: NaiveDate) -> Result<DataFrame, 
     ])
 }
 
+/// Every interval present for the session, not just daily.
+///
+/// Filtering to one interval here would leave intraday rows with no S3 archive at all, and
+/// TimescaleDB's retention policy deletes them on the same 90-day window regardless. The interval
+/// travels as a column so one object still holds the session.
 async fn bars_frame(
     pool: &PgPool,
-    date: NaiveDate,
-    bar_interval: BarInterval,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
         r#"SELECT ticker AS "ticker!", bar_interval AS "bar_interval!",
@@ -221,11 +240,10 @@ async fn bars_frame(
                   close_price AS "close_price!", volume AS "volume!",
                   volume_weighted_average_price, transactions
            FROM equity_bars
-           WHERE bar_interval = $1
-             AND (timestamp AT TIME ZONE 'America/New_York')::date = $2
-           ORDER BY ticker"#,
-        bar_interval.as_str(),
-        date
+           WHERE timestamp >= $1 AND timestamp < $2
+           ORDER BY bar_interval, ticker"#,
+        start,
+        end
     )
     .fetch_all(pool)
     .await
@@ -361,7 +379,8 @@ async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError
 
 async fn account_activities_frame(
     pool: &PgPool,
-    date: NaiveDate,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
         r#"SELECT id AS "id!", activity_type AS "activity_type!",
@@ -370,9 +389,10 @@ async fn account_activities_frame(
                   price::double precision AS price,
                   order_id
            FROM account_activities
-           WHERE (transaction_time AT TIME ZONE 'America/New_York')::date = $1
+           WHERE transaction_time >= $1 AND transaction_time < $2
            ORDER BY transaction_time"#,
-        date
+        start,
+        end
     )
     .fetch_all(pool)
     .await

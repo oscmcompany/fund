@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT correlation_id AS \"correlation_id!\", model_run_id AS \"model_run_id!\",\n                  ticker AS \"ticker!\", timestamp AS \"timestamp!\",\n                  quantile_10 AS \"quantile_10!\", quantile_50 AS \"quantile_50!\",\n                  quantile_90 AS \"quantile_90!\"\n           FROM equity_predictions\n           WHERE (timestamp AT TIME ZONE 'America/New_York')::date = $1\n           ORDER BY ticker",
+  "query": "SELECT correlation_id AS \"correlation_id!\", model_run_id AS \"model_run_id!\",\n                  ticker AS \"ticker!\", timestamp AS \"timestamp!\",\n                  quantile_10 AS \"quantile_10!\", quantile_50 AS \"quantile_50!\",\n                  quantile_90 AS \"quantile_90!\"\n           FROM equity_predictions\n           WHERE timestamp >= $1 AND timestamp < $2\n           ORDER BY ticker",
   "describe": {
     "columns": [
       {
@@ -41,7 +41,8 @@
     ],
     "parameters": {
       "Left": [
-        "Date"
+        "Timestamptz",
+        "Timestamptz"
       ]
     },
     "nullable": [
@@ -54,5 +55,5 @@
       false
     ]
   },
-  "hash": "0646b11d8c470662d109f0fb4d56aceed9198def874f23fce89b5086f668cc46"
+  "hash": "8ea51995e94f24f4496b6003fb215441e3f2a7f0db07262ae1c4cfcc2b72ed67"
 }

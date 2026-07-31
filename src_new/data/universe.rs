@@ -183,6 +183,13 @@ impl UniverseCache {
 
     /// Returns today's universe, rebuilding it if the cache is cold or was filled on an earlier
     /// date.
+    ///
+    /// The lock is released before the Alpaca call and the liquidity query, and re-taken only to
+    /// store the result. Holding it across that I/O would block every other caller for the full
+    /// duration of a cold rebuild. The cost is that two callers arriving on a cold cache may both
+    /// rebuild; both are read-only and deterministic, so they produce the same universe and the
+    /// second store is a harmless overwrite. Blocking every caller to prevent a duplicate read is
+    /// the worse trade.
     pub async fn get(
         &self,
         client: &TradingClient,
@@ -190,9 +197,8 @@ impl UniverseCache {
         now: DateTime<Utc>,
     ) -> Result<Universe, UniverseError> {
         let today = eastern_date(now);
-        let mut guard = self.inner.lock().await;
 
-        if let Some((cached_date, universe)) = guard.as_ref() {
+        if let Some((cached_date, universe)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
                 return Ok(universe.clone());
             }
@@ -211,7 +217,7 @@ impl UniverseCache {
         );
 
         if !universe.is_empty() {
-            *guard = Some((today, universe.clone()));
+            *self.inner.lock().await = Some((today, universe.clone()));
         }
         Ok(universe)
     }

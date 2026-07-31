@@ -133,7 +133,11 @@ pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGua
             }
         }
         Err(_) => {
-            tracing_subscriber::registry().try_init().ok();
+            // Deliberately installs nothing. Calling `try_init()` here would claim the global
+            // dispatcher with an empty subscriber, and that claim is permanent for the process --
+            // a later, working initialization would silently lose the race and emit nothing.
+            // Leaving the default no-op dispatcher in place costs the same log output now and keeps
+            // that door open.
             None
         }
     };
@@ -193,18 +197,18 @@ mod tests {
     fn test_fund_log_dir_override_enables_file_logging() {
         let log_dir = env::temp_dir().join("fund-observability-test");
         let _ = std::fs::remove_dir_all(&log_dir);
-        let previous_log_dir = env::var("FUND_LOG_DIR").ok();
-        env::set_var("FUND_LOG_DIR", &log_dir);
+        // Restored on unwind as well as on return. The manual restore this replaces was skipped
+        // when the assertion below failed, leaving FUND_LOG_DIR pointing at a directory this test
+        // then deleted -- which every later #[serial] test in the file inherited.
+        let _restore = EnvVarRestoreGuard::save("FUND_LOG_DIR");
+        // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+        unsafe { env::set_var("FUND_LOG_DIR", &log_dir) };
 
         let guard = init_tracing("test-observability.log", None, "test");
 
         assert!(log_dir.is_dir());
         let _ = guard;
 
-        match previous_log_dir {
-            Some(value) => env::set_var("FUND_LOG_DIR", value),
-            None => env::remove_var("FUND_LOG_DIR"),
-        }
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 

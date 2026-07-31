@@ -502,6 +502,33 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for BarInterval {
 // Records
 // ---------------------------------------------------------------------------
 
+/// Error returned when a market data record's fields are not internally consistent.
+///
+/// Carries the reason rather than a bare unit so a rejected Alpaca payload can be logged with
+/// enough detail to tell a provider problem from a parsing one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InconsistentRecordError {
+    pub reason: String,
+}
+
+impl std::fmt::Display for InconsistentRecordError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Inconsistent market data record: {}.",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for InconsistentRecordError {}
+
+fn reject(reason: impl Into<String>) -> InconsistentRecordError {
+    InconsistentRecordError {
+        reason: reason.into(),
+    }
+}
+
 /// An OHLCV equity bar at a declared interval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityBar {
@@ -520,7 +547,13 @@ pub struct EquityBar {
 }
 
 impl EquityBar {
-    /// Constructs an `EquityBar` from validated field values.
+    /// Constructs an `EquityBar`, rejecting a bar whose prices do not form a coherent candle.
+    ///
+    /// The invariants are the ones every consumer silently assumes: prices are finite and positive,
+    /// the low is the low, the high is the high, and the open and close fall between them. A bar
+    /// violating any of these reaches the liquidity average, the correlation screen, and the model
+    /// input without complaint, and produces plausible-looking nonsense rather than an error — so
+    /// the boundary where it enters the system is the last cheap place to stop it.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ticker: Ticker,
@@ -533,8 +566,39 @@ impl EquityBar {
         volume: i64,
         volume_weighted_average_price: Option<f64>,
         transactions: Option<i64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, InconsistentRecordError> {
+        for (name, price) in [
+            ("open", open_price),
+            ("high", high_price),
+            ("low", low_price),
+            ("close", close_price),
+        ] {
+            if !price.is_finite() || price <= 0.0 {
+                return Err(reject(format!(
+                    "{name} price {price} is not a positive number"
+                )));
+            }
+        }
+        if low_price > high_price {
+            return Err(reject(format!(
+                "low price {low_price} exceeds high price {high_price}"
+            )));
+        }
+        if open_price < low_price || open_price > high_price {
+            return Err(reject(format!(
+                "open price {open_price} is outside [{low_price}, {high_price}]"
+            )));
+        }
+        if close_price < low_price || close_price > high_price {
+            return Err(reject(format!(
+                "close price {close_price} is outside [{low_price}, {high_price}]"
+            )));
+        }
+        if volume < 0 {
+            return Err(reject(format!("volume {volume} is negative")));
+        }
+
+        Ok(Self {
             ticker,
             bar_interval,
             timestamp,
@@ -545,7 +609,7 @@ impl EquityBar {
             volume,
             volume_weighted_average_price,
             transactions,
-        }
+        })
     }
 
     pub fn ticker(&self) -> &Ticker {
@@ -604,7 +668,14 @@ pub struct EquityQuote {
 }
 
 impl EquityQuote {
-    /// Constructs an `EquityQuote` from validated field values.
+    /// Constructs an `EquityQuote`, rejecting a book that cannot be meaningfully averaged.
+    ///
+    /// [`EquityQuote::mid_price`] is arithmetic with no opinion about its inputs, so the opinion has
+    /// to live here. A crossed book (bid above ask) or a zero side produces a midpoint that looks
+    /// like a price and is not one — a zero bid against a hundred-dollar ask yields a fifty-dollar
+    /// mid, which is the kind of number that reaches an order.
+    ///
+    /// A locked book (bid equal to ask) is legal and accepted.
     pub fn new(
         ticker: Ticker,
         timestamp: DateTime<Utc>,
@@ -612,15 +683,33 @@ impl EquityQuote {
         ask_price: f64,
         bid_size: i32,
         ask_size: i32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, InconsistentRecordError> {
+        for (name, price) in [("bid", bid_price), ("ask", ask_price)] {
+            if !price.is_finite() || price <= 0.0 {
+                return Err(reject(format!(
+                    "{name} price {price} is not a positive number"
+                )));
+            }
+        }
+        if bid_price > ask_price {
+            return Err(reject(format!(
+                "book is crossed: bid {bid_price} exceeds ask {ask_price}"
+            )));
+        }
+        if bid_size < 0 || ask_size < 0 {
+            return Err(reject(format!(
+                "quoted sizes must be non-negative, got bid {bid_size} and ask {ask_size}"
+            )));
+        }
+
+        Ok(Self {
             ticker,
             timestamp,
             bid_price,
             ask_price,
             bid_size,
             ask_size,
-        }
+        })
     }
 
     pub fn ticker(&self) -> &Ticker {
@@ -936,6 +1025,90 @@ mod tests {
             }
         )
         .contains("1.5"));
+    }
+
+    fn bar(
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: i64,
+    ) -> Result<EquityBar, InconsistentRecordError> {
+        EquityBar::new(
+            ticker("AAPL"),
+            BarInterval::OneDay,
+            Utc::now(),
+            open,
+            high,
+            low,
+            close,
+            volume,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_bar_accepts_a_coherent_candle() {
+        let bar_value = bar(100.0, 105.0, 99.0, 103.0, 1_000).expect("coherent candle constructs");
+        assert_eq!(bar_value.close_price(), 103.0);
+        // A doji, where every price is equal, is legitimate.
+        assert!(bar(100.0, 100.0, 100.0, 100.0, 0).is_ok());
+    }
+
+    /// Each invariant must bind on its own. An inverted range, an open or close outside it, and a
+    /// negative volume are separate provider faults that all reach the screen looking plausible.
+    #[test]
+    fn test_bar_rejects_an_incoherent_candle() {
+        assert!(
+            bar(100.0, 99.0, 105.0, 100.0, 10).is_err(),
+            "low above high"
+        );
+        assert!(
+            bar(200.0, 105.0, 99.0, 103.0, 10).is_err(),
+            "open above high"
+        );
+        assert!(
+            bar(100.0, 105.0, 99.0, 50.0, 10).is_err(),
+            "close below low"
+        );
+        assert!(
+            bar(100.0, 105.0, 99.0, 103.0, -1).is_err(),
+            "negative volume"
+        );
+    }
+
+    #[test]
+    fn test_bar_rejects_non_positive_and_non_finite_prices() {
+        assert!(bar(0.0, 105.0, 0.0, 103.0, 10).is_err());
+        assert!(bar(-1.0, 105.0, -2.0, 103.0, 10).is_err());
+        assert!(bar(f64::NAN, 105.0, 99.0, 103.0, 10).is_err());
+        assert!(bar(100.0, f64::INFINITY, 99.0, 103.0, 10).is_err());
+    }
+
+    fn quote(
+        bid: f64,
+        ask: f64,
+        bid_size: i32,
+        ask_size: i32,
+    ) -> Result<EquityQuote, InconsistentRecordError> {
+        EquityQuote::new(ticker("AAPL"), Utc::now(), bid, ask, bid_size, ask_size)
+    }
+
+    #[test]
+    fn test_quote_accepts_a_normal_and_a_locked_book() {
+        assert_eq!(quote(100.0, 102.0, 5, 5).unwrap().mid_price(), 101.0);
+        assert!(quote(100.0, 100.0, 1, 1).is_ok(), "a locked book is legal");
+    }
+
+    /// This is why `mid_price` can be plain arithmetic. A zero bid against a real ask yields a
+    /// midpoint that looks like a price and is not one, and that number would reach an order.
+    #[test]
+    fn test_quote_rejects_a_book_that_cannot_be_averaged() {
+        assert!(quote(0.0, 100.0, 5, 5).is_err(), "zero bid");
+        assert!(quote(103.0, 102.0, 5, 5).is_err(), "crossed book");
+        assert!(quote(f64::NAN, 102.0, 5, 5).is_err(), "non-finite bid");
+        assert!(quote(100.0, 102.0, -1, 5).is_err(), "negative size");
     }
 
     fn prediction(

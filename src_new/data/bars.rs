@@ -272,6 +272,7 @@ mod tests {
             Some(close),
             Some(10),
         )
+        .expect("test bar must be coherent")
     }
 
     /// A repeated key would fail the whole insert chunk, not just the offending row, so the last
@@ -371,7 +372,8 @@ mod tests {
             10,
             None,
             None,
-        );
+        )
+        .expect("test bar must be coherent");
         let frame = bars_to_dataframe(&[sparse]).unwrap();
         assert_eq!(
             frame

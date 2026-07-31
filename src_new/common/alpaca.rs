@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::types::{BarInterval, EquityBar, EquityQuote, Ticker};
 
@@ -80,10 +80,22 @@ async fn error_for_status(response: reqwest::Response) -> Result<reqwest::Respon
 // Credentials
 // --------------------------------------------------------------------------
 
-/// Alpaca API credentials for trading operations.
+/// Why credentials could not be constructed.
 ///
-/// Constructed via `from_env()` to read credentials from environment variables,
-/// or via `new()` for explicit construction (e.g. in tests).
+/// Typed rather than a `String` so a caller can tell an absent variable from an empty one without
+/// matching on message text, and so the variable name travels with the error.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum CredentialsError {
+    #[error("{variable} environment variable is not set")]
+    Missing { variable: &'static str },
+    #[error("{field} must not be empty")]
+    Empty { field: &'static str },
+}
+
+/// Alpaca API credentials, shared by both clients.
+///
+/// Constructed via [`AlpacaCredentials::from_env`] to read from the environment, or via
+/// [`AlpacaCredentials::new`] for explicit construction in tests.
 #[derive(Clone)]
 pub struct AlpacaCredentials {
     key_id: String,
@@ -93,26 +105,26 @@ pub struct AlpacaCredentials {
 impl AlpacaCredentials {
     /// Constructs `AlpacaCredentials` from explicit field values.
     ///
-    /// Returns `Err` if either `key_id` or `secret` is empty.
-    pub fn new(key_id: String, secret: String) -> Result<Self, String> {
+    /// Rejects empty values: an empty key reaches Alpaca as a 403, which reads like a permissions
+    /// problem rather than the configuration one it is.
+    pub fn new(key_id: String, secret: String) -> Result<Self, CredentialsError> {
         if key_id.is_empty() {
-            return Err("key_id must not be empty".to_string());
+            return Err(CredentialsError::Empty { field: "key_id" });
         }
         if secret.is_empty() {
-            return Err("secret must not be empty".to_string());
+            return Err(CredentialsError::Empty { field: "secret" });
         }
         Ok(Self { key_id, secret })
     }
 
-    /// Reads Alpaca credentials from environment variables.
-    ///
-    /// Reads `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET`. Returns `Err` if either
-    /// variable is absent or set to an empty string.
-    pub fn from_env() -> Result<Self, String> {
-        let key_id = std::env::var("ALPACA_API_KEY_ID")
-            .map_err(|_| "ALPACA_API_KEY_ID environment variable is not set".to_string())?;
-        let secret = std::env::var("ALPACA_API_SECRET")
-            .map_err(|_| "ALPACA_API_SECRET environment variable is not set".to_string())?;
+    /// Reads `ALPACA_API_KEY_ID` and `ALPACA_API_SECRET` from the environment.
+    pub fn from_env() -> Result<Self, CredentialsError> {
+        let key_id = std::env::var("ALPACA_API_KEY_ID").map_err(|_| CredentialsError::Missing {
+            variable: "ALPACA_API_KEY_ID",
+        })?;
+        let secret = std::env::var("ALPACA_API_SECRET").map_err(|_| CredentialsError::Missing {
+            variable: "ALPACA_API_SECRET",
+        })?;
         Self::new(key_id, secret)
     }
 
@@ -322,8 +334,17 @@ impl TradingClient {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<CalendarDay>, ClientError> {
-        let url = format!("{}/v2/calendar?start={}&end={}", self.base_url, start, end);
-        let response = error_for_status(self.get(&url).send().await?).await?;
+        let url = format!("{}/v2/calendar", self.base_url);
+        let response = error_for_status(
+            self.get(&url)
+                .query(&[
+                    ("start", start.to_string().as_str()),
+                    ("end", end.to_string().as_str()),
+                ])
+                .send()
+                .await?,
+        )
+        .await?;
         let entries: Vec<CalendarResponse> = response.json().await.map_err(|error| {
             ClientError::Parse(format!("Failed to parse calendar response: {error}"))
         })?;
@@ -437,6 +458,50 @@ struct AssetResponse {
 /// down with it.
 const SNAPSHOT_SYMBOLS_PER_REQUEST: usize = 1_000;
 
+/// Which consolidated tape the market data API serves from.
+///
+/// `iex` covers a few percent of consolidated volume, so quoted spreads are wide and often stale
+/// outside the largest names -- computing a pair spread from it introduces noise that looks exactly
+/// like signal. `sip` is the full consolidated tape and requires a paid subscription.
+///
+/// An enum rather than a string so an unrecognized value is rejected at the edge, where it can be
+/// reported, instead of reaching Alpaca as an unhelpful 400 on every request of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFeed {
+    Iex,
+    Sip,
+}
+
+impl DataFeed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DataFeed::Iex => "iex",
+            DataFeed::Sip => "sip",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "iex" => Some(DataFeed::Iex),
+            "sip" => Some(DataFeed::Sip),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for DataFeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Symbols requested per historical bars call.
+///
+/// Separate from the snapshot cap despite sharing its value today. The two endpoints have different
+/// request shapes -- bars carries six more parameters and a page token -- so the request-line budget
+/// they are each bounded by is not the same, and tuning one should not silently move the other.
+const BARS_SYMBOLS_PER_REQUEST: usize = 1_000;
+
 /// Rows requested per historical bars page.
 ///
 /// 10,000 is the endpoint's documented maximum. Asking for fewer only increases the number of
@@ -505,12 +570,12 @@ pub struct MarketDataClient {
     http_client: reqwest::Client,
     credentials: AlpacaCredentials,
     base_url: String,
-    feed: String,
+    feed: DataFeed,
 }
 
 impl MarketDataClient {
     /// Constructs a client against the production data API.
-    pub fn new(credentials: AlpacaCredentials, feed: String) -> Self {
+    pub fn new(credentials: AlpacaCredentials, feed: DataFeed) -> Self {
         Self {
             http_client: build_http_client(),
             credentials,
@@ -520,7 +585,7 @@ impl MarketDataClient {
     }
 
     /// Constructs a client against an explicit base URL, for tests against a mock server.
-    pub fn with_base_url(credentials: AlpacaCredentials, base_url: String, feed: String) -> Self {
+    pub fn with_base_url(credentials: AlpacaCredentials, base_url: String, feed: DataFeed) -> Self {
         Self {
             http_client: build_http_client(),
             credentials,
@@ -529,14 +594,23 @@ impl MarketDataClient {
         }
     }
 
-    /// Reads the data feed from `ALPACA_DATA_FEED`, defaulting to `iex`.
+    /// Reads the data feed from `ALPACA_DATA_FEED`, defaulting to [`DataFeed::Iex`].
     ///
-    /// `iex` covers a few percent of consolidated volume, so quoted spreads are wide and often
-    /// stale outside the largest names. `sip` requires a paid subscription and is materially better
-    /// for anything that computes a spread. Defaulting to `iex` keeps an unconfigured deployment
-    /// working rather than failing on an entitlement error.
+    /// Defaulting to `iex` keeps an unconfigured deployment working rather than failing on an
+    /// entitlement error. An unrecognized value warns and falls back rather than failing startup,
+    /// for the same reason -- but it warns, because silently serving a different feed than the
+    /// operator asked for changes every price the strategy sees.
     pub fn from_env(credentials: AlpacaCredentials) -> Self {
-        let feed = std::env::var("ALPACA_DATA_FEED").unwrap_or_else(|_| "iex".to_string());
+        let feed = match std::env::var("ALPACA_DATA_FEED") {
+            Ok(raw) => DataFeed::parse(&raw).unwrap_or_else(|| {
+                warn!(
+                    requested = %raw,
+                    "Unrecognized ALPACA_DATA_FEED, falling back to iex"
+                );
+                DataFeed::Iex
+            }),
+            Err(_) => DataFeed::Iex,
+        };
         Self::new(credentials, feed)
     }
 
@@ -594,13 +668,17 @@ impl MarketDataClient {
     }
 
     async fn fetch_snapshot_chunk(&self, symbols: &[String]) -> Result<Vec<Snapshot>, ClientError> {
-        let url = format!(
-            "{}/v2/stocks/snapshots?symbols={}&feed={}",
-            self.base_url,
-            symbols.join(","),
-            self.feed
-        );
-        let response = error_for_status(self.get(&url).send().await?).await?;
+        let url = format!("{}/v2/stocks/snapshots", self.base_url);
+        let response = error_for_status(
+            self.get(&url)
+                .query(&[
+                    ("symbols", symbols.join(",").as_str()),
+                    ("feed", self.feed.as_str()),
+                ])
+                .send()
+                .await?,
+        )
+        .await?;
         let payload: std::collections::HashMap<String, SnapshotResponse> =
             response.json().await.map_err(|error| {
                 ClientError::Parse(format!("Failed to parse snapshots response: {error}"))
@@ -650,24 +728,34 @@ impl MarketDataClient {
         let mut bars: Vec<EquityBar> = Vec::new();
         let mut pages: usize = 0;
 
-        for chunk in symbols.chunks(SNAPSHOT_SYMBOLS_PER_REQUEST) {
+        let url = format!("{}/v2/stocks/bars", self.base_url);
+        let page_limit = BARS_PAGE_LIMIT.to_string();
+        let start_parameter = start.to_string();
+        let end_parameter = end.to_string();
+
+        for chunk in symbols.chunks(BARS_SYMBOLS_PER_REQUEST) {
+            let symbols_parameter = chunk.join(",");
             let mut page_token: Option<String> = None;
             loop {
-                let mut url = format!(
-                    "{}/v2/stocks/bars?symbols={}&timeframe={}&start={}&end={}&limit={}&feed={}&adjustment=all",
-                    self.base_url,
-                    chunk.join(","),
-                    bar_interval.alpaca_timeframe(),
-                    start,
-                    end,
-                    BARS_PAGE_LIMIT,
-                    self.feed
-                );
+                // Built through the query serializer rather than interpolated into the URL.
+                // `next_page_token` is base64, so it can contain `+`, `/`, and `=`; interpolated
+                // raw, a `+` decodes server-side as a space and the token is rejected or silently
+                // resolves to a different page. That surfaces as a truncated backfill, not an error.
+                let mut parameters: Vec<(&str, &str)> = vec![
+                    ("symbols", symbols_parameter.as_str()),
+                    ("timeframe", bar_interval.alpaca_timeframe()),
+                    ("start", start_parameter.as_str()),
+                    ("end", end_parameter.as_str()),
+                    ("limit", page_limit.as_str()),
+                    ("feed", self.feed.as_str()),
+                    ("adjustment", "all"),
+                ];
                 if let Some(token) = &page_token {
-                    url.push_str(&format!("&page_token={token}"));
+                    parameters.push(("page_token", token.as_str()));
                 }
 
-                let response = error_for_status(self.get(&url).send().await?).await?;
+                let response =
+                    error_for_status(self.get(&url).query(&parameters).send().await?).await?;
                 let payload: BarsResponse = response.json().await.map_err(|error| {
                     ClientError::Parse(format!("Failed to parse bars response: {error}"))
                 })?;
@@ -736,15 +824,23 @@ struct QuotePayload {
 impl QuotePayload {
     /// A quote missing any of its four book fields or its timestamp is dropped rather than
     /// defaulted: a zero bid is a real price, and an absent one is not.
+    ///
+    /// A present-but-incoherent book — crossed, or with a zero side — is dropped the same way, via
+    /// the constructor's own validation. Both cases mean "this symbol is unpriced right now", which
+    /// callers already handle.
     fn into_equity_quote(self, ticker: &Ticker) -> Option<EquityQuote> {
-        Some(EquityQuote::new(
+        EquityQuote::new(
             ticker.clone(),
             self.timestamp?,
             self.bid_price?,
             self.ask_price?,
             self.bid_size?,
             self.ask_size?,
-        ))
+        )
+        .inspect_err(|error| {
+            debug!(ticker = %ticker, error = %error, "Dropped an incoherent quote");
+        })
+        .ok()
     }
 }
 
@@ -777,8 +873,11 @@ struct BarPayload {
 impl BarPayload {
     /// Volume arrives as a float and is rounded to whole shares. Alpaca reports fractional volume
     /// for some feeds; the column is a `BIGINT` and a partial share is not a meaningful unit here.
+    ///
+    /// A bar whose prices do not form a coherent candle is dropped by the constructor, with the
+    /// reason logged, rather than being stored for the screen to trip over later.
     fn into_equity_bar(self, ticker: &Ticker, bar_interval: BarInterval) -> Option<EquityBar> {
-        Some(EquityBar::new(
+        EquityBar::new(
             ticker.clone(),
             bar_interval,
             self.timestamp?,
@@ -789,7 +888,11 @@ impl BarPayload {
             self.volume?.round() as i64,
             self.vw,
             self.transactions,
-        ))
+        )
+        .inspect_err(|error| {
+            debug!(ticker = %ticker, error = %error, "Dropped an incoherent bar");
+        })
+        .ok()
     }
 }
 
@@ -818,16 +921,21 @@ mod tests {
 
     #[test]
     fn test_new_rejects_empty_key_id() {
-        let result = AlpacaCredentials::new(String::new(), "secret456".to_string());
-        assert!(result.is_err());
-        assert!(result.err().unwrap().contains("key_id"));
+        // `matches!` rather than `assert_eq!`: `AlpacaCredentials` deliberately does not derive
+        // `Debug`, because it holds a secret and a derived `Debug` would print it into any log line
+        // or panic message that formatted the value.
+        assert!(matches!(
+            AlpacaCredentials::new(String::new(), "secret456".to_string()),
+            Err(CredentialsError::Empty { field: "key_id" })
+        ));
     }
 
     #[test]
     fn test_new_rejects_empty_secret() {
-        let result = AlpacaCredentials::new("key123".to_string(), String::new());
-        assert!(result.is_err());
-        assert!(result.err().unwrap().contains("secret"));
+        assert!(matches!(
+            AlpacaCredentials::new("key123".to_string(), String::new()),
+            Err(CredentialsError::Empty { field: "secret" })
+        ));
     }
 
     #[test]
@@ -839,31 +947,62 @@ mod tests {
         assert_eq!(cloned.secret(), "secret456");
     }
 
+    /// RAII guard restoring one environment variable on drop, so an assertion failure cannot leave
+    /// a removal in place for the next `#[serial]` test in the file.
+    struct EnvironmentVariableGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvironmentVariableGuard {
+        fn save(key: &'static str) -> Self {
+            Self {
+                key,
+                previous: std::env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            // SAFETY: protected by #[serial_test::serial] — no concurrent environment access.
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
-    fn test_from_env_returns_error_when_vars_unset() {
-        // Remove both vars to test the missing-variable path.
-        let key_id_backup = std::env::var("ALPACA_API_KEY_ID").ok();
-        let secret_backup = std::env::var("ALPACA_API_SECRET").ok();
-
-        // SAFETY: environment mutation is safe in single-threaded test context.
+    fn test_from_env_reports_the_missing_variable() {
+        let _key_guard = EnvironmentVariableGuard::save("ALPACA_API_KEY_ID");
+        let _secret_guard = EnvironmentVariableGuard::save("ALPACA_API_SECRET");
+        // SAFETY: protected by #[serial_test::serial] — no concurrent environment access.
         unsafe {
             std::env::remove_var("ALPACA_API_KEY_ID");
             std::env::remove_var("ALPACA_API_SECRET");
         }
 
-        let result = AlpacaCredentials::from_env();
-        assert!(result.is_err());
+        assert!(matches!(
+            AlpacaCredentials::from_env(),
+            Err(CredentialsError::Missing {
+                variable: "ALPACA_API_KEY_ID"
+            })
+        ));
+    }
 
-        // Restore originals.
-        unsafe {
-            if let Some(value) = key_id_backup {
-                std::env::set_var("ALPACA_API_KEY_ID", value);
-            }
-            if let Some(value) = secret_backup {
-                std::env::set_var("ALPACA_API_SECRET", value);
-            }
+    #[test]
+    fn test_data_feed_round_trips_and_rejects_unknown() {
+        for feed in [DataFeed::Iex, DataFeed::Sip] {
+            assert_eq!(DataFeed::parse(feed.as_str()), Some(feed));
         }
+        assert_eq!(DataFeed::parse("SIP"), Some(DataFeed::Sip));
+        assert_eq!(DataFeed::parse(" iex "), Some(DataFeed::Iex));
+        assert_eq!(DataFeed::parse("otc"), None);
+        assert_eq!(DataFeed::parse(""), None);
     }
 
     // --- trading API ---
@@ -1045,7 +1184,7 @@ mod tests {
     // --- market data API ---
 
     fn client(base_url: String) -> MarketDataClient {
-        MarketDataClient::with_base_url(credentials(), base_url, "iex".to_string())
+        MarketDataClient::with_base_url(credentials(), base_url, DataFeed::Iex)
     }
 
     const FULL_SNAPSHOT: &str = r#"{
@@ -1183,6 +1322,41 @@ mod tests {
             .expect("bars must parse");
 
         assert_eq!(bars.len(), 2, "both pages must be accumulated");
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// Page tokens are base64, so they contain `+`, `/`, and `=`. Interpolated into the URL raw, a
+    /// `+` is decoded server-side as a space and the token names a different page or none at all —
+    /// which surfaces as a silently truncated backfill rather than an error. The query serializer
+    /// percent-encodes them, and this asserts the encoded form actually goes out on the wire.
+    #[tokio::test]
+    async fn test_fetch_bars_percent_encodes_the_page_token() {
+        let mut server = mockito::Server::new_async().await;
+        let base = "/v2/stocks/bars?symbols=AAPL&timeframe=1Day&start=2026-06-08&end=2026-06-10&limit=10000&feed=iex&adjustment=all";
+        let first = server
+            .mock("GET", base)
+            .with_status(200)
+            .with_body(r#"{"bars":{},"next_page_token":"a+b/c=="}"#)
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", format!("{base}&page_token=a%2Bb%2Fc%3D%3D").as_str())
+            .with_status(200)
+            .with_body(r#"{"bars":{},"next_page_token":null}"#)
+            .create_async()
+            .await;
+
+        client(server.url())
+            .fetch_bars(
+                &["AAPL".to_string()],
+                BarInterval::OneDay,
+                NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
+            )
+            .await
+            .expect("bars must parse");
+
         first.assert_async().await;
         second.assert_async().await;
     }
