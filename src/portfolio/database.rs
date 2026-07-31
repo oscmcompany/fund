@@ -411,7 +411,7 @@ pub async fn insert_rebalance_session<'e>(
          VALUES ($1, $2, $3, $4, $5, $6)",
         session.id(),
         session.triggered_at(),
-        session.trigger_reason(),
+        session.trigger_reason().as_str(),
         session.model_run_id(),
         session.completed_at(),
         session.status().as_str()
@@ -980,11 +980,13 @@ mod tests {
     #[test]
     fn test_insert_rebalance_session_compiles() {
         make_runtime().block_on(async {
-            use crate::domain::trading::{EquityRebalanceSession, RebalanceSessionStatus};
+            use crate::domain::trading::{
+                EquityRebalanceSession, RebalanceSessionStatus, RebalanceTrigger,
+            };
             let session = EquityRebalanceSession::new(
                 Uuid::new_v4(),
                 Utc::now(),
-                "portfolio_evaluation".to_string(),
+                RebalanceTrigger::SessionStart,
                 None,
                 None,
                 RebalanceSessionStatus::Completed,

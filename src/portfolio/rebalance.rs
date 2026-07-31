@@ -40,7 +40,7 @@ use crate::domain::orders::{FilledPair, Order, Pending};
 use crate::domain::portfolio::{Portfolio, PortfolioError};
 use crate::domain::trading::{
     AllocationAction, AllocationSide, CloseReason, EquityAllocation, EquityOrder, EquityPair,
-    EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus,
+    EquityPairStatus, EquityRebalanceSession, RebalanceSessionStatus, RebalanceTrigger,
 };
 use crate::portfolio::alpaca::{AccountInfo, TradableAssets, Trading};
 use crate::portfolio::beta::compute_market_betas;
@@ -76,6 +76,12 @@ pub struct RebalanceOutcome {
     pub pairs_closed: usize,
     pub pairs_kept: usize,
     pub net_asset_value: f64,
+    /// Pairs the exit evaluation signalled to close, with the reason.
+    ///
+    /// Carried so a caller can tell whether the pass agreed with whatever
+    /// flagged it. Distinct from `pairs_closed`, which counts the closes that
+    /// the broker then accepted.
+    pub close_signals: Vec<(PairID, CloseReason)>,
 }
 
 /// Error returned when `run_rebalance` cannot complete the cycle.
@@ -160,7 +166,10 @@ impl From<PortfolioError> for RebalanceError {
 ///
 /// Returns `RebalanceOutcome` on success or a `RebalanceError` describing
 /// why the cycle was skipped or failed.
-pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, RebalanceError> {
+pub async fn run_rebalance(
+    state: &AppState,
+    trigger: RebalanceTrigger,
+) -> Result<RebalanceOutcome, RebalanceError> {
     let pool = state.pool();
     let alpaca = state.alpaca_client();
 
@@ -233,6 +242,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     // Phase 4: exit evaluation — always runs when open pairs exist.
     let mut pairs_closed: usize = 0;
+    let mut close_signal_summary: Vec<(PairID, CloseReason)> = Vec::new();
     if !open_pairs.is_empty() {
         // Tier 1: streamed mids, already filtered by the sixty-second guard.
         let mut exit_mid_prices = state.live_prices().fresh_mid_prices(Utc::now()).await;
@@ -268,6 +278,10 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
             "Exit evaluation pricing"
         );
         let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices, &exit_mid_prices);
+        close_signal_summary = close_signals
+            .iter()
+            .map(|signal| (signal.open_pair.pair_id().clone(), signal.reason.clone()))
+            .collect();
         pairs_closed = close_triggered_pairs(alpaca, pool, &close_signals).await?;
         let pairs_kept_after_exits = open_pairs.len() - pairs_closed;
         info!(
@@ -415,7 +429,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
     let rebalance_session = EquityRebalanceSession::new(
         session_id,
         now,
-        "portfolio_evaluation".to_string(),
+        trigger,
         None,
         None,
         RebalanceSessionStatus::Completed,
@@ -473,6 +487,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
         pairs_closed,
         pairs_kept,
         net_asset_value,
+        close_signals: close_signal_summary,
     })
 }
 
@@ -2073,6 +2088,7 @@ mod tests {
             pairs_closed: 2,
             pairs_kept: 8,
             net_asset_value: 500_000.0,
+            close_signals: Vec::new(),
         };
         assert_eq!(outcome.pairs_opened, 3);
         assert_eq!(outcome.pairs_closed, 2);

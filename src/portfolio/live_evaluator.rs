@@ -284,7 +284,16 @@ async fn run_live_evaluator(
         match emit_event(
             &pool,
             EventType::PortfolioEvaluationRequested,
-            &serde_json::json!({"reason": "live_threshold_crossing"}),
+            // The flagged pair travels with the request so the authoritative
+            // pass can say whether it agreed. Observability only: by the time
+            // the pass reads this z-score, reconciliation, a positions fetch,
+            // and a historical price load have all happened, so it reprices
+            // rather than trusting the number.
+            &serde_json::json!({
+                "reason": "live_threshold_crossing",
+                "pair_id": crossed[0].0.as_str(),
+                "z_score": crossed[0].1,
+            }),
         )
         .await
         {
