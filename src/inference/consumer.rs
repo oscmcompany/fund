@@ -117,6 +117,10 @@ async fn run_consumer(
                 | EventType::DatabaseExport(_)
                 | EventType::DatabaseBackup(_)
                 | EventType::DatabasePurge(_)
+                | EventType::SchedulerHealthCheck(_)
+                | EventType::ModelArtifactCheck(_)
+                | EventType::ModelArtifactPublished
+                | EventType::ModelArtifactStale
                 | EventType::PortfolioRebalance(_)
                 | EventType::PortfolioLiquidation(_)
                 | EventType::TradingSessionStarted

@@ -133,7 +133,13 @@ async fn run_consumer(
                 }
                 EventType::PortfolioLiquidation(Outcome::Requested) => {
                     info!(event_id, "Received portfolio_liquidation_requested");
-                    handle_portfolio_liquidation(state, pool, event_id).await;
+                    handle_portfolio_liquidation(
+                        state,
+                        pool,
+                        event_id,
+                        LiquidationTrigger::from_payload(notification.payload()),
+                    )
+                    .await;
                 }
                 // Every consumer receives every event; the rest belong to other
                 // services or are audit records. Listed rather than caught by a
@@ -148,6 +154,10 @@ async fn run_consumer(
                 | EventType::DatabaseExport(_)
                 | EventType::DatabaseBackup(_)
                 | EventType::DatabasePurge(_)
+                | EventType::SchedulerHealthCheck(_)
+                | EventType::ModelArtifactCheck(_)
+                | EventType::ModelArtifactPublished
+                | EventType::ModelArtifactStale
                 | EventType::PortfolioRebalance(_)
                 | EventType::StressTest => {}
             }
@@ -264,7 +274,10 @@ async fn run_startup_catch_up(
                 event_id,
                 "Catching up on missed portfolio_liquidation_requested"
             );
-            handle_portfolio_liquidation(state, pool, event_id).await;
+            // A replayed request is neither live path: the payload names the
+            // emitter, but by the time a catch-up runs, "which cron emitted
+            // this" is not the useful fact — that it is being replayed is.
+            handle_portfolio_liquidation(state, pool, event_id, LiquidationTrigger::CatchUp).await;
         } else {
             info!(
                 event_id,
@@ -744,11 +757,84 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
     }
 }
 
-async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id: i64) {
+/// Which emitter produced a `portfolio_liquidation_requested`.
+///
+/// Two paths emit it, deliberately. The in-process timer is armed at session
+/// start from Alpaca's reported close, so it pulls liquidation forward on an
+/// early-close day. The pg_cron job fires on the wall clock at 15:45 Eastern so
+/// an unreachable Alpaca clock cannot leave positions open overnight.
+/// Liquidation is idempotent, so both firing is harmless — which is why the
+/// redundancy stays. What it lacked was any way to tell, afterwards, which one
+/// had acted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiquidationTrigger {
+    /// The in-process timer, armed from the real session close.
+    SessionCloseApproaching,
+    /// The pg_cron fail-safe on the wall clock.
+    FailSafeSchedule,
+    /// A request replayed at startup after being missed.
+    CatchUp,
+    /// An emitter this build does not recognise, or a payload without a reason.
+    Unknown,
+}
+
+impl LiquidationTrigger {
+    /// Reads the trigger from the event payload's `reason` field.
+    fn from_payload(payload: &serde_json::Value) -> Self {
+        match payload.get("reason").and_then(|value| value.as_str()) {
+            Some("session_close_approaching") => Self::SessionCloseApproaching,
+            Some("fail_safe_schedule") => Self::FailSafeSchedule,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Returns the name recorded in emitted payloads and logs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionCloseApproaching => "session_close_approaching",
+            Self::FailSafeSchedule => "fail_safe_schedule",
+            Self::CatchUp => "catch_up",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Logs the outcome of a liquidation, at a level that reflects what it means.
+///
+/// The fail-safe finding a flat book is the healthy case, and saying so is the
+/// point: a silent no-op is indistinguishable from the job not having run at
+/// all. The fail-safe finding open positions means the primary timer did not
+/// fire, or fired and failed — a real signal that was previously invisible,
+/// because both cases logged the same line.
+fn report_liquidation_result(trigger: LiquidationTrigger, pairs_closed: usize) {
+    match (trigger, pairs_closed) {
+        (LiquidationTrigger::FailSafeSchedule, 0) => info!(
+            trigger = trigger.as_str(),
+            "Liquidation fail-safe ran and found the book already flat"
+        ),
+        (LiquidationTrigger::FailSafeSchedule, closed) => warn!(
+            trigger = trigger.as_str(),
+            pairs_closed = closed,
+            "Liquidation fail-safe closed open positions; the session-close timer did not"
+        ),
+        (_, closed) => info!(
+            trigger = trigger.as_str(),
+            pairs_closed = closed,
+            "Portfolio liquidation completed"
+        ),
+    }
+}
+
+async fn handle_portfolio_liquidation(
+    state: &AppState,
+    pool: &PgPool,
+    event_id: i64,
+    trigger: LiquidationTrigger,
+) {
     if let Err(error) = emit_event(
         pool,
         EventType::PortfolioLiquidation(Outcome::Started),
-        &serde_json::json!({}),
+        &serde_json::json!({"trigger": trigger.as_str()}),
     )
     .await
     {
@@ -756,7 +842,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
     }
 
     match run_end_of_day_liquidation(state).await {
-        Ok(pairs_closed) => info!(pairs_closed, "Portfolio liquidation completed"),
+        Ok(pairs_closed) => report_liquidation_result(trigger, pairs_closed),
         Err(RebalanceError::Execution(error)) => {
             error!(error = %error, "Portfolio liquidation errored: Alpaca execution error");
             if let Err(emit_error) = emit_event(
@@ -792,9 +878,9 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluation_trigger_from, report_trigger_disagreement, CONSUMER_PORTFOLIO,
-        CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION, ENTRY_RETRY_BACKOFF_MINUTES,
-        LIQUIDATION_LEAD_TIME_MINUTES,
+        evaluation_trigger_from, report_trigger_disagreement, LiquidationTrigger,
+        CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
+        ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
     };
     use crate::common::events::{EventType, Outcome};
     use crate::domain::market::PairID;
@@ -1235,5 +1321,65 @@ mod tests {
             }
         }
         assert_eq!(granted, 1, "exactly one caller may request predictions");
+    }
+
+    // --- Liquidation trigger ---
+
+    #[test]
+    fn test_liquidation_trigger_reads_both_emitters() {
+        assert_eq!(
+            LiquidationTrigger::from_payload(
+                &serde_json::json!({"reason": "session_close_approaching"})
+            ),
+            LiquidationTrigger::SessionCloseApproaching
+        );
+        assert_eq!(
+            LiquidationTrigger::from_payload(&serde_json::json!({"reason": "fail_safe_schedule"})),
+            LiquidationTrigger::FailSafeSchedule
+        );
+    }
+
+    #[test]
+    fn test_liquidation_trigger_falls_back_to_unknown() {
+        // A payload written by an older build, or a reason this build does not
+        // know, must not be silently attributed to either real path.
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"reason": "something_else"}),
+            serde_json::json!({"reason": 7}),
+        ] {
+            assert_eq!(
+                LiquidationTrigger::from_payload(&payload),
+                LiquidationTrigger::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn test_liquidation_trigger_names_round_trip() {
+        // The timer's payload and the cron job's payload are written from these
+        // names, so a rename on one side without the other would silently
+        // degrade every liquidation to Unknown.
+        for trigger in [
+            LiquidationTrigger::SessionCloseApproaching,
+            LiquidationTrigger::FailSafeSchedule,
+        ] {
+            assert_eq!(
+                LiquidationTrigger::from_payload(&serde_json::json!({"reason": trigger.as_str()})),
+                trigger
+            );
+        }
+    }
+
+    #[test]
+    fn test_catch_up_and_unknown_are_not_reachable_from_a_payload() {
+        // Both exist to describe how the handler was reached, not what a cron
+        // job wrote, so neither should be parseable from a reason string.
+        assert_ne!(
+            LiquidationTrigger::from_payload(&serde_json::json!({"reason": "catch_up"})),
+            LiquidationTrigger::CatchUp
+        );
+        assert_eq!(LiquidationTrigger::CatchUp.as_str(), "catch_up");
+        assert_eq!(LiquidationTrigger::Unknown.as_str(), "unknown");
     }
 }

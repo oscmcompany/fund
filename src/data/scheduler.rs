@@ -2,6 +2,7 @@ use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, run_event_listener,
     update_consumer_offset, EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP,
     CONSUMER_DATA_DATABASE_EXPORT, CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
+    CONSUMER_DATA_SCHEDULER_HEALTH,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
 use crate::data::equity_details;
@@ -10,7 +11,7 @@ use crate::data::market_calendar;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use chrono_tz::US::Eastern;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -40,17 +41,29 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
     "trading-session-started",
     "portfolio-liquidation-requested",
     "database-export-requested",
+    "scheduler-health-check-requested",
+    "model-artifact-check-requested",
     "cron-run-details-cleanup",
 ];
 
-/// Nightly event types and their maximum expected age in hours. Events older
-/// than their threshold trigger a warning on startup. Market-hours-only events
-/// (portfolio_evaluation_requested, equity_predictions_requested,
-/// portfolio_liquidation_requested) are excluded because they would produce
-/// false positives outside trading windows.
-const EVENT_FRESHNESS_THRESHOLDS: &[(&str, i64)] = &[
-    ("equity_bars_sync_requested", 26),
-    ("database_export_requested", 26),
+/// Event types that must fire on every trading day.
+///
+/// Freshness is a trading-day question, not an elapsed-hours one. This was a
+/// list of `(event_type, hours)` pairs, both 26 hours, and a fixed hour count
+/// false-positives on exactly the events it covered: on Monday morning the last
+/// `equity_bars_sync_requested` is Friday's, roughly 72 hours old, which tripped
+/// a 26-hour threshold every single week. The same arithmetic is why the session
+/// events were excluded entirely, leaving the event that begins each trading day
+/// with no monitoring at all.
+///
+/// Keyed on [`EventType`] rather than on strings: the stored name is derivable
+/// from the variant, and a string here could name an event no build emits.
+const MONITORED_EVENTS: &[EventType] = &[
+    EventType::EquityBarsSync(Outcome::Requested),
+    EventType::DatabaseExport(Outcome::Requested),
+    EventType::TradingSessionStarted,
+    EventType::EquityPredictions(Outcome::Requested),
+    EventType::PortfolioLiquidation(Outcome::Requested),
 ];
 
 fn prior_trading_day(date: NaiveDate) -> NaiveDate {
@@ -59,6 +72,40 @@ fn prior_trading_day(date: NaiveDate) -> NaiveDate {
         prior = prior.pred_opt().unwrap();
     }
     prior
+}
+
+/// Returns the most recent trading day at `now` — today when today trades,
+/// otherwise the previous trading day.
+fn most_recent_trading_day(now: DateTime<Utc>) -> NaiveDate {
+    let today = now.with_timezone(&Eastern).date_naive();
+    if market_calendar::is_trading_day(today) {
+        today
+    } else {
+        prior_trading_day(today)
+    }
+}
+
+/// Returns the instant the most recent trading day began, in Eastern terms.
+///
+/// An event that has not fired since this instant has missed a trading day.
+fn most_recent_trading_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    let date = most_recent_trading_day(now);
+    let midnight = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time of day");
+    Eastern
+        .from_local_datetime(&midnight)
+        .single()
+        // US DST transitions happen at 02:00 local, so Eastern midnight is
+        // always unambiguous; `earliest` is a total fallback rather than a real
+        // case.
+        .unwrap_or_else(|| {
+            Eastern
+                .from_local_datetime(&midnight)
+                .earliest()
+                .expect("Eastern midnight always resolves")
+        })
+        .with_timezone(&Utc)
 }
 
 fn sync_date_for(now: DateTime<Utc>) -> TradingDate {
@@ -278,11 +325,37 @@ async fn listen_loop(state: State, shutdown_token: CancellationToken) {
     }
 }
 
-/// Validates that all expected pg_cron jobs are registered. Logs an error for
-/// each missing job. Gracefully skips if pg_cron is not installed (e.g., vanilla
-/// PostgreSQL in tests or local development without extensions). Returns
-/// whether pg_cron is available so callers can gate dependent checks.
-async fn validate_cron_jobs(pool: &sqlx::PgPool) -> bool {
+/// Outcome of comparing the registered pg_cron jobs against the expected set.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CronJobReport {
+    /// Jobs `schema.sql` creates that are absent from `cron.job`.
+    missing: Vec<String>,
+    /// Jobs present in `cron.job` that no current `schema.sql` creates.
+    unexpected: Vec<String>,
+    /// Whether pg_cron is installed at all. `false` means neither list is meaningful.
+    pg_cron_available: bool,
+}
+
+impl CronJobReport {
+    /// Returns `true` when the schedule matches `schema.sql` in both directions.
+    fn is_healthy(&self) -> bool {
+        self.missing.is_empty() && self.unexpected.is_empty()
+    }
+}
+
+/// Compares the registered pg_cron jobs against [`EXPECTED_CRON_JOBS`], both ways.
+///
+/// Gracefully skips if pg_cron is not installed (vanilla PostgreSQL in tests or
+/// local development without extensions).
+///
+/// The unexpected-job direction is as load-bearing as the missing-job one.
+/// `schema.sql` is additive and idempotent by convention, so it has no way to
+/// remove a job it no longer creates: a job scheduled by an older schema version
+/// survives forever and nothing notices. Three such orphans were found by hand in
+/// the development database in July 2026 — two emitting event types that no
+/// longer parse, and one emitting a live control event that would have triggered
+/// a second nightly backup once the application ran.
+async fn validate_cron_jobs(pool: &sqlx::PgPool) -> CronJobReport {
     // Check whether the cron schema exists before querying it.
     let cron_exists = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'cron')",
@@ -293,68 +366,109 @@ async fn validate_cron_jobs(pool: &sqlx::PgPool) -> bool {
         Ok(value) => value,
         Err(error) => {
             warn!(error = %error, "Failed to check pg_cron availability, skipping job validation");
-            return false;
+            return CronJobReport::default();
         }
     };
 
     if !cron_exists {
         info!("pg_cron not available, skipping job validation");
-        return false;
+        return CronJobReport::default();
     }
 
-    let rows: Vec<String> = match sqlx::query_scalar("SELECT jobname FROM cron.job")
+    let registered: Vec<String> = match sqlx::query_scalar("SELECT jobname FROM cron.job")
         .fetch_all(pool)
         .await
     {
         Ok(rows) => rows,
         Err(error) => {
             warn!(error = %error, "Failed to query pg_cron jobs, skipping job validation");
-            return true;
+            return CronJobReport {
+                pg_cron_available: true,
+                ..CronJobReport::default()
+            };
         }
     };
 
-    let mut missing_count = 0;
-    for &expected_name in EXPECTED_CRON_JOBS {
-        if !rows.iter().any(|name| name == expected_name) {
-            error!(job_name = expected_name, "Expected pg_cron job is missing");
-            missing_count += 1;
-        }
+    let report = compare_cron_jobs(&registered);
+
+    for job_name in &report.missing {
+        error!(job_name, "Expected pg_cron job is missing");
+    }
+    for job_name in &report.unexpected {
+        warn!(
+            job_name,
+            "Unexpected pg_cron job is registered; no current schema.sql creates it"
+        );
     }
 
-    if missing_count == 0 {
+    if report.is_healthy() {
         info!(
             job_count = EXPECTED_CRON_JOBS.len(),
-            "All expected pg_cron jobs are active"
+            "Registered pg_cron jobs match the expected schedule"
         );
     } else {
         warn!(
-            missing = missing_count,
+            missing = report.missing.len(),
+            unexpected = report.unexpected.len(),
             total = EXPECTED_CRON_JOBS.len(),
-            "Some expected pg_cron jobs are missing"
+            "Registered pg_cron jobs do not match the expected schedule"
         );
     }
 
-    true
+    report
 }
 
-/// Checks when each nightly event type last fired. Warns if any are overdue,
-/// which indicates pg_cron may not be running or a job's SQL is failing silently.
-async fn check_event_freshness(pool: &sqlx::PgPool) {
-    let now = Utc::now();
-    let mut stale_count = 0;
+/// Compares registered job names against [`EXPECTED_CRON_JOBS`] in both directions.
+///
+/// Separated from the query so the comparison is testable without pg_cron.
+fn compare_cron_jobs(registered: &[String]) -> CronJobReport {
+    CronJobReport {
+        missing: EXPECTED_CRON_JOBS
+            .iter()
+            .filter(|expected| !registered.iter().any(|name| name == *expected))
+            .map(|expected| (*expected).to_string())
+            .collect(),
+        unexpected: registered
+            .iter()
+            .filter(|name| !EXPECTED_CRON_JOBS.contains(&name.as_str()))
+            .cloned()
+            .collect(),
+        pg_cron_available: true,
+    }
+}
 
-    for &(event_type, threshold_hours) in EVENT_FRESHNESS_THRESHOLDS {
+/// Checks that each monitored event has fired on the most recent trading day.
+///
+/// An overdue event means pg_cron is not running, or a job's SQL is failing
+/// silently, or the job was never scheduled at all.
+///
+/// Only sees events inside the nightly purge retention window. The purge deletes
+/// from `events` with a one-day cutoff (`data::database::run_database_purge`), so
+/// absence here means "not within retention", not "never happened" — see the note
+/// at the `events` entry in that table list, which points back at this function.
+/// Shortening that retention, or running the purge on weekends, blinds this check.
+///
+/// One known edge: a startup before a trading day's jobs have fired — the bars
+/// sync runs at 05:00 UTC — reports that day's events as overdue, because they
+/// genuinely have not fired yet. The scheduled run at 10:00 Eastern is past every
+/// daily job, so it does not see this.
+async fn check_event_freshness(pool: &sqlx::PgPool) -> Vec<EventType> {
+    let now = Utc::now();
+    let trading_day_start = most_recent_trading_day_start(now);
+    let mut stale = Vec::new();
+
+    for &event_type in MONITORED_EVENTS {
         let last_seen: Option<DateTime<Utc>> = match sqlx::query_scalar(
             "SELECT created_at FROM events WHERE event_type = $1 ORDER BY id DESC LIMIT 1",
         )
-        .bind(event_type)
+        .bind(event_type.as_str())
         .fetch_optional(pool)
         .await
         {
             Ok(value) => value,
             Err(error) => {
                 warn!(
-                    event_type,
+                    event_type = event_type.as_str(),
                     error = %error,
                     "Failed to query event freshness, skipping"
                 );
@@ -362,49 +476,43 @@ async fn check_event_freshness(pool: &sqlx::PgPool) {
             }
         };
 
-        let is_stale = is_event_stale(last_seen, now, threshold_hours);
+        if !is_event_stale(last_seen, trading_day_start) {
+            continue;
+        }
 
-        if is_stale {
-            stale_count += 1;
-            match last_seen {
-                Some(timestamp) => {
-                    let age_hours = (now - timestamp).num_hours();
-                    warn!(
-                        event_type,
-                        last_seen = %timestamp,
-                        age_hours,
-                        threshold_hours,
-                        "Event is overdue"
-                    );
-                }
-                None => {
-                    warn!(event_type, "Event has never been recorded");
-                }
-            }
+        stale.push(event_type);
+        match last_seen {
+            Some(timestamp) => warn!(
+                event_type = event_type.as_str(),
+                last_seen = %timestamp,
+                trading_day_start = %trading_day_start,
+                "Event has not fired on the most recent trading day"
+            ),
+            None => warn!(
+                event_type = event_type.as_str(),
+                "Event has never been recorded within the retention window"
+            ),
         }
     }
 
-    if stale_count == 0 {
+    if stale.is_empty() {
         info!(
-            event_count = EVENT_FRESHNESS_THRESHOLDS.len(),
-            "All monitored event types are fresh"
+            event_count = MONITORED_EVENTS.len(),
+            "All monitored event types fired on the most recent trading day"
         );
     }
+
+    stale
 }
 
-/// Returns `true` if the event is stale (last seen at least `threshold_hours`
-/// ago, or never seen at all).
-fn is_event_stale(
-    last_seen: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    threshold_hours: i64,
-) -> bool {
+/// Returns `true` when the event has not fired since the trading day began.
+///
+/// Never seen counts as stale: within the retention window, an event that has
+/// left no row has not fired.
+fn is_event_stale(last_seen: Option<DateTime<Utc>>, trading_day_start: DateTime<Utc>) -> bool {
     match last_seen {
         None => true,
-        Some(timestamp) => {
-            let age = now - timestamp;
-            age.num_hours() >= threshold_hours
-        }
+        Some(timestamp) => timestamp < trading_day_start,
     }
 }
 
@@ -437,6 +545,10 @@ async fn run_listener(
                     info!(event_id, "Received database_purge_requested");
                     handle_database_purge(pool, event_id).await;
                 }
+                EventType::SchedulerHealthCheck(Outcome::Requested) => {
+                    info!(event_id, "Received scheduler_health_check_requested");
+                    handle_scheduler_health_check(pool, event_id).await;
+                }
                 // Every consumer receives every event; the rest belong to other
                 // services or are audit records. Listed rather than caught by a
                 // wildcard so that adding a family, or an `Outcome` to one of
@@ -454,6 +566,12 @@ async fn run_listener(
                 | EventType::DatabasePurge(
                     Outcome::Started | Outcome::Completed | Outcome::Errored,
                 )
+                | EventType::SchedulerHealthCheck(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::ModelArtifactCheck(_)
+                | EventType::ModelArtifactPublished
+                | EventType::ModelArtifactStale
                 | EventType::EquityPredictions(_)
                 | EventType::PortfolioRebalance(_)
                 | EventType::PortfolioLiquidation(_)
@@ -474,8 +592,8 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
     // Validate pg_cron jobs and event freshness on startup. Event freshness
     // is only meaningful when pg_cron is installed (otherwise no cron-triggered
     // events exist and every check would produce a false warning).
-    let pg_cron_available = validate_cron_jobs(pool).await;
-    if pg_cron_available {
+    let report = validate_cron_jobs(pool).await;
+    if report.pg_cron_available {
         check_event_freshness(pool).await;
     }
 
@@ -519,6 +637,21 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
         handle_database_backup(state, pool, event_id).await;
     }
 
+    let health_check_offset = get_consumer_offset(pool, CONSUMER_DATA_SCHEDULER_HEALTH).await?;
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::SchedulerHealthCheck(Outcome::Requested),
+        health_check_offset,
+    )
+    .await?
+    {
+        info!(
+            event_id,
+            "Catching up on missed scheduler_health_check_requested"
+        );
+        handle_scheduler_health_check(pool, event_id).await;
+    }
+
     let purge_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE).await?;
     if let Some(event_id) = latest_event_after(
         pool,
@@ -532,6 +665,68 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Re-runs the startup health checks on a schedule and reports the result.
+///
+/// The startup run answers "did we miss anything while we were down"; this
+/// answers "has anything stopped while we were up". A process under a tmux
+/// restart loop can stay up for weeks, so without a scheduled run a cron job
+/// that silently stopped firing produced no warning from anywhere.
+///
+/// A failure emits `scheduler_health_check_errored` rather than only logging, so
+/// a missed cron reaches the dashboard feed and the fund report alongside
+/// everything else.
+async fn handle_scheduler_health_check(pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::SchedulerHealthCheck(Outcome::Started),
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit scheduler_health_check_started");
+    }
+
+    let cron_report = validate_cron_jobs(pool).await;
+    let stale_events = if cron_report.pg_cron_available {
+        check_event_freshness(pool).await
+    } else {
+        Vec::new()
+    };
+
+    let outcome = if cron_report.is_healthy() && stale_events.is_empty() {
+        Outcome::Completed
+    } else {
+        Outcome::Errored
+    };
+    let payload = serde_json::json!({
+        "missing_jobs": cron_report.missing,
+        "unexpected_jobs": cron_report.unexpected,
+        "stale_events": stale_events
+            .iter()
+            .map(|event_type| event_type.as_str())
+            .collect::<Vec<&str>>(),
+    });
+
+    match outcome {
+        Outcome::Completed => info!("Scheduler health check found no problems"),
+        _ => error!(
+            missing_jobs = cron_report.missing.len(),
+            unexpected_jobs = cron_report.unexpected.len(),
+            stale_events = stale_events.len(),
+            "Scheduler health check found problems"
+        ),
+    }
+
+    if let Err(error) = emit_event(pool, EventType::SchedulerHealthCheck(outcome), &payload).await {
+        warn!(error = %error, "Failed to emit the scheduler health check outcome");
+    }
+
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_SCHEDULER_HEALTH, event_id).await
+    {
+        warn!(error = %error, "Failed to update scheduler-health consumer offset");
+    }
 }
 
 async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {
@@ -965,11 +1160,12 @@ fn parse_postgres_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_coverage_gaps, export_date_from_payload, is_event_stale, listen_loop,
-        parse_postgres_url, prior_trading_day, purge_outcome_event, spawn_sync_scheduler,
-        sync_date_for, EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
+        compare_cron_jobs, detect_coverage_gaps, export_date_from_payload, is_event_stale,
+        listen_loop, most_recent_trading_day, most_recent_trading_day_start, parse_postgres_url,
+        prior_trading_day, purge_outcome_event, spawn_sync_scheduler, sync_date_for, EventType,
+        Outcome, EXPECTED_CRON_JOBS, MONITORED_EVENTS,
     };
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
     use tokio_util::sync::CancellationToken;
 
@@ -1448,12 +1644,14 @@ mod tests {
 
     #[test]
     fn test_expected_cron_jobs_list_is_complete() {
-        assert_eq!(EXPECTED_CRON_JOBS.len(), 6);
+        assert_eq!(EXPECTED_CRON_JOBS.len(), 8);
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-predictions-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"trading-session-started"));
         assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"database-export-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"scheduler-health-check-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"model-artifact-check-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
     }
 
@@ -1562,47 +1760,146 @@ mod tests {
     }
 
     #[test]
-    fn test_event_freshness_thresholds_cover_nightly_jobs() {
-        assert_eq!(EVENT_FRESHNESS_THRESHOLDS.len(), 2);
-        let event_types: Vec<&str> = EVENT_FRESHNESS_THRESHOLDS
-            .iter()
-            .map(|(event_type, _)| *event_type)
-            .collect();
-        assert!(event_types.contains(&"equity_bars_sync_requested"));
-        assert!(event_types.contains(&"database_export_requested"));
+    fn test_monitored_events_cover_every_daily_job() {
+        // The session events were previously excluded because a fixed hour count
+        // false-positived on them outside trading windows. A trading-day
+        // question does not, so the event that begins each trading day is
+        // monitored at last.
+        assert!(MONITORED_EVENTS.contains(&EventType::EquityBarsSync(Outcome::Requested)));
+        assert!(MONITORED_EVENTS.contains(&EventType::DatabaseExport(Outcome::Requested)));
+        assert!(MONITORED_EVENTS.contains(&EventType::TradingSessionStarted));
+        assert!(MONITORED_EVENTS.contains(&EventType::EquityPredictions(Outcome::Requested)));
+        assert!(MONITORED_EVENTS.contains(&EventType::PortfolioLiquidation(Outcome::Requested)));
+    }
+
+    /// 2026-07-31 is a Friday; 2026-08-03 is the following Monday.
+    fn eastern(date: (i32, u32, u32), time: (u32, u32)) -> DateTime<Utc> {
+        Eastern
+            .with_ymd_and_hms(date.0, date.1, date.2, time.0, time.1, 0)
+            .single()
+            .expect("fixture instant is unambiguous")
+            .with_timezone(&Utc)
     }
 
     #[test]
     fn test_is_event_stale_never_seen() {
-        let now = Utc::now();
-        assert!(is_event_stale(None, now, 26));
+        let trading_day_start = most_recent_trading_day_start(Utc::now());
+        assert!(is_event_stale(None, trading_day_start));
     }
 
     #[test]
-    fn test_is_event_stale_recent_event_is_fresh() {
-        let now = Utc::now();
-        let one_hour_ago = now - chrono::Duration::hours(1);
-        assert!(!is_event_stale(Some(one_hour_ago), now, 26));
+    fn test_event_that_fired_today_is_fresh() {
+        let now = eastern((2026, 7, 31), (10, 0));
+        let fired = eastern((2026, 7, 31), (5, 0));
+        assert!(!is_event_stale(
+            Some(fired),
+            most_recent_trading_day_start(now)
+        ));
     }
 
     #[test]
-    fn test_is_event_stale_old_event_is_stale() {
-        let now = Utc::now();
-        let two_days_ago = now - chrono::Duration::hours(48);
-        assert!(is_event_stale(Some(two_days_ago), now, 26));
+    fn test_event_that_last_fired_the_previous_trading_day_is_stale() {
+        // Friday morning, last seen Thursday: a day was missed.
+        let now = eastern((2026, 7, 31), (10, 0));
+        let fired = eastern((2026, 7, 30), (5, 0));
+        assert!(is_event_stale(
+            Some(fired),
+            most_recent_trading_day_start(now)
+        ));
+    }
+
+    /// The false positive that ran every week under the old fixed hour count.
+    #[test]
+    fn test_a_weekend_does_not_make_a_friday_event_stale() {
+        let fired = eastern((2026, 7, 31), (5, 0));
+
+        for now in [
+            eastern((2026, 8, 1), (10, 0)), // Saturday
+            eastern((2026, 8, 2), (10, 0)), // Sunday
+        ] {
+            assert!(
+                !is_event_stale(Some(fired), most_recent_trading_day_start(now)),
+                "a Friday event must stay fresh through the weekend"
+            );
+        }
+
+        // Roughly 77 hours old by Monday morning, which tripped the old
+        // 26-hour threshold every week. It is Monday's own firing that is now
+        // expected, so Friday's no longer counts.
+        let monday = eastern((2026, 8, 3), (10, 0));
+        assert!(is_event_stale(
+            Some(fired),
+            most_recent_trading_day_start(monday)
+        ));
     }
 
     #[test]
-    fn test_is_event_stale_at_exact_threshold() {
-        let now = Utc::now();
-        let exactly_at_threshold = now - chrono::Duration::hours(26);
-        assert!(is_event_stale(Some(exactly_at_threshold), now, 26));
+    fn test_most_recent_trading_day_rolls_back_over_a_weekend() {
+        assert_eq!(
+            most_recent_trading_day(eastern((2026, 8, 2), (10, 0))),
+            NaiveDate::from_ymd_opt(2026, 7, 31).unwrap()
+        );
+        assert_eq!(
+            most_recent_trading_day(eastern((2026, 7, 31), (10, 0))),
+            NaiveDate::from_ymd_opt(2026, 7, 31).unwrap()
+        );
     }
 
     #[test]
-    fn test_is_event_stale_just_under_threshold() {
-        let now = Utc::now();
-        let just_under = now - chrono::Duration::hours(25);
-        assert!(!is_event_stale(Some(just_under), now, 26));
+    fn test_compare_cron_jobs_reports_both_directions() {
+        let registered: Vec<String> = EXPECTED_CRON_JOBS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let report = compare_cron_jobs(&registered);
+        assert!(report.is_healthy());
+        assert!(report.pg_cron_available);
+    }
+
+    #[test]
+    fn test_compare_cron_jobs_reports_a_missing_job() {
+        let registered: Vec<String> = EXPECTED_CRON_JOBS
+            .iter()
+            .skip(1)
+            .map(|name| (*name).to_string())
+            .collect();
+        let report = compare_cron_jobs(&registered);
+        assert_eq!(report.missing, vec![EXPECTED_CRON_JOBS[0].to_string()]);
+        assert!(report.unexpected.is_empty());
+        assert!(!report.is_healthy());
+    }
+
+    /// The direction that did not exist, and that three real orphans needed.
+    ///
+    /// `schema.sql` is additive and idempotent, so it cannot remove a job it no
+    /// longer creates. Without this check a job scheduled by an older schema
+    /// version survives forever and nothing notices — including one that emitted
+    /// a live control event and would have doubled the nightly backup.
+    #[test]
+    fn test_compare_cron_jobs_reports_an_unexpected_job() {
+        let mut registered: Vec<String> = EXPECTED_CRON_JOBS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        registered.push("database-backup-requested".to_string());
+
+        let report = compare_cron_jobs(&registered);
+        assert!(report.missing.is_empty());
+        assert_eq!(
+            report.unexpected,
+            vec!["database-backup-requested".to_string()]
+        );
+        assert!(!report.is_healthy());
+    }
+
+    /// An event fired at the very start of the trading day is fresh.
+    ///
+    /// The comparison is `timestamp < trading_day_start`, so the boundary
+    /// instant itself counts as having fired within the day.
+    #[test]
+    fn test_event_at_the_trading_day_boundary_is_fresh() {
+        let now = eastern((2026, 7, 31), (10, 0));
+        let start = most_recent_trading_day_start(now);
+        assert!(!is_event_stale(Some(start), start));
     }
 }
