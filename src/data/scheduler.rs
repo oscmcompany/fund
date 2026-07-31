@@ -722,6 +722,32 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
     }
 }
 
+/// Selects the terminal event for a purge run and builds its payload.
+///
+/// A table that fails to purge is skipped rather than aborting the run, so the
+/// outcome is partial rather than fatal. Reporting it as completed would let a
+/// table fail every night with the event log claiming success each time, which is
+/// exactly the failure the nightly chain exists to make visible.
+fn purge_outcome_event(
+    summary: &crate::data::database::PurgeSummary,
+    total_rows_deleted: u64,
+) -> (EventType, serde_json::Value) {
+    if summary.failed_tables.is_empty() {
+        (
+            EventType::DatabasePurgeCompleted,
+            serde_json::json!({ "total_rows_deleted": total_rows_deleted }),
+        )
+    } else {
+        (
+            EventType::DatabasePurgeErrored,
+            serde_json::json!({
+                "total_rows_deleted": total_rows_deleted,
+                "failed_tables": summary.failed_tables,
+            }),
+        )
+    }
+}
+
 async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
@@ -740,15 +766,20 @@ async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
             info!(table, rows = count, "Purged old rows");
         }
     }
-    info!(total_rows = total, "Database purge completed");
-    if let Err(error) = emit_event(
-        pool,
-        EventType::DatabasePurgeCompleted,
-        &serde_json::json!({"total_rows_deleted": total}),
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to emit database_purge_completed");
+
+    let (event_type, payload) = purge_outcome_event(&summary, total);
+    if summary.failed_tables.is_empty() {
+        info!(total_rows = total, "Database purge completed");
+    } else {
+        error!(
+            total_rows = total,
+            failed_tables = ?summary.failed_tables,
+            "Database purge completed with failures"
+        );
+    }
+
+    if let Err(error) = emit_event(pool, event_type, &payload).await {
+        warn!(error = %error, event_type = event_type.as_str(), "Failed to emit purge outcome");
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE, event_id).await {
@@ -910,8 +941,8 @@ fn parse_postgres_url(
 mod tests {
     use super::{
         detect_coverage_gaps, export_date_from_payload, is_event_stale, listen_loop,
-        parse_postgres_url, prior_trading_day, spawn_sync_scheduler, sync_date_for,
-        EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
+        parse_postgres_url, prior_trading_day, purge_outcome_event, spawn_sync_scheduler,
+        sync_date_for, EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
@@ -1408,6 +1439,58 @@ mod tests {
         // made validate_cron_jobs log a missing-job error on every data-service
         // startup.
         assert!(!EXPECTED_CRON_JOBS.contains(&"portfolio-evaluation-requested"));
+    }
+
+    #[test]
+    fn test_purge_outcome_event_reports_completed_when_no_table_failed() {
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: vec![("events".to_string(), 42)],
+            failed_tables: Vec::new(),
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 42);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeCompleted
+        );
+        assert_eq!(payload["total_rows_deleted"], 42);
+        assert!(payload.get("failed_tables").is_none());
+    }
+
+    #[test]
+    fn test_purge_outcome_event_reports_errored_when_a_table_failed() {
+        // A partial purge must not be announced as a completed one: the failing
+        // table would otherwise be invisible in the events table and the dashboard,
+        // and could fail nightly without anything noticing.
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: vec![("events".to_string(), 42)],
+            failed_tables: vec!["equity_pairs".to_string()],
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 42);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeErrored
+        );
+        assert_eq!(payload["total_rows_deleted"], 42);
+        assert_eq!(payload["failed_tables"][0], "equity_pairs");
+    }
+
+    #[test]
+    fn test_purge_outcome_event_carries_every_failed_table() {
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: Vec::new(),
+            failed_tables: vec![
+                "equity_orders".to_string(),
+                "events".to_string(),
+                "model_runs".to_string(),
+            ],
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 0);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeErrored
+        );
+        assert_eq!(payload["failed_tables"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["total_rows_deleted"], 0);
     }
 
     #[test]

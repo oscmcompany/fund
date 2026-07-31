@@ -2,9 +2,9 @@
 //!
 //! [`MarketDataBuffer`] wraps a [`tokio::sync::broadcast`] channel where
 //! WebSocket readers publish raw market data and downstream consumers
-//! subscribe. Data here lives only for the current process lifetime and is
-//! never written to PostgreSQL — see the [`crate::stream`] module docs for why
-//! that holds structurally rather than by convention.
+//! subscribe. The buffer has no database dependency, so data passing through it
+//! lives only for the current process lifetime — see the [`crate::stream`]
+//! module docs for how that relates to what consumers may do with it.
 
 use std::fmt;
 

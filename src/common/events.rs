@@ -49,12 +49,14 @@ pub enum EventType {
     DatabasePurgeRequested,
     /// data: database purge has started.
     DatabasePurgeStarted,
-    /// data: database purge completed successfully.
-    ///
-    /// There is no errored counterpart: `purge_ephemeral_tables` returns a summary
-    /// rather than a `Result`, logging and skipping any table that fails, so the
-    /// handler has no failure path to report.
+    /// data: database purge completed successfully, with every table purged.
     DatabasePurgeCompleted,
+    /// data: database purge finished with one or more tables failing.
+    ///
+    /// A failing table is skipped so the rest of the purge still runs, so this is a
+    /// partial outcome rather than an abort: the payload carries the failed table
+    /// names alongside the rows that were deleted.
+    DatabasePurgeErrored,
 
     // --- Prediction pipeline ---
     /// pg_cron trigger: pre-market request for the day's equity predictions.
@@ -134,6 +136,7 @@ impl EventType {
             Self::DatabasePurgeRequested => "database_purge_requested",
             Self::DatabasePurgeStarted => "database_purge_started",
             Self::DatabasePurgeCompleted => "database_purge_completed",
+            Self::DatabasePurgeErrored => "database_purge_errored",
             Self::EquityPredictionsRequested => "equity_predictions_requested",
             Self::EquityPredictionsStarted => "equity_predictions_started",
             Self::EquityPredictionsCompleted => "equity_predictions_completed",
@@ -169,6 +172,7 @@ impl EventType {
             "database_purge_requested" => Some(Self::DatabasePurgeRequested),
             "database_purge_started" => Some(Self::DatabasePurgeStarted),
             "database_purge_completed" => Some(Self::DatabasePurgeCompleted),
+            "database_purge_errored" => Some(Self::DatabasePurgeErrored),
             "equity_predictions_requested" => Some(Self::EquityPredictionsRequested),
             "equity_predictions_started" => Some(Self::EquityPredictionsStarted),
             "equity_predictions_completed" => Some(Self::EquityPredictionsCompleted),
@@ -363,6 +367,7 @@ mod tests {
             EventType::DatabasePurgeRequested,
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
+            EventType::DatabasePurgeErrored,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
@@ -546,6 +551,7 @@ mod tests {
                 EventType::DatabasePurgeCompleted,
                 "database_purge_completed",
             ),
+            (EventType::DatabasePurgeErrored, "database_purge_errored"),
             (EventType::TradingSessionStarted, "trading_session_started"),
             (
                 EventType::PortfolioEvaluationRequested,
@@ -626,6 +632,7 @@ mod tests {
             EventType::DatabasePurgeRequested,
             EventType::DatabasePurgeStarted,
             EventType::DatabasePurgeCompleted,
+            EventType::DatabasePurgeErrored,
             EventType::EquityPredictionsRequested,
             EventType::EquityPredictionsStarted,
             EventType::EquityPredictionsCompleted,
