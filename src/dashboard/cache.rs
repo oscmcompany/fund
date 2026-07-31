@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::common::events::EventType;
+use crate::common::events::{EventNotification, EventType};
 use crate::domain::market::{PairID, Ticker};
 use crate::domain::trading::CloseReason;
 
@@ -285,40 +285,17 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
             loop {
                 match listener.recv().await {
                     Ok(notification) => {
-                        let parsed: serde_json::Value =
-                            match serde_json::from_str(notification.payload()) {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    warn!(error = %error, "Invalid event notification payload");
-                                    continue;
-                                }
-                            };
-                        let Some(event_id) =
-                            parsed.get("event_id").and_then(serde_json::Value::as_i64)
-                        else {
-                            warn!("Event notification missing event_id field");
-                            continue;
-                        };
-                        let Some(event_type_str) =
-                            parsed.get("event_type").and_then(serde_json::Value::as_str)
-                        else {
-                            warn!("Event notification missing event_type field");
-                            continue;
-                        };
-                        let Some(event_type) = EventType::parse(event_type_str) else {
+                        let Some(parsed) = EventNotification::parse(notification.payload()) else {
                             warn!(
-                                event_type = event_type_str,
-                                "Unknown event type in notification, skipping"
+                                payload = notification.payload(),
+                                "Skipping unparseable or unrecognised event notification"
                             );
                             continue;
                         };
                         let entry = EventEntry {
-                            event_id,
-                            event_type,
-                            payload: parsed
-                                .get("payload")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null),
+                            event_id: parsed.event_id(),
+                            event_type: parsed.event_type(),
+                            payload: parsed.into_payload(),
                             received_at: Utc::now(),
                         };
                         let mut guard = state.write().await;

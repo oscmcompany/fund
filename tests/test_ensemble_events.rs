@@ -7,11 +7,18 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use fund::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType, Outcome,
+    emit_event, get_consumer_offset, latest_event_after, run_event_listener,
+    update_consumer_offset, EventNotification, EventType, Outcome,
 };
 use fund::inference::database::{insert_predictions, upsert_model_run, ModelRunRecord};
 use serial_test::serial;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -165,4 +172,214 @@ async fn test_insert_predictions_writes_rows() {
             .await
             .unwrap();
     assert_eq!(count, 1);
+}
+
+// --- Shared LISTEN loop ---
+//
+// These exercise `run_event_listener` against the real NOTIFY channel, because
+// the behaviour worth pinning down — that a notification reaches the handler,
+// that catch-up runs per connection, and that cancellation is prompt without
+// truncating in-flight work — only exists end to end.
+//
+// Every test tags its events with a unique marker in the payload and ignores
+// anything else, since the channel is shared with whatever else is running.
+
+/// Emits a `stress_test` event carrying a unique marker.
+async fn emit_marked_event(pool: &sqlx::PgPool, marker: &str) {
+    emit_event(
+        pool,
+        EventType::StressTest,
+        &serde_json::json!({"marker": marker}),
+    )
+    .await
+    .unwrap();
+}
+
+/// Returns true when a notification carries the given marker.
+fn has_marker(notification: &EventNotification, marker: &str) -> bool {
+    notification
+        .payload()
+        .get("marker")
+        .and_then(|value| value.as_str())
+        == Some(marker)
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_event_listener_dispatches_notifications_to_the_handler() {
+    let pool = common::get_pg_pool().await;
+    let marker = Uuid::new_v4().to_string();
+    let token = CancellationToken::new();
+    let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let listener = tokio::spawn({
+        let (pool, token, seen, marker) =
+            (pool.clone(), token.clone(), seen.clone(), marker.clone());
+        async move {
+            run_event_listener(
+                &pool,
+                &token,
+                "test-dispatch",
+                || async { Ok(()) },
+                |notification| {
+                    let seen = seen.clone();
+                    let marker = marker.clone();
+                    async move {
+                        if has_marker(&notification, &marker) {
+                            seen.lock().await.push(notification.event_id());
+                        }
+                    }
+                },
+            )
+            .await
+        }
+    });
+
+    // The listener needs to be subscribed before the event is emitted; NOTIFY
+    // does not replay to a connection that was not listening at the time.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    emit_marked_event(&pool, &marker).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while seen.lock().await.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    token.cancel();
+    listener.await.unwrap().unwrap();
+
+    let received = seen.lock().await;
+    assert_eq!(
+        received.len(),
+        1,
+        "handler should have received exactly the marked event"
+    );
+    assert!(received[0] > 0, "event_id should be a real row id");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_event_listener_runs_catch_up_before_dispatching() {
+    let pool = common::get_pg_pool().await;
+    let token = CancellationToken::new();
+    let catch_up_runs = Arc::new(AtomicUsize::new(0));
+
+    let listener = tokio::spawn({
+        let (pool, token, catch_up_runs) = (pool.clone(), token.clone(), catch_up_runs.clone());
+        async move {
+            run_event_listener(
+                &pool,
+                &token,
+                "test-catch-up",
+                || {
+                    let catch_up_runs = catch_up_runs.clone();
+                    async move {
+                        catch_up_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+                |_| async {},
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    token.cancel();
+    listener.await.unwrap().unwrap();
+
+    assert_eq!(
+        catch_up_runs.load(Ordering::SeqCst),
+        1,
+        "catch-up should run exactly once per connection"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_event_listener_exits_promptly_when_cancelled_while_idle() {
+    let pool = common::get_pg_pool().await;
+    let token = CancellationToken::new();
+
+    let listener = tokio::spawn({
+        let (pool, token) = (pool.clone(), token.clone());
+        async move {
+            run_event_listener(
+                &pool,
+                &token,
+                "test-idle-cancel",
+                || async { Ok(()) },
+                |_| async {},
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let cancelled_at = tokio::time::Instant::now();
+    token.cancel();
+    listener.await.unwrap().unwrap();
+
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "an idle listener should exit on cancellation without waiting for a notification"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_run_event_listener_finishes_an_in_flight_handler_before_exiting() {
+    let pool = common::get_pg_pool().await;
+    let marker = Uuid::new_v4().to_string();
+    let token = CancellationToken::new();
+    let handler_started = Arc::new(AtomicUsize::new(0));
+    let handler_finished = Arc::new(AtomicUsize::new(0));
+
+    let listener = tokio::spawn({
+        let (pool, token, marker) = (pool.clone(), token.clone(), marker.clone());
+        let (started, finished) = (handler_started.clone(), handler_finished.clone());
+        async move {
+            run_event_listener(
+                &pool,
+                &token,
+                "test-in-flight",
+                || async { Ok(()) },
+                |notification| {
+                    let (started, finished) = (started.clone(), finished.clone());
+                    let marker = marker.clone();
+                    async move {
+                        if !has_marker(&notification, &marker) {
+                            return;
+                        }
+                        started.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .await
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    emit_marked_event(&pool, &marker).await;
+
+    // Cancel while the handler is mid-sleep.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while handler_started.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        handler_started.load(Ordering::SeqCst),
+        1,
+        "handler should have started before cancellation"
+    );
+    token.cancel();
+
+    listener.await.unwrap().unwrap();
+    assert_eq!(
+        handler_finished.load(Ordering::SeqCst),
+        1,
+        "an in-flight handler must run to completion rather than being dropped"
+    );
 }

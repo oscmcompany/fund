@@ -29,7 +29,6 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -37,8 +36,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    Outcome, CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
+    emit_event, get_consumer_offset, latest_event_after, run_event_listener,
+    update_consumer_offset, EventType, Outcome, CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION,
+    CONSUMER_PORTFOLIO_SESSION,
 };
 use crate::common::market_hours::MarketSession;
 use crate::portfolio::database::{fetch_open_pairs, predictions_exist_for_today};
@@ -102,14 +102,56 @@ async fn run_consumer(
     pool: &PgPool,
     shutdown_token: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen("events").await?;
-    info!("Event consumer connected, listening on channel 'events'");
+    run_event_listener(
+        pool,
+        shutdown_token,
+        CONSUMER_PORTFOLIO,
+        || run_startup_catch_up(state, pool, shutdown_token),
+        |notification| async move {
+            let event_id = notification.event_id();
+            match notification.event_type() {
+                EventType::TradingSessionStarted => {
+                    info!(event_id, "Received trading_session_started");
+                    handle_trading_session_started(state, pool, event_id, shutdown_token).await;
+                }
+                EventType::PortfolioEvaluationRequested => {
+                    handle_portfolio_evaluation(state, pool).await;
+                }
+                EventType::EquityPredictions(Outcome::Completed) => {
+                    info!(event_id, "Received equity_predictions_completed");
+                    handle_equity_predictions_completed(state, pool, event_id).await;
+                }
+                EventType::EquityPredictions(Outcome::Errored) => {
+                    // Nothing to unwind: the request timestamp is a retry
+                    // backoff, not a lock, so the next due evaluation
+                    // re-requests on its own. An explicit arm because this is a
+                    // considered decision, not an oversight.
+                    info!(event_id, "Received equity_predictions_errored");
+                }
+                EventType::PortfolioLiquidation(Outcome::Requested) => {
+                    info!(event_id, "Received portfolio_liquidation_requested");
+                    handle_portfolio_liquidation(state, pool, event_id).await;
+                }
+                // Every consumer receives every event; the rest belong to other
+                // services or are audit records. The match exists so a new
+                // variant is a compile-time decision rather than a silent
+                // omission.
+                _ => {}
+            }
+        },
+    )
+    .await
+}
 
-    if shutdown_token.is_cancelled() {
-        return Ok(());
-    }
-
+/// Replays the events this consumer missed while it was down.
+///
+/// Runs on every connection, not once per process: a reconnect means delivery
+/// had a gap, and the same replay that covers a restart covers that gap too.
+async fn run_startup_catch_up(
+    state: &AppState,
+    pool: &PgPool,
+    shutdown_token: &CancellationToken,
+) -> Result<(), sqlx::Error> {
     // Run startup reconciliation to resolve any DB-Alpaca drift accumulated
     // while the service was down.
     match reconciliation::reconcile(pool, state.alpaca_client()).await {
@@ -213,46 +255,6 @@ async fn run_consumer(
             {
                 warn!(error = %error, "Failed to update liquidation consumer offset");
             }
-        }
-    }
-
-    loop {
-        let notification = tokio::select! {
-            result = listener.recv() => result?,
-            _ = shutdown_token.cancelled() => {
-                info!("Shutdown signal received, draining");
-                break;
-            }
-        };
-        let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let event_type = parsed
-            .get("event_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let event_id = parsed
-            .get("event_id")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-
-        if event_type == EventType::TradingSessionStarted.as_str() {
-            info!(event_id, "Received trading_session_started");
-            handle_trading_session_started(state, pool, event_id, shutdown_token).await;
-        } else if event_type == EventType::PortfolioEvaluationRequested.as_str() {
-            handle_portfolio_evaluation(state, pool).await;
-        } else if event_type == EventType::EquityPredictions(Outcome::Completed).as_str() {
-            info!(event_id, "Received equity_predictions_completed");
-            handle_equity_predictions_completed(state, pool, event_id).await;
-        } else if event_type == EventType::EquityPredictions(Outcome::Errored).as_str() {
-            // Nothing to unwind: the request timestamp is a retry backoff, not a
-            // lock, so the next due evaluation re-requests on its own.
-            info!(event_id, "Received equity_predictions_errored");
-        } else if event_type == EventType::PortfolioLiquidation(Outcome::Requested).as_str() {
-            info!(event_id, "Received portfolio_liquidation_requested");
-            handle_portfolio_liquidation(state, pool, event_id).await;
         }
     }
 

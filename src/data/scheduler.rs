@@ -1,7 +1,7 @@
 use crate::common::events::{
-    emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
-    EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_DATABASE_EXPORT,
-    CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
+    emit_event, events_after, get_consumer_offset, latest_event_after, run_event_listener,
+    update_consumer_offset, EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP,
+    CONSUMER_DATA_DATABASE_EXPORT, CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
 use crate::data::equity_details;
@@ -12,7 +12,6 @@ use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use chrono_tz::US::Eastern;
-use sqlx::postgres::PgListener;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -414,20 +413,52 @@ async fn run_listener(
     pool: &sqlx::PgPool,
     shutdown_token: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen("events").await?;
-    info!("Event consumer connected, listening on channel 'events'");
+    run_event_listener(
+        pool,
+        shutdown_token,
+        CONSUMER_DATA_EQUITY_BARS_SYNC,
+        || run_startup_catch_up(state, pool),
+        |notification| async move {
+            let event_id = notification.event_id();
+            match notification.event_type() {
+                EventType::EquityBarsSync(Outcome::Requested) => {
+                    info!(event_id, "Received equity_bars_sync_requested");
+                    handle_equity_bars_sync(state, pool, event_id).await;
+                }
+                EventType::DatabaseExport(Outcome::Requested) => {
+                    info!(event_id, "Received database_export_requested");
+                    handle_database_export(state, pool, event_id, notification.payload()).await;
+                }
+                EventType::DatabaseBackup(Outcome::Requested) => {
+                    info!(event_id, "Received database_backup_requested");
+                    handle_database_backup(state, pool, event_id).await;
+                }
+                EventType::DatabasePurge(Outcome::Requested) => {
+                    info!(event_id, "Received database_purge_requested");
+                    handle_database_purge(pool, event_id).await;
+                }
+                // Every consumer receives every event; the rest belong to other
+                // services or are audit records. The match exists so a new
+                // variant is a compile-time decision rather than a silent
+                // omission.
+                _ => {}
+            }
+        },
+    )
+    .await
+}
 
+/// Validates the schedule and replays the events this consumer missed.
+///
+/// Runs on every connection, not once per process: a reconnect means delivery
+/// had a gap, and the same replay that covers a restart covers that gap too.
+async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     // Validate pg_cron jobs and event freshness on startup. Event freshness
     // is only meaningful when pg_cron is installed (otherwise no cron-triggered
     // events exist and every check would produce a false warning).
     let pg_cron_available = validate_cron_jobs(pool).await;
     if pg_cron_available {
         check_event_freshness(pool).await;
-    }
-
-    if shutdown_token.is_cancelled() {
-        return Ok(());
     }
 
     // Catch up on any missed one-time actionable events (latest missed instance each).
@@ -480,46 +511,6 @@ async fn run_listener(
     {
         info!(event_id, "Catching up on missed database_purge_requested");
         handle_database_purge(pool, event_id).await;
-    }
-
-    // Main event loop.
-    loop {
-        let notification = tokio::select! {
-            result = listener.recv() => result?,
-            _ = shutdown_token.cancelled() => {
-                info!("Shutdown signal received, draining");
-                break;
-            }
-        };
-        let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let event_type = parsed
-            .get("event_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let event_id = parsed
-            .get("event_id")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-        let empty_payload = serde_json::Value::Object(Default::default());
-        let payload = parsed.get("payload").unwrap_or(&empty_payload);
-
-        if event_type == EventType::EquityBarsSync(Outcome::Requested).as_str() {
-            info!(event_id, "Received equity_bars_sync_requested");
-            handle_equity_bars_sync(state, pool, event_id).await;
-        } else if event_type == EventType::DatabaseExport(Outcome::Requested).as_str() {
-            info!(event_id, "Received database_export_requested");
-            handle_database_export(state, pool, event_id, payload).await;
-        } else if event_type == EventType::DatabaseBackup(Outcome::Requested).as_str() {
-            info!(event_id, "Received database_backup_requested");
-            handle_database_backup(state, pool, event_id).await;
-        } else if event_type == EventType::DatabasePurge(Outcome::Requested).as_str() {
-            info!(event_id, "Received database_purge_requested");
-            handle_database_purge(pool, event_id).await;
-        }
     }
 
     Ok(())

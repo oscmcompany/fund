@@ -5,9 +5,12 @@
 //! offsets. All services must use these in place of local copies.
 
 use std::fmt;
+use std::future::Future;
 
+use sqlx::postgres::PgListener;
 use sqlx::PgPool;
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info};
 
 /// Lifecycle stage of an event family.
 ///
@@ -235,6 +238,140 @@ impl fmt::Display for EventType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+// --- Notification parsing ---
+
+/// A parsed notification from the `events` channel.
+///
+/// Holding one is proof the payload was well-formed: valid JSON, a positive
+/// `event_id`, and an `event_type` this build recognises. Consumers used to
+/// re-derive those guarantees themselves, and two of them checked for an
+/// `event_id` of zero by hand because their parse helpers returned a sentinel.
+///
+/// The payload shape is fixed by the `notify_event` trigger in `schema.sql`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventNotification {
+    event_id: i64,
+    event_type: EventType,
+    payload: serde_json::Value,
+}
+
+impl EventNotification {
+    /// Parses a NOTIFY payload emitted by the `notify_event` trigger.
+    ///
+    /// Returns `None` when the payload is not valid JSON, is missing or has a
+    /// non-integer `event_id`, carries an `event_id` that is not positive, is
+    /// missing or has a non-string `event_type`, or names an `event_type` this
+    /// build does not know.
+    ///
+    /// An unknown `event_type` is expected rather than exceptional: the `events`
+    /// table retains rows written by earlier builds, including types that have
+    /// since been retired.
+    pub fn parse(payload: &str) -> Option<Self> {
+        let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let event_id = parsed.get("event_id")?.as_i64()?;
+        if event_id <= 0 {
+            return None;
+        }
+        let event_type = EventType::parse(parsed.get("event_type")?.as_str()?)?;
+        let payload = parsed
+            .get("payload")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        Some(Self {
+            event_id,
+            event_type,
+            payload,
+        })
+    }
+
+    /// The `events` row id this notification refers to. Always positive.
+    pub fn event_id(&self) -> i64 {
+        self.event_id
+    }
+
+    /// The event type, already resolved to a variant.
+    pub fn event_type(&self) -> EventType {
+        self.event_type
+    }
+
+    /// The event's JSONB payload, or an empty object when the row carried none.
+    pub fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+
+    /// Consumes the notification and returns the payload by value.
+    pub fn into_payload(self) -> serde_json::Value {
+        self.payload
+    }
+}
+
+/// Connects to the `events` channel and dispatches notifications until shutdown.
+///
+/// Replaces the connect / listen / catch-up / select / dispatch scaffolding that
+/// each consumer used to carry its own copy of. Returning `Err` hands control
+/// back to the caller's supervisor loop, which owns the reconnect backoff.
+///
+/// `on_connect` runs once per successful connection, before the first
+/// notification is read. It carries the consumer's startup catch-up, which
+/// deliberately differs between consumers — some replay every missed event,
+/// some collapse to the latest, and some intentionally skip catch-up entirely.
+/// It must run on every reconnect, not once per process, so that a Postgres blip
+/// does not silently skip the reconciliation and offset replay a consumer needs
+/// after any gap in delivery.
+///
+/// Notifications that fail to parse are skipped: a malformed payload is a bug
+/// worth a warning, but an unrecognised event type is routine, because the
+/// `events` table outlives the builds that wrote it.
+pub async fn run_event_listener<Connect, ConnectFuture, Handle, HandleFuture>(
+    pool: &PgPool,
+    shutdown_token: &CancellationToken,
+    consumer_label: &str,
+    on_connect: Connect,
+    handle: Handle,
+) -> Result<(), sqlx::Error>
+where
+    Connect: Fn() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<(), sqlx::Error>>,
+    Handle: Fn(EventNotification) -> HandleFuture,
+    HandleFuture: Future<Output = ()>,
+{
+    let mut listener = PgListener::connect_with(pool).await?;
+    listener.listen("events").await?;
+    info!(
+        consumer = consumer_label,
+        "Event consumer connected, listening on channel 'events'"
+    );
+
+    if shutdown_token.is_cancelled() {
+        return Ok(());
+    }
+
+    on_connect().await?;
+
+    loop {
+        let notification = tokio::select! {
+            result = listener.recv() => result?,
+            _ = shutdown_token.cancelled() => {
+                info!(consumer = consumer_label, "Shutdown signal received, draining");
+                break;
+            }
+        };
+
+        match EventNotification::parse(notification.payload()) {
+            Some(notification) => handle(notification).await,
+            None => {
+                debug!(
+                    consumer = consumer_label,
+                    payload = notification.payload(),
+                    "Skipping unparseable or unrecognised event notification"
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // --- Consumer name constants ---
@@ -626,6 +763,93 @@ mod tests {
         for &(event_type, _) in ALL_EVENT_TYPES {
             assert_accounted_for(event_type);
         }
+    }
+
+    /// Builds a payload in the shape the `notify_event` trigger emits.
+    fn trigger_payload(event_type: &str, event_id: i64) -> String {
+        serde_json::json!({
+            "event_id": event_id,
+            "event_type": event_type,
+            "payload": {"date": "2026-07-30"},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_event_notification_parses_a_well_formed_payload() {
+        let raw = trigger_payload("equity_predictions_requested", 42);
+        let notification =
+            EventNotification::parse(&raw).expect("well-formed payload should parse");
+        assert_eq!(notification.event_id(), 42);
+        assert_eq!(
+            notification.event_type(),
+            EventType::EquityPredictions(Outcome::Requested)
+        );
+        assert_eq!(notification.payload()["date"], "2026-07-30");
+    }
+
+    #[test]
+    fn test_event_notification_defaults_a_missing_payload_to_an_empty_object() {
+        let raw = serde_json::json!({
+            "event_id": 7,
+            "event_type": "equity_bars_sync_completed",
+        })
+        .to_string();
+        let notification = EventNotification::parse(&raw).expect("payload field is optional");
+        assert_eq!(
+            notification.event_type(),
+            EventType::EquityBarsSync(Outcome::Completed)
+        );
+        assert_eq!(notification.payload(), &serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_event_notification_rejects_invalid_json() {
+        assert!(EventNotification::parse("not-json").is_none());
+        assert!(EventNotification::parse("").is_none());
+        assert!(EventNotification::parse("{unclosed").is_none());
+    }
+
+    #[test]
+    fn test_event_notification_rejects_missing_or_malformed_fields() {
+        // Missing event_type.
+        let raw = serde_json::json!({"event_id": 1}).to_string();
+        assert!(EventNotification::parse(&raw).is_none());
+
+        // Missing event_id.
+        let raw = serde_json::json!({"event_type": "stress_test"}).to_string();
+        assert!(EventNotification::parse(&raw).is_none());
+
+        // Non-string event_type.
+        let raw = serde_json::json!({"event_id": 1, "event_type": 99}).to_string();
+        assert!(EventNotification::parse(&raw).is_none());
+
+        // Non-integer event_id.
+        let raw = serde_json::json!({"event_id": "not-a-number", "event_type": "stress_test"})
+            .to_string();
+        assert!(EventNotification::parse(&raw).is_none());
+    }
+
+    #[test]
+    fn test_event_notification_rejects_non_positive_event_id() {
+        // Two consumers used to check for a zero event_id by hand because their
+        // parse helper returned it as a sentinel. Rejecting it here is what lets
+        // event_id() promise a real row.
+        for event_id in [0, -1] {
+            let raw = trigger_payload("stress_test", event_id);
+            assert!(
+                EventNotification::parse(&raw).is_none(),
+                "event_id {event_id} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_event_notification_rejects_unknown_event_type() {
+        // Retired event types still present in older `events` rows must be
+        // skipped rather than crashing a consumer.
+        let raw = trigger_payload("equity_bars_export_requested", 5);
+        assert!(EventNotification::parse(&raw).is_none());
     }
 
     #[test]
