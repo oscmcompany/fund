@@ -120,6 +120,55 @@ pub enum EventType {
     /// Liquidation is idempotent, so both firing is harmless.
     PortfolioLiquidation(Outcome),
 
+    /// Daily refresh of the published NYSE trading calendar.
+    ///
+    /// `Requested` comes from pg_cron ahead of the bars sync. The data service
+    /// fetches Alpaca's calendar, persists it, and publishes it in memory.
+    ///
+    /// This is the only source that knows about half-days: the hardcoded holiday
+    /// table cannot express a 13:00 close, and `/v2/clock` knows the shortened
+    /// close only for the session it is currently reporting.
+    MarketCalendarSync(Outcome),
+
+    /// Scheduled validation that the pg_cron schedule and event bus are healthy.
+    ///
+    /// `Requested` comes from pg_cron mid-morning; the data service re-runs the
+    /// same job and freshness checks it runs at startup. The two answer
+    /// different questions — startup asks whether anything was missed while the
+    /// service was down, this asks whether anything has stopped while it was up.
+    /// A process under a restart loop can stay up for weeks, so without this a
+    /// cron job that silently stopped firing produced no warning at all.
+    ///
+    /// `Errored` is what a failed check reports, so a missed cron reaches the
+    /// dashboard feed and the fund report rather than only a log line.
+    SchedulerHealthCheck(Outcome),
+
+    /// Scheduled check that the trainer published a fresh model artifact.
+    ///
+    /// The trainer runs on a separate VM with no database connection, so the
+    /// application cannot enforce that a training run happened before the day's
+    /// predictions. It observes instead: this family is the observation.
+    ModelArtifactCheck(Outcome),
+
+    /// A model artifact not previously seen is available in S3. Control.
+    ///
+    /// Emitted by the artifact check when the newest key differs from the most
+    /// recent `model_runs` row. Inference consumes it, downloads and loads the
+    /// artifact, and records the lineage — replacing a 60-second S3 poll that
+    /// did the same work out of band, on a timer, with nothing recording when it
+    /// happened.
+    ///
+    /// A singleton rather than an [`Outcome`] of
+    /// [`EventType::ModelArtifactCheck`] because it is a fact about the world
+    /// rather than a stage of the check that noticed it.
+    ModelArtifactPublished,
+
+    /// The newest model artifact is older than the staleness threshold.
+    ///
+    /// Audit and alert. Means a training run did not happen, or produced nothing
+    /// uploadable, and the day's predictions will come from an aging model.
+    ModelArtifactStale,
+
     /// Dedicated variant for the event bus stress test binary.
     StressTest,
 }
@@ -162,6 +211,20 @@ impl EventType {
             Self::PortfolioLiquidation(Outcome::Started) => "portfolio_liquidation_started",
             Self::PortfolioLiquidation(Outcome::Completed) => "portfolio_liquidation_completed",
             Self::PortfolioLiquidation(Outcome::Errored) => "portfolio_liquidation_errored",
+            Self::MarketCalendarSync(Outcome::Requested) => "market_calendar_sync_requested",
+            Self::MarketCalendarSync(Outcome::Started) => "market_calendar_sync_started",
+            Self::MarketCalendarSync(Outcome::Completed) => "market_calendar_sync_completed",
+            Self::MarketCalendarSync(Outcome::Errored) => "market_calendar_sync_errored",
+            Self::SchedulerHealthCheck(Outcome::Requested) => "scheduler_health_check_requested",
+            Self::SchedulerHealthCheck(Outcome::Started) => "scheduler_health_check_started",
+            Self::SchedulerHealthCheck(Outcome::Completed) => "scheduler_health_check_completed",
+            Self::SchedulerHealthCheck(Outcome::Errored) => "scheduler_health_check_errored",
+            Self::ModelArtifactCheck(Outcome::Requested) => "model_artifact_check_requested",
+            Self::ModelArtifactCheck(Outcome::Started) => "model_artifact_check_started",
+            Self::ModelArtifactCheck(Outcome::Completed) => "model_artifact_check_completed",
+            Self::ModelArtifactCheck(Outcome::Errored) => "model_artifact_check_errored",
+            Self::ModelArtifactPublished => "model_artifact_published",
+            Self::ModelArtifactStale => "model_artifact_stale",
             Self::StressTest => "stress_test",
         }
     }
@@ -208,6 +271,24 @@ impl EventType {
                 Some(Self::PortfolioLiquidation(Outcome::Completed))
             }
             "portfolio_liquidation_errored" => Some(Self::PortfolioLiquidation(Outcome::Errored)),
+            "market_calendar_sync_requested" => Some(Self::MarketCalendarSync(Outcome::Requested)),
+            "market_calendar_sync_started" => Some(Self::MarketCalendarSync(Outcome::Started)),
+            "market_calendar_sync_completed" => Some(Self::MarketCalendarSync(Outcome::Completed)),
+            "market_calendar_sync_errored" => Some(Self::MarketCalendarSync(Outcome::Errored)),
+            "scheduler_health_check_requested" => {
+                Some(Self::SchedulerHealthCheck(Outcome::Requested))
+            }
+            "scheduler_health_check_started" => Some(Self::SchedulerHealthCheck(Outcome::Started)),
+            "scheduler_health_check_completed" => {
+                Some(Self::SchedulerHealthCheck(Outcome::Completed))
+            }
+            "scheduler_health_check_errored" => Some(Self::SchedulerHealthCheck(Outcome::Errored)),
+            "model_artifact_check_requested" => Some(Self::ModelArtifactCheck(Outcome::Requested)),
+            "model_artifact_check_started" => Some(Self::ModelArtifactCheck(Outcome::Started)),
+            "model_artifact_check_completed" => Some(Self::ModelArtifactCheck(Outcome::Completed)),
+            "model_artifact_check_errored" => Some(Self::ModelArtifactCheck(Outcome::Errored)),
+            "model_artifact_published" => Some(Self::ModelArtifactPublished),
+            "model_artifact_stale" => Some(Self::ModelArtifactStale),
             "stress_test" => Some(Self::StressTest),
             _ => None,
         }
@@ -231,6 +312,10 @@ impl EventType {
                 | Self::TradingSessionStarted
                 | Self::PortfolioEvaluationRequested
                 | Self::PortfolioLiquidation(Outcome::Requested)
+                | Self::MarketCalendarSync(Outcome::Requested)
+                | Self::SchedulerHealthCheck(Outcome::Requested)
+                | Self::ModelArtifactCheck(Outcome::Requested)
+                | Self::ModelArtifactPublished
         )
     }
 }
@@ -458,6 +543,20 @@ pub const CONSUMER_DATA_DATABASE_BACKUP: &str = "data-database-backup";
 
 /// Consumer name for the data database purge consumer.
 pub const CONSUMER_DATA_DATABASE_PURGE: &str = "data-database-purge";
+
+/// Consumer name for the daily market calendar sync.
+pub const CONSUMER_DATA_MARKET_CALENDAR: &str = "data-market-calendar";
+
+/// Consumer name for the scheduled scheduler health check.
+pub const CONSUMER_DATA_SCHEDULER_HEALTH: &str = "data-scheduler-health";
+
+/// Consumer name for the scheduled model artifact check.
+pub const CONSUMER_DATA_MODEL_ARTIFACT: &str = "data-model-artifact";
+
+/// Consumer name for the inference model artifact loader.
+/// Tracks the last processed `model_artifact_published` so a process that was
+/// down when the trainer published still loads the artifact when it returns.
+pub const CONSUMER_INFERENCE_MODEL_ARTIFACT: &str = "inference-model-artifact";
 
 // --- Database helpers ---
 
@@ -699,6 +798,59 @@ mod tests {
             EventType::PortfolioLiquidation(Outcome::Errored),
             "portfolio_liquidation_errored",
         ),
+        (
+            EventType::MarketCalendarSync(Outcome::Requested),
+            "market_calendar_sync_requested",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Started),
+            "market_calendar_sync_started",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Completed),
+            "market_calendar_sync_completed",
+        ),
+        (
+            EventType::MarketCalendarSync(Outcome::Errored),
+            "market_calendar_sync_errored",
+        ),
+        (
+            EventType::SchedulerHealthCheck(Outcome::Requested),
+            "scheduler_health_check_requested",
+        ),
+        (
+            EventType::SchedulerHealthCheck(Outcome::Started),
+            "scheduler_health_check_started",
+        ),
+        (
+            EventType::SchedulerHealthCheck(Outcome::Completed),
+            "scheduler_health_check_completed",
+        ),
+        (
+            EventType::SchedulerHealthCheck(Outcome::Errored),
+            "scheduler_health_check_errored",
+        ),
+        (
+            EventType::ModelArtifactCheck(Outcome::Requested),
+            "model_artifact_check_requested",
+        ),
+        (
+            EventType::ModelArtifactCheck(Outcome::Started),
+            "model_artifact_check_started",
+        ),
+        (
+            EventType::ModelArtifactCheck(Outcome::Completed),
+            "model_artifact_check_completed",
+        ),
+        (
+            EventType::ModelArtifactCheck(Outcome::Errored),
+            "model_artifact_check_errored",
+        ),
+        (
+            EventType::ModelArtifactPublished,
+            "model_artifact_published",
+        ),
+        (EventType::ModelArtifactStale, "model_artifact_stale"),
         (EventType::StressTest, "stress_test"),
     ];
 
@@ -713,6 +865,10 @@ mod tests {
         EventType::TradingSessionStarted,
         EventType::PortfolioEvaluationRequested,
         EventType::PortfolioLiquidation(Outcome::Requested),
+        EventType::MarketCalendarSync(Outcome::Requested),
+        EventType::SchedulerHealthCheck(Outcome::Requested),
+        EventType::ModelArtifactCheck(Outcome::Requested),
+        EventType::ModelArtifactPublished,
     ];
 
     #[test]
@@ -750,7 +906,10 @@ mod tests {
         //
         // Adding a *family* still needs a line here, which the exhaustive match
         // below turns into a compile error rather than a silent gap.
-        let families: [fn(Outcome) -> EventType; 7] = [
+        let families: [fn(Outcome) -> EventType; 10] = [
+            EventType::MarketCalendarSync,
+            EventType::SchedulerHealthCheck,
+            EventType::ModelArtifactCheck,
             EventType::EquityBarsSync,
             EventType::DatabaseExport,
             EventType::DatabaseBackup,
@@ -768,6 +927,8 @@ mod tests {
         let singletons = [
             EventType::TradingSessionStarted,
             EventType::PortfolioEvaluationRequested,
+            EventType::ModelArtifactPublished,
+            EventType::ModelArtifactStale,
             EventType::StressTest,
         ];
 
@@ -808,8 +969,13 @@ mod tests {
                 | EventType::EquityPredictions(_)
                 | EventType::PortfolioRebalance(_)
                 | EventType::PortfolioLiquidation(_)
+                | EventType::MarketCalendarSync(_)
+                | EventType::SchedulerHealthCheck(_)
+                | EventType::ModelArtifactCheck(_)
                 | EventType::TradingSessionStarted
                 | EventType::PortfolioEvaluationRequested
+                | EventType::ModelArtifactPublished
+                | EventType::ModelArtifactStale
                 | EventType::StressTest => {}
             }
         }
@@ -977,6 +1143,13 @@ mod tests {
         assert_eq!(CONSUMER_DATA_DATABASE_EXPORT, "data-database-export");
         assert_eq!(CONSUMER_DATA_DATABASE_BACKUP, "data-database-backup");
         assert_eq!(CONSUMER_DATA_DATABASE_PURGE, "data-database-purge");
+        assert_eq!(CONSUMER_DATA_MARKET_CALENDAR, "data-market-calendar");
+        assert_eq!(CONSUMER_DATA_SCHEDULER_HEALTH, "data-scheduler-health");
+        assert_eq!(CONSUMER_DATA_MODEL_ARTIFACT, "data-model-artifact");
+        assert_eq!(
+            CONSUMER_INFERENCE_MODEL_ARTIFACT,
+            "inference-model-artifact"
+        );
     }
 
     #[test]

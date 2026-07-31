@@ -249,6 +249,18 @@ BEGIN
 END;
 $do$;
 
+-- market_calendar: published NYSE trading sessions with their real hours.
+-- One row per trading day; a date with no row does not trade. Times are Eastern local, as Alpaca
+-- publishes them, so a half-day carries its actual 13:00 close rather than an assumed 16:00.
+-- Reference data, not ephemeral: deliberately absent from the nightly purge table list. Purging it
+-- would leave trading-day arithmetic on the hardcoded NYSE_HOLIDAYS fallback until the next sync.
+CREATE TABLE IF NOT EXISTS market_calendar (
+    session_date  DATE        PRIMARY KEY,
+    session_open  TIME        NOT NULL,
+    session_close TIME        NOT NULL,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- events: append-only outbox for cross-service event coordination
 CREATE TABLE IF NOT EXISTS events (
     id          BIGSERIAL   NOT NULL,
@@ -338,6 +350,12 @@ BEGIN
     -- Eastern time so DST needs no schema re-apply. Holidays are handled by the
     -- inference consumer, not here.
     --
+    -- The gate width is lateness tolerance, not a window centred on a target:
+    -- it starts at the scheduled minute and runs 20 minutes. pg_cron delayed
+    -- past it -- a busy database at startup, a backed-up job queue -- misses the
+    -- day entirely. The only hard bound is that a gate must not also match the
+    -- other firing an hour later, so anything under 60 minutes is safe.
+    --
     -- Every job that emits an event is named for the event it emits.
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-predictions-requested') THEN
         PERFORM cron.unschedule('equity-predictions-requested');
@@ -347,7 +365,7 @@ BEGIN
         '0 13,14 * * 1-5',
         $$SELECT emit_event('equity_predictions_requested', '{"reason": "pre_market"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:05'$$
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:20'$$
     );
 
     -- There is deliberately no evaluation job here. A five-minute heartbeat used to
@@ -364,6 +382,11 @@ BEGIN
     -- schedule itself only needs to exclude weekends. Fires in UTC hours 13-14
     -- to cover both EDT and EST, gated on the actual Eastern time so DST needs
     -- no schema re-apply.
+    --
+    -- 20 minutes of lateness tolerance, per the note above. The gate start stays
+    -- at 09:25: it is five minutes before the bell on purpose, so the consumer
+    -- can reconcile, confirm the session, arm the liquidation timer, and build
+    -- the portfolio before the open.
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'trading-session-started') THEN
         PERFORM cron.unschedule('trading-session-started');
     END IF;
@@ -372,7 +395,7 @@ BEGIN
         '25 13,14 * * 1-5',
         $$SELECT emit_event('trading_session_started', '{"reason": "scheduled_open"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:25'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:30'$$
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:45'$$
     );
 END;
 $do$;
@@ -385,7 +408,16 @@ $do$;
 -- close from Alpaca and arms a one-shot timer for 15 minutes before it, which pulls liquidation
 -- forward on early-close days when this fixed 15:45 schedule would fire hours after the market shut.
 -- This job still fires unconditionally so an unreachable Alpaca clock cannot leave positions open
--- overnight; liquidation is idempotent, so both paths firing is harmless.
+-- overnight; liquidation is idempotent, so both paths firing is harmless. The payload names this
+-- path so the handler can tell it from the timer: a fail-safe that fires and finds the book already
+-- flat is the healthy case and says so, while one that finds open positions means the primary path
+-- failed and is worth a warning.
+--
+-- The gate stops at 15:59 rather than taking the full 20 minutes of tolerance the session jobs get.
+-- Neither handle_portfolio_liquidation nor run_end_of_day_liquidation checks the market session, and
+-- DELETE /v2/positions submits market orders, so a trigger arriving after 16:00 would attempt
+-- liquidation into a shut market -- worse than not firing, because the fail-safe would appear to
+-- have run.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
@@ -394,9 +426,9 @@ BEGIN
     PERFORM cron.schedule(
         'portfolio-liquidation-requested',
         '45 19-20 * * 1-5',
-        $$SELECT emit_event('portfolio_liquidation_requested', '{}')
+        $$SELECT emit_event('portfolio_liquidation_requested', '{"reason": "fail_safe_schedule"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '15:45'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:50'$$
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:59'$$
     );
 END;
 $do$;
@@ -413,6 +445,75 @@ BEGIN
             $$SELECT emit_event('database_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
         );
     END IF;
+END;
+$do$;
+
+-- Market calendar sync: daily at 04:00 UTC, ahead of the 05:00 bars sync that depends on
+-- trading-day arithmetic. Refreshes the published NYSE session calendar from Alpaca, which is the
+-- only source that knows about half-days -- the hardcoded holiday table in market_calendar.rs
+-- cannot express a 13:00 close, and treats every early-close day as a full session.
+-- Daily rather than weekly so a newly published holiday or shortened session is picked up promptly
+-- and the forward horizon rolls with the date, at a cost of one API call a day.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-calendar-sync-requested') THEN
+        PERFORM cron.unschedule('market-calendar-sync-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'market-calendar-sync-requested',
+        '0 4 * * *',
+        $$SELECT emit_event('market_calendar_sync_requested', '{"reason": "scheduled"}'::jsonb)$$
+    );
+END;
+$do$;
+
+-- Scheduled health check: weekdays at 10:00 Eastern.
+-- Runs the same pg_cron job validation and event freshness checks the data service runs at startup.
+-- Both are needed and they answer different questions: startup asks "did we miss anything while we
+-- were down", this asks "has anything stopped while we were up". The application runs under a tmux
+-- restart loop and can stay up for weeks, during which a silently stopped cron job produced no
+-- warning from anywhere.
+-- Timed after the session should have started, so a missed trading_session_started is caught the
+-- same morning rather than the next day. Fires in UTC hours 14-15 to cover both EDT and EST, gated
+-- on the actual Eastern time so DST needs no schema re-apply.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'scheduler-health-check-requested') THEN
+        PERFORM cron.unschedule('scheduler-health-check-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'scheduler-health-check-requested',
+        '0 14,15 * * 1-5',
+        $$SELECT emit_event('scheduler_health_check_requested', '{"reason": "scheduled"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '10:00'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '10:20'$$
+    );
+END;
+$do$;
+
+-- Model artifact check: weekdays at 06:30, 12:30 and 13:30 UTC.
+-- The trainer has no database connection -- PostgreSQL is bound to 127.0.0.1 -- so the application
+-- cannot enforce the ordering of sync, training, and prediction across the VM boundary. It observes
+-- it instead: this check turns a training run that did not happen into an event rather than silence.
+-- 06:30 is thirty minutes after the trainer's 06:00 crontab entry on its own VM, which is ample for
+-- a normal run but not for a slow one. Training or upload finishing after 06:30 leaves that check
+-- resolving the previous artifact and emitting nothing, so the day's predictions would run against
+-- a stale model and the new one would go unnoticed until the next weekday.
+-- The 12:30 and 13:30 firings close that window: one of the two lands at 08:30 Eastern in each DST
+-- regime, half an hour before the pre-market prediction request, and the other is redundant.
+-- No Eastern gate, unlike the session jobs, because the handler is idempotent -- an artifact
+-- already recorded resolves as unchanged and emits nothing -- so a redundant firing costs one S3
+-- listing and one query. A gate would buy nothing and add a second thing to keep correct.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'model-artifact-check-requested') THEN
+        PERFORM cron.unschedule('model-artifact-check-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'model-artifact-check-requested',
+        '30 6,12,13 * * 1-5',
+        $$SELECT emit_event('model_artifact_check_requested', '{"reason": "scheduled"}'::jsonb)$$
+    );
 END;
 $do$;
 

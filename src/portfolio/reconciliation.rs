@@ -28,7 +28,7 @@ use crate::portfolio::database::{self, SubmittedOrder, UnresolvedReconciliationE
 const STALE_ORDER_THRESHOLD_SECONDS: i64 = 60;
 
 /// Summary of actions taken during a reconciliation pass.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReconciliationReport {
     /// Number of orphaned Alpaca positions closed.
     pub orphans_closed: usize,
@@ -40,6 +40,30 @@ pub struct ReconciliationReport {
     pub stale_orders_resolved: usize,
     /// Number of compensation failures retried.
     pub compensation_retries: usize,
+    /// Positions Alpaca reported when the pass began.
+    ///
+    /// Carried so a caller that needs the current position set does not have to
+    /// ask Alpaca again moments later. Valid only when
+    /// [`ReconciliationReport::took_corrective_action`] is `false`: every
+    /// corrective branch in this module submits orders, so once one has run this
+    /// snapshot describes the book as it was *before* those orders, not after.
+    pub positions_observed: Vec<Position>,
+}
+
+impl ReconciliationReport {
+    /// Returns `true` when the pass changed anything.
+    ///
+    /// Deliberately conservative — any non-zero counter counts, including the
+    /// database-only ones. A caller uses this to decide whether
+    /// [`ReconciliationReport::positions_observed`] still describes the book, and
+    /// being wrong in that direction means trading against a stale position set.
+    pub fn took_corrective_action(&self) -> bool {
+        self.orphans_closed > 0
+            || self.pairs_marked_closed > 0
+            || self.partial_positions_closed > 0
+            || self.stale_orders_resolved > 0
+            || self.compensation_retries > 0
+    }
 }
 
 /// Runs a full reconciliation pass comparing DB state against Alpaca positions.
@@ -91,6 +115,7 @@ pub async fn reconcile(
         partial_positions_closed: 0,
         stale_orders_resolved: 0,
         compensation_retries: 0,
+        positions_observed: alpaca_positions.clone(),
     };
 
     // --- Alpaca-only positions: close orphans ---
@@ -600,12 +625,46 @@ mod tests {
             partial_positions_closed: 0,
             stale_orders_resolved: 0,
             compensation_retries: 0,
+            positions_observed: Vec::new(),
         };
         assert_eq!(report.orphans_closed, 0);
         assert_eq!(report.pairs_marked_closed, 0);
         assert_eq!(report.partial_positions_closed, 0);
         assert_eq!(report.stale_orders_resolved, 0);
         assert_eq!(report.compensation_retries, 0);
+        assert!(!report.took_corrective_action());
+    }
+
+    #[test]
+    fn test_took_corrective_action_is_true_for_any_non_zero_counter() {
+        let base = ReconciliationReport {
+            orphans_closed: 0,
+            pairs_marked_closed: 0,
+            partial_positions_closed: 0,
+            stale_orders_resolved: 0,
+            compensation_retries: 0,
+            positions_observed: Vec::new(),
+        };
+
+        let mut orphans = base.clone();
+        orphans.orphans_closed = 1;
+        assert!(orphans.took_corrective_action());
+
+        let mut marked = base.clone();
+        marked.pairs_marked_closed = 1;
+        assert!(marked.took_corrective_action());
+
+        let mut partial = base.clone();
+        partial.partial_positions_closed = 1;
+        assert!(partial.took_corrective_action());
+
+        let mut stale = base.clone();
+        stale.stale_orders_resolved = 1;
+        assert!(stale.took_corrective_action());
+
+        let mut compensation = base;
+        compensation.compensation_retries = 1;
+        assert!(compensation.took_corrective_action());
     }
 
     #[test]

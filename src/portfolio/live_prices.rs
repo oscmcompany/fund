@@ -21,6 +21,7 @@ use tracing::{debug, info};
 
 use crate::domain::freshness::StalenessWindow;
 use crate::domain::market::{BookQualityLimits, EquityQuote, Ticker, UsableQuote};
+use crate::portfolio::spread::{PricedLeg, QuoteSource};
 use crate::stream::buffer::MarketDataBuffer;
 
 /// Latest streamed book per ticker, with a staleness guard on read.
@@ -81,23 +82,31 @@ impl LivePriceCache {
         quotes.insert(quote.ticker().clone(), usable);
     }
 
-    /// Returns every mid-price still inside the staleness window at `now`.
+    /// Returns every leg still inside the staleness window at `now`, priced and
+    /// stamped with when its quote was observed.
     ///
     /// Stale entries are filtered rather than evicted: the symbol may resume
     /// quoting, and dropping it would lose the timestamp used to decide that.
-    pub async fn fresh_mid_prices(&self, now: DateTime<Utc>) -> HashMap<Ticker, f64> {
+    ///
+    /// The observation time travels with the price rather than being discarded
+    /// here, because absolute age is not the only question a spread has to
+    /// answer — see [`current_spread`](crate::portfolio::spread::current_spread).
+    pub async fn fresh_legs(&self, now: DateTime<Utc>) -> HashMap<Ticker, PricedLeg> {
         self.fresh_quotes(now)
             .await
             .into_iter()
-            .map(|(ticker, quote)| (ticker, quote.mid_price()))
+            .map(|(ticker, quote)| (ticker, PricedLeg::from_quote(&quote, QuoteSource::Streamed)))
             .collect()
     }
 
     /// Returns every validated quote still inside the staleness window at `now`.
     ///
-    /// Callers needing the spread — entry eligibility, feed health logging — use
-    /// this rather than reconstructing it from a midpoint, which cannot be done.
-    pub async fn fresh_quotes(&self, now: DateTime<Utc>) -> HashMap<Ticker, UsableQuote> {
+    /// Private: [`LivePriceCache::fresh_legs`] is the read path, and it is the
+    /// only caller. This used to be public and had no production caller at all,
+    /// its doc justifying it by an entry-eligibility and feed-health use that did
+    /// not exist. It survives because the skew guard needs `observed_at`, which
+    /// is what it was already carrying.
+    async fn fresh_quotes(&self, now: DateTime<Utc>) -> HashMap<Ticker, UsableQuote> {
         let quotes = self.quotes.read().await;
         quotes
             .iter()
@@ -179,8 +188,8 @@ mod tests {
         let cache = LivePriceCache::default();
         cache.record(&quote_at("AAPL", 180.0, 180.2, now)).await;
 
-        let prices = cache.fresh_mid_prices(now).await;
-        assert!((prices[&ticker("AAPL")] - 180.1).abs() < 1e-9);
+        let prices = cache.fresh_legs(now).await;
+        assert!((prices[&ticker("AAPL")].mid_price() - 180.1).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -192,8 +201,8 @@ mod tests {
             .await;
         cache.record(&quote_at("AAPL", 181.0, 181.0, now)).await;
 
-        let prices = cache.fresh_mid_prices(now).await;
-        assert!((prices[&ticker("AAPL")] - 181.0).abs() < 1e-9);
+        let prices = cache.fresh_legs(now).await;
+        assert!((prices[&ticker("AAPL")].mid_price() - 181.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -207,8 +216,8 @@ mod tests {
             .record(&quote_at("AAPL", 170.0, 170.0, now - Duration::seconds(30)))
             .await;
 
-        let prices = cache.fresh_mid_prices(now).await;
-        assert!((prices[&ticker("AAPL")] - 181.0).abs() < 1e-9);
+        let prices = cache.fresh_legs(now).await;
+        assert!((prices[&ticker("AAPL")].mid_price() - 181.0).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -216,10 +225,15 @@ mod tests {
         let now = Utc::now();
         let cache = LivePriceCache::default();
         cache
-            .record(&quote_at("AAPL", 180.0, 180.2, now - Duration::seconds(61)))
+            .record(&quote_at(
+                "AAPL",
+                180.0,
+                180.2,
+                now - Duration::seconds(301),
+            ))
             .await;
 
-        assert!(cache.fresh_mid_prices(now).await.is_empty());
+        assert!(cache.fresh_legs(now).await.is_empty());
         // Still cached, just not fresh — the symbol may resume quoting.
         assert_eq!(cache.len().await, 1);
     }
@@ -229,10 +243,36 @@ mod tests {
         let now = Utc::now();
         let cache = LivePriceCache::default();
         cache
-            .record(&quote_at("AAPL", 180.0, 180.2, now - Duration::seconds(60)))
+            .record(&quote_at(
+                "AAPL",
+                180.0,
+                180.2,
+                now - Duration::seconds(300),
+            ))
             .await;
 
-        assert_eq!(cache.fresh_mid_prices(now).await.len(), 1);
+        assert_eq!(cache.fresh_legs(now).await.len(), 1);
+    }
+
+    /// A streamed quote between one and five minutes old is now usable.
+    ///
+    /// It was rejected here while a REST snapshot quote of the same age priced a
+    /// stop-loss close in the same evaluation. One window replaced both, and the
+    /// leg-skew guard in `portfolio::spread` is what now protects the spread.
+    #[tokio::test]
+    async fn test_streamed_quote_past_the_old_sixty_second_window_is_fresh() {
+        let now = Utc::now();
+        let cache = LivePriceCache::default();
+        cache
+            .record(&quote_at(
+                "AAPL",
+                180.0,
+                180.2,
+                now - Duration::seconds(120),
+            ))
+            .await;
+
+        assert_eq!(cache.fresh_legs(now).await.len(), 1);
     }
 
     #[tokio::test]
@@ -244,12 +284,12 @@ mod tests {
                 "AAPL",
                 180.0,
                 180.2,
-                now - Duration::seconds(120),
+                now - Duration::seconds(301),
             ))
             .await;
         cache.record(&quote_at("MSFT", 300.0, 300.2, now)).await;
 
-        let prices = cache.fresh_mid_prices(now).await;
+        let prices = cache.fresh_legs(now).await;
         assert_eq!(prices.len(), 1);
         assert!(prices.contains_key(&ticker("MSFT")));
     }

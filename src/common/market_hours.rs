@@ -61,7 +61,36 @@ impl MarketSession {
         })
     }
 
+    /// Constructs a session from published open and close instants.
+    ///
+    /// Unlike [`MarketSession::new`], the open is a real published value rather
+    /// than a derivation. `new` has to assume 09:30 because `/v2/clock` reports
+    /// only a close; the calendar publishes both, so nothing is assumed.
+    ///
+    /// `is_open` is derived from `now` against the schedule, which is what every
+    /// caller means by the question — see [`MarketSession::contains`].
+    ///
+    /// Returns `None` when the close is not strictly after the open.
+    pub fn from_published_hours(
+        open: DateTime<Utc>,
+        close: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Option<Self> {
+        if open >= close {
+            return None;
+        }
+        Some(Self {
+            is_open: now >= open && now < close,
+            open,
+            close,
+        })
+    }
+
     /// Returns whether the market is currently open for trading.
+    ///
+    /// As reported at construction, not as of now. For a session that may have
+    /// been held for a while — anything served from a cache — use
+    /// [`MarketSession::contains`], which derives liveness from the schedule.
     pub fn is_open(&self) -> bool {
         self.is_open
     }

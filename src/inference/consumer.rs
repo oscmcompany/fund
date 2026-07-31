@@ -16,8 +16,9 @@ use tracing::{error, info, warn};
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, run_event_listener,
     update_consumer_offset, EventType, Outcome, CONSUMER_INFERENCE,
+    CONSUMER_INFERENCE_MODEL_ARTIFACT,
 };
-use crate::inference::pipeline::run_predictions;
+use crate::inference::pipeline::{load_latest_artifact, run_predictions};
 use crate::inference::state::AppState;
 
 /// Spawn the event consumer if a database pool is configured.
@@ -96,6 +97,19 @@ async fn run_consumer(
                 );
                 handle_equity_predictions_requested(state, pool, event_id).await;
             }
+
+            // Load an artifact published while this service was down. This is
+            // what makes deleting the startup poll safe: the poll used to run
+            // once before the consumer spawned, precisely so a catch-up
+            // prediction run had a model to use.
+            let artifact_offset =
+                get_consumer_offset(pool, CONSUMER_INFERENCE_MODEL_ARTIFACT).await?;
+            if let Some(event_id) =
+                latest_event_after(pool, EventType::ModelArtifactPublished, artifact_offset).await?
+            {
+                info!(event_id, "Catching up on missed model_artifact_published");
+                handle_model_artifact_published(state, pool, event_id).await;
+            }
             Ok(())
         },
         |notification| async move {
@@ -104,6 +118,10 @@ async fn run_consumer(
                 EventType::EquityPredictions(Outcome::Requested) => {
                     info!(event_id, "Received equity_predictions_requested");
                     handle_equity_predictions_requested(state, pool, event_id).await;
+                }
+                EventType::ModelArtifactPublished => {
+                    info!(event_id, "Received model_artifact_published");
+                    handle_model_artifact_published(state, pool, event_id).await;
                 }
                 // Every consumer receives every event, so most of this is other
                 // services' traffic. Inference acts on nothing else. Listed
@@ -117,6 +135,10 @@ async fn run_consumer(
                 | EventType::DatabaseExport(_)
                 | EventType::DatabaseBackup(_)
                 | EventType::DatabasePurge(_)
+                | EventType::MarketCalendarSync(_)
+                | EventType::SchedulerHealthCheck(_)
+                | EventType::ModelArtifactCheck(_)
+                | EventType::ModelArtifactStale
                 | EventType::PortfolioRebalance(_)
                 | EventType::PortfolioLiquidation(_)
                 | EventType::TradingSessionStarted
@@ -134,6 +156,39 @@ async fn run_consumer(
 /// `equity_predictions_completed` on success or `equity_predictions_errored`
 /// on failure. `run_predictions` persists results and emits those terminal
 /// events, so this function only handles offset bookkeeping.
+/// Loads the artifact the data service reported as newly published.
+///
+/// Replaces a 60-second S3 poll that did the same work on a timer, out of band,
+/// with nothing recording when it happened. Model loading also leaves the
+/// prediction hot path as a result: it now happens once, when an artifact
+/// actually appears, rather than being checked continuously.
+///
+/// `load_latest_artifact` re-resolves the newest key rather than taking the one
+/// in the payload. That keeps a single resolution rule — and means a payload
+/// from a build that named keys differently cannot send this somewhere odd.
+///
+/// The consumer offset advances only when the load succeeded or found the
+/// artifact already current. A failed load leaves the offset where it is, so the
+/// startup catch-up replays the publication on the next connection rather than
+/// stranding inference on the previous model until the trainer publishes again.
+async fn handle_model_artifact_published(state: &AppState, pool: &PgPool, event_id: i64) {
+    let outcome = load_latest_artifact(state).await;
+
+    if !outcome.is_handled() {
+        warn!(
+            event_id,
+            "Model artifact load failed; leaving the consumer offset for a retry"
+        );
+        return;
+    }
+
+    if let Err(error) =
+        update_consumer_offset(pool, CONSUMER_INFERENCE_MODEL_ARTIFACT, event_id).await
+    {
+        warn!(error = %error, "Failed to update model-artifact consumer offset");
+    }
+}
+
 async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,

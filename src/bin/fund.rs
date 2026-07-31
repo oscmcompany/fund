@@ -94,6 +94,13 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
+    // Publish the persisted trading calendar before any service starts. Every
+    // module asks trading-day questions — gap detection, artifact staleness, the
+    // session schedule — and the alternative is the hardcoded holiday fallback,
+    // which knows nothing about half-days. Done here rather than per service so
+    // a process running only the portfolio module gets it too.
+    fund::data::scheduler::publish_persisted_calendar(&pool).await;
+
     let run_data = module.is_none() || module == Some(Module::Data);
     let run_inference = module.is_none() || module == Some(Module::Inference);
     let run_portfolio = module.is_none() || module == Some(Module::Portfolio);
@@ -148,13 +155,6 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     if run_inference {
         let state = fund::inference::state::AppState::with_pool(pool.clone(), s3_client.clone());
-        fund::inference::pipeline::poll_artifact_once(&state).await;
-        handles.push(tokio::spawn(
-            fund::inference::pipeline::start_artifact_polling(
-                state.clone(),
-                shutdown_token.clone(),
-            ),
-        ));
         handles.extend(fund::inference::consumer::spawn_event_consumer(
             state,
             shutdown_token.clone(),

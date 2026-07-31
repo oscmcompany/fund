@@ -190,6 +190,14 @@ pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
         ("equity_rebalance_sessions", "triggered_at", None),
         ("equity_portfolio_snapshots", "created_at", None),
         ("equity_predictions", "timestamp", None),
+        // `data::scheduler::check_event_freshness` reads this table to decide
+        // whether a cron job has stopped firing, so it can only see events
+        // inside this retention window. Its question — "did this fire on the
+        // most recent trading day?" — works against a one-day cutoff, but only
+        // just, and it survives weekends solely because the purge is chained off
+        // a weekday-only export job. Shortening this cutoff, or running the
+        // purge daily, blinds freshness monitoring: it would see no rows and be
+        // unable to tell "never fired" from "already purged".
         ("events", "created_at", None),
         ("model_runs", "started_at", None),
     ];
