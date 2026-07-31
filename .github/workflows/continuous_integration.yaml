@@ -3,6 +3,10 @@ name: Continuous integration
 run-name: Continuous integration
 on:
   pull_request:
+  # Only run on master pushes to provide a base-branch cache for pull requests.
+  push:
+    branches:
+      - master
 permissions:
   contents: read
   pull-requests: read
@@ -51,9 +55,7 @@ jobs:
           restore-keys: |
             llvm-cov-${{ runner.os }}-
       - name: Run base checks
-        run: >-
-          devenv --secretspec-provider env --secretspec-profile development
-          tasks run checks:base
+        run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:base
       # The integration test targets need a database and an S3-compatible
       # object store. Only those two are started, not the fund services: those
       # would connect to Alpaca and are not what is under test here.
@@ -92,6 +94,4 @@ jobs:
         env:
           SQLX_OFFLINE: "true"
           CARGO_INCREMENTAL: "0"
-        run: >-
-          devenv --secretspec-provider env --secretspec-profile development
-          tasks run checks:rust
+        run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:rust
