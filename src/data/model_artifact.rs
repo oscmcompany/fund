@@ -44,21 +44,49 @@ pub fn artifact_prefix() -> String {
         .unwrap_or_else(|_| DEFAULT_ARTIFACT_PREFIX.to_string())
 }
 
+/// The S3 key of a trained model artifact.
+///
+/// `models/tide/{timestamp}/output/model.tar.gz`. A newtype rather than a bare
+/// `String` because it is a domain value with structure — the timestamp segment
+/// is parsed out of it — and because it travels through comparison, persistence,
+/// and an event payload where a plain string would be interchangeable with any
+/// other.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactKey(String);
+
+impl ArtifactKey {
+    /// Wraps an S3 key.
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    /// Returns the key as it is stored in S3 and in `model_runs`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ArtifactKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// What the artifact check found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactStatus {
     /// A key not previously recorded in `model_runs`.
     Published {
-        artifact_key: String,
+        artifact_key: ArtifactKey,
         trained_at: Option<DateTime<Utc>>,
     },
     /// The newest key is one already recorded, and old enough to report.
     Stale {
-        artifact_key: String,
+        artifact_key: ArtifactKey,
         trading_days_old: usize,
     },
     /// The newest key is one already recorded, and recent enough to be normal.
-    Unchanged { artifact_key: String },
+    Unchanged { artifact_key: ArtifactKey },
 }
 
 /// Extracts the training timestamp from an artifact key.
@@ -68,8 +96,9 @@ pub enum ArtifactStatus {
 /// `None` for a key that does not carry a parseable segment, which is a
 /// malformed key rather than an error worth aborting the check for — the key
 /// itself is still reported.
-pub fn trained_at_from_key(artifact_key: &str) -> Option<DateTime<Utc>> {
+pub fn trained_at_from_key(artifact_key: &ArtifactKey) -> Option<DateTime<Utc>> {
     let segment = artifact_key
+        .as_str()
         .split('/')
         .find(|segment| segment.len() >= 19 && segment.starts_with(|c: char| c.is_ascii_digit()))?;
 
@@ -113,11 +142,11 @@ pub fn trading_days_since(trained_at: DateTime<Utc>, now: DateTime<Utc>) -> usiz
 /// A `None` means nothing has been recorded, so any resolvable artifact counts
 /// as newly published.
 pub fn classify(
-    latest_key: String,
-    recorded_key: Option<&str>,
+    latest_key: ArtifactKey,
+    recorded_key: Option<&ArtifactKey>,
     now: DateTime<Utc>,
 ) -> ArtifactStatus {
-    if recorded_key != Some(latest_key.as_str()) {
+    if recorded_key != Some(&latest_key) {
         let trained_at = trained_at_from_key(&latest_key);
         return ArtifactStatus::Published {
             artifact_key: latest_key,
@@ -145,7 +174,7 @@ pub fn classify(
         // stale: the check should not raise an alert it cannot substantiate.
         None => {
             warn!(
-                artifact_key = latest_key,
+                artifact_key = %latest_key,
                 "Artifact key carries no parseable training timestamp; age unknown"
             );
             ArtifactStatus::Unchanged {
@@ -164,14 +193,16 @@ pub fn classify(
 pub async fn resolve_latest_artifact_key(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
-) -> Result<String, artifact::ArtifactError> {
-    artifact::resolve_artifact_key(s3_client, bucket, &artifact_prefix(), "latest", None).await
+) -> Result<ArtifactKey, artifact::ArtifactError> {
+    artifact::resolve_artifact_key(s3_client, bucket, &artifact_prefix(), "latest", None)
+        .await
+        .map(ArtifactKey::new)
 }
 
 /// Returns the `artifact_key` of the most recently started `model_runs` row.
 pub async fn latest_recorded_artifact_key(
     pool: &sqlx::PgPool,
-) -> Result<Option<String>, sqlx::Error> {
+) -> Result<Option<ArtifactKey>, sqlx::Error> {
     let recorded: Option<Option<String>> = sqlx::query_scalar(
         "SELECT artifact_key FROM model_runs \
          WHERE artifact_key IS NOT NULL \
@@ -179,7 +210,7 @@ pub async fn latest_recorded_artifact_key(
     )
     .fetch_optional(pool)
     .await?;
-    Ok(recorded.flatten())
+    Ok(recorded.flatten().map(ArtifactKey::new))
 }
 
 /// Logs the outcome at a level matching what it means for the day's predictions.
@@ -189,7 +220,7 @@ pub fn report(status: &ArtifactStatus) {
             artifact_key,
             trained_at,
         } => info!(
-            artifact_key,
+            artifact_key = %artifact_key,
             trained_at = trained_at.map(|instant| instant.to_string()),
             "New model artifact published"
         ),
@@ -197,11 +228,12 @@ pub fn report(status: &ArtifactStatus) {
             artifact_key,
             trading_days_old,
         } => warn!(
-            artifact_key,
-            trading_days_old, "Model artifact is stale; a training run did not produce a new one"
+            artifact_key = %artifact_key,
+            trading_days_old,
+            "Model artifact is stale; a training run did not produce a new one"
         ),
         ArtifactStatus::Unchanged { artifact_key } => {
-            info!(artifact_key, "Model artifact is unchanged and current")
+            info!(artifact_key = %artifact_key, "Model artifact is unchanged and current")
         }
     }
 }
@@ -218,38 +250,49 @@ mod tests {
 
     const KEY: &str = "models/tide/2026-07-29-06-05-11-482/output/model.tar.gz";
 
+    fn key(text: &str) -> ArtifactKey {
+        ArtifactKey::new(text)
+    }
+
     #[test]
     fn test_trained_at_is_read_from_the_key_timestamp() {
-        assert_eq!(trained_at_from_key(KEY), Some(utc("2026-07-29T06:05:11Z")));
+        assert_eq!(
+            trained_at_from_key(&key(KEY)),
+            Some(utc("2026-07-29T06:05:11Z"))
+        );
     }
 
     #[test]
     fn test_trained_at_reads_a_key_without_milliseconds() {
         assert_eq!(
-            trained_at_from_key("models/tide/2026-07-29-06-05-11/output/model.tar.gz"),
+            trained_at_from_key(&key("models/tide/2026-07-29-06-05-11/output/model.tar.gz")),
             Some(utc("2026-07-29T06:05:11Z"))
         );
     }
 
     #[test]
     fn test_malformed_keys_yield_no_timestamp() {
-        for key in [
+        for malformed in [
             "models/tide/latest/output/model.tar.gz",
             "models/tide//output/model.tar.gz",
             "models/tide/2026-13-45-99-99-99-000/output/model.tar.gz",
             "",
         ] {
-            assert_eq!(trained_at_from_key(key), None, "key {key} must not parse");
+            assert_eq!(
+                trained_at_from_key(&key(malformed)),
+                None,
+                "key {malformed} must not parse"
+            );
         }
     }
 
     #[test]
     fn test_a_new_key_is_published() {
-        let status = classify(KEY.to_string(), None, utc("2026-07-29T10:00:00Z"));
+        let status = classify(key(KEY), None, utc("2026-07-29T10:00:00Z"));
         assert_eq!(
             status,
             ArtifactStatus::Published {
-                artifact_key: KEY.to_string(),
+                artifact_key: key(KEY),
                 trained_at: Some(utc("2026-07-29T06:05:11Z")),
             }
         );
@@ -258,8 +301,10 @@ mod tests {
     #[test]
     fn test_a_different_recorded_key_is_published() {
         let status = classify(
-            KEY.to_string(),
-            Some("models/tide/2026-07-28-06-05-11-482/output/model.tar.gz"),
+            key(KEY),
+            Some(&key(
+                "models/tide/2026-07-28-06-05-11-482/output/model.tar.gz",
+            )),
             utc("2026-07-29T10:00:00Z"),
         );
         assert!(matches!(status, ArtifactStatus::Published { .. }));
@@ -267,11 +312,11 @@ mod tests {
 
     #[test]
     fn test_the_same_key_trained_today_is_unchanged() {
-        let status = classify(KEY.to_string(), Some(KEY), utc("2026-07-29T14:00:00Z"));
+        let status = classify(key(KEY), Some(&key(KEY)), utc("2026-07-29T14:00:00Z"));
         assert_eq!(
             status,
             ArtifactStatus::Unchanged {
-                artifact_key: KEY.to_string()
+                artifact_key: key(KEY)
             }
         );
     }
@@ -279,17 +324,17 @@ mod tests {
     #[test]
     fn test_the_same_key_one_trading_day_old_is_still_unchanged() {
         // 2026-07-29 is a Wednesday; one day later is normal for a daily model.
-        let status = classify(KEY.to_string(), Some(KEY), utc("2026-07-30T14:00:00Z"));
+        let status = classify(key(KEY), Some(&key(KEY)), utc("2026-07-30T14:00:00Z"));
         assert!(matches!(status, ArtifactStatus::Unchanged { .. }));
     }
 
     #[test]
     fn test_the_same_key_two_trading_days_old_is_stale() {
-        let status = classify(KEY.to_string(), Some(KEY), utc("2026-07-31T14:00:00Z"));
+        let status = classify(key(KEY), Some(&key(KEY)), utc("2026-07-31T14:00:00Z"));
         assert_eq!(
             status,
             ArtifactStatus::Stale {
-                artifact_key: KEY.to_string(),
+                artifact_key: key(KEY),
                 trading_days_old: 2,
             }
         );
@@ -300,10 +345,10 @@ mod tests {
     fn test_a_weekend_does_not_make_a_friday_artifact_stale() {
         // 2026-07-31 is a Friday. On Monday 2026-08-03 the artifact is roughly
         // 74 hours old but only one trading day has passed.
-        let friday_key = "models/tide/2026-07-31-06-05-11-482/output/model.tar.gz";
+        let friday_key = key("models/tide/2026-07-31-06-05-11-482/output/model.tar.gz");
         let status = classify(
-            friday_key.to_string(),
-            Some(friday_key),
+            friday_key.clone(),
+            Some(&friday_key),
             utc("2026-08-03T14:00:00Z"),
         );
         assert!(
@@ -313,8 +358,8 @@ mod tests {
 
         // By Tuesday two trading days have passed and it is genuinely overdue.
         let status = classify(
-            friday_key.to_string(),
-            Some(friday_key),
+            friday_key.clone(),
+            Some(&friday_key),
             utc("2026-08-04T14:00:00Z"),
         );
         assert!(matches!(status, ArtifactStatus::Stale { .. }));
@@ -323,12 +368,16 @@ mod tests {
     #[test]
     fn test_an_unreadable_timestamp_is_never_reported_stale() {
         // The check should not raise an alert whose basis it cannot state.
-        let key = "models/tide/latest/output/model.tar.gz";
-        let status = classify(key.to_string(), Some(key), utc("2027-01-01T14:00:00Z"));
+        let unreadable = key("models/tide/latest/output/model.tar.gz");
+        let status = classify(
+            unreadable.clone(),
+            Some(&unreadable),
+            utc("2027-01-01T14:00:00Z"),
+        );
         assert_eq!(
             status,
             ArtifactStatus::Unchanged {
-                artifact_key: key.to_string()
+                artifact_key: unreadable
             }
         );
     }
@@ -355,6 +404,13 @@ mod tests {
             trading_days_since(trained_at, utc("2026-07-30T14:00:00Z")),
             1
         );
+    }
+
+    #[test]
+    fn test_artifact_key_round_trips_its_string() {
+        let wrapped = key(KEY);
+        assert_eq!(wrapped.as_str(), KEY);
+        assert_eq!(wrapped.to_string(), KEY);
     }
 
     #[test]

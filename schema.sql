@@ -491,12 +491,19 @@ BEGIN
 END;
 $do$;
 
--- Model artifact check: weekdays at 06:30 UTC, thirty minutes after the trainer's 06:00 crontab
--- entry on its own VM. UTC-anchored like the bars sync rather than gated on Eastern time, because
--- it tracks the trainer's schedule and not the market's.
+-- Model artifact check: weekdays at 06:30, 12:30 and 13:30 UTC.
 -- The trainer has no database connection -- PostgreSQL is bound to 127.0.0.1 -- so the application
 -- cannot enforce the ordering of sync, training, and prediction across the VM boundary. It observes
 -- it instead: this check turns a training run that did not happen into an event rather than silence.
+-- 06:30 is thirty minutes after the trainer's 06:00 crontab entry on its own VM, which is ample for
+-- a normal run but not for a slow one. Training or upload finishing after 06:30 leaves that check
+-- resolving the previous artifact and emitting nothing, so the day's predictions would run against
+-- a stale model and the new one would go unnoticed until the next weekday.
+-- The 12:30 and 13:30 firings close that window: one of the two lands at 08:30 Eastern in each DST
+-- regime, half an hour before the pre-market prediction request, and the other is redundant.
+-- No Eastern gate, unlike the session jobs, because the handler is idempotent -- an artifact
+-- already recorded resolves as unchanged and emits nothing -- so a redundant firing costs one S3
+-- listing and one query. A gate would buy nothing and add a second thing to keep correct.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'model-artifact-check-requested') THEN
@@ -504,7 +511,7 @@ BEGIN
     END IF;
     PERFORM cron.schedule(
         'model-artifact-check-requested',
-        '30 6 * * 1-5',
+        '30 6,12,13 * * 1-5',
         $$SELECT emit_event('model_artifact_check_requested', '{"reason": "scheduled"}'::jsonb)$$
     );
 END;

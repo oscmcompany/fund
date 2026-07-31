@@ -1143,6 +1143,13 @@ mod tests {
         assert_eq!(CONSUMER_DATA_DATABASE_EXPORT, "data-database-export");
         assert_eq!(CONSUMER_DATA_DATABASE_BACKUP, "data-database-backup");
         assert_eq!(CONSUMER_DATA_DATABASE_PURGE, "data-database-purge");
+        assert_eq!(CONSUMER_DATA_MARKET_CALENDAR, "data-market-calendar");
+        assert_eq!(CONSUMER_DATA_SCHEDULER_HEALTH, "data-scheduler-health");
+        assert_eq!(CONSUMER_DATA_MODEL_ARTIFACT, "data-model-artifact");
+        assert_eq!(
+            CONSUMER_INFERENCE_MODEL_ARTIFACT,
+            "inference-model-artifact"
+        );
     }
 
     #[test]

@@ -166,8 +166,21 @@ async fn run_consumer(
 /// `load_latest_artifact` re-resolves the newest key rather than taking the one
 /// in the payload. That keeps a single resolution rule — and means a payload
 /// from a build that named keys differently cannot send this somewhere odd.
+///
+/// The consumer offset advances only when the load succeeded or found the
+/// artifact already current. A failed load leaves the offset where it is, so the
+/// startup catch-up replays the publication on the next connection rather than
+/// stranding inference on the previous model until the trainer publishes again.
 async fn handle_model_artifact_published(state: &AppState, pool: &PgPool, event_id: i64) {
-    load_latest_artifact(state).await;
+    let outcome = load_latest_artifact(state).await;
+
+    if !outcome.is_handled() {
+        warn!(
+            event_id,
+            "Model artifact load failed; leaving the consumer offset for a retry"
+        );
+        return;
+    }
 
     if let Err(error) =
         update_consumer_offset(pool, CONSUMER_INFERENCE_MODEL_ARTIFACT, event_id).await

@@ -56,10 +56,21 @@ impl<T: Clone> DailyCache<T> {
     {
         let today = now.with_timezone(&Eastern).date_naive();
 
-        if let Some((held_date, value)) = self.held.read().await.as_ref() {
-            if *held_date == today {
-                return Ok(value.clone());
-            }
+        // The read guard is bound to a block so its release point is explicit.
+        // As an `if let` scrutinee the temporary would live for the whole
+        // statement including its body, and `tokio::sync::RwLock` is not
+        // reentrant — so any future statement added to that body which took the
+        // write lock would deadlock. Nothing does today; this removes the shape
+        // that would let it happen quietly.
+        let held = {
+            let guard = self.held.read().await;
+            guard
+                .as_ref()
+                .filter(|(held_date, _)| *held_date == today)
+                .map(|(_, value)| value.clone())
+        };
+        if let Some(value) = held {
+            return Ok(value);
         }
 
         // Two concurrent misses both fetch and the second overwrites the first

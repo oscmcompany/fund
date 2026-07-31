@@ -800,6 +800,39 @@ impl LiquidationTrigger {
     }
 }
 
+/// What a completed liquidation means, given which path triggered it.
+///
+/// Separated from the logging so the distinction is testable without capturing
+/// log output. It is the signal the fail-safe exists to produce, and asserting
+/// on it directly is worth more than asserting a message was formatted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiquidationReport {
+    /// The fail-safe ran and found nothing to do — the healthy case.
+    FailSafeFoundFlatBook,
+    /// The fail-safe closed positions, meaning the primary timer did not.
+    FailSafeClosedPositions,
+    /// A liquidation on any other path completed normally.
+    Routine,
+}
+
+/// Classifies a completed liquidation.
+///
+/// Matched exhaustively on the trigger rather than through a wildcard: this is
+/// the one place whose entire purpose is telling triggers apart, so a new
+/// `LiquidationTrigger` variant should force a decision about what its
+/// completion means rather than being absorbed into the routine case.
+fn classify_liquidation(trigger: LiquidationTrigger, pairs_closed: usize) -> LiquidationReport {
+    match trigger {
+        LiquidationTrigger::FailSafeSchedule if pairs_closed == 0 => {
+            LiquidationReport::FailSafeFoundFlatBook
+        }
+        LiquidationTrigger::FailSafeSchedule => LiquidationReport::FailSafeClosedPositions,
+        LiquidationTrigger::SessionCloseApproaching
+        | LiquidationTrigger::CatchUp
+        | LiquidationTrigger::Unknown => LiquidationReport::Routine,
+    }
+}
+
 /// Logs the outcome of a liquidation, at a level that reflects what it means.
 ///
 /// The fail-safe finding a flat book is the healthy case, and saying so is the
@@ -808,20 +841,19 @@ impl LiquidationTrigger {
 /// fire, or fired and failed — a real signal that was previously invisible,
 /// because both cases logged the same line.
 fn report_liquidation_result(trigger: LiquidationTrigger, pairs_closed: usize) {
-    match (trigger, pairs_closed) {
-        (LiquidationTrigger::FailSafeSchedule, 0) => info!(
+    match classify_liquidation(trigger, pairs_closed) {
+        LiquidationReport::FailSafeFoundFlatBook => info!(
             trigger = trigger.as_str(),
             "Liquidation fail-safe ran and found the book already flat"
         ),
-        (LiquidationTrigger::FailSafeSchedule, closed) => warn!(
+        LiquidationReport::FailSafeClosedPositions => warn!(
             trigger = trigger.as_str(),
-            pairs_closed = closed,
+            pairs_closed,
             "Liquidation fail-safe closed open positions; the session-close timer did not"
         ),
-        (_, closed) => info!(
+        LiquidationReport::Routine => info!(
             trigger = trigger.as_str(),
-            pairs_closed = closed,
-            "Portfolio liquidation completed"
+            pairs_closed, "Portfolio liquidation completed"
         ),
     }
 }
@@ -879,9 +911,9 @@ async fn handle_portfolio_liquidation(
 #[cfg(test)]
 mod tests {
     use super::{
-        evaluation_trigger_from, report_trigger_disagreement, LiquidationTrigger,
-        CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
-        ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
+        classify_liquidation, evaluation_trigger_from, report_trigger_disagreement,
+        LiquidationReport, LiquidationTrigger, CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION,
+        CONSUMER_PORTFOLIO_SESSION, ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
     };
     use crate::common::events::{EventType, Outcome};
     use crate::domain::market::PairID;
@@ -1369,6 +1401,41 @@ mod tests {
                 LiquidationTrigger::from_payload(&serde_json::json!({"reason": trigger.as_str()})),
                 trigger
             );
+        }
+    }
+
+    #[test]
+    fn test_fail_safe_on_a_flat_book_is_the_healthy_case() {
+        assert_eq!(
+            classify_liquidation(LiquidationTrigger::FailSafeSchedule, 0),
+            LiquidationReport::FailSafeFoundFlatBook
+        );
+    }
+
+    #[test]
+    fn test_fail_safe_closing_positions_means_the_timer_did_not_fire() {
+        // The signal that was previously invisible: both cases logged the same
+        // line, so a failed primary path looked exactly like a normal close.
+        assert_eq!(
+            classify_liquidation(LiquidationTrigger::FailSafeSchedule, 3),
+            LiquidationReport::FailSafeClosedPositions
+        );
+    }
+
+    #[test]
+    fn test_every_other_trigger_reports_a_routine_completion() {
+        for trigger in [
+            LiquidationTrigger::SessionCloseApproaching,
+            LiquidationTrigger::CatchUp,
+            LiquidationTrigger::Unknown,
+        ] {
+            for pairs_closed in [0, 4] {
+                assert_eq!(
+                    classify_liquidation(trigger, pairs_closed),
+                    LiquidationReport::Routine,
+                    "{trigger:?} closing {pairs_closed} pairs is a routine completion"
+                );
+            }
         }
     }
 

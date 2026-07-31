@@ -13,7 +13,7 @@ use crate::data::model_artifact;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::US::Eastern;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -49,7 +49,8 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
     "cron-run-details-cleanup",
 ];
 
-/// Event types that must fire on every trading day.
+/// Event types that must fire on every trading day, with the Eastern time each
+/// is due.
 ///
 /// Freshness is a trading-day question, not an elapsed-hours one. This was a
 /// list of `(event_type, hours)` pairs, both 26 hours, and a fixed hour count
@@ -59,14 +60,43 @@ const EXPECTED_CRON_JOBS: &[&str] = &[
 /// events were excluded entirely, leaving the event that begins each trading day
 /// with no monitoring at all.
 ///
+/// The due time is what makes the question answerable at any hour. Two of these
+/// fire later in the day than the health check runs, so a rule that simply asked
+/// "has it fired today" reported both as overdue on a healthy system every
+/// weekday — and an alert that always fires is worse than no alert. Before an
+/// event is due, the honest comparison is against the previous trading day.
+///
+/// Times are Eastern to match the cron gates in `schema.sql`. The two
+/// UTC-anchored jobs are converted at their EDT offset, which is the later of
+/// the two possibilities and therefore the conservative choice: under EST they
+/// fire an hour earlier than recorded here, which only widens the window in
+/// which they are already considered due.
+///
 /// Keyed on [`EventType`] rather than on strings: the stored name is derivable
 /// from the variant, and a string here could name an event no build emits.
-const MONITORED_EVENTS: &[EventType] = &[
-    EventType::EquityBarsSync(Outcome::Requested),
-    EventType::DatabaseExport(Outcome::Requested),
-    EventType::TradingSessionStarted,
-    EventType::EquityPredictions(Outcome::Requested),
-    EventType::PortfolioLiquidation(Outcome::Requested),
+const MONITORED_EVENTS: &[(EventType, NaiveTime)] = &[
+    // 05:00 UTC.
+    (
+        EventType::EquityBarsSync(Outcome::Requested),
+        NaiveTime::from_hms_opt(1, 0, 0).unwrap(),
+    ),
+    // 21:45 UTC, after the close.
+    (
+        EventType::DatabaseExport(Outcome::Requested),
+        NaiveTime::from_hms_opt(17, 45, 0).unwrap(),
+    ),
+    (
+        EventType::TradingSessionStarted,
+        NaiveTime::from_hms_opt(9, 25, 0).unwrap(),
+    ),
+    (
+        EventType::EquityPredictions(Outcome::Requested),
+        NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+    ),
+    (
+        EventType::PortfolioLiquidation(Outcome::Requested),
+        NaiveTime::from_hms_opt(15, 45, 0).unwrap(),
+    ),
 ];
 
 fn prior_trading_day(date: NaiveDate) -> NaiveDate {
@@ -88,11 +118,8 @@ fn most_recent_trading_day(now: DateTime<Utc>) -> NaiveDate {
     }
 }
 
-/// Returns the instant the most recent trading day began, in Eastern terms.
-///
-/// An event that has not fired since this instant has missed a trading day.
-fn most_recent_trading_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
-    let date = most_recent_trading_day(now);
+/// Returns the UTC instant of Eastern midnight on `date`.
+fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
     let midnight = date
         .and_hms_opt(0, 0, 0)
         .expect("midnight is a valid time of day");
@@ -337,12 +364,24 @@ struct CronJobReport {
     unexpected: Vec<String>,
     /// Whether pg_cron is installed at all. `false` means neither list is meaningful.
     pg_cron_available: bool,
+    /// Whether the `cron.job` query itself failed.
+    ///
+    /// Distinct from finding nothing wrong. A failed query leaves both lists
+    /// empty, which without this flag reads identically to a clean schedule —
+    /// so the health check would report success for a validation that never
+    /// ran.
+    query_failed: bool,
 }
 
 impl CronJobReport {
-    /// Returns `true` when the schedule matches `schema.sql` in both directions.
+    /// Returns `true` when the schedule was checked and matches `schema.sql` in
+    /// both directions.
+    ///
+    /// A check that could not run is not healthy. It is not unhealthy either,
+    /// strictly, but the two are indistinguishable from here and reporting the
+    /// optimistic one would hide a broken watchdog.
     fn is_healthy(&self) -> bool {
-        self.missing.is_empty() && self.unexpected.is_empty()
+        !self.query_failed && self.missing.is_empty() && self.unexpected.is_empty()
     }
 }
 
@@ -387,6 +426,7 @@ async fn validate_cron_jobs(pool: &sqlx::PgPool) -> CronJobReport {
             warn!(error = %error, "Failed to query pg_cron jobs, skipping job validation");
             return CronJobReport {
                 pg_cron_available: true,
+                query_failed: true,
                 ..CronJobReport::default()
             };
         }
@@ -437,30 +477,35 @@ fn compare_cron_jobs(registered: &[String]) -> CronJobReport {
             .cloned()
             .collect(),
         pg_cron_available: true,
+        query_failed: false,
     }
 }
 
-/// Checks that each monitored event has fired on the most recent trading day.
+/// Checks that each monitored event fired on the most recent trading day it was
+/// due.
 ///
 /// An overdue event means pg_cron is not running, or a job's SQL is failing
 /// silently, or the job was never scheduled at all.
+///
+/// Each event is judged against its own due time rather than against a single
+/// cutoff. An event already due today must have fired today; one not yet due is
+/// compared against the previous trading day, because it cannot have fired today
+/// and reporting it overdue would be a false alarm. The scheduled run at 10:00
+/// Eastern is *not* past every daily job — liquidation is due at 15:45 and the
+/// nightly export at 17:45 — so a single cutoff reported both as stale on a
+/// healthy system every weekday. It also means a startup before the day's jobs
+/// have run is judged correctly rather than warning about work that is not late.
 ///
 /// Only sees events inside the nightly purge retention window. The purge deletes
 /// from `events` with a one-day cutoff (`data::database::run_database_purge`), so
 /// absence here means "not within retention", not "never happened" — see the note
 /// at the `events` entry in that table list, which points back at this function.
 /// Shortening that retention, or running the purge on weekends, blinds this check.
-///
-/// One known edge: a startup before a trading day's jobs have fired — the bars
-/// sync runs at 05:00 UTC — reports that day's events as overdue, because they
-/// genuinely have not fired yet. The scheduled run at 10:00 Eastern is past every
-/// daily job, so it does not see this.
 async fn check_event_freshness(pool: &sqlx::PgPool) -> Vec<EventType> {
     let now = Utc::now();
-    let trading_day_start = most_recent_trading_day_start(now);
     let mut stale = Vec::new();
 
-    for &event_type in MONITORED_EVENTS {
+    for &(event_type, due_at) in MONITORED_EVENTS {
         let last_seen: Option<DateTime<Utc>> = match sqlx::query_scalar(
             "SELECT created_at FROM events WHERE event_type = $1 ORDER BY id DESC LIMIT 1",
         )
@@ -479,7 +524,7 @@ async fn check_event_freshness(pool: &sqlx::PgPool) -> Vec<EventType> {
             }
         };
 
-        if !is_event_stale(last_seen, trading_day_start) {
+        if !is_event_stale(last_seen, event_type, due_at, now) {
             continue;
         }
 
@@ -488,8 +533,8 @@ async fn check_event_freshness(pool: &sqlx::PgPool) -> Vec<EventType> {
             Some(timestamp) => warn!(
                 event_type = event_type.as_str(),
                 last_seen = %timestamp,
-                trading_day_start = %trading_day_start,
-                "Event has not fired on the most recent trading day"
+                due_after = %freshness_cutoff(due_at, now),
+                "Event has not fired since it was last due"
             ),
             None => warn!(
                 event_type = event_type.as_str(),
@@ -508,14 +553,46 @@ async fn check_event_freshness(pool: &sqlx::PgPool) -> Vec<EventType> {
     stale
 }
 
-/// Returns `true` when the event has not fired since the trading day began.
+/// Returns the instant an event due at `due_at` must have fired since.
+///
+/// The cutoff is the start of the most recent trading day on which the event was
+/// actually due — which is not always today. Three cases:
+///
+/// - Today trades and the due time has passed: today. A miss is caught the same
+///   day.
+/// - Today trades but the due time has not arrived: the previous trading day.
+///   The event cannot have fired yet, so demanding it would be a false alarm.
+/// - Today does not trade: the most recent trading day, whose firing is the last
+///   one there could have been.
+fn freshness_cutoff(due_at: NaiveTime, now: DateTime<Utc>) -> DateTime<Utc> {
+    let eastern_now = now.with_timezone(&Eastern);
+    let today = eastern_now.date_naive();
+    let most_recent = most_recent_trading_day(now);
+
+    let last_due_day = if most_recent != today {
+        most_recent
+    } else if eastern_now.time() >= due_at {
+        today
+    } else {
+        prior_trading_day(today)
+    };
+
+    eastern_midnight(last_due_day)
+}
+
+/// Returns `true` when the event has not fired since it was last due.
 ///
 /// Never seen counts as stale: within the retention window, an event that has
 /// left no row has not fired.
-fn is_event_stale(last_seen: Option<DateTime<Utc>>, trading_day_start: DateTime<Utc>) -> bool {
+fn is_event_stale(
+    last_seen: Option<DateTime<Utc>>,
+    _event_type: EventType,
+    due_at: NaiveTime,
+    now: DateTime<Utc>,
+) -> bool {
     match last_seen {
         None => true,
-        Some(timestamp) => timestamp < trading_day_start,
+        Some(timestamp) => timestamp < freshness_cutoff(due_at, now),
     }
 }
 
@@ -827,6 +904,7 @@ async fn handle_scheduler_health_check(pool: &sqlx::PgPool, event_id: i64) {
     let payload = serde_json::json!({
         "missing_jobs": cron_report.missing,
         "unexpected_jobs": cron_report.unexpected,
+        "cron_query_failed": cron_report.query_failed,
         "stale_events": stale_events
             .iter()
             .map(|event_type| event_type.as_str())
@@ -838,6 +916,7 @@ async fn handle_scheduler_health_check(pool: &sqlx::PgPool, event_id: i64) {
         _ => error!(
             missing_jobs = cron_report.missing.len(),
             unexpected_jobs = cron_report.unexpected.len(),
+            cron_query_failed = cron_report.query_failed,
             stale_events = stale_events.len(),
             "Scheduler health check found problems"
         ),
@@ -883,7 +962,7 @@ async fn handle_model_artifact_check(state: &State, pool: &sqlx::PgPool, event_i
                         pool,
                         EventType::ModelArtifactPublished,
                         &serde_json::json!({
-                            "artifact_key": artifact_key,
+                            "artifact_key": artifact_key.as_str(),
                             "trained_at": trained_at.map(|instant| instant.to_rfc3339()),
                         }),
                     )
@@ -900,7 +979,7 @@ async fn handle_model_artifact_check(state: &State, pool: &sqlx::PgPool, event_i
                         pool,
                         EventType::ModelArtifactStale,
                         &serde_json::json!({
-                            "artifact_key": artifact_key,
+                            "artifact_key": artifact_key.as_str(),
                             "trading_days_old": trading_days_old,
                         }),
                     )
@@ -950,7 +1029,7 @@ async fn run_model_artifact_check(
 
     Ok(model_artifact::classify(
         latest_key,
-        recorded_key.as_deref(),
+        recorded_key.as_ref(),
         Utc::now(),
     ))
 }
@@ -1386,12 +1465,12 @@ fn parse_postgres_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_cron_jobs, detect_coverage_gaps, export_date_from_payload, is_event_stale,
-        listen_loop, most_recent_trading_day, most_recent_trading_day_start, parse_postgres_url,
-        prior_trading_day, purge_outcome_event, spawn_sync_scheduler, sync_date_for, EventType,
-        Outcome, EXPECTED_CRON_JOBS, MONITORED_EVENTS,
+        compare_cron_jobs, detect_coverage_gaps, export_date_from_payload, freshness_cutoff,
+        is_event_stale, listen_loop, most_recent_trading_day, parse_postgres_url,
+        prior_trading_day, purge_outcome_event, spawn_sync_scheduler, sync_date_for, CronJobReport,
+        EventType, Outcome, EXPECTED_CRON_JOBS, MONITORED_EVENTS,
     };
-    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
     use chrono_tz::US::Eastern;
     use tokio_util::sync::CancellationToken;
 
@@ -1986,17 +2065,110 @@ mod tests {
         assert!(EXPECTED_CRON_JOBS.contains(&"trading-session-started"));
     }
 
+    /// Every monitored event can be fresh at the scheduled 10:00 Eastern run.
+    ///
+    /// The defect this pins: liquidation is due at 15:45 and the nightly export
+    /// at 17:45, both after the health check runs. A rule that asked only "has
+    /// it fired today" reported both as overdue on a completely healthy system,
+    /// every weekday — and a watchdog that always fires is worse than none.
+    #[test]
+    fn test_every_monitored_event_can_be_fresh_at_the_scheduled_run() {
+        // Friday 10:00 Eastern, the scheduled health check time. Each event last
+        // fired at its due time on the most recent occasion it was due: the
+        // morning jobs today, the later ones yesterday.
+        let checked_at = eastern((2026, 7, 31), (10, 0));
+
+        for &(event_type, due_at) in MONITORED_EVENTS {
+            let fired_on = if due_at <= checked_at.with_timezone(&Eastern).time() {
+                (2026, 7, 31)
+            } else {
+                (2026, 7, 30)
+            };
+            let last_fired = eastern(fired_on, (due_at.hour(), due_at.minute()));
+
+            assert!(
+                !is_event_stale(Some(last_fired), event_type, due_at, checked_at),
+                "{} fired at its due time and must not be stale at the 10:00 run",
+                event_type.as_str()
+            );
+        }
+    }
+
+    /// An event that misses its own due time is caught the same day.
+    #[test]
+    fn test_an_event_that_misses_its_due_time_is_stale() {
+        // 16:00 Eastern is past liquidation's 15:45 due time, so a book that
+        // last liquidated yesterday means today's did not fire.
+        let checked_at = eastern((2026, 7, 31), (16, 0));
+        let due_at = NaiveTime::from_hms_opt(15, 45, 0).unwrap();
+        let yesterday = eastern((2026, 7, 30), (15, 45));
+
+        assert!(is_event_stale(
+            Some(yesterday),
+            EventType::PortfolioLiquidation(Outcome::Requested),
+            due_at,
+            checked_at
+        ));
+    }
+
+    /// A startup before the day's jobs have run does not warn about them.
+    #[test]
+    fn test_an_event_not_yet_due_is_judged_against_the_previous_day() {
+        // 00:30 Eastern, before the bars sync at 01:00. Yesterday's firing is
+        // the most recent one there could be, so nothing is late.
+        let checked_at = eastern((2026, 7, 31), (0, 30));
+        let due_at = NaiveTime::from_hms_opt(1, 0, 0).unwrap();
+
+        assert!(!is_event_stale(
+            Some(eastern((2026, 7, 30), (1, 0))),
+            EventType::EquityBarsSync(Outcome::Requested),
+            due_at,
+            checked_at
+        ));
+        // But a two-day-old firing is late even before today's is due.
+        assert!(is_event_stale(
+            Some(eastern((2026, 7, 29), (1, 0))),
+            EventType::EquityBarsSync(Outcome::Requested),
+            due_at,
+            checked_at
+        ));
+    }
+
+    #[test]
+    fn test_a_failed_cron_query_is_not_reported_healthy() {
+        // Both lists are empty when the query fails, which without the flag
+        // reads exactly like a clean schedule.
+        let failed = CronJobReport {
+            pg_cron_available: true,
+            query_failed: true,
+            ..CronJobReport::default()
+        };
+        assert!(!failed.is_healthy());
+
+        let clean = CronJobReport {
+            pg_cron_available: true,
+            query_failed: false,
+            ..CronJobReport::default()
+        };
+        assert!(clean.is_healthy());
+    }
+
     #[test]
     fn test_monitored_events_cover_every_daily_job() {
         // The session events were previously excluded because a fixed hour count
         // false-positived on them outside trading windows. A trading-day
         // question does not, so the event that begins each trading day is
         // monitored at last.
-        assert!(MONITORED_EVENTS.contains(&EventType::EquityBarsSync(Outcome::Requested)));
-        assert!(MONITORED_EVENTS.contains(&EventType::DatabaseExport(Outcome::Requested)));
-        assert!(MONITORED_EVENTS.contains(&EventType::TradingSessionStarted));
-        assert!(MONITORED_EVENTS.contains(&EventType::EquityPredictions(Outcome::Requested)));
-        assert!(MONITORED_EVENTS.contains(&EventType::PortfolioLiquidation(Outcome::Requested)));
+        let monitored: Vec<EventType> = MONITORED_EVENTS
+            .iter()
+            .map(|(event_type, _)| *event_type)
+            .collect();
+
+        assert!(monitored.contains(&EventType::EquityBarsSync(Outcome::Requested)));
+        assert!(monitored.contains(&EventType::DatabaseExport(Outcome::Requested)));
+        assert!(monitored.contains(&EventType::TradingSessionStarted));
+        assert!(monitored.contains(&EventType::EquityPredictions(Outcome::Requested)));
+        assert!(monitored.contains(&EventType::PortfolioLiquidation(Outcome::Requested)));
     }
 
     /// 2026-07-31 is a Friday; 2026-08-03 is the following Monday.
@@ -2008,31 +2180,39 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// A due time used by the fixtures below: 05:00 Eastern, well before the
+    /// 10:00 checks, so these exercise the day comparison rather than the
+    /// not-yet-due branch.
+    fn early_morning_due() -> NaiveTime {
+        NaiveTime::from_hms_opt(5, 0, 0).unwrap()
+    }
+
+    fn stale_at(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        is_event_stale(
+            last_seen,
+            EventType::EquityBarsSync(Outcome::Requested),
+            early_morning_due(),
+            now,
+        )
+    }
+
     #[test]
     fn test_is_event_stale_never_seen() {
-        let trading_day_start = most_recent_trading_day_start(Utc::now());
-        assert!(is_event_stale(None, trading_day_start));
+        assert!(stale_at(None, eastern((2026, 7, 31), (10, 0))));
     }
 
     #[test]
     fn test_event_that_fired_today_is_fresh() {
         let now = eastern((2026, 7, 31), (10, 0));
-        let fired = eastern((2026, 7, 31), (5, 0));
-        assert!(!is_event_stale(
-            Some(fired),
-            most_recent_trading_day_start(now)
-        ));
+        assert!(!stale_at(Some(eastern((2026, 7, 31), (5, 0))), now));
     }
 
     #[test]
     fn test_event_that_last_fired_the_previous_trading_day_is_stale() {
-        // Friday morning, last seen Thursday: a day was missed.
+        // Friday morning, past the 05:00 due time, last seen Thursday: today's
+        // firing was missed.
         let now = eastern((2026, 7, 31), (10, 0));
-        let fired = eastern((2026, 7, 30), (5, 0));
-        assert!(is_event_stale(
-            Some(fired),
-            most_recent_trading_day_start(now)
-        ));
+        assert!(stale_at(Some(eastern((2026, 7, 30), (5, 0))), now));
     }
 
     /// The false positive that ran every week under the old fixed hour count.
@@ -2045,19 +2225,26 @@ mod tests {
             eastern((2026, 8, 2), (10, 0)), // Sunday
         ] {
             assert!(
-                !is_event_stale(Some(fired), most_recent_trading_day_start(now)),
+                !stale_at(Some(fired), now),
                 "a Friday event must stay fresh through the weekend"
             );
         }
 
         // Roughly 77 hours old by Monday morning, which tripped the old
-        // 26-hour threshold every week. It is Monday's own firing that is now
-        // expected, so Friday's no longer counts.
-        let monday = eastern((2026, 8, 3), (10, 0));
-        assert!(is_event_stale(
-            Some(fired),
-            most_recent_trading_day_start(monday)
-        ));
+        // 26-hour threshold every week. Monday is a trading day and 10:00 is
+        // past the 05:00 due time, so Monday's own firing is what is expected.
+        assert!(stale_at(Some(fired), eastern((2026, 8, 3), (10, 0))));
+    }
+
+    /// A weekend check does not demand a firing that was never due.
+    #[test]
+    fn test_a_weekend_check_compares_against_the_last_trading_day() {
+        // Saturday is not a trading day, so nothing is due on it and Friday's
+        // firing is the most recent one there could be.
+        let saturday = eastern((2026, 8, 1), (10, 0));
+        assert!(!stale_at(Some(eastern((2026, 7, 31), (5, 0))), saturday));
+        // Thursday's, though, means Friday was missed.
+        assert!(stale_at(Some(eastern((2026, 7, 30), (5, 0))), saturday));
     }
 
     #[test]
@@ -2121,12 +2308,12 @@ mod tests {
 
     /// An event fired at the very start of the trading day is fresh.
     ///
-    /// The comparison is `timestamp < trading_day_start`, so the boundary
-    /// instant itself counts as having fired within the day.
+    /// The comparison is `timestamp < cutoff`, so the boundary instant itself
+    /// counts as having fired within the day.
     #[test]
     fn test_event_at_the_trading_day_boundary_is_fresh() {
         let now = eastern((2026, 7, 31), (10, 0));
-        let start = most_recent_trading_day_start(now);
-        assert!(!is_event_stale(Some(start), start));
+        let start = freshness_cutoff(early_morning_due(), now);
+        assert!(!stale_at(Some(start), now));
     }
 }

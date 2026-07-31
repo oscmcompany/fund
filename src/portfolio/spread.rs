@@ -139,7 +139,12 @@ pub enum SpreadRejection {
         short_priced: bool,
     },
     /// Both legs are priced, but too far apart in time to describe one spread.
-    LegSkew { skew_seconds: i64 },
+    ///
+    /// Reported in milliseconds rather than seconds. Truncating to whole seconds
+    /// made the rejection reason contradict the bound it was rejected against: a
+    /// 30.4-second skew reported as `30` against a 30-second limit reads as
+    /// though the limit were exclusive, when in fact 30.0 is accepted.
+    LegSkew { skew_milliseconds: i64 },
 }
 
 /// Returns the current spread for a pair, or why it cannot be measured.
@@ -181,7 +186,7 @@ pub fn current_spread(
     let skew = (long_leg.observed_at() - short_leg.observed_at()).abs();
     let long_age_seconds = (now - long_leg.observed_at()).num_seconds();
     let short_age_seconds = (now - short_leg.observed_at()).num_seconds();
-    let skew_seconds = skew.num_seconds();
+    let skew_milliseconds = skew.num_milliseconds();
 
     if skew > Duration::seconds(MAXIMUM_LEG_SKEW_SECONDS) {
         debug!(
@@ -190,14 +195,14 @@ pub fn current_spread(
             short_ticker = short_ticker.as_str(),
             long_age_seconds,
             short_age_seconds,
-            skew_seconds,
+            skew_milliseconds,
             long_source = long_leg.source().as_str(),
             short_source = short_leg.source().as_str(),
             verdict = "rejected",
             cause = "leg_skew",
             "Pair spread not measurable"
         );
-        return Err(SpreadRejection::LegSkew { skew_seconds });
+        return Err(SpreadRejection::LegSkew { skew_milliseconds });
     }
 
     let spread = long_leg.mid_price() - hedge_ratio * short_leg.mid_price();
@@ -208,7 +213,7 @@ pub fn current_spread(
         short_ticker = short_ticker.as_str(),
         long_age_seconds,
         short_age_seconds,
-        skew_seconds,
+        skew_milliseconds,
         long_source = long_leg.source().as_str(),
         short_source = short_leg.source().as_str(),
         verdict = "accepted",
@@ -271,7 +276,9 @@ mod tests {
 
         assert_eq!(
             measure(Some(&long_leg), Some(&short_leg), 2.0),
-            Err(SpreadRejection::LegSkew { skew_seconds: 31 })
+            Err(SpreadRejection::LegSkew {
+                skew_milliseconds: 31_000
+            })
         );
     }
 
@@ -284,11 +291,35 @@ mod tests {
 
         assert_eq!(
             measure(Some(&older_long), Some(&fresh_short), 2.0),
-            Err(SpreadRejection::LegSkew { skew_seconds: 45 })
+            Err(SpreadRejection::LegSkew {
+                skew_milliseconds: 45_000
+            })
         );
         assert_eq!(
             measure(Some(&fresh_short), Some(&older_long), 2.0),
-            Err(SpreadRejection::LegSkew { skew_seconds: 45 })
+            Err(SpreadRejection::LegSkew {
+                skew_milliseconds: 45_000
+            })
+        );
+    }
+
+    /// Sub-second skew past the bound is reported at the precision it was
+    /// judged on, not truncated back to the bound it exceeded.
+    #[test]
+    fn test_sub_second_skew_is_reported_precisely() {
+        let now = Utc::now();
+        let long_leg = leg(100.0, now, QuoteSource::Streamed);
+        let short_leg = leg(
+            40.0,
+            now - Duration::milliseconds(MAXIMUM_LEG_SKEW_SECONDS * 1_000 + 400),
+            QuoteSource::Streamed,
+        );
+
+        assert_eq!(
+            measure(Some(&long_leg), Some(&short_leg), 2.0),
+            Err(SpreadRejection::LegSkew {
+                skew_milliseconds: 30_400
+            })
         );
     }
 
