@@ -2,16 +2,14 @@
 //!
 //! [`MarketDataBuffer`] wraps a [`tokio::sync::broadcast`] channel where
 //! WebSocket readers publish raw market data and downstream consumers
-//! subscribe. All data in this buffer is [`DataBoundary::Ephemeral`] —
-//! it lives only during the current process lifetime and is never written
-//! to PostgreSQL.
+//! subscribe. The buffer has no database dependency, so data passing through it
+//! lives only for the current process lifetime — see the [`crate::stream`]
+//! module docs for how that relates to what consumers may do with it.
 
 use std::fmt;
 
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
-
-use super::data_boundary::DataBoundary;
 
 /// Default broadcast channel capacity.
 ///
@@ -27,10 +25,9 @@ const DEFAULT_BUFFER_CAPACITY: usize = 16_384;
 /// to create new receivers. Multiple consumers can subscribe independently
 /// and each receives every message published after their subscription.
 ///
-/// The buffer enforces the [`DataBoundary::Ephemeral`] contract: data
-/// published here is never persisted. Downstream consumers that detect
-/// a durable signal are responsible for crossing the event boundary
-/// themselves via [`crate::common::events::emit_event`].
+/// Data published here is never persisted. Downstream consumers that detect a
+/// durable signal are responsible for crossing the event boundary themselves
+/// via [`crate::common::events::emit_event`].
 pub struct MarketDataBuffer<T: Clone + Send + 'static> {
     sender: broadcast::Sender<T>,
     capacity: usize,
@@ -79,14 +76,6 @@ impl<T: Clone + Send + 'static> MarketDataBuffer<T> {
     /// Returns the configured buffer capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
-    }
-
-    /// Returns the data boundary classification for this buffer.
-    ///
-    /// Always returns [`DataBoundary::Ephemeral`] — data in the broadcast
-    /// channel is never persisted to PostgreSQL.
-    pub fn data_boundary(&self) -> DataBoundary {
-        DataBoundary::Ephemeral
     }
 }
 
@@ -204,14 +193,6 @@ mod tests {
         let _subscriber = buffer.subscribe();
         let result = buffer.publish(42);
         assert_eq!(result.unwrap(), 1);
-    }
-
-    #[test]
-    fn test_data_boundary_is_ephemeral() {
-        let buffer: MarketDataBuffer<i32> = MarketDataBuffer::new();
-        assert_eq!(buffer.data_boundary(), DataBoundary::Ephemeral);
-        assert!(buffer.data_boundary().is_ephemeral());
-        assert!(!buffer.data_boundary().is_durable());
     }
 
     #[tokio::test]

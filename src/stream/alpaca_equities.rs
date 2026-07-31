@@ -2,8 +2,8 @@
 //!
 //! Connects to the Alpaca market data WebSocket, subscribes to the legs of
 //! currently open pairs, and publishes each quote into the shared
-//! [`MarketDataBuffer`]. Quotes are [`DataBoundary::Ephemeral`]: they live only
-//! in the broadcast channel and never reach PostgreSQL.
+//! [`MarketDataBuffer`]. Quotes are ephemeral: they live only in the broadcast
+//! channel and never reach PostgreSQL.
 //!
 //! Only open position legs are streamed, never entry candidates. Exits are the
 //! time-critical decision — a spread can converge at any moment and the position

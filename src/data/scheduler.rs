@@ -10,7 +10,7 @@ use crate::data::market_calendar;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use chrono_tz::US::Eastern;
 use sqlx::postgres::PgListener;
 use std::time::Duration;
@@ -19,10 +19,6 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-const SYNC_HOUR: u32 = 1;
-const SYNC_MINUTE: u32 = 0;
-const SYNC_DEDUP_TTL_SECS: u64 = 300;
-
 /// Maximum number of retry attempts for a single Massive API fetch.
 const FETCH_MAX_RETRIES: u32 = 3;
 
@@ -30,10 +26,19 @@ const FETCH_MAX_RETRIES: u32 = 3;
 const GAP_DETECTION_LOOKBACK_DAYS: i64 = 90;
 
 /// pg_cron job names that must be present for the nightly pipeline to function.
+///
+/// There is deliberately no evaluation job here, and none in `schema.sql` either:
+/// intraday work is driven by the live-quote evaluator, which emits
+/// `portfolio_evaluation_requested` only on a real threshold crossing. Cron opens
+/// and closes the session; it does not drive the work in between.
+///
+/// Every entry except `cron-run-details-cleanup` is named for the event it emits.
+/// That job runs a `DELETE` directly and emits nothing, which is why it does not
+/// carry an event-shaped name.
 const EXPECTED_CRON_JOBS: &[&str] = &[
     "equity-bars-sync-requested",
-    "equity-predictions-request",
-    "portfolio-evaluation-requested",
+    "equity-predictions-requested",
+    "trading-session-started",
     "portfolio-liquidation-requested",
     "database-export-requested",
     "cron-run-details-cleanup",
@@ -55,37 +60,6 @@ fn prior_trading_day(date: NaiveDate) -> NaiveDate {
         prior = prior.pred_opt().unwrap();
     }
     prior
-}
-
-fn duration_until_next_sync(now: DateTime<Utc>) -> Duration {
-    let now_eastern = now.with_timezone(&Eastern);
-    let sync_time = NaiveTime::from_hms_opt(SYNC_HOUR, SYNC_MINUTE, 0).unwrap();
-
-    let mut target_date = now_eastern.date_naive();
-    let mut target_eastern = Eastern
-        .from_local_datetime(&target_date.and_time(sync_time))
-        .earliest()
-        .unwrap();
-
-    if now_eastern >= target_eastern {
-        target_date = target_date.succ_opt().unwrap();
-        target_eastern = Eastern
-            .from_local_datetime(&target_date.and_time(sync_time))
-            .earliest()
-            .unwrap();
-    }
-
-    while matches!(target_eastern.weekday(), Weekday::Sat | Weekday::Sun) {
-        let next_date = target_eastern.date_naive().succ_opt().unwrap();
-        target_eastern = Eastern
-            .from_local_datetime(&next_date.and_time(sync_time))
-            .earliest()
-            .unwrap();
-    }
-
-    (target_eastern.with_timezone(&Utc) - now)
-        .to_std()
-        .unwrap_or(Duration::ZERO)
 }
 
 fn sync_date_for(now: DateTime<Utc>) -> TradingDate {
@@ -127,16 +101,10 @@ pub fn spawn_sync_scheduler(
         );
     }
 
-    let listen_state = state.clone();
-    let mut handles = Vec::new();
-    // sync_loop is a fallback timer-based scheduler used only when PostgreSQL is
-    // unavailable (e.g., local development without a database). In production the
-    // pg_cron + LISTEN/NOTIFY path (listen_loop) is the sole trigger mechanism.
-    if !state.database.is_configured() {
-        handles.push(tokio::spawn(sync_loop(state, shutdown_token.clone())));
-    }
-    handles.push(tokio::spawn(listen_loop(listen_state, shutdown_token)));
-    handles
+    // pg_cron plus LISTEN/NOTIFY is the sole trigger mechanism. A timer-based
+    // fallback scheduler used to run when DATABASE_URL was unset, but PostgreSQL is
+    // configured in devenv and in production alike, so that branch was unreachable.
+    vec![tokio::spawn(listen_loop(state, shutdown_token))]
 }
 
 /// Fetches equity bars for a single trading date with exponential-backoff retry.
@@ -273,45 +241,6 @@ async fn run_equity_bar_sync(state: &State) -> Result<Option<usize>, String> {
     );
 
     Ok(Some(total_bars))
-}
-
-async fn sync_loop(state: State, shutdown_token: CancellationToken) {
-    loop {
-        let wait_duration = duration_until_next_sync(Utc::now());
-        info!(
-            seconds = wait_duration.as_secs(),
-            "Waiting for next equity bar sync"
-        );
-        tokio::select! {
-            _ = sleep(wait_duration) => {}
-            _ = shutdown_token.cancelled() => {
-                info!("Sync loop stopped for shutdown");
-                break;
-            }
-        }
-
-        if shutdown_token.is_cancelled() {
-            break;
-        }
-
-        if state.synced_recently(SYNC_DEDUP_TTL_SECS) {
-            info!("Skipping sync loop run, synced recently");
-            continue;
-        }
-
-        match run_equity_bar_sync(&state).await {
-            Ok(Some(bar_count)) => {
-                info!(rows = bar_count, "Equity bar sync completed");
-                state.mark_synced();
-            }
-            Ok(None) => {
-                info!("No equity bar data available for scheduled sync");
-            }
-            Err(error) => {
-                error!(error = %error, "Equity bar sync failed");
-            }
-        }
-    }
 }
 
 async fn listen_loop(state: State, shutdown_token: CancellationToken) {
@@ -603,7 +532,6 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             {
                 warn!(error = %error, "Failed to emit equity_bars_sync_completed");
             }
-            state.mark_synced();
         }
         Ok(None) => {
             info!("No equity bar data available for sync");
@@ -794,6 +722,32 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
     }
 }
 
+/// Selects the terminal event for a purge run and builds its payload.
+///
+/// A table that fails to purge is skipped rather than aborting the run, so the
+/// outcome is partial rather than fatal. Reporting it as completed would let a
+/// table fail every night with the event log claiming success each time, which is
+/// exactly the failure the nightly chain exists to make visible.
+fn purge_outcome_event(
+    summary: &crate::data::database::PurgeSummary,
+    total_rows_deleted: u64,
+) -> (EventType, serde_json::Value) {
+    if summary.failed_tables.is_empty() {
+        (
+            EventType::DatabasePurgeCompleted,
+            serde_json::json!({ "total_rows_deleted": total_rows_deleted }),
+        )
+    } else {
+        (
+            EventType::DatabasePurgeErrored,
+            serde_json::json!({
+                "total_rows_deleted": total_rows_deleted,
+                "failed_tables": summary.failed_tables,
+            }),
+        )
+    }
+}
+
 async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
@@ -812,15 +766,20 @@ async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
             info!(table, rows = count, "Purged old rows");
         }
     }
-    info!(total_rows = total, "Database purge completed");
-    if let Err(error) = emit_event(
-        pool,
-        EventType::DatabasePurgeCompleted,
-        &serde_json::json!({"total_rows_deleted": total}),
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to emit database_purge_completed");
+
+    let (event_type, payload) = purge_outcome_event(&summary, total);
+    if summary.failed_tables.is_empty() {
+        info!(total_rows = total, "Database purge completed");
+    } else {
+        error!(
+            total_rows = total,
+            failed_tables = ?summary.failed_tables,
+            "Database purge completed with failures"
+        );
+    }
+
+    if let Err(error) = emit_event(pool, event_type, &payload).await {
+        warn!(error = %error, event_type = event_type.as_str(), "Failed to emit purge outcome");
     }
 
     if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE, event_id).await {
@@ -981,35 +940,13 @@ fn parse_postgres_url(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_coverage_gaps, duration_until_next_sync, export_date_from_payload, is_event_stale,
-        listen_loop, parse_postgres_url, prior_trading_day, spawn_sync_scheduler, sync_date_for,
-        EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
+        detect_coverage_gaps, export_date_from_payload, is_event_stale, listen_loop,
+        parse_postgres_url, prior_trading_day, purge_outcome_event, spawn_sync_scheduler,
+        sync_date_for, EVENT_FRESHNESS_THRESHOLDS, EXPECTED_CRON_JOBS,
     };
     use chrono::{NaiveDate, TimeZone, Utc};
     use chrono_tz::US::Eastern;
-    use std::time::Duration;
     use tokio_util::sync::CancellationToken;
-
-    #[test]
-    fn test_duration_until_next_sync_is_positive() {
-        let duration = duration_until_next_sync(Utc::now());
-        assert!(
-            duration.as_secs() > 0,
-            "Expected positive wait time, got {:?}",
-            duration
-        );
-    }
-
-    #[test]
-    fn test_duration_until_next_sync_is_within_one_week() {
-        let duration = duration_until_next_sync(Utc::now());
-        let one_week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-        assert!(
-            duration <= one_week,
-            "Expected wait time within one week, got {:?}",
-            duration
-        );
-    }
 
     #[test]
     fn test_prior_trading_day_wednesday_returns_tuesday() {
@@ -1030,55 +967,6 @@ mod tests {
         let tuesday = NaiveDate::from_ymd_opt(2026, 4, 28).unwrap();
         let prior = prior_trading_day(tuesday);
         assert_eq!(prior, NaiveDate::from_ymd_opt(2026, 4, 27).unwrap());
-    }
-
-    #[test]
-    fn test_duration_until_next_sync_fires_within_one_minute_just_before_1am_et() {
-        // Monday 2026-04-27 at 00:59 ET — should fire in ≤ 60 seconds
-        let now = Eastern
-            .with_ymd_and_hms(2026, 4, 27, 0, 59, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        let duration = duration_until_next_sync(now);
-        assert!(
-            duration.as_secs() <= 60,
-            "Expected ≤ 60s, got {:?}",
-            duration
-        );
-    }
-
-    #[test]
-    fn test_duration_until_next_sync_after_1am_waits_until_next_weekday() {
-        // Monday 2026-04-27 at 02:00 ET — next fire is Tuesday 2026-04-28 at 01:00 ET (~23h)
-        let now = Eastern
-            .with_ymd_and_hms(2026, 4, 27, 2, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        let duration = duration_until_next_sync(now);
-        let twenty_two_hours = Duration::from_secs(22 * 3600);
-        let twenty_four_hours = Duration::from_secs(24 * 3600);
-        assert!(
-            duration > twenty_two_hours && duration < twenty_four_hours,
-            "Expected ~23h, got {:?}",
-            duration
-        );
-    }
-
-    #[test]
-    fn test_duration_until_next_sync_from_friday_skips_to_monday() {
-        // Friday 2026-05-01 at 02:00 ET — next fire is Monday 2026-05-04 at 01:00 ET (~71h)
-        let now = Eastern
-            .with_ymd_and_hms(2026, 5, 1, 2, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        let duration = duration_until_next_sync(now);
-        let seventy_hours = Duration::from_secs(70 * 3600);
-        let seventy_two_hours = Duration::from_secs(72 * 3600);
-        assert!(
-            duration > seventy_hours && duration < seventy_two_hours,
-            "Expected ~71h, got {:?}",
-            duration
-        );
     }
 
     #[test]
@@ -1455,12 +1343,11 @@ mod tests {
             s3_client,
             "test-bucket".to_string(),
         );
-        // DatabaseState::NotConfigured so is_configured() == false, which
-        // causes both the sync_loop and listen_loop tasks to be spawned.
-        // listen_loop returns immediately without a pool.
+        // DatabaseState::NotConfigured, so listen_loop returns immediately without
+        // a pool. The scheduler spawns exactly one task regardless.
         let token = CancellationToken::new();
         let handles = spawn_sync_scheduler(state, token.clone());
-        // Cancel so the sync_loop task exits its sleep and terminates.
+        assert_eq!(handles.len(), 1, "Expected a single listen_loop task");
         token.cancel();
         for handle in handles {
             let _ = handle.await;
@@ -1507,24 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn test_duration_until_next_sync_exactly_at_1am_advances_to_next_weekday() {
-        // Monday 2026-04-27 at exactly 01:00 ET — target has already been reached,
-        // so the next sync should be on Tuesday 2026-04-28 at 01:00 ET (~24h away).
-        let now = chrono_tz::US::Eastern
-            .with_ymd_and_hms(2026, 4, 27, 1, 0, 0)
-            .unwrap()
-            .with_timezone(&Utc);
-        let duration = duration_until_next_sync(now);
-        let twenty_three_hours = Duration::from_secs(23 * 3600);
-        let twenty_five_hours = Duration::from_secs(25 * 3600);
-        assert!(
-            duration > twenty_three_hours && duration < twenty_five_hours,
-            "Expected ~24h, got {:?}",
-            duration
-        );
-    }
-
-    #[test]
     fn test_sync_date_for_thursday_fire_is_wednesday() {
         // Thursday 2026-04-30 at 01:00 ET — should sync Wednesday 2026-04-29
         let now = chrono_tz::US::Eastern
@@ -1556,11 +1425,109 @@ mod tests {
     fn test_expected_cron_jobs_list_is_complete() {
         assert_eq!(EXPECTED_CRON_JOBS.len(), 6);
         assert!(EXPECTED_CRON_JOBS.contains(&"equity-bars-sync-requested"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"equity-predictions-request"));
-        assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-evaluation-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"equity-predictions-requested"));
+        assert!(EXPECTED_CRON_JOBS.contains(&"trading-session-started"));
         assert!(EXPECTED_CRON_JOBS.contains(&"portfolio-liquidation-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"database-export-requested"));
         assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
+    }
+
+    #[test]
+    fn test_expected_cron_jobs_excludes_retired_evaluation_job() {
+        // schema.sql does not schedule portfolio-evaluation-requested; the live-quote
+        // evaluator emits portfolio_evaluation_requested instead. Expecting the job
+        // made validate_cron_jobs log a missing-job error on every data-service
+        // startup.
+        assert!(!EXPECTED_CRON_JOBS.contains(&"portfolio-evaluation-requested"));
+    }
+
+    #[test]
+    fn test_purge_outcome_event_reports_completed_when_no_table_failed() {
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: vec![("events".to_string(), 42)],
+            failed_tables: Vec::new(),
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 42);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeCompleted
+        );
+        assert_eq!(payload["total_rows_deleted"], 42);
+        assert!(payload.get("failed_tables").is_none());
+    }
+
+    #[test]
+    fn test_purge_outcome_event_reports_errored_when_a_table_failed() {
+        // A partial purge must not be announced as a completed one: the failing
+        // table would otherwise be invisible in the events table and the dashboard,
+        // and could fail nightly without anything noticing.
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: vec![("events".to_string(), 42)],
+            failed_tables: vec!["equity_pairs".to_string()],
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 42);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeErrored
+        );
+        assert_eq!(payload["total_rows_deleted"], 42);
+        assert_eq!(payload["failed_tables"][0], "equity_pairs");
+    }
+
+    #[test]
+    fn test_purge_outcome_event_carries_every_failed_table() {
+        let summary = crate::data::database::PurgeSummary {
+            rows_deleted: Vec::new(),
+            failed_tables: vec![
+                "equity_orders".to_string(),
+                "events".to_string(),
+                "model_runs".to_string(),
+            ],
+        };
+        let (event_type, payload) = purge_outcome_event(&summary, 0);
+        assert_eq!(
+            event_type,
+            crate::common::events::EventType::DatabasePurgeErrored
+        );
+        assert_eq!(payload["failed_tables"].as_array().unwrap().len(), 3);
+        assert_eq!(payload["total_rows_deleted"], 0);
+    }
+
+    #[test]
+    fn test_event_emitting_cron_jobs_are_named_for_their_event() {
+        // Every job that emits an event is named for it, hyphenated. The one
+        // exception is cron-run-details-cleanup, which runs a DELETE directly and
+        // emits nothing, so an event-shaped name would point at an event that does
+        // not exist. This caught equity-predictions-request, which emitted
+        // equity_predictions_requested but was missing the suffix.
+        for job_name in EXPECTED_CRON_JOBS {
+            if *job_name == "cron-run-details-cleanup" {
+                continue;
+            }
+            let event_type = job_name.replace('-', "_");
+            assert!(
+                crate::common::events::EventType::parse(&event_type).is_some(),
+                "cron job '{}' implies event type '{}', which is not an EventType variant",
+                job_name,
+                event_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_cleanup_job_is_not_named_for_an_event() {
+        // Guards the exception above: if this job ever gains an event-shaped name,
+        // the convention test would silently start covering it.
+        assert!(EXPECTED_CRON_JOBS.contains(&"cron-run-details-cleanup"));
+        assert!(crate::common::events::EventType::parse("cron_run_details_cleanup").is_none());
+    }
+
+    #[test]
+    fn test_expected_cron_jobs_covers_session_start() {
+        // trading-session-started is scheduled in schema.sql and is the only emitter
+        // of the event that opens the trading day. Its absence from this list meant a
+        // disappearance would go unreported.
+        assert!(EXPECTED_CRON_JOBS.contains(&"trading-session-started"));
     }
 
     #[test]

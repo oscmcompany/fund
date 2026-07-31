@@ -49,9 +49,13 @@ pub enum EventType {
     DatabasePurgeRequested,
     /// data: database purge has started.
     DatabasePurgeStarted,
-    /// data: database purge completed successfully.
+    /// data: database purge completed successfully, with every table purged.
     DatabasePurgeCompleted,
-    /// data: database purge encountered an error.
+    /// data: database purge finished with one or more tables failing.
+    ///
+    /// A failing table is skipped so the rest of the purge still runs, so this is a
+    /// partial outcome rather than an abort: the payload carries the failed table
+    /// names alongside the rows that were deleted.
     DatabasePurgeErrored,
 
     // --- Prediction pipeline ---
@@ -328,27 +332,6 @@ pub async fn events_after(
         .collect())
 }
 
-/// Returns the payload of a specific event by type and id.
-///
-/// Used during startup catchup to retrieve the JSONB payload (e.g. export date)
-/// for an event that was missed while the consumer was down. Returns an empty
-/// object when the event is not found.
-pub async fn query_event_payload(
-    pool: &PgPool,
-    event_type: EventType,
-    event_id: i64,
-) -> Result<serde_json::Value, sqlx::Error> {
-    use sqlx::Row;
-    let row = sqlx::query("SELECT payload FROM events WHERE event_type = $1 AND id = $2 LIMIT 1")
-        .bind(event_type.as_str())
-        .bind(event_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row
-        .and_then(|row| row.try_get::<serde_json::Value, _>("payload").ok())
-        .unwrap_or_else(|| serde_json::json!({})))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,17 +502,6 @@ mod tests {
         make_runtime().block_on(async {
             assert!(
                 events_after(&lazy_pool(), EventType::DatabaseExportRequested, 0)
-                    .await
-                    .is_err()
-            );
-        });
-    }
-
-    #[test]
-    fn test_query_event_payload_compiles() {
-        make_runtime().block_on(async {
-            assert!(
-                query_event_payload(&lazy_pool(), EventType::DatabaseExportRequested, 1)
                     .await
                     .is_err()
             );

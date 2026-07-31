@@ -75,11 +75,6 @@ impl DatabaseState {
             _ => None,
         }
     }
-
-    /// Returns `true` if `DATABASE_URL` was configured (whether or not the connection succeeded).
-    pub fn is_configured(&self) -> bool {
-        !matches!(self, DatabaseState::NotConfigured)
-    }
 }
 
 #[derive(Clone)]
@@ -95,7 +90,6 @@ pub struct State {
     pub s3_client: S3Client,
     pub bucket_name: String,
     pub last_s3_ok_epoch: Arc<AtomicU64>,
-    pub last_sync_epoch: Arc<AtomicU64>,
     pub database: DatabaseState,
     pub alpaca_credentials: Option<AlpacaCredentials>,
     pub active_symbols: Arc<RwLock<HashSet<Ticker>>>,
@@ -171,7 +165,6 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
-            last_sync_epoch: Arc::new(AtomicU64::new(0)),
             database,
             alpaca_credentials,
             active_symbols: Arc::new(RwLock::new(HashSet::new())),
@@ -190,7 +183,6 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
-            last_sync_epoch: Arc::new(AtomicU64::new(0)),
             database: DatabaseState::NotConfigured,
             alpaca_credentials: None,
             active_symbols: Arc::new(RwLock::new(HashSet::new())),
@@ -225,7 +217,6 @@ impl State {
             s3_client,
             bucket_name,
             last_s3_ok_epoch: Arc::new(AtomicU64::new(0)),
-            last_sync_epoch: Arc::new(AtomicU64::new(0)),
             database: DatabaseState::Connected(pool),
             alpaca_credentials: AlpacaCredentials::from_env(),
             active_symbols: Arc::new(RwLock::new(HashSet::new())),
@@ -251,26 +242,6 @@ impl State {
             .as_secs();
         self.last_s3_ok_epoch.store(now, Ordering::Relaxed);
     }
-
-    pub fn synced_recently(&self, ttl_secs: u64) -> bool {
-        let last = self.last_sync_epoch.load(Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now.saturating_sub(last) < ttl_secs
-    }
-
-    pub fn mark_synced(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.last_sync_epoch.store(now, Ordering::Relaxed);
-    }
 }
 
 #[cfg(test)]
@@ -286,16 +257,6 @@ mod tests {
     #[test]
     fn test_database_state_connect_failed_pool_is_none() {
         assert!(DatabaseState::ConnectFailed.pool().is_none());
-    }
-
-    #[test]
-    fn test_database_state_not_configured_is_not_configured() {
-        assert!(!DatabaseState::NotConfigured.is_configured());
-    }
-
-    #[test]
-    fn test_database_state_connect_failed_is_configured() {
-        assert!(DatabaseState::ConnectFailed.is_configured());
     }
 
     #[test]
@@ -453,16 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn test_database_state_is_configured_returns_true_for_connect_failed() {
-        assert!(DatabaseState::ConnectFailed.is_configured());
-    }
-
-    #[test]
-    fn test_database_state_is_configured_returns_false_for_not_configured() {
-        assert!(!DatabaseState::NotConfigured.is_configured());
-    }
-
-    #[test]
     fn test_s3_ok_recently_returns_false_when_never_marked() {
         use super::{MassiveSecrets, State};
 
@@ -577,121 +528,6 @@ mod tests {
             state.last_s3_ok_epoch.store(1, Ordering::Relaxed);
             // ttl_secs=60 — the stored epoch is way older than 60 seconds ago.
             assert!(!state.s3_ok_recently(60));
-        });
-    }
-
-    #[test]
-    fn test_synced_recently_returns_false_when_never_marked() {
-        use super::{MassiveSecrets, State};
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            assert!(!state.synced_recently(300));
-        });
-    }
-
-    #[test]
-    fn test_synced_recently_returns_true_after_mark_synced() {
-        use super::{MassiveSecrets, State};
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            state.mark_synced();
-            assert!(state.synced_recently(300));
-        });
-    }
-
-    #[test]
-    fn test_synced_recently_returns_false_after_ttl_expires() {
-        use super::{MassiveSecrets, State};
-        use std::sync::atomic::Ordering;
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        runtime.block_on(async {
-            use aws_credential_types::Credentials;
-            use aws_sdk_s3::config::Region;
-
-            let credentials =
-                Credentials::new("test-access-key", "test-secret-key", None, None, "tests");
-            let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                .region(Region::new("us-east-1"))
-                .credentials_provider(credentials)
-                .endpoint_url("http://127.0.0.1:9")
-                .load()
-                .await;
-            let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-                .force_path_style(true)
-                .build();
-            let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-            let state = State::new(
-                reqwest::Client::new(),
-                MassiveSecrets {
-                    base: "http://127.0.0.1:1".to_string(),
-                    key: "test-api-key".to_string(),
-                },
-                s3_client,
-                "test-bucket".to_string(),
-            );
-            // Store epoch in the distant past.
-            state.last_sync_epoch.store(1, Ordering::Relaxed);
-            assert!(!state.synced_recently(60));
         });
     }
 

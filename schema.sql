@@ -243,9 +243,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_reconciliation_events_unresolved -- noqa: 
 -- Nightly equity bar sync: weekdays at 05:00 UTC
 DO $do$
 BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bar-sync') THEN
-        PERFORM cron.unschedule('equity-bar-sync');
-    END IF;
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-sync-requested') THEN
         PERFORM cron.schedule('equity-bars-sync-requested', '0 5 * * 1-5', $$SELECT emit_event('equity_bars_sync_requested', '{}')$$);
     END IF;
@@ -335,43 +332,31 @@ SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 -- persisted, so no table mediates this path.
 DO $do$
 BEGIN
-    -- Remove superseded tick jobs. market-session-check emitted a prediction
-    -- request every five minutes; predictions derive from daily bars, so those
-    -- runs recomputed an identical answer up to 78 times per session. It is
-    -- replaced by one pre-market request plus an evaluation heartbeat.
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'intraday-check') THEN
-        PERFORM cron.unschedule('intraday-check');
-    END IF;
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-session-check') THEN
-        PERFORM cron.unschedule('market-session-check');
-    END IF;
-
     -- Pre-market prediction request: weekdays at 09:00 Eastern, 30 minutes ahead
     -- of a regular open so predictions are ready for the first evaluation pass.
     -- Fires in UTC hours 13-14 to cover both EDT and EST, gated on the actual
     -- Eastern time so DST needs no schema re-apply. Holidays are handled by the
     -- inference consumer, not here.
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-predictions-request') THEN
-        PERFORM cron.unschedule('equity-predictions-request');
+    --
+    -- Every job that emits an event is named for the event it emits.
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-predictions-requested') THEN
+        PERFORM cron.unschedule('equity-predictions-requested');
     END IF;
     PERFORM cron.schedule(
-        'equity-predictions-request',
+        'equity-predictions-requested',
         '0 13,14 * * 1-5',
         $$SELECT emit_event('equity_predictions_requested', '{"reason": "pre_market"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00'
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:05'$$
     );
 
-    -- Retire the five-minute evaluation heartbeat. It ran a full rebalance pass
-    -- every five minutes whether or not anything had changed: up to 78 passes a
-    -- session, each re-ranking the candidate reservoir and re-pricing every open
-    -- leg to usually conclude that nothing should happen. Intraday work is now
-    -- driven by the live-quote evaluator, which emits
-    -- portfolio_evaluation_requested only when a spread actually crosses a close
-    -- threshold, and the session is opened and closed by the two jobs below.
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-evaluation-requested') THEN
-        PERFORM cron.unschedule('portfolio-evaluation-requested');
-    END IF;
+    -- There is deliberately no evaluation job here. A five-minute heartbeat used to
+    -- run a full rebalance pass whether or not anything had changed: up to 78 passes
+    -- a session, each re-ranking the candidate reservoir and re-pricing every open leg
+    -- to usually conclude that nothing should happen. Intraday work is driven by the
+    -- live-quote evaluator instead, which emits portfolio_evaluation_requested only
+    -- when a spread actually crosses a close threshold. Cron opens and closes the
+    -- session; it does not drive the work in between.
 
     -- Session start: weekdays at 09:25 Eastern, five minutes ahead of a regular
     -- open. The portfolio consumer confirms against Alpaca's clock that the
@@ -392,43 +377,6 @@ BEGIN
 END;
 $do$;
 
--- cron.schedule_in_timezone: schedules a named pg_cron job using a local-time cron expression.
--- Converts the hour component of a simple 'MM HH dow dom month' expression to UTC at scheduling
--- time using the named timezone. The UTC offset is computed from the current date, so DST
--- transitions that occur after scheduling will shift the job by one hour until the schema is
--- re-applied. Only handles numeric hour and minute fields; non-numeric fields are passed through
--- unchanged to cron.schedule.
-CREATE OR REPLACE FUNCTION cron.schedule_in_timezone(
-    job_name text,
-    schedule text,
-    timezone_name text,
-    command text
-) RETURNS bigint
-LANGUAGE plpgsql AS $$
-DECLARE
-    minute_field text := split_part(schedule, ' ', 1);
-    hour_field   text := split_part(schedule, ' ', 2);
-    rest         text := split_part(schedule, ' ', 3) || ' ' ||
-                         split_part(schedule, ' ', 4) || ' ' ||
-                         split_part(schedule, ' ', 5);
-    utc_hour     integer;
-    utc_schedule text;
-BEGIN
-    IF minute_field ~ '^\d+$' AND hour_field ~ '^\d+$' THEN
-        utc_hour := EXTRACT(
-            hour FROM (
-                (current_date::text || ' ' || hour_field || ':' || minute_field)::timestamp
-                AT TIME ZONE timezone_name
-            )
-        )::integer;
-        utc_schedule := minute_field || ' ' || utc_hour::text || ' ' || rest;
-    ELSE
-        utc_schedule := schedule;
-    END IF;
-    RETURN cron.schedule(job_name, utc_schedule, command);
-END;
-$$;
-
 -- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
 -- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
 -- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
@@ -440,9 +388,6 @@ $$;
 -- overnight; liquidation is idempotent, so both paths firing is harmless.
 DO $do$
 BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'end-of-day-liquidation') THEN
-        PERFORM cron.unschedule('end-of-day-liquidation');
-    END IF;
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
         PERFORM cron.unschedule('portfolio-liquidation-requested');
     END IF;
@@ -453,15 +398,6 @@ BEGIN
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '15:45'
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:50'$$
     );
-END;
-$do$;
-
--- Unschedule removed record-end-of-day-snapshot job from existing deployments.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'record-end-of-day-snapshot') THEN
-        PERFORM cron.unschedule('record-end-of-day-snapshot');
-    END IF;
 END;
 $do$;
 
@@ -493,34 +429,3 @@ BEGIN
     END IF;
 END;
 $do$;
-
--- check_cron_job_health: returns the most recent execution status for each pg_cron job.
--- Operators, the dashboard, or a future bot can call
--- SELECT * FROM check_cron_job_health() to inspect job health at a glance.
-CREATE OR REPLACE FUNCTION check_cron_job_health()
-RETURNS TABLE (
-    job_name TEXT,
-    schedule TEXT,
-    last_run_time TIMESTAMPTZ,
-    last_status TEXT,
-    last_return_message TEXT
-) AS $$
-BEGIN
-    RETURN QUERY
-    SELECT
-        j.jobname::TEXT,
-        j.schedule::TEXT,
-        d.end_time,
-        d.status,
-        d.return_message
-    FROM cron.job j
-    LEFT JOIN LATERAL (
-        SELECT rd.end_time, rd.status, rd.return_message
-        FROM cron.job_run_details rd
-        WHERE rd.jobid = j.jobid
-        ORDER BY rd.end_time DESC
-        LIMIT 1
-    ) d ON TRUE
-    ORDER BY j.jobname;
-END;
-$$ LANGUAGE plpgsql;

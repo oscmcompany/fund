@@ -152,19 +152,28 @@ fn date_to_utc_range(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     (start, end)
 }
 
-/// Summary of rows deleted during a database purge.
+/// Outcome of a database purge.
+///
+/// Carries failures as well as successes. A table that fails to purge is skipped
+/// so the remaining tables still run, but the failure has to reach the caller:
+/// reporting a partial purge as a completed one would let a table fail silently
+/// every night, and the event log would say the purge succeeded each time.
 pub struct PurgeSummary {
-    /// Each entry is `(table_name, rows_deleted)`.
+    /// Each entry is `(table_name, rows_deleted)`, for tables that purged cleanly.
     pub rows_deleted: Vec<(String, u64)>,
+    /// Names of tables whose `DELETE` failed. Empty on a fully successful purge.
+    pub failed_tables: Vec<String>,
 }
 
 /// Deletes rows older than 1 day from all ephemeral tables.
 ///
 /// Tables are deleted in child-first order to respect foreign key constraints.
-/// Returns a summary with per-table row counts.
+/// A failing table is logged and skipped rather than aborting the run, and is
+/// recorded in [`PurgeSummary::failed_tables`] so the caller can report it.
 pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
     let cutoff = Utc::now() - chrono::Duration::days(1);
     let mut rows_deleted = Vec::new();
+    let mut failed_tables = Vec::new();
 
     // Child-first ordering to avoid foreign key violations.
     // The optional third element adds an extra WHERE clause condition.
@@ -198,11 +207,15 @@ pub async fn purge_ephemeral_tables(pool: &PgPool) -> PurgeSummary {
             Ok(result) => rows_deleted.push((table.to_string(), result.rows_affected())),
             Err(error) => {
                 tracing::warn!(table, error = %error, "Failed to purge table, continuing with remaining tables");
+                failed_tables.push(table.to_string());
             }
         }
     }
 
-    PurgeSummary { rows_deleted }
+    PurgeSummary {
+        rows_deleted,
+        failed_tables,
+    }
 }
 
 /// Returns the set of dates that have at least one equity bar row in the
@@ -873,8 +886,53 @@ mod tests {
             let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
                 .expect("lazy pool creation should not fail");
             let summary = purge_ephemeral_tables(&pool).await;
-            // With no database connection, all tables fail silently and return empty summary.
+            // With no database connection every table fails, so nothing is deleted.
             assert!(summary.rows_deleted.is_empty());
         });
+    }
+
+    #[test]
+    fn test_purge_ephemeral_tables_reports_failed_tables() {
+        // The failure path used to vanish into a warn!, so a purge that deleted
+        // nothing was indistinguishable from one that succeeded with no old rows.
+        // Every table must now surface in the summary.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = PgPool::connect_lazy("postgresql://localhost:5432/fund_test_nonexistent")
+                .expect("lazy pool creation should not fail");
+            let summary = purge_ephemeral_tables(&pool).await;
+
+            assert!(
+                !summary.failed_tables.is_empty(),
+                "an unreachable database must report failed tables"
+            );
+            assert!(summary.rows_deleted.is_empty());
+            // Child-first ordering means equity_orders is attempted first; events and
+            // model_runs are last. All of them fail against an unreachable pool.
+            for table in ["equity_orders", "events", "model_runs"] {
+                assert!(
+                    summary.failed_tables.iter().any(|name| name == table),
+                    "expected {} in failed_tables, got {:?}",
+                    table,
+                    summary.failed_tables
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_purge_summary_clean_run_has_no_failures() {
+        // The shape a successful purge produces: counts present, failures empty.
+        // This is what makes `failed_tables.is_empty()` a usable branch condition
+        // in the purge handler.
+        let summary = PurgeSummary {
+            rows_deleted: vec![("equity_orders".to_string(), 12)],
+            failed_tables: Vec::new(),
+        };
+        assert!(summary.failed_tables.is_empty());
+        assert_eq!(summary.rows_deleted.len(), 1);
     }
 }

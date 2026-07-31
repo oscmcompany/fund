@@ -122,9 +122,9 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // The market data buffer is the in-memory broadcast channel for live
-    // quotes. All data here is ephemeral (DataBoundary::Ephemeral) and is never
-    // written to PostgreSQL. Downstream consumers that detect durable signals
-    // are responsible for crossing the event boundary via emit_event().
+    // quotes. All data here is ephemeral and is never written to PostgreSQL.
+    // Downstream consumers that detect durable signals are responsible for
+    // crossing the event boundary via emit_event().
     //
     // Lifecycle: the broadcast channel closes when all senders are dropped. The
     // quote stream producer holds a clone while it runs, so the channel stays
