@@ -2,7 +2,8 @@ use crate::domain::market::{EquityBar, EquityDetail, PairID, Ticker};
 use crate::domain::predictions::{EquityPrediction, ModelRun, ModelRunStatus};
 use crate::domain::trading::{
     AllocationAction, AllocationSide, EquityAllocation, EquityOrder, EquityPair, EquityPairStatus,
-    EquityPortfolioSnapshot, EquityRebalanceSession, RebalanceSessionStatus, SnapshotType,
+    EquityPortfolioSnapshot, EquityRebalanceSession, RebalanceSessionStatus, RebalanceTrigger,
+    SnapshotType,
 };
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -319,7 +320,11 @@ pub async fn query_equity_rebalance_sessions(
             Ok(EquityRebalanceSession::new(
                 row.id,
                 row.triggered_at,
-                row.trigger_reason,
+                RebalanceTrigger::parse(&row.trigger_reason).ok_or_else(|| {
+                    sqlx::Error::Decode(
+                        format!("Invalid rebalance trigger: {}", row.trigger_reason).into(),
+                    )
+                })?,
                 row.model_run_id,
                 row.completed_at,
                 status,

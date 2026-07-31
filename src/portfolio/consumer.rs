@@ -29,7 +29,6 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -37,12 +36,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
+    emit_event, get_consumer_offset, latest_event_after, run_event_listener,
+    update_consumer_offset, EventType, Outcome, CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION,
+    CONSUMER_PORTFOLIO_SESSION,
 };
 use crate::common::market_hours::MarketSession;
+use crate::domain::trading::RebalanceTrigger;
 use crate::portfolio::database::{fetch_open_pairs, predictions_exist_for_today};
-use crate::portfolio::rebalance::{run_end_of_day_liquidation, run_rebalance, RebalanceError};
+use crate::portfolio::rebalance::{
+    run_end_of_day_liquidation, run_rebalance, RebalanceError, RebalanceOutcome,
+};
 use crate::portfolio::reconciliation;
 use crate::portfolio::state::AppState;
 
@@ -102,14 +105,66 @@ async fn run_consumer(
     pool: &PgPool,
     shutdown_token: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen("events").await?;
-    info!("Event consumer connected, listening on channel 'events'");
+    run_event_listener(
+        pool,
+        shutdown_token,
+        "portfolio",
+        || run_startup_catch_up(state, pool, shutdown_token),
+        |notification| async move {
+            let event_id = notification.event_id();
+            match notification.event_type() {
+                EventType::TradingSessionStarted => {
+                    info!(event_id, "Received trading_session_started");
+                    handle_trading_session_started(state, pool, event_id, shutdown_token).await;
+                }
+                EventType::PortfolioEvaluationRequested => {
+                    handle_portfolio_evaluation(state, pool, notification.payload()).await;
+                }
+                EventType::EquityPredictions(Outcome::Completed) => {
+                    info!(event_id, "Received equity_predictions_completed");
+                    handle_equity_predictions_completed(state, pool, event_id).await;
+                }
+                EventType::EquityPredictions(Outcome::Errored) => {
+                    // Nothing to unwind: the request timestamp is a retry
+                    // backoff, not a lock, so the next due evaluation
+                    // re-requests on its own. An explicit arm because this is a
+                    // considered decision, not an oversight.
+                    info!(event_id, "Received equity_predictions_errored");
+                }
+                EventType::PortfolioLiquidation(Outcome::Requested) => {
+                    info!(event_id, "Received portfolio_liquidation_requested");
+                    handle_portfolio_liquidation(state, pool, event_id).await;
+                }
+                // Every consumer receives every event; the rest belong to other
+                // services or are audit records. Listed rather than caught by a
+                // wildcard so that adding a family, or an `Outcome` to a family
+                // this consumer partly handles, fails the build here instead of
+                // being silently ignored.
+                EventType::EquityPredictions(Outcome::Requested | Outcome::Started)
+                | EventType::PortfolioLiquidation(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::EquityBarsSync(_)
+                | EventType::DatabaseExport(_)
+                | EventType::DatabaseBackup(_)
+                | EventType::DatabasePurge(_)
+                | EventType::PortfolioRebalance(_)
+                | EventType::StressTest => {}
+            }
+        },
+    )
+    .await
+}
 
-    if shutdown_token.is_cancelled() {
-        return Ok(());
-    }
-
+/// Replays the events this consumer missed while it was down.
+///
+/// Runs on every connection, not once per process: a reconnect means delivery
+/// had a gap, and the same replay that covers a restart covers that gap too.
+async fn run_startup_catch_up(
+    state: &AppState,
+    pool: &PgPool,
+    shutdown_token: &CancellationToken,
+) -> Result<(), sqlx::Error> {
     // Run startup reconciliation to resolve any DB-Alpaca drift accumulated
     // while the service was down.
     match reconciliation::reconcile(pool, state.alpaca_client()).await {
@@ -133,7 +188,7 @@ async fn run_consumer(
     let predictions_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO).await?;
     if let Some(event_id) = latest_event_after(
         pool,
-        EventType::EquityPredictionsCompleted,
+        EventType::EquityPredictions(Outcome::Completed),
         predictions_offset,
     )
     .await?
@@ -185,7 +240,7 @@ async fn run_consumer(
     let liquidation_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO_LIQUIDATION).await?;
     if let Some(event_id) = latest_event_after(
         pool,
-        EventType::PortfolioLiquidationRequested,
+        EventType::PortfolioLiquidation(Outcome::Requested),
         liquidation_offset,
     )
     .await?
@@ -213,46 +268,6 @@ async fn run_consumer(
             {
                 warn!(error = %error, "Failed to update liquidation consumer offset");
             }
-        }
-    }
-
-    loop {
-        let notification = tokio::select! {
-            result = listener.recv() => result?,
-            _ = shutdown_token.cancelled() => {
-                info!("Shutdown signal received, draining");
-                break;
-            }
-        };
-        let parsed: serde_json::Value = match serde_json::from_str(notification.payload()) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let event_type = parsed
-            .get("event_type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        let event_id = parsed
-            .get("event_id")
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-
-        if event_type == EventType::TradingSessionStarted.as_str() {
-            info!(event_id, "Received trading_session_started");
-            handle_trading_session_started(state, pool, event_id, shutdown_token).await;
-        } else if event_type == EventType::PortfolioEvaluationRequested.as_str() {
-            handle_portfolio_evaluation(state, pool).await;
-        } else if event_type == EventType::EquityPredictionsCompleted.as_str() {
-            info!(event_id, "Received equity_predictions_completed");
-            handle_equity_predictions_completed(state, pool, event_id).await;
-        } else if event_type == EventType::EquityPredictionsErrored.as_str() {
-            // Nothing to unwind: the request timestamp is a retry backoff, not a
-            // lock, so the next due evaluation re-requests on its own.
-            info!(event_id, "Received equity_predictions_errored");
-        } else if event_type == EventType::PortfolioLiquidationRequested.as_str() {
-            info!(event_id, "Received portfolio_liquidation_requested");
-            handle_portfolio_liquidation(state, pool, event_id).await;
         }
     }
 
@@ -304,7 +319,7 @@ async fn handle_trading_session_started(
         record_session_offset(pool, event_id).await;
         return;
     }
-    run_rebalance_pass(state, pool).await;
+    run_rebalance_pass(state, pool, RebalanceTrigger::SessionStart).await;
     state.finish_rebalance();
 
     // A pass that opened nothing is the case the retired heartbeat used to
@@ -454,7 +469,7 @@ fn spawn_liquidation_timer(
         info!(session_close = %close, "Liquidation timer fired; requesting liquidation");
         if let Err(error) = emit_event(
             &pool,
-            EventType::PortfolioLiquidationRequested,
+            EventType::PortfolioLiquidation(Outcome::Requested),
             &serde_json::json!({"reason": "session_close_approaching"}),
         )
         .await
@@ -484,7 +499,8 @@ fn spawn_liquidation_timer(
 ///
 /// No consumer offset tracking, because a stale evaluation tick carries no
 /// meaningful signal.
-async fn handle_portfolio_evaluation(state: &AppState, pool: &PgPool) {
+async fn handle_portfolio_evaluation(state: &AppState, pool: &PgPool, payload: &serde_json::Value) {
+    let trigger = evaluation_trigger_from(payload);
     let session = match state.alpaca_client().fetch_market_session().await {
         Ok(session) => session,
         Err(error) => {
@@ -514,8 +530,14 @@ async fn handle_portfolio_evaluation(state: &AppState, pool: &PgPool) {
         return;
     }
 
-    run_rebalance_pass(state, pool).await;
+    let outcome = run_rebalance_pass(state, pool, trigger).await;
     state.finish_rebalance();
+
+    if trigger == RebalanceTrigger::LiveCrossing {
+        if let Some(outcome) = outcome {
+            report_trigger_disagreement(payload, &outcome);
+        }
+    }
 }
 
 /// Returns `true` when the session close is within [`LIQUIDATION_LEAD_TIME_MINUTES`].
@@ -558,7 +580,7 @@ async fn ensure_predictions_requested(state: &AppState, pool: &PgPool) {
     info!("No predictions recorded for today; requesting a run");
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityPredictionsRequested,
+        EventType::EquityPredictions(Outcome::Requested),
         &serde_json::json!({"reason": "missing_for_session"}),
     )
     .await
@@ -571,14 +593,35 @@ async fn ensure_predictions_requested(state: &AppState, pool: &PgPool) {
     }
 }
 
+/// Maps an evaluation request's payload to the trigger that produced it.
+///
+/// The emitters already set `reason`; this reads it back so the rebalance
+/// session records which of them ran. An unrecognised or absent reason means the
+/// request came from somewhere other than the two in-process emitters.
+fn evaluation_trigger_from(payload: &serde_json::Value) -> RebalanceTrigger {
+    match payload.get("reason").and_then(|value| value.as_str()) {
+        Some("live_threshold_crossing") => RebalanceTrigger::LiveCrossing,
+        Some("entry_retry") => RebalanceTrigger::EntryRetry,
+        _ => RebalanceTrigger::Manual,
+    }
+}
+
 /// Runs a rebalance pass, emitting the start event and translating the outcome
 /// into log lines and, where warranted, a `portfolio_rebalance_errored` event.
 ///
 /// Callers own the in-progress flag; this function neither claims nor releases it.
-async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
+///
+/// Returns the outcome on success so a caller can compare the pass against
+/// whatever triggered it; `None` means the pass was skipped or failed, which the
+/// arms below have already logged.
+async fn run_rebalance_pass(
+    state: &AppState,
+    pool: &PgPool,
+    trigger: RebalanceTrigger,
+) -> Option<RebalanceOutcome> {
     if let Err(error) = emit_event(
         pool,
-        EventType::PortfolioRebalanceStarted,
+        EventType::PortfolioRebalance(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -586,21 +629,22 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
         warn!(error = %error, "Failed to emit portfolio_rebalance_started");
     }
 
-    match run_rebalance(state).await {
+    match run_rebalance(state, trigger).await {
         Ok(outcome) => {
             info!(
-                session_id = %outcome.session_id,
-                pairs_opened = outcome.pairs_opened,
-                pairs_closed = outcome.pairs_closed,
-                pairs_kept = outcome.pairs_kept,
+                session_id = %outcome.session_id(),
+                pairs_opened = outcome.pairs_opened(),
+                pairs_closed = outcome.pairs_closed(),
+                pairs_kept = outcome.pairs_kept(),
                 "Rebalance completed from event"
             );
+            return Some(outcome);
         }
         Err(RebalanceError::StalePredictions) => {
             warn!("Rebalance skipped: stale or absent predictions");
             if let Err(error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": "stale_predictions"}),
             )
             .await
@@ -619,7 +663,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             );
             if let Err(error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": "drawdown_breached"}),
             )
             .await
@@ -631,7 +675,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             error!(error = %error, "Rebalance errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -640,6 +684,35 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             }
         }
     }
+    None
+}
+
+/// Reports when the live evaluator flagged a pair the authoritative pass then
+/// declined to close.
+///
+/// These two paths already produced a livelock once by measuring the same
+/// spread differently, which is why they share `close_reason_for` and
+/// `z_score_against`. A systematic divergence recurring is the failure worth
+/// hearing about, so it is logged rather than left to be inferred from a pass
+/// that quietly did nothing.
+fn report_trigger_disagreement(payload: &serde_json::Value, outcome: &RebalanceOutcome) {
+    let Some(flagged_pair) = payload.get("pair_id").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let agreed = outcome
+        .close_signals()
+        .iter()
+        .any(|(pair_id, _)| pair_id.as_str() == flagged_pair);
+    if agreed {
+        return;
+    }
+    warn!(
+        pair_id = flagged_pair,
+        trigger_z_score = payload.get("z_score").and_then(|value| value.as_f64()),
+        pairs_closed = outcome.pairs_closed(),
+        close_signals = outcome.close_signals().len(),
+        "Live evaluator flagged a pair the rebalance pass did not close"
+    );
 }
 
 /// Runs a rebalance pass in response to a completed prediction run.
@@ -648,7 +721,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
 /// change, so it is acted on immediately rather than waiting for the next tick.
 async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, event_id: i64) {
     if state.try_begin_rebalance() {
-        run_rebalance_pass(state, pool).await;
+        run_rebalance_pass(state, pool, RebalanceTrigger::PredictionRefresh).await;
         state.finish_rebalance();
     } else {
         info!("Skipping prediction-driven rebalance: a pass is already running");
@@ -662,7 +735,7 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
 async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::PortfolioLiquidationStarted,
+        EventType::PortfolioLiquidation(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -676,7 +749,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
             error!(error = %error, "Portfolio liquidation errored: Alpaca execution error");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioLiquidationErrored,
+                EventType::PortfolioLiquidation(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -688,7 +761,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
             error!(error = %error, "Portfolio liquidation errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioLiquidationErrored,
+                EventType::PortfolioLiquidation(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -707,10 +780,97 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
-        ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
+        evaluation_trigger_from, report_trigger_disagreement, CONSUMER_PORTFOLIO,
+        CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION, ENTRY_RETRY_BACKOFF_MINUTES,
+        LIQUIDATION_LEAD_TIME_MINUTES,
     };
-    use crate::common::events::EventType;
+    use crate::common::events::{EventType, Outcome};
+    use crate::domain::market::PairID;
+    use crate::domain::trading::{CloseReason, RebalanceTrigger};
+    use crate::portfolio::rebalance::RebalanceOutcome;
+
+    /// Builds an outcome whose exit evaluation signalled the given pairs.
+    fn outcome_closing(pairs: &[&str]) -> RebalanceOutcome {
+        let close_signals = pairs
+            .iter()
+            .map(|pair| {
+                (
+                    PairID::parse(pair).expect("test pair id should be valid"),
+                    CloseReason::StopLoss,
+                )
+            })
+            .collect::<Vec<_>>();
+        RebalanceOutcome::new(
+            uuid::Uuid::new_v4(),
+            0,
+            close_signals.len(),
+            0,
+            1_000_000.0,
+            close_signals,
+        )
+    }
+
+    #[test]
+    fn test_evaluation_trigger_reads_the_emitters_reason() {
+        assert_eq!(
+            evaluation_trigger_from(&serde_json::json!({"reason": "live_threshold_crossing"})),
+            RebalanceTrigger::LiveCrossing
+        );
+        assert_eq!(
+            evaluation_trigger_from(&serde_json::json!({"reason": "entry_retry", "attempt": 1})),
+            RebalanceTrigger::EntryRetry
+        );
+    }
+
+    #[test]
+    fn test_evaluation_trigger_falls_back_to_manual() {
+        // Anything not emitted by the two in-process emitters came from outside.
+        assert_eq!(
+            evaluation_trigger_from(&serde_json::json!({})),
+            RebalanceTrigger::Manual
+        );
+        assert_eq!(
+            evaluation_trigger_from(&serde_json::json!({"reason": "something_else"})),
+            RebalanceTrigger::Manual
+        );
+        assert_eq!(
+            evaluation_trigger_from(&serde_json::json!({"reason": 7})),
+            RebalanceTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn test_trigger_disagreement_is_silent_when_the_pass_agrees() {
+        let payload = serde_json::json!({
+            "reason": "live_threshold_crossing",
+            "pair_id": "AAPL-MSFT",
+            "z_score": 4.2,
+        });
+        // Nothing to assert beyond not panicking: the pass closed the flagged
+        // pair, so the divergence path must not be taken.
+        report_trigger_disagreement(&payload, &outcome_closing(&["AAPL-MSFT"]));
+    }
+
+    #[test]
+    fn test_trigger_disagreement_handles_a_declined_pair() {
+        let payload = serde_json::json!({
+            "reason": "live_threshold_crossing",
+            "pair_id": "AAPL-MSFT",
+            "z_score": 4.2,
+        });
+        report_trigger_disagreement(&payload, &outcome_closing(&["KO-PEP"]));
+        report_trigger_disagreement(&payload, &outcome_closing(&[]));
+    }
+
+    #[test]
+    fn test_trigger_disagreement_ignores_a_request_without_a_pair() {
+        // Entry retries and manual requests carry no pair, so there is nothing
+        // to disagree about.
+        report_trigger_disagreement(
+            &serde_json::json!({"reason": "entry_retry"}),
+            &outcome_closing(&[]),
+        );
+    }
 
     #[test]
     fn test_consumer_names_are_stable() {
@@ -722,15 +882,15 @@ mod tests {
     #[test]
     fn test_event_type_strings_are_stable() {
         assert_eq!(
-            EventType::EquityPredictionsCompleted.as_str(),
+            EventType::EquityPredictions(Outcome::Completed).as_str(),
             "equity_predictions_completed"
         );
         assert_eq!(
-            EventType::EquityPredictionsErrored.as_str(),
+            EventType::EquityPredictions(Outcome::Errored).as_str(),
             "equity_predictions_errored"
         );
         assert_eq!(
-            EventType::PortfolioLiquidationRequested.as_str(),
+            EventType::PortfolioLiquidation(Outcome::Requested).as_str(),
             "portfolio_liquidation_requested"
         );
         assert_eq!(
@@ -889,7 +1049,7 @@ mod tests {
         };
         let state = make_test_state(mock);
 
-        handle_portfolio_evaluation(&state, state.pool()).await;
+        handle_portfolio_evaluation(&state, state.pool(), &serde_json::json!({})).await;
 
         // The pass returned before claiming the rebalance slot.
         assert!(!state.rebalance_in_progress());
@@ -906,7 +1066,7 @@ mod tests {
         // The dummy pool makes every query fail, so the pass errors out. The
         // slot must still be released or the service would wedge after one
         // transient database failure.
-        handle_portfolio_evaluation(&state, state.pool()).await;
+        handle_portfolio_evaluation(&state, state.pool(), &serde_json::json!({})).await;
 
         assert!(!state.rebalance_in_progress());
     }
@@ -921,7 +1081,7 @@ mod tests {
 
         assert!(state.try_begin_rebalance());
 
-        handle_portfolio_evaluation(&state, state.pool()).await;
+        handle_portfolio_evaluation(&state, state.pool(), &serde_json::json!({})).await;
 
         // Still held by the simulated in-flight pass, not cleared by the skip.
         assert!(state.rebalance_in_progress());

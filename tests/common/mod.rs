@@ -233,38 +233,58 @@ fn database_url_base() -> String {
 /// schema being shipped. The devenv Postgres carries the extension, so the real
 /// one applies.
 fn filter_schema_for_test(schema: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    // `DO` blocks are buffered rather than dropped on sight: the idiom is shared
+    // between pg_cron scheduling, which the test database cannot run, and plain
+    // DDL such as the `events_notify` trigger, which it very much needs. Dropping
+    // every block took the trigger with it, leaving NOTIFY silent here and the
+    // LISTEN loops untestable.
+    let mut do_block: Vec<&str> = Vec::new();
     let mut inside_do_block = false;
     let mut inside_cron_function = false;
-    schema
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim().to_lowercase();
 
-            if trimmed.starts_with("do $do$") {
-                inside_do_block = true;
-            }
-            if inside_do_block {
-                if trimmed.starts_with("$do$;") {
-                    inside_do_block = false;
+    for line in schema.lines() {
+        let trimmed = line.trim().to_lowercase();
+
+        if inside_do_block {
+            do_block.push(line);
+            if trimmed.starts_with("$do$;") {
+                inside_do_block = false;
+                let mentions_cron = do_block
+                    .iter()
+                    .any(|blocked| blocked.to_lowercase().contains("cron."));
+                if !mentions_cron {
+                    kept.append(&mut do_block);
                 }
-                return false;
+                do_block.clear();
             }
+            continue;
+        }
+        if trimmed.starts_with("do $do$") {
+            inside_do_block = true;
+            do_block.push(line);
+            continue;
+        }
 
-            if trimmed.starts_with("create or replace function cron.") {
-                inside_cron_function = true;
+        if trimmed.starts_with("create or replace function cron.") {
+            inside_cron_function = true;
+        }
+        if inside_cron_function {
+            if trimmed == "$$;" {
+                inside_cron_function = false;
             }
-            if inside_cron_function {
-                if trimmed == "$$;" {
-                    inside_cron_function = false;
-                }
-                return false;
-            }
+            continue;
+        }
 
-            !trimmed.starts_with("create extension if not exists pg_cron")
-                && !trimmed.starts_with("select cron.schedule")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        if trimmed.starts_with("create extension if not exists pg_cron")
+            || trimmed.starts_with("select cron.schedule")
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+
+    kept.join("\n")
 }
 
 /// Returns a connection pool to the shared test database.

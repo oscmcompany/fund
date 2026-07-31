@@ -323,12 +323,81 @@ impl std::fmt::Display for CloseReason {
     }
 }
 
+/// What caused a rebalance pass to run.
+///
+/// Stored in `equity_rebalance_sessions.trigger_reason`, which is `TEXT` and was
+/// previously written with the same literal from every call site. A closed set
+/// makes the first question anyone asks of that table — why did this pass run —
+/// answerable from the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebalanceTrigger {
+    /// The trading session opened.
+    SessionStart,
+    /// A live quote moved a spread across a close threshold.
+    LiveCrossing,
+    /// A prediction run completed and produced a fresh set to act on.
+    PredictionRefresh,
+    /// A session-start pass opened nothing and the retry timer fired.
+    EntryRetry,
+    /// Requested out of band rather than by the system itself.
+    Manual,
+    /// Written by every pass before the trigger became a closed set.
+    ///
+    /// Nothing emits this. It exists so rows already in
+    /// `equity_rebalance_sessions` still round-trip, rather than being silently
+    /// relabelled as one of the real triggers.
+    ///
+    /// The explicit rename keeps the Serde form equal to [`Self::as_str`]. It is
+    /// the only variant where `rename_all = "snake_case"` would disagree, which
+    /// is exactly why it is easy to miss.
+    #[serde(rename = "portfolio_evaluation")]
+    Legacy,
+}
+
+impl RebalanceTrigger {
+    /// Returns the canonical string stored in `trigger_reason`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::LiveCrossing => "live_crossing",
+            Self::PredictionRefresh => "prediction_refresh",
+            Self::EntryRetry => "entry_retry",
+            Self::Manual => "manual",
+            Self::Legacy => "portfolio_evaluation",
+        }
+    }
+
+    /// Parses a stored `trigger_reason`.
+    ///
+    /// Rows written before this became a closed set carry `"portfolio_evaluation"`
+    /// and map to [`RebalanceTrigger::Legacy`]. `None` means a value no build has
+    /// ever written.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "session_start" => Some(Self::SessionStart),
+            "live_crossing" => Some(Self::LiveCrossing),
+            "prediction_refresh" => Some(Self::PredictionRefresh),
+            "entry_retry" => Some(Self::EntryRetry),
+            "manual" => Some(Self::Manual),
+            "portfolio_evaluation" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RebalanceTrigger {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Groups one full rebalance cycle from allocation through order submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityRebalanceSession {
     id: Uuid,
     triggered_at: DateTime<Utc>,
-    trigger_reason: String,
+    trigger_reason: RebalanceTrigger,
     /// References `model_runs.run_id`; nullable when the model run is unavailable.
     model_run_id: Option<String>,
     completed_at: Option<DateTime<Utc>>,
@@ -340,7 +409,7 @@ impl EquityRebalanceSession {
     pub fn new(
         id: Uuid,
         triggered_at: DateTime<Utc>,
-        trigger_reason: String,
+        trigger_reason: RebalanceTrigger,
         model_run_id: Option<String>,
         completed_at: Option<DateTime<Utc>>,
         status: RebalanceSessionStatus,
@@ -363,8 +432,8 @@ impl EquityRebalanceSession {
         self.triggered_at
     }
 
-    pub fn trigger_reason(&self) -> &str {
-        &self.trigger_reason
+    pub fn trigger_reason(&self) -> RebalanceTrigger {
+        self.trigger_reason
     }
 
     pub fn model_run_id(&self) -> Option<&str> {
@@ -983,6 +1052,70 @@ mod tests {
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
+    /// Every trigger paired with the exact value stored in `trigger_reason`.
+    const ALL_REBALANCE_TRIGGERS: &[(RebalanceTrigger, &str)] = &[
+        (RebalanceTrigger::SessionStart, "session_start"),
+        (RebalanceTrigger::LiveCrossing, "live_crossing"),
+        (RebalanceTrigger::PredictionRefresh, "prediction_refresh"),
+        (RebalanceTrigger::EntryRetry, "entry_retry"),
+        (RebalanceTrigger::Manual, "manual"),
+        (RebalanceTrigger::Legacy, "portfolio_evaluation"),
+    ];
+
+    #[test]
+    fn test_rebalance_trigger_round_trips_every_variant() {
+        for &(trigger, stored) in ALL_REBALANCE_TRIGGERS {
+            assert_eq!(
+                trigger.as_str(),
+                stored,
+                "wrong stored value for {trigger:?}"
+            );
+            assert_eq!(
+                RebalanceTrigger::parse(stored),
+                Some(trigger),
+                "round-trip failed for {trigger:?}"
+            );
+
+            // The Serde form must equal as_str, or a value written through one
+            // path fails to read back through the other. `Legacy` is the only
+            // variant where the derived snake_case name would disagree, which is
+            // exactly why testing only as_str/parse would miss it.
+            let serialized = serde_json::to_string(&trigger).unwrap();
+            assert_eq!(
+                serialized,
+                format!("\"{stored}\""),
+                "serde form diverges from as_str for {trigger:?}"
+            );
+            let deserialized: RebalanceTrigger = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, trigger);
+        }
+    }
+
+    #[test]
+    fn test_rebalance_trigger_parses_the_pre_enum_value() {
+        // Rows written before this became a closed set all carry this literal.
+        // Mapping it to a real trigger would silently invent provenance that was
+        // never recorded, so it gets its own variant.
+        assert_eq!(
+            RebalanceTrigger::parse("portfolio_evaluation"),
+            Some(RebalanceTrigger::Legacy)
+        );
+    }
+
+    #[test]
+    fn test_rebalance_trigger_rejects_unknown_values() {
+        assert_eq!(RebalanceTrigger::parse("eod_snapshot_requested"), None);
+        assert_eq!(RebalanceTrigger::parse(""), None);
+        assert_eq!(RebalanceTrigger::parse("SESSION_START"), None);
+    }
+
+    #[test]
+    fn test_rebalance_trigger_display_matches_as_str() {
+        for &(trigger, stored) in ALL_REBALANCE_TRIGGERS {
+            assert_eq!(trigger.to_string(), stored);
+        }
+    }
+
     fn make_pair_id() -> PairID {
         PairID::new(Ticker::new("AAPL").unwrap(), Ticker::new("MSFT").unwrap())
     }
@@ -1161,12 +1294,12 @@ mod tests {
         let session = EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "portfolio_evaluation".to_string(),
+            RebalanceTrigger::SessionStart,
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,
         );
-        assert_eq!(session.trigger_reason(), "portfolio_evaluation");
+        assert_eq!(session.trigger_reason(), RebalanceTrigger::SessionStart);
         assert_eq!(session.status(), &RebalanceSessionStatus::Completed);
         assert!(session.completed_at().is_none());
     }
@@ -1176,13 +1309,13 @@ mod tests {
         let session = EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "eod_snapshot_requested".to_string(),
+            RebalanceTrigger::LiveCrossing,
             None,
             Some(Utc::now()),
             RebalanceSessionStatus::Completed,
         );
         let cloned = session.clone();
-        assert_eq!(cloned.trigger_reason(), "eod_snapshot_requested");
+        assert_eq!(cloned.trigger_reason(), RebalanceTrigger::LiveCrossing);
     }
 
     #[test]
@@ -1283,7 +1416,7 @@ mod tests {
         EquityRebalanceSession::new(
             Uuid::new_v4(),
             Utc::now(),
-            "portfolio_evaluation".to_string(),
+            RebalanceTrigger::SessionStart,
             None,
             None,
             RebalanceSessionStatus::Completed,
@@ -1360,7 +1493,7 @@ mod tests {
         assert!(!sessions.is_empty());
         assert_eq!(
             sessions.as_slice()[0].trigger_reason(),
-            "portfolio_evaluation"
+            RebalanceTrigger::SessionStart
         );
     }
 
@@ -1407,7 +1540,7 @@ mod tests {
         let session = EquityRebalanceSession::new(
             id,
             now,
-            "portfolio_evaluation".to_string(),
+            RebalanceTrigger::SessionStart,
             Some("run-xyz".to_string()),
             Some(now),
             RebalanceSessionStatus::Failed,

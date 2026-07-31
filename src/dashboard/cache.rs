@@ -17,9 +17,9 @@ use rust_decimal::Decimal;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::common::events::EventType;
+use crate::common::events::{EventNotification, EventType, NotificationParseFailure};
 use crate::domain::market::{PairID, Ticker};
 use crate::domain::trading::CloseReason;
 
@@ -285,40 +285,24 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
             loop {
                 match listener.recv().await {
                     Ok(notification) => {
-                        let parsed: serde_json::Value =
-                            match serde_json::from_str(notification.payload()) {
-                                Ok(value) => value,
-                                Err(error) => {
-                                    warn!(error = %error, "Invalid event notification payload");
-                                    continue;
-                                }
-                            };
-                        let Some(event_id) =
-                            parsed.get("event_id").and_then(serde_json::Value::as_i64)
-                        else {
-                            warn!("Event notification missing event_id field");
-                            continue;
-                        };
-                        let Some(event_type_str) =
-                            parsed.get("event_type").and_then(serde_json::Value::as_str)
-                        else {
-                            warn!("Event notification missing event_type field");
-                            continue;
-                        };
-                        let Some(event_type) = EventType::parse(event_type_str) else {
-                            warn!(
-                                event_type = event_type_str,
-                                "Unknown event type in notification, skipping"
-                            );
-                            continue;
+                        let parsed = match EventNotification::parse(notification.payload()) {
+                            Ok(parsed) => parsed,
+                            Err(NotificationParseFailure::Malformed) => {
+                                warn!(
+                                    payload = notification.payload(),
+                                    "Skipping malformed event notification"
+                                );
+                                continue;
+                            }
+                            Err(NotificationParseFailure::UnknownEventType(event_type)) => {
+                                debug!(event_type, "Skipping event type this build does not know");
+                                continue;
+                            }
                         };
                         let entry = EventEntry {
-                            event_id,
-                            event_type,
-                            payload: parsed
-                                .get("payload")
-                                .cloned()
-                                .unwrap_or(serde_json::Value::Null),
+                            event_id: parsed.event_id(),
+                            event_type: parsed.event_type(),
+                            payload: parsed.into_payload(),
                             received_at: Utc::now(),
                         };
                         let mut guard = state.write().await;
@@ -341,6 +325,7 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::events::Outcome;
 
     #[test]
     fn test_dashboard_state_default_is_empty() {
@@ -398,12 +383,15 @@ mod tests {
     fn test_event_entry_fields() {
         let entry = EventEntry {
             event_id: 42,
-            event_type: EventType::PortfolioRebalanceCompleted,
+            event_type: EventType::PortfolioRebalance(Outcome::Completed),
             payload: serde_json::json!({"session_id": "abc"}),
             received_at: Utc::now(),
         };
         assert_eq!(entry.event_id, 42);
-        assert_eq!(entry.event_type, EventType::PortfolioRebalanceCompleted);
+        assert_eq!(
+            entry.event_type,
+            EventType::PortfolioRebalance(Outcome::Completed)
+        );
         assert_eq!(entry.payload["session_id"], "abc");
     }
 

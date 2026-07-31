@@ -3,6 +3,7 @@ use std::time::Instant;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::common::events::Outcome;
 use crate::inference::artifact;
 use crate::inference::database;
 use crate::inference::predict;
@@ -98,7 +99,7 @@ pub async fn run_predictions(state: &AppState) -> Result<PredictionRun, Pipeline
         error!(stage = error.stage(), error = %error.message(), "Prediction pipeline failed");
         if let Err(emit_error) = crate::common::events::emit_event(
             pool,
-            crate::common::events::EventType::EquityPredictionsErrored,
+            crate::common::events::EventType::EquityPredictions(Outcome::Errored),
             &serde_json::json!({
                 "correlation_id": correlation_id.to_string(),
                 "reason": error.stage(),
@@ -166,7 +167,7 @@ async fn run_pipeline_and_persist(
         info!(rows = rows, "Predictions inserted into PostgreSQL");
         if let Err(e) = crate::common::events::emit_event(
             pool,
-            crate::common::events::EventType::EquityPredictionsCompleted,
+            crate::common::events::EventType::EquityPredictions(Outcome::Completed),
             &serde_json::json!({"correlation_id": correlation_id.to_string()}),
         )
         .await

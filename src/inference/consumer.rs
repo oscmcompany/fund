@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -15,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_INFERENCE,
+    emit_event, get_consumer_offset, latest_event_after, run_event_listener,
+    update_consumer_offset, EventType, Outcome, CONSUMER_INFERENCE,
 };
 use crate::inference::pipeline::run_predictions;
 use crate::inference::state::AppState;
@@ -76,72 +75,57 @@ async fn run_consumer(
     pool: &PgPool,
     shutdown_token: &CancellationToken,
 ) -> Result<(), sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
-    listener.listen("events").await?;
-    info!("Event consumer connected, listening on channel 'events'");
-
-    if shutdown_token.is_cancelled() {
-        return Ok(());
-    }
-
-    // Catch up on an equity_predictions_requested that arrived while we were down.
-    let offset = get_consumer_offset(pool, CONSUMER_INFERENCE).await?;
-    if let Some(event_id) =
-        latest_event_after(pool, EventType::EquityPredictionsRequested, offset).await?
-    {
-        info!(
-            event_id,
-            "Catching up on missed equity_predictions_requested"
-        );
-        handle_equity_predictions_requested(state, pool, event_id).await;
-    }
-
-    loop {
-        let notification = tokio::select! {
-            result = listener.recv() => result?,
-            _ = shutdown_token.cancelled() => {
-                info!("Shutdown signal received, draining");
-                break;
+    run_event_listener(
+        pool,
+        shutdown_token,
+        "inference",
+        || async {
+            // Catch up on an equity_predictions_requested that arrived while we
+            // were down.
+            let offset = get_consumer_offset(pool, CONSUMER_INFERENCE).await?;
+            if let Some(event_id) = latest_event_after(
+                pool,
+                EventType::EquityPredictions(Outcome::Requested),
+                offset,
+            )
+            .await?
+            {
+                info!(
+                    event_id,
+                    "Catching up on missed equity_predictions_requested"
+                );
+                handle_equity_predictions_requested(state, pool, event_id).await;
             }
-        };
-        let payload = notification.payload();
-
-        if parse_event_type(payload).as_deref()
-            != Some(EventType::EquityPredictionsRequested.as_str())
-        {
-            continue;
-        }
-
-        let event_id = parse_event_id(payload);
-        if event_id == 0 {
-            warn!("Skipping equity_predictions_requested with invalid event_id");
-            continue;
-        }
-        info!(event_id, "Received equity_predictions_requested");
-        handle_equity_predictions_requested(state, pool, event_id).await;
-    }
-
-    Ok(())
-}
-
-/// Parse an event notification payload and return the event type string if
-/// present. Returns `None` when the payload is not valid JSON or does not
-/// carry an `event_type` field.
-pub(crate) fn parse_event_type(payload: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(payload).ok()?;
-    parsed
-        .get("event_type")
-        .and_then(|value| value.as_str())
-        .map(String::from)
-}
-
-/// Extract the `event_id` integer from a notification payload, returning 0
-/// when the field is absent or not an integer.
-pub(crate) fn parse_event_id(payload: &str) -> i64 {
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .and_then(|parsed| parsed.get("event_id").and_then(|value| value.as_i64()))
-        .unwrap_or(0)
+            Ok(())
+        },
+        |notification| async move {
+            let event_id = notification.event_id();
+            match notification.event_type() {
+                EventType::EquityPredictions(Outcome::Requested) => {
+                    info!(event_id, "Received equity_predictions_requested");
+                    handle_equity_predictions_requested(state, pool, event_id).await;
+                }
+                // Every consumer receives every event, so most of this is other
+                // services' traffic. Inference acts on nothing else. Listed
+                // rather than caught by a wildcard so that adding a family, or
+                // an `Outcome` to the family this consumer does handle, fails
+                // the build here instead of being silently ignored.
+                EventType::EquityPredictions(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::EquityBarsSync(_)
+                | EventType::DatabaseExport(_)
+                | EventType::DatabaseBackup(_)
+                | EventType::DatabasePurge(_)
+                | EventType::PortfolioRebalance(_)
+                | EventType::PortfolioLiquidation(_)
+                | EventType::TradingSessionStarted
+                | EventType::PortfolioEvaluationRequested
+                | EventType::StressTest => {}
+            }
+        },
+    )
+    .await
 }
 
 /// Run a prediction pass and advance the consumer offset.
@@ -153,7 +137,7 @@ pub(crate) fn parse_event_id(payload: &str) -> i64 {
 async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityPredictionsStarted,
+        EventType::EquityPredictions(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -176,76 +160,6 @@ async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::events::EventType;
-
-    #[test]
-    fn test_parse_event_type_equity_predictions_requested() {
-        let payload = serde_json::json!({
-            "event_type": EventType::EquityPredictionsRequested.as_str(),
-            "event_id": 42,
-        })
-        .to_string();
-        let result = parse_event_type(&payload);
-        assert_eq!(result.as_deref(), Some("equity_predictions_requested"));
-    }
-
-    #[test]
-    fn test_parse_event_type_other_event() {
-        let payload = serde_json::json!({
-            "event_type": "equity_bars_sync_completed",
-            "event_id": 7,
-        })
-        .to_string();
-        let result = parse_event_type(&payload);
-        assert_eq!(result.as_deref(), Some("equity_bars_sync_completed"));
-    }
-
-    #[test]
-    fn test_parse_event_type_missing_field() {
-        let payload = serde_json::json!({"event_id": 1}).to_string();
-        assert!(parse_event_type(&payload).is_none());
-    }
-
-    #[test]
-    fn test_parse_event_type_invalid_json() {
-        assert!(parse_event_type("not-json").is_none());
-        assert!(parse_event_type("").is_none());
-        assert!(parse_event_type("{unclosed").is_none());
-    }
-
-    #[test]
-    fn test_parse_event_type_non_string_value() {
-        // event_type with a numeric value must return None (not a string).
-        let payload = serde_json::json!({"event_type": 99}).to_string();
-        assert!(parse_event_type(&payload).is_none());
-    }
-
-    #[test]
-    fn test_parse_event_id_present() {
-        let payload = serde_json::json!({
-            "event_type": "equity_predictions_requested",
-            "event_id": 123,
-        })
-        .to_string();
-        assert_eq!(parse_event_id(&payload), 123);
-    }
-
-    #[test]
-    fn test_parse_event_id_missing_defaults_to_zero() {
-        let payload = serde_json::json!({"event_type": "equity_predictions_requested"}).to_string();
-        assert_eq!(parse_event_id(&payload), 0);
-    }
-
-    #[test]
-    fn test_parse_event_id_invalid_json_defaults_to_zero() {
-        assert_eq!(parse_event_id("bad json"), 0);
-    }
-
-    #[test]
-    fn test_parse_event_id_non_integer_defaults_to_zero() {
-        let payload = serde_json::json!({"event_id": "not-a-number"}).to_string();
-        assert_eq!(parse_event_id(&payload), 0);
-    }
 
     #[tokio::test]
     async fn test_spawn_event_consumer_no_pool_does_not_panic() {

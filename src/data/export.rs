@@ -185,7 +185,7 @@ fn create_equity_rebalance_session_dataframe(
     df!(
         "id" => sessions.iter().map(|session| session.id().to_string()).collect::<Vec<String>>(),
         "triggered_at" => sessions.iter().map(|session| session.triggered_at().timestamp_millis()).collect::<Vec<i64>>(),
-        "trigger_reason" => sessions.iter().map(|session| session.trigger_reason()).collect::<Vec<&str>>(),
+        "trigger_reason" => sessions.iter().map(|session| session.trigger_reason().as_str()).collect::<Vec<&str>>(),
         "model_run_id" => sessions.iter().map(|session| session.model_run_id()).collect::<Vec<Option<&str>>>(),
         "completed_at" => sessions.iter().map(|session| session.completed_at().map(|timestamp| timestamp.timestamp_millis())).collect::<Vec<Option<i64>>>(),
         "status" => sessions.iter().map(|session| session.status().as_str()).collect::<Vec<&str>>(),
@@ -344,7 +344,7 @@ mod tests {
         vec![EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440001".parse().unwrap(),
             Utc::now(),
-            "portfolio_evaluation".to_string(),
+            crate::domain::trading::RebalanceTrigger::SessionStart,
             Some("run-abc123".to_string()),
             None,
             RebalanceSessionStatus::Completed,
@@ -656,7 +656,7 @@ mod tests {
         let sessions = vec![crate::domain::trading::EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440099".parse().unwrap(),
             chrono::Utc::now(),
-            "portfolio_evaluation".to_string(),
+            crate::domain::trading::RebalanceTrigger::SessionStart,
             None,
             None,
             crate::domain::trading::RebalanceSessionStatus::Completed,
@@ -1045,7 +1045,7 @@ mod tests {
         let sessions = vec![EquityRebalanceSession::new(
             "550e8400-e29b-41d4-a716-446655440088".parse().unwrap(),
             Utc::now(),
-            "manual".to_string(),
+            crate::domain::trading::RebalanceTrigger::Manual,
             None,
             None,
             RebalanceSessionStatus::Failed,
