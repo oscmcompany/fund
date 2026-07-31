@@ -341,6 +341,7 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::events::Outcome;
 
     #[test]
     fn test_dashboard_state_default_is_empty() {
@@ -398,12 +399,15 @@ mod tests {
     fn test_event_entry_fields() {
         let entry = EventEntry {
             event_id: 42,
-            event_type: EventType::PortfolioRebalanceCompleted,
+            event_type: EventType::PortfolioRebalance(Outcome::Completed),
             payload: serde_json::json!({"session_id": "abc"}),
             received_at: Utc::now(),
         };
         assert_eq!(entry.event_id, 42);
-        assert_eq!(entry.event_type, EventType::PortfolioRebalanceCompleted);
+        assert_eq!(
+            entry.event_type,
+            EventType::PortfolioRebalance(Outcome::Completed)
+        );
         assert_eq!(entry.payload["session_id"], "abc");
     }
 

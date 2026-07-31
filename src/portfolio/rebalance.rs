@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::common::events::{emit_event, EventType};
+use crate::common::events::{emit_event, EventType, Outcome};
 use crate::common::market_hours::MarketSession;
 use crate::domain::freshness::StalenessWindow;
 use crate::domain::market::{BookQualityLimits, PairID, Ticker, UsableQuote};
@@ -445,7 +445,7 @@ pub async fn run_rebalance(state: &AppState) -> Result<RebalanceOutcome, Rebalan
 
     emit_event(
         &mut *transaction,
-        EventType::PortfolioRebalanceCompleted,
+        EventType::PortfolioRebalance(Outcome::Completed),
         &serde_json::json!({
             "session_id": session_id.to_string(),
             "pairs_opened": pairs_opened,
@@ -626,7 +626,7 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
 
         emit_event(
             pool,
-            EventType::PortfolioLiquidationCompleted,
+            EventType::PortfolioLiquidation(Outcome::Completed),
             &serde_json::json!({"pairs_closed": 0}),
         )
         .await?;
@@ -657,7 +657,7 @@ pub async fn run_end_of_day_liquidation(state: &AppState) -> Result<usize, Rebal
 
     emit_event(
         pool,
-        EventType::PortfolioLiquidationCompleted,
+        EventType::PortfolioLiquidation(Outcome::Completed),
         &serde_json::json!({ "pairs_closed": pairs_closed }),
     )
     .await?;

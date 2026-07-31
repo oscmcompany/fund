@@ -517,7 +517,7 @@ tr:hover { background-color: rgba(255, 180, 0, 0.1); }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::events::EventType;
+    use crate::common::events::{EventType, Outcome};
     use crate::dashboard::cache::{
         ClosedTrade, ClosedTradesSummary, DashboardState, EventEntry, ModelRunInformation,
         OpenPosition, PerformanceSnapshot, PeriodReturns, PredictionRow,
@@ -765,7 +765,7 @@ mod tests {
         let mut state = DashboardState::default();
         state.events.push_back(EventEntry {
             event_id: 1,
-            event_type: EventType::PortfolioRebalanceCompleted,
+            event_type: EventType::PortfolioRebalance(Outcome::Completed),
             payload: serde_json::json!({"session_id": "abc"}),
             received_at: Utc::now(),
         });
@@ -780,7 +780,7 @@ mod tests {
         for index in 0..20 {
             state.events.push_back(EventEntry {
                 event_id: index,
-                event_type: EventType::PortfolioRebalanceCompleted,
+                event_type: EventType::PortfolioRebalance(Outcome::Completed),
                 payload: serde_json::json!({"index": index}),
                 received_at: Utc::now(),
             });
@@ -917,7 +917,7 @@ mod tests {
         let mut state = DashboardState::default();
         state.events.push_back(EventEntry {
             event_id: 1,
-            event_type: EventType::PortfolioRebalanceCompleted,
+            event_type: EventType::PortfolioRebalance(Outcome::Completed),
             payload: serde_json::json!({"key": "<script>alert(1)</script>"}),
             received_at: Utc::now(),
         });

@@ -8,7 +8,7 @@
 mod common;
 
 use fund::common::events::{
-    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
+    emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType, Outcome,
 };
 use fund::inference::database::{insert_predictions, upsert_model_run, ModelRunRecord};
 use serial_test::serial;
@@ -43,22 +43,26 @@ async fn test_consumer_offset_round_trip() {
 async fn test_latest_event_after_matches_only_requested_type() {
     let pool = common::get_pg_pool().await;
 
-    let before = latest_event_after(&pool, EventType::EquityPredictionsRequested, 0)
+    let before = latest_event_after(&pool, EventType::EquityPredictions(Outcome::Requested), 0)
         .await
         .unwrap()
         .unwrap_or(0);
 
     emit_event(
         &pool,
-        EventType::EquityPredictionsRequested,
+        EventType::EquityPredictions(Outcome::Requested),
         &serde_json::json!({}),
     )
     .await
     .unwrap();
 
-    let found = latest_event_after(&pool, EventType::EquityPredictionsRequested, before)
-        .await
-        .unwrap();
+    let found = latest_event_after(
+        &pool,
+        EventType::EquityPredictions(Outcome::Requested),
+        before,
+    )
+    .await
+    .unwrap();
     assert!(found.is_some());
     let requested_id = found.unwrap();
     assert!(requested_id > before);
@@ -72,9 +76,13 @@ async fn test_latest_event_after_matches_only_requested_type() {
     .await
     .unwrap();
     assert_eq!(
-        latest_event_after(&pool, EventType::EquityPredictionsRequested, requested_id)
-            .await
-            .unwrap(),
+        latest_event_after(
+            &pool,
+            EventType::EquityPredictions(Outcome::Requested),
+            requested_id
+        )
+        .await
+        .unwrap(),
         None
     );
 }

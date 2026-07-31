@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_INFERENCE,
+    Outcome, CONSUMER_INFERENCE,
 };
 use crate::inference::pipeline::run_predictions;
 use crate::inference::state::AppState;
@@ -86,8 +86,12 @@ async fn run_consumer(
 
     // Catch up on an equity_predictions_requested that arrived while we were down.
     let offset = get_consumer_offset(pool, CONSUMER_INFERENCE).await?;
-    if let Some(event_id) =
-        latest_event_after(pool, EventType::EquityPredictionsRequested, offset).await?
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::EquityPredictions(Outcome::Requested),
+        offset,
+    )
+    .await?
     {
         info!(
             event_id,
@@ -107,7 +111,7 @@ async fn run_consumer(
         let payload = notification.payload();
 
         if parse_event_type(payload).as_deref()
-            != Some(EventType::EquityPredictionsRequested.as_str())
+            != Some(EventType::EquityPredictions(Outcome::Requested).as_str())
         {
             continue;
         }
@@ -153,7 +157,7 @@ pub(crate) fn parse_event_id(payload: &str) -> i64 {
 async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityPredictionsStarted,
+        EventType::EquityPredictions(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -176,12 +180,12 @@ async fn handle_equity_predictions_requested(state: &AppState, pool: &PgPool, ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::events::EventType;
+    use crate::common::events::{EventType, Outcome};
 
     #[test]
     fn test_parse_event_type_equity_predictions_requested() {
         let payload = serde_json::json!({
-            "event_type": EventType::EquityPredictionsRequested.as_str(),
+            "event_type": EventType::EquityPredictions(Outcome::Requested).as_str(),
             "event_id": 42,
         })
         .to_string();

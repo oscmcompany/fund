@@ -38,7 +38,7 @@ use tracing::{error, info, warn};
 
 use crate::common::events::{
     emit_event, get_consumer_offset, latest_event_after, update_consumer_offset, EventType,
-    CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
+    Outcome, CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
 };
 use crate::common::market_hours::MarketSession;
 use crate::portfolio::database::{fetch_open_pairs, predictions_exist_for_today};
@@ -133,7 +133,7 @@ async fn run_consumer(
     let predictions_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO).await?;
     if let Some(event_id) = latest_event_after(
         pool,
-        EventType::EquityPredictionsCompleted,
+        EventType::EquityPredictions(Outcome::Completed),
         predictions_offset,
     )
     .await?
@@ -185,7 +185,7 @@ async fn run_consumer(
     let liquidation_offset = get_consumer_offset(pool, CONSUMER_PORTFOLIO_LIQUIDATION).await?;
     if let Some(event_id) = latest_event_after(
         pool,
-        EventType::PortfolioLiquidationRequested,
+        EventType::PortfolioLiquidation(Outcome::Requested),
         liquidation_offset,
     )
     .await?
@@ -243,14 +243,14 @@ async fn run_consumer(
             handle_trading_session_started(state, pool, event_id, shutdown_token).await;
         } else if event_type == EventType::PortfolioEvaluationRequested.as_str() {
             handle_portfolio_evaluation(state, pool).await;
-        } else if event_type == EventType::EquityPredictionsCompleted.as_str() {
+        } else if event_type == EventType::EquityPredictions(Outcome::Completed).as_str() {
             info!(event_id, "Received equity_predictions_completed");
             handle_equity_predictions_completed(state, pool, event_id).await;
-        } else if event_type == EventType::EquityPredictionsErrored.as_str() {
+        } else if event_type == EventType::EquityPredictions(Outcome::Errored).as_str() {
             // Nothing to unwind: the request timestamp is a retry backoff, not a
             // lock, so the next due evaluation re-requests on its own.
             info!(event_id, "Received equity_predictions_errored");
-        } else if event_type == EventType::PortfolioLiquidationRequested.as_str() {
+        } else if event_type == EventType::PortfolioLiquidation(Outcome::Requested).as_str() {
             info!(event_id, "Received portfolio_liquidation_requested");
             handle_portfolio_liquidation(state, pool, event_id).await;
         }
@@ -454,7 +454,7 @@ fn spawn_liquidation_timer(
         info!(session_close = %close, "Liquidation timer fired; requesting liquidation");
         if let Err(error) = emit_event(
             &pool,
-            EventType::PortfolioLiquidationRequested,
+            EventType::PortfolioLiquidation(Outcome::Requested),
             &serde_json::json!({"reason": "session_close_approaching"}),
         )
         .await
@@ -558,7 +558,7 @@ async fn ensure_predictions_requested(state: &AppState, pool: &PgPool) {
     info!("No predictions recorded for today; requesting a run");
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityPredictionsRequested,
+        EventType::EquityPredictions(Outcome::Requested),
         &serde_json::json!({"reason": "missing_for_session"}),
     )
     .await
@@ -578,7 +578,7 @@ async fn ensure_predictions_requested(state: &AppState, pool: &PgPool) {
 async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
     if let Err(error) = emit_event(
         pool,
-        EventType::PortfolioRebalanceStarted,
+        EventType::PortfolioRebalance(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -600,7 +600,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             warn!("Rebalance skipped: stale or absent predictions");
             if let Err(error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": "stale_predictions"}),
             )
             .await
@@ -619,7 +619,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             );
             if let Err(error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": "drawdown_breached"}),
             )
             .await
@@ -631,7 +631,7 @@ async fn run_rebalance_pass(state: &AppState, pool: &PgPool) {
             error!(error = %error, "Rebalance errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioRebalanceErrored,
+                EventType::PortfolioRebalance(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -662,7 +662,7 @@ async fn handle_equity_predictions_completed(state: &AppState, pool: &PgPool, ev
 async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::PortfolioLiquidationStarted,
+        EventType::PortfolioLiquidation(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -676,7 +676,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
             error!(error = %error, "Portfolio liquidation errored: Alpaca execution error");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioLiquidationErrored,
+                EventType::PortfolioLiquidation(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -688,7 +688,7 @@ async fn handle_portfolio_liquidation(state: &AppState, pool: &PgPool, event_id:
             error!(error = %error, "Portfolio liquidation errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::PortfolioLiquidationErrored,
+                EventType::PortfolioLiquidation(Outcome::Errored),
                 &serde_json::json!({"reason": error.to_string()}),
             )
             .await
@@ -710,7 +710,7 @@ mod tests {
         CONSUMER_PORTFOLIO, CONSUMER_PORTFOLIO_LIQUIDATION, CONSUMER_PORTFOLIO_SESSION,
         ENTRY_RETRY_BACKOFF_MINUTES, LIQUIDATION_LEAD_TIME_MINUTES,
     };
-    use crate::common::events::EventType;
+    use crate::common::events::{EventType, Outcome};
 
     #[test]
     fn test_consumer_names_are_stable() {
@@ -722,15 +722,15 @@ mod tests {
     #[test]
     fn test_event_type_strings_are_stable() {
         assert_eq!(
-            EventType::EquityPredictionsCompleted.as_str(),
+            EventType::EquityPredictions(Outcome::Completed).as_str(),
             "equity_predictions_completed"
         );
         assert_eq!(
-            EventType::EquityPredictionsErrored.as_str(),
+            EventType::EquityPredictions(Outcome::Errored).as_str(),
             "equity_predictions_errored"
         );
         assert_eq!(
-            EventType::PortfolioLiquidationRequested.as_str(),
+            EventType::PortfolioLiquidation(Outcome::Requested).as_str(),
             "portfolio_liquidation_requested"
         );
         assert_eq!(

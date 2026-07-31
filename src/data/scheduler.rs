@@ -1,6 +1,6 @@
 use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, update_consumer_offset,
-    EventType, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_DATABASE_EXPORT,
+    EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP, CONSUMER_DATA_DATABASE_EXPORT,
     CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
@@ -432,8 +432,12 @@ async fn run_listener(
 
     // Catch up on any missed one-time actionable events (latest missed instance each).
     let sync_offset = get_consumer_offset(pool, CONSUMER_DATA_EQUITY_BARS_SYNC).await?;
-    if let Some(event_id) =
-        latest_event_after(pool, EventType::EquityBarsSyncRequested, sync_offset).await?
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::EquityBarsSync(Outcome::Requested),
+        sync_offset,
+    )
+    .await?
     {
         info!(event_id, "Catching up on missed equity_bars_sync_requested");
         handle_equity_bars_sync(state, pool, event_id).await;
@@ -443,24 +447,36 @@ async fn run_listener(
     // replayed in order. Skipping to the latest would permanently lose export dates
     // for any intermediate days the service was down.
     let export_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_EXPORT).await?;
-    for (event_id, payload) in
-        events_after(pool, EventType::DatabaseExportRequested, export_offset).await?
+    for (event_id, payload) in events_after(
+        pool,
+        EventType::DatabaseExport(Outcome::Requested),
+        export_offset,
+    )
+    .await?
     {
         info!(event_id, "Catching up on missed database_export_requested");
         handle_database_export(state, pool, event_id, &payload).await;
     }
 
     let backup_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_BACKUP).await?;
-    if let Some(event_id) =
-        latest_event_after(pool, EventType::DatabaseBackupRequested, backup_offset).await?
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::DatabaseBackup(Outcome::Requested),
+        backup_offset,
+    )
+    .await?
     {
         info!(event_id, "Catching up on missed database_backup_requested");
         handle_database_backup(state, pool, event_id).await;
     }
 
     let purge_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE).await?;
-    if let Some(event_id) =
-        latest_event_after(pool, EventType::DatabasePurgeRequested, purge_offset).await?
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::DatabasePurge(Outcome::Requested),
+        purge_offset,
+    )
+    .await?
     {
         info!(event_id, "Catching up on missed database_purge_requested");
         handle_database_purge(pool, event_id).await;
@@ -491,16 +507,16 @@ async fn run_listener(
         let empty_payload = serde_json::Value::Object(Default::default());
         let payload = parsed.get("payload").unwrap_or(&empty_payload);
 
-        if event_type == EventType::EquityBarsSyncRequested.as_str() {
+        if event_type == EventType::EquityBarsSync(Outcome::Requested).as_str() {
             info!(event_id, "Received equity_bars_sync_requested");
             handle_equity_bars_sync(state, pool, event_id).await;
-        } else if event_type == EventType::DatabaseExportRequested.as_str() {
+        } else if event_type == EventType::DatabaseExport(Outcome::Requested).as_str() {
             info!(event_id, "Received database_export_requested");
             handle_database_export(state, pool, event_id, payload).await;
-        } else if event_type == EventType::DatabaseBackupRequested.as_str() {
+        } else if event_type == EventType::DatabaseBackup(Outcome::Requested).as_str() {
             info!(event_id, "Received database_backup_requested");
             handle_database_backup(state, pool, event_id).await;
-        } else if event_type == EventType::DatabasePurgeRequested.as_str() {
+        } else if event_type == EventType::DatabasePurge(Outcome::Requested).as_str() {
             info!(event_id, "Received database_purge_requested");
             handle_database_purge(pool, event_id).await;
         }
@@ -512,7 +528,7 @@ async fn run_listener(
 async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::EquityBarsSyncStarted,
+        EventType::EquityBarsSync(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -525,7 +541,7 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             info!(rows = bar_count, "Equity bar sync completed");
             if let Err(error) = emit_event(
                 pool,
-                EventType::EquityBarsSyncCompleted,
+                EventType::EquityBarsSync(Outcome::Completed),
                 &serde_json::json!({"bar_count": bar_count}),
             )
             .await
@@ -537,7 +553,7 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             info!("No equity bar data available for sync");
             if let Err(error) = emit_event(
                 pool,
-                EventType::EquityBarsSyncCompleted,
+                EventType::EquityBarsSync(Outcome::Completed),
                 &serde_json::json!({"bar_count": 0}),
             )
             .await
@@ -549,7 +565,7 @@ async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i
             error!(error = %error, "Equity bar sync errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::EquityBarsSyncErrored,
+                EventType::EquityBarsSync(Outcome::Errored),
                 &serde_json::json!({"error": error}),
             )
             .await
@@ -616,7 +632,7 @@ async fn handle_database_export(
     let export_date = export_date_from_payload(payload);
     if let Err(error) = emit_event(
         pool,
-        EventType::DatabaseExportStarted,
+        EventType::DatabaseExport(Outcome::Started),
         &serde_json::json!({"date": export_date.to_string()}),
     )
     .await
@@ -629,7 +645,7 @@ async fn handle_database_export(
             info!(rows = count, "Database export completed");
             if let Err(error) = emit_event(
                 pool,
-                EventType::DatabaseExportCompleted,
+                EventType::DatabaseExport(Outcome::Completed),
                 &serde_json::json!({"count": count, "date": export_date.to_string()}),
             )
             .await
@@ -640,7 +656,7 @@ async fn handle_database_export(
             // Chain: export success → backup
             if let Err(error) = emit_event(
                 pool,
-                EventType::DatabaseBackupRequested,
+                EventType::DatabaseBackup(Outcome::Requested),
                 &serde_json::json!({}),
             )
             .await
@@ -652,7 +668,7 @@ async fn handle_database_export(
             error!(error = %error, "Database export errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::DatabaseExportErrored,
+                EventType::DatabaseExport(Outcome::Errored),
                 &serde_json::json!({"error": error, "date": export_date.to_string()}),
             )
             .await
@@ -671,7 +687,7 @@ async fn handle_database_export(
 async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::DatabaseBackupStarted,
+        EventType::DatabaseBackup(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -684,7 +700,7 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             info!(bytes = byte_count, "Database backup completed");
             if let Err(error) = emit_event(
                 pool,
-                EventType::DatabaseBackupCompleted,
+                EventType::DatabaseBackup(Outcome::Completed),
                 &serde_json::json!({"byte_count": byte_count}),
             )
             .await
@@ -694,7 +710,7 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             // Chain: backup success → purge
             if let Err(chain_error) = emit_event(
                 pool,
-                EventType::DatabasePurgeRequested,
+                EventType::DatabasePurge(Outcome::Requested),
                 &serde_json::json!({}),
             )
             .await
@@ -706,7 +722,7 @@ async fn handle_database_backup(state: &State, pool: &sqlx::PgPool, event_id: i6
             error!(error = %error, "Database backup errored");
             if let Err(emit_error) = emit_event(
                 pool,
-                EventType::DatabaseBackupErrored,
+                EventType::DatabaseBackup(Outcome::Errored),
                 &serde_json::json!({"error": error}),
             )
             .await
@@ -734,12 +750,12 @@ fn purge_outcome_event(
 ) -> (EventType, serde_json::Value) {
     if summary.failed_tables.is_empty() {
         (
-            EventType::DatabasePurgeCompleted,
+            EventType::DatabasePurge(Outcome::Completed),
             serde_json::json!({ "total_rows_deleted": total_rows_deleted }),
         )
     } else {
         (
-            EventType::DatabasePurgeErrored,
+            EventType::DatabasePurge(Outcome::Errored),
             serde_json::json!({
                 "total_rows_deleted": total_rows_deleted,
                 "failed_tables": summary.failed_tables,
@@ -751,7 +767,7 @@ fn purge_outcome_event(
 async fn handle_database_purge(pool: &sqlx::PgPool, event_id: i64) {
     if let Err(error) = emit_event(
         pool,
-        EventType::DatabasePurgeStarted,
+        EventType::DatabasePurge(Outcome::Started),
         &serde_json::json!({}),
     )
     .await
@@ -1450,7 +1466,9 @@ mod tests {
         let (event_type, payload) = purge_outcome_event(&summary, 42);
         assert_eq!(
             event_type,
-            crate::common::events::EventType::DatabasePurgeCompleted
+            crate::common::events::EventType::DatabasePurge(
+                crate::common::events::Outcome::Completed
+            )
         );
         assert_eq!(payload["total_rows_deleted"], 42);
         assert!(payload.get("failed_tables").is_none());
@@ -1468,7 +1486,9 @@ mod tests {
         let (event_type, payload) = purge_outcome_event(&summary, 42);
         assert_eq!(
             event_type,
-            crate::common::events::EventType::DatabasePurgeErrored
+            crate::common::events::EventType::DatabasePurge(
+                crate::common::events::Outcome::Errored
+            )
         );
         assert_eq!(payload["total_rows_deleted"], 42);
         assert_eq!(payload["failed_tables"][0], "equity_pairs");
@@ -1487,7 +1507,9 @@ mod tests {
         let (event_type, payload) = purge_outcome_event(&summary, 0);
         assert_eq!(
             event_type,
-            crate::common::events::EventType::DatabasePurgeErrored
+            crate::common::events::EventType::DatabasePurge(
+                crate::common::events::Outcome::Errored
+            )
         );
         assert_eq!(payload["failed_tables"].as_array().unwrap().len(), 3);
         assert_eq!(payload["total_rows_deleted"], 0);
