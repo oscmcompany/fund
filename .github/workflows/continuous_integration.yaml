@@ -30,12 +30,14 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+      # Deliberately no Nix binary cache action here. devenv pins nixpkgs to
+      # `cachix/devenv-nixpkgs/rolling` and configures `devenv.cachix.org` as a
+      # substituter, so that cache and `cache.nixos.org` already serve the whole
+      # shell closure. Caching Nix into the GitHub Actions cache on top of that
+      # uploaded every substituted path one at a time, costing many minutes in
+      # the post-job step while duplicating what the two public caches provide.
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-      - name: Configure Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-flakehub: false
       - name: Install devenv
         run: nix profile install nixpkgs#devenv
       - name: Cache Rust dependencies
