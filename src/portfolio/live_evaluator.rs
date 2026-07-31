@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -42,6 +42,7 @@ use crate::portfolio::database::{fetch_historical_equity_prices_for, fetch_open_
 use crate::portfolio::live_prices::LivePriceCache;
 use crate::portfolio::math::{standard_deviation, z_score_against};
 use crate::portfolio::rebalance::close_reason_for;
+use crate::portfolio::spread::{current_spread, PricedLeg};
 
 /// How often baselines are rebuilt from the database.
 ///
@@ -88,13 +89,26 @@ struct PairBaseline {
 impl PairBaseline {
     /// Returns the z-score of the live spread against the daily baseline.
     ///
-    /// `None` when either leg lacks a fresh quote. Both legs are required for
-    /// the same reason the authoritative evaluation requires them: a live long
-    /// against a stale short measures a day of drift in one leg, not a spread.
-    fn live_z_score(&self, live_mid_prices: &HashMap<Ticker, f64>) -> Option<f64> {
-        let long_mid = live_mid_prices.get(&self.long_ticker)?;
-        let short_mid = live_mid_prices.get(&self.short_ticker)?;
-        let live_spread = long_mid - self.hedge_ratio * short_mid;
+    /// `None` when the pair cannot be priced — either leg missing, or the two
+    /// legs observed too far apart to describe one spread. Both conditions are
+    /// decided by [`current_spread`], which the authoritative pass calls too, so
+    /// the trigger cannot come to fire on a spread the pass would refuse to
+    /// measure.
+    fn live_z_score(
+        &self,
+        live_legs: &HashMap<Ticker, PricedLeg>,
+        now: DateTime<Utc>,
+    ) -> Option<f64> {
+        let live_spread = current_spread(
+            self.pair_id.as_str(),
+            now,
+            &self.long_ticker,
+            &self.short_ticker,
+            live_legs.get(&self.long_ticker),
+            live_legs.get(&self.short_ticker),
+            self.hedge_ratio,
+        )
+        .ok()?;
         Some(z_score_against(&self.spread_history, live_spread))
     }
 }
@@ -169,12 +183,13 @@ fn baseline_for(
 /// Returns the pairs whose live spread has crossed a close threshold.
 fn crossed_pairs(
     baselines: &[PairBaseline],
-    live_mid_prices: &HashMap<Ticker, f64>,
+    live_legs: &HashMap<Ticker, PricedLeg>,
+    now: DateTime<Utc>,
 ) -> Vec<(PairID, f64)> {
     baselines
         .iter()
         .filter_map(|baseline| {
-            let z_score = baseline.live_z_score(live_mid_prices)?;
+            let z_score = baseline.live_z_score(live_legs, now)?;
             close_reason_for(baseline.entry_z_score, z_score)?;
             Some((baseline.pair_id.clone(), z_score))
         })
@@ -262,8 +277,9 @@ async fn run_live_evaluator(
             continue;
         }
 
-        let live_mid_prices = cache.fresh_mid_prices(Utc::now()).await;
-        let crossed = crossed_pairs(&baselines, &live_mid_prices);
+        let now = Utc::now();
+        let live_legs = cache.fresh_legs(now).await;
+        let crossed = crossed_pairs(&baselines, &live_legs, now);
         if crossed.is_empty() {
             continue;
         }
@@ -337,11 +353,42 @@ mod tests {
         baseline_with(entry_z_score, vec![-1.0, 1.0])
     }
 
-    fn live(long: f64, short: f64) -> HashMap<Ticker, f64> {
-        let mut prices = HashMap::new();
-        prices.insert(ticker("AAPL"), long);
-        prices.insert(ticker("MSFT"), short);
-        prices
+    /// Both legs observed at the same instant, so skew is zero and these
+    /// fixtures exercise the z-score rule rather than the skew guard.
+    fn live(long: f64, short: f64) -> HashMap<Ticker, PricedLeg> {
+        legs_observed_at(long, Utc::now(), short, Utc::now())
+    }
+
+    /// Legs with independent observation times, for the skew cases.
+    fn legs_observed_at(
+        long: f64,
+        long_observed_at: DateTime<Utc>,
+        short: f64,
+        short_observed_at: DateTime<Utc>,
+    ) -> HashMap<Ticker, PricedLeg> {
+        let mut legs = HashMap::new();
+        legs.insert(ticker("AAPL"), priced_leg(long, long_observed_at));
+        legs.insert(ticker("MSFT"), priced_leg(short, short_observed_at));
+        legs
+    }
+
+    /// Calls `crossed_pairs` at the current instant.
+    fn crossed_pairs_now(
+        baselines: &[PairBaseline],
+        live_legs: &HashMap<Ticker, PricedLeg>,
+    ) -> Vec<(PairID, f64)> {
+        crossed_pairs(baselines, live_legs, Utc::now())
+    }
+
+    /// Builds a priced leg at `mid_price`, observed at `observed_at`.
+    ///
+    /// Fixtures here use spread values a real book would never quote — zero and
+    /// negative mids among them — so they construct the leg directly rather than
+    /// through a quote.
+    fn priced_leg(mid_price: f64, observed_at: DateTime<Utc>) -> PricedLeg {
+        use crate::portfolio::spread::QuoteSource;
+
+        PricedLeg::for_tests(mid_price, observed_at, QuoteSource::Streamed)
     }
 
     #[test]
@@ -350,7 +397,7 @@ mod tests {
         let baseline = baseline_with(2.5, vec![8.0, 12.0]);
 
         // Spread is 20 - 4 = 16; (16 - 10) / 2 = 3.
-        let z_score = baseline.live_z_score(&live(20.0, 4.0)).unwrap();
+        let z_score = baseline.live_z_score(&live(20.0, 4.0), Utc::now()).unwrap();
         assert!((z_score - 3.0).abs() < 1e-9);
     }
 
@@ -360,17 +407,17 @@ mod tests {
         baseline.hedge_ratio = 2.0;
 
         // Spread is 20 - 2 * 5 = 10.
-        assert!((baseline.live_z_score(&live(20.0, 5.0)).unwrap() - 10.0).abs() < 1e-9);
+        assert!((baseline.live_z_score(&live(20.0, 5.0), Utc::now()).unwrap() - 10.0).abs() < 1e-9);
     }
 
     #[test]
     fn test_live_z_score_requires_both_legs() {
         let baseline = unit_baseline(2.5);
         let mut only_long = HashMap::new();
-        only_long.insert(ticker("AAPL"), 20.0);
+        only_long.insert(ticker("AAPL"), priced_leg(20.0, Utc::now()));
 
-        assert!(baseline.live_z_score(&only_long).is_none());
-        assert!(baseline.live_z_score(&HashMap::new()).is_none());
+        assert!(baseline.live_z_score(&only_long, Utc::now()).is_none());
+        assert!(baseline.live_z_score(&HashMap::new(), Utc::now()).is_none());
     }
 
     #[test]
@@ -378,7 +425,7 @@ mod tests {
         // Entered long-spread at z = 2.5; the live spread has crossed back
         // through zero.
         let baselines = vec![unit_baseline(2.5)];
-        let crossed = crossed_pairs(&baselines, &live(1.0, 2.0));
+        let crossed = crossed_pairs_now(&baselines, &live(1.0, 2.0));
 
         assert_eq!(crossed.len(), 1);
         assert!(crossed[0].1 < 0.0);
@@ -388,7 +435,7 @@ mod tests {
     fn test_crossing_detected_on_stop_loss() {
         // Entered at z = 2.5 and the spread widened past the stop-loss level.
         let baselines = vec![unit_baseline(2.5)];
-        let crossed = crossed_pairs(&baselines, &live(5.0, 0.0));
+        let crossed = crossed_pairs_now(&baselines, &live(5.0, 0.0));
 
         assert_eq!(crossed.len(), 1);
         assert!(crossed[0].1 >= 4.0);
@@ -398,18 +445,18 @@ mod tests {
     fn test_no_crossing_while_within_range() {
         // Still on the entry side of zero and short of the stop-loss level.
         let baselines = vec![unit_baseline(2.5)];
-        assert!(crossed_pairs(&baselines, &live(2.0, 0.0)).is_empty());
+        assert!(crossed_pairs_now(&baselines, &live(2.0, 0.0)).is_empty());
     }
 
     #[test]
     fn test_no_crossing_without_quotes() {
         let baselines = vec![unit_baseline(2.5)];
-        assert!(crossed_pairs(&baselines, &HashMap::new()).is_empty());
+        assert!(crossed_pairs_now(&baselines, &HashMap::new()).is_empty());
     }
 
     #[test]
     fn test_no_crossing_without_baselines() {
-        assert!(crossed_pairs(&[], &live(1.0, 2.0)).is_empty());
+        assert!(crossed_pairs_now(&[], &live(1.0, 2.0)).is_empty());
     }
 
     #[test]
@@ -424,7 +471,9 @@ mod tests {
 
         let long_mid = 30.0;
         let short_mid = 4.0;
-        let trigger_z = baseline.live_z_score(&live(long_mid, short_mid)).unwrap();
+        let trigger_z = baseline
+            .live_z_score(&live(long_mid, short_mid), Utc::now())
+            .unwrap();
 
         // What evaluate_open_pairs computes for the same inputs.
         let live_spread = long_mid - baseline.hedge_ratio * short_mid;
@@ -446,8 +495,11 @@ mod tests {
         // z_score_against returns zero for a zero-deviation series, which
         // close_reason_for reads as no signal rather than convergence.
         let baseline = baseline_with(2.5, vec![5.0, 5.0, 5.0]);
-        assert_eq!(baseline.live_z_score(&live(99.0, 0.0)), Some(0.0));
-        assert!(crossed_pairs(&[baseline], &live(99.0, 0.0)).is_empty());
+        assert_eq!(
+            baseline.live_z_score(&live(99.0, 0.0), Utc::now()),
+            Some(0.0)
+        );
+        assert!(crossed_pairs_now(&[baseline], &live(99.0, 0.0)).is_empty());
     }
 
     // --- baseline_for discard rules ---
@@ -499,8 +551,51 @@ mod tests {
         for (entry_z, current_z) in [(2.5, -0.5), (-2.5, 0.5), (2.5, 4.5), (-2.5, -4.5)] {
             assert!(close_reason_for(entry_z, current_z).is_some());
             let baselines = vec![unit_baseline(entry_z)];
-            assert_eq!(crossed_pairs(&baselines, &live(current_z, 0.0)).len(), 1);
+            assert_eq!(
+                crossed_pairs_now(&baselines, &live(current_z, 0.0)).len(),
+                1
+            );
         }
+    }
+
+    #[test]
+    fn test_trigger_does_not_fire_on_a_skewed_spread() {
+        // A crossing z-score is not enough: the two legs must also describe one
+        // moment. The authoritative pass rejects a skewed pair through the same
+        // `current_spread`, so a trigger that fired here would request a pass
+        // that declines to act — fire, decline, debounce, fire again.
+        let now = Utc::now();
+        for (entry_z, current_z) in [(2.5, -0.5), (-2.5, -4.5)] {
+            let baselines = vec![unit_baseline(entry_z)];
+
+            let simultaneous = legs_observed_at(current_z, now, 0.0, now);
+            assert_eq!(crossed_pairs(&baselines, &simultaneous, now).len(), 1);
+
+            let skewed = legs_observed_at(
+                current_z,
+                now,
+                0.0,
+                now - chrono::Duration::seconds(
+                    crate::portfolio::spread::MAXIMUM_LEG_SKEW_SECONDS + 1,
+                ),
+            );
+            assert!(crossed_pairs(&baselines, &skewed, now).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_trigger_still_fires_on_equally_aged_legs() {
+        // The absolute staleness window is five minutes for streamed and
+        // snapshot quotes alike. Two legs equally old inside it give a coherent
+        // spread measured a few minutes ago, which is usable for a
+        // mean-reverting series — and is what the retired sixty-second streamed
+        // window rejected.
+        let now = Utc::now();
+        let observed_at = now - chrono::Duration::seconds(240);
+        let baselines = vec![unit_baseline(2.5)];
+        let legs = legs_observed_at(-0.5, observed_at, 0.0, observed_at);
+
+        assert_eq!(crossed_pairs(&baselines, &legs, now).len(), 1);
     }
 
     #[test]

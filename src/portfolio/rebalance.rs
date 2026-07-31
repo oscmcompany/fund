@@ -63,6 +63,8 @@ use crate::portfolio::risk_gate::{
     RiskGateDecision, StrategyId,
 };
 use crate::portfolio::sizing::{size_pairs_with_volatility_parity, SizingError};
+use crate::portfolio::spread as spread_module;
+use crate::portfolio::spread::{PricedLeg, QuoteSource};
 use crate::portfolio::state::AppState;
 use crate::portfolio::statistical_arbitrage::{
     score_candidate_pairs, select_disjoint_pairs, ScoredPair,
@@ -306,18 +308,19 @@ pub async fn run_rebalance(
     let mut pairs_closed: usize = 0;
     let mut close_signal_summary: Vec<(PairID, CloseReason)> = Vec::new();
     if !open_pairs.is_empty() {
-        // Tier 1: streamed mids, already filtered by the sixty-second guard.
-        let mut exit_mid_prices = state.live_prices().fresh_mid_prices(Utc::now()).await;
-        let streamed = exit_mid_prices.len();
+        // Tier 1: streamed legs, already filtered by the staleness window.
+        let priced_at = Utc::now();
+        let mut exit_legs = state.live_prices().fresh_legs(priced_at).await;
+        let streamed = exit_legs.len();
 
         // Tier 2: one batched snapshot for legs the stream did not cover. Only
         // the gap is fetched, so a fully streamed book costs no request at all.
-        // A leg stale in the cache is already absent from `fresh_mid_prices`,
-        // so "not streamed" and "streamed but stale" are the same case here.
+        // A leg stale in the cache is already absent from `fresh_legs`, so "not
+        // streamed" and "streamed but stale" are the same case here.
         let unpriced_legs: Vec<Ticker> = open_pairs
             .iter()
             .flat_map(|pair| [pair.long_ticker().clone(), pair.short_ticker().clone()])
-            .filter(|ticker| !exit_mid_prices.contains_key(ticker))
+            .filter(|ticker| !exit_legs.contains_key(ticker))
             .collect::<HashSet<Ticker>>()
             .into_iter()
             .collect();
@@ -327,7 +330,7 @@ pub async fn run_rebalance(
         } else {
             let filled = fetch_validated_mid_prices(alpaca, &unpriced_legs, "exit").await;
             let count = filled.len();
-            exit_mid_prices.extend(filled);
+            exit_legs.extend(filled);
             count
         };
 
@@ -339,7 +342,8 @@ pub async fn run_rebalance(
             unpriced = unpriced_legs.len().saturating_sub(snapshot_filled),
             "Exit evaluation pricing"
         );
-        let close_signals = evaluate_open_pairs(&open_pairs, &historical_prices, &exit_mid_prices);
+        let close_signals =
+            evaluate_open_pairs(&open_pairs, &historical_prices, &exit_legs, priced_at);
         close_signal_summary = close_signals
             .iter()
             .map(|signal| (signal.open_pair.pair_id().clone(), signal.reason.clone()))
@@ -876,10 +880,11 @@ struct PairCloseSignal {
 ///
 /// Pairs where either leg lacks historical price data are silently skipped (kept open).
 ///
-/// `current_mid_prices` carries validated same-session mid prices, streamed
-/// where the feed covers a symbol and pulled from the REST snapshot where it
-/// does not. Daily closes supply the distribution the z-score is measured
-/// against; they never supply the current observation.
+/// `current_legs` carries validated same-session prices, streamed where the feed
+/// covers a symbol and pulled from the REST snapshot where it does not, each
+/// stamped with when its quote was observed. Daily closes supply the
+/// distribution the z-score is measured against; they never supply the current
+/// observation.
 ///
 /// A pair whose legs are not both priced is kept and re-evaluated next pass. The
 /// alternative, and the previous behaviour, was to fall back to `z_score_last`
@@ -890,7 +895,8 @@ struct PairCloseSignal {
 fn evaluate_open_pairs(
     open_pairs: &[OpenPair],
     historical_prices: &HashMap<Ticker, Vec<f64>>,
-    current_mid_prices: &HashMap<Ticker, f64>,
+    current_legs: &HashMap<Ticker, PricedLeg>,
+    now: DateTime<Utc>,
 ) -> Vec<PairCloseSignal> {
     let mut signals = Vec::new();
 
@@ -926,16 +932,22 @@ fn evaluate_open_pairs(
             .map(|(long, short)| long - pair.hedge_ratio() * short)
             .collect();
 
-        // Both legs must be priced or neither is used: pricing one leg current
-        // against the other's prior close would move the spread by a day of
-        // drift in that leg alone and read as a signal.
-        let (Some(long_mid), Some(short_mid)) = (
-            current_mid_prices.get(pair.long_ticker()),
-            current_mid_prices.get(pair.short_ticker()),
+        // Both legs must be priced, and observed close enough together to
+        // describe one spread. `current_spread` decides both, and the live
+        // trigger calls the same function, so neither path can come to act on a
+        // spread the other would refuse to measure.
+        let Ok(measured_spread) = spread_module::current_spread(
+            pair.pair_id().as_str(),
+            now,
+            pair.long_ticker(),
+            pair.short_ticker(),
+            current_legs.get(pair.long_ticker()),
+            current_legs.get(pair.short_ticker()),
+            pair.hedge_ratio(),
         ) else {
             info!(
                 pair_id = pair.pair_id().as_str(),
-                "No usable current price for both legs; keeping pair for re-evaluation"
+                "Pair not measurable this pass; keeping it for re-evaluation"
             );
             continue;
         };
@@ -947,8 +959,7 @@ fn evaluate_open_pairs(
         // `PairBaseline::live_z_score`, which standardizes against history only.
         // The trigger would then fire on a larger magnitude than this pass
         // computes, keep the pair open, and fire again after the debounce.
-        let current_spread = long_mid - pair.hedge_ratio() * short_mid;
-        let current_z = z_score_against(&spread, current_spread);
+        let current_z = z_score_against(&spread, measured_spread);
 
         match close_reason_for(pair.entry_z_score(), current_z) {
             Some(CloseReason::ProfitTaken) => {
@@ -1284,7 +1295,7 @@ async fn fetch_validated_mid_prices(
     alpaca: &dyn Trading,
     tickers: &[Ticker],
     purpose: &'static str,
-) -> HashMap<Ticker, f64> {
+) -> HashMap<Ticker, PricedLeg> {
     if tickers.is_empty() {
         return HashMap::new();
     }
@@ -1299,13 +1310,13 @@ async fn fetch_validated_mid_prices(
         });
 
     let book_limits = BookQualityLimits::default();
-    let staleness_window = StalenessWindow::rest_quotes();
+    let staleness_window = StalenessWindow::quotes();
     let now = Utc::now();
     let returned = latest_quotes.len();
     let mut rejected_book: usize = 0;
     let mut rejected_stale: usize = 0;
 
-    let mut mid_prices: HashMap<Ticker, f64> = HashMap::new();
+    let mut priced_legs: HashMap<Ticker, PricedLeg> = HashMap::new();
     for latest in latest_quotes {
         let Some(quote) = latest.to_equity_quote() else {
             continue;
@@ -1318,20 +1329,23 @@ async fn fetch_validated_mid_prices(
             rejected_stale += 1;
             continue;
         }
-        mid_prices.insert(quote.ticker().clone(), usable.mid_price());
+        priced_legs.insert(
+            quote.ticker().clone(),
+            PricedLeg::from_quote(&usable, QuoteSource::Snapshot),
+        );
     }
 
     info!(
         purpose,
         requested = tickers.len(),
         returned,
-        accepted = mid_prices.len(),
+        accepted = priced_legs.len(),
         rejected_book,
         rejected_stale,
         "Snapshot quote pricing"
     );
 
-    mid_prices
+    priced_legs
 }
 /// Keeps candidates whose long leg is tradable and short leg shortable.
 ///
@@ -1441,7 +1455,15 @@ async fn screen_entry_candidates(
         .into_iter()
         .collect();
 
-    let entry_prices = fetch_validated_mid_prices(alpaca, &legs, "entry").await;
+    // Reduced to bare mid prices here: entry sizing divides capital by a price
+    // per share and never differences two legs, so the leg-skew question the
+    // exit path asks does not arise. The entry z-score comes from
+    // `score_candidate_pairs` over daily closes, not from these quotes.
+    let entry_prices: HashMap<Ticker, f64> = fetch_validated_mid_prices(alpaca, &legs, "entry")
+        .await
+        .into_iter()
+        .map(|(ticker, leg)| (ticker, leg.mid_price()))
+        .collect();
     let (eligible, rejected_unquoted) =
         screen_quoted_candidates(tradable_candidates, &entry_prices);
 
@@ -1980,7 +2002,7 @@ mod tests {
             .await;
 
             assert_eq!(prices.len(), 1);
-            assert!((prices[&ticker("AAPL")] - 180.1).abs() < 1e-9);
+            assert!((prices[&ticker("AAPL")].mid_price() - 180.1).abs() < 1e-9);
             assert!(!prices.contains_key(&ticker("WIDE")));
             assert!(!prices.contains_key(&ticker("OLD")));
         }
@@ -2190,11 +2212,28 @@ mod tests {
     /// Fixtures written against the daily-close path therefore keep asserting
     /// the same signal boundaries, now expressed through the one estimator the
     /// exit path still uses.
-    fn priced_at_last_close(prices: &HashMap<Ticker, Vec<f64>>) -> HashMap<Ticker, f64> {
+    ///
+    /// Every leg is stamped with the same instant, so these fixtures exercise
+    /// the z-score rule rather than the leg-skew guard; skew is covered in
+    /// `portfolio::spread` and by the mixed-age cases below.
+    fn priced_at_last_close(prices: &HashMap<Ticker, Vec<f64>>) -> HashMap<Ticker, PricedLeg> {
+        let observed_at = Utc::now();
         prices
             .iter()
-            .filter_map(|(ticker, series)| series.last().map(|last| (ticker.clone(), *last)))
+            .filter_map(|(ticker, series)| {
+                series
+                    .last()
+                    .map(|last| (ticker.clone(), test_priced_leg(*last, observed_at)))
+            })
             .collect()
+    }
+
+    /// Builds a priced leg at `mid_price`, observed at `observed_at`.
+    ///
+    /// Constructed directly: these fixtures use series values rather than book
+    /// mid prices, and some are zero or negative.
+    fn test_priced_leg(mid_price: f64, observed_at: DateTime<Utc>) -> PricedLeg {
+        PricedLeg::for_tests(mid_price, observed_at, QuoteSource::Streamed)
     }
 
     #[test]
@@ -2206,7 +2245,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, -1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }
@@ -2220,7 +2260,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 100.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 150.0, -1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }
@@ -2240,7 +2281,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
         prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
@@ -2254,7 +2296,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 0.5));
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert!(signals.is_empty());
     }
 
@@ -2263,7 +2306,8 @@ mod tests {
         let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
         let prices = HashMap::new(); // No price data at all.
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert!(signals.is_empty()); // Pair kept open due to missing data.
     }
 
@@ -2291,6 +2335,7 @@ mod tests {
             &[converging, stable, diverging],
             &prices,
             &priced_at_last_close(&prices),
+            Utc::now(),
         );
         assert_eq!(signals.len(), 2);
 
@@ -2309,13 +2354,14 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0; 60]);
         prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0; 60]);
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert!(signals.is_empty());
     }
 
     #[test]
     fn test_evaluate_open_pairs_empty_input() {
-        let signals = evaluate_open_pairs(&[], &HashMap::new(), &HashMap::new());
+        let signals = evaluate_open_pairs(&[], &HashMap::new(), &HashMap::new(), Utc::now());
         assert!(signals.is_empty());
     }
 
@@ -2338,15 +2384,26 @@ mod tests {
         let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
         let prices = diverged_daily_prices();
 
-        assert!(
-            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &HashMap::new()).is_empty()
+        assert!(evaluate_open_pairs(
+            std::slice::from_ref(&pair),
+            &prices,
+            &HashMap::new(),
+            Utc::now()
+        )
+        .is_empty());
+
+        let observed_at = Utc::now();
+        let mut live = HashMap::new();
+        live.insert(
+            Ticker::new("AAPL").unwrap(),
+            test_priced_leg(100.0, observed_at),
+        );
+        live.insert(
+            Ticker::new("MSFT").unwrap(),
+            test_priced_leg(200.0, observed_at),
         );
 
-        let mut live = HashMap::new();
-        live.insert(Ticker::new("AAPL").unwrap(), 100.0);
-        live.insert(Ticker::new("MSFT").unwrap(), 200.0);
-
-        let signals = evaluate_open_pairs(&[pair], &prices, &live);
+        let signals = evaluate_open_pairs(&[pair], &prices, &live, Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }
@@ -2359,11 +2416,14 @@ mod tests {
         let prices = diverged_daily_prices();
 
         let mut live = HashMap::new();
-        live.insert(Ticker::new("AAPL").unwrap(), 100.0);
+        live.insert(
+            Ticker::new("AAPL").unwrap(),
+            test_priced_leg(100.0, Utc::now()),
+        );
 
         assert_eq!(
-            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &live).len(),
-            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices)).len()
+            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &live, Utc::now()).len(),
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now()).len()
         );
     }
 
@@ -2373,9 +2433,12 @@ mod tests {
         let prices = diverged_daily_prices();
 
         let mut live = HashMap::new();
-        live.insert(Ticker::new("TSLA").unwrap(), 250.0);
+        live.insert(
+            Ticker::new("TSLA").unwrap(),
+            test_priced_leg(250.0, Utc::now()),
+        );
 
-        assert!(evaluate_open_pairs(&[pair], &prices, &live).is_empty());
+        assert!(evaluate_open_pairs(&[pair], &prices, &live, Utc::now()).is_empty());
     }
 
     #[test]
@@ -2397,14 +2460,15 @@ mod tests {
             evaluate_open_pairs(
                 std::slice::from_ref(&pair),
                 &prices,
-                &priced_at_last_close(&prices)
+                &priced_at_last_close(&prices),
+                Utc::now(),
             )
             .len(),
             1
         );
 
         // Unpriced, nothing is signalled and the pair stays open.
-        assert!(evaluate_open_pairs(&[pair], &prices, &HashMap::new()).is_empty());
+        assert!(evaluate_open_pairs(&[pair], &prices, &HashMap::new(), Utc::now()).is_empty());
     }
 
     #[test]
@@ -2417,12 +2481,21 @@ mod tests {
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.0));
 
         let mut long_only = HashMap::new();
-        long_only.insert(Ticker::new("AAPL").unwrap(), 91.0);
-        assert!(evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &long_only).is_empty());
+        long_only.insert(
+            Ticker::new("AAPL").unwrap(),
+            test_priced_leg(91.0, Utc::now()),
+        );
+        assert!(
+            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &long_only, Utc::now())
+                .is_empty()
+        );
 
         let mut short_only = HashMap::new();
-        short_only.insert(Ticker::new("MSFT").unwrap(), 159.0);
-        assert!(evaluate_open_pairs(&[pair], &prices, &short_only).is_empty());
+        short_only.insert(
+            Ticker::new("MSFT").unwrap(),
+            test_priced_leg(159.0, Utc::now()),
+        );
+        assert!(evaluate_open_pairs(&[pair], &prices, &short_only, Utc::now()).is_empty());
     }
 
     #[test]
@@ -2459,15 +2532,26 @@ mod tests {
         let pair = make_open_pair("AAPL", "MSFT", 2.5, 1.0);
         let prices = diverged_daily_prices();
 
-        assert!(
-            evaluate_open_pairs(std::slice::from_ref(&pair), &prices, &HashMap::new()).is_empty()
+        assert!(evaluate_open_pairs(
+            std::slice::from_ref(&pair),
+            &prices,
+            &HashMap::new(),
+            Utc::now()
+        )
+        .is_empty());
+
+        let observed_at = Utc::now();
+        let mut live = HashMap::new();
+        live.insert(
+            Ticker::new("AAPL").unwrap(),
+            test_priced_leg(400.0, observed_at),
+        );
+        live.insert(
+            Ticker::new("MSFT").unwrap(),
+            test_priced_leg(100.0, observed_at),
         );
 
-        let mut live = HashMap::new();
-        live.insert(Ticker::new("AAPL").unwrap(), 400.0);
-        live.insert(Ticker::new("MSFT").unwrap(), 100.0);
-
-        let signals = evaluate_open_pairs(&[pair], &prices, &live);
+        let signals = evaluate_open_pairs(&[pair], &prices, &live, Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
@@ -2532,7 +2616,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), vec![150.0]);
         prices.insert(Ticker::new("MSFT").unwrap(), vec![100.0]);
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert!(signals.is_empty());
     }
 
@@ -2548,7 +2633,8 @@ mod tests {
         // Short: only 30 points increasing.
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(30, 100.0, 1.0));
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         // Should still evaluate correctly using the last 30 points.
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
@@ -2562,7 +2648,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         // No MSFT prices.
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert!(signals.is_empty());
     }
 
@@ -2581,7 +2668,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), long_prices);
         prices.insert(Ticker::new("MSFT").unwrap(), short_prices);
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::StopLoss);
     }
@@ -2599,7 +2687,8 @@ mod tests {
         prices.insert(Ticker::new("AAPL").unwrap(), make_prices(60, 150.0, 1.0));
         prices.insert(Ticker::new("MSFT").unwrap(), make_prices(60, 100.0, 1.5));
 
-        let signals = evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices));
+        let signals =
+            evaluate_open_pairs(&[pair], &prices, &priced_at_last_close(&prices), Utc::now());
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].reason, CloseReason::ProfitTaken);
     }

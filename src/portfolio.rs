@@ -18,5 +18,6 @@ pub mod regime;
 pub mod risk_gate;
 pub mod session_cache;
 pub mod sizing;
+pub mod spread;
 pub mod state;
 pub mod statistical_arbitrage;
