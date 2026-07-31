@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
 
 use crate::common::alpaca::AlpacaCredentials;
 use crate::domain::portfolio::{
@@ -16,10 +15,12 @@ use crate::domain::portfolio::{
 use crate::domain::primitives::Percent;
 use crate::domain::signals::ConfidenceFloor;
 use crate::portfolio::alpaca::{TradableAssets, Trading, TradingClient};
+use crate::portfolio::daily_cache::DailyCache;
 use crate::portfolio::live_prices::LivePriceCache;
 use crate::portfolio::risk_gate::{
     MarginUtilizationLimit, MaximumParticipationRate, RiskGateConfiguration, StrategyId,
 };
+use crate::portfolio::session_cache::SessionCachingClient;
 use crate::portfolio::statistical_arbitrage::DEFAULT_CANDIDATE_POOL;
 
 /// Default drawdown threshold: halt trading when portfolio value drops 10% from peak.
@@ -192,10 +193,12 @@ pub struct AppState {
     constraints: Constraints,
     /// Cached partitioned view of the Alpaca active asset universe.
     ///
-    /// `None` until the first rebalance of the session fetches and populates it.
-    /// Cleared on service restart (intraday deploys rehydrate on next rebalance).
-    /// The inner `Arc` avoids cloning the full struct on every cache hit.
-    tradable_assets: Arc<RwLock<Option<Arc<TradableAssets>>>>,
+    /// Empty until the first rebalance of the session fetches and populates it,
+    /// and re-fetched on the first pass of each new Eastern date — shortability
+    /// changes daily, and this cache previously had no invalidation at all, so a
+    /// process spanning several sessions kept the first session's answer. The
+    /// inner `Arc` avoids cloning the full struct on every cache hit.
+    tradable_assets: DailyCache<Arc<TradableAssets>>,
     /// Latest streamed mid-price per ticker, read during exit evaluation.
     ///
     /// Empty when the quote stream is not running, which degrades evaluation to
@@ -264,7 +267,7 @@ impl AppState {
     }
 
     /// Returns the shared tradable asset cache.
-    pub fn tradable_assets(&self) -> &Arc<RwLock<Option<Arc<TradableAssets>>>> {
+    pub fn tradable_assets(&self) -> &DailyCache<Arc<TradableAssets>> {
         &self.tradable_assets
     }
 
@@ -364,7 +367,9 @@ impl AppState {
         let is_paper = env::var("ALPACA_IS_PAPER")
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
-        let alpaca_client: Arc<dyn Trading> = Arc::new(TradingClient::new(credentials, is_paper));
+        let alpaca_client: Arc<dyn Trading> = Arc::new(SessionCachingClient::new(Arc::new(
+            TradingClient::new(credentials, is_paper),
+        )));
         let drawdown_threshold = Percent::new(env_f64(
             "PORTFOLIO_DRAWDOWN_THRESHOLD",
             DEFAULT_DRAWDOWN_THRESHOLD,
@@ -419,7 +424,7 @@ impl AppState {
                 beta_tolerance,
             ),
             risk_gate_configuration,
-            tradable_assets: Arc::new(RwLock::new(None)),
+            tradable_assets: DailyCache::default(),
             live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),
@@ -465,7 +470,9 @@ impl AppState {
             .map(|value| !value.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
-        let alpaca_client: Arc<dyn Trading> = Arc::new(TradingClient::new(credentials, is_paper));
+        let alpaca_client: Arc<dyn Trading> = Arc::new(SessionCachingClient::new(Arc::new(
+            TradingClient::new(credentials, is_paper),
+        )));
 
         // Risk and strategy parameters fall back to the safe defaults below but
         // can be overridden per environment (keyed off FUND_PROFILE via the
@@ -526,7 +533,7 @@ impl AppState {
                 beta_tolerance,
             ),
             risk_gate_configuration,
-            tradable_assets: Arc::new(RwLock::new(None)),
+            tradable_assets: DailyCache::default(),
             live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),
@@ -554,7 +561,10 @@ impl AppState {
 
         Self {
             pool,
-            alpaca_client: client,
+            // Wrapped exactly as the production constructors wrap, so tests
+            // exercise the caching the real service runs with rather than a
+            // shape that only exists under `cfg(test)`.
+            alpaca_client: Arc::new(SessionCachingClient::new(client)),
             confidence_floor,
             constraints: Constraints::new(
                 drawdown_threshold,
@@ -563,7 +573,7 @@ impl AppState {
                 beta_tolerance,
             ),
             risk_gate_configuration,
-            tradable_assets: Arc::new(RwLock::new(None)),
+            tradable_assets: DailyCache::default(),
             live_prices: LivePriceCache::default(),
             rebalance_in_progress: Arc::new(AtomicBool::new(false)),
             last_prediction_request_at: Arc::new(AtomicI64::new(0)),

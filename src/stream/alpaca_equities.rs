@@ -765,6 +765,34 @@ mod tests {
                 &decide_window(&alpaca, utc("2024-07-15T02:00:00Z")).await
             ));
         }
+
+        #[tokio::test]
+        async fn test_clock_failure_still_fails_open_behind_the_session_cache() {
+            // The producer and the trading paths handle a clock failure in
+            // opposite directions on purpose — this one fails open and keeps
+            // streaming, the trading paths fail closed and skip. The per-date
+            // session cache sits underneath both, so this asserts it did not
+            // quietly unify them by swallowing or memoizing the error.
+            use crate::portfolio::session_cache::SessionCachingClient;
+            use std::sync::Arc;
+
+            let failing = Arc::new(MockTrading {
+                should_fail_session_fetch: true,
+                ..MockTrading::default()
+            });
+            let cached = SessionCachingClient::new(
+                failing.clone() as Arc<dyn crate::portfolio::alpaca::Trading>
+            );
+
+            assert!(is_open(
+                &decide_window(&cached, utc("2024-07-15T14:00:00Z")).await
+            ));
+            assert!(!is_open(
+                &decide_window(&cached, utc("2024-07-15T02:00:00Z")).await
+            ));
+            // Each call re-attempted the clock rather than reusing a cached failure.
+            assert_eq!(failing.market_session_fetch_count(), 2);
+        }
     }
 
     // --- SymbolSubscriptionLimit ---

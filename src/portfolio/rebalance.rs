@@ -28,7 +28,6 @@ const STOP_LOSS_Z_SCORE_THRESHOLD: f64 = 4.0;
 use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -45,6 +44,7 @@ use crate::domain::trading::{
 use crate::portfolio::alpaca::{AccountInfo, TradableAssets, Trading};
 use crate::portfolio::beta::compute_market_betas;
 use crate::portfolio::consolidation::{consolidate_predictions, ConsolidatedSignal};
+use crate::portfolio::daily_cache::DailyCache;
 use crate::portfolio::database::{
     close_equity_pair_with_reason, fetch_equity_details, fetch_equity_predictions,
     fetch_historical_equity_prices, fetch_latest_portfolio_net_asset_value, fetch_open_pairs,
@@ -243,22 +243,27 @@ pub async fn run_rebalance(
         }
     };
 
-    if reconciliation_report.orphans_closed > 0
-        || reconciliation_report.pairs_marked_closed > 0
-        || reconciliation_report.stale_orders_resolved > 0
-    {
+    // Phase 2: establish the position set reconciliation leaves behind.
+    //
+    // Reconciliation already asked Alpaca for positions to do its comparison. On
+    // the common path it changes nothing, and its snapshot is still current — so
+    // it is reused rather than re-requested moments later. When it did act, its
+    // snapshot predates the orders it submitted and a fresh fetch is required.
+    let mut alpaca_positions = if reconciliation_report.took_corrective_action() {
         info!(
             orphans_closed = reconciliation_report.orphans_closed,
             pairs_marked_closed = reconciliation_report.pairs_marked_closed,
+            partial_positions_closed = reconciliation_report.partial_positions_closed,
             stale_orders_resolved = reconciliation_report.stale_orders_resolved,
-            "Reconciliation resolved discrepancies before rebalance"
+            compensation_retries = reconciliation_report.compensation_retries,
+            "Reconciliation resolved discrepancies before rebalance; re-fetching positions"
         );
-    }
-
-    // Phase 2: re-fetch state after reconciliation.
-    let mut alpaca_positions = alpaca.fetch_positions().await.map_err(|error| {
-        RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
-    })?;
+        alpaca.fetch_positions().await.map_err(|error| {
+            RebalanceError::Execution(ExecutionError::PositionFetch { source: error })
+        })?
+    } else {
+        reconciliation_report.positions_observed.clone()
+    };
     let open_pairs = fetch_open_pairs(pool).await?;
 
     // Sanity check: Alpaca has positions but DB has none after reconciliation.
@@ -1141,7 +1146,7 @@ async fn persist_submitted_order(pool: &sqlx::PgPool, leg: &Order<Pending>) {
 async fn select_size_execute(
     pool: &sqlx::PgPool,
     alpaca: &dyn Trading,
-    tradable_assets_cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
+    tradable_assets_cache: &DailyCache<Arc<TradableAssets>>,
     risk_gate_config: &risk_gate::RiskGateConfiguration,
     market_session: &MarketSession,
     alpaca_positions: &[crate::portfolio::alpaca::Position],
@@ -1227,34 +1232,33 @@ async fn select_size_execute(
 /// anything, so the budget is the working set plus this headroom.
 const CONVERGENCE_ITERATION_HEADROOM: usize = 4;
 
-/// Resolves the tradable asset universe, populating the session cache on first use.
+/// Resolves the tradable asset universe, fetching once per Eastern date.
 ///
-/// Subsequent rebalances within the same service instance reuse the cached `Arc`
-/// without cloning the underlying struct.
+/// Subsequent rebalances on the same date reuse the cached `Arc` without cloning
+/// the underlying struct. The cache previously had no invalidation, so a process
+/// spanning several sessions kept the first session's answer indefinitely —
+/// shortability is republished daily, and a symbol that stopped being shortable
+/// would have been sized into a new pair for as long as the process lived.
 async fn resolve_tradable_assets(
     alpaca: &dyn Trading,
-    cache: &Arc<RwLock<Option<Arc<TradableAssets>>>>,
+    cache: &DailyCache<Arc<TradableAssets>>,
 ) -> Result<Arc<TradableAssets>, RebalanceError> {
-    let read_guard = cache.read().await;
-    if let Some(assets) = read_guard.as_ref() {
-        return Ok(Arc::clone(assets));
-    }
-    drop(read_guard);
-
-    let assets = Arc::new(
-        alpaca
-            .fetch_tradable_assets()
-            .await
-            .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
-    );
-    let mut write_guard = cache.write().await;
-    *write_guard = Some(Arc::clone(&assets));
-    info!(
-        tradable = assets.tradable_count(),
-        shortable = assets.shortable_count(),
-        "Tradable asset cache populated"
-    );
-    Ok(assets)
+    cache
+        .get_or_fetch(Utc::now(), || async {
+            let assets = Arc::new(
+                alpaca
+                    .fetch_tradable_assets()
+                    .await
+                    .map_err(|error| RebalanceError::Conversion(error.to_string()))?,
+            );
+            info!(
+                tradable = assets.tradable_count(),
+                shortable = assets.shortable_count(),
+                "Tradable asset cache populated"
+            );
+            Ok(assets)
+        })
+        .await
 }
 
 /// Fetches validated mid prices for `tickers` from the REST snapshot endpoint.
@@ -2851,5 +2855,41 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+    }
+
+    /// The tradable asset universe is fetched once per Eastern date and reused.
+    ///
+    /// Pointer equality proves reuse without needing a call counter: a second
+    /// fetch would allocate a new `Arc`.
+    #[tokio::test]
+    async fn test_resolve_tradable_assets_reuses_within_a_date() {
+        use crate::portfolio::alpaca::MockTrading;
+
+        let mock = MockTrading::default();
+        let cache: DailyCache<Arc<TradableAssets>> = DailyCache::default();
+
+        let first = resolve_tradable_assets(&mock, &cache).await.unwrap();
+        let second = resolve_tradable_assets(&mock, &cache).await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// A fetch failure is not cached, so the next pass retries rather than
+    /// inheriting the failure for the rest of the day.
+    #[tokio::test]
+    async fn test_resolve_tradable_assets_does_not_cache_a_failure() {
+        use crate::portfolio::alpaca::MockTrading;
+
+        let failing = MockTrading {
+            should_fail_tradable_assets: true,
+            ..MockTrading::default()
+        };
+        let cache: DailyCache<Arc<TradableAssets>> = DailyCache::default();
+
+        assert!(resolve_tradable_assets(&failing, &cache).await.is_err());
+        assert!(cache.peek(Utc::now()).await.is_none());
+
+        let succeeding = MockTrading::default();
+        assert!(resolve_tradable_assets(&succeeding, &cache).await.is_ok());
     }
 }

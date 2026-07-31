@@ -974,12 +974,34 @@ pub struct MockTrading {
     /// Makes `fetch_market_session` return an API error, for exercising the
     /// clock-unavailable paths.
     pub should_fail_session_fetch: bool,
+    /// Makes `fetch_tradable_assets` return an API error.
+    pub should_fail_tradable_assets: bool,
     pub market_open: bool,
     /// Session close returned by `fetch_market_session`. Defaults to 16:00
     /// Eastern today; set it earlier to exercise early-close behavior.
     pub session_close: DateTime<Utc>,
     pub tradable_assets: TradableAssets,
     pub latest_quotes: Vec<LatestQuote>,
+    /// Counts calls to `fetch_market_session`, for asserting that a caching
+    /// layer or a restructured pass reaches the clock as few times as intended.
+    pub market_session_fetches: std::sync::atomic::AtomicUsize,
+    /// Counts calls to `fetch_positions`, for the same reason.
+    pub position_fetches: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl MockTrading {
+    /// Returns how many times `fetch_market_session` has been called.
+    pub fn market_session_fetch_count(&self) -> usize {
+        self.market_session_fetches
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many times `fetch_positions` has been called.
+    pub fn position_fetch_count(&self) -> usize {
+        self.position_fetches
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Returns 16:00 Eastern on today's date, the default mock session close.
@@ -1014,6 +1036,7 @@ impl Default for MockTrading {
             should_fail_cancel: false,
             should_fail_close: false,
             should_fail_session_fetch: false,
+            should_fail_tradable_assets: false,
             market_open: true,
             session_close: default_mock_session_close(),
             tradable_assets: TradableAssets {
@@ -1021,6 +1044,8 @@ impl Default for MockTrading {
                 shortable: std::collections::HashSet::new(),
             },
             latest_quotes: Vec::new(),
+            market_session_fetches: std::sync::atomic::AtomicUsize::new(0),
+            position_fetches: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -1095,6 +1120,12 @@ impl Trading for MockTrading {
     }
 
     async fn fetch_tradable_assets(&self) -> Result<TradableAssets, ClientError> {
+        if self.should_fail_tradable_assets {
+            return Err(ClientError::Api {
+                status: 503,
+                body: "mock asset universe unavailable".to_string(),
+            });
+        }
         Ok(self.tradable_assets.clone())
     }
 
@@ -1109,6 +1140,8 @@ impl Trading for MockTrading {
     }
 
     async fn fetch_market_session(&self) -> Result<MarketSession, ClientError> {
+        self.market_session_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.should_fail_session_fetch {
             return Err(ClientError::Api {
                 status: 503,
@@ -1124,6 +1157,8 @@ impl Trading for MockTrading {
     }
 
     async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
+        self.position_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.positions.clone())
     }
 

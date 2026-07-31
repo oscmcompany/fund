@@ -211,8 +211,13 @@ async fn run_startup_catch_up(
     {
         // Guarded on the real session so a restart after the close, or on the
         // day after, does not replay a stale open into a shut market.
+        // `contains` rather than `is_open`: the session is served from a
+        // per-date cache, and `is_open` is the one field of it that is not fixed
+        // for the day — a session cached before the bell reports `false` for the
+        // rest of the session. `contains` derives liveness from the schedule, so
+        // it stays correct however long the value has been held.
         let session_is_live = match state.alpaca_client().fetch_market_session().await {
-            Ok(session) => session.is_open() && session.trades_on_date_of(Utc::now()),
+            Ok(session) => session.contains(Utc::now()) && session.trades_on_date_of(Utc::now()),
             Err(error) => {
                 warn!(error = %error, "Market session fetch failed during session-start catch-up");
                 false
@@ -245,8 +250,10 @@ async fn run_startup_catch_up(
     )
     .await?
     {
+        // `contains` rather than `is_open`, for the reason given at the
+        // session-start catch-up above.
         let session_is_open = match state.alpaca_client().fetch_market_session().await {
-            Ok(session) => session.is_open(),
+            Ok(session) => session.contains(Utc::now()),
             Err(error) => {
                 warn!(error = %error, "Market session fetch failed during liquidation catch-up");
                 false
@@ -509,7 +516,12 @@ async fn handle_portfolio_evaluation(state: &AppState, pool: &PgPool, payload: &
         }
     };
 
-    if !session.is_open() {
+    // `contains` rather than `is_open`, for the reason given at the session-start
+    // catch-up above. This site is the one where it matters most: the session is
+    // established at 09:25, five minutes before the bell, so the cached
+    // `is_open` is `false` for the whole day and reading it here would skip
+    // every intraday evaluation the live evaluator triggers.
+    if !session.contains(Utc::now()) {
         info!("Skipping evaluation: market is not open");
         return;
     }
