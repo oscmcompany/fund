@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ticker AS \"ticker!\",\n               EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS \"timestamp_ms!\",\n               open_price AS \"open_price!\",\n               high_price AS \"high_price!\",\n               low_price AS \"low_price!\",\n               close_price AS \"close_price!\",\n               volume AS \"volume!\",\n               volume_weighted_average_price\n        FROM equity_bars\n        WHERE bar_interval = $1\n          AND timestamp >= $2\n          AND timestamp <= $3\n        ORDER BY ticker, timestamp\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "timestamp_ms!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "open_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "high_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "low_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "close_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "volume!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "volume_weighted_average_price",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "2e54537144a4fd6fd909eaea26a409d1f9d15554655edcd5dca5192c74115668"
+}

@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ticker AS \"ticker!\", bar_interval AS \"bar_interval!\",\n                  timestamp AS \"timestamp!\", open_price AS \"open_price!\",\n                  high_price AS \"high_price!\", low_price AS \"low_price!\",\n                  close_price AS \"close_price!\", volume AS \"volume!\",\n                  volume_weighted_average_price, transactions\n           FROM equity_bars\n           WHERE bar_interval = $1\n             AND (timestamp AT TIME ZONE 'America/New_York')::date = $2\n           ORDER BY ticker",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "bar_interval!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "timestamp!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "open_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "high_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "low_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "close_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "volume!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "volume_weighted_average_price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 9,
+        "name": "transactions",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a5b5168ad307c4e5ecfc9d1089c51eba133a5d5483b3aa95c0046e2ceb4b8409"
+}

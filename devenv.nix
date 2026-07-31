@@ -362,11 +362,13 @@ in {
     # Before this, target selection was --lib --bins, which silently excluded
     # every file under tests/ — around 1,300 lines that compiled under clippy
     # but whose assertions had never been executed.
+    #
+    # The rebuild moved the previous integration targets to tests_old/, where
+    # cargo does not discover them: they test modules that no longer exist. They
+    # are rewritten alongside their subjects in the second pull request and named
+    # here again as each lands. Until then the gate is the library's own tests,
+    # which is why the coverage floor still has to be met without them.
     TEST_ARGS="--lib --bins --all-features"
-    TEST_ARGS="$TEST_ARGS --test test_backfill --test test_data"
-    TEST_ARGS="$TEST_ARGS --test test_database --test test_ensemble_events"
-    TEST_ARGS="$TEST_ARGS --test test_errors --test test_handlers"
-    TEST_ARGS="$TEST_ARGS --test test_stream"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)

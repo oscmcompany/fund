@@ -3,58 +3,28 @@ name = "fund"
 version = "0.0.1"
 edition = "2021"
 resolver = "2"
+# The old tree at `src/` stays on disk until the final rebuild commit, and Cargo would otherwise
+# auto-discover `src/bin/*.rs` as binary targets and try to compile them against the new library.
+# Binaries are declared explicitly as they are rebuilt.
+autobins = false
 
+# Rebuild in progress. The library points at `src_new/`, which is built bottom-up across three
+# pull requests; the old tree remains on disk at `src/` and is not compiled. Binary targets return
+# with the modules they depend on -- the service and trainer in the second, the dashboard in the
+# third -- and `src_new` is renamed to `src` in the final commit.
+# See `.scratchpad/rebuild_0_target_design.md`.
 [lib]
 name = "fund"
-path = "src/lib.rs"
+path = "src_new/lib.rs"
 
-[[bin]]
-name = "seed_equity_bars"
-path = "src/bin/seed_equity_bars.rs"
-required-features = ["data"]
-
-[[bin]]
-name = "seed_equity_details"
-path = "src/bin/seed_equity_details.rs"
-required-features = ["data"]
-
-[[bin]]
-name = "tide_model_trainer"
-path = "src/bin/tide_model_trainer.rs"
-required-features = ["train"]
-
-[[bin]]
-name = "dashboard"
-path = "src/bin/dashboard.rs"
-required-features = ["dashboard"]
-
-[[bin]]
-name = "stress_test_events"
-path = "src/bin/stress_test_events.rs"
-required-features = ["stress-test"]
-
-[[bin]]
-name = "fund"
-path = "src/bin/fund.rs"
-required-features = ["data", "inference", "portfolio", "stream"]
-
-[features]
-default = ["data", "inference", "portfolio", "stream"]
-data = ["dep:chrono-tz"]
-inference = ["dep:burn", "dep:ndarray", "dep:flate2", "dep:tar", "dep:tempfile"]
-portfolio = ["dep:chrono-tz"]
-stream = ["dep:tokio-tungstenite", "dep:futures-util"]
-dashboard = ["dep:axum"]
-stress-test = []
-
-# Rust-native TiDE training. Reuses the inference model/data/predict code
-# and adds the Autodiff backend (via the burn `autodiff` feature) plus `rand`
-# for epoch shuffling.
-train = ["inference", "dep:rand"]
+# No features. `dashboard` returns with the dashboard binary in the third pull request; there is
+# deliberately no `train` feature, because it existed so an inference-only build could skip the
+# training modules but burn's `autodiff` is always compiled in anyway (it costs the NdArray
+# inference path nothing), so all the flag excluded was `rand`. One build configuration is worth
+# more than one unlinked random number generator.
 
 [dependencies]
 # Shared / base (always compiled)
-async-trait = "0.1"
 chrono = { version = "0.4.44", features = ["serde"] }
 polars = { version = "0.51.0", features = [
   "lazy",
@@ -77,7 +47,6 @@ sqlx = { version = "0.8", default-features = false, features = [
   "json",
 ] }
 tokio = { version = "1.51.1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = [
   "env-filter",
@@ -89,37 +58,28 @@ aws-config = "1.8.15"
 aws-sdk-s3 = "1.129"
 thiserror = "2.0.3"
 rust_decimal = { version = "1", features = ["serde"] }
-num-traits = "0.2"
 uuid = { version = "1", features = ["serde", "v4"] }
 # Direct dependency solely to select a process-wide Rustls `CryptoProvider` at
-# startup. Rustls 0.23 is pulled transitively (sqlx, aws-sdk, tungstenite) with
-# both the `aws-lc-rs` and `ring` providers enabled, so it cannot choose one
+# startup. Rustls 0.23 is pulled transitively (sqlx, aws-sdk) with both the
+# `aws-lc-rs` and `ring` providers enabled, so it cannot choose one
 # automatically and panics on first TLS use. See `common::crypto`.
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
-# data-only (optional; enabled by the `data` feature)
-chrono-tz = { version = "0.10", optional = true }
+# Eastern-time arithmetic. Every cron gate, session boundary, and trading-date rollover in the
+# system is expressed in America/New_York, so this is unconditional rather than feature-gated.
+chrono-tz = "0.10"
 
-# inference-only (optional; enabled by the `inference` feature).
-# `autodiff` brings the Autodiff backend used by Rust-native training; it adds
-# no runtime cost to the NdArray inference path.
-burn = { version = "0.16", features = ["ndarray", "autodiff"], optional = true }
-ndarray = { version = "0.16", optional = true }
-flate2 = { version = "1.0", optional = true }
-tar = { version = "0.4", optional = true }
-tempfile = { version = "3.27", optional = true }
+# Model. `autodiff` brings the Autodiff backend used by Rust-native training; it adds no runtime
+# cost to the NdArray inference path, so it is always compiled in rather than gated behind `train`.
+# flate2/tar/tempfile unpack the `model.tar.gz` artifact that both training and inference handle.
+burn = { version = "0.16", features = ["ndarray", "autodiff"] }
+ndarray = "0.16"
+flate2 = "1.0"
+tar = "0.4"
+tempfile = "3.27"
 
-# train-only (optional; enabled by the `train` feature)
-rand = { version = "0.10", optional = true }
-
-# stream-only (optional; enabled by the `stream` feature)
-tokio-tungstenite = { version = "0.26", features = [
-  "native-tls",
-], optional = true }
-futures-util = { version = "0.3", optional = true }
-
-# dashboard-only (optional; enabled by the `dashboard` feature)
-axum = { version = "0.8", optional = true }
+# Epoch shuffling during training.
+rand = "0.10"
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"
