@@ -148,13 +148,6 @@ async fn run(module: Option<Module>) -> Result<(), Box<dyn std::error::Error>> {
 
     if run_inference {
         let state = fund::inference::state::AppState::with_pool(pool.clone(), s3_client.clone());
-        fund::inference::pipeline::poll_artifact_once(&state).await;
-        handles.push(tokio::spawn(
-            fund::inference::pipeline::start_artifact_polling(
-                state.clone(),
-                shutdown_token.clone(),
-            ),
-        ));
         handles.extend(fund::inference::consumer::spawn_event_consumer(
             state,
             shutdown_token.clone(),

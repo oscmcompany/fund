@@ -2,12 +2,13 @@ use crate::common::events::{
     emit_event, events_after, get_consumer_offset, latest_event_after, run_event_listener,
     update_consumer_offset, EventType, Outcome, CONSUMER_DATA_DATABASE_BACKUP,
     CONSUMER_DATA_DATABASE_EXPORT, CONSUMER_DATA_DATABASE_PURGE, CONSUMER_DATA_EQUITY_BARS_SYNC,
-    CONSUMER_DATA_SCHEDULER_HEALTH,
+    CONSUMER_DATA_MODEL_ARTIFACT, CONSUMER_DATA_SCHEDULER_HEALTH,
 };
 use crate::data::equity_bars::fetch_and_store_equity_bars;
 use crate::data::equity_details;
 use crate::data::export;
 use crate::data::market_calendar;
+use crate::data::model_artifact;
 use crate::data::state::State;
 use crate::data::types::TradingDate;
 use aws_sdk_s3::primitives::ByteStream;
@@ -549,6 +550,10 @@ async fn run_listener(
                     info!(event_id, "Received scheduler_health_check_requested");
                     handle_scheduler_health_check(pool, event_id).await;
                 }
+                EventType::ModelArtifactCheck(Outcome::Requested) => {
+                    info!(event_id, "Received model_artifact_check_requested");
+                    handle_model_artifact_check(state, pool, event_id).await;
+                }
                 // Every consumer receives every event; the rest belong to other
                 // services or are audit records. Listed rather than caught by a
                 // wildcard so that adding a family, or an `Outcome` to one of
@@ -569,7 +574,9 @@ async fn run_listener(
                 | EventType::SchedulerHealthCheck(
                     Outcome::Started | Outcome::Completed | Outcome::Errored,
                 )
-                | EventType::ModelArtifactCheck(_)
+                | EventType::ModelArtifactCheck(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
                 | EventType::ModelArtifactPublished
                 | EventType::ModelArtifactStale
                 | EventType::EquityPredictions(_)
@@ -652,6 +659,21 @@ async fn run_startup_catch_up(state: &State, pool: &sqlx::PgPool) -> Result<(), 
         handle_scheduler_health_check(pool, event_id).await;
     }
 
+    let artifact_offset = get_consumer_offset(pool, CONSUMER_DATA_MODEL_ARTIFACT).await?;
+    if let Some(event_id) = latest_event_after(
+        pool,
+        EventType::ModelArtifactCheck(Outcome::Requested),
+        artifact_offset,
+    )
+    .await?
+    {
+        info!(
+            event_id,
+            "Catching up on missed model_artifact_check_requested"
+        );
+        handle_model_artifact_check(state, pool, event_id).await;
+    }
+
     let purge_offset = get_consumer_offset(pool, CONSUMER_DATA_DATABASE_PURGE).await?;
     if let Some(event_id) = latest_event_after(
         pool,
@@ -727,6 +749,108 @@ async fn handle_scheduler_health_check(pool: &sqlx::PgPool, event_id: i64) {
     {
         warn!(error = %error, "Failed to update scheduler-health consumer offset");
     }
+}
+
+/// Checks whether the trainer published a fresh artifact, and says so either way.
+///
+/// The application cannot enforce that training happened before the day's
+/// predictions — the trainer is on another VM with no database connection — so
+/// this observes instead. A new key becomes `model_artifact_published`, which
+/// inference consumes to load the model; an artifact that has not moved for two
+/// trading days becomes `model_artifact_stale`, which previously was silence.
+async fn handle_model_artifact_check(state: &State, pool: &sqlx::PgPool, event_id: i64) {
+    if let Err(error) = emit_event(
+        pool,
+        EventType::ModelArtifactCheck(Outcome::Started),
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit model_artifact_check_started");
+    }
+
+    let outcome = match run_model_artifact_check(state, pool).await {
+        Ok(status) => {
+            model_artifact::report(&status);
+            match status {
+                model_artifact::ArtifactStatus::Published {
+                    artifact_key,
+                    trained_at,
+                } => {
+                    if let Err(error) = emit_event(
+                        pool,
+                        EventType::ModelArtifactPublished,
+                        &serde_json::json!({
+                            "artifact_key": artifact_key,
+                            "trained_at": trained_at.map(|instant| instant.to_rfc3339()),
+                        }),
+                    )
+                    .await
+                    {
+                        warn!(error = %error, "Failed to emit model_artifact_published");
+                    }
+                }
+                model_artifact::ArtifactStatus::Stale {
+                    artifact_key,
+                    trading_days_old,
+                } => {
+                    if let Err(error) = emit_event(
+                        pool,
+                        EventType::ModelArtifactStale,
+                        &serde_json::json!({
+                            "artifact_key": artifact_key,
+                            "trading_days_old": trading_days_old,
+                        }),
+                    )
+                    .await
+                    {
+                        warn!(error = %error, "Failed to emit model_artifact_stale");
+                    }
+                }
+                model_artifact::ArtifactStatus::Unchanged { .. } => {}
+            }
+            Outcome::Completed
+        }
+        Err(error) => {
+            error!(error = %error, "Model artifact check errored");
+            Outcome::Errored
+        }
+    };
+
+    if let Err(error) = emit_event(
+        pool,
+        EventType::ModelArtifactCheck(outcome),
+        &serde_json::json!({}),
+    )
+    .await
+    {
+        warn!(error = %error, "Failed to emit the model artifact check outcome");
+    }
+
+    if let Err(error) = update_consumer_offset(pool, CONSUMER_DATA_MODEL_ARTIFACT, event_id).await {
+        warn!(error = %error, "Failed to update model-artifact consumer offset");
+    }
+}
+
+/// Resolves the newest artifact and compares it against the recorded lineage.
+async fn run_model_artifact_check(
+    state: &State,
+    pool: &sqlx::PgPool,
+) -> Result<model_artifact::ArtifactStatus, String> {
+    let latest_key =
+        model_artifact::resolve_latest_artifact_key(&state.s3_client, &state.bucket_name)
+            .await
+            .map_err(|error| format!("Could not resolve the latest artifact: {error}"))?;
+
+    let recorded_key = model_artifact::latest_recorded_artifact_key(pool)
+        .await
+        .map_err(|error| format!("Could not read the recorded artifact key: {error}"))?;
+
+    Ok(model_artifact::classify(
+        latest_key,
+        recorded_key.as_deref(),
+        Utc::now(),
+    ))
 }
 
 async fn handle_equity_bars_sync(state: &State, pool: &sqlx::PgPool, event_id: i64) {

@@ -180,10 +180,18 @@ async fn run_pipeline_and_persist(
 }
 
 /// Resolve the latest artifact and load it if it differs from the current
-/// model, recording training lineage in `model_runs`. Called once at startup
-/// (before the event consumer spawns, so a catch-up run has a model to use)
-/// and then from the polling loop.
-pub async fn poll_artifact_once(state: &AppState) {
+/// model, recording training lineage in `model_runs`.
+///
+/// Called on `model_artifact_published`, and on the startup catch-up for one
+/// published while this service was down. It was previously also called from a
+/// 60-second polling loop, which is what this replaced: the load itself is
+/// unchanged, only what decides to run it.
+///
+/// Every failure path leaves the currently loaded model in place. Resolution
+/// failure returns before touching it, and a failed download logs without
+/// swapping, so inference continues predicting with what it has rather than
+/// ending up with nothing.
+pub async fn load_latest_artifact(state: &AppState) {
     let latest_key = match artifact::resolve_artifact_key(
         state.s3_client(),
         state.artifact_bucket(),
@@ -265,27 +273,6 @@ pub async fn poll_artifact_once(state: &AppState) {
     }
 }
 
-pub async fn start_artifact_polling(
-    state: AppState,
-    shutdown_token: tokio_util::sync::CancellationToken,
-) {
-    let poll_interval = std::time::Duration::from_secs(60);
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(poll_interval) => {}
-            _ = shutdown_token.cancelled() => {
-                info!("Artifact polling stopped for shutdown");
-                break;
-            }
-        }
-        if shutdown_token.is_cancelled() {
-            break;
-        }
-        poll_artifact_once(&state).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,9 +288,27 @@ mod tests {
         AppState::for_tests(
             s3_client,
             "test-bucket".to_string(),
-            "artifacts/tide/".to_string(),
+            "models/tide/".to_string(),
             "latest".to_string(),
         )
+    }
+
+    /// A failed resolution must not clear the loaded model.
+    ///
+    /// This was the polling loop's effective behavior and is easy to lose when
+    /// the trigger changes: the poll only ever swapped on success, so a
+    /// transient S3 failure left inference predicting with what it had. The
+    /// state fixture points at an unreachable bucket, so resolution fails.
+    #[tokio::test]
+    async fn test_a_failed_load_leaves_the_current_model_in_place() {
+        let state = make_test_state();
+
+        // Nothing loaded, and a failed load must not panic or install anything.
+        load_latest_artifact(&state).await;
+        assert!(
+            state.model_state().lock().await.is_none(),
+            "a failed load must not install a model"
+        );
     }
 
     #[tokio::test]
