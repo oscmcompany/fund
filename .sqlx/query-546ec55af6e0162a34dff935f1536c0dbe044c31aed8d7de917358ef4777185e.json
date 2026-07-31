@@ -1,0 +1,92 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!\", pair_id AS \"pair_id!\", long_ticker AS \"long_ticker!\",\n                  short_ticker AS \"short_ticker!\",\n                  hedge_ratio::double precision AS \"hedge_ratio!\",\n                  entry_z_score::double precision AS \"entry_z_score!\",\n                  signal_strength::double precision AS \"signal_strength!\",\n                  model_run_id, status AS \"status!\", opened_at AS \"opened_at!\", closed_at,\n                  close_reason,\n                  realized_profit_and_loss::double precision AS realized_profit_and_loss\n           FROM equity_pairs\n           ORDER BY opened_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pair_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "long_ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "short_ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "hedge_ratio!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "entry_z_score!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "signal_strength!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "model_run_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "status!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "opened_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "closed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "close_reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "realized_profit_and_loss",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      true,
+      false,
+      false,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "546ec55af6e0162a34dff935f1536c0dbe044c31aed8d7de917358ef4777185e"
+}

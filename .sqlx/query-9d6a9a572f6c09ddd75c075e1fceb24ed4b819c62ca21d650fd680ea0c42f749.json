@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ticker AS \"ticker!\",\n               AVG(close_price) AS \"average_close_price!\",\n               AVG(volume::double precision) AS \"average_volume!\"\n        FROM equity_bars\n        WHERE bar_interval = $1\n          AND timestamp >= $2\n        GROUP BY ticker\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "average_close_price!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "average_volume!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "9d6a9a572f6c09ddd75c075e1fceb24ed4b819c62ca21d650fd680ea0c42f749"
+}

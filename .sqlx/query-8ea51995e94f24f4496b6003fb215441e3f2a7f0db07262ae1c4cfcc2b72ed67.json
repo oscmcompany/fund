@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT correlation_id AS \"correlation_id!\", model_run_id AS \"model_run_id!\",\n                  ticker AS \"ticker!\", timestamp AS \"timestamp!\",\n                  quantile_10 AS \"quantile_10!\", quantile_50 AS \"quantile_50!\",\n                  quantile_90 AS \"quantile_90!\"\n           FROM equity_predictions\n           WHERE timestamp >= $1 AND timestamp < $2\n           ORDER BY ticker",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "correlation_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_run_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "timestamp!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "quantile_10!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "quantile_50!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "quantile_90!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "8ea51995e94f24f4496b6003fb215441e3f2a7f0db07262ae1c4cfcc2b72ed67"
+}

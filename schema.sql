@@ -1,13 +1,43 @@
 -- Fund platform PostgreSQL schema
--- TimescaleDB operational data layer, model metadata, and event coordination
+-- TimescaleDB operational data layer and event coordination.
+--
+-- Seven tables. Alpaca is the source of truth for fills, balances, buying power, and positions;
+-- nothing here duplicates what the broker already knows authoritatively. PostgreSQL holds model
+-- output, the long/short pair mapping, market history, and an audit trail.
+--
+-- Every DDL statement uses an idempotent form so this file can be re-run against a populated
+-- database. Note the one thing that re-running cannot do: CREATE TABLE IF NOT EXISTS is a no-op
+-- against a table that already exists with a different shape. Databases provisioned before the
+-- rebuild must be dropped and recreated rather than upgraded in place, and equity_bars re-seeded
+-- from the S3 parquet exports via seed_equity_bars.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- equity_bars: Rolling buffer for equity bar data (last 90 days; ensemble needs 70-day lookback)
--- Source: Massive API (historical), Alpaca REST (EOD backfill)
+-- ---------------------------------------------------------------------------
+-- Market data
+-- ---------------------------------------------------------------------------
+
+-- equity_bars: rolling buffer of OHLCV bars at a declared interval.
+--
+-- bar_interval is part of the primary key so a single table carries daily and intraday bars
+-- together. Only '1day' is written today -- the intraday migration is deferred, and the column
+-- exists so that migration needs no table rewrite.
+--
+-- These are the canonical stored values, deliberately not Alpaca's timeframe spelling: Alpaca
+-- writes '1Day' and '1Hour' where this column holds '1day' and '60min'. The BarInterval enum in
+-- common::types owns both forms and the mapping between them, so no call site has to remember
+-- which vocabulary it is in.
+--
+-- One retention policy covers every interval, which is the accepted cost of a single table. At 90
+-- days, daily bars across the filtered universe are on the order of 10^5 rows while 1-minute bars
+-- would be on the order of 10^7. Revisit the window when intraday writes begin.
+--
+-- Source: Alpaca REST, fetched by the application post-close and, independently, by the trainer.
 CREATE TABLE IF NOT EXISTS equity_bars (
     ticker                        TEXT             NOT NULL,
+    bar_interval                  TEXT             NOT NULL
+        CHECK (bar_interval IN ('1min', '5min', '15min', '30min', '60min', '1day')),
     timestamp                     TIMESTAMPTZ      NOT NULL,
     open_price                    DOUBLE PRECISION NOT NULL,
     high_price                    DOUBLE PRECISION NOT NULL,
@@ -17,251 +47,157 @@ CREATE TABLE IF NOT EXISTS equity_bars (
     volume_weighted_average_price DOUBLE PRECISION,
     transactions                  BIGINT,
     inserted_at                   TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    PRIMARY KEY (ticker, timestamp)
+    PRIMARY KEY (ticker, bar_interval, timestamp)
 );
 
 SELECT create_hypertable('equity_bars', by_range('timestamp'), if_not_exists => TRUE);
-CREATE INDEX IF NOT EXISTS idx_equity_bars_inserted_at ON equity_bars (inserted_at); -- noqa: PG01
-CREATE INDEX IF NOT EXISTS idx_equity_bars_timestamp ON equity_bars (timestamp DESC); -- noqa: PG01
+CREATE INDEX IF NOT EXISTS idx_equity_bars_interval_timestamp -- noqa: PG01
+    ON equity_bars (bar_interval, timestamp DESC);
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
--- equity_rebalance_sessions: groups one full rebalance cycle (allocation to orders)
-CREATE TABLE IF NOT EXISTS equity_rebalance_sessions (
-    id              UUID        PRIMARY KEY,
-    triggered_at    TIMESTAMPTZ NOT NULL,
-    trigger_reason  TEXT        NOT NULL,
-    model_run_id    TEXT,       -- set by the training pipeline; references model_runs.run_id; nullable when unavailable
-    completed_at    TIMESTAMPTZ,
-    status          TEXT        NOT NULL
-);
-
--- equity_pairs: one row per cointegrated pair per rebalance cycle
--- Entry signals (z_score, hedge_ratio, signal_strength) are recorded at the time of opening.
--- Matches the pairs_schema pandera definition and ClosedPair struct in src/data/types.rs.
-CREATE TABLE IF NOT EXISTS equity_pairs (
-    id                         UUID        PRIMARY KEY,
-    rebalance_id               UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
-    pair_id                    TEXT        NOT NULL,
-    long_ticker                TEXT        NOT NULL,
-    short_ticker               TEXT        NOT NULL,
-    z_score                    NUMERIC     NOT NULL,
-    hedge_ratio                NUMERIC     NOT NULL,
-    signal_strength            NUMERIC     NOT NULL,
-    status                     TEXT        NOT NULL CHECK (status IN ('open', 'closed')),
-    opened_at                  TIMESTAMPTZ NOT NULL,
-    closed_at                  TIMESTAMPTZ,
-    realized_profit_and_loss   NUMERIC,
-    return_percent             NUMERIC,
-    close_reason               TEXT        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')),
-    UNIQUE (pair_id, opened_at)
-);
-
--- Idempotent constraint replacement: updates close_reason CHECK to include reconciliation_alpaca_missing
--- for existing deployments where CREATE TABLE was a no-op.
-DO $do$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'equity_pairs_close_reason_check' AND conrelid = 'equity_pairs'::regclass
-    ) THEN
-        ALTER TABLE equity_pairs DROP CONSTRAINT equity_pairs_close_reason_check;
-    END IF;
-    ALTER TABLE equity_pairs ADD CONSTRAINT equity_pairs_close_reason_check
-        CHECK (close_reason IN ('profit_taken', 'stop_loss', 'end_of_day', 'reconciliation_alpaca_missing')) NOT VALID;
-END;
-$do$;
-
--- equity_allocations: one row per ticker leg per rebalance cycle
--- side and action match PositionSide/PositionAction enums in portfolio_schema.py
--- quantity: whole-share intent for SHORT legs (nullable for LONG legs).
--- notional: dollar amount for LONG legs (nullable for SHORT legs).
--- CHECK ensures at least one of quantity or notional is set per row.
-CREATE TABLE IF NOT EXISTS equity_allocations (
-    id               UUID        PRIMARY KEY,
-    rebalance_id     UUID        NOT NULL REFERENCES equity_rebalance_sessions(id),
-    equity_pair_id   UUID        NOT NULL REFERENCES equity_pairs(id),
-    generated_at     TIMESTAMPTZ NOT NULL,
-    model_run_id     TEXT,       -- set by the training pipeline; references model_runs.run_id; nullable when unavailable
-    ticker           TEXT        NOT NULL,
-    side             TEXT        NOT NULL CHECK (side IN ('LONG', 'SHORT')),
-    action           TEXT        NOT NULL CHECK (action IN ('OPEN_POSITION', 'CLOSE_POSITION', 'UNSPECIFIED')),
-    dollar_amount    NUMERIC     NOT NULL,
-    entry_price      NUMERIC,
-    quantity         NUMERIC,
-    notional         NUMERIC,
-    CONSTRAINT equity_allocations_quantity_notional_check
-        CHECK (quantity IS NOT NULL OR notional IS NOT NULL)
-);
-
-CREATE INDEX IF NOT EXISTS idx_equity_allocations_rebalance_id ON equity_allocations (rebalance_id); -- noqa: PG01
-
--- equity_orders: orders submitted to Alpaca, linked to allocations
--- allocation_id is nullable: submitted orders are tracked before allocations exist.
--- status tracks the order lifecycle: submitted → filled or cancelled.
-CREATE TABLE IF NOT EXISTS equity_orders (
-    id               UUID        PRIMARY KEY,
-    allocation_id    UUID        REFERENCES equity_allocations(id),
-    submitted_at     TIMESTAMPTZ NOT NULL,
-    ticker           TEXT        NOT NULL,
-    side             TEXT        NOT NULL CHECK (side IN ('LONG', 'SHORT')),
-    quantity         NUMERIC     NOT NULL,
-    order_type       TEXT        NOT NULL,
-    limit_price      NUMERIC,
-    alpaca_order_id  TEXT        NOT NULL,
-    status           TEXT        NOT NULL DEFAULT 'filled' CHECK (status IN ('submitted', 'filled', 'cancelled')),
-    filled_at        TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_equity_orders_allocation_id ON equity_orders (allocation_id); -- noqa: PG01
-
--- Idempotent constraint backfill: adds the side CHECK to existing deployments where CREATE TABLE was a no-op.
--- NOT VALID skips scanning existing rows; safe to re-run.
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'equity_orders_side_check' AND conrelid = 'equity_orders'::regclass
-    ) THEN
-        ALTER TABLE equity_orders ADD CONSTRAINT equity_orders_side_check CHECK (side IN ('LONG', 'SHORT')) NOT VALID;
-    END IF;
-END;
-$do$;
-
--- Idempotent column backfill: adds status and filled_at columns, relaxes allocation_id NOT NULL
--- for existing deployments where CREATE TABLE was a no-op.
-DO $do$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_orders' AND column_name = 'status'
-    ) THEN
-        ALTER TABLE equity_orders ADD COLUMN status TEXT NOT NULL DEFAULT 'filled';
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'equity_orders' AND column_name = 'filled_at'
-    ) THEN
-        ALTER TABLE equity_orders ADD COLUMN filled_at TIMESTAMPTZ;
-    END IF;
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'equity_orders_status_check' AND conrelid = 'equity_orders'::regclass
-    ) THEN
-        ALTER TABLE equity_orders ADD CONSTRAINT equity_orders_status_check
-            CHECK (status IN ('submitted', 'filled', 'cancelled')) NOT VALID;
-    END IF;
-    -- Relax allocation_id NOT NULL so submitted orders can be tracked before allocations exist.
-    ALTER TABLE equity_orders ALTER COLUMN allocation_id DROP NOT NULL;
-END;
-$do$;
-
--- equity_portfolio_snapshots: per-rebalance portfolio state snapshots
--- 'intraday' rows are recorded after each live rebalance; gross_return and net_return are NULL.
--- 'end_of_day' rows are recorded once per trading day at market close; all columns are populated.
-CREATE TABLE IF NOT EXISTS equity_portfolio_snapshots (
-    id                   BIGSERIAL   NOT NULL PRIMARY KEY,
-    snapshot_timestamp   TIMESTAMPTZ NOT NULL,
-    snapshot_type        TEXT        NOT NULL CHECK (snapshot_type IN ('intraday', 'end_of_day')),
-    net_asset_value      NUMERIC     NOT NULL,
-    gross_return         NUMERIC,
-    net_return           NUMERIC,
-    total_slippage_cost  NUMERIC     NOT NULL,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_timestamp -- noqa: PG01
-    ON equity_portfolio_snapshots (snapshot_timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_equity_portfolio_snapshots_type_timestamp -- noqa: PG01
-    ON equity_portfolio_snapshots (snapshot_type, snapshot_timestamp DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_equity_portfolio_snapshots_end_of_day_date -- noqa: PG01
-    ON equity_portfolio_snapshots (((snapshot_timestamp AT TIME ZONE 'UTC')::date))
-    WHERE snapshot_type = 'end_of_day';
-
--- equity_trades: fills from Alpaca websocket (Phase 3 — not yet wired)
-CREATE TABLE IF NOT EXISTS equity_trades (
-    timestamp               TIMESTAMPTZ NOT NULL,
-    ticker                  TEXT        NOT NULL,
-    order_id                UUID        NOT NULL,
-    quantity                NUMERIC     NOT NULL,
-    price                   NUMERIC     NOT NULL,
-    side                    TEXT        NOT NULL,
-    slippage_basis_points   NUMERIC
-);
-
--- equity_details: Ticker metadata (sector, industry) seeded from S3 on first startup.
--- Ongoing updates are owned by the data service when equity details are refreshed.
--- Source: data/equity/details/details.csv in the S3 bucket.
+-- equity_details: ticker metadata used to constrain pair selection to cross-sector matches.
+-- Seeded from data/equity_details.csv via seed_equity_details; refreshed by the post-close
+-- market data sync.
 CREATE TABLE IF NOT EXISTS equity_details (
     ticker    TEXT NOT NULL PRIMARY KEY,
     sector    TEXT NOT NULL DEFAULT 'NOT AVAILABLE',
     industry  TEXT NOT NULL DEFAULT 'NOT AVAILABLE'
 );
 
--- model_runs: Training metadata for model artifacts and evaluation metrics
-CREATE TABLE IF NOT EXISTS model_runs (
-    id                                  BIGSERIAL PRIMARY KEY,
-    run_id                              TEXT NOT NULL UNIQUE,
-    model_name                          TEXT NOT NULL DEFAULT 'tide',
-    artifact_key                        TEXT,
-    training_data_key                   TEXT,
-    start_date                          DATE,
-    end_date                            DATE,
-    lookback_days                       INTEGER,
-    status                              TEXT NOT NULL DEFAULT 'started',
-    continuous_ranked_probability_score DOUBLE PRECISION,
-    directional_accuracy                DOUBLE PRECISION,
-    quantile_coverage                   DOUBLE PRECISION,
-    drift_status                        TEXT,
-    stage_counts                        JSONB,
-    started_at                          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at                        TIMESTAMPTZ
+-- ---------------------------------------------------------------------------
+-- Model output
+-- ---------------------------------------------------------------------------
+
+-- equity_predictions: TiDE quantile output, one row per ticker per prediction batch.
+-- Written by the pre-open predictions handler and read by the entry screen for the rest of the
+-- session. Identity is (ticker, timestamp); a batch is identified by its shared correlation_id.
+CREATE TABLE IF NOT EXISTS equity_predictions (
+    correlation_id  UUID             NOT NULL,
+    model_run_id    TEXT             NOT NULL,
+    ticker          TEXT             NOT NULL,
+    timestamp       TIMESTAMPTZ      NOT NULL,
+    quantile_10     DOUBLE PRECISION NOT NULL,
+    quantile_50     DOUBLE PRECISION NOT NULL,
+    quantile_90     DOUBLE PRECISION NOT NULL,
+    created_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    PRIMARY KEY (ticker, timestamp)
 );
 
-CREATE INDEX IF NOT EXISTS idx_model_runs_status ON model_runs (status); -- noqa: PG01
-CREATE INDEX IF NOT EXISTS idx_model_runs_started_at ON model_runs (started_at DESC); -- noqa: PG01
+SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
+-- Retention is the nightly purge handler's job, not TimescaleDB's: rows must reach S3 via the
+-- export before they are dropped, and only the handler knows whether that happened.
+SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
 
--- equity_reconciliation_events: audit trail for DB-Alpaca state discrepancies.
--- Append-only during detection; resolved_at is updated when corrective action succeeds.
--- Designed for Phase 2b continuous reconciliation without schema migration.
-CREATE TABLE IF NOT EXISTS equity_reconciliation_events (
-    id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    detected_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    event_type        TEXT        NOT NULL,
-    ticker            TEXT        NOT NULL,
-    expected_quantity NUMERIC,
-    actual_quantity   NUMERIC,
-    equity_pair_id    UUID        REFERENCES equity_pairs(id),
-    alpaca_order_id   TEXT,
-    action_taken      TEXT        NOT NULL,
-    resolved_at       TIMESTAMPTZ
+-- ---------------------------------------------------------------------------
+-- Positions
+-- ---------------------------------------------------------------------------
+
+-- equity_pairs: the long/short leg mapping, plus the signal that justified the entry.
+--
+-- This is the application's own record and deliberately not a position ledger -- Alpaca holds the
+-- authoritative position, quantity, and fill. What Alpaca cannot answer is which long belongs with
+-- which short and why they were opened together, so that is exactly what this table stores.
+--
+-- realized_profit_and_loss is a derived column, written by the post-close account sync from Alpaca
+-- activity data rather than computed by the portfolio module. It is materialized so the dashboard
+-- does not re-join activities to pairs on ticker and time window on every page load; Alpaca remains
+-- the source.
+CREATE TABLE IF NOT EXISTS equity_pairs (
+    id                        UUID        PRIMARY KEY,
+    pair_id                   TEXT        NOT NULL,
+    long_ticker               TEXT        NOT NULL,
+    short_ticker              TEXT        NOT NULL,
+    hedge_ratio               NUMERIC     NOT NULL,
+    entry_z_score             NUMERIC     NOT NULL,
+    signal_strength           NUMERIC     NOT NULL,
+    model_run_id              TEXT,
+    status                    TEXT        NOT NULL CHECK (status IN ('open', 'closed')),
+    opened_at                 TIMESTAMPTZ NOT NULL,
+    closed_at                 TIMESTAMPTZ,
+    close_reason              TEXT
+        CHECK (close_reason IN ('convergence', 'stop_loss', 'end_of_day', 'position_missing')),
+    realized_profit_and_loss  NUMERIC,
+    UNIQUE (pair_id, opened_at),
+    -- Closure is three columns that must agree, so the agreement is enforced here rather than in
+    -- the handler that writes them. Without this the table accepts a closed pair with a null
+    -- closed_at, which idx_equity_pairs_closed_at then sorts first under DESC -- so the least
+    -- complete row would present as the most recent close.
+    CONSTRAINT equity_pairs_closure_is_consistent CHECK (
+        (status = 'open' AND closed_at IS NULL AND close_reason IS NULL)
+        OR (status = 'closed' AND closed_at IS NOT NULL AND close_reason IS NOT NULL)
+    )
 );
 
-CREATE INDEX IF NOT EXISTS idx_equity_reconciliation_events_unresolved -- noqa: PG01
-    ON equity_reconciliation_events (detected_at)
-    WHERE resolved_at IS NULL;
+-- The evaluation pass asks for open pairs every five minutes and for nothing else on this table
+-- during a session, so the partial index is the one that matters.
+CREATE INDEX IF NOT EXISTS idx_equity_pairs_open -- noqa: PG01
+    ON equity_pairs (opened_at DESC)
+    WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_equity_pairs_closed_at -- noqa: PG01
+    ON equity_pairs (closed_at DESC)
+    WHERE status = 'closed';
 
--- Nightly equity bar sync: weekdays at 05:00 UTC
-DO $do$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-bars-sync-requested') THEN
-        PERFORM cron.schedule('equity-bars-sync-requested', '0 5 * * 1-5', $$SELECT emit_event('equity_bars_sync_requested', '{}')$$);
-    END IF;
-END;
-$do$;
+-- ---------------------------------------------------------------------------
+-- Account, as reported by Alpaca
+-- ---------------------------------------------------------------------------
 
--- market_calendar: published NYSE trading sessions with their real hours.
--- One row per trading day; a date with no row does not trade. Times are Eastern local, as Alpaca
--- publishes them, so a half-day carries its actual 13:00 close rather than an assumed 16:00.
--- Reference data, not ephemeral: deliberately absent from the nightly purge table list. Purging it
--- would leave trading-day arithmetic on the hardcoded NYSE_HOLIDAYS fallback until the next sync.
-CREATE TABLE IF NOT EXISTS market_calendar (
-    session_date  DATE        PRIMARY KEY,
-    session_open  TIME        NOT NULL,
-    session_close TIME        NOT NULL,
-    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+-- account_snapshots: one row per trading session, written by the post-close account sync.
+--
+-- The previous session's equity is the reference the next session's drawdown gate compares live
+-- account equity against. That gate is the reason this table exists; everything else it carries is
+-- for the dashboard.
+CREATE TABLE IF NOT EXISTS account_snapshots (
+    session_date        DATE        PRIMARY KEY,
+    equity              NUMERIC     NOT NULL,
+    last_equity         NUMERIC     NOT NULL,
+    cash                NUMERIC     NOT NULL,
+    buying_power        NUMERIC     NOT NULL,
+    long_market_value   NUMERIC     NOT NULL,
+    short_market_value  NUMERIC     NOT NULL,
+    fetched_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- events: append-only outbox for cross-service event coordination
+-- account_activities: Alpaca account activities, stored close to as returned.
+--
+-- The primary key is Alpaca's own activity ID, which makes the post-close sync idempotent by
+-- construction: re-running it against an already-synced session conflicts on every row and changes
+-- nothing. Columns are nullable where Alpaca omits them for non-trade activity types.
+CREATE TABLE IF NOT EXISTS account_activities (
+    id                TEXT        PRIMARY KEY,
+    activity_type     TEXT        NOT NULL,
+    transaction_time  TIMESTAMPTZ NOT NULL,
+    ticker            TEXT,
+    side              TEXT,
+    quantity          NUMERIC,
+    price             NUMERIC,
+    order_id          TEXT,
+    fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_activities_transaction_time -- noqa: PG01
+    ON account_activities (transaction_time DESC);
+-- Attributing realized P&L back to a pair joins activities to legs on ticker within the pair's
+-- open window, so ticker leads and time follows.
+CREATE INDEX IF NOT EXISTS idx_account_activities_ticker_time -- noqa: PG01
+    ON account_activities (ticker, transaction_time DESC);
+
+-- ---------------------------------------------------------------------------
+-- Event coordination
+-- ---------------------------------------------------------------------------
+
+-- events: append-only record of every command issued and every outcome reached.
+--
+-- Six commands, three outcomes. pg_cron writes the '<command>_requested' rows; the service writes
+-- '<command>_completed' or '<command>_errored' when it finishes handling one. There is no
+-- '_started' outcome -- nothing read it and the structured logs already cover it.
+--
+-- Completed payloads carry the summary of what happened -- pairs opened and closed with their exit
+-- reasons, rows synced, the artifact the predictions ran against and its age. That is what makes
+-- the nightly parquet export of this table worth reading afterwards.
+--
+-- This table is also the restart recovery mechanism. On startup the service scans for today's
+-- '_requested' rows with no matching '_completed' or '_errored' and re-runs them, which is why
+-- there is no separate consumer offset table.
 CREATE TABLE IF NOT EXISTS events (
     id          BIGSERIAL   NOT NULL,
     event_type  TEXT        NOT NULL,
@@ -272,20 +208,46 @@ CREATE TABLE IF NOT EXISTS events (
 
 SELECT create_hypertable('events', by_range('created_at'), if_not_exists => TRUE);
 CREATE INDEX IF NOT EXISTS idx_events_type_id ON events (event_type, id); -- noqa: PG01
+-- As with predictions: the purge handler drops these once the export has written them to S3.
 SELECT remove_retention_policy('events', if_exists => TRUE);
 
 -- notify_event: fires pg_notify on the 'events' channel after each insert.
--- Payload is JSON with event_id, event_type, and the event payload so consumers
--- can update offsets and access structured data without an extra DB round-trip.
+--
+-- The notification carries event_id, event_type, and normally the payload too, so the consumer can
+-- dispatch and read structured data without a second round trip.
+--
+-- "Normally" is load-bearing. pg_notify rejects a payload of 8000 bytes or more, and this trigger
+-- is AFTER INSERT FOR EACH ROW, so that rejection propagates and rolls back the emit_event insert
+-- that caused it. The event row would be lost entirely -- and worse, the startup recovery scan
+-- looks for requests with no terminal outcome, so a completed row lost this way reads as a command
+-- that never finished and gets replayed.
+--
+-- That is reachable rather than theoretical: completed payloads deliberately carry per-run
+-- summaries, and those grow with session activity. So the payload is included only when the whole
+-- notification fits, and omitted with payload_truncated set otherwise. The consumer reads the row
+-- by event_id in that case. The 7900-byte bound leaves room for the enclosing JSON.
 CREATE OR REPLACE FUNCTION notify_event() RETURNS trigger AS $$
+DECLARE
+    full_notification TEXT;
 BEGIN
-    PERFORM pg_notify('events',
-        json_build_object(
-            'event_id',   NEW.id,
-            'event_type', NEW.event_type,
-            'payload',    NEW.payload
-        )::text
-    );
+    full_notification := json_build_object(
+        'event_id',   NEW.id,
+        'event_type', NEW.event_type,
+        'payload',    NEW.payload
+    )::text;
+
+    IF octet_length(full_notification) < 7900 THEN
+        PERFORM pg_notify('events', full_notification);
+    ELSE
+        PERFORM pg_notify('events',
+            json_build_object(
+                'event_id',          NEW.id,
+                'event_type',        NEW.event_type,
+                'payload_truncated', TRUE
+            )::text
+        );
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -304,120 +266,83 @@ BEGIN
 END;
 $do$;
 
--- emit_event: inserts an event row; the trigger fires pg_notify automatically
+-- emit_event: inserts an event row; the trigger fires pg_notify automatically.
 CREATE OR REPLACE FUNCTION emit_event(event_type TEXT, payload JSONB) RETURNS void AS $$
 BEGIN
     INSERT INTO events (event_type, payload) VALUES (event_type, payload);
 END;
 $$ LANGUAGE plpgsql;
 
--- event_consumer_offsets: tracks per-consumer polling progress for restart recovery
-CREATE TABLE IF NOT EXISTS event_consumer_offsets (
-    consumer_name  TEXT        PRIMARY KEY,
-    last_event_id  BIGINT      NOT NULL DEFAULT 0,
-    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- ---------------------------------------------------------------------------
+-- Schedule
+-- ---------------------------------------------------------------------------
+--
+-- Six jobs. Every one fires across both DST-candidate UTC hours and gates on the actual Eastern
+-- time in its WHERE clause, so a DST transition needs no schema re-apply. Every job is named for
+-- the event it emits.
+--
+-- For the once-daily jobs the gate is lateness tolerance, not a window centred on a target: it
+-- starts at the scheduled minute and runs long enough that pg_cron delayed by a busy database
+-- still lands inside it. The only hard bound is that a gate must not also match the firing an hour
+-- later, so anything under 60 minutes is safe.
+--
+-- Holidays are not gated here. The trading calendar lives in an in-memory cache refreshed from
+-- Alpaca rather than in a table, so SQL cannot consult it; the handlers check the calendar and
+-- return early. A market holiday therefore costs a day of no-op events, which is cheaper than
+-- keeping a calendar table alive solely to answer a WHERE clause.
 
--- equity_predictions: model output quantiles (purged nightly by unified database purge)
--- Columns match the Prediction struct in src/data/types.rs and
--- the predictions_schema pandera definition in the inference module.
--- timestamp is TIMESTAMPTZ; callers convert from Unix milliseconds at write time.
--- Identity is (ticker, timestamp) — the TimescaleDB primary key; no surrogate id column.
-CREATE TABLE IF NOT EXISTS equity_predictions (
-    correlation_id  UUID             NOT NULL,
-    model_run_id    TEXT             NOT NULL,
-    ticker          TEXT             NOT NULL,
-    timestamp       TIMESTAMPTZ      NOT NULL,
-    quantile_10     DOUBLE PRECISION NOT NULL,
-    quantile_50     DOUBLE PRECISION NOT NULL,
-    quantile_90     DOUBLE PRECISION NOT NULL,
-    created_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    PRIMARY KEY (ticker, timestamp)
-);
-
-SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exists => TRUE);
-SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
-
--- Session cron jobs: one pre-market prediction request plus a session-start
--- trigger. Consumers listen on the 'events' channel; live quotes reach the
--- portfolio service over the in-memory broadcast channel and are never
--- persisted, so no table mediates this path.
+-- Pre-open predictions: weekdays at 09:00 Eastern, 30 minutes ahead of a regular open so
+-- predictions are ready for the first evaluation pass. The handler resolves the newest model
+-- artifact, runs inference, writes equity_predictions, and warms the calendar and universe caches.
 DO $do$
 BEGIN
-    -- Pre-market prediction request: weekdays at 09:00 Eastern, 30 minutes ahead
-    -- of a regular open so predictions are ready for the first evaluation pass.
-    -- Fires in UTC hours 13-14 to cover both EDT and EST, gated on the actual
-    -- Eastern time so DST needs no schema re-apply. Holidays are handled by the
-    -- inference consumer, not here.
-    --
-    -- The gate width is lateness tolerance, not a window centred on a target:
-    -- it starts at the scheduled minute and runs 20 minutes. pg_cron delayed
-    -- past it -- a busy database at startup, a backed-up job queue -- misses the
-    -- day entirely. The only hard bound is that a gate must not also match the
-    -- other firing an hour later, so anything under 60 minutes is safe.
-    --
-    -- Every job that emits an event is named for the event it emits.
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'equity-predictions-requested') THEN
-        PERFORM cron.unschedule('equity-predictions-requested');
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'predictions-requested') THEN
+        PERFORM cron.unschedule('predictions-requested');
     END IF;
     PERFORM cron.schedule(
-        'equity-predictions-requested',
+        'predictions-requested',
         '0 13,14 * * 1-5',
-        $$SELECT emit_event('equity_predictions_requested', '{"reason": "pre_market"}'::jsonb)
+        $$SELECT emit_event('predictions_requested', '{"reason": "pre_open"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00'
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:20'$$
-    );
-
-    -- There is deliberately no evaluation job here. A five-minute heartbeat used to
-    -- run a full rebalance pass whether or not anything had changed: up to 78 passes
-    -- a session, each re-ranking the candidate reservoir and re-pricing every open leg
-    -- to usually conclude that nothing should happen. Intraday work is driven by the
-    -- live-quote evaluator instead, which emits portfolio_evaluation_requested only
-    -- when a spread actually crosses a close threshold. Cron opens and closes the
-    -- session; it does not drive the work in between.
-
-    -- Session start: weekdays at 09:25 Eastern, five minutes ahead of a regular
-    -- open. The portfolio consumer confirms against Alpaca's clock that the
-    -- market actually trades today, so a holiday costs one no-op event; the
-    -- schedule itself only needs to exclude weekends. Fires in UTC hours 13-14
-    -- to cover both EDT and EST, gated on the actual Eastern time so DST needs
-    -- no schema re-apply.
-    --
-    -- 20 minutes of lateness tolerance, per the note above. The gate start stays
-    -- at 09:25: it is five minutes before the bell on purpose, so the consumer
-    -- can reconcile, confirm the session, arm the liquidation timer, and build
-    -- the portfolio before the open.
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'trading-session-started') THEN
-        PERFORM cron.unschedule('trading-session-started');
-    END IF;
-    PERFORM cron.schedule(
-        'trading-session-started',
-        '25 13,14 * * 1-5',
-        $$SELECT emit_event('trading_session_started', '{"reason": "scheduled_open"}'::jsonb)
-          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:25'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:45'$$
     );
 END;
 $do$;
 
--- End-of-day liquidation trigger: weekdays at 3:45 PM Eastern Time (15 minutes before market close).
--- Fires in the UTC range 19-20 (covering 15:45 EDT and 15:45 EST) with an inline WHERE clause
--- that gates on the actual Eastern time, so DST is handled correctly year-round without needing
--- to re-apply the schema after a DST transition.
--- This is the fail-safe path only. On trading_session_started the portfolio consumer reads the real
--- close from Alpaca and arms a one-shot timer for 15 minutes before it, which pulls liquidation
--- forward on early-close days when this fixed 15:45 schedule would fire hours after the market shut.
--- This job still fires unconditionally so an unreachable Alpaca clock cannot leave positions open
--- overnight; liquidation is idempotent, so both paths firing is harmless. The payload names this
--- path so the handler can tell it from the timer: a fail-safe that fires and finds the book already
--- flat is the healthy case and says so, while one that finds open positions means the primary path
--- failed and is worth a warning.
+-- Portfolio evaluation: every five minutes through the regular session.
 --
--- The gate stops at 15:59 rather than taking the full 20 minutes of tolerance the session jobs get.
--- Neither handle_portfolio_liquidation nor run_end_of_day_liquidation checks the market session, and
--- DELETE /v2/positions submits market orders, so a trigger arriving after 16:00 would attempt
--- liquidation into a shut market -- worse than not firing, because the fail-safe would appear to
--- have run.
+-- The gate here is a window rather than a lateness tolerance, which is the one place this file
+-- departs from the convention above -- a recurring job has no single target minute to be late for.
+-- UTC hours 13-20 cover 09:30-15:40 Eastern in both DST regimes.
+--
+-- Evaluation stops at 15:40 while liquidation fires at 15:45: entries stop before exits do, and the
+-- final pass gets five minutes to finish before the fail-safe. The handler additionally refuses to
+-- open a pair within 30 minutes of the close, so the last productive entry pass is around 15:10.
+DO $do$
+BEGIN
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-evaluation-requested') THEN
+        PERFORM cron.unschedule('portfolio-evaluation-requested');
+    END IF;
+    PERFORM cron.schedule(
+        'portfolio-evaluation-requested',
+        '*/5 13-20 * * 1-5',
+        $$SELECT emit_event('portfolio_evaluation_requested', '{"reason": "scheduled"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:30'
+            AND (now() AT TIME ZONE 'America/New_York')::time <= TIME '15:40'$$
+    );
+END;
+$do$;
+
+-- End-of-day liquidation: weekdays at 15:45 Eastern, 15 minutes before a regular close.
+--
+-- The book is flat overnight without exception, and this is the job that guarantees it. The gate
+-- stops at 15:59 rather than taking a longer tolerance because liquidation submits market orders:
+-- a trigger arriving after 16:00 would attempt to liquidate into a shut market, which is worse than
+-- not firing, since the fail-safe would appear to have run.
+--
+-- On an early-close day this fires hours after the market shut and finds the book already flat,
+-- because the evaluation handler reads the real close from the cached calendar and liquidates
+-- against that. Liquidation is idempotent, so both paths firing is harmless.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'portfolio-liquidation-requested') THEN
@@ -425,100 +350,56 @@ BEGIN
     END IF;
     PERFORM cron.schedule(
         'portfolio-liquidation-requested',
-        '45 19-20 * * 1-5',
-        $$SELECT emit_event('portfolio_liquidation_requested', '{"reason": "fail_safe_schedule"}'::jsonb)
+        '45 19,20 * * 1-5',
+        $$SELECT emit_event('portfolio_liquidation_requested', '{"reason": "scheduled"}'::jsonb)
           WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '15:45'
             AND (now() AT TIME ZONE 'America/New_York')::time < TIME '15:59'$$
     );
 END;
 $do$;
 
--- Nightly database export: weekdays at 21:45 UTC.
--- Exports all ephemeral tables to S3 Parquet, then chains backup and purge via events:
--- database_export → database_backup → database_purge.
+-- Account sync: weekdays at 16:15 Eastern, 15 minutes after the close.
+-- Fetches account balances and activities from Alpaca, writes account_snapshots and
+-- account_activities, and attributes realized profit and loss back to the session's closed pairs.
 DO $do$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'database-export-requested') THEN
-        PERFORM cron.schedule(
-            'database-export-requested',
-            '45 21 * * 1-5',
-            $$SELECT emit_event('database_export_requested', json_build_object('date', CURRENT_DATE::text)::jsonb)$$
-        );
-    END IF;
-END;
-$do$;
-
--- Market calendar sync: daily at 04:00 UTC, ahead of the 05:00 bars sync that depends on
--- trading-day arithmetic. Refreshes the published NYSE session calendar from Alpaca, which is the
--- only source that knows about half-days -- the hardcoded holiday table in market_calendar.rs
--- cannot express a 13:00 close, and treats every early-close day as a full session.
--- Daily rather than weekly so a newly published holiday or shortened session is picked up promptly
--- and the forward horizon rolls with the date, at a cost of one API call a day.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-calendar-sync-requested') THEN
-        PERFORM cron.unschedule('market-calendar-sync-requested');
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'account-sync-requested') THEN
+        PERFORM cron.unschedule('account-sync-requested');
     END IF;
     PERFORM cron.schedule(
-        'market-calendar-sync-requested',
-        '0 4 * * *',
-        $$SELECT emit_event('market_calendar_sync_requested', '{"reason": "scheduled"}'::jsonb)$$
+        'account-sync-requested',
+        '15 20,21 * * 1-5',
+        $$SELECT emit_event('account_sync_requested', '{"reason": "post_close"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '16:15'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:35'$$
     );
 END;
 $do$;
 
--- Scheduled health check: weekdays at 10:00 Eastern.
--- Runs the same pg_cron job validation and event freshness checks the data service runs at startup.
--- Both are needed and they answer different questions: startup asks "did we miss anything while we
--- were down", this asks "has anything stopped while we were up". The application runs under a tmux
--- restart loop and can stay up for weeks, during which a silently stopped cron job produced no
--- warning from anywhere.
--- Timed after the session should have started, so a missed trading_session_started is caught the
--- same morning rather than the next day. Fires in UTC hours 14-15 to cover both EDT and EST, gated
--- on the actual Eastern time so DST needs no schema re-apply.
+-- Market data sync: weekdays at 16:30 Eastern.
+-- Pulls the session's bars and any equity detail changes from Alpaca into PostgreSQL, then chains
+-- the database export on completion. The export is chained rather than scheduled so it cannot run
+-- against a half-synced database; the purge runs inside the export handler once S3 has the data.
+--
+-- This path does not feed the trainer. The trainer fetches its own data from Alpaca on its own VM
+-- and shares only the fetch code, so a failure here costs a backup rather than the next day's model.
 DO $do$
 BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'scheduler-health-check-requested') THEN
-        PERFORM cron.unschedule('scheduler-health-check-requested');
+    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-data-sync-requested') THEN
+        PERFORM cron.unschedule('market-data-sync-requested');
     END IF;
     PERFORM cron.schedule(
-        'scheduler-health-check-requested',
-        '0 14,15 * * 1-5',
-        $$SELECT emit_event('scheduler_health_check_requested', '{"reason": "scheduled"}'::jsonb)
-          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '10:00'
-            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '10:20'$$
+        'market-data-sync-requested',
+        '30 20,21 * * 1-5',
+        $$SELECT emit_event('market_data_sync_requested', '{"reason": "post_close"}'::jsonb)
+          WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '16:30'
+            AND (now() AT TIME ZONE 'America/New_York')::time < TIME '16:50'$$
     );
 END;
 $do$;
 
--- Model artifact check: weekdays at 06:30, 12:30 and 13:30 UTC.
--- The trainer has no database connection -- PostgreSQL is bound to 127.0.0.1 -- so the application
--- cannot enforce the ordering of sync, training, and prediction across the VM boundary. It observes
--- it instead: this check turns a training run that did not happen into an event rather than silence.
--- 06:30 is thirty minutes after the trainer's 06:00 crontab entry on its own VM, which is ample for
--- a normal run but not for a slow one. Training or upload finishing after 06:30 leaves that check
--- resolving the previous artifact and emitting nothing, so the day's predictions would run against
--- a stale model and the new one would go unnoticed until the next weekday.
--- The 12:30 and 13:30 firings close that window: one of the two lands at 08:30 Eastern in each DST
--- regime, half an hour before the pre-market prediction request, and the other is redundant.
--- No Eastern gate, unlike the session jobs, because the handler is idempotent -- an artifact
--- already recorded resolves as unchanged and emits nothing -- so a redundant firing costs one S3
--- listing and one query. A gate would buy nothing and add a second thing to keep correct.
-DO $do$
-BEGIN
-    IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'model-artifact-check-requested') THEN
-        PERFORM cron.unschedule('model-artifact-check-requested');
-    END IF;
-    PERFORM cron.schedule(
-        'model-artifact-check-requested',
-        '30 6,12,13 * * 1-5',
-        $$SELECT emit_event('model_artifact_check_requested', '{"reason": "scheduled"}'::jsonb)$$
-    );
-END;
-$do$;
-
--- Daily cleanup of pg_cron run history: retain 7 days to keep the table small
--- while providing enough history for health monitoring and debugging.
+-- Daily cleanup of pg_cron run history: retain 7 days, which is enough for health monitoring and
+-- debugging without letting the table grow unbounded.
 DO $do$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'cron-run-details-cleanup') THEN

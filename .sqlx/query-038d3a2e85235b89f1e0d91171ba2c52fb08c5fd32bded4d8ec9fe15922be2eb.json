@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id!\", activity_type AS \"activity_type!\",\n                  transaction_time AS \"transaction_time!\", ticker, side,\n                  quantity::double precision AS quantity,\n                  price::double precision AS price,\n                  order_id\n           FROM account_activities\n           WHERE transaction_time >= $1 AND transaction_time < $2\n           ORDER BY transaction_time",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "activity_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_time!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "ticker",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "side",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "quantity",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "price",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 7,
+        "name": "order_id",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      null,
+      true
+    ]
+  },
+  "hash": "038d3a2e85235b89f1e0d91171ba2c52fb08c5fd32bded4d8ec9fe15922be2eb"
+}
