@@ -416,7 +416,7 @@ async fn run_listener(
     run_event_listener(
         pool,
         shutdown_token,
-        CONSUMER_DATA_EQUITY_BARS_SYNC,
+        "data",
         || run_startup_catch_up(state, pool),
         |notification| async move {
             let event_id = notification.event_id();
@@ -438,10 +438,28 @@ async fn run_listener(
                     handle_database_purge(pool, event_id).await;
                 }
                 // Every consumer receives every event; the rest belong to other
-                // services or are audit records. The match exists so a new
-                // variant is a compile-time decision rather than a silent
-                // omission.
-                _ => {}
+                // services or are audit records. Listed rather than caught by a
+                // wildcard so that adding a family, or an `Outcome` to one of
+                // the families this consumer handles, fails the build here
+                // instead of being silently ignored.
+                EventType::EquityBarsSync(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::DatabaseExport(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::DatabaseBackup(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::DatabasePurge(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::EquityPredictions(_)
+                | EventType::PortfolioRebalance(_)
+                | EventType::PortfolioLiquidation(_)
+                | EventType::TradingSessionStarted
+                | EventType::PortfolioEvaluationRequested
+                | EventType::StressTest => {}
             }
         },
     )

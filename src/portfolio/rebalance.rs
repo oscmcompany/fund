@@ -71,17 +71,74 @@ use crate::portfolio::statistical_arbitrage::{
 /// Outcome of a completed rebalance cycle.
 #[derive(Debug)]
 pub struct RebalanceOutcome {
-    pub session_id: Uuid,
-    pub pairs_opened: usize,
-    pub pairs_closed: usize,
-    pub pairs_kept: usize,
-    pub net_asset_value: f64,
+    session_id: Uuid,
+    pairs_opened: usize,
+    pairs_closed: usize,
+    pairs_kept: usize,
+    net_asset_value: f64,
+    close_signals: Vec<(PairID, CloseReason)>,
+}
+
+impl RebalanceOutcome {
+    /// Constructs an outcome from a completed rebalance cycle.
+    ///
+    /// `close_signals` are the pairs the exit evaluation signalled to close,
+    /// with their reasons; `pairs_closed` counts the subset the broker then
+    /// accepted. A pass cannot close more pairs than it signalled, so the two
+    /// disagreeing means a caller has mixed up which quantity it holds.
+    pub fn new(
+        session_id: Uuid,
+        pairs_opened: usize,
+        pairs_closed: usize,
+        pairs_kept: usize,
+        net_asset_value: f64,
+        close_signals: Vec<(PairID, CloseReason)>,
+    ) -> Self {
+        debug_assert!(
+            pairs_closed <= close_signals.len(),
+            "closed {pairs_closed} pairs from {} close signals",
+            close_signals.len()
+        );
+        Self {
+            session_id,
+            pairs_opened,
+            pairs_closed,
+            pairs_kept,
+            net_asset_value,
+            close_signals,
+        }
+    }
+
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn pairs_opened(&self) -> usize {
+        self.pairs_opened
+    }
+
+    /// Pairs the broker accepted a close for. Never exceeds
+    /// [`Self::close_signals`]`.len()`.
+    pub fn pairs_closed(&self) -> usize {
+        self.pairs_closed
+    }
+
+    pub fn pairs_kept(&self) -> usize {
+        self.pairs_kept
+    }
+
+    pub fn net_asset_value(&self) -> f64 {
+        self.net_asset_value
+    }
+
     /// Pairs the exit evaluation signalled to close, with the reason.
     ///
     /// Carried so a caller can tell whether the pass agreed with whatever
-    /// flagged it. Distinct from `pairs_closed`, which counts the closes that
-    /// the broker then accepted.
-    pub close_signals: Vec<(PairID, CloseReason)>,
+    /// flagged it, which is a different question from whether the close then
+    /// succeeded.
+    pub fn close_signals(&self) -> &[(PairID, CloseReason)] {
+        &self.close_signals
+    }
 }
 
 /// Error returned when `run_rebalance` cannot complete the cycle.
@@ -481,14 +538,14 @@ pub async fn run_rebalance(
         "Rebalance cycle completed"
     );
 
-    Ok(RebalanceOutcome {
+    Ok(RebalanceOutcome::new(
         session_id,
         pairs_opened,
         pairs_closed,
         pairs_kept,
         net_asset_value,
-        close_signals: close_signal_summary,
-    })
+        close_signal_summary,
+    ))
 }
 
 /// Reasons entry evaluation can be skipped without aborting the full cycle.
@@ -2082,18 +2139,20 @@ mod tests {
 
     #[test]
     fn test_rebalance_outcome_fields() {
-        let outcome = RebalanceOutcome {
-            session_id: Uuid::new_v4(),
-            pairs_opened: 3,
-            pairs_closed: 2,
-            pairs_kept: 8,
-            net_asset_value: 500_000.0,
-            close_signals: Vec::new(),
-        };
-        assert_eq!(outcome.pairs_opened, 3);
-        assert_eq!(outcome.pairs_closed, 2);
-        assert_eq!(outcome.pairs_kept, 8);
-        assert_eq!(outcome.net_asset_value, 500_000.0);
+        // Two closes need two signals behind them; the constructor asserts it.
+        let signals = vec![
+            (
+                PairID::parse("AAPL-MSFT").unwrap(),
+                CloseReason::ProfitTaken,
+            ),
+            (PairID::parse("KO-PEP").unwrap(), CloseReason::StopLoss),
+        ];
+        let outcome = RebalanceOutcome::new(Uuid::new_v4(), 3, 2, 8, 500_000.0, signals);
+        assert_eq!(outcome.pairs_opened(), 3);
+        assert_eq!(outcome.pairs_closed(), 2);
+        assert_eq!(outcome.pairs_kept(), 8);
+        assert_eq!(outcome.net_asset_value(), 500_000.0);
+        assert_eq!(outcome.close_signals().len(), 2);
     }
 
     // --- evaluate_open_pairs tests ---

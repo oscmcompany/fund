@@ -17,9 +17,9 @@ use rust_decimal::Decimal;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::common::events::{EventNotification, EventType};
+use crate::common::events::{EventNotification, EventType, NotificationParseFailure};
 use crate::domain::market::{PairID, Ticker};
 use crate::domain::trading::CloseReason;
 
@@ -285,12 +285,19 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
             loop {
                 match listener.recv().await {
                     Ok(notification) => {
-                        let Some(parsed) = EventNotification::parse(notification.payload()) else {
-                            warn!(
-                                payload = notification.payload(),
-                                "Skipping unparseable or unrecognised event notification"
-                            );
-                            continue;
+                        let parsed = match EventNotification::parse(notification.payload()) {
+                            Ok(parsed) => parsed,
+                            Err(NotificationParseFailure::Malformed) => {
+                                warn!(
+                                    payload = notification.payload(),
+                                    "Skipping malformed event notification"
+                                );
+                                continue;
+                            }
+                            Err(NotificationParseFailure::UnknownEventType(event_type)) => {
+                                debug!(event_type, "Skipping event type this build does not know");
+                                continue;
+                            }
                         };
                         let entry = EventEntry {
                             event_id: parsed.event_id(),

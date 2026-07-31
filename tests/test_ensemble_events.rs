@@ -184,6 +184,13 @@ async fn test_insert_predictions_writes_rows() {
 // Every test tags its events with a unique marker in the payload and ignores
 // anything else, since the channel is shared with whatever else is running.
 
+/// How long a cancelled listener is given to return before the test fails.
+///
+/// Without this the four tests below would hang rather than fail if
+/// `run_event_listener` stopped returning on cancellation, which turns a clear
+/// regression into a silent CI timeout.
+const LISTENER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Emits a `stress_test` event carrying a unique marker.
 async fn emit_marked_event(pool: &sqlx::PgPool, marker: &str) {
     emit_event(
@@ -246,7 +253,11 @@ async fn test_run_event_listener_dispatches_notifications_to_the_handler() {
     }
 
     token.cancel();
-    listener.await.unwrap().unwrap();
+    tokio::time::timeout(LISTENER_EXIT_TIMEOUT, listener)
+        .await
+        .expect("listener did not exit after cancellation")
+        .unwrap()
+        .unwrap();
 
     let received = seen.lock().await;
     assert_eq!(
@@ -286,7 +297,11 @@ async fn test_run_event_listener_runs_catch_up_before_dispatching() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     token.cancel();
-    listener.await.unwrap().unwrap();
+    tokio::time::timeout(LISTENER_EXIT_TIMEOUT, listener)
+        .await
+        .expect("listener did not exit after cancellation")
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         catch_up_runs.load(Ordering::SeqCst),
@@ -318,7 +333,11 @@ async fn test_run_event_listener_exits_promptly_when_cancelled_while_idle() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let cancelled_at = tokio::time::Instant::now();
     token.cancel();
-    listener.await.unwrap().unwrap();
+    tokio::time::timeout(LISTENER_EXIT_TIMEOUT, listener)
+        .await
+        .expect("listener did not exit after cancellation")
+        .unwrap()
+        .unwrap();
 
     assert!(
         cancelled_at.elapsed() < Duration::from_secs(2),
@@ -376,7 +395,11 @@ async fn test_run_event_listener_finishes_an_in_flight_handler_before_exiting() 
     );
     token.cancel();
 
-    listener.await.unwrap().unwrap();
+    tokio::time::timeout(LISTENER_EXIT_TIMEOUT, listener)
+        .await
+        .expect("listener did not exit after cancellation")
+        .unwrap()
+        .unwrap();
     assert_eq!(
         handler_finished.load(Ordering::SeqCst),
         1,

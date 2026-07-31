@@ -347,6 +347,11 @@ pub enum RebalanceTrigger {
     /// Nothing emits this. It exists so rows already in
     /// `equity_rebalance_sessions` still round-trip, rather than being silently
     /// relabelled as one of the real triggers.
+    ///
+    /// The explicit rename keeps the Serde form equal to [`Self::as_str`]. It is
+    /// the only variant where `rename_all = "snake_case"` would disagree, which
+    /// is exactly why it is easy to miss.
+    #[serde(rename = "portfolio_evaluation")]
     Legacy,
 }
 
@@ -363,8 +368,11 @@ impl RebalanceTrigger {
         }
     }
 
-    /// Parses a stored `trigger_reason`. Returns `None` for unknown values,
-    /// which includes every row written before this became an enum.
+    /// Parses a stored `trigger_reason`.
+    ///
+    /// Rows written before this became a closed set carry `"portfolio_evaluation"`
+    /// and map to [`RebalanceTrigger::Legacy`]. `None` means a value no build has
+    /// ever written.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "session_start" => Some(Self::SessionStart),
@@ -1067,6 +1075,19 @@ mod tests {
                 Some(trigger),
                 "round-trip failed for {trigger:?}"
             );
+
+            // The Serde form must equal as_str, or a value written through one
+            // path fails to read back through the other. `Legacy` is the only
+            // variant where the derived snake_case name would disagree, which is
+            // exactly why testing only as_str/parse would miss it.
+            let serialized = serde_json::to_string(&trigger).unwrap();
+            assert_eq!(
+                serialized,
+                format!("\"{stored}\""),
+                "serde form diverges from as_str for {trigger:?}"
+            );
+            let deserialized: RebalanceTrigger = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(deserialized, trigger);
         }
     }
 

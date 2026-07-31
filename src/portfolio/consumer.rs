@@ -108,7 +108,7 @@ async fn run_consumer(
     run_event_listener(
         pool,
         shutdown_token,
-        CONSUMER_PORTFOLIO,
+        "portfolio",
         || run_startup_catch_up(state, pool, shutdown_token),
         |notification| async move {
             let event_id = notification.event_id();
@@ -136,10 +136,20 @@ async fn run_consumer(
                     handle_portfolio_liquidation(state, pool, event_id).await;
                 }
                 // Every consumer receives every event; the rest belong to other
-                // services or are audit records. The match exists so a new
-                // variant is a compile-time decision rather than a silent
-                // omission.
-                _ => {}
+                // services or are audit records. Listed rather than caught by a
+                // wildcard so that adding a family, or an `Outcome` to a family
+                // this consumer partly handles, fails the build here instead of
+                // being silently ignored.
+                EventType::EquityPredictions(Outcome::Requested | Outcome::Started)
+                | EventType::PortfolioLiquidation(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::EquityBarsSync(_)
+                | EventType::DatabaseExport(_)
+                | EventType::DatabaseBackup(_)
+                | EventType::DatabasePurge(_)
+                | EventType::PortfolioRebalance(_)
+                | EventType::StressTest => {}
             }
         },
     )
@@ -622,10 +632,10 @@ async fn run_rebalance_pass(
     match run_rebalance(state, trigger).await {
         Ok(outcome) => {
             info!(
-                session_id = %outcome.session_id,
-                pairs_opened = outcome.pairs_opened,
-                pairs_closed = outcome.pairs_closed,
-                pairs_kept = outcome.pairs_kept,
+                session_id = %outcome.session_id(),
+                pairs_opened = outcome.pairs_opened(),
+                pairs_closed = outcome.pairs_closed(),
+                pairs_kept = outcome.pairs_kept(),
                 "Rebalance completed from event"
             );
             return Some(outcome);
@@ -690,7 +700,7 @@ fn report_trigger_disagreement(payload: &serde_json::Value, outcome: &RebalanceO
         return;
     };
     let agreed = outcome
-        .close_signals
+        .close_signals()
         .iter()
         .any(|(pair_id, _)| pair_id.as_str() == flagged_pair);
     if agreed {
@@ -699,8 +709,8 @@ fn report_trigger_disagreement(payload: &serde_json::Value, outcome: &RebalanceO
     warn!(
         pair_id = flagged_pair,
         trigger_z_score = payload.get("z_score").and_then(|value| value.as_f64()),
-        pairs_closed = outcome.pairs_closed,
-        close_signals = outcome.close_signals.len(),
+        pairs_closed = outcome.pairs_closed(),
+        close_signals = outcome.close_signals().len(),
         "Live evaluator flagged a pair the rebalance pass did not close"
     );
 }
@@ -781,22 +791,23 @@ mod tests {
 
     /// Builds an outcome whose exit evaluation signalled the given pairs.
     fn outcome_closing(pairs: &[&str]) -> RebalanceOutcome {
-        RebalanceOutcome {
-            session_id: uuid::Uuid::new_v4(),
-            pairs_opened: 0,
-            pairs_closed: pairs.len(),
-            pairs_kept: 0,
-            net_asset_value: 1_000_000.0,
-            close_signals: pairs
-                .iter()
-                .map(|pair| {
-                    (
-                        PairID::parse(pair).expect("test pair id should be valid"),
-                        CloseReason::StopLoss,
-                    )
-                })
-                .collect(),
-        }
+        let close_signals = pairs
+            .iter()
+            .map(|pair| {
+                (
+                    PairID::parse(pair).expect("test pair id should be valid"),
+                    CloseReason::StopLoss,
+                )
+            })
+            .collect::<Vec<_>>();
+        RebalanceOutcome::new(
+            uuid::Uuid::new_v4(),
+            0,
+            close_signals.len(),
+            0,
+            1_000_000.0,
+            close_signals,
+        )
     }
 
     #[test]

@@ -78,7 +78,7 @@ async fn run_consumer(
     run_event_listener(
         pool,
         shutdown_token,
-        CONSUMER_INFERENCE,
+        "inference",
         || async {
             // Catch up on an equity_predictions_requested that arrived while we
             // were down.
@@ -105,11 +105,23 @@ async fn run_consumer(
                     info!(event_id, "Received equity_predictions_requested");
                     handle_equity_predictions_requested(state, pool, event_id).await;
                 }
-                // Every consumer receives every event, so the catch-all is
-                // mostly other services' traffic. Inference acts on nothing
-                // else; the match exists so a new variant is a compile-time
-                // decision rather than a silent omission.
-                _ => {}
+                // Every consumer receives every event, so most of this is other
+                // services' traffic. Inference acts on nothing else. Listed
+                // rather than caught by a wildcard so that adding a family, or
+                // an `Outcome` to the family this consumer does handle, fails
+                // the build here instead of being silently ignored.
+                EventType::EquityPredictions(
+                    Outcome::Started | Outcome::Completed | Outcome::Errored,
+                )
+                | EventType::EquityBarsSync(_)
+                | EventType::DatabaseExport(_)
+                | EventType::DatabaseBackup(_)
+                | EventType::DatabasePurge(_)
+                | EventType::PortfolioRebalance(_)
+                | EventType::PortfolioLiquidation(_)
+                | EventType::TradingSessionStarted
+                | EventType::PortfolioEvaluationRequested
+                | EventType::StressTest => {}
             }
         },
     )
