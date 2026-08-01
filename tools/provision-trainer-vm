@@ -8,7 +8,15 @@ set -euo pipefail
 #
 # The trainer VM runs no persistent services. It bootstraps the devenv
 # environment. After provisioning, SSH in and run start-trainer to install
-# the training cron job (weekdays 06:00 UTC).
+# the training cron job (weekdays 23:00 UTC, post-close Eastern) and the
+# per-minute sync cron job.
+#
+# Secrets reach the VM the same way the application VM's do: provision-common-vm
+# writes AWS credentials, and secretspec resolves the rest from Secrets Manager
+# under the VM's profile at run time. The trainer needs MASSIVE_BASE_URL and
+# MASSIVE_API_KEY now that it fetches its own bars. It needs no Alpaca
+# credentials at all -- it has no account to query and no symbol list to build,
+# because the grouped endpoint answers by date.
 # --------------------------------------------------------------------------- #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +29,7 @@ usage() {
   echo "Usage: $(basename "$0") --environment <development|production>"
   echo ""
   echo "Provision an oscm-fund trainer VM on exe.dev."
-  echo "After provisioning, run start-trainer to install the training cron job."
+  echo "After provisioning, run start-trainer to install the training and sync cron jobs."
   echo ""
   echo "Options:"
   echo "  --environment   Required. Either 'development' or 'production'."
@@ -78,7 +86,7 @@ echo ""
 echo "Next steps:"
 echo "  ssh $VM_NAME.exe.xyz"
 if [[ "$PRODUCTION" == true ]]; then
-  echo "  start-trainer                         # install training cron job"
+  echo "  start-trainer                         # install training and sync cron jobs"
   echo "  tail -f /var/log/fund/train-tide-model.log  # follow training log"
 else
   echo "  cd ~/fund"

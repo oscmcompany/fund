@@ -1,753 +1,618 @@
-//! Read-only database queries for the dashboard service.
+//! Read-only queries behind the dashboard, and the aggregations computed from them.
 //!
-//! All queries use raw `sqlx::query` (no compile-time macros) so the
-//! dashboard has no `.sqlx` offline cache entries to maintain.
+//! Every query uses raw `sqlx::query` rather than the compile-time macros, so the dashboard adds
+//! no entries to the `.sqlx` offline cache. It connects as `dashboard_reader`, which holds SELECT
+//! on exactly the tables below and nothing else.
+//!
+//! The aggregations are separated from the queries deliberately: each is a pure function over rows
+//! it was handed, which is what makes win rate, profit factor, and period returns testable without
+//! a database.
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
-use num_traits::ToPrimitive;
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
+use tracing::warn;
 
+use crate::common::types::{PairID, Ticker};
 use crate::dashboard::cache::{
-    ClosedTrade, ClosedTradesSummary, ModelRunInformation, OpenPosition, PerformanceSnapshot,
-    PeriodReturns, PredictionRow,
+    AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
 };
+use crate::portfolio::pairs::CloseReason;
 
-/// How many days of performance snapshot history to fetch for Tab 2.
-const PERFORMANCE_HISTORY_DAYS: i64 = 365;
+/// Sessions of account history fetched for the equity curve.
+const EQUITY_HISTORY_DAYS: i64 = 365;
 
-/// Maximum number of closed trades to fetch for Tab 3.
-const CLOSED_TRADES_LIMIT: i64 = 200;
+/// Closed pairs fetched for the trade table and its summary.
+const CLOSED_PAIRS_LIMIT: i64 = 200;
 
-/// All data produced by a single poll cycle, consumed by [`fetch_dashboard_data`].
+/// Rows shown from the most recent prediction batch.
+const PREDICTIONS_LIMIT: i64 = 50;
+
+/// Events read from the table to seed the ring buffer at startup.
+const RECENT_EVENTS_LIMIT: i64 = 100;
+
+/// One poll cycle's worth of data.
 pub struct DashboardData {
-    pub open_positions: Vec<OpenPosition>,
-    pub gross_exposure: Decimal,
-    pub net_exposure: Decimal,
-    pub performance_history: Vec<PerformanceSnapshot>,
+    pub equity_history: Vec<AccountSnapshot>,
     pub period_returns: PeriodReturns,
-    pub closed_trades: Vec<ClosedTrade>,
-    pub closed_trades_summary: ClosedTradesSummary,
-    pub predictions: Vec<PredictionRow>,
-    pub model_run_information: Option<ModelRunInformation>,
+    pub open_pairs: Vec<OpenPair>,
+    pub closed_pairs: Vec<ClosedPair>,
+    pub closed_summary: ClosedSummary,
+    pub predictions: Vec<Prediction>,
+    pub prediction_model_run_id: Option<String>,
+    pub prediction_timestamp: Option<DateTime<Utc>>,
+    pub recent_events: Vec<EventEntry>,
     pub latest_bars_inserted_at: Option<DateTime<Utc>>,
-    pub last_rebalance_completed_at: Option<DateTime<Utc>>,
 }
 
-/// Fetches all data needed for a full dashboard state refresh.
-///
-/// Executes queries for all four static views sequentially against the
-/// read-only pool. A failure in any query returns an error for the whole
-/// cycle; the caller retains the previous state and records the error.
+/// Runs every query for one refresh. A failure in any one fails the cycle, and the caller keeps
+/// the previous state.
 pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::Error> {
-    let open_positions = fetch_open_positions(pool).await?;
-    let (gross_exposure, net_exposure) = compute_exposures(&open_positions);
-    let performance_history = fetch_performance_history(pool).await?;
-    let period_returns = compute_period_returns(&performance_history);
-    let closed_trades = fetch_closed_trades(pool).await?;
-    let closed_trades_summary = compute_closed_trades_summary(&closed_trades);
-    let predictions = fetch_latest_predictions(pool).await?;
-    let model_run_information = fetch_latest_model_run_information(pool).await?;
+    let equity_history = fetch_equity_history(pool).await?;
+    let period_returns = compute_period_returns(&equity_history);
+    let open_pairs = fetch_open_pairs(pool).await?;
+    let closed_pairs = fetch_closed_pairs(pool).await?;
+    let closed_summary = compute_closed_summary(&closed_pairs);
+    let (predictions, prediction_model_run_id, prediction_timestamp) =
+        fetch_latest_predictions(pool).await?;
+    let recent_events = fetch_recent_events(pool).await?;
     let latest_bars_inserted_at = fetch_latest_bars_inserted_at(pool).await?;
-    let last_rebalance_completed_at = fetch_last_rebalance_completed_at(pool).await?;
 
     Ok(DashboardData {
-        open_positions,
-        gross_exposure,
-        net_exposure,
-        performance_history,
+        equity_history,
         period_returns,
-        closed_trades,
-        closed_trades_summary,
+        open_pairs,
+        closed_pairs,
+        closed_summary,
         predictions,
-        model_run_information,
+        prediction_model_run_id,
+        prediction_timestamp,
+        recent_events,
         latest_bars_inserted_at,
-        last_rebalance_completed_at,
     })
 }
 
-/// Fetches all open long/short pair positions with per-leg dollar amounts.
-///
-/// Dollar amounts are summed from `equity_allocations` grouped by side so
-/// a single pair row represents both legs.
-async fn fetch_open_positions(pool: &PgPool) -> Result<Vec<OpenPosition>, sqlx::Error> {
+/// Fetches the account history oldest-first, which is the order every horizon calculation wants.
+async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT
-             p.pair_id,
-             p.long_ticker,
-             p.short_ticker,
-             p.z_score,
-             p.hedge_ratio,
-             p.signal_strength,
-             p.opened_at,
-             COALESCE(SUM(a.dollar_amount) FILTER (WHERE a.side = 'LONG'),  0) AS long_dollar_amount,
-             COALESCE(SUM(a.dollar_amount) FILTER (WHERE a.side = 'SHORT'), 0) AS short_dollar_amount
-         FROM equity_pairs p
-         LEFT JOIN equity_allocations a ON a.equity_pair_id = p.id
-         WHERE p.status = 'open'
-         GROUP BY p.id, p.pair_id, p.long_ticker, p.short_ticker,
-                  p.z_score, p.hedge_ratio, p.signal_strength, p.opened_at
-         ORDER BY p.opened_at DESC",
+        "SELECT session_date, equity, cash, buying_power, long_market_value, short_market_value
+         FROM account_snapshots
+         WHERE session_date >= CURRENT_DATE - ($1::BIGINT || ' days')::INTERVAL
+         ORDER BY session_date ASC",
     )
+    .bind(EQUITY_HISTORY_DAYS)
     .fetch_all(pool)
     .await?;
 
     rows.into_iter()
         .map(|row| {
-            Ok(OpenPosition {
-                pair_id: row.try_get::<crate::domain::market::PairID, _>("pair_id")?,
-                long_ticker: row.try_get::<crate::domain::market::Ticker, _>("long_ticker")?,
-                short_ticker: row.try_get::<crate::domain::market::Ticker, _>("short_ticker")?,
-                z_score: row.try_get("z_score")?,
-                hedge_ratio: row.try_get("hedge_ratio")?,
-                signal_strength: row.try_get("signal_strength")?,
-                long_dollar_amount: row.try_get("long_dollar_amount")?,
-                short_dollar_amount: row.try_get("short_dollar_amount")?,
-                opened_at: row.try_get("opened_at")?,
+            Ok(AccountSnapshot {
+                session_date: row.try_get("session_date")?,
+                equity: row.try_get("equity")?,
+                cash: row.try_get("cash")?,
+                buying_power: row.try_get("buying_power")?,
+                long_market_value: row.try_get("long_market_value")?,
+                short_market_value: row.try_get("short_market_value")?,
             })
         })
         .collect()
 }
 
-/// Computes gross and net exposure from the set of open positions.
+/// Fetches open pairs, newest first.
 ///
-/// Returns `(Decimal::ZERO, Decimal::ZERO)` when no positions are open.
-fn compute_exposures(positions: &[OpenPosition]) -> (Decimal, Decimal) {
-    if positions.is_empty() {
-        return (Decimal::ZERO, Decimal::ZERO);
-    }
-    let gross: Decimal = positions
-        .iter()
-        .map(|position| position.long_dollar_amount + position.short_dollar_amount)
-        .sum();
-    let net: Decimal = positions
-        .iter()
-        .map(|position| position.long_dollar_amount - position.short_dollar_amount)
-        .sum();
-    (gross, net)
-}
-
-/// Fetches portfolio NAV snapshots for the past year joined with SPY close prices.
-///
-/// SPY closes are pulled from `equity_bars` by matching date so the performance
-/// view can display a benchmark comparison without a separate SPY data source.
-/// Rows without a matching SPY bar have `spy_close = None`.
-async fn fetch_performance_history(pool: &PgPool) -> Result<Vec<PerformanceSnapshot>, sqlx::Error> {
-    let cutoff: DateTime<Utc> = Utc::now() - Duration::days(PERFORMANCE_HISTORY_DAYS);
+/// A row whose stored tickers no longer parse is skipped with a warning rather than failing the
+/// poll. The dashboard is an observer; a malformed row is something to report, not a reason to
+/// take the page down.
+async fn fetch_open_pairs(pool: &PgPool) -> Result<Vec<OpenPair>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT
-             s.snapshot_timestamp,
-             s.net_asset_value,
-             s.gross_return,
-             s.net_return,
-             s.total_slippage_cost,
-             b.close_price AS spy_close
-         FROM equity_portfolio_snapshots s
-         LEFT JOIN equity_bars b
-             ON b.ticker = 'SPY'
-             AND b.timestamp::date = s.snapshot_timestamp::date
-         WHERE s.snapshot_timestamp >= $1
-         ORDER BY s.snapshot_timestamp DESC",
-    )
-    .bind(cutoff)
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| {
-            Ok(PerformanceSnapshot {
-                snapshot_timestamp: row.try_get("snapshot_timestamp")?,
-                net_asset_value: row.try_get("net_asset_value")?,
-                gross_return: row.try_get("gross_return")?,
-                net_return: row.try_get("net_return")?,
-                total_slippage_cost: row.try_get("total_slippage_cost")?,
-                spy_close: row.try_get("spy_close")?,
-            })
-        })
-        .collect()
-}
-
-/// Fetches the most recent closed pair trades up to [`CLOSED_TRADES_LIMIT`].
-async fn fetch_closed_trades(pool: &PgPool) -> Result<Vec<ClosedTrade>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT
-             pair_id,
-             long_ticker,
-             short_ticker,
-             realized_profit_and_loss,
-             return_percent,
-             EXTRACT(EPOCH FROM (closed_at - opened_at))::BIGINT AS holding_seconds,
-             close_reason,
-             closed_at
+        "SELECT pair_id, long_ticker, short_ticker, hedge_ratio, entry_z_score,
+                signal_strength, opened_at
          FROM equity_pairs
-         WHERE status = 'closed'
+         WHERE status = 'open'
+         ORDER BY opened_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut pairs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_pair_id: String = row.try_get("pair_id")?;
+        let raw_long: String = row.try_get("long_ticker")?;
+        let raw_short: String = row.try_get("short_ticker")?;
+
+        let (Some(pair_id), Some(long_ticker), Some(short_ticker)) = (
+            PairID::parse(&raw_pair_id),
+            Ticker::new(&raw_long),
+            Ticker::new(&raw_short),
+        ) else {
+            warn!(pair_id = %raw_pair_id, "Open pair has unparseable identifiers, skipping");
+            continue;
+        };
+
+        pairs.push(OpenPair {
+            pair_id,
+            long_ticker,
+            short_ticker,
+            hedge_ratio: row.try_get("hedge_ratio")?,
+            entry_z_score: row.try_get("entry_z_score")?,
+            signal_strength: row.try_get("signal_strength")?,
+            opened_at: row.try_get("opened_at")?,
+        });
+    }
+    Ok(pairs)
+}
+
+/// Fetches recently closed pairs, newest first.
+///
+/// `closed_at` and `close_reason` are typed as nullable in the table but cannot be null on a closed
+/// row: `equity_pairs_closure_is_consistent` rejects that combination. The filter states the
+/// constraint anyway so the query does not depend on it, and a reason outside the vocabulary is
+/// skipped rather than guessed at.
+async fn fetch_closed_pairs(pool: &PgPool) -> Result<Vec<ClosedPair>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT pair_id, long_ticker, short_ticker, entry_z_score, realized_profit_and_loss,
+                close_reason, opened_at, closed_at
+         FROM equity_pairs
+         WHERE status = 'closed' AND closed_at IS NOT NULL AND close_reason IS NOT NULL
          ORDER BY closed_at DESC
          LIMIT $1",
     )
-    .bind(CLOSED_TRADES_LIMIT)
+    .bind(CLOSED_PAIRS_LIMIT)
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(ClosedTrade {
-                pair_id: row.try_get::<crate::domain::market::PairID, _>("pair_id")?,
-                long_ticker: row.try_get::<crate::domain::market::Ticker, _>("long_ticker")?,
-                short_ticker: row.try_get::<crate::domain::market::Ticker, _>("short_ticker")?,
-                realized_profit_and_loss: row.try_get("realized_profit_and_loss")?,
-                return_percent: row.try_get("return_percent")?,
-                holding_seconds: row.try_get("holding_seconds")?,
-                close_reason: row.try_get("close_reason")?,
-                closed_at: row.try_get("closed_at")?,
-            })
-        })
-        .collect()
-}
+    let mut pairs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_pair_id: String = row.try_get("pair_id")?;
+        let raw_long: String = row.try_get("long_ticker")?;
+        let raw_short: String = row.try_get("short_ticker")?;
+        let raw_reason: String = row.try_get("close_reason")?;
 
-/// Computes aggregate trade statistics from the fetched closed trades.
-///
-/// All metrics (win rate, profit factor, averages) are computed only from
-/// trades that have a non-null `realized_profit_and_loss` convertible to `f64`;
-/// `total_closed` reflects the full slice length regardless of null fields.
-/// Win rate is `None` when all trades are break-even (no winners or losers).
-/// Profit factor is `None` when there are no losing trades (gross loss is zero).
-pub fn compute_closed_trades_summary(trades: &[ClosedTrade]) -> ClosedTradesSummary {
-    let total_closed = trades.len();
-    if total_closed == 0 {
-        return ClosedTradesSummary::default();
-    }
-
-    let profit_and_loss_values: Vec<f64> = trades
-        .iter()
-        .filter_map(|trade| {
-            trade
-                .realized_profit_and_loss
-                .and_then(|value| value.to_f64())
-        })
-        .collect();
-
-    if profit_and_loss_values.is_empty() {
-        return ClosedTradesSummary {
-            total_closed,
-            ..Default::default()
+        let (Some(pair_id), Some(long_ticker), Some(short_ticker), Some(close_reason)) = (
+            PairID::parse(&raw_pair_id),
+            Ticker::new(&raw_long),
+            Ticker::new(&raw_short),
+            CloseReason::parse(&raw_reason),
+        ) else {
+            warn!(
+                pair_id = %raw_pair_id,
+                close_reason = %raw_reason,
+                "Closed pair has unparseable fields, skipping"
+            );
+            continue;
         };
+
+        pairs.push(ClosedPair {
+            pair_id,
+            long_ticker,
+            short_ticker,
+            entry_z_score: row.try_get("entry_z_score")?,
+            realized_profit_and_loss: row.try_get("realized_profit_and_loss")?,
+            close_reason,
+            opened_at: row.try_get("opened_at")?,
+            closed_at: row.try_get("closed_at")?,
+        });
     }
-
-    let winners: Vec<f64> = profit_and_loss_values
-        .iter()
-        .copied()
-        .filter(|&value| value > 0.0)
-        .collect();
-    let losers: Vec<f64> = profit_and_loss_values
-        .iter()
-        .copied()
-        .filter(|&value| value < 0.0)
-        .collect();
-
-    let decided = winners.len() + losers.len();
-    let win_rate = (decided > 0).then(|| winners.len() as f64 / decided as f64);
-
-    let gross_profit: f64 = winners.iter().sum();
-    let gross_loss: f64 = losers.iter().map(|value| value.abs()).sum();
-    let profit_factor = if gross_loss == 0.0 {
-        None
-    } else {
-        Some(gross_profit / gross_loss)
-    };
-
-    let return_values: Vec<f64> = trades
-        .iter()
-        .filter_map(|trade| trade.return_percent.and_then(|value| value.to_f64()))
-        .collect();
-    let average_return_percent = if return_values.is_empty() {
-        None
-    } else {
-        Some(return_values.iter().sum::<f64>() / return_values.len() as f64)
-    };
-
-    let holding_second_values: Vec<f64> = trades
-        .iter()
-        .filter_map(|trade| trade.holding_seconds.map(|seconds| seconds as f64))
-        .collect();
-    let average_holding_seconds = if holding_second_values.is_empty() {
-        None
-    } else {
-        Some(holding_second_values.iter().sum::<f64>() / holding_second_values.len() as f64)
-    };
-
-    let total_realized_profit_and_loss: Decimal = trades
-        .iter()
-        .filter_map(|trade| trade.realized_profit_and_loss)
-        .sum();
-
-    ClosedTradesSummary {
-        total_closed,
-        win_rate,
-        profit_factor,
-        average_return_percent,
-        average_holding_seconds,
-        total_realized_profit_and_loss: Some(total_realized_profit_and_loss),
-    }
+    Ok(pairs)
 }
 
-/// Fetches all predictions from the most recent model run batch.
+/// Fetches the most recent prediction batch, ranked by median forecast.
 ///
-/// Uses a subquery on MAX(timestamp) so the view always shows a coherent
-/// single-cycle snapshot rather than mixing predictions across batches.
-async fn fetch_latest_predictions(pool: &PgPool) -> Result<Vec<PredictionRow>, sqlx::Error> {
+/// A batch is identified by its shared `correlation_id`, not by timestamp: selecting on the maximum
+/// timestamp alone would mix rows from two runs if one ever wrote a ticker the other did not.
+async fn fetch_latest_predictions(
+    pool: &PgPool,
+) -> Result<(Vec<Prediction>, Option<String>, Option<DateTime<Utc>>), sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT ticker, quantile_10, quantile_50, quantile_90, model_run_id, timestamp
-         FROM equity_predictions
-         WHERE timestamp = (SELECT MAX(timestamp) FROM equity_predictions)
-         ORDER BY ticker ASC",
+        "WITH latest_batch AS (
+             SELECT correlation_id
+             FROM equity_predictions
+             ORDER BY timestamp DESC
+             LIMIT 1
+         )
+         SELECT p.ticker, p.quantile_10, p.quantile_50, p.quantile_90,
+                p.model_run_id, p.timestamp
+         FROM equity_predictions p
+         JOIN latest_batch b ON p.correlation_id = b.correlation_id
+         ORDER BY p.quantile_50 DESC
+         LIMIT $1",
     )
+    .bind(PREDICTIONS_LIMIT)
+    .fetch_all(pool)
+    .await?;
+
+    let mut model_run_id = None;
+    let mut timestamp = None;
+    let mut predictions = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let raw_ticker: String = row.try_get("ticker")?;
+        let Some(ticker) = Ticker::new(&raw_ticker) else {
+            warn!(ticker = %raw_ticker, "Prediction has an unparseable ticker, skipping");
+            continue;
+        };
+        if model_run_id.is_none() {
+            model_run_id = Some(row.try_get::<String, _>("model_run_id")?);
+            timestamp = Some(row.try_get::<DateTime<Utc>, _>("timestamp")?);
+        }
+        predictions.push(Prediction {
+            ticker,
+            quantile_10: row.try_get("quantile_10")?,
+            quantile_50: row.try_get("quantile_50")?,
+            quantile_90: row.try_get("quantile_90")?,
+        });
+    }
+
+    Ok((predictions, model_run_id, timestamp))
+}
+
+/// Seeds the event ring buffer from the table, newest first.
+async fn fetch_recent_events(pool: &PgPool) -> Result<Vec<EventEntry>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT event_type, payload, created_at
+         FROM events
+         ORDER BY created_at DESC, id DESC
+         LIMIT $1",
+    )
+    .bind(RECENT_EVENTS_LIMIT)
     .fetch_all(pool)
     .await?;
 
     rows.into_iter()
         .map(|row| {
-            Ok(PredictionRow {
-                ticker: row.try_get::<crate::domain::market::Ticker, _>("ticker")?,
-                quantile_10: row.try_get("quantile_10")?,
-                quantile_50: row.try_get("quantile_50")?,
-                quantile_90: row.try_get("quantile_90")?,
-                model_run_id: row.try_get("model_run_id")?,
-                timestamp: row.try_get("timestamp")?,
+            Ok(EventEntry {
+                event_type: row.try_get("event_type")?,
+                payload: row.try_get("payload")?,
+                created_at: row.try_get("created_at")?,
             })
         })
         .collect()
 }
 
-/// Fetches metadata for the most recently completed model run.
-///
-/// Returns `None` when no run has completed yet. Used by Tab 4 to display
-/// training recency alongside the prediction table.
-async fn fetch_latest_model_run_information(
-    pool: &PgPool,
-) -> Result<Option<ModelRunInformation>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT completed_at, start_date, end_date,
-                continuous_ranked_probability_score, directional_accuracy
-         FROM model_runs
-         WHERE status = 'completed' AND completed_at IS NOT NULL
-         ORDER BY completed_at DESC
-         LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    match row {
-        None => Ok(None),
-        Some(row) => {
-            let model_run_information = ModelRunInformation::new(
-                row.try_get("completed_at")?,
-                row.try_get("start_date")?,
-                row.try_get("end_date")?,
-                row.try_get("continuous_ranked_probability_score")?,
-                row.try_get("directional_accuracy")?,
-            )
-            .map_err(|message| sqlx::Error::Protocol(message.to_string()))?;
-            Ok(Some(model_run_information))
-        }
-    }
-}
-
-/// Returns the maximum `inserted_at` timestamp across all equity bars rows.
-///
-/// Used by Tab 4 to indicate how recently market data was ingested. Returns
-/// `None` when the table is empty (e.g. before the first nightly ingest).
+/// The freshness signal: when the most recent daily bar was written.
 async fn fetch_latest_bars_inserted_at(
     pool: &PgPool,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-    let row = sqlx::query("SELECT MAX(inserted_at) AS max_inserted_at FROM equity_bars")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.try_get("max_inserted_at")?)
+    let row = sqlx::query(
+        "SELECT MAX(inserted_at) AS latest FROM equity_bars WHERE bar_interval = '1day'",
+    )
+    .fetch_one(pool)
+    .await?;
+    row.try_get("latest")
 }
 
-/// Returns the most recent `completed_at` across all rebalance sessions.
+/// Percentage change between two equity values.
 ///
-/// Used by Tab 1 to indicate how recently the portfolio was rebalanced. Returns
-/// `None` when no session has completed yet.
-async fn fetch_last_rebalance_completed_at(
-    pool: &PgPool,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-    let row =
-        sqlx::query("SELECT MAX(completed_at) AS max_completed_at FROM equity_rebalance_sessions")
-            .fetch_one(pool)
-            .await?;
-    Ok(row.try_get("max_completed_at")?)
+/// Returns `None` for a zero or negative baseline: a percentage against zero equity is a division
+/// by zero, and against negative equity it changes sign without changing meaning.
+fn percentage_change(baseline: Decimal, latest: Decimal) -> Option<f64> {
+    if baseline <= Decimal::ZERO {
+        return None;
+    }
+    let baseline = baseline.to_f64()?;
+    let latest = latest.to_f64()?;
+    Some((latest - baseline) / baseline * 100.0)
 }
 
-/// Returns the first snapshot (newest-to-oldest order) whose timestamp is at or
-/// before `cutoff`, giving the most recent baseline for a return period.
-fn find_snapshot_at_or_before(
-    history: &[PerformanceSnapshot],
-    cutoff: DateTime<Utc>,
-) -> Option<&PerformanceSnapshot> {
+/// The last snapshot at or before `cutoff`, which is the baseline for a horizon.
+///
+/// "At or before" rather than "exactly on": the series is sessions, not calendar days, so the date
+/// exactly one week back is a Saturday two times in seven.
+fn baseline_at_or_before(
+    history: &[AccountSnapshot],
+    cutoff: NaiveDate,
+) -> Option<&AccountSnapshot> {
     history
         .iter()
-        .find(|snapshot| snapshot.snapshot_timestamp <= cutoff)
+        .rev()
+        .find(|snapshot| snapshot.session_date <= cutoff)
 }
 
-/// Computes the percentage return from `baseline` NAV to `current_net_asset_value`.
-///
-/// Returns `None` when baseline NAV converts to zero (division guard).
-fn nav_period_return(current_net_asset_value: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
-    let baseline_net_asset_value = baseline.net_asset_value.to_f64()?;
-    if baseline_net_asset_value == 0.0 {
-        return None;
-    }
-    Some((current_net_asset_value - baseline_net_asset_value) / baseline_net_asset_value * 100.0)
-}
-
-/// Computes the percentage return from `baseline` SPY close to `current_spy`.
-///
-/// Returns `None` when either close price is absent or baseline is zero.
-fn spy_period_return(current_spy: f64, baseline: &PerformanceSnapshot) -> Option<f64> {
-    let base_spy = baseline.spy_close?;
-    if base_spy == 0.0 {
-        return None;
-    }
-    Some((current_spy - base_spy) / base_spy * 100.0)
-}
-
-/// Computes period returns from the cached snapshot history.
-///
-/// `history` is expected to be sorted newest-first (matching the query
-/// `ORDER BY snapshot_timestamp DESC`). Returns are expressed as percentages.
-/// Any period for which no baseline snapshot exists returns `None`.
-pub fn compute_period_returns(history: &[PerformanceSnapshot]) -> PeriodReturns {
-    if history.is_empty() {
-        return PeriodReturns::default();
-    }
-
-    let current = &history[0];
-    let Some(current_net_asset_value) = current.net_asset_value.to_f64() else {
+/// Computes the return over each horizon from an ascending-ordered account history.
+pub fn compute_period_returns(history: &[AccountSnapshot]) -> PeriodReturns {
+    let Some(latest) = history.last() else {
         return PeriodReturns::default();
     };
-    if current_net_asset_value == 0.0 {
-        return PeriodReturns::default();
-    }
 
-    let now = current.snapshot_timestamp;
-    let one_day_cutoff = now - Duration::days(1);
-    let one_week_cutoff = now - Duration::weeks(1);
-    let one_month_cutoff = now - Duration::days(30);
-    let year_start_cutoff = Utc
-        .with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0)
-        .single()
-        .unwrap_or(now);
+    let horizon = |days: i64| {
+        baseline_at_or_before(history, latest.session_date - Duration::days(days))
+            .and_then(|baseline| percentage_change(baseline.equity, latest.equity))
+    };
 
-    let baseline_one_day = find_snapshot_at_or_before(history, one_day_cutoff);
-    let baseline_one_week = find_snapshot_at_or_before(history, one_week_cutoff);
-    let baseline_one_month = find_snapshot_at_or_before(history, one_month_cutoff);
-    let baseline_year_to_date = find_snapshot_at_or_before(history, year_start_cutoff);
-    let inception = history.last();
-
-    let current_spy = current.spy_close;
+    // Year to date measures from the last session of the previous year, so the first session of
+    // January is a full day of performance rather than a flat zero.
+    let year_start = NaiveDate::from_ymd_opt(latest.session_date.year(), 1, 1);
+    let year_to_date = year_start
+        .and_then(|start| baseline_at_or_before(history, start.pred_opt()?))
+        .or_else(|| history.first())
+        .and_then(|baseline| percentage_change(baseline.equity, latest.equity));
 
     PeriodReturns {
-        fund_one_day: baseline_one_day.and_then(|b| nav_period_return(current_net_asset_value, b)),
-        fund_one_week: baseline_one_week
-            .and_then(|b| nav_period_return(current_net_asset_value, b)),
-        fund_one_month: baseline_one_month
-            .and_then(|b| nav_period_return(current_net_asset_value, b)),
-        fund_year_to_date: baseline_year_to_date
-            .and_then(|b| nav_period_return(current_net_asset_value, b)),
-        fund_since_inception: inception.and_then(|b| nav_period_return(current_net_asset_value, b)),
-        spy_one_day: current_spy
-            .and_then(|spy| baseline_one_day.and_then(|b| spy_period_return(spy, b))),
-        spy_one_week: current_spy
-            .and_then(|spy| baseline_one_week.and_then(|b| spy_period_return(spy, b))),
-        spy_one_month: current_spy
-            .and_then(|spy| baseline_one_month.and_then(|b| spy_period_return(spy, b))),
-        spy_year_to_date: current_spy
-            .and_then(|spy| baseline_year_to_date.and_then(|b| spy_period_return(spy, b))),
-        spy_since_inception: current_spy
-            .and_then(|spy| inception.and_then(|b| spy_period_return(spy, b))),
+        one_day: horizon(1),
+        one_week: horizon(7),
+        one_month: horizon(30),
+        year_to_date,
+        since_inception: history
+            .first()
+            .and_then(|baseline| percentage_change(baseline.equity, latest.equity)),
+    }
+}
+
+/// Computes the aggregates shown under the closed-pair table.
+pub fn compute_closed_summary(closed: &[ClosedPair]) -> ClosedSummary {
+    if closed.is_empty() {
+        return ClosedSummary {
+            by_close_reason: CloseReason::ALL
+                .into_iter()
+                .map(|reason| (reason, 0))
+                .collect(),
+            ..ClosedSummary::default()
+        };
+    }
+
+    let realized: Vec<Decimal> = closed
+        .iter()
+        .filter_map(|pair| pair.realized_profit_and_loss)
+        .collect();
+
+    let wins = realized
+        .iter()
+        .filter(|value| **value > Decimal::ZERO)
+        .count();
+    let losses = realized
+        .iter()
+        .filter(|value| **value < Decimal::ZERO)
+        .count();
+    let decided = wins + losses;
+
+    let gross_profit: Decimal = realized
+        .iter()
+        .filter(|value| **value > Decimal::ZERO)
+        .sum();
+    let gross_loss: Decimal = realized
+        .iter()
+        .filter(|value| **value < Decimal::ZERO)
+        .sum::<Decimal>()
+        .abs();
+
+    let total_realized: Decimal = realized.iter().sum();
+    let average_realized = if realized.is_empty() {
+        None
+    } else {
+        Some(total_realized / Decimal::from(realized.len()))
+    };
+
+    // A book with no losing trade has no profit factor rather than an infinite one. Reporting
+    // infinity here would put the most flattering number on the smallest sample.
+    let profit_factor = if gross_loss > Decimal::ZERO {
+        gross_profit
+            .to_f64()
+            .zip(gross_loss.to_f64())
+            .map(|(profit, loss)| profit / loss)
+    } else {
+        None
+    };
+
+    let by_close_reason: Vec<(CloseReason, usize)> = CloseReason::ALL
+        .into_iter()
+        .map(|reason| {
+            let count = closed
+                .iter()
+                .filter(|pair| pair.close_reason == reason)
+                .count();
+            (reason, count)
+        })
+        .collect();
+
+    let signal_exits = closed
+        .iter()
+        .filter(|pair| pair.close_reason.is_signal())
+        .count();
+
+    let average_holding_hours =
+        closed.iter().map(ClosedPair::holding_hours).sum::<f64>() / closed.len() as f64;
+
+    ClosedSummary {
+        total_closed: closed.len(),
+        wins,
+        losses,
+        win_rate: if decided > 0 {
+            Some(wins as f64 / decided as f64 * 100.0)
+        } else {
+            None
+        },
+        total_realized,
+        average_realized,
+        profit_factor,
+        average_holding_hours: Some(average_holding_hours),
+        by_close_reason,
+        signal_exit_share: Some(signal_exits as f64 / closed.len() as f64 * 100.0),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use std::str::FromStr;
 
-    fn make_closed_trade(
-        profit_and_loss: Option<&str>,
-        return_percent: Option<&str>,
-        holding_seconds: Option<i64>,
-    ) -> ClosedTrade {
-        ClosedTrade {
-            pair_id: crate::domain::market::PairID::parse("AAPL-MSFT").unwrap(),
-            long_ticker: crate::domain::market::Ticker::new("AAPL").unwrap(),
-            short_ticker: crate::domain::market::Ticker::new("MSFT").unwrap(),
-            realized_profit_and_loss: profit_and_loss
-                .map(|s| s.parse::<Decimal>().expect("valid decimal")),
-            return_percent: return_percent.map(|s| s.parse::<Decimal>().expect("valid decimal")),
-            holding_seconds,
-            close_reason: None,
-            closed_at: None,
+    fn decimal(value: &str) -> Decimal {
+        Decimal::from_str(value).expect("a valid test decimal")
+    }
+
+    fn snapshot(date: &str, equity: &str) -> AccountSnapshot {
+        AccountSnapshot {
+            session_date: NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
+            equity: decimal(equity),
+            cash: decimal("0"),
+            buying_power: decimal("0"),
+            long_market_value: decimal("0"),
+            short_market_value: decimal("0"),
+        }
+    }
+
+    fn closed(realized: Option<&str>, reason: CloseReason, hours: i64) -> ClosedPair {
+        let opened_at = Utc.with_ymd_and_hms(2026, 7, 30, 14, 0, 0).unwrap();
+        ClosedPair {
+            pair_id: PairID::parse("AAA-BBB").expect("a valid pair"),
+            long_ticker: Ticker::new("AAA").expect("a valid ticker"),
+            short_ticker: Ticker::new("BBB").expect("a valid ticker"),
+            entry_z_score: 2.5,
+            realized_profit_and_loss: realized.map(decimal),
+            close_reason: reason,
+            opened_at,
+            closed_at: opened_at + Duration::hours(hours),
         }
     }
 
     #[test]
-    fn test_compute_exposures_empty() {
-        let (gross, net) = compute_exposures(&[]);
-        assert_eq!(gross, Decimal::ZERO);
-        assert_eq!(net, Decimal::ZERO);
+    fn test_period_returns_are_empty_without_history() {
+        assert_eq!(compute_period_returns(&[]), PeriodReturns::default());
     }
 
     #[test]
-    fn test_compute_exposures_single_position() {
-        let position = OpenPosition {
-            pair_id: crate::domain::market::PairID::parse("AAPL-MSFT").unwrap(),
-            long_ticker: crate::domain::market::Ticker::new("AAPL").unwrap(),
-            short_ticker: crate::domain::market::Ticker::new("MSFT").unwrap(),
-            z_score: Decimal::new(15, 1),
-            hedge_ratio: Decimal::ONE,
-            signal_strength: Decimal::new(8, 1),
-            long_dollar_amount: Decimal::new(10000, 0),
-            short_dollar_amount: Decimal::new(9500, 0),
-            opened_at: Utc::now(),
-        };
-        let (gross, net) = compute_exposures(&[position]);
-        assert_eq!(gross, Decimal::new(19500, 0));
-        assert_eq!(net, Decimal::new(500, 0));
+    fn test_a_horizon_longer_than_the_history_has_no_answer() {
+        let history = vec![
+            snapshot("2026-07-30", "100000"),
+            snapshot("2026-07-31", "101000"),
+        ];
+        let returns = compute_period_returns(&history);
+        assert_eq!(returns.one_day, Some(1.0));
+        // Nothing sits at or before 2026-07-24, so a weekly return cannot be computed.
+        assert_eq!(returns.one_week, None);
+        assert_eq!(returns.since_inception, Some(1.0));
+    }
+
+    /// The baseline for a horizon is the last session at or before the cutoff, because the
+    /// calendar date one week back lands on a weekend two times in seven.
+    #[test]
+    fn test_a_horizon_falling_on_a_weekend_uses_the_prior_session() {
+        let history = vec![
+            snapshot("2026-07-24", "100000"),
+            snapshot("2026-07-27", "104000"),
+            snapshot("2026-07-31", "110000"),
+        ];
+        // 2026-07-31 minus seven days is 2026-07-24, a Friday, and it is in the series.
+        assert_eq!(compute_period_returns(&history).one_week, Some(10.0));
+
+        let shifted = vec![
+            snapshot("2026-07-23", "100000"),
+            snapshot("2026-07-27", "104000"),
+            snapshot("2026-07-31", "110000"),
+        ];
+        // The cutoff now falls on a day with no session, so the prior one is used.
+        assert_eq!(compute_period_returns(&shifted).one_week, Some(10.0));
     }
 
     #[test]
-    fn test_compute_exposures_multiple_positions() {
-        let make_position = |long: i64, short: i64| OpenPosition {
-            pair_id: crate::domain::market::PairID::parse("AAPL-MSFT").unwrap(),
-            long_ticker: crate::domain::market::Ticker::new("AAPL").unwrap(),
-            short_ticker: crate::domain::market::Ticker::new("MSFT").unwrap(),
-            z_score: Decimal::ONE,
-            hedge_ratio: Decimal::ONE,
-            signal_strength: Decimal::ONE,
-            long_dollar_amount: Decimal::new(long, 0),
-            short_dollar_amount: Decimal::new(short, 0),
-            opened_at: Utc::now(),
-        };
-        let positions = vec![make_position(10000, 9000), make_position(8000, 7500)];
-        let (gross, net) = compute_exposures(&positions);
-        assert_eq!(gross, Decimal::new(34500, 0));
-        assert_eq!(net, Decimal::new(1500, 0));
+    fn test_year_to_date_measures_from_the_last_session_of_the_prior_year() {
+        let history = vec![
+            snapshot("2025-12-31", "100000"),
+            snapshot("2026-01-02", "102000"),
+            snapshot("2026-07-31", "120000"),
+        ];
+        assert_eq!(compute_period_returns(&history).year_to_date, Some(20.0));
     }
 
     #[test]
-    fn test_compute_closed_trades_summary_empty() {
-        let summary = compute_closed_trades_summary(&[]);
+    fn test_year_to_date_falls_back_to_inception_within_the_first_year() {
+        let history = vec![
+            snapshot("2026-01-02", "100000"),
+            snapshot("2026-07-31", "125000"),
+        ];
+        assert_eq!(compute_period_returns(&history).year_to_date, Some(25.0));
+    }
+
+    /// A zero baseline is a division by zero, and it is reachable: the first snapshot of an account
+    /// that has been funded but holds nothing.
+    #[test]
+    fn test_a_zero_baseline_yields_no_return_rather_than_an_infinity() {
+        let history = vec![
+            snapshot("2026-07-30", "0"),
+            snapshot("2026-07-31", "100000"),
+        ];
+        let returns = compute_period_returns(&history);
+        assert_eq!(returns.one_day, None);
+        assert_eq!(returns.since_inception, None);
+    }
+
+    #[test]
+    fn test_an_empty_close_summary_still_lists_every_reason_at_zero() {
+        let summary = compute_closed_summary(&[]);
         assert_eq!(summary.total_closed, 0);
-        assert!(summary.win_rate.is_none());
-        assert!(summary.profit_factor.is_none());
-        assert!(summary.total_realized_profit_and_loss.is_none());
+        assert_eq!(summary.by_close_reason.len(), CloseReason::ALL.len());
+        assert!(summary.by_close_reason.iter().all(|(_, count)| *count == 0));
     }
 
     #[test]
-    fn test_compute_closed_trades_summary_no_pnl_data() {
-        let trades = vec![make_closed_trade(None, None, None)];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.total_closed, 1);
-        assert!(summary.win_rate.is_none());
-    }
-
-    #[test]
-    fn test_compute_closed_trades_summary_all_winners() {
-        // holding_seconds: 5 min and 3 min → average 4 min = 240 seconds
-        let trades = vec![
-            make_closed_trade(Some("100"), Some("2"), Some(300)),
-            make_closed_trade(Some("200"), Some("4"), Some(180)),
+    fn test_win_rate_and_profit_factor_over_a_mixed_book() {
+        let pairs = vec![
+            closed(Some("300"), CloseReason::Convergence, 4),
+            closed(Some("100"), CloseReason::Convergence, 6),
+            closed(Some("-200"), CloseReason::StopLoss, 2),
         ];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.total_closed, 2);
-        assert_eq!(summary.win_rate, Some(1.0));
-        // No losers means gross_loss == 0 → profit_factor is None.
-        assert!(summary.profit_factor.is_none());
-        assert_eq!(summary.average_return_percent, Some(3.0));
-        assert_eq!(summary.average_holding_seconds, Some(240.0));
-        assert_eq!(
-            summary.total_realized_profit_and_loss,
-            Some(Decimal::new(300, 0))
+        let summary = compute_closed_summary(&pairs);
+        assert_eq!(summary.total_closed, 3);
+        assert_eq!(summary.wins, 2);
+        assert_eq!(summary.losses, 1);
+        let win_rate = summary.win_rate.expect("a win rate over a decided book");
+        assert!(
+            (win_rate - 200.0 / 3.0).abs() < 1e-9,
+            "expected two thirds, got {win_rate}"
         );
+        assert_eq!(summary.total_realized, decimal("200"));
+        assert_eq!(summary.profit_factor, Some(2.0));
+        assert_eq!(summary.average_holding_hours, Some(4.0));
     }
 
+    /// Infinity is the most flattering number available and it appears on the smallest sample, so
+    /// a book with no losing trade reports no profit factor at all.
     #[test]
-    fn test_compute_closed_trades_summary_mixed_wins_and_losses() {
-        let trades = vec![
-            make_closed_trade(Some("100"), Some("2"), Some(400)),
-            make_closed_trade(Some("-50"), Some("-1"), Some(200)),
-        ];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.win_rate, Some(0.5));
-        let profit_factor = summary.profit_factor.expect("profit factor is set");
-        assert!((profit_factor - 2.0).abs() < 1e-10);
-        assert_eq!(
-            summary.total_realized_profit_and_loss,
-            Some(Decimal::new(50, 0))
-        );
+    fn test_no_losing_trade_yields_no_profit_factor() {
+        let pairs = vec![closed(Some("300"), CloseReason::Convergence, 4)];
+        assert_eq!(compute_closed_summary(&pairs).profit_factor, None);
     }
 
+    /// The measurement the section exists for: a book that only ever exits at the pre-close
+    /// fail-safe is holding for a shorter period than it forecasts.
     #[test]
-    fn test_compute_closed_trades_summary_all_losers() {
-        let trades = vec![
-            make_closed_trade(Some("-100"), Some("-2"), Some(300)),
-            make_closed_trade(Some("-50"), Some("-1"), Some(120)),
+    fn test_the_signal_exit_share_separates_opinion_from_the_fail_safe() {
+        let pairs = vec![
+            closed(Some("300"), CloseReason::Convergence, 4),
+            closed(Some("-50"), CloseReason::EndOfDay, 6),
+            closed(Some("-20"), CloseReason::EndOfDay, 6),
+            closed(None, CloseReason::PositionMissing, 6),
         ];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.win_rate, Some(0.0));
-        // No winners means gross_profit == 0 → profit_factor is Some(0.0).
-        assert_eq!(summary.profit_factor, Some(0.0));
+        let summary = compute_closed_summary(&pairs);
+        assert_eq!(summary.signal_exit_share, Some(25.0));
+
+        let count_for = |wanted: CloseReason| {
+            summary
+                .by_close_reason
+                .iter()
+                .find(|(reason, _)| *reason == wanted)
+                .map(|(_, count)| *count)
+                .expect("every reason is listed")
+        };
+        assert_eq!(count_for(CloseReason::Convergence), 1);
+        assert_eq!(count_for(CloseReason::EndOfDay), 2);
+        assert_eq!(count_for(CloseReason::StopLoss), 0);
     }
 
+    /// A pair with no attributed profit and loss is still a close. It counts toward the exit-reason
+    /// breakdown and the holding period, and it must not count as a loss.
     #[test]
-    fn test_compute_closed_trades_summary_break_even_trades() {
-        // All trades at exactly 0.0 PnL — no winners or losers → win_rate is None.
-        let trades = vec![
-            make_closed_trade(Some("0"), Some("0"), Some(300)),
-            make_closed_trade(Some("0"), Some("0"), Some(120)),
+    fn test_an_unattributed_pair_counts_as_a_close_but_not_as_a_loss() {
+        let pairs = vec![
+            closed(Some("100"), CloseReason::Convergence, 4),
+            closed(None, CloseReason::PositionMissing, 4),
         ];
-        let summary = compute_closed_trades_summary(&trades);
+        let summary = compute_closed_summary(&pairs);
         assert_eq!(summary.total_closed, 2);
-        assert!(summary.win_rate.is_none());
-        assert!(summary.profit_factor.is_none());
-    }
-
-    #[test]
-    fn test_compute_closed_trades_summary_missing_return_percent() {
-        // PnL is present but return_percent is None → average_return_percent should be None.
-        let trades = vec![
-            make_closed_trade(Some("100"), None, Some(300)),
-            make_closed_trade(Some("200"), None, Some(180)),
-        ];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.total_closed, 2);
-        assert_eq!(summary.win_rate, Some(1.0));
-        assert!(summary.average_return_percent.is_none());
-        assert_eq!(summary.average_holding_seconds, Some(240.0));
-    }
-
-    #[test]
-    fn test_compute_closed_trades_summary_missing_holding_seconds() {
-        // PnL and return_percent present but holding_seconds is None → average_holding_seconds None.
-        let trades = vec![
-            make_closed_trade(Some("100"), Some("2"), None),
-            make_closed_trade(Some("-50"), Some("-1"), None),
-        ];
-        let summary = compute_closed_trades_summary(&trades);
-        assert_eq!(summary.total_closed, 2);
-        assert!(summary.average_holding_seconds.is_none());
-        assert_eq!(summary.average_return_percent, Some(0.5));
-    }
-
-    /// Builds a snapshot at an exact offset from a shared `now` so that all
-    /// timestamps in a single test are derived from the same instant. This
-    /// prevents the race where two `Utc::now()` calls return slightly different
-    /// values, causing a baseline snapshot to appear microseconds newer than
-    /// the period cutoff and therefore not be found by
-    /// `find_snapshot_at_or_before`.
-    fn make_snapshot(
-        now: DateTime<Utc>,
-        days_ago: i64,
-        nav: i64,
-        spy: Option<f64>,
-    ) -> PerformanceSnapshot {
-        PerformanceSnapshot {
-            snapshot_timestamp: now - Duration::days(days_ago),
-            net_asset_value: Decimal::new(nav, 0),
-            gross_return: None,
-            net_return: None,
-            total_slippage_cost: Decimal::ZERO,
-            spy_close: spy,
-        }
-    }
-
-    #[test]
-    fn test_compute_period_returns_empty_history() {
-        let returns = compute_period_returns(&[]);
-        assert!(returns.fund_one_day.is_none());
-        assert!(returns.fund_one_week.is_none());
-        assert!(returns.fund_since_inception.is_none());
-        assert!(returns.spy_one_day.is_none());
-    }
-
-    #[test]
-    fn test_compute_period_returns_single_snapshot() {
-        // Only one snapshot — it's both current and inception.
-        // since_inception baseline is history.last() == history[0] == current.
-        // (current - current) / current = 0%
-        let now = Utc::now();
-        let history = vec![make_snapshot(now, 0, 100_000, Some(450.0))];
-        let returns = compute_period_returns(&history);
-        assert_eq!(returns.fund_since_inception, Some(0.0));
-        // No older snapshots → other periods are None.
-        assert!(returns.fund_one_day.is_none());
-        assert!(returns.fund_one_week.is_none());
-    }
-
-    #[test]
-    fn test_compute_period_returns_one_day() {
-        // Current = 110_000, 1-day baseline = 100_000 → 10%
-        let now = Utc::now();
-        let history = vec![
-            make_snapshot(now, 0, 110_000, Some(455.0)),
-            make_snapshot(now, 1, 100_000, Some(450.0)),
-        ];
-        let returns = compute_period_returns(&history);
-        let one_day = returns.fund_one_day.expect("fund_one_day should be Some");
-        assert!((one_day - 10.0).abs() < 1e-9, "expected 10%, got {one_day}");
-    }
-
-    #[test]
-    fn test_compute_period_returns_spy_one_day() {
-        // SPY: current=455, baseline=450 → (455−450)/450×100 ≈ 1.111%
-        let now = Utc::now();
-        let history = vec![
-            make_snapshot(now, 0, 110_000, Some(455.0)),
-            make_snapshot(now, 1, 100_000, Some(450.0)),
-        ];
-        let returns = compute_period_returns(&history);
-        let spy = returns.spy_one_day.expect("spy_one_day should be Some");
-        assert!((spy - (5.0 / 450.0 * 100.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_compute_period_returns_since_inception() {
-        // Oldest snapshot = 80_000; current = 110_000 → 37.5%
-        let now = Utc::now();
-        let history = vec![
-            make_snapshot(now, 0, 110_000, None),
-            make_snapshot(now, 7, 105_000, None),
-            make_snapshot(now, 365, 80_000, None),
-        ];
-        let returns = compute_period_returns(&history);
-        let inception = returns
-            .fund_since_inception
-            .expect("fund_since_inception should be Some");
-        assert!((inception - 37.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_compute_period_returns_missing_spy_gives_none() {
-        let now = Utc::now();
-        let history = vec![
-            make_snapshot(now, 0, 110_000, None),
-            make_snapshot(now, 1, 100_000, None),
-        ];
-        let returns = compute_period_returns(&history);
-        assert!(returns.spy_one_day.is_none());
-        // Fund return is still computed even when SPY data is absent.
-        assert!(returns.fund_one_day.is_some());
-    }
-
-    #[test]
-    fn test_compute_period_returns_zero_baseline_nav_gives_none() {
-        let now = Utc::now();
-        let history = vec![
-            make_snapshot(now, 0, 110_000, None),
-            make_snapshot(now, 1, 0, None), // zero baseline NAV → division guard
-        ];
-        let returns = compute_period_returns(&history);
-        assert!(returns.fund_one_day.is_none());
+        assert_eq!(summary.wins, 1);
+        assert_eq!(summary.losses, 0);
+        assert_eq!(summary.win_rate, Some(100.0));
+        assert_eq!(summary.average_realized, Some(decimal("100")));
     }
 }

@@ -34,9 +34,10 @@ provision-production-application-vm
 ssh oscm-fund-production-application.vm.exe.dev
 start-application
 
-# Seed historical data into S3 and PostgreSQL on the running application.
-# Run without arguments for full usage and options.
-SEED_SOURCE=massive SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
+# Seed ticker metadata and historical bars into PostgreSQL on the running
+# application. Run without arguments for full usage and options. The pair screen
+# needs 60 sessions of aligned closes and the model 70, so allow six months.
+SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
 
 # Share the VM with the team and publish the dashboard externally.
 ssh exe.dev share add oscm-fund-production-application team
@@ -61,9 +62,13 @@ start-duckdb oscm-fund-production
 #### Notes
 
 - Application services run in a tmux session; attach with `tmux attach -t fund`
+- Two processes run there: `fund`, the service, and `dashboard`. The service is one event loop woken
+  by pg_cron through `LISTEN`/`NOTIFY`, not a set of per-module workers
 - Dashboard is available at `http://<vm-name>.vm.exe.dev:8084`
-- Git sync checks for updates every minute; view logs at `/var/log/fund/sync-application.log`
-- Training runs weekdays at 06:00 UTC; view logs at `/var/log/fund/train-tide-model.log`
+- Git sync checks for updates every minute on both VMs; view logs at
+  `/var/log/fund/sync-application.log` and `/var/log/fund/sync-trainer.log`
+- Training runs weekdays at 23:00 UTC — post-close Eastern year-round, so the artifact is ready the
+  evening before the session that uses it; view logs at `/var/log/fund/train-tide-model.log`
 - The local `~/lab.duckdb` file is scratch space. It can be deleted and rebuilt from S3 at any time.
 
 ### Principles

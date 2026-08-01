@@ -1,23 +1,17 @@
-//! Portfolio service: selects statistical arbitrage pairs from ensemble
-//! predictions, sizes positions with volatility parity, and executes rebalance
-//! cycles against the Alpaca trading API. Driven by the Postgres event bus.
+//! The strategy: which pairs to hold, how large, and when to let them go.
+//!
+//! [`pairs`] is the record — the long/short mapping and the signal that justified it. [`screen`]
+//! decides what is worth holding, [`size`] how much, and [`risk`] whether the book can take it.
+//! [`execute`] is the only module that sends an order, and [`evaluate`] is the five-minute pass
+//! that drives the rest.
+//!
+//! [`account`] is the post-close half: what Alpaca says actually happened, written back as the
+//! reference the next session's drawdown gate reads.
 
-pub mod alpaca;
-pub mod beta;
-pub mod consolidation;
-pub mod consumer;
-pub mod daily_cache;
-pub mod database;
-pub mod execution;
-pub mod live_evaluator;
-pub mod live_prices;
-pub mod math;
-pub mod rebalance;
-pub mod reconciliation;
-pub mod regime;
-pub mod risk_gate;
-pub mod session_cache;
-pub mod sizing;
-pub mod spread;
-pub mod state;
-pub mod statistical_arbitrage;
+pub mod account;
+pub mod evaluate;
+pub mod execute;
+pub mod pairs;
+pub mod risk;
+pub mod screen;
+pub mod size;

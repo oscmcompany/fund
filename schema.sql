@@ -8,8 +8,11 @@
 -- Every DDL statement uses an idempotent form so this file can be re-run against a populated
 -- database. Note the one thing that re-running cannot do: CREATE TABLE IF NOT EXISTS is a no-op
 -- against a table that already exists with a different shape. Databases provisioned before the
--- rebuild must be dropped and recreated rather than upgraded in place, and equity_bars re-seeded
--- from the S3 parquet exports via seed_equity_bars.
+-- rebuild must be dropped and recreated rather than upgraded in place, then re-seeded with
+-- `devenv tasks run data:seed` -- ticker metadata from the embedded CSV and daily bars from
+-- Alpaca. Not from the S3 exports: they are the same rows, but the seed path has one source and
+-- one code path, and a bootstrap that reads its own backups is a bootstrap that fails the first
+-- time it is genuinely needed.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
@@ -381,11 +384,15 @@ END;
 $do$;
 
 -- Market data sync: weekdays at 16:30 Eastern.
--- Pulls the session's bars and any equity detail changes from Alpaca into PostgreSQL, then chains
+-- Pulls the session's bars from Massive and any equity detail changes into PostgreSQL, then chains
 -- the database export on completion. The export is chained rather than scheduled so it cannot run
 -- against a half-synced database; the purge runs inside the export handler once S3 has the data.
 --
--- This path does not feed the trainer. The trainer fetches its own data from Alpaca on its own VM
+-- Bars are whole-market, not universe-filtered. The liquidity screen selects from what this stores,
+-- so storing only the current universe would make the universe self-selecting -- it could never
+-- admit a name that became liquid, and would only ever shrink.
+--
+-- This path does not feed the trainer. The trainer fetches its own data from Massive on its own VM
 -- and shares only the fetch code, so a failure here costs a backup rather than the next day's model.
 DO $do$
 BEGIN

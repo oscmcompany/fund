@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, TradingClient};
@@ -66,6 +67,12 @@ pub struct EvaluationContext<'a> {
     pub close_history: &'a HashMap<Ticker, Vec<f64>>,
     pub sizing: SizingParameters,
     pub execution: ExecutionSettings,
+    /// Cancelled when the process is asked to stop.
+    ///
+    /// Checked between pairs in the entry half so the pass stops *starting* positions it could not
+    /// finish opening. Nothing here aborts work already in flight — that is the drain's job, and
+    /// this is what keeps the drain's bound honest.
+    pub shutdown: &'a CancellationToken,
     pub now: DateTime<Utc>,
 }
 
@@ -114,6 +121,12 @@ pub struct EvaluationSummary {
     /// says which model it was deciding with. That is the difference between "the model saw no
     /// opportunity" and "the model was yesterday's".
     pub model_run_id: Option<String>,
+    /// Approved pairs the pass declined to open because shutdown was requested mid-entry.
+    ///
+    /// Distinct from `entries_refused`, which is the risk gate turning a pair down on its merits.
+    /// These cleared every check and were simply not reached. Reported rather than left implicit,
+    /// because the alternative is a short `pairs_opened` that looks like a quiet screen.
+    pub entries_abandoned: usize,
 }
 
 /// Decides whether an open pair should be closed at this spread reading.
@@ -195,7 +208,28 @@ pub async fn run_pass(
         .map(|block| format!("{}: {block}", block.as_str()))
         .collect();
 
-    for pair in &approved {
+    for (index, pair) in approved.iter().enumerate() {
+        // Checked between pairs, never inside one. Opening a pair is two broker legs and an insert,
+        // and abandoning it partway is the failure this whole path is arranged to avoid — so the
+        // pass finishes whatever it has started and declines to start the next one.
+        //
+        // This is what makes the drain's timeout in `bin/fund.rs` a real bound rather than a hope.
+        // Without it the pass works through every approved candidate sequentially, and no fixed
+        // timeout covers a list whose length is decided by the screen.
+        //
+        // Only the entry half. `close_what_should_close` ran earlier in this pass and is never
+        // skipped: a close reduces risk, and declining one leaves the book holding something it had
+        // already decided to let go of.
+        if context.shutdown.is_cancelled() {
+            summary.entries_abandoned = approved.len() - index;
+            warn!(
+                abandoned = summary.entries_abandoned,
+                opened = summary.pairs_opened.len(),
+                "Shutdown requested mid-entry; opening no further pairs"
+            );
+            break;
+        }
+
         match execute::open_pair(
             context.trading,
             pair,

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
 use crate::common::events::{self, Command, EventError};
+use crate::common::massive::MassiveClient;
 use crate::common::types::BarInterval;
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
 use crate::data::calendar::{eastern_date, CalendarCache, TradingCalendar};
@@ -33,6 +34,7 @@ use crate::portfolio::evaluate::{self, EvaluationContext};
 use crate::portfolio::execute::ExecutionSettings;
 use crate::portfolio::screen::CORRELATION_WINDOW_SESSIONS;
 use crate::portfolio::size::SizingParameters;
+use tokio_util::sync::CancellationToken;
 
 /// Sessions of history the post-close bar sync re-fetches.
 ///
@@ -79,7 +81,10 @@ pub enum HandlerError {
 pub struct ServiceState {
     pool: PgPool,
     trading: TradingClient,
+    /// Alpaca, for intraday snapshots. The book is priced against the venue it trades on.
     market_data: MarketDataClient,
+    /// Massive, for daily bars. See [`crate::common::massive`] for why the two are split.
+    massive: MassiveClient,
     s3_client: aws_sdk_s3::Client,
     bucket: String,
     artifact_prefix: String,
@@ -89,6 +94,12 @@ pub struct ServiceState {
     close_history_cache: CloseHistoryCache,
     sizing: SizingParameters,
     execution: ExecutionSettings,
+    /// Cancelled when the process is asked to stop.
+    ///
+    /// Held here so a handler can decline to *start* more work it would not be able to finish. The
+    /// drain in `bin/fund.rs` bounds how long shutdown waits; this is what keeps the thing being
+    /// waited on inside that bound.
+    shutdown: CancellationToken,
     /// A standard-library mutex, not a `tokio` one. The critical section is a single set
     /// insertion or removal and is never held across an await, and the release happens in `Drop` —
     /// which is synchronous and so cannot await an async lock at all.
@@ -97,8 +108,10 @@ pub struct ServiceState {
 
 impl ServiceState {
     /// Builds the state from the environment.
-    pub async fn from_env(pool: PgPool) -> Result<Self, HandlerError> {
+    pub async fn from_env(pool: PgPool, shutdown: CancellationToken) -> Result<Self, HandlerError> {
         let credentials = AlpacaCredentials::from_env()
+            .map_err(|error| HandlerError::Configuration(error.to_string()))?;
+        let massive = MassiveClient::from_env()
             .map_err(|error| HandlerError::Configuration(error.to_string()))?;
 
         let bucket = std::env::var("AWS_S3_BUCKET_NAME").map_err(|_| {
@@ -112,6 +125,7 @@ impl ServiceState {
             pool,
             trading: TradingClient::from_env(credentials.clone()),
             market_data: MarketDataClient::from_env(credentials),
+            massive,
             s3_client: crate::common::aws::s3_client().await,
             bucket,
             artifact_prefix,
@@ -121,6 +135,7 @@ impl ServiceState {
             close_history_cache: CloseHistoryCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
+            shutdown,
             in_flight: std::sync::Mutex::new(HashSet::new()),
         })
     }
@@ -376,6 +391,7 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
         close_history: &close_history,
         sizing: state.sizing,
         execution: state.execution,
+        shutdown: &state.shutdown,
         now,
     };
 
@@ -420,44 +436,41 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
 
-    let universe = state
-        .universe_cache
-        .get(&state.trading, &state.pool, now)
-        .await?;
+    // No universe load here any more, and that is the point rather than a tidy-up.
+    //
+    // This fetch used to ask Alpaca for `universe.symbols()`, while `load_liquidity` built that
+    // universe from averages over `equity_bars` — so the only tickers that got fresh bars were the
+    // ones already in the universe. Thirty days after a seed (`LIQUIDITY_LOOKBACK_DAYS`), nothing
+    // outside it had bars inside the window any more, and a stock that became liquid could never
+    // enter: the universe ratcheted closed and could only shrink. Massive's grouped endpoint takes
+    // a date rather than a symbol list, so every symbol that traded is stored and the liquidity
+    // screen is a real re-selection each day.
 
     // A span wide enough to hold the requested sessions even through a holiday week. Six calendar
     // days was not: Thanksgiving plus two weekends leaves fewer than three sessions inside it, and
     // the previous `unwrap_or(today)` then collapsed the window to a single session — closing none
     // of the gap the constant exists to close, and saying nothing about it.
-    let sessions = calendar.trading_days_in_range(
+    let span = calendar.trading_days_in_range(
         today - Duration::days(BAR_SYNC_LOOKBACK_SESSIONS as i64 * 4),
         today,
     );
-    let start = match sessions.iter().rev().nth(BAR_SYNC_LOOKBACK_SESSIONS - 1) {
-        Some(session) => *session,
-        // Fall back to the oldest session actually found, not to today. A short calendar means a
-        // narrower window, and the log says so rather than leaving it to be inferred.
-        None => {
-            let oldest = sessions.first().copied().unwrap_or(today);
+    let sessions: Vec<_> = if span.len() > BAR_SYNC_LOOKBACK_SESSIONS {
+        span[span.len() - BAR_SYNC_LOOKBACK_SESSIONS..].to_vec()
+    } else {
+        // Fewer sessions than requested is a narrower window, and the log says so rather than
+        // leaving it to be inferred.
+        if span.len() < BAR_SYNC_LOOKBACK_SESSIONS {
             warn!(
                 requested = BAR_SYNC_LOOKBACK_SESSIONS,
-                found = sessions.len(),
-                %oldest,
-                "Fewer trading sessions in the lookback span than requested; syncing from the oldest"
+                found = span.len(),
+                "Fewer trading sessions in the lookback span than requested; syncing all of them"
             );
-            oldest
         }
+        span
     };
 
-    let fetched = bars::fetch_bars(
-        &state.market_data,
-        &universe.symbols(),
-        BarInterval::OneDay,
-        start,
-        today,
-    )
-    .await?;
-    let bar_rows = bars::store_bars(&state.pool, &fetched).await?;
+    let fetched = bars::fetch_daily_bars(&state.massive, &sessions).await;
+    let bar_rows = bars::store_bars(&state.pool, &fetched.bars).await?;
 
     let detail_rows =
         details::store_details(&state.pool, &details::parse_embedded_details()?).await?;
@@ -479,8 +492,9 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
 
     Ok(json!({
         "session_date": today,
-        "bar_start": start,
-        "bars_fetched": fetched.len(),
+        "sessions_requested": sessions.len(),
+        "sessions_failed": fetched.dates_failed,
+        "bars_fetched": fetched.bars.len(),
         "bar_rows_written": bar_rows,
         "detail_rows_written": detail_rows,
         "export_chained": true,

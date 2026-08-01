@@ -3,33 +3,17 @@ name = "fund"
 version = "0.0.1"
 edition = "2021"
 resolver = "2"
-# The old tree at `src/` stays on disk until the final rebuild commit, and Cargo would otherwise
-# auto-discover `src/bin/*.rs` as binary targets and try to compile them against the new library.
-# Binaries are declared explicitly as they are rebuilt.
-autobins = false
 
-# Rebuild in progress. The library points at `src_new/`, which is built bottom-up across three
-# pull requests; the old tree remains on disk at `src/` and is not compiled. Binary targets return
-# with the modules they depend on -- the service and trainer in the second, the dashboard in the
-# third -- and `src_new` is renamed to `src` in the final commit.
-# See `.scratchpad/rebuild_0_target_design.md`.
-[lib]
-name = "fund"
-path = "src_new/lib.rs"
-
-[[bin]]
-name = "fund"
-path = "src_new/bin/fund.rs"
-
-[[bin]]
-name = "tide_model_trainer"
-path = "src_new/bin/tide_model_trainer.rs"
-
-# No features. `dashboard` returns with the dashboard binary in the third pull request; there is
-# deliberately no `train` feature, because it existed so an inference-only build could skip the
-# training modules but burn's `autodiff` is always compiled in anyway (it costs the NdArray
-# inference path nothing), so all the flag excluded was `rand`. One build configuration is worth
-# more than one unlinked random number generator.
+# No features, and four binaries auto-discovered from `src/bin/`: `fund`, `tide_model_trainer`,
+# `seed_equity_bars`, `seed_equity_details`.
+#
+# There is deliberately no `train` feature -- it existed so an inference-only build could skip the
+# training modules, but burn's `autodiff` is always compiled in anyway (it costs the NdArray
+# inference path nothing), so all the flag excluded was `rand`. There is deliberately no `dashboard`
+# feature either, for a sharper reason: features are crate-wide, so building the service and then
+# the dashboard with different feature sets recompiles the entire dependency graph twice on every
+# `devenv up`. Axum is cheaper than that. One build configuration is worth more than one unlinked
+# web framework.
 
 [dependencies]
 # Shared / base (always compiled)
@@ -90,6 +74,9 @@ tempfile = "3.27"
 
 # Epoch shuffling during training.
 rand = "0.10"
+
+# The dashboard's HTTP server. Unconditional rather than behind a feature -- see the note above.
+axum = "0.8"
 
 [dev-dependencies]
 aws-credential-types = "1.2.14"

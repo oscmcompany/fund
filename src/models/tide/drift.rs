@@ -31,7 +31,12 @@ pub fn check_drift(
     minimum_runs: usize,
     degradation_threshold: f64,
 ) -> DriftResult {
-    if prior_crps.len() < minimum_runs {
+    // The emptiness check is separate from the `minimum_runs` check on purpose. With
+    // `minimum_runs` of 0 the comparison below is false for an empty slice, so the function would
+    // continue and divide by zero: `baseline_crps` becomes NaN, `NaN.max(1e-8)` collapses the limit
+    // to the floor so almost any current value reports drift, and the NaN then fails JSON
+    // serialization at the call site.
+    if prior_crps.is_empty() || prior_crps.len() < minimum_runs {
         let message = format!(
             "Insufficient evaluation history: {} run(s) recorded, {} required for baseline.",
             prior_crps.len(),
@@ -78,6 +83,16 @@ pub fn check_drift(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `minimum_runs` of zero the length comparison passes for an empty slice, and the mean
+    /// then divides by zero. The resulting NaN collapses the drift limit to its floor, so almost
+    /// any current value reports drift, and it cannot be serialized to JSON afterwards.
+    #[test]
+    fn test_empty_history_is_insufficient_regardless_of_minimum_runs() {
+        let result = check_drift(0.5, &[], 0, 0.2);
+        assert_eq!(result.status, DriftStatus::InsufficientHistory);
+        assert_eq!(result.baseline_crps, None);
+    }
 
     #[test]
     fn test_insufficient_history_below_minimum_runs() {

@@ -246,7 +246,7 @@ in {
     ${runtimeEnv}
     BACKUP_KEY="''${AWS_S3_DATABASE_BACKUP_KEY:-database/backups/fund-latest.dump.gz}"
     echo "Creating database backup..."
-    pg_dump -Fc -h localhost -p 5432 -U exedev fund > /tmp/fund-latest.dump
+    pg_dump -Fc -h localhost -p 5432 fund > /tmp/fund-latest.dump
     gzip -f /tmp/fund-latest.dump
     echo "Uploading backup to S3..."
     aws s3 cp /tmp/fund-latest.dump.gz "s3://$AWS_S3_BUCKET_NAME/$BACKUP_KEY"
@@ -254,11 +254,15 @@ in {
     echo "Database backup complete"
   '';
 
+  # No `-U exedev`. That is the VM's OS user, so hardcoding it made the two tasks that matter most
+  # during a cutover -- drop, recreate -- fail everywhere else with `role "exedev" does not exist`.
+  # Letting libpq default to the invoking OS user is what every other psql call in this file does,
+  # and on the VM the invoking user *is* exedev, so the behaviour there is unchanged.
   scripts.reset-database.exec = ''
     set -euo pipefail
     echo "Resetting fund database..."
-    psql -h localhost -p 5432 -U exedev -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
-    psql -h localhost -p 5432 -U exedev -d postgres -c "CREATE DATABASE fund"
+    psql -h localhost -p 5432 -d postgres -c "DROP DATABASE IF EXISTS fund WITH (FORCE)"
+    psql -h localhost -p 5432 -d postgres -c "CREATE DATABASE fund"
     echo "Fund database reset"
   '';
 
@@ -363,13 +367,15 @@ in {
     # every file under tests/ — around 1,300 lines that compiled under clippy
     # but whose assertions had never been executed.
     #
-    # The rebuild moved the previous integration targets to tests_old/, where
-    # cargo does not discover them: they test modules that no longer exist. The
-    # two below are their rewrites against the new schema, and each owns its own
-    # database (fund_test_database, fund_test_handlers) recreated on first use —
+    # Each integration target owns its own database (fund_test_database,
+    # fund_test_handlers, fund_test_dashboard) recreated on first use —
     # #[serial] only serializes within a process, so a shared database would have
     # two binaries deleting from the same tables concurrently.
-    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers"
+    #
+    # test_dashboard is not optional cover. The dashboard is the only part of the
+    # tree using raw sqlx::query rather than the checked macros, so nothing else
+    # catches a mistyped column there until the page is loaded.
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)
@@ -491,12 +497,15 @@ in {
     exec duckdb ~/lab.duckdb -init "$DEVENV_ROOT/tools/duckdb_initialization.sql"
   '';
 
-  # Emits the same event the live-quote evaluator raises on a threshold crossing, so a
-  # manual trigger exercises the identical handler path. The previous 'intraday_check'
-  # type was retired with the five-minute heartbeat and matched no consumer, so this
-  # script inserted a row that nothing acted on.
-  scripts.trigger-rebalance.exec = ''
+  # Emits the same event pg_cron raises every five minutes during a session, so a manual trigger
+  # exercises the identical handler path. Named for the command it emits; there is no "rebalance"
+  # in the vocabulary any more.
+  scripts.trigger-evaluation.exec = ''
     psql -h localhost -p 5432 -d fund -c "SELECT emit_event('portfolio_evaluation_requested', jsonb_build_object('reason', 'manual'))"
+  '';
+
+  scripts.trigger-liquidation.exec = ''
+    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('portfolio_liquidation_requested', jsonb_build_object('reason', 'manual'))"
   '';
 
   scripts.provision-development-application-vm.exec = "bash tools/provision-application-vm --environment development";
@@ -557,14 +566,31 @@ in {
   scripts.start-trainer.exec = ''
     set -euo pipefail
 
-    # Idempotent: install cron entry only if not already present
+    # Two entries, each checked independently. A single early exit on the first one would mean a
+    # machine provisioned before the sync entry existed never gets it, which is the drift the sync
+    # entry is there to prevent.
+
+    # 23:00 UTC on weekdays: 19:00 Eastern in summer, 18:00 in winter, so it is post-close in both
+    # halves of the year without a daylight-saving rule in the crontab. The artifact is then ready
+    # the evening before the session that uses it rather than three hours before, which is more
+    # margin for a failed run, not less.
+    #
+    # A fixed UTC hour is what makes that true year-round. 06:00 UTC, the previous schedule, is
+    # 01:00 or 02:00 Eastern -- after the close it was named for, but on the wrong side of
+    # midnight, so the run and the session it served never shared a date.
     if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
       echo "Training cron entry already installed"
-      exit 0
+    else
+      (crontab -l 2>/dev/null || true; echo '0 23 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
+      echo "Installed training cron entry (weekdays 23:00 UTC, post-close Eastern)"
     fi
 
-    (crontab -l 2>/dev/null || true; echo '0 6 * * 1-5 bash ~/fund-cron.sh tools/train-tide-model >> /var/log/fund/train-tide-model.log 2>&1') | crontab -
-    echo "Installed training cron entry (weekdays 06:00 UTC)"
+    if crontab -l 2>/dev/null | grep -qF 'sync-trainer'; then
+      echo "Sync cron entry already installed"
+    else
+      (crontab -l 2>/dev/null || true; echo '* * * * * bash ~/fund-cron.sh tools/sync-trainer >> /var/log/fund/sync-trainer.log 2>&1') | crontab -
+      echo "Installed sync-trainer cron entry"
+    fi
   '';
 
   scripts.stop-trainer.exec = ''
@@ -576,46 +602,43 @@ in {
     else
       echo "No training cron entry to remove"
     fi
+
+    if crontab -l 2>/dev/null | grep -qF 'sync-trainer'; then
+      crontab -l 2>/dev/null | grep -vF 'sync-trainer' | crontab - || true
+      echo "Removed sync-trainer cron entry"
+    else
+      echo "No sync cron entry to remove"
+    fi
   '';
 
+  # Bars come from Massive and go into PostgreSQL. There is no source or target to choose any more:
+  # the grouped endpoint answers by date rather than by symbol list, and the trainer fetches and
+  # archives its own S3 parquet rather than reading what a seed run left behind.
   scripts.seed-equity-bars.exec = ''
     set -euo pipefail
 
-    if [ -z "''${SEED_SOURCE:-}" ] || [ -z "''${SEED_TARGET:-}" ] || [ -z "''${SEED_START_DATE:-}" ]; then
-      echo "Usage: SEED_SOURCE=<massive|s3> SEED_TARGET=<s3|postgresql|all> SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars"
-      echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today)"
+    if [ -z "''${SEED_START_DATE:-}" ]; then
+      echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars"
+      echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
       echo ""
-      echo "  Sources: massive (Massive API), s3 (existing S3 Parquet)"
-      echo "  Targets: s3, postgresql, all"
-      echo "  Note: --source s3 with --target s3 or --target all is not supported"
+      echo "  Fetches whole-market daily bars from Massive, one request per session, and upserts"
+      echo "  them into equity_bars. Needs MASSIVE_BASE_URL and MASSIVE_API_KEY, not Alpaca"
+      echo "  credentials. Safe to re-run over a range already seeded."
       exit 1
     fi
 
-    END_DATE_ARGS=""
-    if [ -n "''${SEED_END_DATE:-}" ]; then
-      END_DATE_ARGS="$SEED_END_DATE"
-    fi
-
-    echo "Seeding equity bars: source=$SEED_SOURCE target=$SEED_TARGET from $SEED_START_DATE"
+    echo "Seeding equity bars from $SEED_START_DATE to ''${SEED_END_DATE:-today}"
     ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data --bin seed_equity_bars -- \
-      --source "$SEED_SOURCE" --target "$SEED_TARGET" "$SEED_START_DATE" $END_DATE_ARGS
+    secretspec run -- cargo run --release --bin seed_equity_bars -- \
+      "$SEED_START_DATE" ''${SEED_END_DATE:-}
   '';
 
   scripts.seed-equity-details.exec = ''
     set -euo pipefail
 
-    if [ -z "''${SEED_TARGET:-}" ]; then
-      echo "Usage: SEED_TARGET=<s3|postgresql|all> devenv tasks run data:equity-details"
-      echo ""
-      echo "  Targets: s3, postgresql, all"
-      exit 1
-    fi
-
-    echo "Seeding equity details: target=$SEED_TARGET"
+    echo "Seeding equity details from the embedded CSV"
     ${runtimeEnv}
-    secretspec run -- cargo run --no-default-features --features data --bin seed_equity_details -- \
-      --target "$SEED_TARGET"
+    secretspec run -- cargo run --release --bin seed_equity_details
   '';
 
   tasks = {
@@ -646,59 +669,47 @@ in {
 
     # --- Model training ---
 
-    # Rust-native TiDE training (burn). Reads bars + details from S3, trains, and
-    # uploads a model.tar.gz the inference service loads directly. The
-    # former Python/tinygrad workflow and its Prefect block registration are
-    # retired.
+    # Rust-native TiDE training (burn). Fetches its own bars from Massive, archives them to S3,
+    # trains against the accumulated window, and uploads a model.tar.gz the service loads directly.
+    # Needs no Alpaca credentials: the grouped endpoint answers by date, so there is no symbol list
+    # to build and therefore no broker to ask for one.
+    # The former Python/tinygrad workflow and its Prefect block registration are retired.
     "models:tide:train".exec = ''
       set -euo pipefail
       echo "Running tide training pipeline (Rust + burn)"
       ${runtimeEnv}
-      secretspec run -- cargo run --release --no-default-features --features train --bin tide_model_trainer
+      secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
     # --- Data tasks ---
 
-    # Seed equity bars from Massive API or S3 into S3 and/or PostgreSQL.
+    # Seed whole-market equity bars from Massive into PostgreSQL over a date range.
     "data:equity-bars".exec = "seed-equity-bars";
 
-    # Seed equity details from the embedded CSV into S3 and/or PostgreSQL.
+    # Seed ticker metadata from the embedded CSV into PostgreSQL.
     "data:equity-details".exec = "seed-equity-details";
 
-    # Full bootstrap: seed equity details and equity bars into all targets.
-    # Runs equity-details first (fast, no date range), then equity-bars.
+    # Full bootstrap for an empty database. Details first, because they are fast and carry no date
+    # range, and because the pair screen's sector rule silently admits nothing without them.
     "data:seed" = {
       exec = ''
         set -euo pipefail
 
         if [ -z "''${SEED_START_DATE:-}" ]; then
-          echo "Usage: SEED_SOURCE=<massive|s3> SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed"
-          echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today)"
+          echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed"
+          echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
           echo ""
-          echo "  Seeds equity details and equity bars into both S3 and PostgreSQL."
-          echo "  Source controls where equity bars are read from (massive or s3)."
+          echo "  Seeds ticker metadata and daily bars into PostgreSQL. The screen needs 60"
+          echo "  sessions of aligned closes and the model 70, so allow at least six months."
           exit 1
         fi
 
-        if [ -z "''${SEED_SOURCE:-}" ]; then
-          echo "Error: SEED_SOURCE is required (massive or s3)"
-          exit 1
-        fi
-
-        echo "=== Seeding equity details (target=all) ==="
-        SEED_TARGET=all seed-equity-details
-
-        # When source is s3, target=all is rejected (s3-to-s3 is a no-op).
-        # Route to postgresql instead.
-        if [ "$SEED_SOURCE" = "s3" ]; then
-          BARS_TARGET="postgresql"
-        else
-          BARS_TARGET="all"
-        fi
+        echo "=== Seeding equity details ==="
+        seed-equity-details
 
         echo ""
-        echo "=== Seeding equity bars (source=$SEED_SOURCE target=$BARS_TARGET) ==="
-        SEED_TARGET="$BARS_TARGET" seed-equity-bars
+        echo "=== Seeding equity bars ==="
+        seed-equity-bars
       '';
     };
 
@@ -785,33 +796,26 @@ in {
       ${applySchema}
     '';
 
-    processes.data = {
+    # One service process, not three.
+    #
+    # `data`, `inference`, and `portfolio` were separate processes distinguished by a `--module`
+    # flag, each running its own scheduler and its own consumer. The rebuild replaced all of that
+    # with one binary woken by pg_cron through LISTEN/NOTIFY: there is no `--module` flag left to
+    # pass, and splitting one event loop across three processes would mean three listeners racing
+    # for the same events.
+    #
+    # The shutdown timeout is the handler drain bound plus headroom. `bin/fund` waits for running
+    # handlers before returning, and killing it mid-drain is exactly the outcome the drain exists
+    # to prevent -- a liquidation stopped between two broker orders.
+    #
+    # Launched through `run-with-secrets`, not `secretspec run` directly. secretspec does not
+    # forward SIGTERM: it exits on the signal and orphans the binary underneath it, so the drain
+    # above never ran and every restart left a service behind. See that script for the measurement.
+    processes.fund = {
       exec = ''
         set -euo pipefail
         ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module data
-      '';
-      process-compose.depends_on.schema.condition = "process_completed_successfully";
-      process-compose.shutdown.signal = 15;
-      process-compose.shutdown.timeout_seconds = 60;
-    };
-
-    processes.inference = {
-      exec = ''
-        set -euo pipefail
-        ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module inference
-      '';
-      process-compose.depends_on.schema.condition = "process_completed_successfully";
-      process-compose.shutdown.signal = 15;
-      process-compose.shutdown.timeout_seconds = 120;
-    };
-
-    processes.portfolio = {
-      exec = ''
-        set -euo pipefail
-        ${runtimeEnv}
-        exec secretspec run -- cargo run --release --bin fund -- --module portfolio
+        exec bash "$DEVENV_ROOT/tools/run-with-secrets" cargo run --release --bin fund
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
       process-compose.shutdown.signal = 15;
@@ -821,10 +825,13 @@ in {
     processes.dashboard = {
       exec = ''
         set -euo pipefail
+        ${runtimeEnv}
         export DATABASE_URL="postgresql://dashboard_reader@localhost:5432/fund"
-        exec cargo run --release --features dashboard --bin dashboard
+        exec cargo run --release --bin dashboard
       '';
       process-compose.depends_on.schema.condition = "process_completed_successfully";
+      process-compose.shutdown.signal = 15;
+      process-compose.shutdown.timeout_seconds = 30;
     };
   };
 
@@ -877,13 +884,12 @@ in {
       echo "                                and pg_cron (localhost:5432)"
       echo "    schema                      Apply database schema"
       echo "                                (runs first, then exits)"
-      echo "    data                        Market data sync, nightly exports,"
-      echo "                                database backups"
-      echo "    inference                   Model artifact polling,"
-      echo "                                prediction pipeline"
-      echo "    portfolio                   Rebalance orchestration,"
-      echo "                                liquidation"
-      echo "    dashboard                   Monitoring UI"
+      echo "    fund                        The service: one event loop woken"
+      echo "                                by pg_cron. Predictions, the"
+      echo "                                evaluation pass, liquidation, the"
+      echo "                                account and market data syncs, and"
+      echo "                                the nightly export"
+      echo "    dashboard                   Monitoring UI (localhost:8084)"
       echo ""
       echo "  Scripts:"
       echo "    provision-{production|development}-{application|trainer}-vm"
@@ -899,8 +905,10 @@ in {
       echo "                                (run on VM)"
       echo "    list-aws-buckets            List fund S3 buckets"
       echo "    list-aws-secrets            List fund secrets in AWS"
-      echo "    trigger-rebalance           Emit an intraday_check event"
-      echo "                                manually"
+      echo "    trigger-evaluation          Emit a portfolio evaluation"
+      echo "                                request manually"
+      echo "    trigger-liquidation         Emit a portfolio liquidation"
+      echo "                                request manually"
       echo "    start-duckdb                Open DuckDB with S3 data lake"
       echo "                                views pre-loaded (pass bucket name)"
       echo "    bump-rust-dependencies      Update all dependency lockfiles"

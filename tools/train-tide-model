@@ -1,24 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# train-tide-model -- Cron job that syncs to latest code and runs model
-# training. Scheduled weekdays at 06:00 UTC by start-trainer.
+# train-tide-model -- Cron job that runs model training. Scheduled weekdays at 23:00 UTC by
+# start-trainer, which is post-close Eastern in both halves of the year.
+#
+# This script used to `git fetch` and `git reset --hard origin/master` before every run. That moved
+# to `sync-trainer`, which runs every minute, so the checkout is already current by the time this
+# fires. Two mechanisms resetting the same working tree is one more than can be reasoned about, and
+# keeping it here put a network operation in the critical path of a job with a fixed nightly window.
+#
+# What remains is the lock. `sync-trainer` refuses to reset the tree while this file exists, which
+# covers the whole run -- including the release build, where no `tide_model_trainer` process exists
+# yet to detect. Resetting the source out from under a compile is a real failure mode, and not a
+# fast one to diagnose from a training log.
 #
 # Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="/tmp/train-tide-model.pid"
 
 log() {
   echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
 }
 
+if [[ -f "$LOCK_FILE" ]]; then
+  existing_pid="$(cat "$LOCK_FILE")"
+  if kill -0 "$existing_pid" 2>/dev/null; then
+    log "Training already in progress (pid $existing_pid), skipping"
+    exit 0
+  fi
+  log "Removing a stale lock from pid $existing_pid"
+  rm -f "$LOCK_FILE"
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
 cd "$REPO_ROOT"
 
-log "Syncing to latest origin/master"
-git fetch origin master
-git reset --hard origin/master
-devenv allow 2>/dev/null || log "WARNING: devenv allow failed"
-
-log "Starting tide training pipeline"
+log "Starting tide training pipeline at $(git rev-parse --short HEAD)"
 devenv tasks run models:tide:train
 log "Training complete"

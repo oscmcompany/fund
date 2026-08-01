@@ -4,6 +4,14 @@
 -- views over the S3 data lake so production and export data is queryable
 -- immediately.
 --
+-- Two prefixes, and they are not interchangeable:
+--
+--   data/    the trainer's own archive. Fetched from Massive and written by the
+--            trainer VM, which has no database. This is the training input and
+--            it accumulates for as long as the bucket keeps it.
+--   exports/ the application's nightly export of its PostgreSQL tables. This is
+--            what the 90-day retention window would otherwise discard.
+--
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
 --   - AWS_S3_BUCKET_NAME set (start-duckdb passes the bucket argument)
@@ -19,21 +27,21 @@ SET VARIABLE bucket = getenv('AWS_S3_BUCKET_NAME');
 .bail off
 
 -- ---------------------------------------------------------------------------
--- Data lake views (raw ingested data)
+-- Trainer archive (data/) -- the model's training input
 -- ---------------------------------------------------------------------------
 
-.print 'Loading equity_bars...'
-DROP VIEW IF EXISTS equity_bars;
-CREATE OR REPLACE VIEW equity_bars AS
+.print 'Loading training_bars...'
+DROP VIEW IF EXISTS training_bars;
+CREATE OR REPLACE VIEW training_bars AS
 SELECT *
 FROM read_parquet(
     's3://' || getvariable('bucket') || '/data/equity/bars/**/*.parquet',
     hive_partitioning = true
 );
 
-.print 'Loading equity_details...'
-DROP VIEW IF EXISTS equity_details;
-CREATE OR REPLACE VIEW equity_details AS
+.print 'Loading training_details...'
+DROP VIEW IF EXISTS training_details;
+CREATE OR REPLACE VIEW training_details AS
 SELECT *
 FROM read_csv(
     's3://' || getvariable('bucket') || '/data/equity/details/details.csv',
@@ -41,8 +49,26 @@ FROM read_csv(
 );
 
 -- ---------------------------------------------------------------------------
--- Export views (daily operational snapshots)
+-- Nightly exports (exports/) -- one view per exported table
 -- ---------------------------------------------------------------------------
+
+.print 'Loading equity_bars...'
+DROP VIEW IF EXISTS equity_bars;
+CREATE OR REPLACE VIEW equity_bars AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('bucket') || '/exports/equity/bars/**/*.parquet',
+    hive_partitioning = true
+);
+
+.print 'Loading equity_details...'
+DROP VIEW IF EXISTS equity_details;
+CREATE OR REPLACE VIEW equity_details AS
+SELECT *
+FROM read_parquet(
+    's3://' || getvariable('bucket') || '/exports/equity/details/**/*.parquet',
+    hive_partitioning = true
+);
 
 .print 'Loading equity_predictions...'
 DROP VIEW IF EXISTS equity_predictions;
@@ -50,15 +76,6 @@ CREATE OR REPLACE VIEW equity_predictions AS
 SELECT *
 FROM read_parquet(
     's3://' || getvariable('bucket') || '/exports/equity/predictions/**/*.parquet',
-    hive_partitioning = true
-);
-
-.print 'Loading equity_rebalance_sessions...'
-DROP VIEW IF EXISTS equity_rebalance_sessions;
-CREATE OR REPLACE VIEW equity_rebalance_sessions AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/rebalance-sessions/**/*.parquet',
     hive_partitioning = true
 );
 
@@ -71,48 +88,33 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
-.print 'Loading equity_allocations...'
-DROP VIEW IF EXISTS equity_allocations;
-CREATE OR REPLACE VIEW equity_allocations AS
+.print 'Loading account_snapshots...'
+DROP VIEW IF EXISTS account_snapshots;
+CREATE OR REPLACE VIEW account_snapshots AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/allocations/**/*.parquet',
+    's3://' || getvariable('bucket') || '/exports/account/snapshots/**/*.parquet',
     hive_partitioning = true
 );
 
-.print 'Loading equity_orders...'
-DROP VIEW IF EXISTS equity_orders;
-CREATE OR REPLACE VIEW equity_orders AS
+.print 'Loading account_activities...'
+DROP VIEW IF EXISTS account_activities;
+CREATE OR REPLACE VIEW account_activities AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/orders/**/*.parquet',
+    's3://' || getvariable('bucket') || '/exports/account/activities/**/*.parquet',
     hive_partitioning = true
 );
 
-.print 'Loading equity_portfolio_snapshots...'
-DROP VIEW IF EXISTS equity_portfolio_snapshots;
-CREATE OR REPLACE VIEW equity_portfolio_snapshots AS
+-- The event log is the record of every command issued and every outcome reached, and completed
+-- payloads carry the per-run summaries. It is the most useful table here for asking what the
+-- strategy actually did on a given day.
+.print 'Loading events...'
+DROP VIEW IF EXISTS events;
+CREATE OR REPLACE VIEW events AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/portfolio-snapshots/**/*.parquet',
-    hive_partitioning = true
-);
-
-.print 'Loading model_runs...'
-DROP VIEW IF EXISTS model_runs;
-CREATE OR REPLACE VIEW model_runs AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/model-runs/**/*.parquet',
-    hive_partitioning = true
-);
-
-.print 'Loading equity_reconciliation_events...'
-DROP VIEW IF EXISTS equity_reconciliation_events;
-CREATE OR REPLACE VIEW equity_reconciliation_events AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/reconciliation-events/**/*.parquet',
+    's3://' || getvariable('bucket') || '/exports/events/**/*.parquet',
     hive_partitioning = true
 );
 

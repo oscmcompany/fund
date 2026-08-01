@@ -1,54 +1,68 @@
-//! PostgreSQL connection handling shared by all services.
+//! PostgreSQL connection handling.
+//!
+//! The service cannot do anything useful without a database — every command arrives through it and
+//! every result is written back to it — so connecting is fallible at startup rather than optional
+//! at runtime. There is no degraded mode to fall back to.
 
+use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::info;
 
-/// Connect to PostgreSQL when `DATABASE_URL` is set.
+/// Maximum pooled connections.
 ///
-/// Returns the optional pool together with whether `DATABASE_URL` was configured
-/// at all — the pool can be `None` even when configured, if the connection
-/// attempt failed. Services that do not distinguish the two cases can ignore the
-/// boolean.
-pub async fn connect_optional_pool() -> (Option<PgPool>, bool) {
-    match std::env::var("DATABASE_URL") {
-        Ok(database_url) => match PgPool::connect(&database_url).await {
-            Ok(pool) => {
-                info!("Connected to PostgreSQL");
-                (Some(pool), true)
-            }
-            Err(error) => {
-                warn!("Failed to connect to PostgreSQL: {}", error);
-                (None, true)
-            }
-        },
-        Err(_) => {
-            info!("DATABASE_URL not set, PostgreSQL disabled");
-            (None, false)
-        }
-    }
+/// One process with one event consumer, a handful of concurrent queries inside a single evaluation
+/// pass, and a separate listener connection. Five is comfortable headroom; the previous default of
+/// ten existed for three services sharing a database.
+const MAXIMUM_CONNECTIONS: u32 = 5;
+
+/// How long to wait for a free connection before giving up.
+///
+/// Explicit rather than left at sqlx's 30-second default. A handler that cannot get a connection is
+/// blocked on something that is not going to resolve inside a five-minute evaluation window, and a
+/// prompt error that lands in the `_errored` payload is more useful than a long stall that pushes
+/// the pass past its next firing.
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Errors that prevent the service from reaching PostgreSQL.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionError {
+    #[error("DATABASE_URL environment variable must be set")]
+    MissingDatabaseUrl,
+    #[error("failed to connect to PostgreSQL: {0}")]
+    Connect(#[from] sqlx::Error),
+}
+
+/// Connects to PostgreSQL using `DATABASE_URL`.
+pub async fn connect_pool() -> Result<PgPool, ConnectionError> {
+    let database_url =
+        std::env::var("DATABASE_URL").map_err(|_| ConnectionError::MissingDatabaseUrl)?;
+    let pool = PgPoolOptions::new()
+        .max_connections(MAXIMUM_CONNECTIONS)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .connect(&database_url)
+        .await?;
+    info!(
+        maximum_connections = MAXIMUM_CONNECTIONS,
+        acquire_timeout_seconds = ACQUIRE_TIMEOUT.as_secs(),
+        "Connected to PostgreSQL"
+    );
+    Ok(pool)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
     /// RAII guard that restores a single environment variable on drop.
     ///
-    /// Guarantees cleanup even when the test body panics. Tests using this guard
-    /// must be marked `#[serial_test::serial]` to prevent concurrent env access.
-    struct EnvVarRestoreGuard {
+    /// Guarantees cleanup even when the test body panics. Tests using this guard must be marked
+    /// `#[serial_test::serial]` to prevent concurrent environment access.
+    struct EnvironmentVariableGuard {
         key: &'static str,
         previous: Option<String>,
     }
 
-    impl EnvVarRestoreGuard {
+    impl EnvironmentVariableGuard {
         fn save(key: &'static str) -> Self {
             Self {
                 key,
@@ -57,9 +71,9 @@ mod tests {
         }
     }
 
-    impl Drop for EnvVarRestoreGuard {
+    impl Drop for EnvironmentVariableGuard {
         fn drop(&mut self) {
-            // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
+            // SAFETY: protected by #[serial_test::serial] — no concurrent environment access.
             unsafe {
                 match self.previous.as_ref() {
                     Some(value) => std::env::set_var(self.key, value),
@@ -69,27 +83,24 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn test_connect_optional_pool_returns_false_when_database_url_unset() {
-        // Remove DATABASE_URL so the not-configured branch is exercised.
-        let _guard = EnvVarRestoreGuard::save("DATABASE_URL");
-        // SAFETY: single-process test; env mutation is serialized by #[serial].
+    async fn test_connect_pool_reports_missing_database_url() {
+        let _guard = EnvironmentVariableGuard::save("DATABASE_URL");
+        // SAFETY: single-process test; environment mutation is serialized by #[serial].
         unsafe { std::env::remove_var("DATABASE_URL") };
 
-        let (pool, configured) = make_runtime().block_on(connect_optional_pool());
+        let error = connect_pool().await.expect_err("unset URL must fail");
 
-        assert!(pool.is_none());
-        assert!(!configured);
+        assert!(matches!(error, ConnectionError::MissingDatabaseUrl));
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn test_connect_optional_pool_returns_true_when_database_url_set_but_unreachable() {
-        // With a syntactically valid but unreachable URL the function must return
-        // (None, true): the URL was configured, but the connection failed.
-        let _guard = EnvVarRestoreGuard::save("DATABASE_URL");
-        // SAFETY: single-process test; env mutation is serialized by #[serial].
+    async fn test_connect_pool_reports_unreachable_host() {
+        let _guard = EnvironmentVariableGuard::save("DATABASE_URL");
+        // SAFETY: single-process test; environment mutation is serialized by #[serial].
+        // The .invalid TLD (RFC 2606) never resolves, so this always fails to connect.
         unsafe {
             std::env::set_var(
                 "DATABASE_URL",
@@ -97,12 +108,10 @@ mod tests {
             )
         };
 
-        let (pool, configured) = make_runtime().block_on(connect_optional_pool());
+        let error = connect_pool()
+            .await
+            .expect_err("unreachable host must fail");
 
-        // The URL was present, so configured == true regardless of whether the
-        // connection succeeded.
-        assert!(configured);
-        // An unresolvable host (.invalid TLD, RFC 2606) always fails to connect.
-        assert!(pool.is_none());
+        assert!(matches!(error, ConnectionError::Connect(_)));
     }
 }
