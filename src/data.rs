@@ -1,16 +1,19 @@
-//! Data: syncs equity data from the Massive API, backed by S3 and
-//! PostgreSQL. Driven by the Postgres event bus and a sync scheduler.
+//! Market data and storage: what the market is, what it costs, and where the record goes.
+//!
+//! [`calendar`] and [`universe`] answer the two questions every session opens with — does the
+//! market trade today and until when, and which symbols are eligible. Both are fetched once and
+//! held for the Eastern date, because neither changes intraday.
+//!
+//! [`bars`] and [`details`] are the market history the model and the pair screen read from.
+//! [`bars`] is shared with the trainer, which runs on a different machine with no database and
+//! writes the same frames to S3 — that shared code path is what keeps the training and inference
+//! datasets structurally identical.
+//!
+//! [`export`] and [`purge`] are the nightly archival pair, in that order and never the reverse.
 
-pub mod database;
-pub mod equity_bars;
-pub mod equity_details;
-pub mod errors;
+pub mod bars;
+pub mod calendar;
+pub mod details;
 pub mod export;
-pub mod manifest;
-pub mod market_calendar;
-pub mod market_calendar_sync;
-pub mod model_artifact;
-pub mod scheduler;
-pub mod state;
-pub mod types;
-pub mod validation;
+pub mod purge;
+pub mod universe;

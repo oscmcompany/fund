@@ -8,8 +8,11 @@
 -- Every DDL statement uses an idempotent form so this file can be re-run against a populated
 -- database. Note the one thing that re-running cannot do: CREATE TABLE IF NOT EXISTS is a no-op
 -- against a table that already exists with a different shape. Databases provisioned before the
--- rebuild must be dropped and recreated rather than upgraded in place, and equity_bars re-seeded
--- from the S3 parquet exports via seed_equity_bars.
+-- rebuild must be dropped and recreated rather than upgraded in place, then re-seeded with
+-- `devenv tasks run data:seed` -- ticker metadata from the embedded CSV and daily bars from
+-- Alpaca. Not from the S3 exports: they are the same rows, but the seed path has one source and
+-- one code path, and a bootstrap that reads its own backups is a bootstrap that fails the first
+-- time it is genuinely needed.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;

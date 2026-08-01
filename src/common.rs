@@ -1,12 +1,14 @@
-//! Shared service infrastructure: observability, AWS clients, database pools,
-//! and the PostgreSQL event bus. Deduplicates the bootstrap code common to
-//! every module.
+//! Shared vocabulary and service infrastructure.
+//!
+//! [`types`] holds the domain vocabulary every other module speaks — tickers, bars, quotes,
+//! predictions, and the validated financial primitives. [`events`] is the coordination mechanism:
+//! six commands, three outcomes, and the scan that recovers work missed while the process was down.
+//! The remainder is bootstrap shared by every entry point.
 
 pub mod alpaca;
 pub mod aws;
 pub mod crypto;
 pub mod database;
 pub mod events;
-#[cfg(any(feature = "data", feature = "portfolio"))]
-pub mod market_hours;
 pub mod observability;
+pub mod types;

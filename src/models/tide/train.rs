@@ -22,11 +22,78 @@ use crate::models::tide::model::TideModel;
 pub type TrainBackend = Autodiff<NdArray>;
 
 pub struct TrainConfig {
-    pub learning_rate: f64,
-    pub epoch_count: usize,
-    pub batch_size: usize,
-    pub early_stopping_patience: usize,
-    pub min_delta: f64,
+    learning_rate: f64,
+    epoch_count: usize,
+    batch_size: usize,
+    early_stopping_patience: usize,
+    min_delta: f64,
+}
+
+/// Why a training configuration was rejected.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("invalid training configuration: {reason}")]
+pub struct TrainConfigError {
+    pub reason: String,
+}
+
+impl TrainConfig {
+    /// Constructs a validated `TrainConfig`.
+    ///
+    /// `batch_size` is the one that bites hardest: it reaches `slice::chunks`, which panics on
+    /// zero, so a zero batch size aborts the training task rather than failing it. A non-positive
+    /// learning rate is quieter and worse — training runs to completion and learns nothing.
+    pub fn new(
+        learning_rate: f64,
+        epoch_count: usize,
+        batch_size: usize,
+        early_stopping_patience: usize,
+        min_delta: f64,
+    ) -> Result<Self, TrainConfigError> {
+        let reject = |reason: &str| {
+            Err(TrainConfigError {
+                reason: reason.to_string(),
+            })
+        };
+        if batch_size == 0 {
+            return reject("batch_size must be greater than zero");
+        }
+        if epoch_count == 0 {
+            return reject("epoch_count must be greater than zero");
+        }
+        if !learning_rate.is_finite() || learning_rate <= 0.0 {
+            return reject("learning_rate must be a positive, finite number");
+        }
+        if !min_delta.is_finite() || min_delta < 0.0 {
+            return reject("min_delta must be a non-negative, finite number");
+        }
+        Ok(Self {
+            learning_rate,
+            epoch_count,
+            batch_size,
+            early_stopping_patience,
+            min_delta,
+        })
+    }
+
+    pub fn learning_rate(&self) -> f64 {
+        self.learning_rate
+    }
+
+    pub fn epoch_count(&self) -> usize {
+        self.epoch_count
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub fn early_stopping_patience(&self) -> usize {
+        self.early_stopping_patience
+    }
+
+    pub fn min_delta(&self) -> f64 {
+        self.min_delta
+    }
 }
 
 impl Default for TrainConfig {
@@ -233,6 +300,50 @@ fn validation_loss(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `batch_size` reaches `slice::chunks`, which panics on zero — so an invalid configuration
+    /// aborts the training task rather than failing it. A non-positive learning rate is quieter and
+    /// worse: training completes and learns nothing.
+    #[test]
+    fn test_train_config_rejects_values_that_break_the_loop() {
+        assert!(
+            TrainConfig::new(0.001, 20, 0, 3, 1e-5).is_err(),
+            "zero batch"
+        );
+        assert!(
+            TrainConfig::new(0.001, 0, 512, 3, 1e-5).is_err(),
+            "zero epochs"
+        );
+        assert!(
+            TrainConfig::new(0.0, 20, 512, 3, 1e-5).is_err(),
+            "zero learning rate"
+        );
+        assert!(
+            TrainConfig::new(-0.1, 20, 512, 3, 1e-5).is_err(),
+            "negative learning rate"
+        );
+        assert!(
+            TrainConfig::new(f64::NAN, 20, 512, 3, 1e-5).is_err(),
+            "non-finite"
+        );
+        assert!(
+            TrainConfig::new(0.001, 20, 512, 3, -1.0).is_err(),
+            "negative min_delta"
+        );
+    }
+
+    #[test]
+    fn test_train_config_accepts_the_defaults() {
+        let defaults = TrainConfig::default();
+        assert!(TrainConfig::new(
+            defaults.learning_rate(),
+            defaults.epoch_count(),
+            defaults.batch_size(),
+            defaults.early_stopping_patience(),
+            defaults.min_delta(),
+        )
+        .is_ok());
+    }
     use crate::models::tide::data::input_feature_size;
 
     /// A tiny dataset whose target is a constant the model can fit; used to prove

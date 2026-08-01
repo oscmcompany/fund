@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sync-trainer -- Per-minute cron job that fast-forwards the trainer VM to origin/master.
+#
+# The application VM has had `sync-application` since it was provisioned; the trainer VM has had
+# nothing, so it ran whatever revision it happened to be provisioned at. That was survivable while
+# the trainer only read a dataset the application had written. It is not now: both sides fetch
+# through `fund::data::bars` and build frames through `bars_to_dataframe`, and a drift between the
+# two produces a model trained on columns the inference path does not produce -- which surfaces as
+# bad predictions rather than as an error.
+#
+# Simpler than the application's version in the way that matters. The trainer is a batch job, not a
+# long-running process, so there is nothing to restart: the next training run picks up whatever is
+# checked out. What it needs instead is a guard against syncing *during* a run, because resetting
+# the working tree under a training job would swap the source out from beneath it.
+#
+# This replaces the fetch-and-reset that used to live at the top of `train-tide-model`, rather than
+# adding a second one alongside it.
+#
+# Invoked by cron via ~/fund-cron.sh (written by bootstrap-machine).
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="/tmp/sync-trainer.pid"
+TRAINING_LOCK_FILE="/tmp/train-tide-model.pid"
+
+log() {
+  echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") $1"
+}
+
+# Single-instance guard: prevent overlapping cron runs.
+if [[ -f "$LOCK_FILE" ]]; then
+  existing_pid="$(cat "$LOCK_FILE")"
+  if kill -0 "$existing_pid" 2>/dev/null; then
+    exit 0
+  fi
+  rm -f "$LOCK_FILE"
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+cd "$REPO_ROOT"
+
+# Never sync mid-run. A training run takes far longer than the one-minute cron interval, so this is
+# the common case on a training evening rather than a rare race. Skipping costs one cycle; the next
+# firing after the run finishes picks the new revision up.
+#
+# The lock `train-tide-model` holds, not a `pgrep` for `tide_model_trainer`. The binary does not
+# exist as a process during the release build that precedes it, which can run for minutes -- and
+# that is precisely the window in which resetting the tree does the most damage.
+if [[ -f "$TRAINING_LOCK_FILE" ]]; then
+  training_pid="$(cat "$TRAINING_LOCK_FILE")"
+  if kill -0 "$training_pid" 2>/dev/null; then
+    log "Training in progress (pid $training_pid), skipping sync"
+    exit 0
+  fi
+  log "Ignoring a stale training lock from pid $training_pid"
+fi
+
+if ! git fetch origin master 2>&1; then
+  log "git fetch failed, will retry next cycle"
+  exit 0
+fi
+
+local_head="$(git rev-parse HEAD)"
+remote_head="$(git rev-parse origin/master)"
+
+if [[ "$local_head" == "$remote_head" ]]; then
+  exit 0
+fi
+
+log "New commits detected (local=$local_head remote=$remote_head)"
+git reset --hard origin/master
+devenv allow 2>/dev/null || log "WARNING: devenv allow failed; manual 'devenv allow' may be needed"
+log "Updated to $(git rev-parse --short HEAD)"

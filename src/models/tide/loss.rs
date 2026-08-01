@@ -37,7 +37,14 @@ pub fn quantile_loss<B: Backend>(
         let loss = if huber_delta > 0.0 {
             let absolute = error.clone().abs();
             let is_small = absolute.clone().lower_equal_elem(huber_delta);
-            let huber_small = error.clone().powf_scalar(2.0).div_scalar(2.0 * huber_delta);
+            // Squared by multiplication rather than `powf_scalar(2.0)`. Several backends compute
+            // `powf` as `exp(n * ln(x))`, which is NaN for the negative errors that occur whenever
+            // the prediction overshoots the target -- exactly half the Huber region. Multiplication
+            // is exact for every sign and cheaper besides.
+            let huber_small = error
+                .clone()
+                .mul(error.clone())
+                .div_scalar(2.0 * huber_delta);
             let huber_large = absolute.sub_scalar(huber_delta / 2.0);
             let huber = huber_large.mask_where(is_small, huber_small);
 

@@ -293,13 +293,19 @@ pub async fn seed_details(pool: &PgPool, ticker_sectors: &[(&str, &str)]) {
     }
 }
 
-/// Inserts one prediction per ticker at `timestamp`.
+/// Inserts one prediction per ticker at `timestamp`, all sharing one `correlation_id`.
+///
+/// One identifier for the whole batch, not one per row. `insert_predictions` takes a single
+/// `correlation_id` and applies it to every prediction in the call, which is what makes the column
+/// identify a batch at all — a fixture giving each ticker its own would produce a table state the
+/// writer cannot produce, and any query grouping by batch would see one row per group.
 pub async fn seed_predictions(
     pool: &PgPool,
     model_run_id: &str,
     tickers_and_medians: &[(&str, f64)],
     timestamp: DateTime<Utc>,
 ) {
+    let correlation_id = Uuid::new_v4();
     for (ticker, median) in tickers_and_medians {
         sqlx::query(
             "INSERT INTO equity_predictions \
@@ -310,7 +316,7 @@ pub async fn seed_predictions(
                  quantile_50 = EXCLUDED.quantile_50, \
                  quantile_90 = EXCLUDED.quantile_90",
         )
-        .bind(Uuid::new_v4())
+        .bind(correlation_id)
         .bind(model_run_id)
         .bind(*ticker)
         .bind(timestamp)

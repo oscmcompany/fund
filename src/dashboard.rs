@@ -1,57 +1,50 @@
-//! Dashboard service: HTTP server rendering a read-only fund status page.
+//! The dashboard: a read-only page describing what the fund is doing.
 //!
-//! Entry point is [`run`], which connects to the local Postgres instance,
-//! spawns the background polling and event-listener tasks, then starts the
-//! Axum HTTP server.
+//! Runs as its own process alongside the service, connecting as `dashboard_reader` — a role holding
+//! SELECT on five tables and nothing else, so a bug here cannot write to the database the strategy
+//! trades from.
 //!
-//! Data flow:
-//! - A single [`cache::spawn_polling_task`] refreshes all view data every 30
-//!   seconds behind an `Arc<RwLock<DashboardState>>`.
-//! - A [`cache::spawn_event_listener_task`] subscribes to the Postgres `events`
-//!   NOTIFY channel and appends real-time events to the ring buffer.
-//! - HTTP request handlers read from the shared cache without touching the
-//!   database directly, so viewer count does not affect Postgres connection load.
+//! Two background tasks keep one shared state current: a poller that refreshes every view on a
+//! fixed interval, and a listener that appends events from the `events` NOTIFY channel as they
+//! happen. Request handlers read that state and never query, so the number of viewers has no
+//! bearing on the connection pool.
 
 pub mod cache;
 pub mod database;
-pub mod events;
 pub mod html;
-pub mod performance;
-pub mod positions;
-pub mod predictions;
 pub mod server;
-pub mod trades;
+
+use std::sync::Arc;
 
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::RwLock;
 use tracing::info;
 
 use crate::common::observability::init_tracing_file_only;
 
-/// Maximum number of Postgres connections the dashboard pool may open.
-///
-/// One connection is used by the polling task and one by the LISTEN/NOTIFY
-/// event listener. A small additional allowance covers startup overlap.
+/// Connections the dashboard pool may open: one for the poller, one for the listener, and headroom
+/// for the overlap while a dropped listener reconnects.
 const POOL_MAX_CONNECTIONS: u32 = 4;
 
-/// Initializes tracing, connects to the read-only database, spawns background
-/// tasks, and starts the HTTP server.
+/// Connects, spawns the background tasks, and serves until the process ends.
 ///
-/// Panics on startup if `DATABASE_URL` is unset or the database is unreachable.
+/// Panics on a missing `DATABASE_URL` or an unreachable database. Both are configuration errors
+/// that no amount of retrying fixes, and a dashboard that starts without a database would serve an
+/// empty page indistinguishable from a flat one.
 pub async fn run() {
     let _tracing_guard = init_tracing_file_only("dashboard-service.log", "dashboard");
     info!("Starting dashboard service");
 
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| panic!("DATABASE_URL must be set"));
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| panic!("DATABASE_URL must be set for the dashboard"));
 
     let pool = PgPoolOptions::new()
         .max_connections(POOL_MAX_CONNECTIONS)
         .connect(&database_url)
         .await
-        .unwrap_or_else(|error| panic!("Failed to connect to database: {error}"));
+        .unwrap_or_else(|error| panic!("Failed to connect to the database: {error}"));
 
-    let state = std::sync::Arc::new(tokio::sync::RwLock::new(cache::DashboardState::default()));
-
+    let state = Arc::new(RwLock::new(cache::DashboardState::default()));
     cache::spawn_polling_task(state.clone(), pool.clone());
     cache::spawn_event_listener_task(state.clone(), pool);
 
