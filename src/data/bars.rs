@@ -1,10 +1,15 @@
-//! Equity bars: one fetch from Alpaca, three destinations.
+//! Equity bars: one fetch from Massive, three destinations.
 //!
 //! The application writes bars to PostgreSQL after the close. The trainer, on a different machine
 //! with no database, writes the same bars to S3 parquet before it trains. Both call
-//! [`fetch_bars`] and both build their frames through [`bars_to_dataframe`], which is the whole
-//! point: if the two ever diverged, the model would train on columns the inference path does not
-//! produce, and the failure would surface as bad predictions rather than as a build error.
+//! [`fetch_daily_bars`] and both build their frames through [`bars_to_dataframe`], which is the
+//! whole point: if the two ever diverged, the model would train on columns the inference path does
+//! not produce, and the failure would surface as bad predictions rather than as a build error.
+//!
+//! Bars come from Massive's grouped endpoint rather than Alpaca's, for reasons recorded in
+//! [`crate::common::massive`]: it takes a date rather than a symbol list, which removes both the
+//! survivorship bias in any backfill and the ratchet that would otherwise close the tradable
+//! universe. Alpaca still prices the book intraday, because that is the venue we trade on.
 //!
 //! [`load_bars_dataframe`] is the read side, feeding the prediction pipeline and the correlation
 //! screen.
@@ -15,9 +20,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::common::alpaca::{ClientError, MarketDataClient};
+use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, Ticker};
 
 /// Rows per insert chunk.
@@ -35,26 +40,55 @@ pub const HISTORY_LOOKBACK_DAYS: i64 = 120;
 /// Errors syncing or reading bars.
 #[derive(Debug, thiserror::Error)]
 pub enum BarsError {
-    #[error("failed to fetch bars from Alpaca: {0}")]
-    Alpaca(#[from] ClientError),
+    #[error("failed to fetch bars from Massive: {0}")]
+    Massive(#[from] MassiveError),
     #[error("failed to persist bars: {0}")]
     Database(#[from] sqlx::Error),
     #[error("failed to build a bar frame: {0}")]
     Frame(#[from] PolarsError),
 }
 
-/// Fetches bars for `symbols` over an inclusive date range.
+/// What a multi-date fetch produced, and which dates it could not.
 ///
-/// A thin pass-through to the market data client, present so both the application and the trainer
-/// have one entry point to call and one place to change.
-pub async fn fetch_bars(
-    client: &MarketDataClient,
-    symbols: &[String],
-    bar_interval: BarInterval,
-    start: NaiveDate,
-    end: NaiveDate,
-) -> Result<Vec<EquityBar>, BarsError> {
-    Ok(client.fetch_bars(symbols, bar_interval, start, end).await?)
+/// The failed dates are carried rather than folded into an error, because a partial fetch is
+/// usable: a backfill spanning months should keep the sessions it retrieved. The caller decides
+/// whether the gaps matter, and it is the caller that knows whether this run was a nightly
+/// three-session top-up or a cold seed.
+#[derive(Debug, Default)]
+pub struct FetchedBars {
+    pub bars: Vec<EquityBar>,
+    pub dates_failed: Vec<NaiveDate>,
+}
+
+/// Fetches whole-market daily bars for each of `dates`.
+///
+/// One request per date, because that is the grouped endpoint's unit. Dates that are not trading
+/// sessions cost a request and return nothing, so a caller with a calendar should filter first and
+/// one without can simply pass every calendar day.
+///
+/// A failed date is recorded and stepped over. Aborting would discard every date already
+/// retrieved, and the upsert makes re-running the same range cheap, so partial progress is worth
+/// more than an all-or-nothing guarantee that nothing else depends on.
+pub async fn fetch_daily_bars(client: &MassiveClient, dates: &[NaiveDate]) -> FetchedBars {
+    let mut fetched = FetchedBars::default();
+
+    for date in dates {
+        match client.fetch_grouped_daily(*date).await {
+            Ok(bars) => fetched.bars.extend(bars),
+            Err(error) => {
+                warn!(%date, %error, "Failed to fetch a session's bars, continuing");
+                fetched.dates_failed.push(*date);
+            }
+        }
+    }
+
+    info!(
+        dates = dates.len(),
+        bars = fetched.bars.len(),
+        dates_failed = fetched.dates_failed.len(),
+        "Daily bars fetched"
+    );
+    fetched
 }
 
 /// Removes repeated `(ticker, bar_interval, timestamp)` rows, keeping the last occurrence.

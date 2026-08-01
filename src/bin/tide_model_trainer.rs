@@ -2,7 +2,7 @@
 //!
 //! Four stages, and the first one is new. The trainer used to read a dataset the application's
 //! nightly export had written, which coupled two machines through a bucket and made a failed export
-//! cost the next day's model. It now fetches its own bars from Alpaca and writes its own parquet,
+//! cost the next day's model. It now fetches its own bars from Massive and writes its own parquet,
 //! so the only thing crossing the boundary between the two VMs is the finished artifact.
 //!
 //! Both sides fetch through [`fund::data::bars`] and build frames through
@@ -10,9 +10,9 @@
 //! and the application's ever diverged, the model would train on columns the inference path does
 //! not produce, and it would surface as bad predictions rather than as a build error.
 //!
-//! Nothing here writes to a database, and nothing here reads one.
+//! Nothing here writes to a database, reads one, or talks to Alpaca. Massive answers by date, so
+//! there is no symbol list to build and therefore no broker to ask for one.
 
-use std::collections::HashSet;
 use std::io::Cursor;
 
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -22,10 +22,10 @@ use chrono::{Duration, NaiveDate, Utc};
 use polars::prelude::*;
 use tracing::{error, info, warn};
 
-use fund::common::alpaca::{AlpacaCredentials, MarketDataClient, TradingClient};
 use fund::common::aws::date_partitioned_key;
+use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
-use fund::common::types::{BarInterval, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use fund::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use fund::data::bars;
 use fund::data::calendar::{eastern_date, is_weekend};
 use fund::data::details;
@@ -60,10 +60,10 @@ const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 /// Three rather than one, for the same reason the application's sync uses three: a night the
 /// trainer did not run leaves a hole in the archive that nothing else fills.
 ///
-/// The overlap is only cheap because the rewrite *merges*. The universe is recomputed from Alpaca's
-/// current tradable set each run, so a plain overwrite would drop every delisted symbol's already
-/// archived bars for those three days -- shrinking the training window one delisting at a time, with
-/// nothing to show for it.
+/// The merge below is what makes the overlap cheap. It matters less than it did -- the grouped
+/// endpoint returns whatever traded on the date, so a delisted symbol's bars come back for the days
+/// it was still trading rather than vanishing with the current tradable set -- but a plain overwrite
+/// would still discard anything the API omits from a later response, and the merge costs nothing.
 const FETCH_LOOKBACK_SESSIONS: i64 = 3;
 
 /// Calendar days of archive the training window spans by default.
@@ -111,7 +111,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     //
     // A failure here is logged and stepped over rather than fatal. The archive already holds a
     // year; a night with no new partition trains on 364 days instead of 365, which is a far better
-    // outcome than publishing no model because Alpaca was briefly unreachable.
+    // outcome than publishing no model because Massive was briefly unreachable.
     match fetch_and_archive(&s3_client, &bucket).await {
         Ok(rows) => info!(rows, "Session bars archived"),
         Err(error) => warn!(%error, "Fetch stage failed; training on the existing archive"),
@@ -357,42 +357,41 @@ fn training_config() -> Result<TrainConfig, Box<dyn std::error::Error>> {
     )?)
 }
 
-/// Fetches the most recent sessions' bars from Alpaca and writes them to the archive.
+/// Fetches the most recent sessions' bars from Massive and writes them to the archive.
 ///
-/// Returns the number of rows written. The universe is Alpaca's tradable set intersected with the
-/// embedded ticker list — the trainer has no database, so it cannot compute the application's
-/// liquidity-filtered universe, and it does not need to: `filter_training_bars` applies the same
-/// price and volume thresholds to the rows themselves further down.
+/// Returns the number of rows written. There is no universe here and no symbol list: the grouped
+/// endpoint is asked for a date and answers with every stock that traded on it. That is what the
+/// trainer wants — `filter_training_bars` applies the price and volume thresholds to the rows
+/// themselves further down, so pre-filtering here would only decide which names the model is
+/// allowed to have ever seen.
+///
+/// It also means the trainer needs no Alpaca credentials at all. It used to call
+/// `fetch_tradable_assets` purely to build that symbol list, which had the side effect of pinning
+/// the archive to whatever Alpaca lists *today* — the survivorship problem the merge below exists
+/// to limit. Asking for a date removes the cause rather than the symptom.
 async fn fetch_and_archive(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let credentials = AlpacaCredentials::from_env()?;
-    let trading = TradingClient::from_env(credentials.clone());
-    let market_data = MarketDataClient::from_env(credentials);
-
-    let assets = trading.fetch_tradable_assets().await?;
-    let known: HashSet<String> = details::parse_embedded_details()?
-        .into_iter()
-        .map(|detail| detail.ticker().as_str().to_string())
-        .collect();
-    let symbols: Vec<String> = assets
-        .tradable_symbols()
-        .into_iter()
-        .filter(|symbol| known.contains(symbol))
-        .collect();
+    let client = MassiveClient::from_env()?;
 
     let end = most_recent_weekday(eastern_date(Utc::now()));
     let start = end - Duration::days(FETCH_LOOKBACK_SESSIONS * 2);
-    info!(
-        symbols = symbols.len(),
-        %start,
-        %end,
-        "Fetching session bars from Alpaca"
-    );
+    let dates: Vec<NaiveDate> = (0..=(end - start).num_days())
+        .map(|offset| start + Duration::days(offset))
+        .collect();
+    info!(%start, %end, dates = dates.len(), "Fetching session bars from Massive");
 
-    let fetched = bars::fetch_bars(&market_data, &symbols, BarInterval::OneDay, start, end).await?;
-    if fetched.is_empty() {
+    let fetched = bars::fetch_daily_bars(&client, &dates).await;
+    if !fetched.dates_failed.is_empty() {
+        // Logged rather than fatal, as before: a failed session costs one day of history, and the
+        // next run's overlap window covers it.
+        warn!(
+            dates_failed = ?fetched.dates_failed,
+            "Some sessions could not be fetched; the archive will have gaps until the next run"
+        );
+    }
+    if fetched.bars.is_empty() {
         return Ok(0);
     }
 
@@ -400,7 +399,7 @@ async fn fetch_and_archive(
     // can walk it a day at a time.
     let mut by_date: std::collections::BTreeMap<NaiveDate, Vec<_>> =
         std::collections::BTreeMap::new();
-    for bar in fetched {
+    for bar in fetched.bars {
         by_date
             .entry(eastern_date(bar.timestamp()))
             .or_default()

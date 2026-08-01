@@ -8,30 +8,31 @@
 //! Usage: `seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]`
 //! The end date defaults to today (US/Eastern) when omitted.
 //!
-//! The previous version took `--source <massive|s3>` and `--target <s3|postgresql|all>`. Both are
-//! gone with the topology that justified them: Massive is no longer a data provider, and the
-//! trainer now fetches and archives its own S3 parquet rather than reading what a seed run left
-//! behind. What remains is the one path that was ever load-bearing — Alpaca into PostgreSQL.
+//! The previous version took `--source <massive|s3>` and `--target <s3|postgresql|all>`. The
+//! targets are gone with the topology that justified them — the trainer archives its own S3 parquet
+//! rather than reading what a seed run left behind — and the source is gone because there is only
+//! one correct answer. Massive's grouped endpoint takes a **date**, not a symbol list, and that is
+//! what makes a backfill honest: asking Alpaca means asking for its *current* tradable set, so
+//! every symbol delisted since the start date would be silently missing from its own history and
+//! the model would train on a universe that survived by construction.
 
 use chrono::{Duration, NaiveDate, Utc};
-use std::collections::HashSet;
 use tracing::{error, info, warn};
 
-use fund::common::alpaca::{AlpacaCredentials, MarketDataClient, TradingClient};
 use fund::common::database::connect_pool;
+use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
-use fund::common::types::BarInterval;
 use fund::data::bars;
 use fund::data::calendar::eastern_date;
-use fund::data::details;
 
 const USAGE: &str = "Usage: seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]";
 
-/// Calendar days fetched and stored per round trip.
+/// Calendar days fetched before the rows are written and the buffer released.
 ///
-/// The bars endpoint pages internally, so a single call spanning a year would succeed — and would
-/// hold every row of it in memory before the first one reached PostgreSQL, then lose all of it to
-/// one timeout. Chunking bounds the memory and makes a failure cost one window instead of the run.
+/// A grouped response is the whole market — on the order of ten thousand rows per session — so a
+/// year fetched before the first write would hold roughly two and a half million bars in memory and
+/// lose all of them to one failure. Thirty days is about twenty-one sessions, a couple of hundred
+/// thousand rows, and a bounded amount of work to repeat.
 const CHUNK_DAYS: i64 = 30;
 
 /// Inclusive date range, validated on construction.
@@ -69,6 +70,22 @@ impl SeedRange {
         }
         chunks
     }
+
+    /// Every calendar day in the window.
+    ///
+    /// Calendar days, not trading sessions: this binary has no calendar — it exists for the case
+    /// where the database is empty, and the published calendar is one of the things that is not
+    /// there yet. A weekend costs one request and answers with nothing, which is cheap enough that
+    /// filtering is not worth a dependency on data the caller may not have.
+    fn dates(&self) -> Vec<NaiveDate> {
+        let mut dates = Vec::new();
+        let mut date = self.start;
+        while date <= self.end {
+            dates.push(date);
+            date += Duration::days(1);
+        }
+        dates
+    }
 }
 
 fn parse_date(value: &str) -> Result<NaiveDate, String> {
@@ -93,13 +110,20 @@ fn parse_arguments(arguments: &[String], today: NaiveDate) -> Result<SeedRange, 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SeedSummary {
     rows_stored: u64,
+    /// Sessions the fetch could not retrieve. A gap in the history, not a failure to store.
+    dates_failed: usize,
+    /// Windows whose store failed after a successful fetch.
     chunks_failed: usize,
 }
 
 impl SeedSummary {
-    /// A run that stepped over a failed window is incomplete, so it must not look successful.
+    /// A run that stepped over anything is incomplete, so it must not look successful.
+    ///
+    /// Both counters gate the exit code. A seed whose fetch quietly skipped eleven sessions leaves
+    /// exactly the kind of hole that surfaces later as a correlation computed across a gap, and
+    /// the operator's only signal that the range needs re-running is this exit code.
     fn exit_code(&self) -> i32 {
-        if self.chunks_failed > 0 {
+        if self.chunks_failed > 0 || self.dates_failed > 0 {
             1
         } else {
             0
@@ -126,6 +150,7 @@ async fn main() {
         Ok(summary) => {
             info!(
                 rows = summary.rows_stored,
+                dates_failed = summary.dates_failed,
                 chunks_failed = summary.chunks_failed,
                 "Equity bars seeded"
             );
@@ -145,48 +170,33 @@ async fn main() {
 }
 
 async fn run(range: &SeedRange) -> Result<SeedSummary, Box<dyn std::error::Error>> {
-    let credentials = AlpacaCredentials::from_env()?;
-    let trading = TradingClient::from_env(credentials.clone());
-    let market_data = MarketDataClient::from_env(credentials);
+    let client = MassiveClient::from_env()?;
     let pool = connect_pool().await?;
 
-    // Alpaca's tradable set intersected with the embedded ticker list, which is the same universe
-    // the trainer fetches. Deliberately not the application's liquidity-filtered universe: that one
-    // is computed *from* `equity_bars`, and this binary exists for the case where that table is
-    // empty.
-    let assets = trading.fetch_tradable_assets().await?;
-    let known: HashSet<String> = details::parse_embedded_details()?
-        .into_iter()
-        .map(|detail| detail.ticker().as_str().to_string())
-        .collect();
-    let symbols: Vec<String> = assets
-        .tradable_symbols()
-        .into_iter()
-        .filter(|symbol| known.contains(symbol))
-        .collect();
-
-    if symbols.is_empty() {
-        return Err("No tradable symbols intersect the embedded ticker list".into());
-    }
-
+    // No symbol list, and no universe. The grouped endpoint is asked for a date and answers with
+    // every stock that traded on it, which is exactly what a bootstrap wants: the liquidity screen
+    // downstream selects from what is stored, so storing a pre-filtered subset would decide the
+    // universe here rather than there.
     let chunks = range.chunks();
     info!(
-        symbols = symbols.len(),
         start = %range.start,
         end = %range.end,
         chunks = chunks.len(),
-        "Seeding equity bars from Alpaca"
+        "Seeding equity bars from Massive"
     );
 
     let mut summary = SeedSummary::default();
     for chunk in &chunks {
-        match seed_chunk(&market_data, &pool, &symbols, chunk).await {
-            Ok(rows) => summary.rows_stored += rows,
+        match seed_chunk(&client, &pool, chunk).await {
+            Ok(chunk_summary) => {
+                summary.rows_stored += chunk_summary.rows_stored;
+                summary.dates_failed += chunk_summary.dates_failed;
+            }
             Err(error) => {
-                // Stepped over rather than propagated. A seed spans months, and one failed window
-                // costs the sessions inside it; aborting costs every window after it too, and the
-                // upsert makes a rerun of the whole range cheap enough that partial progress is
-                // worth keeping.
+                // A store failure, as distinct from a fetch failure — `fetch_daily_bars` already
+                // steps over the dates it could not retrieve. Stepped over for the same reason:
+                // a seed spans months, aborting costs every window after this one, and the upsert
+                // makes re-running the whole range cheap.
                 summary.chunks_failed += 1;
                 error!(
                     start = %chunk.start,
@@ -202,36 +212,38 @@ async fn run(range: &SeedRange) -> Result<SeedSummary, Box<dyn std::error::Error
 }
 
 async fn seed_chunk(
-    market_data: &MarketDataClient,
+    client: &MassiveClient,
     pool: &sqlx::PgPool,
-    symbols: &[String],
     chunk: &SeedRange,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let fetched = bars::fetch_bars(
-        market_data,
-        symbols,
-        BarInterval::OneDay,
-        chunk.start,
-        chunk.end,
-    )
-    .await?;
+) -> Result<SeedSummary, Box<dyn std::error::Error>> {
+    let dates = chunk.dates();
+    let fetched = bars::fetch_daily_bars(client, &dates).await;
 
-    if fetched.is_empty() {
+    if fetched.bars.is_empty() {
         // Expected for a window that is entirely weekend or holiday, so not an error — but a
         // silent zero over a window that should hold sessions is worth being able to see.
         warn!(start = %chunk.start, end = %chunk.end, "Chunk returned no bars");
-        return Ok(0);
+        return Ok(SeedSummary {
+            rows_stored: 0,
+            dates_failed: fetched.dates_failed.len(),
+            chunks_failed: 0,
+        });
     }
 
-    let stored = bars::store_bars(pool, &fetched).await?;
+    let stored = bars::store_bars(pool, &fetched.bars).await?;
     info!(
         start = %chunk.start,
         end = %chunk.end,
-        fetched = fetched.len(),
+        fetched = fetched.bars.len(),
+        dates_failed = fetched.dates_failed.len(),
         stored,
         "Chunk seeded"
     );
-    Ok(stored)
+    Ok(SeedSummary {
+        rows_stored: stored,
+        dates_failed: fetched.dates_failed.len(),
+        chunks_failed: 0,
+    })
 }
 
 #[cfg(test)]
@@ -328,17 +340,46 @@ mod tests {
         assert_eq!(range.chunks().len(), 1);
     }
 
+    /// A single-day range must still produce that day, or a one-session top-up fetches nothing.
     #[test]
-    fn test_a_failed_chunk_makes_the_run_fail() {
+    fn test_a_single_day_range_yields_that_one_date() {
+        let range = SeedRange::new(date("2026-01-05"), date("2026-01-05")).expect("a valid range");
+        assert_eq!(range.dates(), vec![date("2026-01-05")]);
+    }
+
+    /// Every calendar day, weekends included. The binary has no calendar to filter with, and a
+    /// non-session simply answers with nothing.
+    #[test]
+    fn test_dates_covers_every_calendar_day_in_the_window() {
+        let range = SeedRange::new(date("2026-01-01"), date("2026-01-10")).expect("a valid range");
+        let dates = range.dates();
+        assert_eq!(dates.len(), 10);
+        assert_eq!(dates[0], date("2026-01-01"));
+        assert_eq!(dates[9], date("2026-01-10"));
+        for window in dates.windows(2) {
+            assert_eq!(window[1], window[0] + Duration::days(1));
+        }
+    }
+
+    /// Both counters gate the exit code. A fetch that skipped sessions leaves a hole in the history
+    /// that nothing else reports, so it must not exit zero any more than a failed store does.
+    #[test]
+    fn test_any_skipped_work_makes_the_run_fail() {
         let clean = SeedSummary {
             rows_stored: 100,
+            dates_failed: 0,
             chunks_failed: 0,
         };
-        let partial = SeedSummary {
-            rows_stored: 100,
+        let store_failed = SeedSummary {
             chunks_failed: 1,
+            ..clean
+        };
+        let fetch_skipped = SeedSummary {
+            dates_failed: 1,
+            ..clean
         };
         assert_eq!(clean.exit_code(), 0);
-        assert_eq!(partial.exit_code(), 1);
+        assert_eq!(store_failed.exit_code(), 1);
+        assert_eq!(fetch_skipped.exit_code(), 1);
     }
 }

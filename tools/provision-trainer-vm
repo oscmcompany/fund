@@ -12,10 +12,11 @@ set -euo pipefail
 # per-minute sync cron job.
 #
 # Secrets reach the VM the same way the application VM's do: provision-common-vm
-# writes AWS credentials, and secretspec resolves ALPACA_API_KEY_ID and
-# ALPACA_API_SECRET from Secrets Manager under the VM's profile at run time. The
-# trainer needs those now that it fetches its own bars from Alpaca rather than
-# reading a dataset the application exported.
+# writes AWS credentials, and secretspec resolves the rest from Secrets Manager
+# under the VM's profile at run time. The trainer needs MASSIVE_BASE_URL and
+# MASSIVE_API_KEY now that it fetches its own bars. It needs no Alpaca
+# credentials at all -- it has no account to query and no symbol list to build,
+# because the grouped endpoint answers by date.
 # --------------------------------------------------------------------------- #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
