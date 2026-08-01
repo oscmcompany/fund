@@ -364,11 +364,12 @@ in {
     # but whose assertions had never been executed.
     #
     # The rebuild moved the previous integration targets to tests_old/, where
-    # cargo does not discover them: they test modules that no longer exist. They
-    # are rewritten alongside their subjects in the second pull request and named
-    # here again as each lands. Until then the gate is the library's own tests,
-    # which is why the coverage floor still has to be met without them.
-    TEST_ARGS="--lib --bins --all-features"
+    # cargo does not discover them: they test modules that no longer exist. The
+    # two below are their rewrites against the new schema, and each owns its own
+    # database (fund_test_database, fund_test_handlers) recreated on first use —
+    # #[serial] only serializes within a process, so a shared database would have
+    # two binaries deleting from the same tables concurrently.
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)

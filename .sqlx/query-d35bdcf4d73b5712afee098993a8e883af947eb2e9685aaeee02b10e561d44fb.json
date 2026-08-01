@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, pair_id, opened_at, closed_at AS \"closed_at!\", close_reason AS \"close_reason!\"\n           FROM equity_pairs\n           WHERE status = 'closed' AND closed_at >= $1 AND closed_at < $2\n           ORDER BY closed_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "pair_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "opened_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "closed_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "close_reason!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "d35bdcf4d73b5712afee098993a8e883af947eb2e9685aaeee02b10e561d44fb"
+}

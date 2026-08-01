@@ -14,7 +14,13 @@
 //! - [`data`] — market data and storage: the trading calendar, the tradable universe, bar and
 //!   detail syncing, S3 export, and purging.
 //! - [`models`] — the TiDE model: artifact handling, inference, and training.
+//! - [`portfolio`] — the strategy: pair selection, sizing, the risk gate, execution, and the
+//!   five-minute evaluation pass.
+//! - [`handlers`] — one function per command, and the state they share. The only module that knows
+//!   how an event name turns into work.
 
 pub mod common;
 pub mod data;
+pub mod handlers;
 pub mod models;
+pub mod portfolio;

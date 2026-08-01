@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE equity_pairs\n           SET realized_profit_and_loss = $1\n           WHERE id = $2 AND status = 'closed'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Numeric",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c00527aa47d21e89a8ee6fd2365a7bfe782226d8177832e7de8ca11701969e7f"
+}

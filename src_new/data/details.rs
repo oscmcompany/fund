@@ -8,6 +8,8 @@
 //! be populated with no network and no S3 access. Alpaca does not publish sector or industry, so the
 //! post-close sync refreshes only what changes: tickers that have appeared or been delisted.
 
+use std::collections::HashMap;
+
 use polars::prelude::*;
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -169,6 +171,55 @@ pub async fn store_details(pool: &PgPool, details: &[EquityDetail]) -> Result<u6
     Ok(rows_affected)
 }
 
+/// Loads the sector of every ticker, for the pair screen's different-sector rule.
+///
+/// A map rather than a frame because the screen looks a ticker up per candidate combination, and a
+/// frame join per lookup in a quadratic loop is the wrong shape entirely.
+pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, DetailsError> {
+    let rows =
+        sqlx::query!(r#"SELECT ticker AS "ticker!", sector AS "sector!" FROM equity_details"#)
+            .fetch_all(pool)
+            .await?;
+
+    let supplied = rows.len();
+    let sectors: HashMap<Ticker, String> = rows
+        .into_iter()
+        .filter_map(|row| Ticker::new(&row.ticker).map(|ticker| (ticker, row.sector)))
+        .collect();
+
+    // Counted and reported, as `parse_details` does for the CSV path. A dropped ticker removes a
+    // symbol from the screen, and an `info!` reporting only the survivors leaves no trace of it.
+    let skipped = supplied - sectors.len();
+    if skipped > 0 {
+        warn!(skipped, "Skipped equity sector rows with unusable tickers");
+    }
+    info!(tickers = sectors.len(), "Equity sectors loaded");
+    Ok(sectors)
+}
+
+/// Builds the detail frame from validated details.
+///
+/// Shared by the application, which reads them from PostgreSQL, and the trainer, which has no
+/// database and parses the embedded CSV. One builder because the two paths feed the same
+/// `consolidate_data`, and a column name or order that differed between them would surface as a
+/// model trained on features the inference path does not produce.
+pub fn details_to_dataframe(details: &[EquityDetail]) -> Result<DataFrame, PolarsError> {
+    let mut tickers: Vec<String> = Vec::with_capacity(details.len());
+    let mut sectors: Vec<String> = Vec::with_capacity(details.len());
+    let mut industries: Vec<String> = Vec::with_capacity(details.len());
+    for detail in details {
+        tickers.push(detail.ticker().as_str().to_string());
+        sectors.push(detail.sector().to_string());
+        industries.push(detail.industry().to_string());
+    }
+
+    DataFrame::new(vec![
+        Column::new("ticker".into(), tickers),
+        Column::new("sector".into(), sectors),
+        Column::new("industry".into(), industries),
+    ])
+}
+
 /// Loads all ticker metadata as a frame, for joining onto bars in the prediction pipeline.
 pub async fn load_details_dataframe(pool: &PgPool) -> Result<DataFrame, DetailsError> {
     let rows = sqlx::query!(
@@ -179,21 +230,20 @@ pub async fn load_details_dataframe(pool: &PgPool) -> Result<DataFrame, DetailsE
     .fetch_all(pool)
     .await?;
 
-    let mut tickers: Vec<String> = Vec::with_capacity(rows.len());
-    let mut sectors: Vec<String> = Vec::with_capacity(rows.len());
-    let mut industries: Vec<String> = Vec::with_capacity(rows.len());
-    for row in rows {
-        tickers.push(row.ticker);
-        sectors.push(row.sector);
-        industries.push(row.industry);
+    let supplied = rows.len();
+    let details: Vec<EquityDetail> = rows
+        .into_iter()
+        .filter_map(|row| {
+            Ticker::new(&row.ticker)
+                .map(|ticker| EquityDetail::new(ticker, row.sector, row.industry))
+        })
+        .collect();
+
+    let skipped = supplied - details.len();
+    if skipped > 0 {
+        warn!(skipped, "Skipped equity detail rows with unusable tickers");
     }
-
-    let dataframe = DataFrame::new(vec![
-        Column::new("ticker".into(), tickers),
-        Column::new("sector".into(), sectors),
-        Column::new("industry".into(), industries),
-    ])?;
-
+    let dataframe = details_to_dataframe(&details)?;
     info!(rows = dataframe.height(), "Equity details loaded");
     Ok(dataframe)
 }

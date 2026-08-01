@@ -15,7 +15,7 @@ use burn::backend::NdArray;
 use chrono::{DateTime, Duration, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::types::{EquityPrediction, Ticker};
@@ -534,6 +534,81 @@ pub async fn insert_predictions(
     transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
     Ok(rows_affected)
+}
+
+/// Loads the most recent prediction per ticker within a half-open instant range.
+///
+/// The range is the current session's Eastern day, so a pass on a morning when the pre-open
+/// inference failed reads nothing rather than reading yesterday's forecast as though it were
+/// today's. A stale artifact is acceptable and logged; a stale *prediction* silently presented as
+/// current is not, because nothing downstream carries the timestamp far enough to notice.
+///
+/// `DISTINCT ON` rather than a group-by join: the table's primary key is `(ticker, timestamp)`, so
+/// the newest row per ticker is a single ordered scan of the day's chunk.
+pub async fn load_predictions_between(
+    pool: &PgPool,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<EquityPrediction>, sqlx::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT ON (ticker)
+               ticker AS "ticker!",
+               correlation_id AS "correlation_id!",
+               model_run_id AS "model_run_id!",
+               timestamp AS "timestamp!",
+               quantile_10 AS "quantile_10!",
+               quantile_50 AS "quantile_50!",
+               quantile_90 AS "quantile_90!"
+        FROM equity_predictions
+        WHERE timestamp >= $1 AND timestamp < $2
+        ORDER BY ticker, timestamp DESC
+        "#,
+        start,
+        end,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut predictions = Vec::with_capacity(rows.len());
+    let mut rejected: usize = 0;
+    for row in rows {
+        // Named individually, not just counted. A rejected row means the stored data already
+        // violates the invariant `insert_predictions` enforces at write time, so the operator needs
+        // to find that row -- and a count alone cannot locate it.
+        let Some(ticker) = Ticker::new(&row.ticker) else {
+            warn!(ticker = %row.ticker, "Dropped a prediction row whose ticker is unusable");
+            rejected += 1;
+            continue;
+        };
+        let stored_ticker = ticker.clone();
+        match EquityPrediction::new(
+            row.correlation_id,
+            row.model_run_id,
+            ticker,
+            row.timestamp,
+            row.quantile_10,
+            row.quantile_50,
+            row.quantile_90,
+        ) {
+            Ok(prediction) => predictions.push(prediction),
+            Err(error) => {
+                warn!(
+                    ticker = %stored_ticker,
+                    timestamp = %row.timestamp,
+                    %error,
+                    "Dropped a stored prediction that violates the quantile ordering invariant"
+                );
+                rejected += 1;
+            }
+        }
+    }
+
+    if rejected > 0 {
+        warn!(rejected, "Dropped unreadable prediction rows");
+    }
+    info!(predictions = predictions.len(), "Predictions loaded");
+    Ok(predictions)
 }
 
 #[cfg(test)]

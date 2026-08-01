@@ -107,9 +107,13 @@ CREATE TABLE IF NOT EXISTS equity_pairs (
     pair_id                   TEXT        NOT NULL,
     long_ticker               TEXT        NOT NULL,
     short_ticker              TEXT        NOT NULL,
-    hedge_ratio               NUMERIC     NOT NULL,
-    entry_z_score             NUMERIC     NOT NULL,
-    signal_strength           NUMERIC     NOT NULL,
+    -- Statistics rather than money, so double precision rather than NUMERIC. These are an OLS
+    -- slope and two standardized scores; they carry no exact decimal value worth preserving, and
+    -- typing them as NUMERIC would mean converting every one of them through a decimal
+    -- representation on the way in and back out for arithmetic the strategy does in f64 anyway.
+    hedge_ratio               DOUBLE PRECISION NOT NULL,
+    entry_z_score             DOUBLE PRECISION NOT NULL,
+    signal_strength           DOUBLE PRECISION NOT NULL,
     model_run_id              TEXT,
     status                    TEXT        NOT NULL CHECK (status IN ('open', 'closed')),
     opened_at                 TIMESTAMPTZ NOT NULL,
