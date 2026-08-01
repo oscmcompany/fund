@@ -9,7 +9,8 @@
 //! [`load_bars_dataframe`] is the read side, feeding the prediction pipeline and the correlation
 //! screen.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use polars::prelude::*;
@@ -249,6 +250,148 @@ pub async fn load_bars_dataframe(
         "Equity bars loaded"
     );
     Ok(dataframe)
+}
+
+/// Loads a trailing window of closes per ticker, aligned across tickers by session.
+///
+/// Every returned series has the same length, and position `i` in one is the same session as
+/// position `i` in every other. Tickers missing any session in the window are dropped rather than
+/// gap-filled, which is the whole reason this exists and is not a `GROUP BY ticker`: two series of
+/// equal length covering different dates produce a correlation between different days, and neither
+/// the correlation nor the spread that follows carries any sign that it happened.
+///
+/// The lower bound on `timestamp` is what keeps this from scanning every chunk of the hypertable.
+/// It is expressed against the column directly rather than wrapped in an expression, so chunk
+/// exclusion applies.
+pub async fn load_aligned_closes(
+    pool: &PgPool,
+    bar_interval: BarInterval,
+    sessions: usize,
+) -> Result<HashMap<Ticker, Vec<f64>>, BarsError> {
+    if sessions == 0 {
+        return Ok(HashMap::new());
+    }
+
+    // Twice the session count in calendar days covers weekends and holidays with room to spare;
+    // a 60-session window spans roughly 84 calendar days.
+    let earliest = Utc::now() - Duration::days(sessions as i64 * 2);
+
+    let rows = sqlx::query!(
+        r#"
+        WITH recent_sessions AS (
+            SELECT DISTINCT timestamp
+            FROM equity_bars
+            WHERE bar_interval = $1 AND timestamp >= $2
+            ORDER BY timestamp DESC
+            LIMIT $3
+        )
+        SELECT ticker AS "ticker!", timestamp AS "timestamp!", close_price AS "close_price!"
+        FROM equity_bars
+        WHERE bar_interval = $1
+          AND timestamp >= $2
+          AND timestamp IN (SELECT timestamp FROM recent_sessions)
+        ORDER BY ticker, timestamp
+        "#,
+        bar_interval.as_str(),
+        earliest,
+        sessions as i64,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let session_count = rows
+        .iter()
+        .map(|row| row.timestamp)
+        .collect::<HashSet<_>>()
+        .len();
+
+    let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> = HashMap::new();
+    for row in rows {
+        let Some(ticker) = Ticker::new(&row.ticker) else {
+            continue;
+        };
+        closes_by_ticker
+            .entry(ticker)
+            .or_default()
+            .push(row.close_price);
+    }
+
+    let before = closes_by_ticker.len();
+    closes_by_ticker.retain(|_, closes| closes.len() == session_count);
+
+    info!(
+        tickers = closes_by_ticker.len(),
+        dropped_for_gaps = before - closes_by_ticker.len(),
+        sessions = session_count,
+        "Aligned close history loaded"
+    );
+    Ok(closes_by_ticker)
+}
+
+/// The aligned close history, loaded at most once per Eastern date.
+///
+/// Daily bars are written after the close, so this does not change intraday — and the evaluation
+/// pass runs seventy-eight times a session and needs the whole thing on every pass that screens.
+/// Reloading it each time would be a six-figure row count re-read for a result known not to have
+/// moved.
+///
+/// Same shape as [`crate::data::calendar::CalendarCache`] and
+/// [`crate::data::universe::UniverseCache`], and for the same reason: a value held in state and
+/// passed explicitly, not a process-wide static.
+/// Session-aligned close series, shared by reference because every caller only reads.
+pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
+
+#[derive(Default)]
+pub struct CloseHistoryCache {
+    inner: tokio::sync::Mutex<Option<(NaiveDate, AlignedCloses)>>,
+}
+
+impl CloseHistoryCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns today's aligned close history, loading it if the cache is cold or stale.
+    ///
+    /// Behind an `Arc` because the map is large and every caller only reads it. The lock is
+    /// released before the query and re-taken to store, which lets two cold callers both load; both
+    /// reads are deterministic, so the second store is a harmless overwrite.
+    pub async fn get(
+        &self,
+        pool: &PgPool,
+        bar_interval: BarInterval,
+        sessions: usize,
+        now: DateTime<Utc>,
+    ) -> Result<AlignedCloses, BarsError> {
+        let today = crate::data::calendar::eastern_date(now);
+
+        if let Some((cached_date, closes)) = self.inner.lock().await.as_ref() {
+            if *cached_date == today {
+                return Ok(Arc::clone(closes));
+            }
+        }
+
+        let closes = Arc::new(load_aligned_closes(pool, bar_interval, sessions).await?);
+        if !closes.is_empty() {
+            *self.inner.lock().await = Some((today, Arc::clone(&closes)));
+        }
+        Ok(closes)
+    }
+
+    /// Replaces the cached history. Used by tests and by the pre-open warm path.
+    pub async fn install(&self, now: DateTime<Utc>, closes: HashMap<Ticker, Vec<f64>>) {
+        *self.inner.lock().await =
+            Some((crate::data::calendar::eastern_date(now), Arc::new(closes)));
+    }
+
+    /// Drops the cached history so the next caller reloads it.
+    ///
+    /// Used after the post-close bar sync, whose new rows the cached window predates. Clearing is
+    /// not the same as installing an empty map: an empty map keyed to today would answer "no
+    /// history" for the rest of the Eastern date rather than reloading.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
 }
 
 #[cfg(test)]

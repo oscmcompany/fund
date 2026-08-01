@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT equity AS \"equity!\" FROM account_snapshots WHERE session_date = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "equity!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0bf98465fc4f26d473635c127b59139df05e459c379630436808c323756b2b86"
+}

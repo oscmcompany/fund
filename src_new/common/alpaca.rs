@@ -13,12 +13,14 @@
 //! after the fact.
 
 use std::collections::HashSet;
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::common::types::{BarInterval, EquityBar, EquityQuote, Ticker};
+use crate::common::types::{BarInterval, Dollars, EquityBar, EquityQuote, Ticker};
 
 // --------------------------------------------------------------------------
 // Shared configuration and errors
@@ -292,12 +294,14 @@ impl TradingClient {
         }
     }
 
-    /// Reads the paper/live choice from `ALPACA_PAPER_TRADING`, defaulting to paper.
+    /// Reads the paper/live choice from `ALPACA_IS_PAPER`, defaulting to paper.
     ///
-    /// Defaulting to paper is deliberate: a missing or misspelled variable sends orders to the
-    /// sandbox, not to a live account.
+    /// The variable name is fixed by `secretspec.toml` and is not ours to spell differently.
+    ///
+    /// Defaulting to paper is deliberate, and it is what makes a misspelling here survivable in one
+    /// direction only: an unreadable variable sends orders to the sandbox, never to a live account.
     pub fn from_env(credentials: AlpacaCredentials) -> Self {
-        let is_paper = std::env::var("ALPACA_PAPER_TRADING")
+        let is_paper = std::env::var("ALPACA_IS_PAPER")
             .map(|value| !value.trim().eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         Self::new(credentials, is_paper)
@@ -440,6 +444,776 @@ struct AssetResponse {
     tradable: Option<bool>,
     shortable: Option<bool>,
     easy_to_borrow: Option<bool>,
+}
+
+// --------------------------------------------------------------------------
+// Trading API: orders, positions, account, activities
+// --------------------------------------------------------------------------
+
+/// Activities requested per page. 100 is the endpoint's documented maximum.
+const ACTIVITIES_PAGE_SIZE: usize = 100;
+
+/// Pages walked before a paginated activity fetch gives up.
+///
+/// A bound rather than an unbounded loop, because the page token is the previous page's last
+/// activity ID and a server that returned a full page of the same rows forever would otherwise
+/// spin. At the page size above this covers ten thousand activities in a session, which is two
+/// orders of magnitude more than ten pairs opening and closing can produce.
+const ACTIVITIES_MAXIMUM_PAGES: usize = 100;
+
+/// What an order is meant to do, carrying the sizing form that side actually accepts.
+///
+/// The two variants differ in more than direction. A long leg is submitted as a dollar notional and
+/// Alpaca fills it fractionally, so both legs of a pair can be sized to the same dollar amount. A
+/// short leg cannot be: Alpaca rejects a fractional short, so it is submitted as whole shares.
+/// Making the sizing form a property of the variant rather than two nullable fields turns a
+/// fractional short from a runtime rejection into a state that cannot be written down.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderIntent {
+    /// Buy to open the long leg, sized in dollars.
+    OpenLong { ticker: Ticker, notional: Dollars },
+    /// Sell to open the short leg, sized in whole shares.
+    OpenShort { ticker: Ticker, shares: NonZeroU32 },
+}
+
+impl OrderIntent {
+    /// The symbol the order is for.
+    pub fn ticker(&self) -> &Ticker {
+        match self {
+            OrderIntent::OpenLong { ticker, .. } | OrderIntent::OpenShort { ticker, .. } => ticker,
+        }
+    }
+
+    /// Builds the request body Alpaca expects.
+    ///
+    /// `position_intent` is sent explicitly rather than left to Alpaca's inference. Without it a
+    /// sell against an existing long is read as a close rather than a short, which for a strategy
+    /// that holds both sides of a pair is the difference between opening a hedge and unwinding one.
+    fn to_request(&self) -> OrderRequest {
+        match self {
+            OrderIntent::OpenLong { ticker, notional } => OrderRequest {
+                symbol: ticker.as_str().to_string(),
+                side: "buy",
+                order_type: "market",
+                time_in_force: "day",
+                notional: Some(format!("{:.2}", notional.value())),
+                qty: None,
+                position_intent: "buy_to_open",
+            },
+            OrderIntent::OpenShort { ticker, shares } => OrderRequest {
+                symbol: ticker.as_str().to_string(),
+                side: "sell",
+                order_type: "market",
+                time_in_force: "day",
+                notional: None,
+                qty: Some(shares.get()),
+                position_intent: "sell_to_open",
+            },
+        }
+    }
+}
+
+/// Where a submitted order stands, reduced to the three answers a caller acts on.
+///
+/// Alpaca publishes fifteen order statuses. Collapsing them here rather than at each call site is
+/// what makes the caller's `match` exhaustive over outcomes it can actually respond to — keep
+/// waiting, use the fill, or unwind — instead of over a string it has to remember the meaning of.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderState {
+    /// Alpaca still has it: accepted, queued, or partially filled. Ask again.
+    Working { filled_shares: f64 },
+    /// Terminal and completely filled.
+    Filled {
+        filled_shares: f64,
+        average_price: f64,
+    },
+    /// Terminal without a complete fill: canceled, expired, rejected, or done for the day.
+    ///
+    /// `filled_shares` is non-zero when a partial fill was terminated, which is the case that makes
+    /// this more than a failure flag — those shares are held and have to be unwound.
+    Abandoned { status: String, filled_shares: f64 },
+}
+
+impl OrderState {
+    /// Whether Alpaca is finished with this order, however it ended.
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            OrderState::Working { .. } => false,
+            OrderState::Filled { .. } | OrderState::Abandoned { .. } => true,
+        }
+    }
+
+    /// Shares Alpaca reports as filled, whatever state the order reached.
+    pub fn filled_shares(&self) -> f64 {
+        match self {
+            OrderState::Working { filled_shares }
+            | OrderState::Filled { filled_shares, .. }
+            | OrderState::Abandoned { filled_shares, .. } => *filled_shares,
+        }
+    }
+}
+
+/// Which direction a held position runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionSide {
+    Long,
+    Short,
+}
+
+impl PositionSide {
+    /// Parses Alpaca's `side` field. Returns `None` for anything else.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "long" => Some(PositionSide::Long),
+            "short" => Some(PositionSide::Short),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PositionSide::Long => "long",
+            PositionSide::Short => "short",
+        }
+    }
+}
+
+/// One open position as Alpaca reports it.
+///
+/// `shares` is the absolute count; the direction lives in `side`. Alpaca signs the quantity for
+/// shorts, and carrying a signed count alongside a side means two representations of the same fact
+/// that can disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Position {
+    ticker: Ticker,
+    side: PositionSide,
+    shares: f64,
+    market_value: f64,
+    unrealized_profit_and_loss: f64,
+}
+
+impl Position {
+    pub fn new(
+        ticker: Ticker,
+        side: PositionSide,
+        shares: f64,
+        market_value: f64,
+        unrealized_profit_and_loss: f64,
+    ) -> Self {
+        Self {
+            ticker,
+            side,
+            shares: shares.abs(),
+            market_value,
+            unrealized_profit_and_loss,
+        }
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn side(&self) -> PositionSide {
+        self.side
+    }
+
+    pub fn shares(&self) -> f64 {
+        self.shares
+    }
+
+    pub fn market_value(&self) -> f64 {
+        self.market_value
+    }
+
+    pub fn unrealized_profit_and_loss(&self) -> f64 {
+        self.unrealized_profit_and_loss
+    }
+}
+
+/// Account balances as Alpaca reports them at a point in time.
+///
+/// Stored verbatim rather than validated into a narrower shape. Every field here can legitimately
+/// be negative under margin — `short_market_value` always is — so there is no invariant to enforce
+/// that would not also reject a truthful response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountSnapshot {
+    equity: Decimal,
+    last_equity: Decimal,
+    cash: Decimal,
+    buying_power: Decimal,
+    long_market_value: Decimal,
+    short_market_value: Decimal,
+}
+
+impl AccountSnapshot {
+    pub fn new(
+        equity: Decimal,
+        last_equity: Decimal,
+        cash: Decimal,
+        buying_power: Decimal,
+        long_market_value: Decimal,
+        short_market_value: Decimal,
+    ) -> Self {
+        Self {
+            equity,
+            last_equity,
+            cash,
+            buying_power,
+            long_market_value,
+            short_market_value,
+        }
+    }
+
+    pub fn equity(&self) -> Decimal {
+        self.equity
+    }
+
+    /// Equity at the previous session's close, as Alpaca computes it.
+    pub fn last_equity(&self) -> Decimal {
+        self.last_equity
+    }
+
+    pub fn cash(&self) -> Decimal {
+        self.cash
+    }
+
+    pub fn buying_power(&self) -> Decimal {
+        self.buying_power
+    }
+
+    pub fn long_market_value(&self) -> Decimal {
+        self.long_market_value
+    }
+
+    pub fn short_market_value(&self) -> Decimal {
+        self.short_market_value
+    }
+
+    /// Gross exposure: long plus the magnitude of short.
+    ///
+    /// The magnitude rather than the signed value, because a market-neutral book nets to roughly
+    /// zero and the quantity the exposure cap is about is how much is at work, not how much is net.
+    pub fn gross_exposure(&self) -> Decimal {
+        self.long_market_value + self.short_market_value.abs()
+    }
+}
+
+/// One account activity: a fill, a fee, a dividend.
+///
+/// Fields beyond the identity are optional because Alpaca omits rather than zeroes, and which ones
+/// are present depends on the activity type — a `FILL` carries a symbol, side, quantity, and price;
+/// a `FEE` carries none of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountActivity {
+    id: String,
+    activity_type: String,
+    transaction_time: DateTime<Utc>,
+    ticker: Option<Ticker>,
+    side: Option<String>,
+    shares: Option<Decimal>,
+    price: Option<Decimal>,
+    order_id: Option<String>,
+}
+
+impl AccountActivity {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        activity_type: String,
+        transaction_time: DateTime<Utc>,
+        ticker: Option<Ticker>,
+        side: Option<String>,
+        shares: Option<Decimal>,
+        price: Option<Decimal>,
+        order_id: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            activity_type,
+            transaction_time,
+            ticker,
+            side,
+            shares,
+            price,
+            order_id,
+        }
+    }
+
+    /// Alpaca's own activity identifier, and the primary key of `account_activities`.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn activity_type(&self) -> &str {
+        &self.activity_type
+    }
+
+    pub fn transaction_time(&self) -> DateTime<Utc> {
+        self.transaction_time
+    }
+
+    pub fn ticker(&self) -> Option<&Ticker> {
+        self.ticker.as_ref()
+    }
+
+    pub fn side(&self) -> Option<&str> {
+        self.side.as_deref()
+    }
+
+    pub fn shares(&self) -> Option<Decimal> {
+        self.shares
+    }
+
+    pub fn price(&self) -> Option<Decimal> {
+        self.price
+    }
+
+    pub fn order_id(&self) -> Option<&str> {
+        self.order_id.as_deref()
+    }
+
+    /// Signed cash effect of a fill: negative when shares were bought, positive when sold.
+    ///
+    /// `None` for any activity that is not a two-sided trade, which is what keeps a fee or a
+    /// dividend from being attributed to a pair as though it were a leg.
+    pub fn signed_cash_flow(&self) -> Option<Decimal> {
+        let shares = self.shares?;
+        let price = self.price?;
+        match self.side.as_deref()? {
+            "buy" => Some(-(shares * price)),
+            "sell" | "sell_short" => Some(shares * price),
+            _ => None,
+        }
+    }
+}
+
+/// The result of asking Alpaca to close one position during a bulk liquidation.
+///
+/// Alpaca answers a bulk close with `207 Multi-Status` and a per-symbol status, so a single
+/// success/failure for the request as a whole would discard exactly the information that says
+/// whether the book is actually flat.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiquidationOutcome {
+    ticker: Ticker,
+    status: u16,
+}
+
+impl LiquidationOutcome {
+    pub fn new(ticker: Ticker, status: u16) -> Self {
+        Self { ticker, status }
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Whether Alpaca accepted the close for this symbol.
+    pub fn succeeded(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
+impl TradingClient {
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http_client
+            .post(url)
+            .header(HEADER_KEY_ID, self.credentials.key_id())
+            .header(HEADER_SECRET_KEY, self.credentials.secret())
+    }
+
+    fn delete(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http_client
+            .delete(url)
+            .header(HEADER_KEY_ID, self.credentials.key_id())
+            .header(HEADER_SECRET_KEY, self.credentials.secret())
+    }
+
+    /// Fetches current account balances.
+    pub async fn fetch_account(&self) -> Result<AccountSnapshot, ClientError> {
+        let url = format!("{}/v2/account", self.base_url);
+        let response = error_for_status(self.get(&url).send().await?).await?;
+        let account: AccountResponse = response.json().await.map_err(|error| {
+            ClientError::Parse(format!("Failed to parse account response: {error}"))
+        })?;
+
+        Ok(AccountSnapshot::new(
+            parse_decimal(&account.equity, "equity")?,
+            parse_decimal(&account.last_equity, "last_equity")?,
+            parse_decimal(&account.cash, "cash")?,
+            parse_decimal(&account.buying_power, "buying_power")?,
+            parse_decimal(&account.long_market_value, "long_market_value")?,
+            parse_decimal(&account.short_market_value, "short_market_value")?,
+        ))
+    }
+
+    /// Fetches every open position.
+    ///
+    /// Positions whose symbol or side cannot be interpreted are dropped with a warning rather than
+    /// failing the call. The caller uses this to decide what to close, and one unrecognizable row
+    /// must not stop the rest of the book from being flattened.
+    pub async fn fetch_positions(&self) -> Result<Vec<Position>, ClientError> {
+        let url = format!("{}/v2/positions", self.base_url);
+        let response = error_for_status(self.get(&url).send().await?).await?;
+        let payloads: Vec<PositionResponse> = response.json().await.map_err(|error| {
+            ClientError::Parse(format!("Failed to parse positions response: {error}"))
+        })?;
+
+        let reported = payloads.len();
+        let mut positions = Vec::with_capacity(reported);
+        for payload in payloads {
+            let (Some(ticker), Some(side)) = (
+                Ticker::new(&payload.symbol),
+                PositionSide::parse(&payload.side),
+            ) else {
+                warn!(
+                    symbol = %payload.symbol,
+                    side = %payload.side,
+                    "Dropped an Alpaca position with an unrecognized symbol or side"
+                );
+                continue;
+            };
+            positions.push(Position::new(
+                ticker,
+                side,
+                parse_f64(&payload.qty, "qty")?,
+                parse_f64(&payload.market_value, "market_value")?,
+                parse_f64(&payload.unrealized_pl, "unrealized_pl")?,
+            ));
+        }
+
+        debug!(
+            positions = positions.len(),
+            reported, "Alpaca positions fetched"
+        );
+        Ok(positions)
+    }
+
+    /// Submits an order and returns Alpaca's order identifier.
+    pub async fn submit_order(&self, intent: &OrderIntent) -> Result<String, ClientError> {
+        let url = format!("{}/v2/orders", self.base_url);
+        let response =
+            error_for_status(self.post(&url).json(&intent.to_request()).send().await?).await?;
+        let order: OrderResponse = response.json().await.map_err(|error| {
+            ClientError::Parse(format!("Failed to parse order response: {error}"))
+        })?;
+
+        info!(
+            ticker = %intent.ticker(),
+            order_id = %order.id,
+            "Order submitted"
+        );
+        Ok(order.id)
+    }
+
+    /// Reads the current state of a submitted order.
+    pub async fn fetch_order(&self, order_id: &str) -> Result<OrderState, ClientError> {
+        let url = format!("{}/v2/orders/{order_id}", self.base_url);
+        let response = error_for_status(self.get(&url).send().await?).await?;
+        let order: OrderResponse = response.json().await.map_err(|error| {
+            ClientError::Parse(format!("Failed to parse order response: {error}"))
+        })?;
+        order_state_from(order)
+    }
+
+    /// Cancels an open order.
+    ///
+    /// Returns `false` when Alpaca reports the order already terminal (`422`), which is a race
+    /// rather than a failure: the order filled between the decision to cancel and the request.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<bool, ClientError> {
+        let url = format!("{}/v2/orders/{order_id}", self.base_url);
+        let response = self.delete(&url).send().await?;
+        if response.status().as_u16() == 422 {
+            debug!(order_id, "Order was already terminal; nothing to cancel");
+            return Ok(false);
+        }
+        error_for_status(response).await?;
+        info!(order_id, "Order cancelled");
+        Ok(true)
+    }
+
+    /// Closes the whole position in one symbol.
+    ///
+    /// Returns `false` when there was no position to close (`404`). That is the expected answer
+    /// when a pair is being closed for the second time — after a retry, or after Alpaca liquidated
+    /// the leg itself — and treating it as an error would turn a no-op into an incident.
+    pub async fn close_position(&self, ticker: &Ticker) -> Result<bool, ClientError> {
+        let url = format!("{}/v2/positions/{}", self.base_url, ticker.as_str());
+        let response = self
+            .delete(&url)
+            .query(&[("percentage", "100")])
+            .send()
+            .await?;
+
+        if response.status().as_u16() == 404 {
+            info!(ticker = %ticker, "No position to close");
+            return Ok(false);
+        }
+        error_for_status(response).await?;
+        info!(ticker = %ticker, "Position close submitted");
+        Ok(true)
+    }
+
+    /// Closes every open position and cancels every open order.
+    ///
+    /// This is the pre-close fail-safe, and it deliberately does not consult `equity_pairs` first:
+    /// the requirement is that the account is flat overnight, not that the pairs the application
+    /// knows about are flat. A leg opened by a pass that died before it could record the pair would
+    /// otherwise be held.
+    pub async fn close_all_positions(&self) -> Result<Vec<LiquidationOutcome>, ClientError> {
+        let url = format!("{}/v2/positions", self.base_url);
+        let response = error_for_status(
+            self.delete(&url)
+                .query(&[("cancel_orders", "true")])
+                .send()
+                .await?,
+        )
+        .await?;
+
+        let payloads: Vec<ClosePositionResponse> = response.json().await.map_err(|error| {
+            ClientError::Parse(format!("Failed to parse bulk close response: {error}"))
+        })?;
+
+        let mut outcomes = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let Some(ticker) = Ticker::new(&payload.symbol) else {
+                warn!(
+                    symbol = %payload.symbol,
+                    "Dropped a bulk close result with an unrecognized symbol"
+                );
+                continue;
+            };
+            if !(200..300).contains(&payload.status) {
+                warn!(ticker = %ticker, status = payload.status, "Alpaca refused to close a position");
+            }
+            outcomes.push(LiquidationOutcome::new(ticker, payload.status));
+        }
+
+        info!(
+            requested = outcomes.len(),
+            closed = outcomes.iter().filter(|o| o.succeeded()).count(),
+            "Bulk liquidation submitted"
+        );
+        Ok(outcomes)
+    }
+
+    /// Fetches one activity type for a single session date, walking pagination.
+    ///
+    /// Activities with neither a `transaction_time` nor a `date` are dropped with a warning. They
+    /// cannot be stored — `account_activities.transaction_time` is `NOT NULL` — and synthesizing a
+    /// timestamp would put a fabricated time into the record the dashboard reads as fact.
+    pub async fn fetch_activities(
+        &self,
+        activity_type: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<AccountActivity>, ClientError> {
+        let url = format!("{}/v2/account/activities/{activity_type}", self.base_url);
+        let date_text = date.to_string();
+        let page_size = ACTIVITIES_PAGE_SIZE.to_string();
+
+        let mut activities: Vec<AccountActivity> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut undated: usize = 0;
+
+        for page in 0..ACTIVITIES_MAXIMUM_PAGES {
+            let mut query: Vec<(&str, &str)> = vec![
+                ("date", date_text.as_str()),
+                ("page_size", page_size.as_str()),
+            ];
+            if let Some(token) = page_token.as_deref() {
+                query.push(("page_token", token));
+            }
+
+            let response = error_for_status(self.get(&url).query(&query).send().await?).await?;
+            let payloads: Vec<ActivityResponse> = response.json().await.map_err(|error| {
+                ClientError::Parse(format!("Failed to parse activities response: {error}"))
+            })?;
+
+            let returned = payloads.len();
+            let last_id = payloads.last().map(|payload| payload.id.clone());
+
+            for payload in payloads {
+                let Some(transaction_time) = payload.transaction_time.or_else(|| {
+                    payload
+                        .date
+                        .and_then(|day| day.and_hms_opt(0, 0, 0))
+                        .map(|naive| naive.and_utc())
+                }) else {
+                    undated += 1;
+                    continue;
+                };
+                activities.push(AccountActivity::new(
+                    payload.id,
+                    payload.activity_type,
+                    transaction_time,
+                    payload.symbol.as_deref().and_then(Ticker::new),
+                    payload.side,
+                    payload
+                        .qty
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(decimal_or_none),
+                    payload
+                        .price
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(decimal_or_none),
+                    payload.order_id,
+                ));
+            }
+
+            if returned < ACTIVITIES_PAGE_SIZE {
+                break;
+            }
+            let Some(token) = last_id else { break };
+            page_token = Some(token);
+
+            if page + 1 == ACTIVITIES_MAXIMUM_PAGES {
+                warn!(
+                    activity_type,
+                    %date,
+                    pages = ACTIVITIES_MAXIMUM_PAGES,
+                    "Activity pagination hit its page bound; the tail was not fetched"
+                );
+            }
+        }
+
+        if undated > 0 {
+            warn!(
+                activity_type,
+                undated, "Dropped activities carrying neither a transaction time nor a date"
+            );
+        }
+        debug!(activity_type, %date, activities = activities.len(), "Account activities fetched");
+        Ok(activities)
+    }
+}
+
+/// Collapses Alpaca's order status vocabulary into [`OrderState`].
+///
+/// Statuses not named here are treated as working, which is the safe default: a caller that keeps
+/// waiting on an order that is in fact dead times out and unwinds, whereas one that treats an
+/// unfamiliar working status as terminal abandons a live position.
+fn order_state_from(order: OrderResponse) -> Result<OrderState, ClientError> {
+    let filled_shares = order
+        .filled_qty
+        .as_deref()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    match order.status.as_str() {
+        "filled" => {
+            let average_price = order
+                .filled_avg_price
+                .as_deref()
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .ok_or_else(|| {
+                    ClientError::Parse(format!(
+                        "Alpaca reported order {} filled with no average fill price",
+                        order.id
+                    ))
+                })?;
+            Ok(OrderState::Filled {
+                filled_shares,
+                average_price,
+            })
+        }
+        "canceled" | "expired" | "rejected" | "done_for_day" | "stopped" | "suspended" => {
+            Ok(OrderState::Abandoned {
+                status: order.status,
+                filled_shares,
+            })
+        }
+        _ => Ok(OrderState::Working { filled_shares }),
+    }
+}
+
+fn parse_decimal(raw: &str, field: &'static str) -> Result<Decimal, ClientError> {
+    raw.trim()
+        .parse::<Decimal>()
+        .map_err(|error| ClientError::Parse(format!("Failed to parse {field} '{raw}': {error}")))
+}
+
+fn parse_f64(raw: &str, field: &'static str) -> Result<f64, ClientError> {
+    raw.trim()
+        .parse::<f64>()
+        .map_err(|error| ClientError::Parse(format!("Failed to parse {field} '{raw}': {error}")))
+}
+
+/// Parses an optional decimal field, discarding a value that will not parse.
+///
+/// Unlike the balance fields, an unparsable quantity on one activity is not worth failing a whole
+/// session's sync for; the column is nullable and a null reads as "Alpaca did not say".
+fn decimal_or_none(raw: &str) -> Option<Decimal> {
+    raw.parse::<Decimal>().ok()
+}
+
+#[derive(Deserialize)]
+struct AccountResponse {
+    equity: String,
+    last_equity: String,
+    cash: String,
+    buying_power: String,
+    long_market_value: String,
+    short_market_value: String,
+}
+
+/// Alpaca's wire names are pinned in the `serde` attributes; the Rust fields spell them out where
+/// they differ. `qty` and `type` are the exception — they are the external contract's own spelling
+/// and renaming the Rust field would only hide which key is on the wire.
+#[derive(serde::Serialize)]
+struct OrderRequest {
+    symbol: String,
+    side: &'static str,
+    #[serde(rename = "type")]
+    order_type: &'static str,
+    time_in_force: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notional: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qty: Option<u32>,
+    position_intent: &'static str,
+}
+
+#[derive(Deserialize)]
+struct OrderResponse {
+    id: String,
+    status: String,
+    filled_qty: Option<String>,
+    filled_avg_price: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PositionResponse {
+    symbol: String,
+    side: String,
+    qty: String,
+    market_value: String,
+    unrealized_pl: String,
+}
+
+#[derive(Deserialize)]
+struct ClosePositionResponse {
+    symbol: String,
+    status: u16,
+}
+
+#[derive(Deserialize)]
+struct ActivityResponse {
+    id: String,
+    activity_type: String,
+    /// Present on trade activities.
+    transaction_time: Option<DateTime<Utc>>,
+    /// Present on non-trade activities, which carry a settlement date and no time.
+    date: Option<NaiveDate>,
+    symbol: Option<String>,
+    side: Option<String>,
+    qty: Option<String>,
+    price: Option<String>,
+    order_id: Option<String>,
 }
 
 // --------------------------------------------------------------------------
@@ -1178,6 +1952,459 @@ mod tests {
             }
             other => panic!("expected an API error, got {other:?}"),
         }
+        mock.assert_async().await;
+    }
+
+    // --- trading API: orders, positions, account, activities ---
+
+    fn ticker(raw: &str) -> Ticker {
+        Ticker::new(raw).expect("the test ticker must be valid")
+    }
+
+    fn shares(count: u32) -> NonZeroU32 {
+        NonZeroU32::new(count).expect("the test share count must be non-zero")
+    }
+
+    fn order_response(status: &str, filled_qty: &str, filled_avg_price: &str) -> OrderResponse {
+        OrderResponse {
+            id: "order-1".to_string(),
+            status: status.to_string(),
+            filled_qty: Some(filled_qty.to_string()),
+            filled_avg_price: Some(filled_avg_price.to_string()),
+        }
+    }
+
+    /// A long leg is sized in dollars and a short leg in whole shares, and the two must not be
+    /// interchangeable. Sending `qty` on a long would lose the fractional sizing that lets the two
+    /// legs match on notional; sending `notional` on a short is rejected by Alpaca outright.
+    #[test]
+    fn test_order_intent_sizes_each_side_in_its_own_units() {
+        let long = OrderIntent::OpenLong {
+            ticker: ticker("AAPL"),
+            notional: Dollars::new(Decimal::new(123456, 2)).unwrap(),
+        }
+        .to_request();
+        assert_eq!(long.side, "buy");
+        assert_eq!(long.notional.as_deref(), Some("1234.56"));
+        assert_eq!(long.qty, None);
+        assert_eq!(long.position_intent, "buy_to_open");
+
+        let short = OrderIntent::OpenShort {
+            ticker: ticker("MSFT"),
+            shares: shares(40),
+        }
+        .to_request();
+        assert_eq!(short.side, "sell");
+        assert_eq!(short.notional, None);
+        assert_eq!(short.qty, Some(40));
+        assert_eq!(short.position_intent, "sell_to_open");
+    }
+
+    /// `sell_to_open` rather than a bare sell. Without the explicit intent Alpaca reads a sell
+    /// against an existing long as a close, so a pair whose long leg is already held would have its
+    /// hedge silently turned into an unwind.
+    #[test]
+    fn test_short_order_serializes_the_opening_intent() {
+        let body = serde_json::to_value(
+            OrderIntent::OpenShort {
+                ticker: ticker("MSFT"),
+                shares: shares(10),
+            }
+            .to_request(),
+        )
+        .unwrap();
+        assert_eq!(body["position_intent"], "sell_to_open");
+        assert_eq!(body["type"], "market");
+        assert_eq!(body["time_in_force"], "day");
+        assert!(body.get("notional").is_none());
+    }
+
+    #[test]
+    fn test_order_state_maps_terminal_and_working_statuses() {
+        assert_eq!(
+            order_state_from(order_response("filled", "12", "101.25")).unwrap(),
+            OrderState::Filled {
+                filled_shares: 12.0,
+                average_price: 101.25,
+            }
+        );
+        for status in ["canceled", "expired", "rejected", "done_for_day"] {
+            assert!(matches!(
+                order_state_from(order_response(status, "3", "100")).unwrap(),
+                OrderState::Abandoned {
+                    filled_shares,
+                    ..
+                } if filled_shares == 3.0
+            ));
+        }
+        for status in ["new", "accepted", "partially_filled", "pending_cancel"] {
+            assert!(matches!(
+                order_state_from(order_response(status, "0", "0")).unwrap(),
+                OrderState::Working { .. }
+            ));
+        }
+    }
+
+    /// An unfamiliar status reads as working, not as dead. A caller that keeps waiting on an order
+    /// that has in fact ended times out and unwinds; one that abandons a live order leaves an
+    /// unhedged leg on the book.
+    #[test]
+    fn test_unknown_order_status_is_treated_as_working() {
+        assert!(matches!(
+            order_state_from(order_response("held_for_some_new_reason", "0", "0")).unwrap(),
+            OrderState::Working { .. }
+        ));
+    }
+
+    /// A partial fill that was then cancelled still holds shares, so the count has to survive into
+    /// the terminal state — it is what the unwind is sized against.
+    #[test]
+    fn test_abandoned_order_retains_its_partial_fill() {
+        let state = order_state_from(order_response("canceled", "7.5", "0")).unwrap();
+        assert_eq!(state.filled_shares(), 7.5);
+        assert!(state.is_terminal());
+    }
+
+    /// Alpaca reports `filled` and then omits the price only when something is wrong. Defaulting it
+    /// to zero would record a free fill, which the P&L attribution would then believe.
+    #[test]
+    fn test_filled_order_without_a_price_is_an_error() {
+        let order = OrderResponse {
+            id: "order-1".to_string(),
+            status: "filled".to_string(),
+            filled_qty: Some("10".to_string()),
+            filled_avg_price: None,
+        };
+        assert!(matches!(
+            order_state_from(order),
+            Err(ClientError::Parse(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_account_reads_every_balance() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/account")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"equity":"105000.50","last_equity":"104000.00","cash":"25000.00",
+                    "buying_power":"210000.00","long_market_value":"80000.00",
+                    "short_market_value":"-79000.00"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let account = client.fetch_account().await.expect("account must parse");
+
+        assert_eq!(account.equity(), Decimal::new(10500050, 2));
+        assert_eq!(account.last_equity(), Decimal::new(10400000, 2));
+        assert_eq!(account.short_market_value(), Decimal::new(-7900000, 2));
+        mock.assert_async().await;
+    }
+
+    /// A market-neutral book nets to roughly zero, so gross exposure has to add the magnitudes.
+    /// Summing the signed values would report this account as holding a thousand dollars.
+    #[test]
+    fn test_gross_exposure_adds_magnitudes_rather_than_netting() {
+        let account = AccountSnapshot::new(
+            Decimal::new(100000, 0),
+            Decimal::new(100000, 0),
+            Decimal::new(20000, 0),
+            Decimal::new(200000, 0),
+            Decimal::new(80000, 0),
+            Decimal::new(-79000, 0),
+        );
+        assert_eq!(account.gross_exposure(), Decimal::new(159000, 0));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_positions_reports_absolute_share_counts() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/positions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"symbol":"AAPL","side":"long","qty":"10","market_value":"1500.00",
+                     "unrealized_pl":"25.00"},
+                    {"symbol":"MSFT","side":"short","qty":"-4","market_value":"-1480.00",
+                     "unrealized_pl":"-12.00"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let positions = client
+            .fetch_positions()
+            .await
+            .expect("positions must parse");
+
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[1].side(), PositionSide::Short);
+        assert_eq!(positions[1].shares(), 4.0);
+        assert_eq!(positions[1].market_value(), -1480.0);
+        mock.assert_async().await;
+    }
+
+    /// One unreadable row must not stop the rest of the book from being flattened. This is the
+    /// pre-close path, and the cost of failing the whole call is a position held overnight.
+    #[tokio::test]
+    async fn test_fetch_positions_drops_an_unreadable_row_and_keeps_the_rest() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/positions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"symbol":"AAPL","side":"sideways","qty":"10","market_value":"1500.00",
+                     "unrealized_pl":"25.00"},
+                    {"symbol":"MSFT","side":"long","qty":"4","market_value":"1480.00",
+                     "unrealized_pl":"12.00"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let positions = client
+            .fetch_positions()
+            .await
+            .expect("positions must parse");
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].ticker(), &ticker("MSFT"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_returns_the_order_identifier() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v2/orders")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "symbol": "AAPL",
+                "side": "buy",
+                "notional": "5000.00",
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"abc-123","status":"accepted"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let order_id = client
+            .submit_order(&OrderIntent::OpenLong {
+                ticker: ticker("AAPL"),
+                notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
+            })
+            .await
+            .expect("order must submit");
+
+        assert_eq!(order_id, "abc-123");
+        mock.assert_async().await;
+    }
+
+    /// Closing a position that is not there is the expected answer on a retry, or after Alpaca
+    /// liquidated the leg itself. Treating the 404 as an error would turn a no-op into an incident
+    /// and stall the rest of the liquidation behind it.
+    #[tokio::test]
+    async fn test_close_position_reports_a_missing_position_without_failing() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/positions/AAPL?percentage=100")
+            .with_status(404)
+            .with_body(r#"{"message":"position not found"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        assert!(!client
+            .close_position(&ticker("AAPL"))
+            .await
+            .expect("a missing position is not an error"));
+        mock.assert_async().await;
+    }
+
+    /// Alpaca answers a bulk close with 207 and a per-symbol status. Reading only the outer status
+    /// would report a liquidation that left half the book open as a complete success.
+    #[tokio::test]
+    async fn test_close_all_positions_reports_each_symbol_separately() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/positions?cancel_orders=true")
+            .with_status(207)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"symbol":"AAPL","status":200,"body":{}},
+                    {"symbol":"MSFT","status":422,"body":{}}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let outcomes = client
+            .close_all_positions()
+            .await
+            .expect("bulk close must parse");
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes[0].succeeded());
+        assert!(!outcomes[1].succeeded());
+        assert_eq!(outcomes[1].ticker(), &ticker("MSFT"));
+        mock.assert_async().await;
+    }
+
+    /// A cancel that races a fill comes back 422. That is the order having filled, not the cancel
+    /// having failed, and the caller has to be able to tell them apart.
+    #[tokio::test]
+    async fn test_cancel_order_treats_an_already_terminal_order_as_no_op() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("DELETE", "/v2/orders/order-1")
+            .with_status(422)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        assert!(!client
+            .cancel_order("order-1")
+            .await
+            .expect("a terminal order is not an error"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_activities_follows_pagination() {
+        let mut server = mockito::Server::new_async().await;
+        let full_page: Vec<serde_json::Value> = (0..ACTIVITIES_PAGE_SIZE)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("activity-{index}"),
+                    "activity_type": "FILL",
+                    "transaction_time": "2026-07-30T18:00:00Z",
+                    "symbol": "AAPL",
+                    "side": "buy",
+                    "qty": "1",
+                    "price": "150.00",
+                    "order_id": "order-1",
+                })
+            })
+            .collect();
+        let last_id = format!("activity-{}", ACTIVITIES_PAGE_SIZE - 1);
+
+        let first = server
+            .mock("GET", "/v2/account/activities/FILL")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "date".to_string(),
+                "2026-07-30".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&full_page).unwrap())
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/v2/account/activities/FILL")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "page_token".to_string(),
+                last_id,
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"activity-tail","activity_type":"FILL",
+                     "transaction_time":"2026-07-30T18:05:00Z","symbol":"MSFT","side":"sell_short",
+                     "qty":"2","price":"370.00","order_id":"order-2"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let activities = client
+            .fetch_activities("FILL", date(2026, 7, 30))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(activities.len(), ACTIVITIES_PAGE_SIZE + 1);
+        assert_eq!(activities.last().unwrap().id(), "activity-tail");
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// A buy consumes cash and a sell produces it. Getting the sign wrong inverts every pair's
+    /// realized profit and loss, which is a number that looks entirely plausible either way.
+    #[test]
+    fn test_signed_cash_flow_follows_the_side() {
+        let build = |side: &str| {
+            AccountActivity::new(
+                "a".to_string(),
+                "FILL".to_string(),
+                Utc::now(),
+                Some(ticker("AAPL")),
+                Some(side.to_string()),
+                Some(Decimal::new(10, 0)),
+                Some(Decimal::new(15050, 2)),
+                None,
+            )
+        };
+        assert_eq!(
+            build("buy").signed_cash_flow(),
+            Some(Decimal::new(-150500, 2))
+        );
+        assert_eq!(
+            build("sell").signed_cash_flow(),
+            Some(Decimal::new(150500, 2))
+        );
+        assert_eq!(
+            build("sell_short").signed_cash_flow(),
+            Some(Decimal::new(150500, 2))
+        );
+    }
+
+    /// A fee has no side, quantity, or price. Attributing it to a pair as though it were a leg
+    /// would move that pair's realized profit and loss by the fee amount.
+    #[test]
+    fn test_non_trade_activity_has_no_cash_flow() {
+        let fee = AccountActivity::new(
+            "f".to_string(),
+            "FEE".to_string(),
+            Utc::now(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(fee.signed_cash_flow(), None);
+    }
+
+    /// `account_activities.transaction_time` is NOT NULL, so an activity with neither a time nor a
+    /// date cannot be stored. Synthesizing one would put a fabricated timestamp into the record.
+    #[tokio::test]
+    async fn test_activity_without_a_time_or_date_is_dropped() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"timeless","activity_type":"FEE"},
+                    {"id":"dated","activity_type":"DIV","date":"2026-07-30"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let activities = client
+            .fetch_activities("FEE", date(2026, 7, 30))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].id(), "dated");
         mock.assert_async().await;
     }
 

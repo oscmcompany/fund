@@ -17,6 +17,14 @@ autobins = false
 name = "fund"
 path = "src_new/lib.rs"
 
+[[bin]]
+name = "fund"
+path = "src_new/bin/fund.rs"
+
+[[bin]]
+name = "tide_model_trainer"
+path = "src_new/bin/tide_model_trainer.rs"
+
 # No features. `dashboard` returns with the dashboard binary in the third pull request; there is
 # deliberately no `train` feature, because it existed so an inference-only build could skip the
 # training modules but burn's `autodiff` is always compiled in anyway (it costs the NdArray
@@ -47,6 +55,8 @@ sqlx = { version = "0.8", default-features = false, features = [
   "json",
 ] }
 tokio = { version = "1.51.1", features = ["full"] }
+# `CancellationToken`, for the shutdown signal shared between the listener and the recovery scan.
+tokio-util = "0.7"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.23", features = [
   "env-filter",
