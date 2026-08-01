@@ -6,7 +6,7 @@
 --
 -- Two prefixes, and they are not interchangeable:
 --
---   data/    the trainer's own archive. Fetched from Alpaca and written by the
+--   data/    the trainer's own archive. Fetched from Massive and written by the
 --            trainer VM, which has no database. This is the training input and
 --            it accumulates for as long as the bucket keeps it.
 --   exports/ the application's nightly export of its PostgreSQL tables. This is

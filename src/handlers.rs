@@ -34,6 +34,7 @@ use crate::portfolio::evaluate::{self, EvaluationContext};
 use crate::portfolio::execute::ExecutionSettings;
 use crate::portfolio::screen::CORRELATION_WINDOW_SESSIONS;
 use crate::portfolio::size::SizingParameters;
+use tokio_util::sync::CancellationToken;
 
 /// Sessions of history the post-close bar sync re-fetches.
 ///
@@ -93,6 +94,12 @@ pub struct ServiceState {
     close_history_cache: CloseHistoryCache,
     sizing: SizingParameters,
     execution: ExecutionSettings,
+    /// Cancelled when the process is asked to stop.
+    ///
+    /// Held here so a handler can decline to *start* more work it would not be able to finish. The
+    /// drain in `bin/fund.rs` bounds how long shutdown waits; this is what keeps the thing being
+    /// waited on inside that bound.
+    shutdown: CancellationToken,
     /// A standard-library mutex, not a `tokio` one. The critical section is a single set
     /// insertion or removal and is never held across an await, and the release happens in `Drop` —
     /// which is synchronous and so cannot await an async lock at all.
@@ -101,7 +108,7 @@ pub struct ServiceState {
 
 impl ServiceState {
     /// Builds the state from the environment.
-    pub async fn from_env(pool: PgPool) -> Result<Self, HandlerError> {
+    pub async fn from_env(pool: PgPool, shutdown: CancellationToken) -> Result<Self, HandlerError> {
         let credentials = AlpacaCredentials::from_env()
             .map_err(|error| HandlerError::Configuration(error.to_string()))?;
         let massive = MassiveClient::from_env()
@@ -128,6 +135,7 @@ impl ServiceState {
             close_history_cache: CloseHistoryCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
+            shutdown,
             in_flight: std::sync::Mutex::new(HashSet::new()),
         })
     }
@@ -383,6 +391,7 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
         close_history: &close_history,
         sizing: state.sizing,
         execution: state.execution,
+        shutdown: &state.shutdown,
         now,
     };
 

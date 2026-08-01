@@ -411,11 +411,10 @@ async fn fetch_and_archive(
         let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date);
         let fetched_frame = bars::bars_to_dataframe(&bars_for_date)?;
 
-        // Merged with whatever the partition already holds, not written over it. The universe is
-        // recomputed from Alpaca's *current* tradable set on every run, so a symbol delisted today
-        // is absent from tonight's fetch — and a plain overwrite would erase the bars already
-        // archived for it on the days it was still trading. The training window would shrink
-        // silently, one delisting at a time.
+        // Merged with whatever the partition already holds, not written over it. This matters less
+        // than it did — the grouped endpoint answers by date, so a symbol delisted today still
+        // comes back for the days it was trading — but a plain overwrite would still discard
+        // anything a later response happens to omit, and merging costs nothing.
         let mut frame = match read_partition(s3_client, bucket, &key).await? {
             Some(existing) => merge_partitions(existing, fetched_frame)?,
             None => fetched_frame,

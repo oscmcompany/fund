@@ -384,11 +384,15 @@ END;
 $do$;
 
 -- Market data sync: weekdays at 16:30 Eastern.
--- Pulls the session's bars and any equity detail changes from Alpaca into PostgreSQL, then chains
+-- Pulls the session's bars from Massive and any equity detail changes into PostgreSQL, then chains
 -- the database export on completion. The export is chained rather than scheduled so it cannot run
 -- against a half-synced database; the purge runs inside the export handler once S3 has the data.
 --
--- This path does not feed the trainer. The trainer fetches its own data from Alpaca on its own VM
+-- Bars are whole-market, not universe-filtered. The liquidity screen selects from what this stores,
+-- so storing only the current universe would make the universe self-selecting -- it could never
+-- admit a name that became liquid, and would only ever shrink.
+--
+-- This path does not feed the trainer. The trainer fetches its own data from Massive on its own VM
 -- and shares only the fetch code, so a failure here costs a backup rather than the next day's model.
 DO $do$
 BEGIN

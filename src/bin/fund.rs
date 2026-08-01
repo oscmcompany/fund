@@ -36,10 +36,18 @@ const LISTENER_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// its terminal event. Dropping one of those mid-sequence leaves a `_requested` row with no outcome
 /// while the process logs a clean stop.
 ///
-/// Sixty seconds is longer than any handler should take and shorter than a process supervisor's
-/// patience. A handler still running at the deadline is reported rather than waited on further,
-/// because at that point the more useful thing is a log line naming it.
-const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Derived from the work rather than picked as a round number. The longest thing this can be waiting
+/// on is one pair being opened, which is two legs at
+/// [`fund::portfolio::execute::FILL_TIMEOUT`] each — sixty seconds. Seventy-five leaves margin for
+/// the terminal event write, and stays well inside the 120 seconds process-compose allows before it
+/// escalates.
+///
+/// That bound only holds because the evaluation pass stops *starting* pairs once shutdown is
+/// requested; see `entries_abandoned` in [`fund::portfolio::evaluate`]. Without that check the pass
+/// would work through every approved candidate sequentially and no fixed timeout would cover it —
+/// the previous sixty seconds was exactly one pair's worst case with nothing left over, while its
+/// own comment claimed it was "longer than any handler should take".
+const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,18 +55,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = observability::init_tracing("fund.log", None, "fund");
 
     let pool = database::connect_pool().await?;
-    let state = Arc::new(ServiceState::from_env(pool).await?);
-    info!("Service starting");
 
+    // The token is built before the state because the state holds it: a handler needs to be able to
+    // see that shutdown was requested, not merely be cancelled by it.
     let shutdown = CancellationToken::new();
     spawn_signal_handler(shutdown.clone());
 
-    // Recovery before the listener, not alongside it. A command replayed here and then notified
-    // again by a late-arriving cron row is dropped by the in-flight claim, which is the correct
-    // outcome; the reverse order would let the listener and the replay both start the same work
-    // before either had claimed it.
-    handlers::recover(Arc::clone(&state)).await;
+    let state = Arc::new(ServiceState::from_env(pool, shutdown.clone()).await?);
+    info!("Service starting");
 
+    // Recovery is not called here. It runs inside `listen`, after each successful subscription --
+    // see the comment there for why the order matters.
+    //
     // Handlers are tracked rather than detached, so shutdown can wait for them. `tokio::spawn`
     // returns a handle nobody holds; when `main` returns, the runtime drops and every running task
     // is cancelled at its next await point.
@@ -127,17 +135,67 @@ async fn listen(
         }
 
         info!("Listening for events");
+
+        // Recovery runs *after* subscribing and *before* the first `recv`, on every connection
+        // rather than once at startup. Both halves of that matter.
+        //
+        // After subscribing, because PostgreSQL delivers a NOTIFY only to sessions already
+        // listening — it is never persisted. Scanning first and subscribing second leaves a window
+        // in which a request is written, notified to nobody, and then missed by the scan that
+        // already ran. The row sits at `_requested` with no terminal outcome and nothing looks
+        // again until the next restart; for a liquidation that means positions held overnight.
+        //
+        // On every connection, because the same window reopens on every reconnect — and that one
+        // recurs unattended. Anything notified while the connection was down was addressed to a
+        // session that no longer exists.
+        //
+        // Subscribing first cannot double-dispatch. The subscription is passive: notifications
+        // queue on the connection until `recv` is called, which does not happen until this returns.
+        // A request that recovery replays and the queue also carries arrives twice, and `claim` --
+        // a mutex-guarded set insert -- admits exactly one of them. Re-scanning on every reconnect
+        // is likewise cheap and safe: the query is bounded to today's Eastern date, and
+        // `Command::PortfolioEvaluation` is `Recovery::Skip`, so a reconnect cannot replay a pass
+        // whose inputs have gone stale.
+        handlers::recover(Arc::clone(&state)).await;
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return,
-                received = listener.recv() => match received {
-                    Ok(notification) => {
+                // `try_recv`, not `recv`. `recv` loops over `try_recv` internally and returns only
+                // notifications, so a dropped connection is invisible to the caller — sqlx
+                // reconnects, re-subscribes, and carries on, and its own documentation is explicit
+                // that "any received while the connection was lost will not be returned". A
+                // reconnect handled that transparently is a silent hole: the request row exists,
+                // nothing dispatched it, and no log line was ever written. Measured, not assumed —
+                // terminating the listener's backend and inserting a request in the gap left it at
+                // `_requested` with no terminal outcome and not one line in the log.
+                //
+                // `try_recv` surfaces that boundary as `Ok(None)`, which is the only place the
+                // rescan can be hung.
+                received = listener.try_recv() => match received {
+                    Ok(Some(notification)) => {
                         // Reap anything already finished so the set does not grow across a session.
                         while handlers_in_flight.try_join_next().is_some() {}
                         dispatch(&state, handlers_in_flight, notification.payload()).await
                     }
+                    Ok(None) => {
+                        // sqlx has already reconnected and re-subscribed by the time this returns,
+                        // so there is nothing to rebuild — only the gap to close. Anything notified
+                        // while the connection was down is gone, and the table is the only record
+                        // that it happened.
+                        //
+                        // This makes delivery at-least-once rather than exactly-once: a request
+                        // notified just before the drop can still be sitting in sqlx's buffer, so
+                        // the rescan replays it and the buffered notification then dispatches it
+                        // again. Observed, 2ms apart. That is the accepted shape of this design —
+                        // every `Recovery::Replay` command is idempotent because replay *is* the
+                        // recovery mechanism, and the only cost is a duplicate `_completed` row in
+                        // the audit trail. Suppressing it would mean a round trip per dispatch to
+                        // ask a question the in-flight claim exists to avoid asking.
+                        warn!("Listener connection was re-established; rescanning for missed requests");
+                        handlers::recover(Arc::clone(&state)).await;
+                    }
                     Err(error) => {
-                        error!(%error, "Event listener dropped; reconnecting");
+                        error!(%error, "Event listener failed; reconnecting");
                         break;
                     }
                 },

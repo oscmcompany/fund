@@ -34,7 +34,8 @@ pub enum Command {
     /// Post-close: pull balances and activities from Alpaca, attribute realized profit and loss
     /// back to the session's closed pairs.
     AccountSync,
-    /// Post-close: pull the session's bars and detail changes from Alpaca into PostgreSQL.
+    /// Post-close: pull the session's whole-market bars from Massive, and detail changes, into
+    /// PostgreSQL.
     MarketDataSync,
     /// Chained from a completed market data sync: export to S3 parquet, then purge.
     DatabaseExport,

@@ -23,6 +23,7 @@ use fund::portfolio::pairs::{self, CloseReason, PairEntry};
 use fund::portfolio::size::SizingParameters;
 use serial_test::serial;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 
 const SESSIONS: i64 = 70;
 
@@ -152,6 +153,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let calendar = calendar_for_today();
     let universe = universe_of(&["AAAA", "BBBB"]);
 
+    let running = CancellationToken::new();
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -161,6 +163,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
+        shutdown: &running,
         now: session_instant(),
     };
 
@@ -184,6 +187,107 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     assert!(
         open[0].entry_z_score() > 0.0,
         "the stored entry score must be positive by the orientation invariant"
+    );
+    submit.assert_async().await;
+}
+
+/// The same fixture as above, with shutdown already requested: the pass must open nothing and say
+/// so, rather than submitting orders it may not survive to record.
+///
+/// This is what makes the drain's timeout in `bin/fund.rs` a real bound. Opening a pair is two
+/// broker legs at `FILL_TIMEOUT` each, so a pass that keeps working through its approved list
+/// cannot be covered by any fixed timeout — the list's length is decided by the screen. Bounding
+/// the *start* of new pairs is what caps the worst case at the one pair already in flight.
+///
+/// `.expect(0)` on the order mock is the assertion that matters. Without it this test would pass on
+/// a summary that merely reported zero opens while orders went out anyway.
+#[tokio::test]
+#[serial]
+async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
+    common::seed_details(&pool, &[("AAAA", "Technology"), ("BBBB", "Utilities")]).await;
+    common::seed_predictions(
+        &pool,
+        "run-1",
+        &[("AAAA", 0.04), ("BBBB", -0.03)],
+        Utc::now(),
+    )
+    .await;
+
+    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
+        .await
+        .expect("history must load");
+
+    let snapshot_body = serde_json::json!({
+        "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
+        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.5 } },
+    });
+    let _snapshots = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(snapshot_body.to_string())
+        .create_async()
+        .await;
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(200)
+        .with_body(account_body(100_000))
+        .create_async()
+        .await;
+    let submit = server
+        .mock("POST", "/v2/orders")
+        .with_status(200)
+        .with_body(r#"{"id":"order-1","status":"accepted"}"#)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
+    let calendar = calendar_for_today();
+    let universe = universe_of(&["AAAA", "BBBB"]);
+
+    let running = CancellationToken::new();
+    running.cancel();
+
+    let context = EvaluationContext {
+        pool: &pool,
+        trading: &trading,
+        market_data: &market_data,
+        calendar: &calendar,
+        universe: &universe,
+        close_history: &close_history,
+        sizing: SizingParameters::default(),
+        execution: settings(),
+        shutdown: &running,
+        now: session_instant(),
+    };
+
+    let summary = evaluate::run_pass(&context)
+        .await
+        .expect("the pass must still complete cleanly");
+
+    // The pair cleared every check — it was approved and then not reached. That is the distinction
+    // `entries_abandoned` exists to record, and it is why this is not `entries_refused`.
+    assert_eq!(
+        summary.candidates_screened, 1,
+        "the screen still ran; only the opening stopped"
+    );
+    assert_eq!(summary.entries_blocked, None, "the gate did not block");
+    assert!(summary.entries_refused.is_empty(), "nothing was refused");
+    assert_eq!(summary.entries_abandoned, 1);
+    assert!(summary.pairs_opened.is_empty());
+
+    assert!(
+        pairs::load_open_pairs(&pool).await.unwrap().is_empty(),
+        "no pair may be recorded"
     );
     submit.assert_async().await;
 }
@@ -266,6 +370,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let universe = universe_of(&["AAAA", "BBBB"]);
     let sizing = SizingParameters::new(4, 1.0).unwrap();
 
+    let running = CancellationToken::new();
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -275,6 +380,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         close_history: &close_history,
         sizing,
         execution: settings(),
+        shutdown: &running,
         now: session_instant(),
     };
 
@@ -347,6 +453,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let calendar = calendar_for_today();
     let universe = universe_of(&["AAAA", "BBBB"]);
 
+    let running = CancellationToken::new();
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -356,6 +463,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
+        shutdown: &running,
         now: session_instant(),
     };
 

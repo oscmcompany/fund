@@ -611,9 +611,9 @@ in {
     fi
   '';
 
-  # Bars come from Alpaca and go into PostgreSQL. There is no source or target to choose any more:
-  # Massive is no longer a provider, and the trainer fetches and archives its own S3 parquet rather
-  # than reading what a seed run left behind.
+  # Bars come from Massive and go into PostgreSQL. There is no source or target to choose any more:
+  # the grouped endpoint answers by date rather than by symbol list, and the trainer fetches and
+  # archives its own S3 parquet rather than reading what a seed run left behind.
   scripts.seed-equity-bars.exec = ''
     set -euo pipefail
 
@@ -621,8 +621,9 @@ in {
       echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars"
       echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
       echo ""
-      echo "  Fetches daily bars from Alpaca for the tradable universe and upserts them into"
-      echo "  equity_bars. Safe to re-run over a range already seeded."
+      echo "  Fetches whole-market daily bars from Massive, one request per session, and upserts"
+      echo "  them into equity_bars. Needs MASSIVE_BASE_URL and MASSIVE_API_KEY, not Alpaca"
+      echo "  credentials. Safe to re-run over a range already seeded."
       exit 1
     fi
 
@@ -668,8 +669,10 @@ in {
 
     # --- Model training ---
 
-    # Rust-native TiDE training (burn). Fetches its own bars from Alpaca, archives them to S3,
+    # Rust-native TiDE training (burn). Fetches its own bars from Massive, archives them to S3,
     # trains against the accumulated window, and uploads a model.tar.gz the service loads directly.
+    # Needs no Alpaca credentials: the grouped endpoint answers by date, so there is no symbol list
+    # to build and therefore no broker to ask for one.
     # The former Python/tinygrad workflow and its Prefect block registration are retired.
     "models:tide:train".exec = ''
       set -euo pipefail
@@ -680,7 +683,7 @@ in {
 
     # --- Data tasks ---
 
-    # Seed equity bars from Alpaca into PostgreSQL over a date range.
+    # Seed whole-market equity bars from Massive into PostgreSQL over a date range.
     "data:equity-bars".exec = "seed-equity-bars";
 
     # Seed ticker metadata from the embedded CSV into PostgreSQL.
