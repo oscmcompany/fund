@@ -129,10 +129,13 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         .with_body(account_body(100_000))
         .create_async()
         .await;
-    let _submit = server
+    // Both legs, and exactly both. Without the count this test would pass if only one order were
+    // ever submitted, which is precisely the mis-wiring it exists to catch.
+    let submit = server
         .mock("POST", "/v2/orders")
         .with_status(200)
         .with_body(r#"{"id":"order-1","status":"accepted"}"#)
+        .expect(2)
         .create_async()
         .await;
     let _confirm = server
@@ -182,13 +185,14 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         open[0].entry_z_score() > 0.0,
         "the stored entry score must be positive by the orientation invariant"
     );
+    submit.assert_async().await;
 }
 
 /// Exits run before anything else and are never gated. A pass on a full book still has to close
 /// what should close, which is the property that makes every early return in the entry half safe.
 #[tokio::test]
 #[serial]
-async fn test_a_pass_closes_a_converged_pair_even_with_no_vacant_slots() {
+async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let pool = fresh_pool().await;
     let mut server = mockito::Server::new_async().await;
 
@@ -278,14 +282,24 @@ async fn test_a_pass_closes_a_converged_pair_even_with_no_vacant_slots() {
         .await
         .expect("the pass must run");
 
+    // The book was at capacity when the pass began, which is the condition under test: the exit
+    // half must run before, and independently of, anything the entry half decides.
+    assert_eq!(summary.open_pairs_at_start, 4);
     assert_eq!(
         summary.pairs_closed.len(),
         1,
-        "the converged pair must close even though the book was full"
+        "the converged pair must close even though the book started full"
     );
     assert_eq!(summary.pairs_closed[0].pair_id, "AAAA-BBBB");
     assert_eq!(summary.pairs_closed[0].reason, "convergence");
     assert!(summary.pairs_opened.is_empty());
+
+    // Pin *why* nothing opened rather than only that nothing did. Closing the converged pair frees
+    // a slot, so the entry half is not capacity-blocked by the time it runs — it runs and finds
+    // nothing, because this test seeds no details and no predictions. Asserting both fields
+    // distinguishes that from a gate refusal, which an empty `pairs_opened` alone cannot.
+    assert_eq!(summary.entries_blocked, None);
+    assert_eq!(summary.candidates_screened, 0);
 }
 
 /// A pair with no price this pass is held, not closed and not crashed. The pre-close liquidation
@@ -348,7 +362,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let summary = evaluate::run_pass(&context)
         .await
         .expect("the pass must survive");
-    assert_eq!(summary.legs_unpriced, 1);
+    assert_eq!(summary.pairs_unpriced, 1);
     assert!(summary.pairs_closed.is_empty());
     assert_eq!(pairs::load_open_pairs(&pool).await.unwrap().len(), 1);
 }
@@ -623,7 +637,6 @@ fn mean_reverting_short_price(history: &HashMap<Ticker, Vec<f64>>) -> f64 {
     panic!("could not construct a converged price for the fixture");
 }
 
-/// An instant inside the session, so the risk gate's hold-window check has room.
 /// An instant inside the session, so the risk gate's hold-window check has room.
 ///
 /// Built from the **Eastern** date, not `Utc::now().date_naive()`. Between 20:00 Eastern and

@@ -25,6 +25,11 @@ pub const CORRELATION_WINDOW_SESSIONS: usize = 60;
 /// alike that the spread is mostly microstructure noise — two share classes of one issuer, or an
 /// index fund and its largest holding — where the spread's standard deviation is small enough that
 /// a two-sigma move is inside the bid-ask spread.
+///
+/// **The band is on the signed correlation, not its magnitude.** An anti-correlated pair fits a
+/// negative hedge ratio, which turns `ln(short) - hedge_ratio * ln(long)` into a sum rather than a
+/// difference — a quantity that hedges nothing. Sizing is dollar-neutral regardless of the ratio, so
+/// admitting one produces a directional bet wearing the name of a market-neutral pair.
 const CORRELATION_MINIMUM: f64 = 0.5;
 const CORRELATION_MAXIMUM: f64 = 0.95;
 
@@ -48,6 +53,13 @@ pub const CONFIDENCE_FLOOR: f64 = 0.5;
 
 /// Tickers needed before a screen can produce anything.
 const MINIMUM_ELIGIBLE_TICKERS: usize = 2;
+
+/// Observations needed before a spread distribution can be fitted at all.
+///
+/// Two, because the sample standard deviation removes one degree of freedom. Deliberately a separate
+/// constant from [`MINIMUM_ELIGIBLE_TICKERS`] despite sharing its value: the two are unrelated
+/// quantities, and a change to the ticker threshold must not silently move the statistical floor.
+const MINIMUM_SPREAD_OBSERVATIONS: usize = 2;
 
 /// One symbol's inputs to the screen.
 ///
@@ -166,6 +178,13 @@ impl SpreadModel {
     /// This is the exit path. Refitting the hedge ratio here instead would mean the pass measures a
     /// different spread from the one the entry was taken on, and the position would be judged
     /// against a line it was never above.
+    ///
+    /// The window length is enforced here as well as the hedge ratio, and for the same reason.
+    /// [`SpreadModel::fit`] is only ever called with exactly `CORRELATION_WINDOW_SESSIONS` closes,
+    /// so a shorter series here yields a mean and standard deviation drawn from a different sample
+    /// than the entry was measured against — and a z-score computed from it can cross the
+    /// convergence or stop threshold for a spread that has not moved. Reusing the hedge ratio but
+    /// not the window would reintroduce the asymmetry this type exists to prevent, one level down.
     pub fn with_hedge_ratio(
         hedge_ratio: f64,
         long_closes: &[f64],
@@ -174,7 +193,15 @@ impl SpreadModel {
         if !hedge_ratio.is_finite() {
             return None;
         }
-        let (long_logs, short_logs) = aligned_logs(long_closes, short_closes)?;
+        if long_closes.len() < CORRELATION_WINDOW_SESSIONS
+            || short_closes.len() < CORRELATION_WINDOW_SESSIONS
+        {
+            return None;
+        }
+        let long_window = &long_closes[long_closes.len() - CORRELATION_WINDOW_SESSIONS..];
+        let short_window = &short_closes[short_closes.len() - CORRELATION_WINDOW_SESSIONS..];
+
+        let (long_logs, short_logs) = aligned_logs(long_window, short_window)?;
         Self::build(hedge_ratio, &long_logs, &short_logs)
     }
 
@@ -322,7 +349,7 @@ impl PairCandidate {
 ///
 /// 1. Both legs clear the confidence floor, the short leg is shortable, and the two come from
 ///    different sectors.
-/// 2. Their log returns correlate within `[CORRELATION_MINIMUM, CORRELATION_MAXIMUM]`.
+/// 2. Their log returns correlate *positively*, within `[CORRELATION_MINIMUM, CORRELATION_MAXIMUM]`.
 /// 3. The spread, oriented so the short leg is the expensive one, is at or above `ENTRY_Z_SCORE`.
 /// 4. The model agrees with that orientation — it expects the long leg to out-return the short.
 ///
@@ -370,7 +397,7 @@ pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
             let Some(correlation) = correlation else {
                 continue;
             };
-            if !(CORRELATION_MINIMUM..=CORRELATION_MAXIMUM).contains(&correlation.abs()) {
+            if !(CORRELATION_MINIMUM..=CORRELATION_MAXIMUM).contains(&correlation) {
                 continue;
             }
 
@@ -498,7 +525,7 @@ pub fn exit_models<'a>(
 /// Takes the natural logarithm of two series, returning `None` unless both are the same usable
 /// length with no non-positive value.
 fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
-    if long_closes.len() != short_closes.len() || long_closes.len() < MINIMUM_ELIGIBLE_TICKERS {
+    if long_closes.len() != short_closes.len() || long_closes.len() < MINIMUM_SPREAD_OBSERVATIONS {
         return None;
     }
     let to_logs = |closes: &[f64]| -> Option<Vec<f64>> {
@@ -639,7 +666,7 @@ mod tests {
         let correlation = pearson_correlation(&log_returns(&leader), &log_returns(&follower))
             .expect("the fixture must correlate");
         assert!(
-            (CORRELATION_MINIMUM..=CORRELATION_MAXIMUM).contains(&correlation.abs()),
+            (CORRELATION_MINIMUM..=CORRELATION_MAXIMUM).contains(&correlation),
             "fixture correlation {correlation} is outside [{CORRELATION_MINIMUM}, {CORRELATION_MAXIMUM}]"
         );
     }
@@ -715,6 +742,42 @@ mod tests {
         assert!(
             z_score > sample_bound,
             "a live observation must be able to exceed the in-sample maximum of {sample_bound}, got {z_score}"
+        );
+    }
+
+    /// The exit path must be fitted over the same window as the entry. A shorter series produces a
+    /// mean and standard deviation from a different sample, so the z-score can cross a threshold for
+    /// a spread that has not moved — which is the asymmetry this type exists to prevent, one level
+    /// down from the hedge ratio.
+    #[test]
+    fn test_with_hedge_ratio_refuses_a_series_shorter_than_the_window() {
+        let (long_closes, short_closes) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
+        let short_history = CORRELATION_WINDOW_SESSIONS - 1;
+
+        assert_eq!(
+            SpreadModel::with_hedge_ratio(
+                1.0,
+                &long_closes[..short_history],
+                &short_closes[..short_history],
+            ),
+            None
+        );
+        assert!(SpreadModel::with_hedge_ratio(1.0, &long_closes, &short_closes).is_some());
+    }
+
+    /// A longer history is trimmed to the window rather than fitted over all of it, so an exit
+    /// measured today uses the same number of observations as the entry did.
+    #[test]
+    fn test_with_hedge_ratio_trims_a_longer_series_to_the_window() {
+        let (long_closes, short_closes) = cointegrated_series(CORRELATION_WINDOW_SESSIONS * 2);
+        let trimmed = SpreadModel::with_hedge_ratio(
+            1.0,
+            &long_closes[long_closes.len() - CORRELATION_WINDOW_SESSIONS..],
+            &short_closes[short_closes.len() - CORRELATION_WINDOW_SESSIONS..],
+        );
+        assert_eq!(
+            SpreadModel::with_hedge_ratio(1.0, &long_closes, &short_closes),
+            trimmed
         );
     }
 
@@ -825,6 +888,38 @@ mod tests {
                 -0.02,
             ),
             input("BBBB", follower, stretched, "Utilities", 0.03),
+        ];
+        assert!(score_candidates(&inputs).is_empty());
+    }
+
+    /// An anti-correlated pair fits a negative hedge ratio, which turns the spread into a sum and
+    /// hedges nothing. Sizing is dollar-neutral regardless, so admitting one produces a directional
+    /// bet wearing the name of a market-neutral pair.
+    #[test]
+    fn test_an_anti_correlated_pair_is_rejected() {
+        let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
+        // Mirror the follower's returns around its starting level to invert the correlation while
+        // keeping every price positive and the dispersion intact.
+        let first = follower[0];
+        let mirrored: Vec<f64> = follower.iter().map(|price| first * first / price).collect();
+
+        let correlation = pearson_correlation(&log_returns(&leader), &log_returns(&mirrored))
+            .expect("the mirrored fixture must correlate");
+        assert!(
+            correlation < -CORRELATION_MINIMUM,
+            "the fixture must be anti-correlated inside the band's magnitude, got {correlation}"
+        );
+
+        let stretched = mirrored.last().unwrap() * 1.5;
+        let inputs = vec![
+            input(
+                "AAAA",
+                leader.clone(),
+                *leader.last().unwrap(),
+                "Technology",
+                0.03,
+            ),
+            input("BBBB", mirrored, stretched, "Utilities", -0.02),
         ];
         assert!(score_candidates(&inputs).is_empty());
     }

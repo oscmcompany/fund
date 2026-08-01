@@ -71,10 +71,7 @@ impl SizingParameters {
                 maximum_concurrent_pairs,
                 gross_exposure_multiple, "Sizing overrides are unusable; falling back to defaults"
             );
-            Self {
-                maximum_concurrent_pairs: MAXIMUM_CONCURRENT_PAIRS,
-                gross_exposure_multiple: GROSS_EXPOSURE_MULTIPLE,
-            }
+            Self::default()
         })
     }
 
@@ -101,11 +98,14 @@ impl SizingParameters {
 }
 
 impl Default for SizingParameters {
+    /// The defaults, through the validated constructor rather than a struct literal.
+    ///
+    /// `notional_per_leg` divides by `maximum_concurrent_pairs * LEGS_PER_PAIR`, and `Decimal`
+    /// division by zero panics. The constants are sound today; routing through `new` means a future
+    /// edit that makes one of them zero fails here, at construction, rather than inside sizing.
     fn default() -> Self {
-        Self {
-            maximum_concurrent_pairs: MAXIMUM_CONCURRENT_PAIRS,
-            gross_exposure_multiple: GROSS_EXPOSURE_MULTIPLE,
-        }
+        Self::new(MAXIMUM_CONCURRENT_PAIRS, GROSS_EXPOSURE_MULTIPLE)
+            .expect("the sizing defaults must satisfy their own validation")
     }
 }
 

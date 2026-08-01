@@ -573,10 +573,15 @@ pub async fn load_predictions_between(
     let mut predictions = Vec::with_capacity(rows.len());
     let mut rejected: usize = 0;
     for row in rows {
+        // Named individually, not just counted. A rejected row means the stored data already
+        // violates the invariant `insert_predictions` enforces at write time, so the operator needs
+        // to find that row -- and a count alone cannot locate it.
         let Some(ticker) = Ticker::new(&row.ticker) else {
+            warn!(ticker = %row.ticker, "Dropped a prediction row whose ticker is unusable");
             rejected += 1;
             continue;
         };
+        let stored_ticker = ticker.clone();
         match EquityPrediction::new(
             row.correlation_id,
             row.model_run_id,
@@ -587,7 +592,15 @@ pub async fn load_predictions_between(
             row.quantile_90,
         ) {
             Ok(prediction) => predictions.push(prediction),
-            Err(_) => rejected += 1,
+            Err(error) => {
+                warn!(
+                    ticker = %stored_ticker,
+                    timestamp = %row.timestamp,
+                    %error,
+                    "Dropped a stored prediction that violates the quantile ordering invariant"
+                );
+                rejected += 1;
+            }
         }
     }
 

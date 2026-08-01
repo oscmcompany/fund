@@ -343,20 +343,23 @@ mod tests {
 
     #[test]
     fn test_entries_stop_inside_the_minimum_hold_window() {
-        let gate = gate(&account(100_000, 0, 0), Some(100_000), 0, Some(20));
+        let inside_window = gate(&account(100_000, 0, 0), Some(100_000), 0, Some(20));
         assert!(matches!(
-            gate.session_block(),
+            inside_window.session_block(),
             Some(RiskBlock::TooCloseToClose {
                 minutes_remaining: 20,
                 minimum: MINIMUM_HOLD_MINUTES,
             })
         ));
-        let ample = gate2(&account(100_000, 0, 0), MINIMUM_HOLD_MINUTES);
-        assert_eq!(ample.session_block(), None);
-    }
 
-    fn gate2(account: &AccountSnapshot, minutes: i64) -> RiskGate {
-        gate(account, Some(100_000), 0, Some(minutes))
+        // Exactly at the minimum is enough; the check is "below", not "at or below".
+        let ample = gate(
+            &account(100_000, 0, 0),
+            Some(100_000),
+            0,
+            Some(MINIMUM_HOLD_MINUTES),
+        );
+        assert_eq!(ample.session_block(), None);
     }
 
     /// The calendar answers `None` outside its published horizon. Opening a position when the

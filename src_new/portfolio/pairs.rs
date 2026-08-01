@@ -146,7 +146,10 @@ impl PairEntry {
                 value: entry_z_score,
             });
         }
-        if !signal_strength.is_finite() || signal_strength < 0.0 {
+        // Strictly positive, matching `PairCandidate::new`. Zero means the forecast is neutral
+        // between the legs, which `screen::orient` already refuses — so accepting it here would let
+        // a future call site build a `PairEntry` the screen would never have produced.
+        if !signal_strength.is_finite() || signal_strength <= 0.0 {
             return Err(InvalidEntryError {
                 field: "signal_strength",
                 value: signal_strength,
@@ -540,15 +543,21 @@ mod tests {
         assert!(PairEntry::new(pair(), 1.0, 2.5, 0.1, None).is_ok());
     }
 
+    /// Zero is rejected as well as negative. A neutral forecast is not a reason to hold a pair, and
+    /// `PairCandidate::new` already refuses it — the two validators have to agree or a future call
+    /// site could build an entry the screen would never have produced.
     #[test]
-    fn test_entry_rejects_a_negative_signal_strength() {
-        assert!(matches!(
-            PairEntry::new(pair(), 1.0, 2.5, -0.1, None),
-            Err(InvalidEntryError {
-                field: "signal_strength",
-                ..
-            })
-        ));
+    fn test_entry_rejects_a_non_positive_signal_strength() {
+        for value in [-0.1, 0.0] {
+            assert!(matches!(
+                PairEntry::new(pair(), 1.0, 2.5, value, None),
+                Err(InvalidEntryError {
+                    field: "signal_strength",
+                    ..
+                })
+            ));
+        }
+        assert!(PairEntry::new(pair(), 1.0, 2.5, 0.01, None).is_ok());
     }
 
     #[test]

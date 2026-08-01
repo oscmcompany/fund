@@ -425,16 +425,29 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
         .get(&state.trading, &state.pool, now)
         .await?;
 
+    // A span wide enough to hold the requested sessions even through a holiday week. Six calendar
+    // days was not: Thanksgiving plus two weekends leaves fewer than three sessions inside it, and
+    // the previous `unwrap_or(today)` then collapsed the window to a single session — closing none
+    // of the gap the constant exists to close, and saying nothing about it.
     let sessions = calendar.trading_days_in_range(
-        today - Duration::days(BAR_SYNC_LOOKBACK_SESSIONS as i64 * 2),
+        today - Duration::days(BAR_SYNC_LOOKBACK_SESSIONS as i64 * 4),
         today,
     );
-    let start = sessions
-        .iter()
-        .rev()
-        .nth(BAR_SYNC_LOOKBACK_SESSIONS - 1)
-        .copied()
-        .unwrap_or(today);
+    let start = match sessions.iter().rev().nth(BAR_SYNC_LOOKBACK_SESSIONS - 1) {
+        Some(session) => *session,
+        // Fall back to the oldest session actually found, not to today. A short calendar means a
+        // narrower window, and the log says so rather than leaving it to be inferred.
+        None => {
+            let oldest = sessions.first().copied().unwrap_or(today);
+            warn!(
+                requested = BAR_SYNC_LOOKBACK_SESSIONS,
+                found = sessions.len(),
+                %oldest,
+                "Fewer trading sessions in the lookback span than requested; syncing from the oldest"
+            );
+            oldest
+        }
+    };
 
     let fetched = bars::fetch_bars(
         &state.market_data,

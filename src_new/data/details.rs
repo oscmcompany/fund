@@ -181,11 +181,18 @@ pub async fn load_sectors(pool: &PgPool) -> Result<HashMap<Ticker, String>, Deta
             .fetch_all(pool)
             .await?;
 
+    let supplied = rows.len();
     let sectors: HashMap<Ticker, String> = rows
         .into_iter()
         .filter_map(|row| Ticker::new(&row.ticker).map(|ticker| (ticker, row.sector)))
         .collect();
 
+    // Counted and reported, as `parse_details` does for the CSV path. A dropped ticker removes a
+    // symbol from the screen, and an `info!` reporting only the survivors leaves no trace of it.
+    let skipped = supplied - sectors.len();
+    if skipped > 0 {
+        warn!(skipped, "Skipped equity sector rows with unusable tickers");
+    }
     info!(tickers = sectors.len(), "Equity sectors loaded");
     Ok(sectors)
 }
@@ -223,6 +230,7 @@ pub async fn load_details_dataframe(pool: &PgPool) -> Result<DataFrame, DetailsE
     .fetch_all(pool)
     .await?;
 
+    let supplied = rows.len();
     let details: Vec<EquityDetail> = rows
         .into_iter()
         .filter_map(|row| {
@@ -231,6 +239,10 @@ pub async fn load_details_dataframe(pool: &PgPool) -> Result<DataFrame, DetailsE
         })
         .collect();
 
+    let skipped = supplied - details.len();
+    if skipped > 0 {
+        warn!(skipped, "Skipped equity detail rows with unusable tickers");
+    }
     let dataframe = details_to_dataframe(&details)?;
     info!(rows = dataframe.height(), "Equity details loaded");
     Ok(dataframe)

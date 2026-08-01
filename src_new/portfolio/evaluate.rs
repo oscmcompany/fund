@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, TradingClient};
 use crate::common::types::{EquityPrediction, Ticker};
@@ -87,9 +87,24 @@ pub struct EvaluationSummary {
     pub open_pairs_at_start: usize,
     pub pairs_closed: Vec<ClosedRecord>,
     pub pairs_opened: Vec<String>,
-    pub legs_unpriced: usize,
+    /// Open pairs that could not be priced this pass.
+    ///
+    /// Counted per pair, not per leg: a pair missing either price cannot be measured, so one
+    /// increment covers both. Named for what it counts — the previous `legs_unpriced` implied a leg
+    /// count and reported a pair count, which is the kind of number that gets divided by two in a
+    /// dashboard six months later.
+    pub pairs_unpriced: usize,
+    /// Open pairs whose close was attempted and failed at the broker.
+    ///
+    /// These stay open in the record and are retried next pass. Non-empty means the book is holding
+    /// something it tried to let go of.
+    pub exits_failed: Vec<String>,
     pub candidates_screened: usize,
     /// Why the entry half did not run at all, if it did not.
+    ///
+    /// The stable name and the rendered detail, joined — `drawdown: drawdown of 0.1240 exceeds the
+    /// threshold of 0.1000`. The name alone is greppable but says nothing about how close the pass
+    /// came to running, which is the question anyone reading the row actually has.
     pub entries_blocked: Option<String>,
     /// Why individual candidates were refused, if any were.
     pub entries_refused: Vec<String>,
@@ -155,9 +170,16 @@ pub async fn run_pass(
         context.sizing,
     );
 
+    // Before the gate, not after. A pass blocked by drawdown, capacity, or the hold window is the
+    // most common way a session opens nothing, and those are exactly the rows where "which model
+    // was deciding" matters — the difference between the model seeing no opportunity and the model
+    // being three days old. Only the identifier is read here; the forecasts themselves stay behind
+    // the gate, so a blocked pass still does not pay for the screen.
+    summary.model_run_id = current_model_run_id(context).await?;
+
     if let Some(block) = gate.session_block() {
         info!(block = block.as_str(), reason = %block, "Entry half skipped");
-        summary.entries_blocked = Some(block.as_str().to_string());
+        summary.entries_blocked = Some(format!("{}: {block}", block.as_str()));
         return Ok(summary);
     }
 
@@ -170,9 +192,8 @@ pub async fn run_pass(
     let (approved, refusals) = gate.admit_all(&sized);
     summary.entries_refused = refusals
         .iter()
-        .map(|block| block.as_str().to_string())
+        .map(|block| format!("{}: {block}", block.as_str()))
         .collect();
-    summary.model_run_id = screened.model_run_id.clone();
 
     for pair in &approved {
         match execute::open_pair(
@@ -183,8 +204,34 @@ pub async fn run_pass(
         )
         .await?
         {
-            OpenOutcome::Opened { entry, .. } => {
-                pairs::record_open(context.pool, &entry, context.now).await?;
+            OpenOutcome::Opened {
+                entry,
+                long_fill,
+                short_fill,
+            } => {
+                // Both legs are filled at the broker before this line runs, and the broker and the
+                // database are separate systems — there is no transaction that spans them. If the
+                // insert fails, the position is live with no `equity_pairs` row, so no later pass
+                // can exit it on a signal and the account sync cannot attribute its fills.
+                //
+                // The pre-close liquidation is the backstop, and it is why it flattens the
+                // *account* rather than the pairs the application knows about. What this can add is
+                // a record precise enough to reconstruct the pair by hand before then.
+                if let Err(error) = pairs::record_open(context.pool, &entry, context.now).await {
+                    error!(
+                        pair_id = %entry.pair_id(),
+                        long_ticker = %long_fill.ticker(),
+                        long_shares = long_fill.shares(),
+                        long_price = long_fill.average_price(),
+                        short_ticker = %short_fill.ticker(),
+                        short_shares = short_fill.shares(),
+                        short_price = short_fill.average_price(),
+                        %error,
+                        "Pair filled at the broker but could not be recorded; the position is live \
+                         with no pair row and will be flattened by the pre-close liquidation"
+                    );
+                    return Err(error.into());
+                }
                 summary.pairs_opened.push(entry.pair_id().to_string());
             }
             OpenOutcome::Abandoned { ticker, reason } => {
@@ -322,7 +369,7 @@ async fn close_what_should_close(
             prices.get(pair.long_ticker()),
             prices.get(pair.short_ticker()),
         ) else {
-            summary.legs_unpriced += 1;
+            summary.pairs_unpriced += 1;
             warn!(pair_id = %pair.pair_id(), "Open pair could not be priced this pass");
             continue;
         };
@@ -337,8 +384,25 @@ async fn close_what_should_close(
             continue;
         };
 
+        // One pair's close failing must not take the other pairs' exits down with it. Propagating
+        // here would abort the loop, so a single broker error on the first pair would leave every
+        // later pair open for another five minutes — turning one stuck position into all of them.
+        // The pair stays open in the record, which is the honest state, and the next pass retries.
         let outcome =
-            execute::close_pair(context.trading, pair.long_ticker(), pair.short_ticker()).await?;
+            match execute::close_pair(context.trading, pair.long_ticker(), pair.short_ticker())
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    error!(
+                        pair_id = %pair.pair_id(),
+                        %error,
+                        "Closing a pair failed; it stays open and the next pass retries"
+                    );
+                    summary.exits_failed.push(pair.pair_id().to_string());
+                    continue;
+                }
+            };
         if outcome.was_already_gone() {
             reason = CloseReason::PositionMissing;
         }
@@ -351,6 +415,28 @@ async fn close_what_should_close(
         });
     }
     Ok(closed)
+}
+
+/// The model run behind the current session's forecasts, without loading the forecasts.
+///
+/// One row rather than seven thousand, so this is cheap enough to run before the risk gate on every
+/// pass. See the call site for why it belongs there.
+async fn current_model_run_id(
+    context: &EvaluationContext<'_>,
+) -> Result<Option<String>, EvaluationError> {
+    let (start, end) = eastern_day_bounds(eastern_date(context.now));
+    let row = sqlx::query!(
+        r#"SELECT model_run_id AS "model_run_id!"
+           FROM equity_predictions
+           WHERE timestamp >= $1 AND timestamp < $2
+           ORDER BY timestamp DESC
+           LIMIT 1"#,
+        start,
+        end,
+    )
+    .fetch_optional(context.pool)
+    .await?;
+    Ok(row.map(|row| row.model_run_id))
 }
 
 /// The equity recorded for the previous trading day, if any.

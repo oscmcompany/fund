@@ -10,13 +10,12 @@
 //! Unwinding is still implemented, because the uncommon case — the short fills and the long does
 //! not — is the one that leaves an unhedged position, and it is the one worth having a path for.
 
-use std::num::NonZeroU32;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::common::alpaca::{ClientError, OrderIntent, OrderState, TradingClient};
-use crate::common::types::{Dollars, Ticker};
+use crate::common::types::Ticker;
 use crate::portfolio::pairs::PairEntry;
 use crate::portfolio::size::SizedPair;
 
@@ -197,7 +196,20 @@ pub async fn open_pair(
                 reason,
                 "Long leg did not fill; unwinding the short leg"
             );
-            client.close_position(&short_ticker).await?;
+            // If the unwind itself fails, the short leg is held and no `equity_pairs` row exists
+            // for it — `PairEntry` is not built until below. Name the held symbol and its size
+            // before propagating, because the error carries only the broker's message and the
+            // warning above names the leg that *failed*, not the one still on the book.
+            if let Err(error) = client.close_position(&short_ticker).await {
+                error!(
+                    pair_id = %candidate.pair_id(),
+                    held_ticker = %short_ticker,
+                    held_shares = short_fill.shares,
+                    %error,
+                    "Unwind failed; an unhedged short position is held with no pair record"
+                );
+                return Err(error.into());
+            }
             return Ok(OpenOutcome::Abandoned {
                 ticker: long_ticker,
                 reason,
@@ -228,16 +240,31 @@ pub async fn open_pair(
 
 /// Closes both legs of a pair.
 ///
-/// Both closes are attempted even when the first fails to find a position. Stopping after a missing
-/// long would leave a live short leg on the book, which is the naked directional position the pair
-/// structure exists to avoid.
+/// **Both closes are always attempted, including when the first one errors.** A missing position is
+/// `Ok(false)` and was never the hard case; a 500, a timeout, or a dropped connection is. Returning
+/// early on one of those would leave a live short leg on the book — the naked directional position
+/// the pair structure exists to avoid — and it would do so in exactly the situation where the leg is
+/// most likely still held.
+///
+/// The error is reported only after both attempts have been made, so a failure on the long leg costs
+/// the caller its error and nothing else.
 pub async fn close_pair(
     client: &TradingClient,
     long_ticker: &Ticker,
     short_ticker: &Ticker,
 ) -> Result<CloseOutcome, ExecutionError> {
-    let long_closed = client.close_position(long_ticker).await?;
-    let short_closed = client.close_position(short_ticker).await?;
+    let long_result = client.close_position(long_ticker).await;
+    let short_result = client.close_position(short_ticker).await;
+
+    if let Err(error) = &long_result {
+        warn!(ticker = %long_ticker, %error, "Closing the long leg failed");
+    }
+    if let Err(error) = &short_result {
+        warn!(ticker = %short_ticker, %error, "Closing the short leg failed");
+    }
+
+    let long_closed = long_result?;
+    let short_closed = short_result?;
 
     if long_closed != short_closed {
         warn!(
@@ -332,43 +359,6 @@ async fn submit_and_confirm(
             }
         }
     }
-}
-
-/// Flattens the account: every position closed, every open order cancelled.
-///
-/// Returns the number of symbols Alpaca refused to close. Non-zero means the book is not flat and
-/// the caller must report it rather than treat the liquidation as done.
-pub async fn liquidate_everything(client: &TradingClient) -> Result<usize, ExecutionError> {
-    let outcomes = client.close_all_positions().await?;
-    let refused = outcomes
-        .iter()
-        .filter(|outcome| !outcome.succeeded())
-        .count();
-
-    if refused > 0 {
-        warn!(
-            refused,
-            requested = outcomes.len(),
-            "Liquidation left positions open"
-        );
-    } else {
-        info!(closed = outcomes.len(), "Account flattened");
-    }
-    Ok(refused)
-}
-
-/// Convenience for the caller that only has a share count and a ticker.
-///
-/// Present so [`crate::portfolio::evaluate`] does not construct [`OrderIntent`] itself; the
-/// intent's two variants encode the sizing rules for each side and there should be one place that
-/// knows them.
-pub fn short_intent(ticker: Ticker, shares: NonZeroU32) -> OrderIntent {
-    OrderIntent::OpenShort { ticker, shares }
-}
-
-/// The long-leg counterpart of [`short_intent`].
-pub fn long_intent(ticker: Ticker, notional: Dollars) -> OrderIntent {
-    OrderIntent::OpenLong { ticker, notional }
 }
 
 #[cfg(test)]
@@ -652,6 +642,36 @@ mod tests {
         short.assert_async().await;
     }
 
+    /// A broker error on the long leg must not skip the short close. The 404 case was never the
+    /// hard one; a 500 is, because that is when the leg is most likely still held — and returning
+    /// early would leave a live short on the book overnight.
+    #[tokio::test]
+    async fn test_close_pair_still_closes_the_short_leg_when_the_long_leg_errors() {
+        let mut server = mockito::Server::new_async().await;
+        let long = server
+            .mock("DELETE", "/v2/positions/AAAA?percentage=100")
+            .with_status(500)
+            .with_body("internal error")
+            .expect(1)
+            .create_async()
+            .await;
+        let short = server
+            .mock("DELETE", "/v2/positions/BBBB?percentage=100")
+            .with_status(200)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let result = close_pair(&client, &ticker("AAAA"), &ticker("BBBB")).await;
+
+        assert!(result.is_err(), "the broker failure must still be reported");
+        long.assert_async().await;
+        // The assertion that matters: the short close was attempted despite the long leg failing.
+        short.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_close_pair_reports_a_pair_that_was_already_gone() {
         let mut server = mockito::Server::new_async().await;
@@ -671,34 +691,5 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.was_already_gone());
-    }
-
-    #[tokio::test]
-    async fn test_liquidation_counts_what_alpaca_refused_to_close() {
-        let mut server = mockito::Server::new_async().await;
-        let _bulk = server
-            .mock("DELETE", "/v2/positions?cancel_orders=true")
-            .with_status(207)
-            .with_body(
-                r#"[{"symbol":"AAAA","status":200,"body":{}},
-                    {"symbol":"BBBB","status":500,"body":{}}]"#,
-            )
-            .create_async()
-            .await;
-
-        let client = TradingClient::with_base_url(credentials(), server.url());
-        assert_eq!(liquidate_everything(&client).await.unwrap(), 1);
-    }
-
-    #[test]
-    fn test_intent_helpers_build_the_matching_variant() {
-        assert!(matches!(
-            short_intent(ticker("AAAA"), NonZeroU32::new(5).unwrap()),
-            OrderIntent::OpenShort { .. }
-        ));
-        assert!(matches!(
-            long_intent(ticker("AAAA"), Dollars::new(Decimal::from(100)).unwrap()),
-            OrderIntent::OpenLong { .. }
-        ));
     }
 }

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT model_run_id AS \"model_run_id!\"\n           FROM equity_predictions\n           WHERE timestamp >= $1 AND timestamp < $2\n           ORDER BY timestamp DESC\n           LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model_run_id!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "64287b38bb5a85373420b548837af4516ff47aeb9fcc300b086a1d9c5c727d46"
+}

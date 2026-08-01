@@ -15,6 +15,7 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 
+use aws_sdk_s3::operation::get_object::GetObjectError;
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
 use chrono::{Duration, NaiveDate, Utc};
@@ -57,9 +58,19 @@ const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 /// Sessions the fetch stage re-requests each night.
 ///
 /// Three rather than one, for the same reason the application's sync uses three: a night the
-/// trainer did not run leaves a hole in the archive that nothing else fills, and the overlap is one
-/// extra request against a partition that is simply overwritten.
+/// trainer did not run leaves a hole in the archive that nothing else fills.
+///
+/// The overlap is only cheap because the rewrite *merges*. The universe is recomputed from Alpaca's
+/// current tradable set each run, so a plain overwrite would drop every delisted symbol's already
+/// archived bars for those three days -- shrinking the training window one delisting at a time, with
+/// nothing to show for it.
 const FETCH_LOOKBACK_SESSIONS: i64 = 3;
+
+/// Calendar days of archive the training window spans by default.
+const DEFAULT_LOOKBACK_DAYS: i64 = 365;
+
+/// Attempts to publish `run_metadata.json` before giving up.
+const METADATA_UPLOAD_ATTEMPTS: usize = 3;
 
 // Drift baseline: mean CRPS of the most recent prior runs. Reported, never used to block an
 // artifact -- a model that has degraded is still better than no model at all, and the decision to
@@ -75,6 +86,9 @@ async fn main() {
     if let Err(error) = run().await {
         error!(%error, "Training failed");
         eprintln!("Training failed: {error}");
+        // `std::process::exit` runs no destructors, so the non-blocking appender's guard would
+        // never drop and its buffered lines would be lost -- exactly when the failure log matters.
+        drop(_tracing_guard);
         std::process::exit(1);
     }
 }
@@ -84,11 +98,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
     let artifact_prefix =
         std::env::var("AWS_S3_MODEL_ARTIFACT_PATH").unwrap_or_else(|_| "models/tide/".to_string());
-    let lookback_days: i64 = std::env::var("FUND_LOOKBACK_DAYS")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(365);
+    let lookback_days = read_positive_env("FUND_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS)?;
 
     let s3_client = fund::common::aws::s3_client().await;
 
@@ -220,13 +230,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         DRIFT_MINIMUM_RUNS,
         DRIFT_DEGRADATION_THRESHOLD,
     );
+    // Every variant named. A wildcard would send a future `DriftStatus` down the informational path
+    // with no compiler error, which is the case where a new signal is most likely to be missed.
     match drift.status {
         DriftStatus::DriftDetected => warn!(
             current_crps = drift.current_crps,
             baseline_crps = drift.baseline_crps,
             "Model drift detected"
         ),
-        _ => info!(
+        DriftStatus::NoDrift | DriftStatus::InsufficientHistory => info!(
+            status = ?drift.status,
             current_crps = drift.current_crps,
             baseline_crps = drift.baseline_crps,
             prior_runs = prior_crps.len(),
@@ -257,14 +270,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "prior_runs": prior_crps.len(),
         },
     });
-    upload_artifact(
-        &s3_client,
-        &bucket,
-        &format!("{current_folder}run_metadata.json"),
-        serde_json::to_vec_pretty(&metadata)?,
-        "application/json",
-    )
-    .await?;
+    // Retried, because the model tarball is already published by this point. A folder holding a
+    // model and no metadata is skipped by `fetch_prior_crps`, so the run vanishes from the drift
+    // baseline for the next DRIFT_PRIOR_RUN_COUNT executions -- and with DRIFT_MINIMUM_RUNS at three,
+    // repeated partial publishes suppress drift reporting entirely.
+    let metadata_key = format!("{current_folder}run_metadata.json");
+    let metadata_body = serde_json::to_vec_pretty(&metadata)?;
+    let mut published = false;
+    for attempt in 1..=METADATA_UPLOAD_ATTEMPTS {
+        match upload_artifact(
+            &s3_client,
+            &bucket,
+            &metadata_key,
+            metadata_body.clone(),
+            "application/json",
+        )
+        .await
+        {
+            Ok(()) => {
+                published = true;
+                break;
+            }
+            Err(error) => warn!(
+                attempt,
+                attempts = METADATA_UPLOAD_ATTEMPTS,
+                %error,
+                "Publishing run metadata failed"
+            ),
+        }
+    }
+    if !published {
+        error!(
+            folder = current_folder,
+            "Run metadata could not be published; this folder holds a model with no metadata and \
+             will be skipped by the drift baseline"
+        );
+        return Err(format!("failed to publish run metadata for {current_folder}").into());
+    }
 
     println!("Training complete: artifact s3://{bucket}/{model_key}");
     println!(
@@ -274,6 +316,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Reads a positive integer from the environment, falling back only when the variable is absent.
+///
+/// A present-but-unparsable value is an error rather than a fallback. This is a batch job an
+/// operator starts: a typo in a deployment variable should stop it, not silently run it with a
+/// default nobody chose. That is the opposite of `SizingParameters::from_env`, which warns and
+/// continues -- and deliberately so, because the service has to keep running.
+fn read_positive_env(variable: &str, default: i64) -> Result<i64, Box<dyn std::error::Error>> {
+    let Some(raw) = std::env::var(variable)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(default);
+    };
+    let value: i64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{variable} must be a positive integer, got {raw:?}"))?;
+    if value <= 0 {
+        return Err(format!("{variable} must be greater than zero, got {value}").into());
+    }
+    Ok(value)
+}
+
 /// The training configuration, with `FUND_EPOCHS` applied over the defaults.
 ///
 /// Rebuilt through the validated constructor rather than by assigning a field, so an epoch count of
@@ -281,11 +346,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// epochs and publish an untrained model that looks exactly like a trained one.
 fn training_config() -> Result<TrainConfig, Box<dyn std::error::Error>> {
     let defaults = TrainConfig::default();
-    let epoch_count = std::env::var("FUND_EPOCHS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or_else(|| defaults.epoch_count());
+    let epoch_count = read_positive_env("FUND_EPOCHS", defaults.epoch_count() as i64)? as usize;
 
     Ok(TrainConfig::new(
         defaults.learning_rate(),
@@ -348,18 +409,23 @@ async fn fetch_and_archive(
 
     let mut written = 0;
     for (date, bars_for_date) in by_date {
-        let mut frame = bars::bars_to_dataframe(&bars_for_date)?;
+        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date);
+        let fetched_frame = bars::bars_to_dataframe(&bars_for_date)?;
+
+        // Merged with whatever the partition already holds, not written over it. The universe is
+        // recomputed from Alpaca's *current* tradable set on every run, so a symbol delisted today
+        // is absent from tonight's fetch — and a plain overwrite would erase the bars already
+        // archived for it on the days it was still trading. The training window would shrink
+        // silently, one delisting at a time.
+        let mut frame = match read_partition(s3_client, bucket, &key).await? {
+            Some(existing) => merge_partitions(existing, fetched_frame)?,
+            None => fetched_frame,
+        };
+
         let mut buffer: Vec<u8> = Vec::new();
         ParquetWriter::new(&mut buffer).finish(&mut frame)?;
 
-        upload_artifact(
-            s3_client,
-            bucket,
-            &date_partitioned_key(BAR_ARCHIVE_PREFIX, date),
-            buffer,
-            "application/octet-stream",
-        )
-        .await?;
+        upload_artifact(s3_client, bucket, &key, buffer, "application/octet-stream").await?;
         written += frame.height();
     }
 
@@ -373,6 +439,57 @@ async fn fetch_and_archive(
     .await?;
 
     Ok(written)
+}
+
+/// Reads one archived partition, distinguishing a missing object from a failed request.
+///
+/// `Ok(None)` means the partition genuinely does not exist yet — the documented skip. Every other
+/// failure propagates: a credential error, a throttle, or a network fault silently treated as
+/// "missing" would shorten the training window without any signal, and the model would just be
+/// slightly worse for reasons nothing recorded.
+async fn read_partition(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<DataFrame>, Box<dyn std::error::Error>> {
+    let response = match s3_client.get_object().bucket(bucket).key(key).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            return match error.into_service_error() {
+                GetObjectError::NoSuchKey(_) => Ok(None),
+                other => Err(other.into()),
+            }
+        }
+    };
+    let bytes = response.body.collect().await?.into_bytes();
+    Ok(Some(ParquetReader::new(Cursor::new(bytes)).finish()?))
+}
+
+/// Combines an existing partition with a freshly fetched one, newest row winning per key.
+///
+/// The key is `(ticker, bar_interval, timestamp)` — the same primary key `equity_bars` uses, so the
+/// archive and the table agree about what constitutes a duplicate. The fetched rows are appended
+/// last and `UniqueKeepStrategy::Last` keeps them, which makes a re-fetch a correction rather than a
+/// duplicate.
+fn merge_partitions(
+    existing: DataFrame,
+    fetched: DataFrame,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    let combined = concat([existing.lazy(), fetched.lazy()], UnionArgs::default())?
+        .unique_stable(
+            Some(polars::prelude::Selector::ByName {
+                names: vec![
+                    PlSmallStr::from("ticker"),
+                    PlSmallStr::from("bar_interval"),
+                    PlSmallStr::from("timestamp"),
+                ]
+                .into(),
+                strict: false,
+            }),
+            UniqueKeepStrategy::Last,
+        )
+        .collect()?;
+    Ok(combined)
 }
 
 /// The most recent weekday at or before `date`.
@@ -405,9 +522,8 @@ async fn load_archived_bars(
     let mut date = start_date;
     while date <= end_date {
         let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date);
-        if let Ok(response) = s3_client.get_object().bucket(bucket).key(&key).send().await {
-            let bytes = response.body.collect().await?.into_bytes();
-            frames.push(ParquetReader::new(Cursor::new(bytes)).finish()?.lazy());
+        if let Some(frame) = read_partition(s3_client, bucket, &key).await? {
+            frames.push(frame.lazy());
         }
         date = match date.succ_opt() {
             Some(next_date) => next_date,
@@ -469,4 +585,123 @@ async fn fetch_prior_crps(
         }
     }
     prior_crps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// RAII guard restoring one environment variable on drop, so an assertion failure cannot leave
+    /// a value in place for the next `#[serial]` test in the file.
+    struct EnvironmentVariableGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvironmentVariableGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid")
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_absent_variable_uses_the_default() {
+        let _guard = EnvironmentVariableGuard::unset("FUND_LOOKBACK_DAYS");
+        assert_eq!(
+            read_positive_env("FUND_LOOKBACK_DAYS", DEFAULT_LOOKBACK_DAYS).unwrap(),
+            DEFAULT_LOOKBACK_DAYS
+        );
+    }
+
+    /// An empty value is a variable that was set to nothing, which reads the same as unset. That is
+    /// the one fallback worth keeping, because deployment tooling writes empty strings routinely.
+    #[test]
+    #[serial]
+    fn test_an_empty_variable_uses_the_default() {
+        let _guard = EnvironmentVariableGuard::set("FUND_LOOKBACK_DAYS", "   ");
+        assert_eq!(read_positive_env("FUND_LOOKBACK_DAYS", 365).unwrap(), 365);
+    }
+
+    /// A typo must stop the run. Falling back would make a misconfigured deployment
+    /// indistinguishable from an unconfigured one, and the model would train on a window nobody
+    /// chose.
+    #[test]
+    #[serial]
+    fn test_an_unparsable_variable_is_an_error() {
+        let _guard = EnvironmentVariableGuard::set("FUND_LOOKBACK_DAYS", "3o5");
+        assert!(read_positive_env("FUND_LOOKBACK_DAYS", 365).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_non_positive_variable_is_an_error() {
+        for value in ["0", "-5"] {
+            let _guard = EnvironmentVariableGuard::set("FUND_LOOKBACK_DAYS", value);
+            assert!(
+                read_positive_env("FUND_LOOKBACK_DAYS", 365).is_err(),
+                "{value} must be rejected"
+            );
+        }
+    }
+
+    /// The docstring on `training_config` claims a zero epoch count is rejected with a message.
+    /// Nothing proved that until now — and an accepted zero would publish an untrained model that
+    /// looks exactly like a trained one.
+    #[test]
+    #[serial]
+    fn test_a_zero_epoch_count_is_rejected() {
+        let _guard = EnvironmentVariableGuard::set("FUND_EPOCHS", "0");
+        assert!(training_config().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_malformed_epoch_count_is_rejected() {
+        let _guard = EnvironmentVariableGuard::set("FUND_EPOCHS", "twenty");
+        assert!(training_config().is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_absent_epoch_count_keeps_the_default() {
+        let _guard = EnvironmentVariableGuard::unset("FUND_EPOCHS");
+        assert_eq!(
+            training_config().unwrap().epoch_count(),
+            TrainConfig::default().epoch_count()
+        );
+    }
+
+    /// Alpaca publishes no bars on a weekend, so the fetch window has to end on a weekday or the
+    /// last partition of the run is empty.
+    #[test]
+    fn test_most_recent_weekday_walks_back_over_the_weekend() {
+        // 2026-08-01 is a Saturday, 2026-08-02 a Sunday, 2026-08-03 a Monday.
+        assert_eq!(most_recent_weekday(date(2026, 8, 1)), date(2026, 7, 31));
+        assert_eq!(most_recent_weekday(date(2026, 8, 2)), date(2026, 7, 31));
+        assert_eq!(most_recent_weekday(date(2026, 8, 3)), date(2026, 8, 3));
+        assert_eq!(most_recent_weekday(date(2026, 7, 31)), date(2026, 7, 31));
+    }
 }

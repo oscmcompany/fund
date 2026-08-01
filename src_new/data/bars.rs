@@ -328,6 +328,9 @@ pub async fn load_aligned_closes(
     Ok(closes_by_ticker)
 }
 
+/// Session-aligned close series, shared by reference because every caller only reads.
+pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
+
 /// The aligned close history, loaded at most once per Eastern date.
 ///
 /// Daily bars are written after the close, so this does not change intraday — and the evaluation
@@ -338,9 +341,6 @@ pub async fn load_aligned_closes(
 /// Same shape as [`crate::data::calendar::CalendarCache`] and
 /// [`crate::data::universe::UniverseCache`], and for the same reason: a value held in state and
 /// passed explicitly, not a process-wide static.
-/// Session-aligned close series, shared by reference because every caller only reads.
-pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
-
 #[derive(Default)]
 pub struct CloseHistoryCache {
     inner: tokio::sync::Mutex<Option<(NaiveDate, AlignedCloses)>>,

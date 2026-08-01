@@ -29,14 +29,20 @@ const TEST_DATABASE_PREFIX: &str = "fund_test";
 /// Small because each test builds its own pool and the server allows a hundred in total.
 const TEST_POOL_MAX_CONNECTIONS: u32 = 4;
 
-/// Marks that the test database exists and carries the schema.
+/// Databases this process has already created and populated.
 ///
-/// Stores `()` rather than the pool, and that is load-bearing. A `PgPool` is bound to the tokio
-/// runtime that created it, and every `#[tokio::test]` builds its own runtime; caching a pool here
-/// meant the second test to run inherited a handle whose background reaper had died with the first
-/// test's runtime, and every acquire from it failed with `PoolTimedOut`. This is the trap recorded
-/// in `rust_test_pitfalls`.
-static SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+/// Holds names rather than pools, and that is load-bearing. A `PgPool` is bound to the tokio runtime
+/// that created it, and every `#[tokio::test]` builds its own runtime; caching a pool here meant the
+/// second test to run inherited a handle whose background reaper had died with the first test's
+/// runtime, and every acquire from it failed with `PoolTimedOut`. This is the trap recorded in
+/// `rust_test_pitfalls`.
+///
+/// A set rather than a single `OnceCell`, so the readiness is keyed by database. A `OnceCell` is
+/// initialized once per *process*: a binary calling `test_pool` with two suffixes would create the
+/// first database, then skip the initializer for the second and connect to a database that was
+/// never created — surfacing as a bare connection error rather than as fixture misuse.
+static PREPARED_DATABASES: tokio::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    tokio::sync::Mutex::const_new(None);
 
 fn database_url_base() -> String {
     std::env::var("TEST_DATABASE_URL_BASE")
@@ -105,6 +111,18 @@ fn filter_schema_for_test(schema: &str) -> String {
         kept.push(line);
     }
 
+    // A block that never terminated means every line after it was buffered and dropped, and the
+    // suite would then apply a truncated schema — surfacing much later as a confusing missing-column
+    // error. Fail here, where the cause is legible.
+    assert!(
+        !inside_do_block,
+        "schema.sql has an unterminated DO block; the test filter expects `$do$;` on its own line"
+    );
+    assert!(
+        !inside_cron_function,
+        "schema.sql has an unterminated cron function; the test filter expects `$$;` on its own line"
+    );
+
     kept.join("\n")
 }
 
@@ -128,8 +146,13 @@ pub async fn test_pool(suffix: &str) -> PgPool {
     let base = database_url_base();
     let database = format!("{TEST_DATABASE_PREFIX}_{suffix}");
 
-    SCHEMA_READY
-        .get_or_init(|| async {
+    // The lock is held across the setup so two concurrent callers for the same database cannot both
+    // decide it needs creating. It is released before the pool below is built.
+    {
+        let mut guard = PREPARED_DATABASES.lock().await;
+        let prepared = guard.get_or_insert_with(std::collections::HashSet::new);
+
+        if prepared.insert(database.clone()) {
             let admin = PgPool::connect(&format!("{base}/postgres"))
                 .await
                 .expect("Failed to connect to Postgres — is `devenv up` running?");
@@ -154,8 +177,8 @@ pub async fn test_pool(suffix: &str) -> PgPool {
                 .await
                 .expect("Failed to apply schema.sql to the test database");
             setup.close().await;
-        })
-        .await;
+        }
+    }
 
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(TEST_POOL_MAX_CONNECTIONS)
@@ -183,7 +206,11 @@ pub async fn reset_tables(pool: &PgPool) {
     .expect("Failed to reset the test tables");
 }
 
-/// Inserts daily bars for each ticker over `sessions` consecutive weekdays ending today.
+/// Inserts daily bars for each ticker over `sessions` consecutive **calendar** days ending today.
+///
+/// Calendar days, not trading sessions: the loop applies no weekday filter, so the series includes
+/// weekends. The synthetic prices still satisfy the correlation property the screen needs, so this
+/// only matters to a reader sizing a window that must align with real sessions.
 ///
 /// The two legs are driven by a shared factor plus an idiosyncratic one, so their log returns
 /// correlate around 0.8 — inside the screen's `[0.5, 0.95]` band — and the spread has real
@@ -278,7 +305,10 @@ pub async fn seed_predictions(
             "INSERT INTO equity_predictions \
              (correlation_id, model_run_id, ticker, timestamp, quantile_10, quantile_50, quantile_90) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (ticker, timestamp) DO UPDATE SET quantile_50 = EXCLUDED.quantile_50",
+             ON CONFLICT (ticker, timestamp) DO UPDATE SET \
+                 quantile_10 = EXCLUDED.quantile_10, \
+                 quantile_50 = EXCLUDED.quantile_50, \
+                 quantile_90 = EXCLUDED.quantile_90",
         )
         .bind(Uuid::new_v4())
         .bind(model_run_id)
