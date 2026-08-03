@@ -53,7 +53,6 @@ async fn fresh_pool() -> PgPool {
 async fn store_equity(pool: &PgPool, session_date: NaiveDate, equity: &str) {
     let snapshot = AccountSnapshot::new(
         decimal(equity),
-        decimal(equity),
         decimal("50000"),
         decimal("200000"),
         decimal("40000"),

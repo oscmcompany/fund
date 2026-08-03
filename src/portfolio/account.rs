@@ -101,13 +101,12 @@ pub async fn store_snapshot(
 ) -> Result<(), AccountError> {
     sqlx::query!(
         r#"INSERT INTO account_snapshots (
-               session_date, equity, last_equity, cash, buying_power,
+               session_date, equity, cash, buying_power,
                long_market_value, short_market_value
            )
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (session_date) DO UPDATE SET
                equity             = EXCLUDED.equity,
-               last_equity        = EXCLUDED.last_equity,
                cash               = EXCLUDED.cash,
                buying_power       = EXCLUDED.buying_power,
                long_market_value  = EXCLUDED.long_market_value,
@@ -115,7 +114,6 @@ pub async fn store_snapshot(
                fetched_at         = now()"#,
         session_date,
         account.equity(),
-        account.last_equity(),
         account.cash(),
         account.buying_power(),
         account.long_market_value(),

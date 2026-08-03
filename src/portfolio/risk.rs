@@ -258,7 +258,6 @@ mod tests {
         AccountSnapshot::new(
             Decimal::from(equity),
             Decimal::from(equity),
-            Decimal::from(equity),
             Decimal::from(equity * 2),
             Decimal::from(long),
             Decimal::from(short),

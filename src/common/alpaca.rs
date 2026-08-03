@@ -638,7 +638,6 @@ impl Position {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountSnapshot {
     equity: Decimal,
-    last_equity: Decimal,
     cash: Decimal,
     buying_power: Decimal,
     long_market_value: Decimal,
@@ -648,7 +647,6 @@ pub struct AccountSnapshot {
 impl AccountSnapshot {
     pub fn new(
         equity: Decimal,
-        last_equity: Decimal,
         cash: Decimal,
         buying_power: Decimal,
         long_market_value: Decimal,
@@ -656,7 +654,6 @@ impl AccountSnapshot {
     ) -> Self {
         Self {
             equity,
-            last_equity,
             cash,
             buying_power,
             long_market_value,
@@ -666,11 +663,6 @@ impl AccountSnapshot {
 
     pub fn equity(&self) -> Decimal {
         self.equity
-    }
-
-    /// Equity at the previous session's close, as Alpaca computes it.
-    pub fn last_equity(&self) -> Decimal {
-        self.last_equity
     }
 
     pub fn cash(&self) -> Decimal {
@@ -842,7 +834,6 @@ impl TradingClient {
 
         Ok(AccountSnapshot::new(
             parse_decimal(&account.equity, "equity")?,
-            parse_decimal(&account.last_equity, "last_equity")?,
             parse_decimal(&account.cash, "cash")?,
             parse_decimal(&account.buying_power, "buying_power")?,
             parse_decimal(&account.long_market_value, "long_market_value")?,
@@ -1154,7 +1145,6 @@ fn decimal_or_none(raw: &str) -> Option<Decimal> {
 #[derive(Deserialize)]
 struct AccountResponse {
     equity: String,
-    last_equity: String,
     cash: String,
     buying_power: String,
     long_market_value: String,
@@ -1268,19 +1258,6 @@ impl std::fmt::Display for DataFeed {
         formatter.write_str(self.as_str())
     }
 }
-
-/// Symbols requested per historical bars call.
-///
-/// Separate from the snapshot cap despite sharing its value today. The two endpoints have different
-/// request shapes -- bars carries six more parameters and a page token -- so the request-line budget
-/// they are each bounded by is not the same, and tuning one should not silently move the other.
-const BARS_SYMBOLS_PER_REQUEST: usize = 1_000;
-
-/// Rows requested per historical bars page.
-///
-/// 10,000 is the endpoint's documented maximum. Asking for fewer only increases the number of
-/// round trips needed to walk a backfill.
-const BARS_PAGE_LIMIT: usize = 10_000;
 
 /// One symbol's point-in-time market state.
 ///
@@ -1481,88 +1458,6 @@ impl MarketDataClient {
             })
             .collect())
     }
-
-    /// Fetches historical bars for `symbols` over an inclusive date range, following pagination
-    /// until the feed is exhausted.
-    ///
-    /// The multi-symbol bars endpoint returns a map of symbol to bar list plus a `next_page_token`
-    /// that spans symbols, so a page boundary can fall in the middle of one symbol's history.
-    /// Accumulating across pages before returning is what keeps that invisible to callers.
-    pub async fn fetch_bars(
-        &self,
-        symbols: &[String],
-        bar_interval: BarInterval,
-        start: NaiveDate,
-        end: NaiveDate,
-    ) -> Result<Vec<EquityBar>, ClientError> {
-        if symbols.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut bars: Vec<EquityBar> = Vec::new();
-        let mut pages: usize = 0;
-
-        let url = format!("{}/v2/stocks/bars", self.base_url);
-        let page_limit = BARS_PAGE_LIMIT.to_string();
-        let start_parameter = start.to_string();
-        let end_parameter = end.to_string();
-
-        for chunk in symbols.chunks(BARS_SYMBOLS_PER_REQUEST) {
-            let symbols_parameter = chunk.join(",");
-            let mut page_token: Option<String> = None;
-            loop {
-                // Built through the query serializer rather than interpolated into the URL.
-                // `next_page_token` is base64, so it can contain `+`, `/`, and `=`; interpolated
-                // raw, a `+` decodes server-side as a space and the token is rejected or silently
-                // resolves to a different page. That surfaces as a truncated backfill, not an error.
-                let mut parameters: Vec<(&str, &str)> = vec![
-                    ("symbols", symbols_parameter.as_str()),
-                    ("timeframe", bar_interval.alpaca_timeframe()),
-                    ("start", start_parameter.as_str()),
-                    ("end", end_parameter.as_str()),
-                    ("limit", page_limit.as_str()),
-                    ("feed", self.feed.as_str()),
-                    ("adjustment", "all"),
-                ];
-                if let Some(token) = &page_token {
-                    parameters.push(("page_token", token.as_str()));
-                }
-
-                let response =
-                    error_for_status(self.get(&url).query(&parameters).send().await?).await?;
-                let payload: BarsResponse = response.json().await.map_err(|error| {
-                    ClientError::Parse(format!("Failed to parse bars response: {error}"))
-                })?;
-                pages += 1;
-
-                for (symbol, symbol_bars) in payload.bars {
-                    let Some(ticker) = Ticker::new(&symbol) else {
-                        warn!(symbol = %symbol, "Bars returned for an unparseable symbol, skipping");
-                        continue;
-                    };
-                    bars.extend(
-                        symbol_bars
-                            .into_iter()
-                            .filter_map(|bar| bar.into_equity_bar(&ticker, bar_interval)),
-                    );
-                }
-
-                match payload.next_page_token {
-                    Some(token) if !token.is_empty() => page_token = Some(token),
-                    _ => break,
-                }
-            }
-        }
-
-        info!(
-            symbols = symbols.len(),
-            bar_interval = bar_interval.as_str(),
-            bars = bars.len(),
-            pages,
-            "Historical bars fetched"
-        );
-        Ok(bars)
-    }
 }
 
 /// Alpaca's wire names are pinned in the `serde` attributes, which is what the external contract
@@ -1668,14 +1563,6 @@ impl BarPayload {
         })
         .ok()
     }
-}
-
-#[derive(Deserialize)]
-struct BarsResponse {
-    #[serde(default)]
-    bars: std::collections::HashMap<String, Vec<BarPayload>>,
-    #[serde(default)]
-    next_page_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -2089,7 +1976,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{"equity":"105000.50","last_equity":"104000.00","cash":"25000.00",
+                r#"{"equity":"105000.50","cash":"25000.00",
                     "buying_power":"210000.00","long_market_value":"80000.00",
                     "short_market_value":"-79000.00"}"#,
             )
@@ -2100,7 +1987,9 @@ mod tests {
         let account = client.fetch_account().await.expect("account must parse");
 
         assert_eq!(account.equity(), Decimal::new(10500050, 2));
-        assert_eq!(account.last_equity(), Decimal::new(10400000, 2));
+        assert_eq!(account.cash(), Decimal::new(2500000, 2));
+        assert_eq!(account.buying_power(), Decimal::new(21000000, 2));
+        assert_eq!(account.long_market_value(), Decimal::new(8000000, 2));
         assert_eq!(account.short_market_value(), Decimal::new(-7900000, 2));
         mock.assert_async().await;
     }
@@ -2110,7 +1999,6 @@ mod tests {
     #[test]
     fn test_gross_exposure_adds_magnitudes_rather_than_netting() {
         let account = AccountSnapshot::new(
-            Decimal::new(100000, 0),
             Decimal::new(100000, 0),
             Decimal::new(20000, 0),
             Decimal::new(200000, 0),
@@ -2511,105 +2399,5 @@ mod tests {
         let server = mockito::Server::new_async().await;
         let snapshots = client(server.url()).fetch_snapshots(&[]).await.unwrap();
         assert!(snapshots.is_empty());
-    }
-
-    /// Bars must accumulate across pages. Stopping at the first page silently truncates a backfill,
-    /// which then looks like missing market history rather than a client bug.
-    #[tokio::test]
-    async fn test_fetch_bars_follows_pagination() {
-        let mut server = mockito::Server::new_async().await;
-        let base = "/v2/stocks/bars?symbols=AAPL&timeframe=1Day&start=2026-06-08&end=2026-06-10&limit=10000&feed=iex&adjustment=all";
-        let first = server
-            .mock("GET", base)
-            .with_status(200)
-            .with_body(
-                r#"{"bars":{"AAPL":[{"t":"2026-06-08T04:00:00Z","o":1.0,"h":2.0,"l":0.5,"c":1.5,"v":100.0}]},
-                    "next_page_token":"page2"}"#,
-            )
-            .create_async()
-            .await;
-        let second = server
-            .mock("GET", format!("{base}&page_token=page2").as_str())
-            .with_status(200)
-            .with_body(
-                r#"{"bars":{"AAPL":[{"t":"2026-06-09T04:00:00Z","o":1.5,"h":2.5,"l":1.0,"c":2.0,"v":200.0}]},
-                    "next_page_token":null}"#,
-            )
-            .create_async()
-            .await;
-
-        let bars = client(server.url())
-            .fetch_bars(
-                &["AAPL".to_string()],
-                BarInterval::OneDay,
-                NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
-            )
-            .await
-            .expect("bars must parse");
-
-        assert_eq!(bars.len(), 2, "both pages must be accumulated");
-        first.assert_async().await;
-        second.assert_async().await;
-    }
-
-    /// Page tokens are base64, so they contain `+`, `/`, and `=`. Interpolated into the URL raw, a
-    /// `+` is decoded server-side as a space and the token names a different page or none at all —
-    /// which surfaces as a silently truncated backfill rather than an error. The query serializer
-    /// percent-encodes them, and this asserts the encoded form actually goes out on the wire.
-    #[tokio::test]
-    async fn test_fetch_bars_percent_encodes_the_page_token() {
-        let mut server = mockito::Server::new_async().await;
-        let base = "/v2/stocks/bars?symbols=AAPL&timeframe=1Day&start=2026-06-08&end=2026-06-10&limit=10000&feed=iex&adjustment=all";
-        let first = server
-            .mock("GET", base)
-            .with_status(200)
-            .with_body(r#"{"bars":{},"next_page_token":"a+b/c=="}"#)
-            .create_async()
-            .await;
-        let second = server
-            .mock("GET", format!("{base}&page_token=a%2Bb%2Fc%3D%3D").as_str())
-            .with_status(200)
-            .with_body(r#"{"bars":{},"next_page_token":null}"#)
-            .create_async()
-            .await;
-
-        client(server.url())
-            .fetch_bars(
-                &["AAPL".to_string()],
-                BarInterval::OneDay,
-                NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
-            )
-            .await
-            .expect("bars must parse");
-
-        first.assert_async().await;
-        second.assert_async().await;
-    }
-
-    /// The request must carry Alpaca's timeframe spelling, not the stored form. Sending `1day`
-    /// returns an empty result rather than an error, so this is the test that catches it.
-    #[tokio::test]
-    async fn test_fetch_bars_sends_alpaca_timeframe_spelling() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/v2/stocks/bars?symbols=AAPL&timeframe=1Hour&start=2026-06-10&end=2026-06-10&limit=10000&feed=iex&adjustment=all")
-            .with_status(200)
-            .with_body(r#"{"bars":{},"next_page_token":null}"#)
-            .create_async()
-            .await;
-
-        client(server.url())
-            .fetch_bars(
-                &["AAPL".to_string()],
-                BarInterval::SixtyMinute,
-                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
-                NaiveDate::from_ymd_opt(2026, 6, 10).unwrap(),
-            )
-            .await
-            .expect("bars must parse");
-
-        mock.assert_async().await;
     }
 }

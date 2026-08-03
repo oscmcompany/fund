@@ -1,9 +1,6 @@
 -- Fund platform PostgreSQL schema
--- TimescaleDB operational data layer and event coordination.
 --
--- Seven tables. Alpaca is the source of truth for fills, balances, buying power, and positions;
--- nothing here duplicates what the broker already knows authoritatively. PostgreSQL holds model
--- output, the long/short pair mapping, market history, and an audit trail.
+-- TimescaleDB operational data layer and event coordination.
 --
 -- Every DDL statement uses an idempotent form so this file can be re-run against a populated
 -- database. Note the one thing that re-running cannot do: CREATE TABLE IF NOT EXISTS is a no-op
@@ -17,30 +14,18 @@
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 CREATE EXTENSION IF NOT EXISTS pg_cron;
 
--- ---------------------------------------------------------------------------
--- Market data
--- ---------------------------------------------------------------------------
-
 -- equity_bars: rolling buffer of OHLCV bars at a declared interval.
 --
--- bar_interval is part of the primary key so a single table carries daily and intraday bars
--- together. Only '1day' is written today -- the intraday migration is deferred, and the column
--- exists so that migration needs no table rewrite.
+-- One retention policy covers every interval, which is the accepted cost of a single table.
 --
--- These are the canonical stored values, deliberately not Alpaca's timeframe spelling: Alpaca
--- writes '1Day' and '1Hour' where this column holds '1day' and '60min'. The BarInterval enum in
--- common::types owns both forms and the mapping between them, so no call site has to remember
--- which vocabulary it is in.
---
--- One retention policy covers every interval, which is the accepted cost of a single table. At 90
--- days, daily bars across the filtered universe are on the order of 10^5 rows while 1-minute bars
--- would be on the order of 10^7. Revisit the window when intraday writes begin.
---
--- Source: Alpaca REST, fetched by the application post-close and, independently, by the trainer.
+-- Only 'one_day' is ever stored; 'one_minute' is accepted because it is the tag Alpaca's snapshot
+-- minuteBar carries. These are the snake_case of the BarInterval variants in common::types, which
+-- is what lets the enum derive the same strings for serde, and they must match this constraint
+-- exactly.
 CREATE TABLE IF NOT EXISTS equity_bars (
     ticker                        TEXT             NOT NULL,
     bar_interval                  TEXT             NOT NULL
-        CHECK (bar_interval IN ('1min', '5min', '15min', '30min', '60min', '1day')),
+        CHECK (bar_interval IN ('one_minute', 'one_day')),
     timestamp                     TIMESTAMPTZ      NOT NULL,
     open_price                    DOUBLE PRECISION NOT NULL,
     high_price                    DOUBLE PRECISION NOT NULL,
@@ -59,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_equity_bars_interval_timestamp -- noqa: PG01
 SELECT add_retention_policy('equity_bars', INTERVAL '90 days', if_not_exists => TRUE);
 
 -- equity_details: ticker metadata used to constrain pair selection to cross-sector matches.
+--
 -- Seeded from data/equity_details.csv via seed_equity_details; refreshed by the post-close
 -- market data sync.
 CREATE TABLE IF NOT EXISTS equity_details (
@@ -67,11 +53,8 @@ CREATE TABLE IF NOT EXISTS equity_details (
     industry  TEXT NOT NULL DEFAULT 'NOT AVAILABLE'
 );
 
--- ---------------------------------------------------------------------------
--- Model output
--- ---------------------------------------------------------------------------
-
 -- equity_predictions: TiDE quantile output, one row per ticker per prediction batch.
+--
 -- Written by the pre-open predictions handler and read by the entry screen for the rest of the
 -- session. Identity is (ticker, timestamp); a batch is identified by its shared correlation_id.
 CREATE TABLE IF NOT EXISTS equity_predictions (
@@ -90,10 +73,6 @@ SELECT create_hypertable('equity_predictions', by_range('timestamp'), if_not_exi
 -- Retention is the nightly purge handler's job, not TimescaleDB's: rows must reach S3 via the
 -- export before they are dropped, and only the handler knows whether that happened.
 SELECT remove_retention_policy('equity_predictions', if_exists => TRUE);
-
--- ---------------------------------------------------------------------------
--- Positions
--- ---------------------------------------------------------------------------
 
 -- equity_pairs: the long/short leg mapping, plus the signal that justified the entry.
 --
@@ -144,10 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_pairs_closed_at -- noqa: PG01
     ON equity_pairs (closed_at DESC)
     WHERE status = 'closed';
 
--- ---------------------------------------------------------------------------
--- Account, as reported by Alpaca
--- ---------------------------------------------------------------------------
-
 -- account_snapshots: one row per trading session, written by the post-close account sync.
 --
 -- The previous session's equity is the reference the next session's drawdown gate compares live
@@ -156,7 +131,6 @@ CREATE INDEX IF NOT EXISTS idx_equity_pairs_closed_at -- noqa: PG01
 CREATE TABLE IF NOT EXISTS account_snapshots (
     session_date        DATE        PRIMARY KEY,
     equity              NUMERIC     NOT NULL,
-    last_equity         NUMERIC     NOT NULL,
     cash                NUMERIC     NOT NULL,
     buying_power        NUMERIC     NOT NULL,
     long_market_value   NUMERIC     NOT NULL,
@@ -188,15 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_account_activities_transaction_time -- noqa: PG01
 CREATE INDEX IF NOT EXISTS idx_account_activities_ticker_time -- noqa: PG01
     ON account_activities (ticker, transaction_time DESC);
 
--- ---------------------------------------------------------------------------
--- Event coordination
--- ---------------------------------------------------------------------------
-
 -- events: append-only record of every command issued and every outcome reached.
---
--- Six commands, three outcomes. pg_cron writes the '<command>_requested' rows; the service writes
--- '<command>_completed' or '<command>_errored' when it finishes handling one. There is no
--- '_started' outcome -- nothing read it and the structured logs already cover it.
 --
 -- Completed payloads carry the summary of what happened -- pairs opened and closed with their exit
 -- reasons, rows synced, the artifact the predictions ran against and its age. That is what makes
@@ -222,12 +188,9 @@ SELECT remove_retention_policy('events', if_exists => TRUE);
 --
 -- The notification carries event_id, event_type, and normally the payload too, so the consumer can
 -- dispatch and read structured data without a second round trip.
---
 -- "Normally" is load-bearing. pg_notify rejects a payload of 8000 bytes or more, and this trigger
 -- is AFTER INSERT FOR EACH ROW, so that rejection propagates and rolls back the emit_event insert
--- that caused it. The event row would be lost entirely -- and worse, the startup recovery scan
--- looks for requests with no terminal outcome, so a completed row lost this way reads as a command
--- that never finished and gets replayed.
+-- that caused it.
 --
 -- That is reachable rather than theoretical: completed payloads deliberately carry per-run
 -- summaries, and those grow with session activity. So the payload is included only when the whole
@@ -280,11 +243,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- ---------------------------------------------------------------------------
--- Schedule
--- ---------------------------------------------------------------------------
---
--- Six jobs. Every one fires across both DST-candidate UTC hours and gates on the actual Eastern
+-- Schedules fire across both DST-candidate UTC hours and gates on the actual Eastern
 -- time in its WHERE clause, so a DST transition needs no schema re-apply. Every job is named for
 -- the event it emits.
 --
@@ -293,11 +252,6 @@ $$ LANGUAGE plpgsql;
 -- still lands inside it. The only hard bound is that a gate must not also match the firing an hour
 -- later, so anything under 60 minutes is safe.
 --
--- Holidays are not gated here. The trading calendar lives in an in-memory cache refreshed from
--- Alpaca rather than in a table, so SQL cannot consult it; the handlers check the calendar and
--- return early. A market holiday therefore costs a day of no-op events, which is cheaper than
--- keeping a calendar table alive solely to answer a WHERE clause.
-
 -- Pre-open predictions: weekdays at 09:00 Eastern, 30 minutes ahead of a regular open so
 -- predictions are ready for the first evaluation pass. The handler resolves the newest model
 -- artifact, runs inference, writes equity_predictions, and warms the calendar and universe caches.
@@ -366,6 +320,7 @@ END;
 $do$;
 
 -- Account sync: weekdays at 16:15 Eastern, 15 minutes after the close.
+--
 -- Fetches account balances and activities from Alpaca, writes account_snapshots and
 -- account_activities, and attributes realized profit and loss back to the session's closed pairs.
 DO $do$
@@ -384,16 +339,10 @@ END;
 $do$;
 
 -- Market data sync: weekdays at 16:30 Eastern.
+--
 -- Pulls the session's bars from Massive and any equity detail changes into PostgreSQL, then chains
 -- the database export on completion. The export is chained rather than scheduled so it cannot run
 -- against a half-synced database; the purge runs inside the export handler once S3 has the data.
---
--- Bars are whole-market, not universe-filtered. The liquidity screen selects from what this stores,
--- so storing only the current universe would make the universe self-selecting -- it could never
--- admit a name that became liquid, and would only ever shrink.
---
--- This path does not feed the trainer. The trainer fetches its own data from Massive on its own VM
--- and shares only the fetch code, so a failure here costs a backup rather than the next day's model.
 DO $do$
 BEGIN
     IF EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'market-data-sync-requested') THEN

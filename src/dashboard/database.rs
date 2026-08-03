@@ -275,7 +275,7 @@ async fn fetch_latest_bars_inserted_at(
     pool: &PgPool,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT MAX(inserted_at) AS latest FROM equity_bars WHERE bar_interval = '1day'",
+        "SELECT MAX(inserted_at) AS latest FROM equity_bars WHERE bar_interval = 'one_day'",
     )
     .fetch_one(pool)
     .await?;

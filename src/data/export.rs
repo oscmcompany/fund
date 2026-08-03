@@ -342,7 +342,6 @@ async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError
     let rows = sqlx::query!(
         r#"SELECT session_date AS "session_date!",
                   equity::double precision AS "equity!",
-                  last_equity::double precision AS "last_equity!",
                   cash::double precision AS "cash!",
                   buying_power::double precision AS "buying_power!",
                   long_market_value::double precision AS "long_market_value!",
@@ -360,7 +359,6 @@ async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError
             collect(&rows, |row| row.session_date.to_string()),
         ),
         Column::new("equity".into(), collect(&rows, |row| row.equity)),
-        Column::new("last_equity".into(), collect(&rows, |row| row.last_equity)),
         Column::new("cash".into(), collect(&rows, |row| row.cash)),
         Column::new(
             "buying_power".into(),
