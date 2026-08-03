@@ -705,7 +705,7 @@ async fn test_the_account_sync_is_idempotent() {
 
 fn account_body(equity: i64) -> String {
     format!(
-        r#"{{"equity":"{equity}","last_equity":"{equity}","cash":"{equity}",
+        r#"{{"equity":"{equity}","cash":"{equity}",
              "buying_power":"{}","long_market_value":"0","short_market_value":"0"}}"#,
         equity * 2
     )

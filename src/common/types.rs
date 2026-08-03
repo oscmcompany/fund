@@ -391,65 +391,43 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 /// The sampling interval of an OHLCV bar.
 ///
 /// Part of the `equity_bars` primary key, so a single table carries daily and intraday history
-/// together. Only [`BarInterval::OneDay`] is written today; the rest exist so the intraday
-/// migration needs no table rewrite.
+/// together. The post-close sync writes only [`BarInterval::OneDay`]; [`BarInterval::OneMinute`] is
+/// equally permitted by the CHECK constraint and is what `fetch_snapshots` tags Alpaca's `minuteBar`
+/// with in memory. Nothing persists a minute bar today, so treat "daily only" as a property of the
+/// current writer rather than of the table.
 ///
-/// Two string forms, deliberately distinct. [`BarInterval::as_str`] is the canonical stored form
-/// and must match the `bar_interval` CHECK constraint in `schema.sql` exactly.
-/// [`BarInterval::alpaca_timeframe`] is what Alpaca's bars API expects, which differs in both
-/// casing and vocabulary — Alpaca writes `1Min` and `1Hour` where the stored form is `1min` and
-/// `60min`. Conflating them silently produces empty API responses, so the mapping lives here rather
-/// than at each call site.
+/// [`BarInterval::as_str`] is the canonical stored form and must match the `bar_interval` CHECK
+/// constraint in `schema.sql` exactly. It is the snake_case of the variant name — `one_day`, not
+/// `1day` or `1_day` — and that is load-bearing rather than cosmetic: it lets `rename_all` derive
+/// the same string for serde, so serializing and storing cannot drift into two vocabularies. They
+/// previously had: the derive emitted `OneDay` while the parser accepted only the stored form, so
+/// an `EquityBar` written to JSON could not be read back. Intervals added later follow the variant
+/// name the same way: `five_minute`, `fifteen_minute`, `sixty_minute`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BarInterval {
     OneMinute,
-    FiveMinute,
-    FifteenMinute,
-    ThirtyMinute,
-    SixtyMinute,
     OneDay,
 }
 
 impl BarInterval {
     /// Every variant, for exhaustive iteration in tests and validation.
-    pub const ALL: [BarInterval; 6] = [
-        BarInterval::OneMinute,
-        BarInterval::FiveMinute,
-        BarInterval::FifteenMinute,
-        BarInterval::ThirtyMinute,
-        BarInterval::SixtyMinute,
-        BarInterval::OneDay,
-    ];
+    pub const ALL: [BarInterval; 2] = [BarInterval::OneMinute, BarInterval::OneDay];
 
     /// The canonical stored form, matching the `bar_interval` CHECK constraint.
+    ///
+    /// Must stay identical to what the `rename_all` derive produces; the round-trip test below is
+    /// what enforces that.
     pub fn as_str(self) -> &'static str {
         match self {
-            BarInterval::OneMinute => "1min",
-            BarInterval::FiveMinute => "5min",
-            BarInterval::FifteenMinute => "15min",
-            BarInterval::ThirtyMinute => "30min",
-            BarInterval::SixtyMinute => "60min",
-            BarInterval::OneDay => "1day",
-        }
-    }
-
-    /// The timeframe string Alpaca's bars API expects.
-    ///
-    /// Not the same as [`BarInterval::as_str`]: Alpaca capitalizes and expresses sixty minutes as
-    /// an hour.
-    pub fn alpaca_timeframe(self) -> &'static str {
-        match self {
-            BarInterval::OneMinute => "1Min",
-            BarInterval::FiveMinute => "5Min",
-            BarInterval::FifteenMinute => "15Min",
-            BarInterval::ThirtyMinute => "30Min",
-            BarInterval::SixtyMinute => "1Hour",
-            BarInterval::OneDay => "1Day",
+            BarInterval::OneMinute => "one_minute",
+            BarInterval::OneDay => "one_day",
         }
     }
 
     /// Parses the canonical stored form. Returns `None` for anything else, including Alpaca's
-    /// timeframe spelling — the two vocabularies are deliberately not interchangeable.
+    /// `1Day`/`1Min` timeframe spelling — that vocabulary belonged to a bars endpoint this
+    /// codebase no longer calls, and accepting it here would let it back in unnoticed.
     pub fn parse(raw: &str) -> Option<Self> {
         BarInterval::ALL
             .into_iter()
@@ -953,21 +931,40 @@ mod tests {
         }
     }
 
-    /// The stored form and the Alpaca timeframe are different vocabularies. If a refactor ever
-    /// collapses them, this fails rather than silently sending `1day` to an API expecting `1Day`.
+    /// These exact strings are the `bar_interval` CHECK constraint in `schema.sql`. Changing one
+    /// without the other makes every insert fail at runtime, which no compile-time check catches —
+    /// the column is TEXT, so sqlx sees a string either way.
     #[test]
-    fn test_bar_interval_alpaca_timeframe_differs_from_stored_form() {
-        assert_eq!(BarInterval::OneDay.as_str(), "1day");
-        assert_eq!(BarInterval::OneDay.alpaca_timeframe(), "1Day");
-        assert_eq!(BarInterval::SixtyMinute.as_str(), "60min");
-        assert_eq!(BarInterval::SixtyMinute.alpaca_timeframe(), "1Hour");
+    fn test_bar_interval_stored_form_matches_the_check_constraint() {
+        assert_eq!(BarInterval::OneDay.as_str(), "one_day");
+        assert_eq!(BarInterval::OneMinute.as_str(), "one_minute");
     }
 
+    /// The serde derive and the stored form must produce the same string. They did not before the
+    /// `rename_all` attribute: the derive emitted `OneDay` while `parse` accepted only the stored
+    /// form, so an `EquityBar` serialized to JSON could not be deserialized back. Nothing failed
+    /// loudly because no live path did that round trip — this is what stops one being added.
     #[test]
-    fn test_bar_interval_parse_rejects_alpaca_spelling() {
+    fn test_bar_interval_serde_agrees_with_the_stored_form() {
+        for interval in BarInterval::ALL {
+            let encoded = serde_json::to_string(&interval).expect("interval must serialize");
+            assert_eq!(encoded, format!("\"{}\"", interval.as_str()));
+            let decoded: BarInterval =
+                serde_json::from_str(&encoded).expect("what serde writes, serde must read");
+            assert_eq!(decoded, interval);
+        }
+    }
+
+    /// Neither Alpaca's timeframe spelling nor either pre-rename stored form is accepted. The last
+    /// two matter most: `1day` was the stored value before this vocabulary changed, and silently
+    /// parsing it would let a stale writer put unreadable rows in the table.
+    #[test]
+    fn test_bar_interval_parse_rejects_foreign_spellings() {
         assert!(BarInterval::parse("1Day").is_none());
         assert!(BarInterval::parse("1Hour").is_none());
-        assert!(BarInterval::parse("7min").is_none());
+        assert!(BarInterval::parse("OneDay").is_none());
+        assert!(BarInterval::parse("1day").is_none());
+        assert!(BarInterval::parse("1_day").is_none());
     }
 
     #[test]

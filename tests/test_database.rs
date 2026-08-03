@@ -237,7 +237,6 @@ async fn test_an_account_snapshot_overwrites_the_same_session() {
         AccountSnapshot::new(
             Decimal::from(equity),
             Decimal::from(equity),
-            Decimal::from(equity),
             Decimal::from(equity * 2),
             Decimal::ZERO,
             Decimal::ZERO,
@@ -301,7 +300,7 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
     assert_eq!(closes[&ticker("AAAA")].len(), 5);
 }
 
-/// The interval is part of the primary key, so a daily and an hourly bar for the same ticker and
+/// The interval is part of the primary key, so a daily and a one-minute bar for the same ticker and
 /// instant coexist. A query that ignored the interval would mix sampling rates into one series.
 #[tokio::test]
 #[serial]
@@ -314,7 +313,7 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
-         VALUES ('AAAA', '60min', $1, 9, 9, 9, 9, 100)",
+         VALUES ('AAAA', 'one_minute', $1, 9, 9, 9, 9, 100)",
     )
     .bind(timestamp)
     .execute(&pool)

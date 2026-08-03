@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO account_snapshots (\n               session_date, equity, cash, buying_power,\n               long_market_value, short_market_value\n           )\n           VALUES ($1, $2, $3, $4, $5, $6)\n           ON CONFLICT (session_date) DO UPDATE SET\n               equity             = EXCLUDED.equity,\n               cash               = EXCLUDED.cash,\n               buying_power       = EXCLUDED.buying_power,\n               long_market_value  = EXCLUDED.long_market_value,\n               short_market_value = EXCLUDED.short_market_value,\n               fetched_at         = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "539ec4f55fbc8447c5d9991ebfa9d2898925771e80ccf2df34bbedf284b98fa9"
+}

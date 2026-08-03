@@ -238,7 +238,7 @@ pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64
                 "INSERT INTO equity_bars \
                  (ticker, bar_interval, timestamp, open_price, high_price, low_price, \
                   close_price, volume) \
-                 VALUES ($1, '1day', $2, $3, $4, $5, $6, $7) \
+                 VALUES ($1, 'one_day', $2, $3, $4, $5, $6, $7) \
                  ON CONFLICT (ticker, bar_interval, timestamp) DO UPDATE SET \
                      close_price = EXCLUDED.close_price",
             )
@@ -267,7 +267,7 @@ pub async fn seed_bar(pool: &PgPool, ticker: &str, date: NaiveDate, close: f64) 
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
-         VALUES ($1, '1day', $2, $3, $3, $3, $3, 5000000) \
+         VALUES ($1, 'one_day', $2, $3, $3, $3, $3, 5000000) \
          ON CONFLICT (ticker, bar_interval, timestamp) DO UPDATE SET close_price = EXCLUDED.close_price",
     )
     .bind(ticker)
