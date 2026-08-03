@@ -1,20 +1,16 @@
 //! Backfills daily bars into an empty database over an arbitrary date range.
 //!
-//! Bootstrap tooling. The running service's `market_data_sync` closes a three-session gap, which is
-//! the right window for a database that is already populated and the wrong one for a database that
-//! is not: the screen needs sixty sessions of aligned closes and the model seventy, so a fresh
-//! deployment cannot trade until something has fetched several months at once.
+//! Bootstrap tooling. The service's `market_data_sync` closes a three-session gap, which is right
+//! for a populated database and wrong for an empty one: the screen needs sixty sessions of aligned
+//! closes and the model forty, so a fresh deployment cannot trade until something has fetched
+//! several months at once.
 //!
 //! Usage: `seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]`
 //! The end date defaults to today (US/Eastern) when omitted.
 //!
-//! The previous version took `--source <massive|s3>` and `--target <s3|postgresql|all>`. The
-//! targets are gone with the topology that justified them — the trainer archives its own S3 parquet
-//! rather than reading what a seed run left behind — and the source is gone because there is only
-//! one correct answer. Massive's grouped endpoint takes a **date**, not a symbol list, and that is
-//! what makes a backfill honest: asking Alpaca means asking for its *current* tradable set, so
-//! every symbol delisted since the start date would be silently missing from its own history and
-//! the model would train on a universe that survived by construction.
+//! Massive is the only source, because its grouped endpoint takes a **date** rather than a symbol
+//! list. Asking Alpaca means asking for its *current* tradable set, so every symbol delisted since
+//! the start date would be missing from its own history.
 
 use chrono::{Duration, NaiveDate, Utc};
 use tracing::{error, info, warn};

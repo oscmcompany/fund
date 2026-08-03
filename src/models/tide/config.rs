@@ -1,10 +1,10 @@
+//! Model hyperparameters. Serialized into the artifact, so changing a default only affects new
+//! training runs — existing artifacts keep the values they were trained with.
+
 use serde::{Deserialize, Serialize};
 
-/// TiDE model hyperparameters, persisted as `tide_parameters.json` in the
-/// training artifact and reloaded at inference time.
-///
-/// Fields are private; construct via [`ModelParameters::new`] (which applies
-/// the architecture defaults) or deserialize from a stored artifact.
+/// TiDE model hyperparameters, persisted as `tide_parameters.json` in the training artifact and
+/// reloaded at inference time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelParameters {
     input_size: usize,

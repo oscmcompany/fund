@@ -1,7 +1,6 @@
-//! Model drift detection: compare a training run's CRPS against the baseline
-//! of recent prior runs. A direct port of the retired Python trainer's
-//! `check_drift` — drift is reported (logged and recorded in `model_runs`),
-//! never used to block an artifact upload.
+//! Model drift detection: compare a training run's CRPS against the baseline of recent prior runs.
+//!
+//! Drift is logged, never used to block an artifact upload.
 
 use serde::Serialize;
 
@@ -104,8 +103,8 @@ mod tests {
 
     #[test]
     fn test_no_drift_at_exact_degradation_limit() {
-        // baseline = 0.3, limit = 0.36; the Python check is strictly greater
-        // than, so a value exactly at the limit is not drift.
+        // baseline = 0.3, limit = 0.36. The check is strictly greater than, so a value
+        // exactly at the limit is not drift.
         let result = check_drift(0.36, &[0.3, 0.3, 0.3], 3, 0.20);
         assert_eq!(result.status, DriftStatus::NoDrift);
         assert_eq!(result.baseline_crps, Some(0.3));
@@ -136,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_status_serializes_to_python_strings() {
+    fn test_status_serializes_to_snake_case() {
         assert_eq!(
             serde_json::to_value(DriftStatus::InsufficientHistory).unwrap(),
             "insufficient_history"

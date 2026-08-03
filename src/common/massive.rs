@@ -1,29 +1,21 @@
 //! Massive market data client: whole-market daily bars, one request per session.
 //!
-//! Deliberately narrow. Massive answers exactly one question here — what did every US stock do on
-//! this date — and Alpaca answers everything else: the clock, the calendar, the tradable set,
-//! intraday snapshots, orders, positions, and balances.
+//! Deliberately narrow: Massive answers only what every US stock did on a date, and Alpaca answers
+//! everything about our account and the current moment. Three properties of the grouped endpoint
+//! make that split load-bearing rather than aesthetic.
 //!
-//! The split is by question rather than by preference. Alpaca is the venue, so it is authoritative
-//! for facts about our account and about the current moment. Massive is a market data vendor, so it
-//! is better at describing what the whole market did on a past date. Two properties of the grouped
-//! endpoint make that difference load-bearing rather than aesthetic:
+//! **It takes no symbol list.** A backfill through Alpaca's bars endpoint can only pass Alpaca's
+//! *current* tradable set, so every symbol delisted since the start date is absent from its own
+//! history and the model trains on a universe that survived by construction.
 //!
-//! **It takes no symbol list.** Alpaca's bars endpoint requires one, and the only list available to
-//! a backfill is Alpaca's *current* tradable set — so every symbol delisted since the start date is
-//! silently absent from its own history, and the model trains on a universe that survived by
-//! construction. Asking for a date instead of a list removes that failure mode entirely.
+//! **It returns the whole market, which keeps the universe open.** `load_liquidity` reads averages
+//! out of `equity_bars`, so a sync that refreshed only the tickers already in the universe could
+//! never admit a name that became liquid — it would ratchet closed `LIQUIDITY_LOOKBACK_DAYS` after
+//! the last seed and shrink from there.
 //!
-//! **It returns the whole market, which is what keeps the universe open.** `load_liquidity` reads
-//! averages out of `equity_bars`, so if the nightly sync only refreshed the tickers already in the
-//! universe, the universe could never admit a name that became liquid — it would ratchet closed
-//! `LIQUIDITY_LOOKBACK_DAYS` after the last seed and shrink from there. Storing every symbol that
-//! traded is what makes the liquidity screen an actual re-selection each day.
-//!
-//! It is also the consolidated tape, with no feed tiers. Alpaca's `iex` feed carries a few percent
-//! of consolidated volume, which is survivable for quotes and not for bars: `volume` and `vw` are
-//! computed over that few percent, and the liquidity thresholds are calibrated against the real
-//! numbers.
+//! **It is the consolidated tape, with no feed tiers.** Alpaca's `iex` feed carries a few percent
+//! of consolidated volume — survivable for quotes, not for bars, since `volume` and `vw` would be
+//! computed over that few percent while the liquidity thresholds assume the real numbers.
 
 use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;

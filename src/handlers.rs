@@ -3,11 +3,9 @@
 //! This is the only place that knows how a command name turns into work. The listener parses a
 //! notification and calls [`handle`]; everything else is a module doing one thing.
 //!
-//! Every handler returns a JSON summary, which becomes the `_completed` payload. That is
-//! deliberate and it is what makes the nightly export of the `events` table worth reading: a
-//! completed row that says only "it finished" tells you nothing the logs did not, whereas one
-//! carrying the pairs opened and closed, the rows synced, and the model run used is the record of
-//! the trading day.
+//! Every handler returns a JSON summary, which becomes the `_completed` payload. That is what
+//! makes the nightly export of `events` worth reading — a row carrying the pairs opened and closed,
+//! rows synced, and the model run used is the record of the trading day.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -28,7 +26,7 @@ use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
 use crate::data::universe::{UniverseCache, UniverseError};
-use crate::models::{artifact, predict};
+use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
 use crate::portfolio::evaluate::{self, EvaluationContext};
 use crate::portfolio::execute::ExecutionSettings;
@@ -238,10 +236,8 @@ async fn dispatch(state: &ServiceState, command: Command) -> Result<Value, Handl
 
 /// Pre-open: warm the caches, resolve the newest artifact, run inference, write predictions.
 ///
-/// Also absorbs two jobs that used to be their own cron entries. The previous session's post-close
-/// commands are checked here rather than by a `scheduler_health_check` job, and the artifact is
-/// resolved here rather than by a `model_artifact_check` job. Both were work that only mattered
-/// immediately before a session, and neither needed a schedule of its own to say so.
+/// The previous session's post-close commands are checked here, and the artifact resolved here,
+/// rather than on schedules of their own — both only matter immediately before a session.
 async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError> {
     let now = Utc::now();
     let today = eastern_date(now);
@@ -436,14 +432,12 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
 
-    // No universe load here any more, and that is the point rather than a tidy-up.
-    //
-    // This fetch used to ask Alpaca for `universe.symbols()`, while `load_liquidity` built that
-    // universe from averages over `equity_bars` — so the only tickers that got fresh bars were the
-    // ones already in the universe. Thirty days after a seed (`LIQUIDITY_LOOKBACK_DAYS`), nothing
-    // outside it had bars inside the window any more, and a stock that became liquid could never
-    // enter: the universe ratcheted closed and could only shrink. Massive's grouped endpoint takes
-    // a date rather than a symbol list, so every symbol that traded is stored and the liquidity
+    // Deliberately no universe load. `load_liquidity` builds the universe from averages over
+    // `equity_bars`, so fetching only `universe.symbols()` would mean the sole tickers getting
+    // fresh bars are the ones already in it. Past `LIQUIDITY_LOOKBACK_DAYS`, nothing outside would
+    // have bars in the window and a stock that became liquid could never enter — the universe
+    // ratchets closed and can only shrink. Massive's grouped endpoint takes a date rather than a
+    // symbol list, so every symbol that traded is stored and the liquidity
     // screen is a real re-selection each day.
 
     // A span wide enough to hold the requested sessions even through a holiday week. Six calendar

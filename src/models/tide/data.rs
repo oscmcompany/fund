@@ -1,3 +1,8 @@
+//! Feature engineering, scaling, categorical encoding, and windowing.
+//!
+//! Training fits the scaler and mappings here; inference reuses the ones stored in the artifact.
+//! Both paths run the same functions, so a change to any of them changes both.
+
 use std::collections::HashMap;
 
 use chrono::Datelike;
@@ -128,11 +133,9 @@ pub(crate) const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "in
 
 /// Placeholder for a null categorical value.
 ///
-/// `into_no_null_iter` silently *skips* nulls, so building these columns with it produced a vector
-/// shorter than the frame whenever `sector` or `industry` was null — which either failed the column
-/// replacement outright or, worse, shifted every later row onto the wrong ticker. Substituting a
-/// sentinel preserves length and alignment, and for `ticker` the sentinel is the value the filter
-/// immediately below already drops.
+/// `into_no_null_iter` silently *skips* nulls, so a null `sector` or `industry` yields a column
+/// shorter than the frame, shifting every later row onto the wrong ticker. The sentinel preserves
+/// alignment.
 pub(crate) const UNKNOWN_CATEGORY: &str = "UNKNOWN";
 
 /// The model target is the future window of `daily_return`, which is the last
@@ -187,10 +190,8 @@ impl Data {
         Ok(Self::from_parts(data, scaler.clone(), mappings.clone()))
     }
 
-    /// Split the engineered frame into (train, validate) by a global date cutoff
-    /// at `min + (max - min) * validation_split`: rows at or before the cutoff
-    /// are training, later rows are validation (the Python trainer uses
-    /// `date <= split` for train).
+    /// Split the engineered frame into (train, validate) by a global date cutoff at
+    /// `min + (max - min) * validation_split`. Rows at or before the cutoff are training.
     pub fn split_by_timestamp(
         &self,
         validation_split: f64,
@@ -390,8 +391,7 @@ fn window_frame(
 pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
     // Sort by [ticker, timestamp] so daily returns and the downstream windowing
     // are chronological and contiguous within each ticker, independent of the
-    // order rows arrived in. Each ticker's first row gets a null return (like
-    // pct_change over ticker in the Python pipeline); clean_data drops it.
+    // order rows arrived in. Each ticker's first row gets a null return; clean_data drops it.
     let data = data
         .sort(
             ["ticker", "timestamp"],
@@ -451,7 +451,7 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
         let date = datetime.date_naive();
 
-        // Monday = 1 .. Sunday = 7, matching polars dt.weekday() in Python.
+        // Monday = 1 .. Sunday = 7, per polars `dt.weekday()`.
         day_of_week.push(date.weekday().number_from_monday() as i32);
         day_of_month.push(date.day() as i32);
         day_of_year.push(date.ordinal() as i32);
@@ -537,9 +537,8 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
 
     // Drop rows with a null or non-finite value in any continuous column —
     // each ticker's first observation (null return), missing vendor fields
-    // such as volume_weighted_average_price, and any division artifacts —
-    // matching the Python CleanData stage. Downstream scaling and windowing
-    // iterate these columns assuming they are dense and finite.
+    // such as volume_weighted_average_price, and any division artifacts. Downstream
+    // scaling and windowing iterate these columns assuming they are dense and finite.
     let mut keep_row = vec![true; cleaned.height()];
     for column in CONTINUOUS_COLUMNS {
         let values = cleaned
@@ -835,9 +834,8 @@ mod tests {
 
     #[test]
     fn test_engineer_features_nulls_first_row_per_ticker() {
-        // Mirrors the Python pct_change().over("ticker"): each ticker's first
-        // row has a null daily_return (dropped later by clean_data), never a
-        // synthetic zero and never a value carried across the ticker boundary.
+        // Each ticker's first row has a null daily_return (dropped later by clean_data), never
+        // a synthetic zero and never a value carried across the ticker boundary.
         let engineered = engineer_features(raw_two_ticker_frame()).unwrap();
         // Sorted by [ticker, timestamp]: AAA@0, AAA@1, BBB@0, BBB@1.
         let returns: Vec<Option<f32>> = engineered
@@ -855,8 +853,8 @@ mod tests {
 
     #[test]
     fn test_clean_data_drops_null_return_rows() {
-        // Python's CleanData filters null/NaN/non-finite daily_return rows, so
-        // each ticker's first observation never reaches the scaler or windows.
+        // Null, NaN, and non-finite daily_return rows are filtered, so each ticker's first
+        // observation never reaches the scaler or windows.
         let engineered = engineer_features(raw_two_ticker_frame()).unwrap();
         let cleaned = clean_data(engineered).unwrap();
         assert_eq!(cleaned.height(), 2);
@@ -873,8 +871,8 @@ mod tests {
     #[test]
     fn test_clean_data_drops_rows_with_null_continuous_values() {
         // A null volume_weighted_average_price (nullable in the database and in
-        // vendor data) must drop the row, like the Python CleanData stage; it
-        // must never silently shorten a column during scaling or windowing.
+        // vendor data) must drop the row; it must never silently shorten a column during
+        // scaling or windowing.
         let mut engineered = engineer_features(raw_two_ticker_frame()).unwrap();
         engineered
             .with_column(Column::new(
@@ -890,7 +888,7 @@ mod tests {
 
     #[test]
     fn test_engineer_features_day_of_week_is_monday_based_one_to_seven() {
-        // Python uses polars dt.weekday(): Monday = 1 .. Sunday = 7.
+        // Monday = 1 .. Sunday = 7.
         let monday = chrono::NaiveDate::from_ymd_opt(2026, 6, 8)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -931,9 +929,8 @@ mod tests {
 
     #[test]
     fn test_split_by_timestamp_boundary_row_goes_to_train() {
-        // Python: train is date <= split, validation is date > split. With 11
-        // daily rows (0..=10 days) and split 0.8 the cutoff lands exactly on
-        // day 8, which must belong to train.
+        // Train is date <= split, validation is date > split. With 11 daily rows (0..=10 days)
+        // and split 0.8 the cutoff lands exactly on day 8, which must belong to train.
         let data = empty_data(make_encoded_frame(1, 11));
         let (train, valid) = data.split_by_timestamp(0.8).unwrap();
         assert_eq!(train.height(), 9);

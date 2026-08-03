@@ -4,10 +4,9 @@
 //! in the export rather than in the database. That ordering is the entire safety property: a purge
 //! that ran first, or ran on its own schedule, could delete rows that never reached S3.
 //!
-//! Retention is a window rather than a truncation. Keeping a few days in PostgreSQL costs almost
-//! nothing and means a question about yesterday — why did that pair close, what did the model say —
-//! is a query rather than an S3 download. It also means an export that silently failed has several
-//! nights to be noticed before the rows are gone.
+//! Retention is a window, not a truncation. A few days in PostgreSQL costs almost nothing, keeps
+//! questions about yesterday a query rather than an S3 download, and gives a silently failed export
+//! several nights to be noticed before the rows are gone.
 //!
 //! `equity_bars` is deliberately absent: TimescaleDB's retention policy owns it, and two mechanisms
 //! deleting from one table is how a rolling window becomes an empty one.

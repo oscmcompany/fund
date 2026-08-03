@@ -1,20 +1,11 @@
-//! TiDE model artifacts: writing them on the trainer, reading them on the application.
+//! TiDE model artifacts: written on the trainer, read on the application.
 //!
-//! The artifact is the only thing crossing the boundary between the two machines. The trainer VM
-//! packages a directory of trained files into a flat `model.tar.gz` and uploads it to
-//! `s3://{bucket}/models/tide/{run_id}/output/model.tar.gz`; the application VM resolves the newest
-//! one at pre-open and loads it. Nothing enforces the ordering between those two events, and
-//! nothing will — the trainer has no database connection. Running a session against yesterday's
-//! model is a normal outcome, reported as the artifact age in the `predictions_completed` payload
-//! rather than treated as a failure.
+//! Nothing orders the write against the read — the trainer has no database. Running a session
+//! against yesterday's model is normal, reported as the artifact age in the `predictions_completed`
+//! payload rather than as a failure.
 //!
-//! Both sides live here, rather than a write module beside the trainer and a read module beside
-//! inference, because they are one format. The tar is flat — one entry per file, no directory
-//! prefix — and the extraction on the reading side assumes exactly that.
-//!
-//! Resolution walks run folders newest-first and verifies the object exists before committing to
-//! it, so a trainer that crashed after creating its folder but before uploading falls back to the
-//! previous good artifact instead of failing the day.
+//! The tar is flat: one entry per file, no directory prefix. Both sides live here because that
+//! format is the only contract between them.
 
 use std::path::{Path, PathBuf};
 
@@ -45,7 +36,7 @@ pub struct ModelState {
     artifact_key: String,
     /// Training run id: the timestamp segment of the artifact key. Written to
     /// `equity_predictions.model_run_id`, which is how a prediction is traced back to the artifact
-    /// that produced it now that there is no `model_runs` table to join against.
+    /// that produced it.
     run_id: String,
     load_timestamp: i64,
 }
@@ -497,8 +488,7 @@ mod tests {
     use super::*;
 
     /// `Path::join` discards its base when given an absolute path, so an entry named `/tmp/...`
-    /// would previously have been written to that absolute location rather than inside the
-    /// extraction directory. Rejecting non-`Normal` components is what stops it.
+    /// would escape the extraction directory. Rejecting non-`Normal` components is what stops it.
     ///
     /// The header name is written directly because the `tar` crate refuses to *produce* an absolute
     /// entry path through its safe API — which is precisely why the reading side has to defend

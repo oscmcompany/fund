@@ -2,18 +2,15 @@
 //!
 //! Chained from a completed market data sync rather than scheduled, so it can never run against a
 //! half-synced database. Everything it writes is archival: the trainer fetches its own data from
-//! Alpaca on its own machine, so a failed export costs a backup rather than the next day's model.
+//! Massive, so a failed export costs a backup rather than the next day's model.
 //!
-//! Two export shapes, because the tables have two shapes. **Incremental** tables — events,
-//! predictions, bars — are written for one session date under a Hive-partitioned key, so a day's
-//! rows land in their own object and the history accumulates. **Snapshot** tables — pairs,
-//! account state, ticker metadata — are written whole each night, because they are small and
-//! because a row can change after the day it was created (a pair opened on Monday closes on
-//! Tuesday, and the closing is the interesting part).
+//! Two shapes. **Incremental** tables — events, predictions, bars, account activities — are written
+//! per session date under a Hive-partitioned key. **Snapshot** tables — pairs, account state,
+//! ticker metadata — are written whole each night, because a row can change after the day it was
+//! created (a pair opened Monday closes Tuesday, and the closing is the interesting part).
 //!
-//! A failure on one table is logged and the rest continue. Exporting six of seven tables is
-//! strictly better than exporting none, and the caller receives the list of failures so the
-//! completion event can report them.
+//! A failure on one table is logged and the rest continue; the caller receives the list so the
+//! completion event can report it.
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;

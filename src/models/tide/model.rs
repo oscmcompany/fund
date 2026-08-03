@@ -1,3 +1,5 @@
+//! The TiDE network: residual blocks, encoder, decoder, and the quantile output projection.
+
 use burn::backend::NdArray;
 use burn::module::Module;
 use burn::nn;
@@ -160,7 +162,6 @@ impl<B: Backend> TideModel<B> {
 
         let combined = decoder_output + encoder_output;
         let combined = self.final_layer_norm.forward(combined);
-        // The Python model projects relu(x): `output_projection(x.relu())`.
         let combined = burn::tensor::activation::relu(combined);
 
         let output = self.output_projection.forward(combined);
@@ -234,9 +235,8 @@ mod tests {
         )
         .reshape([4, input_size]);
 
-        // Compose the expected output from the model's own components, applying
-        // relu to the layer-normed combination before the output projection as
-        // the Python trainer does (`output_projection(x.relu())`).
+        // Compose the expected output from the model's own components, applying relu to the
+        // layer-normed combination before the output projection.
         let hidden =
             burn::tensor::activation::relu(model.feature_projection_1.forward(input.clone()));
         let hidden = burn::tensor::activation::relu(model.feature_projection_2.forward(hidden));

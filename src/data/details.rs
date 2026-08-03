@@ -1,12 +1,11 @@
 //! Ticker metadata: sector and industry.
 //!
-//! The pair screen requires the two legs to come from different sectors, so this is not decoration —
-//! without it every pair is a same-sector pair and the strategy is a bet on one industry rather than
-//! on a spread.
+//! The pair screen requires the two legs to come from different sectors, so without this every pair
+//! is same-sector and the strategy is a bet on one industry rather than on a spread.
 //!
-//! The seed comes from `data/equity_details.csv`, embedded at compile time so a fresh database can
-//! be populated with no network and no S3 access. Alpaca does not publish sector or industry, so the
-//! post-close sync refreshes only what changes: tickers that have appeared or been delisted.
+//! Seeded from `data/equity_details.csv`, embedded at compile time so a fresh database needs no
+//! network. Alpaca does not publish sector or industry, so the post-close sync refreshes only
+//! tickers that have appeared or been delisted.
 
 use std::collections::HashMap;
 

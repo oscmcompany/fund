@@ -1,18 +1,12 @@
 //! Process-wide TLS crypto provider selection.
 //!
-//! Rustls 0.23 reaches the platform transitively through several dependencies
-//! (sqlx with `tls-rustls`, the AWS SDK, `tokio-tungstenite`), and the
-//! dependency graph enables *both* the `aws-lc-rs` and `ring` crypto providers.
-//! When more than one provider is linked, Rustls cannot pick a process default
-//! on its own and panics on the first TLS handshake with "Could not
-//! automatically determine the process-level CryptoProvider". Because each S3,
-//! Massive, or Alpaca request runs on its own Tokio worker thread, the panic
-//! silently kills individual worker threads mid-request, truncating large
-//! syncs (for example, a day of equity bars) to a partial result.
+//! The dependency graph pulls in Rustls transitively and enables *both* the `aws-lc-rs` and `ring`
+//! providers. With more than one linked, Rustls cannot pick a process default, and the first client
+//! configuration that needs one panics. Requests run as spawned tasks, so the panic surfaces as a
+//! failed task rather than a crash — a large sync comes back truncated instead of erroring.
 //!
-//! Selecting a provider explicitly at startup removes the ambiguity for the
-//! whole process. Every service binary calls [`install_default_crypto_provider`]
-//! as the first statement in `main`, before any TLS client is constructed.
+//! Every service binary calls [`install_default_crypto_provider`] as the first statement in `main`,
+//! before any TLS client is constructed.
 
 use rustls::crypto::aws_lc_rs;
 

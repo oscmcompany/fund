@@ -1,18 +1,11 @@
 //! Equity bars: one fetch from Massive, three destinations.
 //!
-//! The application writes bars to PostgreSQL after the close. The trainer, on a different machine
-//! with no database, writes the same bars to S3 parquet before it trains. Both call
-//! [`fetch_daily_bars`] and both build their frames through [`bars_to_dataframe`], which is the
-//! whole point: if the two ever diverged, the model would train on columns the inference path does
-//! not produce, and the failure would surface as bad predictions rather than as a build error.
+//! The application writes bars to PostgreSQL after the close; the trainer writes the same bars to
+//! S3 parquet. Both go through [`fetch_daily_bars`] and [`bars_to_dataframe`] — if the two
+//! diverged, the model would train on columns the inference path does not produce and it would
+//! surface as bad predictions rather than a build error.
 //!
-//! Bars come from Massive's grouped endpoint rather than Alpaca's, for reasons recorded in
-//! [`crate::common::massive`]: it takes a date rather than a symbol list, which removes both the
-//! survivorship bias in any backfill and the ratchet that would otherwise close the tradable
-//! universe. Alpaca still prices the book intraday, because that is the venue we trade on.
-//!
-//! [`load_bars_dataframe`] is the read side, feeding the prediction pipeline and the correlation
-//! screen.
+//! Bars come from Massive rather than Alpaca; see [`crate::common::massive`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -62,13 +55,11 @@ pub struct FetchedBars {
 
 /// Fetches whole-market daily bars for each of `dates`.
 ///
-/// One request per date, because that is the grouped endpoint's unit. Dates that are not trading
-/// sessions cost a request and return nothing, so a caller with a calendar should filter first and
-/// one without can simply pass every calendar day.
+/// One request per date, the grouped endpoint's unit. Non-session dates cost a request and return
+/// nothing, so a caller with a calendar should filter first.
 ///
-/// A failed date is recorded and stepped over. Aborting would discard every date already
-/// retrieved, and the upsert makes re-running the same range cheap, so partial progress is worth
-/// more than an all-or-nothing guarantee that nothing else depends on.
+/// A failed date is recorded and stepped over rather than aborting, which would discard every date
+/// already retrieved. The upsert makes re-running a range cheap.
 pub async fn fetch_daily_bars(client: &MassiveClient, dates: &[NaiveDate]) -> FetchedBars {
     let mut fetched = FetchedBars::default();
 
@@ -288,15 +279,13 @@ pub async fn load_bars_dataframe(
 
 /// Loads a trailing window of closes per ticker, aligned across tickers by session.
 ///
-/// Every returned series has the same length, and position `i` in one is the same session as
-/// position `i` in every other. Tickers missing any session in the window are dropped rather than
-/// gap-filled, which is the whole reason this exists and is not a `GROUP BY ticker`: two series of
-/// equal length covering different dates produce a correlation between different days, and neither
-/// the correlation nor the spread that follows carries any sign that it happened.
+/// Every series has the same length and position `i` is the same session across all of them.
+/// Tickers missing any session are dropped rather than gap-filled — this is why it is not a
+/// `GROUP BY ticker`: two equal-length series covering different dates correlate different days,
+/// and nothing downstream carries a sign that it happened.
 ///
-/// The lower bound on `timestamp` is what keeps this from scanning every chunk of the hypertable.
-/// It is expressed against the column directly rather than wrapped in an expression, so chunk
-/// exclusion applies.
+/// The lower bound on `timestamp` is expressed against the column directly rather than wrapped in
+/// an expression, so hypertable chunk exclusion applies.
 pub async fn load_aligned_closes(
     pool: &PgPool,
     bar_interval: BarInterval,
@@ -367,14 +356,11 @@ pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
 
 /// The aligned close history, loaded at most once per Eastern date.
 ///
-/// Daily bars are written after the close, so this does not change intraday — and the evaluation
-/// pass runs seventy-eight times a session and needs the whole thing on every pass that screens.
-/// Reloading it each time would be a six-figure row count re-read for a result known not to have
-/// moved.
+/// Daily bars are written after the close, so this cannot change intraday, and the evaluation pass
+/// needs all of it on every screening pass — seventy-eight times a session.
 ///
-/// Same shape as [`crate::data::calendar::CalendarCache`] and
-/// [`crate::data::universe::UniverseCache`], and for the same reason: a value held in state and
-/// passed explicitly, not a process-wide static.
+/// A value held in state and passed explicitly, not a process-wide static, like the calendar and
+/// universe caches.
 #[derive(Default)]
 pub struct CloseHistoryCache {
     inner: tokio::sync::Mutex<Option<(NaiveDate, AlignedCloses)>>,

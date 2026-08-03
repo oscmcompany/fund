@@ -1,10 +1,7 @@
-//! Fit the scaler and categorical mappings from training data, and serialize
-//! the artifact JSON files the inference path loads.
+//! Fit the scaler and categorical mappings from training data, and serialize the artifact JSON
+//! files the inference path loads.
 //!
-//! Mirrors the Python trainer's preprocessing: z-score the continuous columns,
-//! integer-encode `ticker`/`sector`/`industry` over sorted-unique values (so the
-//! mapping is deterministic and interchangeable), and leave the calendar
-//! categoricals as their raw integers.
+//! Categoricals are encoded over sorted-unique values so the mapping is deterministic across runs.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -102,10 +99,9 @@ fn build_mapping(
         .collect())
 }
 
-/// Row-level training filter mirroring the Python trainer: keep rows whose
-/// close price and volume meet the thresholds (inclusive) and whose ticker
-/// contains no lowercase letters (lowercase variants are distinct instruments
-/// that would collide with the uppercase ticker after cleaning).
+/// Row-level training filter: thresholds are inclusive, and tickers containing lowercase letters
+/// are dropped — they are distinct instruments that would collide with the uppercase ticker after
+/// cleaning.
 pub fn filter_training_bars(
     data: DataFrame,
     minimum_close_price: f64,
@@ -230,9 +226,8 @@ mod tests {
 
     #[test]
     fn test_filter_training_bars_is_row_level_and_inclusive() {
-        // Python: (close_price >= min) & (volume >= min) per row — a ticker
-        // with one qualifying row and one penny row keeps only the qualifying
-        // row, and rows exactly at the threshold are kept.
+        // The filter is per row, so a ticker with one qualifying row and one penny row keeps
+        // only the qualifying row. Rows exactly at the threshold are kept.
         let data = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAA", "AAA", "BBB"]),
             Column::new("timestamp".into(), vec![0_i64, 86_400_000, 0]),
@@ -263,8 +258,8 @@ mod tests {
 
     #[test]
     fn test_filter_training_bars_drops_lowercase_tickers() {
-        // Python excludes tickers matching [a-z]: lowercase variants are
-        // distinct instruments that would collide once uppercased.
+        // Tickers containing lowercase letters are distinct instruments that would collide
+        // once uppercased.
         let data = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL", "AAPLw", "brk.a"]),
             Column::new("timestamp".into(), vec![0_i64, 0, 0]),

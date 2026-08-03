@@ -1,18 +1,13 @@
-//! Shared conversion of windowed ndarray datasets into Burn tensors.
+//! Windowed ndarray datasets into Burn tensors.
 //!
-//! Both training and inference flatten a [`TrainingDataset`] into the model's
-//! `[batch, input_size]` input here so the feature ordering can never drift
-//! between the two paths.
+//! Training and inference both flatten through here, so the feature ordering cannot drift between
+//! them.
 
 use burn::prelude::*;
 
 use crate::models::tide::data::TrainingDataset;
 
 /// Build the `[batch, input_size]` forward input for the given sample indices.
-///
-/// Features are flattened in the canonical order the model expects: past
-/// continuous, past categorical, future categorical, then static — each cast to
-/// f32.
 pub fn build_input_tensor<B: Backend>(
     dataset: &TrainingDataset,
     indices: &[usize],

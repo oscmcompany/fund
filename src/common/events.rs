@@ -5,12 +5,10 @@
 //! `<command>_errored` with a payload describing what happened. That is the entire coordination
 //! mechanism — there is no queue, no offset table, and no in-memory scheduling.
 //!
-//! There is deliberately no `started` outcome. It existed to say a handler had picked up the work,
-//! nothing read it, and the structured logs already answer the question.
+//! There is deliberately no `started` outcome — nothing would read it that the logs do not answer.
 //!
-//! The `events` table doubles as the restart recovery mechanism. A `_requested` row with no
-//! matching terminal outcome is work that was issued and never finished, which is exactly what a
-//! process that died mid-handler leaves behind. See [`recover_missed_commands`].
+//! The table doubles as the restart recovery mechanism: a `_requested` row with no terminal outcome
+//! is work issued and never finished. See [`recover_missed_commands`].
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -246,17 +244,14 @@ pub async fn emit_errored(pool: &PgPool, command: Command, error: &str) -> Resul
 /// Finds commands requested during the current Eastern trading date that never reached a terminal
 /// outcome, and which should be re-run.
 ///
-/// This is what replaces a consumer offset table. A `_requested` row with no later `_completed` or
-/// `_errored` row is, by construction, work that was issued and never finished — which is what a
-/// process killed mid-handler leaves behind, and also what a process that was simply not running
-/// when cron fired leaves behind. Both want the same response.
+/// This replaces a consumer offset table. A `_requested` row with no terminal outcome is work
+/// issued and never finished — what a process killed mid-handler leaves behind, and equally what a
+/// process not running when cron fired leaves behind. Both want the same response.
 ///
-/// Commands whose [`Command::recovery`] is [`Recovery::Skip`] are found and then dropped, so the
-/// caller receives only work worth doing.
+/// [`Recovery::Skip`] commands are found and dropped, so the caller receives only work worth doing.
 ///
-/// The Eastern date rather than the UTC date because that is the boundary the trading day actually
-/// has. The additional two-day bound on `created_at` keeps the hypertable from scanning every
-/// chunk to answer a question about today.
+/// The window is the Eastern date because that is the boundary the trading day has, and the
+/// additional two-day bound on `created_at` keeps the hypertable from scanning every chunk.
 pub async fn recover_missed_commands(pool: &PgPool) -> Result<Vec<Command>, EventError> {
     let rows = sqlx::query!(
         r#"

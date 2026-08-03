@@ -2,14 +2,10 @@
 //!
 //! Two properties the implementation has to preserve, and both are easy to lose:
 //!
-//! 1. **Exits run unconditionally.** A pass that cannot price the universe, cannot read
-//!    predictions, or finds no vacant slots still closes what should close. Only the entry half is
-//!    conditional, and every early return below is in the entry half.
-//! 2. **The entry half reuses the prices the exit half already fetched.** It asks Alpaca only for
-//!    the symbols it does not already have. Re-fetching an open leg between the exit decision and
-//!    the entry decision would make the cheap and expensive halves two opinions that can disagree,
-//!    which is the failure recorded in `dual_path_signal_agreement`; here they are one measurement
-//!    used twice.
+//! 1. **Exits run unconditionally.** Every early return below is in the entry half.
+//! 2. **The entry half reuses the prices the exit half already fetched**, asking Alpaca only for
+//!    symbols it does not have. Re-fetching an open leg between the two decisions would make them
+//!    two opinions that can disagree; here they are one measurement used twice.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,7 +20,7 @@ use crate::common::types::{EquityPrediction, Ticker};
 use crate::data::calendar::{eastern_date, eastern_day_bounds, TradingCalendar};
 use crate::data::details::{self, DetailsError};
 use crate::data::universe::Universe;
-use crate::models::predict;
+use crate::models::tide::predict;
 use crate::portfolio::account::{self, AccountError};
 use crate::portfolio::execute::{self, ExecutionError, ExecutionSettings, OpenOutcome};
 use crate::portfolio::pairs::{self, CloseReason, OpenPair, PairsError};
@@ -209,17 +205,12 @@ pub async fn run_pass(
         .collect();
 
     for (index, pair) in approved.iter().enumerate() {
-        // Checked between pairs, never inside one. Opening a pair is two broker legs and an insert,
-        // and abandoning it partway is the failure this whole path is arranged to avoid — so the
-        // pass finishes whatever it has started and declines to start the next one.
+        // Between pairs, never inside one: opening a pair is two broker legs and an insert, so the
+        // pass finishes what it started and declines to start the next. This is what makes the
+        // drain timeout in `bin/fund.rs` a real bound rather than a hope.
         //
-        // This is what makes the drain's timeout in `bin/fund.rs` a real bound rather than a hope.
-        // Without it the pass works through every approved candidate sequentially, and no fixed
-        // timeout covers a list whose length is decided by the screen.
-        //
-        // Only the entry half. `close_what_should_close` ran earlier in this pass and is never
-        // skipped: a close reduces risk, and declining one leaves the book holding something it had
-        // already decided to let go of.
+        // Entry half only. `close_what_should_close` ran earlier and is never skipped — a close
+        // reduces risk, and declining one leaves the book holding what it decided to let go of.
         if context.shutdown.is_cancelled() {
             summary.entries_abandoned = approved.len() - index;
             warn!(
@@ -243,14 +234,11 @@ pub async fn run_pass(
                 long_fill,
                 short_fill,
             } => {
-                // Both legs are filled at the broker before this line runs, and the broker and the
-                // database are separate systems — there is no transaction that spans them. If the
-                // insert fails, the position is live with no `equity_pairs` row, so no later pass
-                // can exit it on a signal and the account sync cannot attribute its fills.
-                //
-                // The pre-close liquidation is the backstop, and it is why it flattens the
-                // *account* rather than the pairs the application knows about. What this can add is
-                // a record precise enough to reconstruct the pair by hand before then.
+                // Both legs are already filled and no transaction spans the broker and the
+                // database. If this insert fails the position is live with no `equity_pairs` row,
+                // so no later pass can exit it on a signal. The pre-close liquidation is the
+                // backstop, which is why it flattens the *account* rather than known pairs; this
+                // log is what makes the pair reconstructable by hand before then.
                 if let Err(error) = pairs::record_open(context.pool, &entry, context.now).await {
                     error!(
                         pair_id = %entry.pair_id(),
@@ -295,12 +283,11 @@ pub struct LiquidationSummary {
 
 /// Flattens the account, then marks the pair records closed.
 ///
-/// The order is not negotiable. Marking the records first and flattening afterwards would, on a
-/// failure, leave the application believing it holds nothing while the account holds positions
-/// overnight — and nothing would look again until the next morning.
+/// The order is not negotiable: marking records first would, on failure, leave the application
+/// believing it holds nothing while the account holds positions overnight.
 ///
-/// A pair whose leg Alpaca refused to close stays open in the record. That is the honest state, and
-/// it is what makes `pairs_still_open` a usable alarm rather than a formality.
+/// A pair whose leg Alpaca refused to close stays open in the record, which is what makes
+/// `pairs_still_open` a usable alarm.
 pub async fn run_liquidation(
     pool: &PgPool,
     client: &TradingClient,

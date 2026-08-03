@@ -1,15 +1,11 @@
 //! The server-rendered page.
 //!
 //! Five sections stacked vertically — account, open pairs, predictions, closed pairs, events — in
-//! the amber CRT aesthetic the dashboard has always used. The page refreshes itself every thirty
-//! seconds with a `<meta>` tag, matching the poll interval; there is no client-side JavaScript and
-//! nothing to load from a CDN.
+//! an amber CRT aesthetic. The page refreshes every thirty seconds with a `<meta>` tag, matching
+//! the poll interval; no client-side JavaScript and nothing loaded from a CDN.
 //!
-//! Three sections the previous dashboard rendered are gone, because the tables behind them are:
-//! per-leg dollar allocations, the fund-versus-benchmark curve, and the training run's metrics. The
-//! rebuild's `account_snapshots` carries exposure as Alpaca reports it, the universe holds no index
-//! ETF to benchmark against, and the trainer publishes its metrics to S3 rather than to a table the
-//! dashboard can read.
+//! It renders only what the database can answer. There is no benchmark curve (the universe holds no
+//! index ETF) and no training metrics (the trainer publishes those to S3, not to a table).
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;

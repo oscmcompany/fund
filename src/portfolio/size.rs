@@ -6,11 +6,9 @@
 //! target rather than concentrating the full target into the pairs that happen to be open.
 //!
 //! **Both legs get equal notional, not hedge-ratio-weighted notional.** The hedge ratio decides
-//! where the spread's mean is, not how much to buy. Sizing the short leg at `hedge_ratio x` the
-//! long would make the book hedge-ratio-neutral instead of dollar-neutral, which is a different
-//! and larger claim about what the two legs have in common — and the machinery that justified it
-//! is what `risk_management_reintroduction.md` records as removed. Dollar neutrality is the
-//! assumption this version can actually support.
+//! where the spread's mean is, not how much to buy. Sizing the short at `hedge_ratio x` the long
+//! would make the book hedge-ratio-neutral rather than dollar-neutral — a larger claim about what
+//! the two legs share than this version can support.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;

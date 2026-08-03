@@ -7,28 +7,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 /// Initialize structured JSON tracing for a service.
 ///
-/// The `service` parameter identifies which service is emitting logs
-/// (e.g. `"data"`, `"inference"`, `"portfolio"`) and is included in the
-/// initial `Tracing initialized` log line for correlation.
+/// `service` (e.g. `"fund"`, `"tide-model-trainer"`) is included in the initial log line for
+/// correlation.
 ///
-/// Logs to stdout at the `RUST_LOG` level (default `info`). When the log
-/// directory is writable, also logs to a rolling daily file there; the
-/// directory is `FUND_LOG_DIR` when set, otherwise `/var/log/fund` (local
-/// dev sets `FUND_LOG_DIR` to a writable path via devenv). When `file_filter`
-/// is `Some`, the file layer uses that fixed directive
-/// (e.g. `"warn"` for an errors-only file), otherwise it follows the stdout
-/// level. If the log directory cannot be created (e.g. in tests or restricted
-/// environments), file logging is disabled and only stdout is used.
+/// Logs to stdout at `RUST_LOG` (default `info`), and to a rolling daily file under `FUND_LOG_DIR`
+/// or `/var/log/fund` when that directory is writable. `file_filter` overrides the file layer's
+/// level; `None` follows stdout. An uncreatable log directory disables file logging rather than
+/// failing.
 ///
-/// Returns `Some(WorkerGuard)` when file logging is active; the guard MUST be
-/// held for the lifetime of the process, since dropping it tears down the
-/// non-blocking file writer and buffered lines would be lost. Returns `None`
-/// when file logging is disabled. Uses `try_init`, so calling this more than
-/// once (e.g. across tests) is a no-op rather than a panic.
-///
-/// Services that own stdout for terminal rendering (e.g. the dashboard TUI)
-/// should call [`init_tracing_file_only`] instead to avoid corrupting the
-/// alternate screen with JSON log output.
+/// `Some` means *this call* installed the file layer, and the `WorkerGuard` MUST then be held for
+/// the process lifetime — dropping it tears down the non-blocking writer and buffered lines are
+/// lost. `None` means it did not, either because file logging is off or because `try_init` found a
+/// subscriber already installed, which is what makes repeated calls across tests a no-op.
 pub fn init_tracing(
     log_file: &str,
     file_filter: Option<&str>,
@@ -96,11 +86,8 @@ pub fn init_tracing(
 
 /// Initialize structured JSON tracing to a file only, with no stdout output.
 ///
-/// Identical to [`init_tracing`] except the stdout layer is omitted. Use this
-/// for services that own stdout for terminal rendering (e.g. the dashboard TUI)
-/// where writing JSON to stdout would corrupt the alternate screen buffer.
-///
-/// When the log directory is not writable, tracing is silently disabled rather
+/// Like [`init_tracing`] but file-only and with no `file_filter` — the file layer always follows
+/// `RUST_LOG`. Used by the dashboard. An unwritable log directory installs nothing at all rather
 /// than falling back to stdout.
 pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());

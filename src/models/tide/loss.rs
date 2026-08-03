@@ -1,9 +1,8 @@
 //! Quantile (pinball) loss for the TiDE model, optionally Huber-smoothed.
 //!
-//! Ported from the Python trainer's `quantile_loss`. The training loss averages
-//! the per-quantile loss over all quantiles and uses a strict `error > 0` split;
-//! the evaluation CRPS (see [`crate::models::tide::evaluate`]) intentionally
-//! differs (sum over quantiles, non-strict split).
+//! This averages over quantiles with a strict `error > 0` split. The evaluation CRPS in
+//! [`crate::models::tide::evaluate`] sums instead, with a non-strict split — a deliberate
+//! difference, not a bug to reconcile.
 
 use burn::prelude::*;
 

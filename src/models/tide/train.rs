@@ -1,8 +1,7 @@
-//! Rust-native TiDE training loop on the `Autodiff<NdArray>` backend.
+//! TiDE training loop on the `Autodiff<NdArray>` backend.
 //!
-//! A hand-rolled loop (no `burn-train` `Learner`) mirroring the Python trainer:
-//! Adam, mini-batch shuffling, validation-loss early stopping with patience, and
-//! best-checkpoint restore (kept in memory rather than round-tripped to disk).
+//! Hand-rolled rather than `burn-train`'s `Learner`. The best checkpoint is restored from memory
+//! rather than round-tripped to disk.
 
 use burn::backend::{Autodiff, NdArray};
 use burn::module::AutodiffModule;
@@ -103,18 +102,16 @@ impl Default for TrainConfig {
             epoch_count: 20,
             batch_size: 512,
             early_stopping_patience: 3,
-            // The scaled-return quantile loss sits around 1e-4, so the Python
-            // default min_delta of 1e-3 never registered an improvement and
-            // training always stopped after `patience`. Use a delta below the
-            // loss scale so genuine epoch-over-epoch gains keep training going.
+            // The scaled-return quantile loss sits around 1e-4, so a min_delta of 1e-3 never
+            // registers an improvement and training always stops after `patience`. This must stay
+            // below the loss scale for genuine epoch-over-epoch gains to keep training going.
             min_delta: 1e-5,
         }
     }
 }
 
-/// Epoch-end checkpoint and early-stopping policy, mirroring the Python
-/// trainer: the best model is snapshotted on any improvement, while the
-/// early-stopping counter only resets on improvements larger than `min_delta`.
+/// Epoch-end checkpoint and early-stopping policy. The best model is snapshotted on any
+/// improvement; the early-stopping counter only resets on improvements larger than `min_delta`.
 pub(crate) struct EarlyStopping {
     best_checkpoint_metric: f64,
     best_stopping_metric: f64,
@@ -381,10 +378,9 @@ mod tests {
 
     #[test]
     fn test_early_stopping_snapshots_below_min_delta_improvements() {
-        // Truth table from the Python trainer: any improvement checkpoints the
-        // model, but only improvements beyond min_delta reset the patience
-        // counter — small gains keep the best weights while still counting
-        // toward early stopping.
+        // Any improvement checkpoints the model, but only improvements beyond min_delta reset
+        // the patience counter — small gains keep the best weights while still counting toward
+        // early stopping.
         let mut policy = EarlyStopping::new();
         assert_eq!(policy.observe(0.5, 1e-3, 2), (true, false));
         // Better, but by less than min_delta: snapshot, counter advances.
@@ -406,10 +402,9 @@ mod tests {
 
     #[test]
     fn test_best_model_checkpointed_even_below_min_delta() {
-        // The Python trainer snapshots the best model whenever the stopping
-        // metric improves at all; min_delta only gates the early-stopping
-        // counter. With an enormous min_delta the counter never resets, but the
-        // returned model must still be the best epoch, not the initial weights.
+        // The best model is snapshotted whenever the stopping metric improves at all; min_delta
+        // only gates the early-stopping counter. With an enormous min_delta the counter never
+        // resets, but the returned model must still be the best epoch, not the initial weights.
         let input_length = 3;
         let output_length = 1;
         let dataset = overfit_dataset(32, input_length, output_length);

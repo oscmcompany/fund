@@ -324,8 +324,49 @@ in {
       [ -n "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "${objectStoreEndpoint}" 2>/dev/null | grep -v '^000$')" ]
     }
 
+    # Probe the endpoint the suite actually connects to, not pg_isready's default.
+    # tests/common/mod.rs reads TEST_DATABASE_URL_BASE and falls back to
+    # localhost:5432, so the probe derives host and port from the same value. A
+    # bare `pg_isready` is a proxy for that, and the two can disagree — a data
+    # directory carries its port in postgresql.conf, so a profile whose directory
+    # was initialised while 5432 was taken keeps the shifted port afterwards. The
+    # proxy then loops for a minute against a port nothing is listening on and
+    # reports "did not start", which is the one thing that had not happened.
+    # Stripped in this order because each step can otherwise hide the next: a query string can
+    # contain a slash, userinfo can contain a colon, and an IPv6 host contains several. Splitting
+    # the authority on its first colon without removing userinfo first reads
+    # `user:password@host:5433` as host `user`, and pg_isready then waits out its timeout against a
+    # host that does not exist.
+    test_base="''${TEST_DATABASE_URL_BASE:-postgresql://localhost:5432}"
+    test_authority="''${test_base#*//}"
+    test_authority="''${test_authority%%\?*}"
+    test_authority="''${test_authority%%/*}"
+    test_authority="''${test_authority##*@}"
+    case "$test_authority" in
+      \[*\]*)
+        # Bracketed IPv6. libpq wants the bare address, so the brackets come off.
+        test_host="''${test_authority#\[}"
+        test_host="''${test_host%%\]*}"
+        test_port="''${test_authority##*\]}"
+        test_port="''${test_port#:}"
+        ;;
+      *:*)
+        test_host="''${test_authority%%:*}"
+        test_port="''${test_authority##*:}"
+        ;;
+      *)
+        test_host="$test_authority"
+        test_port=""
+        ;;
+    esac
+    [ -z "$test_port" ] && test_port=5432
+
+    postgres_up() {
+      pg_isready -q -h "$test_host" -p "$test_port" 2>/dev/null
+    }
+
     needed=""
-    pg_isready -q 2>/dev/null || needed="postgres"
+    postgres_up || needed="postgres"
     object_store_up || needed="$needed object-store"
 
     if [ -z "$needed" ]; then
@@ -338,7 +379,7 @@ in {
     for _ in $(seq 1 60); do
       pg_ok=false
       store_ok=false
-      pg_isready -q 2>/dev/null && pg_ok=true
+      postgres_up && pg_ok=true
       object_store_up && store_ok=true
       if [ "$pg_ok" = true ] && [ "$store_ok" = true ]; then
         exit 0
@@ -347,9 +388,11 @@ in {
     done
 
     echo "Test services did not start within 60s"
-    echo "  postgres:     $(pg_isready -q 2>/dev/null && echo ready || echo down)"
+    echo "  postgres:     $test_host:$test_port ($(postgres_up && echo ready || echo down))"
     echo "  object-store: ${objectStoreEndpoint}"
     echo "Start them with 'devenv --profile test up postgres object-store --detach'."
+    echo "If postgres is listening on another port, that port is recorded in the"
+    echo "profile's postgresql.conf; remove the state directory to reinitialise it."
     exit 1
   '';
 
@@ -700,7 +743,7 @@ in {
           echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
           echo ""
           echo "  Seeds ticker metadata and daily bars into PostgreSQL. The screen needs 60"
-          echo "  sessions of aligned closes and the model 70, so allow at least six months."
+          echo "  sessions of aligned closes and the model 40, so allow at least six months."
           exit 1
         fi
 
@@ -725,8 +768,14 @@ in {
     # recovering from a breaking schema change.
     "database:reset".exec = "reset-database";
 
-    # Dumps the live database and uploads it to S3. Also runs automatically via
-    # pg_cron at 22:00 UTC on weekdays after all nightly exports complete.
+    # Dumps the live database with pg_dump and uploads it to S3. Manual only:
+    # nothing schedules it. pg_cron runs SQL inside the database and cannot shell
+    # out to pg_dump, so this cannot become a cron job as written.
+    #
+    # Not the same thing as the nightly export, which the market data sync does
+    # chain automatically. That writes per-table parquet under exports/ for
+    # querying; this writes a pg_restore-able dump under database/backups/. Only
+    # this one restores equity_pairs, which nothing else can reconstruct.
     "database:backup".exec = "backup-database";
 
     # Applies the schema to the fund database. Safe to re-run (all DDL is
