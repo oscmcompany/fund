@@ -1,14 +1,11 @@
 //! Order submission and fill confirmation. The only module that sends an order.
 //!
-//! Opening a pair is two orders that have to both work or neither hold. The short leg goes first
-//! and its fill is confirmed before the long leg is submitted at all, which is not the fastest
-//! ordering but is the one that fails cleanly: a short can be rejected for borrow reasons a long
-//! never is, and submitting them together means the common failure leaves a naked long to unwind.
-//! Sequenced this way, the usual rejection costs nothing to recover from because there is nothing
-//! yet to recover.
+//! Opening a pair is two orders that must both work or neither hold. The short leg goes first and
+//! its fill is confirmed before the long is submitted: a short can be rejected for borrow reasons a
+//! long never is, so the common failure costs nothing to recover from because nothing is held yet.
 //!
-//! Unwinding is still implemented, because the uncommon case — the short fills and the long does
-//! not — is the one that leaves an unhedged position, and it is the one worth having a path for.
+//! Unwinding is still implemented for the uncommon case — the short fills and the long does not —
+//! which is the one that leaves an unhedged position.
 
 use std::time::Duration;
 
@@ -240,14 +237,10 @@ pub async fn open_pair(
 
 /// Closes both legs of a pair.
 ///
-/// **Both closes are always attempted, including when the first one errors.** A missing position is
-/// `Ok(false)` and was never the hard case; a 500, a timeout, or a dropped connection is. Returning
-/// early on one of those would leave a live short leg on the book — the naked directional position
-/// the pair structure exists to avoid — and it would do so in exactly the situation where the leg is
-/// most likely still held.
-///
-/// The error is reported only after both attempts have been made, so a failure on the long leg costs
-/// the caller its error and nothing else.
+/// **Both closes are always attempted, even when the first errors.** A missing position is
+/// `Ok(false)`; a 500 or a timeout is the hard case, and returning early on one would leave a live
+/// short leg — the naked directional position the pair structure exists to avoid — in exactly the
+/// situation where it is most likely still held. The error is reported after both attempts.
 pub async fn close_pair(
     client: &TradingClient,
     long_ticker: &Ticker,

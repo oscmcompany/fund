@@ -1,17 +1,14 @@
 //! The trainer: fetch, archive, train, publish. Runs on its own machine with no database.
 //!
-//! Four stages, and the first one is new. The trainer used to read a dataset the application's
-//! nightly export had written, which coupled two machines through a bucket and made a failed export
-//! cost the next day's model. It now fetches its own bars from Massive and writes its own parquet,
-//! so the only thing crossing the boundary between the two VMs is the finished artifact.
+//! It fetches its own bars from Massive and writes its own parquet rather than reading the
+//! application's nightly export, so the only thing crossing between the two VMs is the finished
+//! artifact and a failed export cannot cost the next day's model.
 //!
-//! Both sides fetch through [`fund::data::bars`] and build frames through
-//! [`fund::data::bars::bars_to_dataframe`]. That shared path is the point: if the trainer's frames
-//! and the application's ever diverged, the model would train on columns the inference path does
-//! not produce, and it would surface as bad predictions rather than as a build error.
+//! Frames are built through [`fund::data::bars::bars_to_dataframe`], shared with the application:
+//! if the two diverged, the model would train on columns the inference path does not produce.
 //!
-//! Nothing here writes to a database, reads one, or talks to Alpaca. Massive answers by date, so
-//! there is no symbol list to build and therefore no broker to ask for one.
+//! Nothing here touches a database or Alpaca — Massive answers by date, so there is no symbol list
+//! to build and no broker to ask for one.
 
 use std::io::Cursor;
 
@@ -29,16 +26,16 @@ use fund::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use fund::data::bars;
 use fund::data::calendar::{eastern_date, is_weekend};
 use fund::data::details;
-use fund::models::artifact::{
+use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
-use fund::models::predict::consolidate_data;
 use fund::models::tide::config::ModelParameters;
 use fund::models::tide::data::input_feature_size;
 use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
 use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
 use fund::models::tide::model::TideModel;
+use fund::models::tide::predict::consolidate_data;
 use fund::models::tide::train::{train, TrainBackend, TrainConfig};
 
 const INPUT_LENGTH: usize = 35;
@@ -57,13 +54,9 @@ const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 
 /// Sessions the fetch stage re-requests each night.
 ///
-/// Three rather than one, for the same reason the application's sync uses three: a night the
-/// trainer did not run leaves a hole in the archive that nothing else fills.
-///
-/// The merge below is what makes the overlap cheap. It matters less than it did -- the grouped
-/// endpoint returns whatever traded on the date, so a delisted symbol's bars come back for the days
-/// it was still trading rather than vanishing with the current tradable set -- but a plain overwrite
-/// would still discard anything the API omits from a later response, and the merge costs nothing.
+/// Three rather than one: a night the trainer did not run leaves a hole nothing else fills. The
+/// merge below makes the overlap cheap, and guards against a later response omitting rows an
+/// earlier one had.
 const FETCH_LOOKBACK_SESSIONS: i64 = 3;
 
 /// Calendar days of archive the training window spans by default.
@@ -359,16 +352,11 @@ fn training_config() -> Result<TrainConfig, Box<dyn std::error::Error>> {
 
 /// Fetches the most recent sessions' bars from Massive and writes them to the archive.
 ///
-/// Returns the number of rows written. There is no universe here and no symbol list: the grouped
-/// endpoint is asked for a date and answers with every stock that traded on it. That is what the
-/// trainer wants — `filter_training_bars` applies the price and volume thresholds to the rows
-/// themselves further down, so pre-filtering here would only decide which names the model is
-/// allowed to have ever seen.
-///
-/// It also means the trainer needs no Alpaca credentials at all. It used to call
-/// `fetch_tradable_assets` purely to build that symbol list, which had the side effect of pinning
-/// the archive to whatever Alpaca lists *today* — the survivorship problem the merge below exists
-/// to limit. Asking for a date removes the cause rather than the symptom.
+/// Returns rows written. No universe and no symbol list: the endpoint is asked for a date and
+/// answers with every stock that traded. `filter_training_bars` applies the thresholds further
+/// down, so pre-filtering here would only decide which names the model may ever have seen — and
+/// building a list from `fetch_tradable_assets` would pin the archive to whatever Alpaca lists
+/// *today*, which is the survivorship problem.
 async fn fetch_and_archive(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -537,9 +525,9 @@ async fn load_archived_bars(
 
 /// CRPS from the most recent prior runs' `run_metadata.json`, newest first.
 ///
-/// Read from the standalone metadata object rather than from inside the artifact tarball, which is
-/// what the deleted `model_runs` lineage table used to make possible. Failures degrade to an empty
-/// history: a drift baseline that cannot be read is not a reason to fail a training run.
+/// Read from the standalone metadata object rather than from inside the artifact tarball, so a
+/// baseline can be built without downloading every prior run. Failures degrade to an empty history:
+/// a drift baseline that cannot be read is not a reason to fail a training run.
 async fn fetch_prior_crps(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,

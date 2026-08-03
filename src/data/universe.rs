@@ -10,9 +10,8 @@
 //!    average. A universe wider than the training population means predicting on names the scaler
 //!    never saw.
 //!
-//! Roughly seven thousand symbols enter and a few hundred survive, which is why this is computed
-//! once at pre-open and held for the Eastern date rather than recomputed on every five-minute pass.
-//! The universe does not change intraday.
+//! Roughly seven thousand symbols enter and a few hundred survive, so it is computed once at
+//! pre-open and held for the Eastern date. The universe does not change intraday.
 
 use std::collections::HashSet;
 
@@ -200,11 +199,9 @@ impl UniverseCache {
     /// date.
     ///
     /// The lock is released before the Alpaca call and the liquidity query, and re-taken only to
-    /// store the result. Holding it across that I/O would block every other caller for the full
-    /// duration of a cold rebuild. The cost is that two callers arriving on a cold cache may both
-    /// rebuild; both are read-only and deterministic, so they produce the same universe and the
-    /// second store is a harmless overwrite. Blocking every caller to prevent a duplicate read is
-    /// the worse trade.
+    /// store. Two callers on a cold cache may both rebuild, but both are read-only and
+    /// deterministic, so the second store is a harmless overwrite — cheaper than blocking every
+    /// caller for the duration of a cold rebuild.
     pub async fn get(
         &self,
         client: &TradingClient,

@@ -1,10 +1,8 @@
-//! Evaluation metrics for a trained TiDE model, computed on the validation set
-//! in scaled space. Ports the Python `evaluate.py` definitions exactly:
+//! Evaluation metrics for a trained TiDE model, computed on the validation set in scaled space.
 //!
-//! - CRPS: per row, the **sum** over quantiles of pinball loss (non-strict
-//!   `error >= 0` split), then the mean over rows.
-//! - directional accuracy: fraction of rows where `(q50 >= 0) == (target >= 0)`.
-//! - quantile coverage: fraction of rows where `q10 <= target <= q90`.
+//! CRPS here **sums** pinball loss over quantiles with a non-strict `error >= 0` split, where the
+//! training loss in [`crate::models::tide::loss`] averages with a strict split. The two are
+//! deliberately different.
 
 use burn::backend::NdArray;
 

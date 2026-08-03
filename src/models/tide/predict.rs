@@ -1,15 +1,8 @@
 //! Running the TiDE model: from stored market history to rows in `equity_predictions`.
 //!
-//! The transformations here are pure functions over Polars frames — consolidate bars with sector
-//! detail, filter to the liquid universe, restrict to tickers the model was actually trained on,
-//! run the network, and reshape the output. Loading the frames is `data`\'s job and persisting the
-//! result is the last step in this file, which keeps the model pipeline testable without a
-//! database.
-//!
-//! The liquidity filter matters more than it looks: training applies the same thresholds per row
-//! that inference applies per ticker average. They were historically mismatched, which trained the
-//! scaler on penny-stock dynamics the service never predicts. Both sides read the constants from
-//! [`crate::common::types`] now so they cannot drift again.
+//! Training and inference must apply the same liquidity thresholds — training per row, inference
+//! per ticker average. Both read them from [`crate::common::types`] so they cannot drift; a
+//! mismatch trains the scaler on dynamics the service never predicts.
 
 use burn::backend::NdArray;
 use chrono::{DateTime, Duration, Utc};
@@ -19,7 +12,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::types::{EquityPrediction, Ticker};
-use crate::models::artifact::ModelState;
+use crate::models::tide::artifact::ModelState;
 use crate::models::tide::data::Data;
 
 #[derive(Debug, thiserror::Error)]
@@ -80,8 +73,7 @@ pub fn consolidate_data(
                 .str()
                 .strip_chars(lit(" ")),
         ])
-        // Rows without a sector or industry cannot be categorically encoded;
-        // the Python pipeline drops them after the join.
+        // Rows without a sector or industry cannot be categorically encoded.
         .filter(
             col("sector")
                 .is_not_null()
@@ -210,10 +202,9 @@ pub fn filter_to_trained_tickers(
     Ok(filtered)
 }
 
-/// Inverse-scale the predicted `daily_return` quantiles and sort them so they
-/// are monotonic, exactly as the Python postprocessing does (`np.sort` per
-/// row). Quantile crossing is routine in quantile regression; sorting is the
-/// standard rearrangement remedy.
+/// Inverse-scale the predicted `daily_return` quantiles and sort them monotonic.
+///
+/// Quantile crossing is routine in quantile regression; sorting is the standard remedy.
 pub(crate) fn unscale_and_sort_quantiles(
     scaled_quantiles: &[f64],
     scaler: &crate::models::tide::data::Scaler,
@@ -226,8 +217,7 @@ pub(crate) fn unscale_and_sort_quantiles(
     unscaled
 }
 
-/// Timestamp (UTC midnight, milliseconds) for horizon step `step`, where step 0
-/// is `now`'s date — matching the Python labeling `now + timedelta(days=step)`.
+/// Timestamp (UTC midnight, milliseconds) for horizon step `step`, where step 0 is `now`'s date.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
     (now + Duration::days(step as i64))
         .date_naive()
@@ -325,8 +315,7 @@ pub fn generate_predictions(
         }
     }
 
-    // Persist the final horizon step, now + (output_length - 1) days, exactly
-    // like the Python service.
+    // Persist the final horizon step, now + (output_length - 1) days.
     let target_date = step_timestamp_milliseconds(now, output_length - 1);
 
     let final_predictions: Vec<serde_json::Value> = results
@@ -415,12 +404,10 @@ pub fn validate_predictions(predictions: &[serde_json::Value]) -> Result<(), Str
 // Persistence
 // --------------------------------------------------------------------------
 
-/// Boundary morphism: converts an untrusted pipeline prediction JSON object
-/// into a validated [`EquityPrediction`].
+/// Converts a pipeline prediction JSON object into a validated [`EquityPrediction`].
 ///
-/// Predictions come from our own pipeline, so a missing or mistyped field is a
-/// real data bug upstream; this fails loudly with the offending field and
-/// ticker instead of persisting placeholder values.
+/// These come from our own pipeline, so a missing or mistyped field is a bug upstream. It fails
+/// loudly with the offending field and ticker rather than persisting placeholders.
 fn prediction_from_json(
     prediction: &serde_json::Value,
     correlation_id: Uuid,
@@ -752,8 +739,8 @@ mod tests {
 
     #[test]
     fn test_step_timestamp_step_zero_is_today_midnight() {
-        // Python labels horizon step t as now + t days at midnight: step 0 is
-        // today, and the persisted target is step output_length - 1.
+        // Horizon step t is now + t days at midnight: step 0 is today, and the persisted
+        // target is step output_length - 1.
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
             .with_timezone(&Utc);

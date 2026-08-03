@@ -7,9 +7,8 @@
 //!
 //! Usage: `seed_equity_details`
 //!
-//! There are no arguments. The previous version took `--target <s3|postgresql|all>`, from a data
-//! topology that no longer exists — the trainer reads the same embedded CSV directly rather than a
-//! copy of it in a bucket, so there is no second target left to choose between.
+//! There are no arguments. The trainer reads the same embedded CSV directly rather than a copy in
+//! a bucket, so PostgreSQL is the only target.
 
 use fund::common::database::connect_pool;
 use fund::common::observability::init_tracing;

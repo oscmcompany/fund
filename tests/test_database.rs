@@ -18,7 +18,7 @@ use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, Ticker};
 use fund::data::bars;
 use fund::data::calendar::{eastern_date, eastern_day_bounds};
-use fund::models::predict;
+use fund::models::tide::predict;
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};
 use rust_decimal::Decimal;

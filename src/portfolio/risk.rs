@@ -1,14 +1,11 @@
 //! The risk gate: four conditions, all of which only ever stop an *entry*.
 //!
-//! Nothing here can block an exit. That is the property the whole design rests on — the book is
-//! flat overnight without exception, so a gate that could refuse to close a position would be a way
-//! to carry one. Exits run first and unconditionally in [`crate::portfolio::evaluate`]; this module
-//! is consulted only afterwards, when the pass is deciding whether to open anything.
+//! Nothing here can block an exit. The book is flat overnight without exception, so a gate that
+//! could refuse to close a position would be a way to carry one. Exits run first and
+//! unconditionally in [`crate::portfolio::evaluate`]; this is consulted only afterwards.
 //!
-//! This is a much smaller surface than the system it replaces. What was removed, why, and the order
-//! it should come back in are recorded in `risk_management_reintroduction.md`. The short version:
-//! everything that modeled overnight exposure went with the requirement to hold overnight, and the
-//! beta-neutral optimizer went with the machinery that estimated the betas.
+//! Deliberately small: everything modelling overnight exposure went with the requirement to hold
+//! overnight, and the beta-neutral optimizer went with the machinery that estimated the betas.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;

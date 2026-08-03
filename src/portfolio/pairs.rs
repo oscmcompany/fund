@@ -1,13 +1,11 @@
 //! `equity_pairs` persistence: which long belongs with which short, and why.
 //!
-//! Alpaca holds the authoritative position, quantity, and fill. What it cannot answer is which
-//! long belongs with which short and what signal put them there, so that — and only that — is what
-//! this table stores. Nothing here is a position ledger, and nothing here should be trusted over
-//! Alpaca about what is actually held.
+//! Alpaca holds the authoritative position, quantity, and fill. What it cannot answer is which long
+//! belongs with which short and what signal put them there, so that — and only that — is stored
+//! here. This is not a position ledger and should never be trusted over Alpaca.
 //!
-//! `realized_profit_and_loss` is written by the post-close account sync in
-//! [`crate::portfolio::account`], not by the evaluation pass. The pass knows a pair closed; it does
-//! not know what the fills came back at.
+//! `realized_profit_and_loss` is written by the post-close sync in [`crate::portfolio::account`],
+//! not by the evaluation pass: the pass knows a pair closed, not what the fills came back at.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;

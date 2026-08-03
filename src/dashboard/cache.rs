@@ -1,12 +1,11 @@
 //! Shared in-memory state for the dashboard, and the two tasks that keep it current.
 //!
-//! A single polling task refreshes everything every [`POLL_INTERVAL`] behind an `RwLock`, and a
-//! separate listener appends events from the `events` NOTIFY channel as they arrive. Request
-//! handlers read the lock and never touch the database, so the number of people looking at the page
-//! has no bearing on the connection pool.
+//! A polling task refreshes everything every [`POLL_INTERVAL`] behind an `RwLock`; a listener
+//! appends `events` as they arrive. Request handlers read the lock and never touch the database, so
+//! viewer count has no bearing on the connection pool.
 //!
-//! A poll that fails leaves the previous state in place and records the error rather than blanking
-//! the page. Stale numbers with a visible "last updated" are more useful than no numbers.
+//! A failed poll leaves the previous state and records the error rather than blanking the page —
+//! stale numbers with a visible "last updated" beat no numbers.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

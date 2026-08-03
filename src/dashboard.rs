@@ -1,13 +1,11 @@
 //! The dashboard: a read-only page describing what the fund is doing.
 //!
-//! Runs as its own process alongside the service, connecting as `dashboard_reader` — a role holding
-//! SELECT on five tables and nothing else, so a bug here cannot write to the database the strategy
-//! trades from.
+//! Its own process, connecting as `dashboard_reader` — SELECT on five tables and nothing else, so
+//! a bug here cannot write to the database the strategy trades from.
 //!
-//! Two background tasks keep one shared state current: a poller that refreshes every view on a
-//! fixed interval, and a listener that appends events from the `events` NOTIFY channel as they
-//! happen. Request handlers read that state and never query, so the number of viewers has no
-//! bearing on the connection pool.
+//! A poller refreshes every view on a fixed interval; a listener appends events from the `events`
+//! NOTIFY channel as they arrive. Request handlers read that shared state and never query, so
+//! viewer count has no bearing on the connection pool.
 
 pub mod cache;
 pub mod database;

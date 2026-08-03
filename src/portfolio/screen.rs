@@ -1,14 +1,11 @@
 //! Pair selection: which two symbols, which way round, and how strong the signal.
 //!
-//! The screen is quadratic in the eligible universe, so everything cheap happens first: the
-//! prediction confidence floor, the shortable check, and the different-sector rule all reduce the
-//! input before a single correlation is computed.
+//! The screen is quadratic in the eligible universe, so everything cheap runs first: the confidence
+//! floor, the shortable check, and the different-sector rule all shrink the input before a single
+//! correlation is computed.
 //!
-//! [`SpreadModel`] is the load-bearing type. Entry and exit both measure the spread through it, and
-//! an open pair's model is rebuilt from its *stored* hedge ratio rather than refitted, so the
-//! spread a pass compares against the exit threshold is the same spread the entry threshold was
-//! applied to. Two code paths measuring the same quantity differently is the failure recorded in
-//! `dual_path_signal_agreement`, and this is where it would recur.
+//! [`SpreadModel`] is load-bearing. An open pair's model is rebuilt from its *stored* hedge ratio
+//! rather than refitted, so entry and exit measure the same spread.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,15 +18,14 @@ pub const CORRELATION_WINDOW_SESSIONS: usize = 60;
 
 /// Correlation band a pair's log returns must fall inside.
 ///
-/// The floor rejects pairs with no relationship to mean-revert to. The ceiling rejects pairs so
-/// alike that the spread is mostly microstructure noise — two share classes of one issuer, or an
-/// index fund and its largest holding — where the spread's standard deviation is small enough that
-/// a two-sigma move is inside the bid-ask spread.
+/// The floor rejects pairs with nothing to mean-revert to. The ceiling rejects pairs so alike the
+/// spread is mostly microstructure noise — two share classes of one issuer — where a two-sigma move
+/// is inside the bid-ask spread.
 ///
-/// **The band is on the signed correlation, not its magnitude.** An anti-correlated pair fits a
-/// negative hedge ratio, which turns `ln(short) - hedge_ratio * ln(long)` into a sum rather than a
-/// difference — a quantity that hedges nothing. Sizing is dollar-neutral regardless of the ratio, so
-/// admitting one produces a directional bet wearing the name of a market-neutral pair.
+/// **The band is on signed correlation, not magnitude.** An anti-correlated pair fits a negative
+/// hedge ratio, turning `ln(short) - hedge_ratio * ln(long)` into a sum that hedges nothing, and
+/// sizing is dollar-neutral regardless — so admitting one is a directional bet wearing a
+/// market-neutral name.
 const CORRELATION_MINIMUM: f64 = 0.5;
 const CORRELATION_MAXIMUM: f64 = 0.95;
 
@@ -175,16 +171,13 @@ impl SpreadModel {
 
     /// Rebuilds the distribution around a hedge ratio that was already decided.
     ///
-    /// This is the exit path. Refitting the hedge ratio here instead would mean the pass measures a
-    /// different spread from the one the entry was taken on, and the position would be judged
-    /// against a line it was never above.
+    /// This is the exit path. Refitting here would measure a different spread from the one the
+    /// entry was taken on, judging the position against a line it was never above.
     ///
-    /// The window length is enforced here as well as the hedge ratio, and for the same reason.
-    /// [`SpreadModel::fit`] is only ever called with exactly `CORRELATION_WINDOW_SESSIONS` closes,
-    /// so a shorter series here yields a mean and standard deviation drawn from a different sample
-    /// than the entry was measured against — and a z-score computed from it can cross the
-    /// convergence or stop threshold for a spread that has not moved. Reusing the hedge ratio but
-    /// not the window would reintroduce the asymmetry this type exists to prevent, one level down.
+    /// The window length is enforced for the same reason: [`SpreadModel::fit`] is only ever called
+    /// with exactly `CORRELATION_WINDOW_SESSIONS` closes, so a shorter series draws its mean and
+    /// standard deviation from a different sample and can cross a threshold for a spread that has
+    /// not moved.
     pub fn with_hedge_ratio(
         hedge_ratio: f64,
         long_closes: &[f64],
@@ -353,13 +346,11 @@ impl PairCandidate {
 /// 3. The spread, oriented so the short leg is the expensive one, is at or above `ENTRY_Z_SCORE`.
 /// 4. The model agrees with that orientation — it expects the long leg to out-return the short.
 ///
-/// Test four is the model doing more than gating eligibility. Without it a pair can be opened whose
-/// spread says buy A and sell B while the forecast says the opposite, and the two disagreements
-/// cancel into a position with no thesis at all.
+/// Test four is the model doing more than gating eligibility: without it a pair can open whose
+/// spread says buy A and sell B while the forecast says the opposite.
 ///
-/// No disjointness constraint is applied: the returned list is the full reservoir and pairs within
-/// it may share tickers. [`select_disjoint`] is the cheap second half, so a pass that rejects a
-/// candidate can re-select without paying for the ranking again.
+/// No disjointness constraint is applied — the returned list is the full reservoir and pairs may
+/// share tickers. [`select_disjoint`] is the cheap second half.
 pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
     let eligible: Vec<&ScreenInput> = inputs
         .iter()
@@ -631,16 +622,13 @@ mod tests {
 
     /// A cointegrated pair whose correlation lands inside the screen's band.
     ///
-    /// Both legs are driven by a common factor; the follower carries an idiosyncratic component at
-    /// a different frequency, which is what puts the correlation near 0.8 rather than at 1.0 and
-    /// what gives the spread dispersion to revert within.
+    /// Both legs share a common factor; the follower's idiosyncratic component puts the correlation
+    /// near 0.8 rather than 1.0 and gives the spread dispersion to revert within.
     ///
-    /// Two failure modes are being avoided deliberately, both recorded in
-    /// `statistical_arbitrage_test_fixtures`. A series with no idiosyncratic component correlates
-    /// at 1.0 and is rejected by `CORRELATION_MAXIMUM`; one whose spread has no variance yields an
-    /// infinite z-score. Either produces zero candidates, and every test built on it then passes
-    /// while asserting nothing — which is why `test_the_fixture_yields_at_least_one_candidate`
-    /// exists as a guard above the rest.
+    /// Two failure modes are avoided deliberately. A series with no idiosyncratic component
+    /// correlates at 1.0 and is rejected by `CORRELATION_MAXIMUM`; one whose spread has no variance
+    /// yields an infinite z-score. Either produces zero candidates and every test built on it then
+    /// asserts nothing, which is what `test_the_fixture_yields_at_least_one_candidate` guards.
     fn cointegrated_series(sessions: usize) -> (Vec<f64>, Vec<f64>) {
         let mut leader = Vec::with_capacity(sessions);
         let mut follower = Vec::with_capacity(sessions);

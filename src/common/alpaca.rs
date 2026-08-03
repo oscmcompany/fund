@@ -1,16 +1,12 @@
 //! The Alpaca integration: credentials, the trading API, and the market data API.
 //!
-//! Alpaca is two services behind one set of credentials. The trading API at `api.alpaca.markets`
-//! answers what the market *is* — the clock, the published calendar, the asset universe, and in due
-//! course orders and positions. The market data API at `data.alpaca.markets` answers what things
-//! *cost* — snapshots and bars. They share authentication, an error type, and nothing else, which
-//! is why one file holds both rather than a module per host.
+//! Two services behind one set of credentials: the trading API answers what the market *is* — the
+//! clock, calendar, assets, orders, positions — and the market data API what things *cost*. They
+//! share authentication and an error type and nothing else, which is why one file holds both.
 //!
-//! Alpaca is the source of truth for fills, balances, buying power, and positions, so this module
-//! is deliberately thin: it deserializes what Alpaca reports and hands it on. Where a response is
-//! ambiguous — a snapshot with no quote, a calendar day with no duration — the ambiguity is
-//! surfaced rather than defaulted, because a missing value and a zero one are indistinguishable
-//! after the fact.
+//! Deliberately thin, since Alpaca is the source of truth for fills and balances. Ambiguity — a
+//! snapshot with no quote, a calendar day with no duration — is surfaced rather than defaulted,
+//! because a missing value and a zero one are indistinguishable after the fact.
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;
@@ -1212,24 +1208,21 @@ struct ActivityResponse {
 
 /// Symbols requested per snapshot call.
 ///
-/// The endpoint imposes no documented symbol ceiling and has been measured accepting 2,000 symbols
-/// in a 9,424-character URL. This cap is therefore not the API's limit but a bound on request-line
-/// length, which intermediaries do restrict.
+/// Not the API's limit — the endpoint has been measured accepting 2,000 symbols in a
+/// 9,424-character URL — but a bound on request-line length, which intermediaries do restrict.
 ///
-/// Chunking also limits the blast radius of a single failed request, but only because
-/// [`MarketDataClient::fetch_snapshots`] keeps the chunks that succeeded. Propagating the first
-/// error instead would make a smaller cap strictly worse, by giving one failure more chunks to take
-/// down with it.
+/// Chunking also limits the blast radius of one failed request, but only because
+/// [`MarketDataClient::fetch_snapshots`] keeps the chunks that succeeded.
 const SNAPSHOT_SYMBOLS_PER_REQUEST: usize = 1_000;
 
 /// Which consolidated tape the market data API serves from.
 ///
-/// `iex` covers a few percent of consolidated volume, so quoted spreads are wide and often stale
-/// outside the largest names -- computing a pair spread from it introduces noise that looks exactly
-/// like signal. `sip` is the full consolidated tape and requires a paid subscription.
+/// `iex` covers a few percent of consolidated volume, so spreads are wide and often stale outside
+/// the largest names — noise that looks exactly like signal. `sip` is the full tape and needs a
+/// paid subscription.
 ///
-/// An enum rather than a string so an unrecognized value is rejected at the edge, where it can be
-/// reported, instead of reaching Alpaca as an unhelpful 400 on every request of the session.
+/// An enum so an unrecognized value is rejected at the edge rather than reaching Alpaca as a 400 on
+/// every request of the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataFeed {
     Iex,

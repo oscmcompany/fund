@@ -1,12 +1,10 @@
 //! The domain vocabulary every module speaks.
 //!
-//! Two kinds of type live here. **Validated primitives** wrap standard Rust types so unit-mismatch
-//! and sign bugs are compile errors rather than silent runtime surprises. **Record types** mirror
-//! the PostgreSQL tables and the Alpaca payloads they are built from.
+//! **Validated primitives** wrap standard Rust types so unit-mismatch and sign bugs are compile
+//! errors. **Record types** mirror the PostgreSQL tables and Alpaca payloads.
 //!
-//! Both follow the same rule: fields are private and construction goes through a constructor that
-//! validates. A value of one of these types in scope is proof that its invariants held at
-//! construction, so downstream code never re-checks.
+//! Both keep fields private and validate in the constructor, so a value in scope is proof its
+//! invariants held and downstream code never re-checks.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -16,8 +14,7 @@ use uuid::Uuid;
 /// Liquidity thresholds defining the modeled and served equity universe.
 ///
 /// Training applies them per row and inference per ticker average; both sides must use the same
-/// values so the model trains on the population it serves. They were historically mismatched, which
-/// trained the scaler and model on penny-stock dynamics the service never predicts.
+/// values, or the scaler and model learn dynamics the service never predicts.
 pub const MINIMUM_CLOSE_PRICE: f64 = 10.0;
 pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
 
@@ -188,14 +185,10 @@ impl<'de> Deserialize<'de> for Notional {
 
 /// A normalized US equity ticker symbol.
 ///
-/// Enforces the Alpaca US equity ticker format: 1–5 uppercase ASCII letters for the base symbol,
-/// with an optional dot-separated suffix of 1–3 uppercase ASCII letters for share class or warrant
-/// notation (e.g. `BRK.B`, `BRK.WS`).
+/// Enforces the Alpaca US equity ticker format: 1–5 uppercase ASCII letters, with an optional
+/// dot-separated suffix of 1–3 for share class or warrant notation (e.g. `BRK.B`, `BRK.WS`).
 ///
-/// Alpaca asset reference: <https://docs.alpaca.markets/us/reference/get-v2-assets-1>
-///
-/// The private field prevents construction without going through [`Ticker::new`], which trims,
-/// uppercases, and validates. A `Ticker` in scope is proof that the symbol passed format validation.
+/// Reference: <https://docs.alpaca.markets/us/reference/get-v2-assets-1>
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct Ticker(String);
 
@@ -390,19 +383,14 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 
 /// The sampling interval of an OHLCV bar.
 ///
-/// Part of the `equity_bars` primary key, so a single table carries daily and intraday history
-/// together. The post-close sync writes only [`BarInterval::OneDay`]; [`BarInterval::OneMinute`] is
-/// equally permitted by the CHECK constraint and is what `fetch_snapshots` tags Alpaca's `minuteBar`
-/// with in memory. Nothing persists a minute bar today, so treat "daily only" as a property of the
-/// current writer rather than of the table.
+/// Part of the `equity_bars` primary key. The post-close sync writes only
+/// [`BarInterval::OneDay`]; [`BarInterval::OneMinute`] is equally permitted by the CHECK constraint
+/// and is what `fetch_snapshots` tags Alpaca's `minuteBar` with in memory, so "daily only" is a
+/// property of the current writer rather than of the table.
 ///
-/// [`BarInterval::as_str`] is the canonical stored form and must match the `bar_interval` CHECK
-/// constraint in `schema.sql` exactly. It is the snake_case of the variant name — `one_day`, not
-/// `1day` or `1_day` — and that is load-bearing rather than cosmetic: it lets `rename_all` derive
-/// the same string for serde, so serializing and storing cannot drift into two vocabularies. They
-/// previously had: the derive emitted `OneDay` while the parser accepted only the stored form, so
-/// an `EquityBar` written to JSON could not be read back. Intervals added later follow the variant
-/// name the same way: `five_minute`, `fifteen_minute`, `sixty_minute`.
+/// [`BarInterval::as_str`] must match the `bar_interval` CHECK constraint exactly. It is the
+/// snake_case of the variant name, which lets `rename_all` derive the same string for serde so what
+/// is serialized and what is stored cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BarInterval {
@@ -648,12 +636,10 @@ pub struct EquityQuote {
 impl EquityQuote {
     /// Constructs an `EquityQuote`, rejecting a book that cannot be meaningfully averaged.
     ///
-    /// [`EquityQuote::mid_price`] is arithmetic with no opinion about its inputs, so the opinion has
-    /// to live here. A crossed book (bid above ask) or a zero side produces a midpoint that looks
-    /// like a price and is not one — a zero bid against a hundred-dollar ask yields a fifty-dollar
-    /// mid, which is the kind of number that reaches an order.
-    ///
-    /// A locked book (bid equal to ask) is legal and accepted.
+    /// [`EquityQuote::mid_price`] is arithmetic with no opinion about its inputs, so the opinion
+    /// lives here. A crossed book or a zero side yields a midpoint that looks like a price and is
+    /// not one — a zero bid against a hundred-dollar ask gives a fifty-dollar mid, and that reaches
+    /// an order. A locked book (bid equal to ask) is legal and accepted.
     pub fn new(
         ticker: Ticker,
         timestamp: DateTime<Utc>,

@@ -1,15 +1,14 @@
 //! The trading calendar, as Alpaca publishes it.
 //!
 //! Two questions get asked constantly — does the market trade today, and when does it close — and
-//! both are answered from a calendar fetched once and held in memory for the Eastern date. There is
-//! no `market_calendar` table any more: the calendar is reference data that Alpaca owns, and
-//! persisting a copy bought nothing except a second source that could disagree.
+//! both are answered from a calendar fetched once and held in memory for the Eastern date. It is
+//! deliberately not persisted: the calendar is reference data Alpaca owns, and a stored copy is
+//! just a second source that can disagree.
 //!
-//! There is also no hardcoded holiday fallback. The old one could not express a half-day, so every
-//! early close looked like a 16:00 session and the fail-safe liquidation fired hours after the
-//! market had shut. More importantly it made an unreachable Alpaca look like a normal trading day.
-//! **An absent calendar now means "do not trade", not "assume open"** — see
-//! [`TradingCalendar::is_trading_day`], which answers `false` for a date outside its horizon.
+//! There is deliberately no hardcoded holiday fallback: one cannot express a half-day, and it
+//! would make an unreachable Alpaca look like a normal trading day. **An absent calendar means "do
+//! not trade", not "assume open"** — [`TradingCalendar::is_trading_day`] answers `false` outside
+//! its horizon.
 //!
 //! Everything here is Eastern local time, because that is the timezone the trading day actually has.
 
@@ -49,16 +48,13 @@ pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
 
 /// The half-open UTC interval `[start, end)` covering one Eastern calendar date.
 ///
-/// This is the inverse of [`eastern_date`], and it exists so queries can bound a timestamp column
-/// directly instead of converting it. A predicate like
-/// `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column behind an expression,
-/// which stops TimescaleDB excluding chunks and stops the B-tree index being used — on a hypertable
-/// that turns a one-day export into a full scan of every chunk. Resolving the bounds here once and
-/// filtering `column >= $start AND column < $end` keeps the predicate sargable.
+/// The inverse of [`eastern_date`], so queries can bound a timestamp column directly. A predicate
+/// like `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column behind an
+/// expression, defeating chunk exclusion and the index — a one-day export becomes a full scan.
+/// Resolving bounds here keeps `column >= $start AND column < $end` sargable.
 ///
-/// Spring-forward makes local midnight nonexistent in some timezones; Eastern shifts at 02:00, so
-/// midnight is always well-defined here. `earliest()` is nonetheless used rather than `unwrap()`,
-/// with a UTC-midnight fallback, so a timezone database change cannot panic the export.
+/// Eastern shifts at 02:00 so local midnight always exists, but `earliest()` with a UTC fallback is
+/// used anyway so a timezone database change cannot panic the export.
 pub fn eastern_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     let start = eastern_midnight(date);
     let end = eastern_midnight(date + Duration::days(1));

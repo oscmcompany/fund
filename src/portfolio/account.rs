@@ -1,14 +1,12 @@
 //! The post-close account sync: what Alpaca says actually happened.
 //!
-//! Three things come out of this, in order. The session's balances land in `account_snapshots`,
-//! whose `equity` is the reference the *next* session's drawdown gate measures against — that gate
-//! is the reason this table exists. The session's fills land in `account_activities`, keyed by
-//! Alpaca's own activity identifier so a re-run conflicts on every row and changes nothing. Then
-//! the fills are attributed back to the pairs they belong to.
+//! Three things, in order. Balances land in `account_snapshots`, whose `equity` is what the *next*
+//! session's drawdown gate measures against. Fills land in `account_activities`, keyed by Alpaca's
+//! activity identifier so a re-run conflicts on every row and changes nothing. Then the fills are
+//! attributed back to their pairs.
 //!
-//! Attribution is a materialization, not a source. Alpaca's activities remain the truth; the
-//! `realized_profit_and_loss` column exists so the dashboard does not re-join activities to pairs
-//! on ticker and time window on every page load.
+//! Attribution is a materialization, not a source: `realized_profit_and_loss` exists so the
+//! dashboard need not re-join activities to pairs on every page load.
 
 use std::collections::HashMap;
 
@@ -205,10 +203,9 @@ pub struct Attribution {
 /// a sell positive, so a pair that opened and closed cleanly sums to what it made.
 ///
 /// A fill matching more than one pair is counted against **none** of them and reported as
-/// unattributed. That happens when the same symbol was traded in two overlapping pairs, which the
-/// disjointness rule in [`crate::portfolio::screen::select_disjoint`] is supposed to prevent —
-/// so it is a signal that something upstream is wrong, and splitting the fill between the two
-/// candidates would produce two plausible numbers and hide it.
+/// unattributed. That means the same symbol traded in two overlapping pairs, which
+/// [`crate::portfolio::screen::select_disjoint`] is supposed to prevent — so splitting the fill
+/// would produce two plausible numbers and hide an upstream bug.
 pub fn attribute(closed: &[ClosedPair], activities: &[AccountActivity]) -> Attribution {
     let mut realized: HashMap<Uuid, Decimal> = closed
         .iter()
