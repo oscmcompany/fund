@@ -4,10 +4,10 @@
 //! half-synced database. Everything it writes is archival: the trainer fetches its own data from
 //! Massive, so a failed export costs a backup rather than the next day's model.
 //!
-//! Two shapes. **Incremental** tables — events, predictions, bars — are written per session date
-//! under a Hive-partitioned key. **Snapshot** tables — pairs, account state, ticker metadata — are
-//! written whole each night, because a row can change after the day it was created (a pair opened
-//! Monday closes Tuesday, and the closing is the interesting part).
+//! Two shapes. **Incremental** tables — events, predictions, bars, account activities — are written
+//! per session date under a Hive-partitioned key. **Snapshot** tables — pairs, account state,
+//! ticker metadata — are written whole each night, because a row can change after the day it was
+//! created (a pair opened Monday closes Tuesday, and the closing is the interesting part).
 //!
 //! A failure on one table is logged and the rest continue; the caller receives the list so the
 //! completion event can report it.

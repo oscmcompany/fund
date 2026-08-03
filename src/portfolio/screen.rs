@@ -627,8 +627,9 @@ mod tests {
     ///
     /// Two failure modes are avoided deliberately. A series with no idiosyncratic component
     /// correlates at 1.0 and is rejected by `CORRELATION_MAXIMUM`; one whose spread has no variance
-    /// yields an infinite z-score. Either produces zero candidates and every test built on it then
-    /// asserts nothing, which is what `test_the_fixture_yields_at_least_one_candidate` guards.
+    /// is rejected by [`SpreadModel::build`]. Either produces zero candidates and every test built
+    /// on it then asserts nothing, which is what
+    /// `test_the_fixture_yields_at_least_one_candidate` guards.
     fn cointegrated_series(sessions: usize) -> (Vec<f64>, Vec<f64>) {
         let mut leader = Vec::with_capacity(sessions);
         let mut follower = Vec::with_capacity(sessions);

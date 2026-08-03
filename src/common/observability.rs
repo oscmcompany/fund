@@ -15,9 +15,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 /// level; `None` follows stdout. An uncreatable log directory disables file logging rather than
 /// failing.
 ///
-/// The returned `WorkerGuard` MUST be held for the process lifetime — dropping it tears down the
-/// non-blocking writer and buffered lines are lost. `None` when file logging is off. Uses
-/// `try_init`, so repeated calls across tests are a no-op rather than a panic.
+/// `Some` means *this call* installed the file layer, and the `WorkerGuard` MUST then be held for
+/// the process lifetime — dropping it tears down the non-blocking writer and buffered lines are
+/// lost. `None` means it did not, either because file logging is off or because `try_init` found a
+/// subscriber already installed, which is what makes repeated calls across tests a no-op.
 pub fn init_tracing(
     log_file: &str,
     file_filter: Option<&str>,
@@ -85,8 +86,9 @@ pub fn init_tracing(
 
 /// Initialize structured JSON tracing to a file only, with no stdout output.
 ///
-/// Identical to [`init_tracing`] without the stdout layer; used by the dashboard. An unwritable log
-/// directory disables tracing rather than falling back to stdout.
+/// Like [`init_tracing`] but file-only and with no `file_filter` — the file layer always follows
+/// `RUST_LOG`. Used by the dashboard. An unwritable log directory installs nothing at all rather
+/// than falling back to stdout.
 pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 

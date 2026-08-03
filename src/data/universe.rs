@@ -199,9 +199,10 @@ impl UniverseCache {
     /// date.
     ///
     /// The lock is released before the Alpaca call and the liquidity query, and re-taken only to
-    /// store. Two callers on a cold cache may both rebuild, but both are read-only and
-    /// deterministic, so the second store is a harmless overwrite — cheaper than blocking every
-    /// caller for the duration of a cold rebuild.
+    /// store, so two callers on a cold cache may both rebuild and the later completion wins. Both
+    /// reads are read-only and scoped to one Eastern date, over which the universe does not change,
+    /// so the two rebuilds agree in practice — cheaper than blocking every caller for the duration
+    /// of a cold rebuild. Single-flight coordination would be the fix if that ever stopped holding.
     pub async fn get(
         &self,
         client: &TradingClient,

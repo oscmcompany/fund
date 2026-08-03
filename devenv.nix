@@ -332,14 +332,34 @@ in {
     # was initialised while 5432 was taken keeps the shifted port afterwards. The
     # proxy then loops for a minute against a port nothing is listening on and
     # reports "did not start", which is the one thing that had not happened.
+    # Stripped in this order because each step can otherwise hide the next: a query string can
+    # contain a slash, userinfo can contain a colon, and an IPv6 host contains several. Splitting
+    # the authority on its first colon without removing userinfo first reads
+    # `user:password@host:5433` as host `user`, and pg_isready then waits out its timeout against a
+    # host that does not exist.
     test_base="''${TEST_DATABASE_URL_BASE:-postgresql://localhost:5432}"
     test_authority="''${test_base#*//}"
+    test_authority="''${test_authority%%\?*}"
     test_authority="''${test_authority%%/*}"
-    test_host="''${test_authority%%:*}"
-    test_port="''${test_authority#*:}"
-    if [ "$test_port" = "$test_host" ]; then
-      test_port=5432
-    fi
+    test_authority="''${test_authority##*@}"
+    case "$test_authority" in
+      \[*\]*)
+        # Bracketed IPv6. libpq wants the bare address, so the brackets come off.
+        test_host="''${test_authority#\[}"
+        test_host="''${test_host%%\]*}"
+        test_port="''${test_authority##*\]}"
+        test_port="''${test_port#:}"
+        ;;
+      *:*)
+        test_host="''${test_authority%%:*}"
+        test_port="''${test_authority##*:}"
+        ;;
+      *)
+        test_host="$test_authority"
+        test_port=""
+        ;;
+    esac
+    [ -z "$test_port" ] && test_port=5432
 
     postgres_up() {
       pg_isready -q -h "$test_host" -p "$test_port" 2>/dev/null

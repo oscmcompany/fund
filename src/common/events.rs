@@ -250,8 +250,8 @@ pub async fn emit_errored(pool: &PgPool, command: Command, error: &str) -> Resul
 ///
 /// [`Recovery::Skip`] commands are found and dropped, so the caller receives only work worth doing.
 ///
-/// The Eastern date because that is the boundary the trading day has; the two-day bound on
-/// `created_at` keeps the hypertable from scanning every chunk.
+/// The window is the Eastern date because that is the boundary the trading day has, and the
+/// additional two-day bound on `created_at` keeps the hypertable from scanning every chunk.
 pub async fn recover_missed_commands(pool: &PgPool) -> Result<Vec<Command>, EventError> {
     let rows = sqlx::query!(
         r#"

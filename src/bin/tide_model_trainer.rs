@@ -526,8 +526,9 @@ async fn load_archived_bars(
 /// CRPS from the most recent prior runs' `run_metadata.json`, newest first.
 ///
 /// Read from the standalone metadata object rather than from inside the artifact tarball, so a
-/// baseline can be built without downloading every prior run. Failures degrade to an empty history:
-/// a drift baseline that cannot be read is not a reason to fail a training run.
+/// baseline can be built without downloading every prior run. An unreadable run is skipped and the
+/// rest are kept; only an unlistable prefix yields nothing. Either way a drift baseline that cannot
+/// be read is not a reason to fail a training run.
 async fn fetch_prior_crps(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,

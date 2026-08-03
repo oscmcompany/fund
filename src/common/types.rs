@@ -1,7 +1,8 @@
 //! The domain vocabulary every module speaks.
 //!
-//! **Validated primitives** wrap standard Rust types so unit-mismatch and sign bugs are compile
-//! errors. **Record types** mirror the PostgreSQL tables and Alpaca payloads.
+//! **Validated primitives** wrap standard Rust types so a unit mismatch is a compile error and
+//! sign and range constraints are enforced by the constructor. **Record types** mirror the
+//! PostgreSQL tables and Alpaca payloads.
 //!
 //! Both keep fields private and validate in the constructor, so a value in scope is proof its
 //! invariants held and downstream code never re-checks.

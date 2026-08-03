@@ -315,7 +315,7 @@ pub fn generate_predictions(
         }
     }
 
-    // Persist the final horizon step, now + (output_length - 1) days.
+    // Select the final horizon step, now + (output_length - 1) days, for the caller to persist.
     let target_date = step_timestamp_milliseconds(now, output_length - 1);
 
     let final_predictions: Vec<serde_json::Value> = results

@@ -4,9 +4,11 @@
 //! clock, calendar, assets, orders, positions — and the market data API what things *cost*. They
 //! share authentication and an error type and nothing else, which is why one file holds both.
 //!
-//! Deliberately thin, since Alpaca is the source of truth for fills and balances. Ambiguity — a
-//! snapshot with no quote, a calendar day with no duration — is surfaced rather than defaulted,
-//! because a missing value and a zero one are indistinguishable after the fact.
+//! Deliberately thin, since Alpaca is the source of truth for fills and balances. Deserialization
+//! surfaces ambiguity rather than defaulting it — a snapshot with no quote, a calendar day with no
+//! duration — because a missing value and a zero one are indistinguishable after the fact. What to
+//! do about a missing value is left to the consumer: [`Snapshot::reference_price`], for one,
+//! deliberately falls back to the last trade.
 
 use std::collections::HashSet;
 use std::num::NonZeroU32;

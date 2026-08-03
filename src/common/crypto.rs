@@ -1,9 +1,9 @@
 //! Process-wide TLS crypto provider selection.
 //!
 //! The dependency graph pulls in Rustls transitively and enables *both* the `aws-lc-rs` and `ring`
-//! providers. With more than one linked, Rustls cannot pick a process default and panics on the
-//! first TLS handshake. Each request runs on its own Tokio worker thread, so that panic silently
-//! kills threads mid-request and truncates large syncs to a partial result.
+//! providers. With more than one linked, Rustls cannot pick a process default, and the first client
+//! configuration that needs one panics. Requests run as spawned tasks, so the panic surfaces as a
+//! failed task rather than a crash — a large sync comes back truncated instead of erroring.
 //!
 //! Every service binary calls [`install_default_crypto_provider`] as the first statement in `main`,
 //! before any TLS client is constructed.
