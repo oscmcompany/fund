@@ -391,9 +391,10 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 /// The sampling interval of an OHLCV bar.
 ///
 /// Part of the `equity_bars` primary key, so a single table carries daily and intraday history
-/// together. Only [`BarInterval::OneDay`] is ever stored. [`BarInterval::OneMinute`] is not
-/// speculative — Alpaca's snapshot carries a `minuteBar` beside the daily one, and tagging it
-/// correctly is what stops a minute bar being read as a session close.
+/// together. The post-close sync writes only [`BarInterval::OneDay`]; [`BarInterval::OneMinute`] is
+/// equally permitted by the CHECK constraint and is what `fetch_snapshots` tags Alpaca's `minuteBar`
+/// with in memory. Nothing persists a minute bar today, so treat "daily only" as a property of the
+/// current writer rather than of the table.
 ///
 /// [`BarInterval::as_str`] is the canonical stored form and must match the `bar_interval` CHECK
 /// constraint in `schema.sql` exactly. It is the snake_case of the variant name — `one_day`, not
