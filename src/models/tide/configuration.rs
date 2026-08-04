@@ -74,9 +74,23 @@ impl ModelParameters {
         }
     }
 
+    /// Reads parameters from a training artifact, rejecting window lengths of zero.
+    ///
+    /// A zero `output_length` produces no horizon steps, so inference returns an empty set and a
+    /// corrupt artifact is indistinguishable from a session with nothing to forecast. Refusing it
+    /// here keeps the failure at the boundary where the untrusted file is read.
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let params: Self = serde_json::from_str(&content)?;
+        if params.output_length == 0 || params.input_length == 0 {
+            return Err(format!(
+                "Model parameters at {} have a zero window length (input_length {}, output_length {})",
+                path.display(),
+                params.input_length,
+                params.output_length
+            )
+            .into());
+        }
         Ok(params)
     }
 
@@ -160,5 +174,30 @@ mod tests {
         let params: ModelParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.input_size(), 100);
         assert_eq!(params.hidden_size(), 64);
+    }
+
+    #[test]
+    fn test_load_rejects_a_zero_window_length() {
+        // A zero output_length yields no horizon steps, so inference would return an empty set and
+        // the corrupt artifact would read as a session with nothing to forecast.
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, output_length: usize, input_length: usize| {
+            let path = directory.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                         "decoder_layer_count": 2, "output_length": {output_length},
+                         "input_length": {input_length}, "dropout_rate": 0.1,
+                         "quantiles": [0.1, 0.5, 0.9], "huber_delta": 0.5}}"#
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        assert!(ModelParameters::load(&write("zero_output.json", 0, 35)).is_err());
+        assert!(ModelParameters::load(&write("zero_input.json", 1, 0)).is_err());
+        assert!(ModelParameters::load(&write("valid.json", 1, 35)).is_ok());
     }
 }

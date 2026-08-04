@@ -133,15 +133,6 @@ pub(crate) const CATEGORICAL_COLUMNS: &[&str] = &[
 
 pub(crate) const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "industry"];
 
-/// Placeholder written into `ticker` when the source value is null, then matched by the filter in
-/// [`clean_data`] to drop the row.
-///
-/// `into_no_null_iter` silently *skips* nulls, so a null yields a column shorter than the frame,
-/// shifting every later row onto the wrong ticker. The sentinel preserves alignment until the row
-/// can be removed. Sector and industry instead fall back to [`UNKNOWN_SECTOR_OR_INDUSTRY`], which
-/// is a category the model keeps rather than a row it discards.
-pub(crate) const MISSING_TICKER: &str = "UNKNOWN";
-
 /// The model target is the future window of `daily_return`, which is the last
 /// continuous column. Fitting and windowing index into this position.
 pub(crate) const TARGET_COLUMN: &str = "daily_return";
@@ -181,11 +172,18 @@ impl Data {
         }
     }
 
+    /// Inference-only preparation: the training path fits its own scaler and mappings instead.
+    ///
+    /// `target_session` is the session being forecast. It exists because inference has no bar for
+    /// that session yet — see [`append_forecast_session_rows`] — and it must be the same session the
+    /// caller stamps the output with, or the features and the label describe different days.
     pub fn apply_existing_scaler(
         data: DataFrame,
         scaler: &Scaler,
         mappings: &FeatureMappings,
+        target_session: chrono::NaiveDate,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let data = append_forecast_session_rows(data, target_session)?;
         let data = engineer_features(data)?;
         let data = clean_data(data)?;
         let data = apply_scaling(data, scaler)?;
@@ -405,6 +403,89 @@ fn window_frame(
     })
 }
 
+/// Append one row per ticker carrying `target_session`, so the windowing has a future step to spend
+/// that is not a real bar.
+///
+/// [`window_frame`] splits one contiguous block of `input_length + output_length` rows into a past
+/// and a future half. Without this the newest bar is spent as the future calendar step, which both
+/// feeds the model the wrong session's calendar and pushes the most recent close out of the past
+/// window — so a pre-open run forecasts the session that already closed.
+///
+/// The appended row is the ticker's own last bar with `timestamp` moved to the target session.
+/// Copying it rather than inventing values means `close_price` equals the previous close, so the
+/// engineered `daily_return` is `0.0` and survives [`clean_data`]'s non-finite filter, and sector
+/// and industry carry over. None of those prices reach the model: the future half consumes only
+/// [`CATEGORICAL_COLUMNS`], and the extra row shifts the window so the past half lands on real bars.
+/// Calendar fields are left to [`engineer_features`] so only one place derives them.
+///
+/// Tickers already holding a bar at or after the target session are skipped, so a late run cannot
+/// duplicate a real row.
+pub(crate) fn append_forecast_session_rows(
+    data: DataFrame,
+    target_session: chrono::NaiveDate,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    let target_milliseconds =
+        crate::data::calendar::eastern_midnight(target_session).timestamp_millis();
+
+    let sorted = data
+        .sort(
+            ["ticker", "timestamp"],
+            SortMultipleOptions::default().with_maintain_order(true),
+        )
+        .map_err(|e| e.to_string())?;
+
+    let tickers: Vec<&str> = sorted
+        .column("ticker")
+        .map_err(|e| e.to_string())?
+        .str()
+        .map_err(|e| e.to_string())?
+        .into_no_null_iter()
+        .collect();
+    let timestamps: Vec<i64> = sorted
+        .column("timestamp")
+        .map_err(|e| e.to_string())?
+        .i64()
+        .map_err(|e| e.to_string())?
+        .into_no_null_iter()
+        .collect();
+
+    if tickers.len() != sorted.height() || timestamps.len() != sorted.height() {
+        return Err("Equity bars contain null ticker or timestamp values"
+            .to_string()
+            .into());
+    }
+
+    // Rows are sorted, so a ticker's last row is also its newest. Comparing that against the target
+    // both finds the row to copy and skips any ticker already carrying the target session.
+    let mut source_rows: Vec<polars::prelude::IdxSize> = Vec::new();
+    for index in 0..sorted.height() {
+        let is_last_for_ticker =
+            index + 1 == sorted.height() || tickers[index + 1] != tickers[index];
+        if is_last_for_ticker && timestamps[index] < target_milliseconds {
+            source_rows.push(index as polars::prelude::IdxSize);
+        }
+    }
+
+    if source_rows.is_empty() {
+        return Ok(sorted);
+    }
+
+    let source_index = IdxCa::from_vec("index".into(), source_rows);
+    let mut forecast_rows = sorted.take(&source_index).map_err(|e| e.to_string())?;
+    forecast_rows
+        .with_column(Column::new(
+            "timestamp".into(),
+            vec![target_milliseconds; forecast_rows.height()],
+        ))
+        .map_err(|e| e.to_string())?;
+
+    let mut combined = sorted;
+    combined
+        .vstack_mut(&forecast_rows)
+        .map_err(|e| e.to_string())?;
+    Ok(combined)
+}
+
 pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
     // Sort by [ticker, timestamp] so daily returns and the downstream windowing
     // are chronological and contiguous within each ticker, independent of the
@@ -507,14 +588,27 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
 }
 
 pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    // Uppercase ticker, sector, industry columns in-place
-    let ticker_upper: Vec<String> = data
+    // A row with no ticker cannot be attributed to an instrument, and substituting a placeholder
+    // would make it indistinguishable from a real symbol of the same spelling. Reject it the way
+    // `engineer_features` does rather than encoding one and filtering it back out.
+    let tickers = data
         .column("ticker")
         .map_err(|e| e.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|value| value.unwrap_or(MISSING_TICKER).to_uppercase())
+        .map_err(|e| e.to_string())?;
+    if tickers.null_count() > 0 {
+        return Err(format!(
+            "Equity bars contain {} null ticker values out of {} rows",
+            tickers.null_count(),
+            data.height()
+        )
+        .into());
+    }
+
+    // Uppercase ticker, sector, industry columns in-place
+    let ticker_upper: Vec<String> = tickers
+        .into_no_null_iter()
+        .map(|value| value.to_uppercase())
         .collect();
 
     let sector_upper: Vec<String> = data
@@ -542,15 +636,7 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
     data.with_column(Column::new("industry".into(), industry_upper))
         .map_err(|e| e.to_string())?;
 
-    // Drop the rows whose ticker was null.
-    let mask = data
-        .column("ticker")
-        .map_err(|e| e.to_string())?
-        .str()
-        .map_err(|e| e.to_string())?
-        .not_equal(MISSING_TICKER);
-
-    let cleaned = data.filter(&mask).map_err(|e| e.to_string())?;
+    let cleaned = data;
 
     // Drop rows with a null or non-finite value in any continuous column —
     // each ticker's first observation (null return), missing vendor fields
@@ -920,6 +1006,257 @@ mod tests {
                 "{column} fell back to {values:?} instead of the schema default"
             );
         }
+    }
+
+    /// Raw (pre-engineering) frame with string tickers and one bar per consecutive day.
+    ///
+    /// `close_price` is `100 + row`, so a window's contents identify which rows produced them.
+    fn raw_frame(ticker_count: usize, rows_per_ticker: usize) -> DataFrame {
+        let names = ["AAA", "BBB", "CCC"];
+        let total = ticker_count * rows_per_ticker;
+        let mut ticker = Vec::with_capacity(total);
+        let mut timestamp = Vec::with_capacity(total);
+        let mut close = Vec::with_capacity(total);
+        for index in 0..ticker_count {
+            for row in 0..rows_per_ticker {
+                ticker.push(names[index]);
+                let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
+                    + chrono::Duration::days(row as i64);
+                timestamp.push(crate::data::calendar::eastern_midnight(date).timestamp_millis());
+                close.push(100.0 + row as f64);
+            }
+        }
+        DataFrame::new(vec![
+            Column::new("ticker".into(), ticker),
+            Column::new("timestamp".into(), timestamp),
+            Column::new("open_price".into(), vec![1.0_f64; total]),
+            Column::new("high_price".into(), vec![1.0_f64; total]),
+            Column::new("low_price".into(), vec![1.0_f64; total]),
+            Column::new("close_price".into(), close),
+            Column::new("volume".into(), vec![1.0_f64; total]),
+            Column::new("volume_weighted_average_price".into(), vec![1.0_f64; total]),
+            Column::new("sector".into(), vec!["S"; total]),
+            Column::new("industry".into(), vec!["I"; total]),
+        ])
+        .unwrap()
+    }
+
+    /// The session a pre-open run forecasts: the day after the newest bar in the frame.
+    fn forecast_session(frame: &DataFrame) -> chrono::NaiveDate {
+        let newest = frame
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .max()
+            .unwrap();
+        crate::data::calendar::eastern_date(
+            chrono::DateTime::from_timestamp_millis(newest).unwrap(),
+        ) + chrono::Duration::days(1)
+    }
+
+    /// Everything `apply_existing_scaler` does to a frame, minus the scaler and mappings.
+    fn prepared(frame: DataFrame) -> DataFrame {
+        clean_data(engineer_features(frame).unwrap()).unwrap()
+    }
+
+    /// `prepared`, then integer-encoded the way `window_frame` expects. Mappings are fitted from
+    /// the frame itself, mirroring `fit_mappings`, which covers only the static columns.
+    fn prepared_and_encoded(frame: DataFrame) -> DataFrame {
+        let cleaned = prepared(frame);
+        let mut mappings = FeatureMappings::new();
+        for column in STATIC_CATEGORICAL_COLUMNS {
+            let mut values: Vec<String> = cleaned
+                .column(column)
+                .unwrap()
+                .str()
+                .unwrap()
+                .into_no_null_iter()
+                .map(str::to_string)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            values.sort();
+            mappings.insert(
+                (*column).to_string(),
+                values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| (value, index as i32))
+                    .collect(),
+            );
+        }
+        encode_categoricals(cleaned, &mappings).unwrap()
+    }
+
+    #[test]
+    fn test_forecast_row_keeps_the_newest_bar_in_the_past_window() {
+        // Without the appended row the newest bar is spent as the future calendar step, so the
+        // model's price context stops a session short and it forecasts a close that already
+        // happened. close_price is 100 + row, so the window's contents identify their rows.
+        let input_length = 35usize;
+        let output_length = 1usize;
+        let frame = raw_frame(1, 40);
+        let session = forecast_session(&frame);
+
+        let without = window_frame(
+            &prepared_and_encoded(frame.clone()),
+            input_length,
+            output_length,
+            true,
+            false,
+        )
+        .unwrap();
+        let with = window_frame(
+            &prepared_and_encoded(append_forecast_session_rows(frame, session).unwrap()),
+            input_length,
+            output_length,
+            true,
+            false,
+        )
+        .unwrap();
+
+        let close_index = CONTINUOUS_COLUMNS
+            .iter()
+            .position(|column| *column == "close_price")
+            .unwrap();
+        let newest_in_past = |dataset: &TrainingDataset| {
+            dataset.past_continuous[[0, input_length - 1, close_index]] as usize - 100
+        };
+
+        // The newest real bar is row 39. Cleaning drops each ticker's first row, so the frame the
+        // window sees ends there either way -- only the appended row changes which side it lands on.
+        assert_eq!(
+            newest_in_past(&without),
+            38,
+            "precondition: without the appended row the newest bar is not a past feature"
+        );
+        assert_eq!(
+            newest_in_past(&with),
+            39,
+            "the newest real bar must be the last step of the past window"
+        );
+    }
+
+    #[test]
+    fn test_forecast_row_carries_the_target_session_calendar() {
+        // The future step must describe the session being forecast, not the last one observed.
+        let frame = raw_frame(1, 40);
+        let session = forecast_session(&frame);
+        let engineered =
+            engineer_features(append_forecast_session_rows(frame, session).unwrap()).unwrap();
+
+        let target_milliseconds =
+            crate::data::calendar::eastern_midnight(session).timestamp_millis();
+        let timestamps: Vec<i64> = engineered
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        let row = timestamps
+            .iter()
+            .position(|value| *value == target_milliseconds)
+            .expect("the appended session must survive feature engineering");
+
+        let day_of_week: Vec<i32> = engineered
+            .column("day_of_week")
+            .unwrap()
+            .i32()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(
+            day_of_week[row],
+            session.weekday().number_from_monday() as i32,
+            "the appended row's calendar must match the forecast session"
+        );
+    }
+
+    #[test]
+    fn test_forecast_row_survives_cleaning_and_matches_the_stamped_session() {
+        // Two invariants together. The row must survive clean_data -- if it were dropped the window
+        // would silently revert to the misaligned behaviour with no error anywhere. And its session
+        // must equal the one `step_timestamp_milliseconds` stamps, or the features and the label
+        // describe different days, which is the shape of the bug this replaced.
+        let frame = raw_frame(2, 40);
+        let session = forecast_session(&frame);
+        let cleaned = prepared(append_forecast_session_rows(frame, session).unwrap());
+
+        let target_milliseconds =
+            crate::data::calendar::eastern_midnight(session).timestamp_millis();
+        let surviving = cleaned
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .into_no_null_iter()
+            .filter(|value| *value == target_milliseconds)
+            .count();
+        assert_eq!(
+            surviving, 2,
+            "one appended row per ticker must survive cleaning"
+        );
+
+        // Any instant inside the forecast session must stamp that same session.
+        let noon = crate::data::calendar::eastern_midnight(session) + chrono::Duration::hours(12);
+        assert_eq!(
+            crate::models::tide::predict::step_timestamp_milliseconds(noon, 0),
+            target_milliseconds,
+            "the stamped session must be the session the appended row carries"
+        );
+    }
+
+    #[test]
+    fn test_forecast_row_is_not_appended_when_the_session_already_has_a_bar() {
+        // A run after the session's own bar has landed must not duplicate it.
+        let frame = raw_frame(1, 40);
+        let newest = frame
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .max()
+            .unwrap();
+        let already_present = crate::data::calendar::eastern_date(
+            chrono::DateTime::from_timestamp_millis(newest).unwrap(),
+        );
+        let appended = append_forecast_session_rows(frame.clone(), already_present).unwrap();
+        assert_eq!(
+            appended.height(),
+            frame.height(),
+            "no row should be appended for a session already present"
+        );
+    }
+
+    #[test]
+    fn test_clean_data_rejects_a_null_ticker_and_keeps_every_real_one() {
+        // A null ticker is refused rather than encoded as a placeholder and filtered back out.
+        // `engineer_features` already rejects nulls, so this is the guard for a direct caller --
+        // and it means no real symbol can collide with a sentinel spelling and be dropped.
+        let mut engineered = engineer_features(raw_two_ticker_frame()).unwrap();
+        let kept = clean_data(engineered.clone()).unwrap();
+        let survivors: Vec<&str> = kept
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert!(!survivors.is_empty(), "no rows survived cleaning");
+
+        engineered
+            .with_column(Column::new(
+                "ticker".into(),
+                vec![Some("AAA"), None::<&str>, Some("BBB"), Some("BBB")],
+            ))
+            .unwrap();
+        let error = clean_data(engineered).unwrap_err().to_string();
+        assert!(
+            error.contains("null ticker"),
+            "expected a null-ticker rejection, got: {error}"
+        );
     }
 
     #[test]

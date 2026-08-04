@@ -89,7 +89,7 @@ run **multiple experiments in parallel** using Bash background jobs.
 
    ```bash
    git worktree add /tmp/autotrain-variant-1 HEAD
-   # edit config.rs in /tmp/autotrain-variant-1, then:
+   # edit configuration.rs in /tmp/autotrain-variant-1, then:
    cd /tmp/autotrain-variant-1 && secretspec run -- cargo run --release --features train --bin tide_model_trainer
    ```
 
@@ -97,8 +97,8 @@ run **multiple experiments in parallel** using Bash background jobs.
 
 4. **Identify the best performer**.
 
-5. **Apply the winning config** to the `Default` impl in `src/models/tide/config.rs`
-   (for `ModelParameters`) or `src/models/tide/train.rs` (for `TrainConfig`)
+5. **Apply the winning config** to the `Default` impl in `src/models/tide/configuration.rs`
+   (for `ModelParameters`) or `src/models/tide/train.rs` (for `TrainConfiguration`)
    if it beat the previous best. Commit with description.
 
 6. **Log result** to `autotrain/<model-name>/experiments.jsonl` with fields:
@@ -156,16 +156,16 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 Primarily:
 - `src/models/tide/model.rs` (model architecture — TiDEModel, encoder/decoder layers)
 - `src/models/tide/data.rs` (data processing — feature engineering, dataset construction)
-- `src/models/tide/config.rs` (ModelParameters — architecture hyperparameters)
-- `src/models/tide/train.rs` (TrainConfig — learning rate, epochs, batch size, early stopping)
+- `src/models/tide/configuration.rs` (ModelParameters — architecture hyperparameters)
+- `src/models/tide/train.rs` (TrainConfiguration — learning rate, epochs, batch size, early stopping)
 - `src/models/tide/loss.rs` (loss function — quantile loss, huber delta)
 
 ## Key Files
 
 - **Entrypoint**: `src/bin/tide_model_trainer.rs` (loads data, trains, evaluates, uploads artifact)
 - **Model**: `src/models/tide/model.rs` (Burn TiDEModel with encoder/decoder)
-- **Config**: `src/models/tide/config.rs` (ModelParameters with Default impl)
-- **Training**: `src/models/tide/train.rs` (TrainConfig, train loop, early stopping)
+- **Config**: `src/models/tide/configuration.rs` (ModelParameters with Default impl)
+- **Training**: `src/models/tide/train.rs` (TrainConfiguration, train loop, early stopping)
 - **Data**: `src/models/tide/data.rs` (TrainingDataset, feature engineering)
 - **Loss**: `src/models/tide/loss.rs` (quantile loss with huber delta)
 - **Evaluation**: `src/models/tide/evaluate.rs` (CRPS, directional accuracy, quantile coverage)

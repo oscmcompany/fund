@@ -232,8 +232,15 @@ pub fn generate_predictions(
     data: DataFrame,
     model_state: &ModelState,
 ) -> Result<serde_json::Value, PredictionError> {
-    let tide_data = Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings())
-        .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
+    // One `now` for the whole run. The session the synthesized future row carries and the session
+    // the output is stamped with are both derived from it, so the features and the label cannot
+    // describe different days -- which is the shape of the bug this replaced.
+    let now = Utc::now();
+    let session = crate::data::calendar::eastern_date(now);
+
+    let tide_data =
+        Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings(), session)
+            .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
 
     let output_length = model_state.parameters().output_length();
     let dataset_input_length = model_state.parameters().input_length();
@@ -288,8 +295,6 @@ pub fn generate_predictions(
     })?;
     let reverse_ticker_map: std::collections::HashMap<i32, &String> =
         ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
-
-    let now = Utc::now();
 
     for sample_idx in 0..num_samples {
         let ticker_id = dataset.static_categorical[[sample_idx, 0, 0]];
@@ -1093,15 +1098,49 @@ mod tests {
     }
 
     #[test]
-    fn test_step_timestamp_advances_one_day_per_step() {
+    fn test_step_timestamp_advances_one_session_per_step() {
+        // Compared against `eastern_midnight` rather than a fixed 86,400,000 ms stride: successive
+        // Eastern midnights are 23 or 25 hours apart across a daylight-saving transition, so a
+        // fixed stride asserts something that is only true away from March and November.
+        use crate::data::calendar::eastern_midnight;
+
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let step0 = step_timestamp_milliseconds(now, 0);
-        let step1 = step_timestamp_milliseconds(now, 1);
-        let step7 = step_timestamp_milliseconds(now, 7);
-        assert_eq!(step1 - step0, 86_400_000);
-        assert_eq!(step7 - step0, 7 * 86_400_000);
+        let session = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        for step in [0usize, 1, 7] {
+            assert_eq!(
+                step_timestamp_milliseconds(now, step),
+                eastern_midnight(session + Duration::days(step as i64)).timestamp_millis(),
+                "step {step} did not land on its Eastern session midnight"
+            );
+        }
+    }
+
+    #[test]
+    fn test_step_timestamp_crosses_daylight_saving_transitions() {
+        // Eastern time springs forward 2026-03-08 and falls back 2026-11-01. Stepping across either
+        // boundary must still land on the session's own midnight, which a fixed day-length stride
+        // would miss by an hour in each direction.
+        use crate::data::calendar::eastern_midnight;
+
+        for (start, label) in [
+            ("2026-03-06T17:00:00Z", "spring forward"),
+            ("2026-10-30T17:00:00Z", "fall back"),
+        ] {
+            let now = chrono::DateTime::parse_from_rfc3339(start)
+                .unwrap()
+                .with_timezone(&Utc);
+            let session = crate::data::calendar::eastern_date(now);
+            for step in 0..5usize {
+                let expected = eastern_midnight(session + Duration::days(step as i64));
+                assert_eq!(
+                    step_timestamp_milliseconds(now, step),
+                    expected.timestamp_millis(),
+                    "{label}: step {step} did not land on {expected}"
+                );
+            }
+        }
     }
 
     #[test]
