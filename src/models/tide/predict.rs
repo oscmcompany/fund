@@ -5,13 +5,14 @@
 //! mismatch trains the scaler on dynamics the service never predicts.
 
 use burn::backend::NdArray;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::types::{EquityPrediction, Ticker};
+use crate::data::calendar::SessionDate;
 use crate::models::tide::artifact::ModelState;
 use crate::models::tide::data::Data;
 
@@ -224,8 +225,8 @@ pub(crate) fn unscale_and_sort_quantiles(
 /// Eastern day under daylight time -- so a UTC-stamped forecast lands in the wrong session's
 /// window and the morning's inference run is never read by that day's passes.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
-    let session = crate::data::calendar::eastern_date(now) + Duration::days(step as i64);
-    crate::data::calendar::eastern_midnight(session).timestamp_millis()
+    let session = SessionDate::at(now).plus_calendar_days(step as i64);
+    session.midnight().timestamp_millis()
 }
 
 pub fn generate_predictions(
@@ -236,7 +237,7 @@ pub fn generate_predictions(
     // the output is stamped with are both derived from it, so the features and the label cannot
     // describe different days -- which is the shape of the bug this replaced.
     let now = Utc::now();
-    let session = crate::data::calendar::eastern_date(now);
+    let session = SessionDate::at(now);
 
     let tide_data =
         Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings(), session)
@@ -752,7 +753,7 @@ mod tests {
         // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
         // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
         // morning is never the one read this afternoon.
-        use crate::data::calendar::{eastern_date, eastern_day_bounds};
+        use crate::data::calendar::SessionDate;
 
         for day in [
             "2026-08-03",
@@ -767,7 +768,7 @@ mod tests {
                 .with_timezone(&Utc);
             let stamp = DateTime::<Utc>::from_timestamp_millis(step_timestamp_milliseconds(now, 0))
                 .unwrap();
-            let (start, end) = eastern_day_bounds(eastern_date(now));
+            let (start, end) = SessionDate::at(now).bounds();
             assert!(
                 stamp >= start && stamp < end,
                 "{day}: forecast stamped {stamp} is outside the session window [{start}, {end})"
@@ -779,19 +780,19 @@ mod tests {
     fn test_step_timestamp_step_zero_is_the_current_eastern_session() {
         // Step t is the Eastern session t days out, stamped at Eastern midnight. 15:30Z is 11:30
         // Eastern, so step 0 is that same session rather than the one UTC is already into.
-        use crate::data::calendar::eastern_midnight;
+        use crate::data::calendar::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let session = chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap());
         assert_eq!(
             step_timestamp_milliseconds(now, 0),
-            eastern_midnight(session).timestamp_millis()
+            session.midnight().timestamp_millis()
         );
         assert_eq!(
             step_timestamp_milliseconds(now, 4),
-            eastern_midnight(session + Duration::days(4)).timestamp_millis()
+            session.plus_calendar_days(4).midnight().timestamp_millis()
         );
     }
 
@@ -799,14 +800,15 @@ mod tests {
     fn test_late_evening_eastern_still_stamps_the_current_session() {
         // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
         // forecast a session forward, which is the failure this function exists to avoid.
-        use crate::data::calendar::eastern_midnight;
+        use crate::data::calendar::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
             step_timestamp_milliseconds(now, 0),
-            eastern_midnight(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap())
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap())
+                .midnight()
                 .timestamp_millis()
         );
     }
@@ -1102,16 +1104,20 @@ mod tests {
         // Compared against `eastern_midnight` rather than a fixed 86,400,000 ms stride: successive
         // Eastern midnights are 23 or 25 hours apart across a daylight-saving transition, so a
         // fixed stride asserts something that is only true away from March and November.
-        use crate::data::calendar::eastern_midnight;
+        use crate::data::calendar::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let session = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        let session =
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
         for step in [0usize, 1, 7] {
             assert_eq!(
                 step_timestamp_milliseconds(now, step),
-                eastern_midnight(session + Duration::days(step as i64)).timestamp_millis(),
+                session
+                    .plus_calendar_days(step as i64)
+                    .midnight()
+                    .timestamp_millis(),
                 "step {step} did not land on its Eastern session midnight"
             );
         }
@@ -1122,7 +1128,7 @@ mod tests {
         // Eastern time springs forward 2026-03-08 and falls back 2026-11-01. Stepping across either
         // boundary must still land on the session's own midnight, which a fixed day-length stride
         // would miss by an hour in each direction.
-        use crate::data::calendar::eastern_midnight;
+        use crate::data::calendar::SessionDate;
 
         for (start, label) in [
             ("2026-03-06T17:00:00Z", "spring forward"),
@@ -1131,9 +1137,9 @@ mod tests {
             let now = chrono::DateTime::parse_from_rfc3339(start)
                 .unwrap()
                 .with_timezone(&Utc);
-            let session = crate::data::calendar::eastern_date(now);
+            let session = SessionDate::at(now);
             for step in 0..5usize {
-                let expected = eastern_midnight(session + Duration::days(step as i64));
+                let expected = session.plus_calendar_days(step as i64).midnight();
                 assert_eq!(
                     step_timestamp_milliseconds(now, step),
                     expected.timestamp_millis(),

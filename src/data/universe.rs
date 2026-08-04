@@ -15,13 +15,13 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::info;
 
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
 use crate::common::types::{BarInterval, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use crate::data::calendar::eastern_date;
+use crate::data::calendar::SessionDate;
 
 /// Trailing window over which liquidity is averaged.
 ///
@@ -149,9 +149,9 @@ impl Universe {
 /// threshold and reject the entire universe.
 pub async fn load_liquidity(
     pool: &PgPool,
-    as_of: NaiveDate,
+    as_of: SessionDate,
 ) -> Result<Vec<LiquidityRow>, sqlx::Error> {
-    let start = as_of - chrono::Duration::days(LIQUIDITY_LOOKBACK_DAYS);
+    let start = as_of.plus_calendar_days(-LIQUIDITY_LOOKBACK_DAYS);
     let rows = sqlx::query!(
         r#"
         SELECT ticker AS "ticker!",
@@ -163,10 +163,7 @@ pub async fn load_liquidity(
         GROUP BY ticker
         "#,
         BarInterval::OneDay.as_str(),
-        start
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is a valid time")
-            .and_utc(),
+        start.midnight(),
     )
     .fetch_all(pool)
     .await?;
@@ -187,7 +184,7 @@ pub async fn load_liquidity(
 /// restart mid-session repopulates rather than trading an empty universe until the next morning.
 #[derive(Default)]
 pub struct UniverseCache {
-    inner: tokio::sync::Mutex<Option<(NaiveDate, Universe)>>,
+    inner: tokio::sync::Mutex<Option<(SessionDate, Universe)>>,
 }
 
 impl UniverseCache {
@@ -209,7 +206,7 @@ impl UniverseCache {
         pool: &PgPool,
         now: DateTime<Utc>,
     ) -> Result<Universe, UniverseError> {
-        let today = eastern_date(now);
+        let today = SessionDate::at(now);
 
         if let Some((cached_date, universe)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
@@ -237,7 +234,7 @@ impl UniverseCache {
 
     /// Replaces the cached universe. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, universe: Universe) {
-        *self.inner.lock().await = Some((eastern_date(now), universe));
+        *self.inner.lock().await = Some((SessionDate::at(now), universe));
     }
 }
 

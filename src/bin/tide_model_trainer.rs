@@ -15,7 +15,7 @@ use std::io::Cursor;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::Utc;
 use polars::prelude::*;
 use tracing::{error, info, warn};
 
@@ -24,7 +24,7 @@ use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
 use fund::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use fund::data::bars;
-use fund::data::calendar::{eastern_date, is_weekend};
+use fund::data::calendar::SessionDate;
 use fund::data::details;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
@@ -95,9 +95,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let s3_client = fund::common::aws::s3_client().await;
 
+    // One instant for the whole run, resolved once to its Eastern session.
+    //
+    // The stages disagreed before: the fetch keyed archive partitions by the Eastern date while the
+    // load walked them by the UTC date, and a run that crossed UTC midnight -- which one starting at
+    // 23:00 UTC does whenever training takes over an hour -- read a window shifted a day off the one
+    // it had just written, silently dropping its oldest session. Deriving every date below from this
+    // one value is what makes the stages agree regardless of how long training takes.
+    let now = Utc::now();
+    let session = SessionDate::at(now);
+
     info!(
         bucket,
-        artifact_prefix, lookback_days, "Starting tide training"
+        artifact_prefix,
+        lookback_days,
+        %session,
+        "Starting tide training"
     );
 
     // --- stage one: fetch and archive ---
@@ -105,14 +118,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // A failure here is logged and stepped over rather than fatal. The archive already holds a
     // year; a night with no new partition trains on 364 days instead of 365, which is a far better
     // outcome than publishing no model because Massive was briefly unreachable.
-    match fetch_and_archive(&s3_client, &bucket).await {
+    match fetch_and_archive(&s3_client, &bucket, session).await {
         Ok(rows) => info!(rows, "Session bars archived"),
         Err(error) => warn!(%error, "Fetch stage failed; training on the existing archive"),
     }
 
     // --- stage two: load the accumulated window ---
 
-    let equity_bars = load_archived_bars(&s3_client, &bucket, lookback_days).await?;
+    let equity_bars = load_archived_bars(&s3_client, &bucket, lookback_days, session).await?;
     info!(rows = equity_bars.height(), "Loaded equity bars from S3");
 
     let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
@@ -196,7 +209,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The run identifier is a sortable timestamp, and the application reads its date prefix to
     // report how stale the model it is serving is. A different format would silently turn that
     // staleness field into "unknown" on every session.
-    let timestamp = Utc::now().format("%Y-%m-%d-%H-%M-%S-%3f").to_string();
+    //
+    // Eastern, not UTC, because that date prefix is read back as a *session*. Stamped in UTC it
+    // named the session after next whenever training crossed midnight, so the same artifact
+    // reported a different staleness depending only on how long it had taken to build.
+    //
+    // Still sortable: `resolve_artifact_key` picks the lexicographically greatest folder, and
+    // Eastern local time is monotonic except across the hour that repeats on the autumn transition
+    // -- 01:00 Eastern on a Sunday, which a weekday 23:00 UTC schedule cannot reach.
+    let timestamp = fund::data::calendar::eastern_datetime(now)
+        .format("%Y-%m-%d-%H-%M-%S-%3f")
+        .to_string();
     let model_key = format!("{artifact_prefix}{timestamp}/output/model.tar.gz");
     upload_artifact(
         &s3_client,
@@ -241,16 +264,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    let end_date = Utc::now().date_naive();
-    let start_date = end_date - Duration::days(lookback_days);
+    let end_date = session;
+    let start_date = end_date.plus_calendar_days(-lookback_days);
     let metadata = serde_json::json!({
         "artifact_timestamp": timestamp,
         "input_size": input_size,
         "input_length": INPUT_LENGTH,
         "output_length": OUTPUT_LENGTH,
         "lookback_days": lookback_days,
-        "start_date": start_date.format("%Y-%m-%d").to_string(),
-        "end_date": end_date.format("%Y-%m-%d").to_string(),
+        "start_date": start_date.to_string(),
+        "end_date": end_date.to_string(),
         "epochs_run": losses.len(),
         "final_train_loss": losses.last().copied().unwrap_or_default(),
         "metrics": metrics,
@@ -360,13 +383,14 @@ fn training_configuration() -> Result<TrainConfiguration, Box<dyn std::error::Er
 async fn fetch_and_archive(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
+    session: SessionDate,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let client = MassiveClient::from_env()?;
 
-    let end = most_recent_weekday(eastern_date(Utc::now()));
-    let start = end - Duration::days(FETCH_LOOKBACK_SESSIONS * 2);
-    let dates: Vec<NaiveDate> = (0..=(end - start).num_days())
-        .map(|offset| start + Duration::days(offset))
+    let end = most_recent_weekday(session);
+    let start = end.plus_calendar_days(-(FETCH_LOOKBACK_SESSIONS * 2));
+    let dates: Vec<SessionDate> = (0..=(end.date() - start.date()).num_days())
+        .map(|offset| start.plus_calendar_days(offset))
         .collect();
     info!(%start, %end, dates = dates.len(), "Fetching session bars from Massive");
 
@@ -385,18 +409,18 @@ async fn fetch_and_archive(
 
     // One partition per session date, so the archive stays date-partitioned and the loader below
     // can walk it a day at a time.
-    let mut by_date: std::collections::BTreeMap<NaiveDate, Vec<_>> =
+    let mut by_date: std::collections::BTreeMap<SessionDate, Vec<_>> =
         std::collections::BTreeMap::new();
     for bar in fetched.bars {
         by_date
-            .entry(eastern_date(bar.timestamp()))
+            .entry(SessionDate::at(bar.timestamp()))
             .or_default()
             .push(bar);
     }
 
     let mut written = 0;
     for (date, bars_for_date) in by_date {
-        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date);
+        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date.date());
         let fetched_frame = bars::bars_to_dataframe(&bars_for_date)?;
 
         // Merged with whatever the partition already holds, not written over it. This matters less
@@ -483,10 +507,10 @@ fn merge_partitions(
 /// A weekday check rather than a calendar lookup. The trainer would otherwise need the published
 /// calendar for one date arithmetic, and a request for a holiday's partition simply returns nothing
 /// — which the loader below already steps over.
-fn most_recent_weekday(date: NaiveDate) -> NaiveDate {
+fn most_recent_weekday(date: SessionDate) -> SessionDate {
     let mut candidate = date;
-    while is_weekend(candidate) {
-        candidate = candidate.pred_opt().unwrap_or(candidate);
+    while candidate.is_weekend() {
+        candidate = candidate.plus_calendar_days(-1);
     }
     candidate
 }
@@ -500,21 +524,19 @@ async fn load_archived_bars(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     lookback_days: i64,
+    session: SessionDate,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    let end_date = Utc::now().date_naive();
-    let start_date = end_date - Duration::days(lookback_days);
+    let end_date = session;
+    let start_date = end_date.plus_calendar_days(-lookback_days);
 
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut date = start_date;
     while date <= end_date {
-        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date);
+        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date.date());
         if let Some(frame) = read_partition(s3_client, bucket, &key).await? {
             frames.push(frame.lazy());
         }
-        date = match date.succ_opt() {
-            Some(next_date) => next_date,
-            None => break,
-        };
+        date = date.plus_calendar_days(1);
     }
 
     if frames.is_empty() {
@@ -577,6 +599,7 @@ async fn fetch_prior_crps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
     use serial_test::serial;
 
     /// RAII guard restoring one environment variable on drop, so an assertion failure cannot leave
@@ -609,8 +632,10 @@ mod tests {
         }
     }
 
-    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid")
+    fn date(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(
+            NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
+        )
     }
 
     #[test]

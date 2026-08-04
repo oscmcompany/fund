@@ -12,11 +12,12 @@
 
 mod common;
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, Utc};
 use fund::common::alpaca::AccountSnapshot;
 use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{PairID, Ticker};
 use fund::dashboard::database::fetch_dashboard_data;
+use fund::data::calendar::SessionDate;
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};
 use rust_decimal::Decimal;
@@ -50,7 +51,7 @@ async fn fresh_pool() -> PgPool {
     pool
 }
 
-async fn store_equity(pool: &PgPool, session_date: NaiveDate, equity: &str) {
+async fn store_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
     let snapshot = AccountSnapshot::new(
         decimal(equity),
         decimal("50000"),
@@ -116,10 +117,10 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
             .expect("Failed to attribute realized profit and loss")
     );
 
-    store_equity(&pool, (now - Duration::days(1)).date_naive(), "1000000").await;
-    store_equity(&pool, now.date_naive(), "1010000").await;
+    store_equity(&pool, SessionDate::at(now - Duration::days(1)), "1000000").await;
+    store_equity(&pool, SessionDate::at(now), "1010000").await;
 
-    common::seed_bar(&pool, "AAPL", now.date_naive(), 190.0).await;
+    common::seed_bar(&pool, "AAPL", SessionDate::at(now), 190.0).await;
     common::seed_predictions(
         &pool,
         "run-dashboard",

@@ -14,13 +14,13 @@
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::aws::date_partitioned_key;
-use crate::data::calendar::eastern_day_bounds;
+use crate::data::calendar::SessionDate;
 
 /// What one nightly export accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -51,7 +51,7 @@ pub async fn export_database(
     pool: &PgPool,
     s3_client: &S3Client,
     bucket: &str,
-    date: NaiveDate,
+    date: SessionDate,
 ) -> ExportSummary {
     let mut summary = ExportSummary::default();
 
@@ -59,7 +59,7 @@ pub async fn export_database(
         ($dataset:expr, $prefix:expr, $frame:expr) => {
             match $frame.await {
                 Ok(mut frame) => {
-                    let key = date_partitioned_key($prefix, date);
+                    let key = date_partitioned_key($prefix, date.date());
                     match write_frame(s3_client, bucket, &key, &mut frame).await {
                         Ok(()) => summary
                             .exported
@@ -76,7 +76,7 @@ pub async fn export_database(
 
     // Resolved once and passed to every incremental query. Bounding the timestamp column directly
     // keeps the predicate sargable; see `eastern_day_bounds`.
-    let (start, end) = eastern_day_bounds(date);
+    let (start, end) = date.bounds();
 
     export!("events", "exports/events", events_frame(pool, start, end));
     export!(

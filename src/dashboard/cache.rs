@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::postgres::PgListener;
@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 
 use crate::common::events::Notification;
 use crate::common::types::{PairID, Ticker};
+use crate::data::calendar::SessionDate;
 use crate::portfolio::pairs::CloseReason;
 
 /// How often the background task refreshes every view from PostgreSQL.
@@ -35,7 +36,7 @@ const EVENT_BUFFER_CAPACITY: usize = 500;
 /// One session's account state, as Alpaca reported it after the close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
-    pub session_date: NaiveDate,
+    pub session_date: SessionDate,
     pub equity: Decimal,
     pub cash: Decimal,
     pub buying_power: Decimal,
@@ -268,7 +269,7 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{NaiveDate, TimeZone};
     use std::str::FromStr;
 
     fn decimal(value: &str) -> Decimal {
@@ -277,7 +278,9 @@ mod tests {
 
     fn snapshot(long: &str, short: &str) -> AccountSnapshot {
         AccountSnapshot {
-            session_date: NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid test date"),
+            session_date: SessionDate::from_date(
+                NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid test date"),
+            ),
             equity: decimal("100000"),
             cash: decimal("50000"),
             buying_power: decimal("200000"),

@@ -30,13 +30,35 @@ pub fn render_html(state: &DashboardState) -> String {
     render_html_at(state, Utc::now())
 }
 
+/// Formats an instant for display: Eastern wall clock, with the zone stated.
+///
+/// Every timestamp on this page goes through here, so the page cannot mix zones. Eastern rather
+/// than UTC because that is the timezone the trading day has — rendered in UTC, the page disagreed
+/// with the session it was describing for the last four or five hours of every evening, which is
+/// exactly when an operator is checking whether the post-close jobs ran and exactly when the UTC
+/// date has already rolled over to tomorrow.
+///
+/// Elapsed times — [`format_age`], holding durations — are differences between two instants and
+/// carry no zone, so they do not come through here.
+fn eastern_stamp(instant: DateTime<Utc>, format: &str) -> String {
+    format!(
+        "{} ET",
+        crate::data::calendar::eastern_datetime(instant).format(format)
+    )
+}
+
 /// Renders the page as of `now`.
 ///
 /// The clock is a parameter so the age calculations can be tested at a fixed instant rather than
 /// whenever the suite happens to run.
 fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
-    let date_string = now.format("%d-%b-%Y").to_string().to_uppercase();
-    let time_string = now.format("%H:%M:%S UTC").to_string();
+    // The date carries no suffix of its own; the time sits beside it in the header and states the
+    // zone for both.
+    let date_string = crate::data::calendar::eastern_datetime(now)
+        .format("%d-%b-%Y")
+        .to_string()
+        .to_uppercase();
+    let time_string = eastern_stamp(now, "%H:%M:%S");
     let updated = render_updated_line(state, now);
     let freshness = render_freshness_line(state, now);
     let account = render_account_section(state);
@@ -217,7 +239,7 @@ fn render_predictions_section(state: &DashboardState) -> String {
         (Some(run_id), Some(timestamp)) => format!(
             "Run {} at {}",
             html_escape(run_id),
-            timestamp.format("%Y-%m-%d %H:%M UTC")
+            eastern_stamp(timestamp, "%Y-%m-%d %H:%M")
         ),
         (Some(run_id), None) => format!("Run {}", html_escape(run_id)),
         _ => "Run unknown".to_string(),
@@ -259,7 +281,7 @@ fn render_closed_pairs_section(state: &DashboardState) -> String {
                 pair.entry_z_score,
                 html_escape(pair.close_reason.as_str()),
                 format_holding(pair.holding_hours()),
-                pair.closed_at.format("%Y-%m-%d %H:%M"),
+                eastern_stamp(pair.closed_at, "%Y-%m-%d %H:%M"),
             )
         })
         .collect();
@@ -304,7 +326,7 @@ fn render_events_section(state: &DashboardState) -> String {
         .map(|event| {
             format!(
                 r#"<tr><td>{}</td><td class="{}">{}</td><td>{}</td></tr>"#,
-                event.created_at.format("%Y-%m-%d %H:%M:%S"),
+                eastern_stamp(event.created_at, "%Y-%m-%d %H:%M:%S"),
                 event_css_class(&event.event_type),
                 html_escape(&event.event_type),
                 html_escape(&truncate_payload(&event.payload)),
@@ -559,7 +581,9 @@ mod tests {
 
         DashboardState {
             account: Some(AccountSnapshot {
-                session_date: NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid date"),
+                session_date: crate::data::calendar::SessionDate::from_date(
+                    NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid date"),
+                ),
                 equity: decimal("1234567.89"),
                 cash: decimal("500000"),
                 buying_power: decimal("2000000"),
@@ -632,6 +656,36 @@ mod tests {
         assert!(html.contains("run-2026-07-31"));
         assert!(html.contains("portfolio_evaluation_completed"));
         assert!(html.contains("convergence=1"));
+    }
+
+    /// Every timestamp on the page is Eastern, and none is left unlabelled.
+    ///
+    /// The fixture instant is 20:00 UTC, which is 16:00 Eastern, so the two cannot be confused: a
+    /// regression to UTC brings the 20:00 back and the assertion fails rather than passing on a
+    /// shared substring. The closed pair at 19:00 UTC and the event at 19:55 UTC are checked for
+    /// the same reason — they are the two columns that used to render with no zone at all.
+    #[test]
+    fn test_every_timestamp_renders_in_eastern_and_says_so() {
+        let html = render_html_at(&populated_state(), now());
+
+        assert!(html.contains("16:00:00 ET"), "the header must be Eastern");
+        assert!(
+            html.contains("2026-07-31 15:00 ET"),
+            "the closed pair's 19:00 UTC close must render as 15:00 Eastern"
+        );
+        assert!(
+            html.contains("2026-07-31 15:55:00 ET"),
+            "the event's 19:55 UTC instant must render as 15:55 Eastern"
+        );
+
+        assert!(
+            !html.contains("20:00:00"),
+            "the UTC wall clock must not appear anywhere"
+        );
+        assert!(
+            !html.contains("UTC"),
+            "no timestamp may still be labelled UTC"
+        );
     }
 
     /// A failed poll must say so. Serving the previous numbers under a header that reads "Updated

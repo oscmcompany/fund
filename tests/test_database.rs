@@ -5,11 +5,11 @@
 //! database; the notify trigger only fires in the database; the alignment guarantee in
 //! `load_aligned_closes` depends on how the query is planned, not on how the Rust reads.
 //!
-//! Session windows are always built with `eastern_day_bounds(eastern_date(now))`, never
-//! `eastern_day_bounds(now.date_naive())`. The second is the UTC calendar date, which between 20:00
-//! Eastern and midnight names *tomorrow* — so the window starts four hours in the future and
-//! excludes the rows the test just seeded. It is the trading day these queries are bounded by, and
-//! a test that assumes the two coincide fails for four hours every evening.
+//! Session windows are always built with `SessionDate::at(now).bounds()`, never from
+//! `now.date_naive()`. The second is the UTC calendar date, which between 20:00 Eastern and
+//! midnight names *tomorrow* — so the window starts four hours in the future and excludes the rows
+//! the test just seeded. It is the trading day these queries are bounded by, and a test that
+//! assumes the two coincide fails for four hours every evening.
 
 mod common;
 
@@ -17,7 +17,7 @@ use chrono::{Duration, NaiveDate, Utc};
 use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, Ticker};
 use fund::data::bars;
-use fund::data::calendar::{eastern_date, eastern_day_bounds};
+use fund::data::calendar::SessionDate;
 use fund::models::tide::predict;
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};
@@ -100,7 +100,7 @@ async fn test_closing_an_already_closed_pair_changes_nothing() {
         .await
         .unwrap());
 
-    let (start, end) = eastern_day_bounds(eastern_date(now));
+    let (start, end) = SessionDate::at(now).bounds();
     let closed = pairs::load_closed_between(&pool, start, end).await.unwrap();
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].close_reason(), CloseReason::Convergence);
@@ -232,7 +232,7 @@ async fn test_an_account_snapshot_overwrites_the_same_session() {
     use fund::common::alpaca::AccountSnapshot;
 
     let pool = fresh_pool().await;
-    let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
     let snapshot = |equity: i64| {
         AccountSnapshot::new(
             Decimal::from(equity),
@@ -262,7 +262,7 @@ async fn test_an_account_snapshot_overwrites_the_same_session() {
 #[serial]
 async fn test_a_session_with_no_snapshot_reads_as_none() {
     let pool = fresh_pool().await;
-    let date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
     assert_eq!(account::load_equity_for(&pool, date).await.unwrap(), None);
 }
 
@@ -277,10 +277,13 @@ async fn test_a_session_with_no_snapshot_reads_as_none() {
 #[serial]
 async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
     let pool = fresh_pool().await;
-    let today = Utc::now().date_naive();
+    let today = SessionDate::at(Utc::now());
 
+    // Negative: the window this loader serves is trailing history, so the fixture must run
+    // backwards from today. Seeding forwards puts the whole window in the future, and the
+    // alignment assertion then proves nothing about the historical lower bound.
     for offset in 0..5 {
-        let date = today - Duration::days(offset);
+        let date = today.plus_calendar_days(-offset);
         common::seed_bar(&pool, "AAAA", date, 100.0 + offset as f64).await;
         // BBBB is missing one session in the middle of the window.
         if offset != 2 {
@@ -306,10 +309,10 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
 #[serial]
 async fn test_aligned_closes_reads_only_the_requested_interval() {
     let pool = fresh_pool().await;
-    let today = Utc::now().date_naive();
+    let today = SessionDate::at(Utc::now());
     common::seed_bar(&pool, "AAAA", today, 100.0).await;
 
-    let timestamp = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let timestamp = today.midnight();
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
@@ -334,7 +337,7 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
 async fn test_predictions_are_bounded_to_the_session_window() {
     let pool = fresh_pool().await;
     let now = Utc::now();
-    let (start, end) = eastern_day_bounds(eastern_date(now));
+    let (start, end) = SessionDate::at(now).bounds();
 
     common::seed_predictions(&pool, "run-today", &[("AAAA", 0.03)], now).await;
     common::seed_predictions(
@@ -360,7 +363,7 @@ async fn test_predictions_are_bounded_to_the_session_window() {
 async fn test_predictions_return_the_newest_row_per_ticker() {
     let pool = fresh_pool().await;
     let now = Utc::now();
-    let (start, end) = eastern_day_bounds(eastern_date(now));
+    let (start, end) = SessionDate::at(now).bounds();
 
     common::seed_predictions(
         &pool,

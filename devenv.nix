@@ -418,7 +418,13 @@ in {
     # test_dashboard is not optional cover. The dashboard is the only part of the
     # tree using raw sqlx::query rather than the checked macros, so nothing else
     # catches a mistyped column there until the page is loaded.
-    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard"
+    #
+    # test_schedules is the exception to the paragraph above: it needs neither
+    # PostgreSQL nor MinIO, because it reads schema.sql as text. It is here
+    # because the pg_cron blocks it checks are stripped out by
+    # tests/common/mod.rs before the schema is applied, so the trading schedules
+    # have no other executable cover at all.
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)
@@ -621,6 +627,29 @@ in {
     # A fixed UTC hour is what makes that true year-round. 06:00 UTC, the previous schedule, is
     # 01:00 or 02:00 Eastern -- after the close it was named for, but on the wrong side of
     # midnight, so the run and the session it served never shared a date.
+    #
+    # CRON_TZ pins the hour to UTC in the crontab itself. Every other schedule in this system says
+    # which timezone it is in -- pg_cron has `cron.timezone = UTC` in the settings above -- and this
+    # one was reading it from host state nobody sets, so "23:00 UTC" was a hope rather than a fact.
+    #
+    # Checked independently of the entry below, for the reason in the comment at the top of this
+    # script: a machine provisioned before the pin existed has the training entry already, so a
+    # check that rode along with it would never run there.
+    #
+    # A crontab variable applies only to the entries *below* it, so presence is not proof. A second
+    # assignment above the trainer entry would leave that schedule in the host timezone while a
+    # grep for CRON_TZ=UTC anywhere still passed. Rather than test for that, this normalizes: every
+    # CRON_TZ line is stripped and exactly one is prepended, so the managed crontab carries a single
+    # timezone declaration at the top and every entry inherits it regardless of the order they were
+    # installed in. Idempotent, and it makes the invariant true instead of merely checked.
+    if [ "$(crontab -l 2>/dev/null | grep -c '^CRON_TZ=' || true)" = "1" ] \
+       && crontab -l 2>/dev/null | head -n 1 | grep -qE '^CRON_TZ=UTC$'; then
+      echo "Cron timezone already pinned to UTC"
+    else
+      (echo 'CRON_TZ=UTC'; crontab -l 2>/dev/null | grep -v '^CRON_TZ=' || true) | crontab -
+      echo "Pinned cron timezone to UTC (host is $(date +%Z), offset $(date +%z))"
+    fi
+
     if crontab -l 2>/dev/null | grep -qF 'train-tide-model'; then
       echo "Training cron entry already installed"
     else
