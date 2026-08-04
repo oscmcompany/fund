@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct ModelParameters {
     input_size: usize,
     hidden_size: usize,
-    num_encoder_layers: usize,
-    num_decoder_layers: usize,
+    encoder_layer_count: usize,
+    decoder_layer_count: usize,
     output_length: usize,
     input_length: usize,
     dropout_rate: f64,
@@ -23,8 +23,8 @@ impl Default for ModelParameters {
         Self {
             input_size: 0,
             hidden_size: 64,
-            num_encoder_layers: 3,
-            num_decoder_layers: 2,
+            encoder_layer_count: 3,
+            decoder_layer_count: 2,
             output_length: 5,
             input_length: 35,
             dropout_rate: 0.1,
@@ -53,8 +53,8 @@ impl ModelParameters {
     pub fn for_tests(
         input_size: usize,
         hidden_size: usize,
-        num_encoder_layers: usize,
-        num_decoder_layers: usize,
+        encoder_layer_count: usize,
+        decoder_layer_count: usize,
         output_length: usize,
         input_length: usize,
         dropout_rate: f64,
@@ -64,8 +64,8 @@ impl ModelParameters {
         Self {
             input_size,
             hidden_size,
-            num_encoder_layers,
-            num_decoder_layers,
+            encoder_layer_count,
+            decoder_layer_count,
             output_length,
             input_length,
             dropout_rate,
@@ -88,12 +88,12 @@ impl ModelParameters {
         self.hidden_size
     }
 
-    pub fn num_encoder_layers(&self) -> usize {
-        self.num_encoder_layers
+    pub fn encoder_layer_count(&self) -> usize {
+        self.encoder_layer_count
     }
 
-    pub fn num_decoder_layers(&self) -> usize {
-        self.num_decoder_layers
+    pub fn decoder_layer_count(&self) -> usize {
+        self.decoder_layer_count
     }
 
     pub fn output_length(&self) -> usize {
@@ -137,8 +137,8 @@ mod tests {
         assert_eq!(params.input_length(), 35);
         assert_eq!(params.output_length(), 5);
         assert_eq!(params.hidden_size(), 64);
-        assert_eq!(params.num_encoder_layers(), 3);
-        assert_eq!(params.num_decoder_layers(), 2);
+        assert_eq!(params.encoder_layer_count(), 3);
+        assert_eq!(params.decoder_layer_count(), 2);
         assert_eq!(params.dropout_rate(), 0.1);
         assert_eq!(params.quantiles(), [0.1, 0.5, 0.9]);
         assert_eq!(params.huber_delta(), 0.5);
@@ -149,8 +149,8 @@ mod tests {
         let json = r#"{
             "input_size": 100,
             "hidden_size": 64,
-            "num_encoder_layers": 3,
-            "num_decoder_layers": 2,
+            "encoder_layer_count": 3,
+            "decoder_layer_count": 2,
             "output_length": 5,
             "input_length": 35,
             "dropout_rate": 0.1,

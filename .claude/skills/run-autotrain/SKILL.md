@@ -154,7 +154,7 @@ Priority order: architecture > hyperparameters > epoch depth > loss function > d
 ## Files Modified During Loop
 
 Primarily:
-- `src/models/tide/model.rs` (model architecture — TideModel, encoder/decoder layers)
+- `src/models/tide/model.rs` (model architecture — TiDEModel, encoder/decoder layers)
 - `src/models/tide/data.rs` (data processing — feature engineering, dataset construction)
 - `src/models/tide/config.rs` (ModelParameters — architecture hyperparameters)
 - `src/models/tide/train.rs` (TrainConfig — learning rate, epochs, batch size, early stopping)
@@ -163,7 +163,7 @@ Primarily:
 ## Key Files
 
 - **Entrypoint**: `src/bin/tide_model_trainer.rs` (loads data, trains, evaluates, uploads artifact)
-- **Model**: `src/models/tide/model.rs` (Burn TideModel with encoder/decoder)
+- **Model**: `src/models/tide/model.rs` (Burn TiDEModel with encoder/decoder)
 - **Config**: `src/models/tide/config.rs` (ModelParameters with Default impl)
 - **Training**: `src/models/tide/train.rs` (TrainConfig, train loop, early stopping)
 - **Data**: `src/models/tide/data.rs` (TrainingDataset, feature engineering)

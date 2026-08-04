@@ -9,6 +9,8 @@ use chrono::Datelike;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::data::details::UNKNOWN as UNKNOWN_SECTOR_OR_INDUSTRY;
+
 pub type CategoryMapping = HashMap<String, i32>;
 pub type FeatureMappings = HashMap<String, CategoryMapping>;
 
@@ -131,12 +133,14 @@ pub(crate) const CATEGORICAL_COLUMNS: &[&str] = &[
 
 pub(crate) const STATIC_CATEGORICAL_COLUMNS: &[&str] = &["ticker", "sector", "industry"];
 
-/// Placeholder for a null categorical value.
+/// Placeholder written into `ticker` when the source value is null, then matched by the filter in
+/// [`clean_data`] to drop the row.
 ///
-/// `into_no_null_iter` silently *skips* nulls, so a null `sector` or `industry` yields a column
-/// shorter than the frame, shifting every later row onto the wrong ticker. The sentinel preserves
-/// alignment.
-pub(crate) const UNKNOWN_CATEGORY: &str = "UNKNOWN";
+/// `into_no_null_iter` silently *skips* nulls, so a null yields a column shorter than the frame,
+/// shifting every later row onto the wrong ticker. The sentinel preserves alignment until the row
+/// can be removed. Sector and industry instead fall back to [`UNKNOWN_SECTOR_OR_INDUSTRY`], which
+/// is a category the model keeps rather than a row it discards.
+pub(crate) const MISSING_TICKER: &str = "UNKNOWN";
 
 /// The model target is the future window of `daily_return`, which is the last
 /// continuous column. Fitting and windowing index into this position.
@@ -198,9 +202,10 @@ impl Data {
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
         let timestamps = self.data.column("timestamp").map_err(|e| e.to_string())?;
         let timestamps = timestamps.i64().map_err(|e| e.to_string())?;
-        let min_ts = timestamps.min().unwrap_or(0);
-        let max_ts = timestamps.max().unwrap_or(0);
-        let cutoff = min_ts + (((max_ts - min_ts) as f64) * validation_split) as i64;
+        let minimum_timestamp = timestamps.min().unwrap_or(0);
+        let maximum_timestamp = timestamps.max().unwrap_or(0);
+        let cutoff = minimum_timestamp
+            + (((maximum_timestamp - minimum_timestamp) as f64) * validation_split) as i64;
 
         let train_mask = timestamps.lt_eq(cutoff);
         let valid_mask = timestamps.gt(cutoff);
@@ -247,12 +252,12 @@ fn window_frame(
     with_targets: bool,
 ) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
     let window_size = input_length + output_length;
-    let n_cont = CONTINUOUS_COLUMNS.len();
-    let n_cat = CATEGORICAL_COLUMNS.len();
-    let n_static = STATIC_CATEGORICAL_COLUMNS.len();
+    let continuous_feature_count = CONTINUOUS_COLUMNS.len();
+    let categorical_feature_count = CATEGORICAL_COLUMNS.len();
+    let static_feature_count = STATIC_CATEGORICAL_COLUMNS.len();
     let target_index = CONTINUOUS_COLUMNS
         .iter()
-        .position(|c| *c == TARGET_COLUMN)
+        .position(|column| *column == TARGET_COLUMN)
         .expect("daily_return must be a continuous column");
 
     // `ticker` is integer-encoded by this point (encode_categoricals). Group by
@@ -268,10 +273,10 @@ fn window_frame(
         .collect();
     tickers.sort_unstable();
 
-    let mut all_past_cont: Vec<Vec<f32>> = Vec::new();
-    let mut all_past_cat: Vec<Vec<i32>> = Vec::new();
-    let mut all_future_cat: Vec<Vec<i32>> = Vec::new();
-    let mut all_static_cat: Vec<Vec<i32>> = Vec::new();
+    let mut all_past_continuous: Vec<Vec<f32>> = Vec::new();
+    let mut all_past_categorical: Vec<Vec<i32>> = Vec::new();
+    let mut all_future_categorical: Vec<Vec<i32>> = Vec::new();
+    let mut all_static_categorical: Vec<Vec<i32>> = Vec::new();
     let mut all_targets: Vec<Vec<f32>> = Vec::new();
 
     for ticker in &tickers {
@@ -287,9 +292,9 @@ fn window_frame(
             continue;
         }
 
-        let cont_arrays = get_float_columns(&ticker_data, CONTINUOUS_COLUMNS)?;
-        let cat_arrays = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
-        let static_arrays = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
+        let continuous_column_values = get_float_columns(&ticker_data, CONTINUOUS_COLUMNS)?;
+        let categorical_column_values = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
+        let static_column_values = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
 
         let windows: Vec<usize> = if predict_mode {
             vec![ticker_data.height() - window_size]
@@ -298,79 +303,91 @@ fn window_frame(
         };
 
         for start in windows {
-            let mut past_cont = Vec::with_capacity(input_length * n_cont);
-            for t in start..start + input_length {
-                for col in &cont_arrays {
-                    past_cont.push(col[t]);
+            let mut past_continuous_window =
+                Vec::with_capacity(input_length * continuous_feature_count);
+            for row in start..start + input_length {
+                for column in &continuous_column_values {
+                    past_continuous_window.push(column[row]);
                 }
             }
 
-            let mut past_cat = Vec::with_capacity(input_length * n_cat);
-            for t in start..start + input_length {
-                for col in &cat_arrays {
-                    past_cat.push(col[t]);
+            let mut past_categorical_window =
+                Vec::with_capacity(input_length * categorical_feature_count);
+            for row in start..start + input_length {
+                for column in &categorical_column_values {
+                    past_categorical_window.push(column[row]);
                 }
             }
 
-            let mut future_cat = Vec::with_capacity(output_length * n_cat);
-            for t in (start + input_length)..(start + input_length + output_length) {
-                for col in &cat_arrays {
-                    future_cat.push(col[t]);
+            let mut future_categorical_window =
+                Vec::with_capacity(output_length * categorical_feature_count);
+            for row in (start + input_length)..(start + input_length + output_length) {
+                for column in &categorical_column_values {
+                    future_categorical_window.push(column[row]);
                 }
             }
 
-            let mut static_cat = Vec::with_capacity(n_static);
-            for col in &static_arrays {
-                static_cat.push(col[start]);
+            let mut static_categorical_window = Vec::with_capacity(static_feature_count);
+            for column in &static_column_values {
+                static_categorical_window.push(column[start]);
             }
 
-            all_past_cont.push(past_cont);
-            all_past_cat.push(past_cat);
-            all_future_cat.push(future_cat);
-            all_static_cat.push(static_cat);
+            all_past_continuous.push(past_continuous_window);
+            all_past_categorical.push(past_categorical_window);
+            all_future_categorical.push(future_categorical_window);
+            all_static_categorical.push(static_categorical_window);
 
             if with_targets {
-                let returns = &cont_arrays[target_index];
+                let returns = &continuous_column_values[target_index];
                 let future = (start + input_length)..(start + input_length + output_length);
                 all_targets.push(returns[future].to_vec());
             }
         }
     }
 
-    let num_samples = all_past_cont.len();
+    let sample_count = all_past_continuous.len();
 
-    let past_continuous = if num_samples > 0 {
-        let flat: Vec<f32> = all_past_cont.into_iter().flatten().collect();
-        ndarray::Array3::from_shape_vec((num_samples, input_length, n_cont), flat)?
+    let past_continuous = if sample_count > 0 {
+        let flat: Vec<f32> = all_past_continuous.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec(
+            (sample_count, input_length, continuous_feature_count),
+            flat,
+        )?
     } else {
-        ndarray::Array3::zeros((0, input_length, n_cont))
+        ndarray::Array3::zeros((0, input_length, continuous_feature_count))
     };
 
-    let past_categorical = if num_samples > 0 {
-        let flat: Vec<i32> = all_past_cat.into_iter().flatten().collect();
-        ndarray::Array3::from_shape_vec((num_samples, input_length, n_cat), flat)?
+    let past_categorical = if sample_count > 0 {
+        let flat: Vec<i32> = all_past_categorical.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec(
+            (sample_count, input_length, categorical_feature_count),
+            flat,
+        )?
     } else {
-        ndarray::Array3::zeros((0, input_length, n_cat))
+        ndarray::Array3::zeros((0, input_length, categorical_feature_count))
     };
 
-    let future_categorical = if num_samples > 0 {
-        let flat: Vec<i32> = all_future_cat.into_iter().flatten().collect();
-        ndarray::Array3::from_shape_vec((num_samples, output_length, n_cat), flat)?
+    let future_categorical = if sample_count > 0 {
+        let flat: Vec<i32> = all_future_categorical.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec(
+            (sample_count, output_length, categorical_feature_count),
+            flat,
+        )?
     } else {
-        ndarray::Array3::zeros((0, output_length, n_cat))
+        ndarray::Array3::zeros((0, output_length, categorical_feature_count))
     };
 
-    let static_categorical = if num_samples > 0 {
-        let flat: Vec<i32> = all_static_cat.into_iter().flatten().collect();
-        ndarray::Array3::from_shape_vec((num_samples, 1, n_static), flat)?
+    let static_categorical = if sample_count > 0 {
+        let flat: Vec<i32> = all_static_categorical.into_iter().flatten().collect();
+        ndarray::Array3::from_shape_vec((sample_count, 1, static_feature_count), flat)?
     } else {
-        ndarray::Array3::zeros((0, 1, n_static))
+        ndarray::Array3::zeros((0, 1, static_feature_count))
     };
 
-    let targets = if with_targets && num_samples > 0 {
+    let targets = if with_targets && sample_count > 0 {
         let flat: Vec<f32> = all_targets.into_iter().flatten().collect();
         Some(ndarray::Array3::from_shape_vec(
-            (num_samples, output_length, 1),
+            (sample_count, output_length, 1),
             flat,
         )?)
     } else if with_targets {
@@ -497,7 +514,7 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .str()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
+        .map(|value| value.unwrap_or(MISSING_TICKER).to_uppercase())
         .collect();
 
     let sector_upper: Vec<String> = data
@@ -506,7 +523,7 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .str()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
+        .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
     let industry_upper: Vec<String> = data
@@ -515,7 +532,7 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .str()
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|value| value.unwrap_or(UNKNOWN_CATEGORY).to_uppercase())
+        .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
     data.with_column(Column::new("ticker".into(), ticker_upper))
@@ -525,13 +542,13 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
     data.with_column(Column::new("industry".into(), industry_upper))
         .map_err(|e| e.to_string())?;
 
-    // Filter out UNKNOWN tickers
+    // Drop the rows whose ticker was null.
     let mask = data
         .column("ticker")
         .map_err(|e| e.to_string())?
         .str()
         .map_err(|e| e.to_string())?
-        .not_equal(UNKNOWN_CATEGORY);
+        .not_equal(MISSING_TICKER);
 
     let cleaned = data.filter(&mask).map_err(|e| e.to_string())?;
 
@@ -563,17 +580,17 @@ pub(crate) fn apply_scaling(
     scaler: &Scaler,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let mut result = data;
-    for col_name in CONTINUOUS_COLUMNS {
-        let mean = scaler.means.get(*col_name).copied().unwrap_or(0.0);
+    for column_name in CONTINUOUS_COLUMNS {
+        let mean = scaler.means.get(*column_name).copied().unwrap_or(0.0);
         let std = scaler
             .standard_deviations
-            .get(*col_name)
+            .get(*column_name)
             .copied()
             .unwrap_or(1.0);
         let std = if std == 0.0 { 1e-8 } else { std };
 
         let values: Vec<f32> = result
-            .column(col_name)
+            .column(column_name)
             .map_err(|e| e.to_string())?
             .cast(&DataType::Float64)
             .map_err(|e| e.to_string())?
@@ -584,7 +601,7 @@ pub(crate) fn apply_scaling(
             .collect();
 
         result
-            .with_column(Column::new((*col_name).into(), values))
+            .with_column(Column::new((*column_name).into(), values))
             .map_err(|e| e.to_string())?;
     }
     Ok(result)
@@ -602,10 +619,10 @@ pub(crate) fn encode_categoricals(
         .copied()
         .collect();
 
-    for col_name in all_categorical {
-        if let Some(mapping) = mappings.get(col_name) {
+    for column_name in all_categorical {
+        if let Some(mapping) = mappings.get(column_name) {
             let values: Vec<Option<i32>> = result
-                .column(col_name)
+                .column(column_name)
                 .map_err(|e| e.to_string())?
                 .str()
                 .map(|ca| {
@@ -615,7 +632,7 @@ pub(crate) fn encode_categoricals(
                 })
                 .or_else(|_| {
                     result
-                        .column(col_name)
+                        .column(column_name)
                         .map_err(|e| e.to_string())?
                         .i32()
                         .map(|ca| ca.into_iter().collect())
@@ -632,18 +649,18 @@ pub(crate) fn encode_categoricals(
             // `filter_to_trained_tickers` removes unmapped tickers before this on the prediction
             // path, but that guard lives in another module and nothing enforces the ordering, so
             // the invariant is also enforced here where it is relied upon.
-            let is_static = STATIC_CATEGORICAL_COLUMNS.contains(&col_name);
+            let is_static = STATIC_CATEGORICAL_COLUMNS.contains(&column_name);
             let unmapped = values.iter().filter(|value| value.is_none()).count();
             let keep: BooleanChunked = values.iter().map(|value| value.is_some()).collect();
             let encoded: Vec<i32> = values.into_iter().map(|v| v.unwrap_or(-1)).collect();
             result
-                .with_column(Column::new(col_name.into(), encoded))
+                .with_column(Column::new(column_name.into(), encoded))
                 .map_err(|e| e.to_string())?;
 
             if is_static && unmapped > 0 {
                 result = result.filter(&keep).map_err(|e| e.to_string())?;
                 tracing::warn!(
-                    column = col_name,
+                    column = column_name,
                     dropped_rows = unmapped,
                     "Dropped rows whose static categorical value is absent from the training mapping"
                 );
@@ -659,9 +676,9 @@ fn get_float_columns(
     columns: &[&str],
 ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
     let mut result = Vec::new();
-    for col_name in columns {
+    for column_name in columns {
         let values: Vec<f32> = data
-            .column(col_name)
+            .column(column_name)
             .map_err(|e| e.to_string())?
             .cast(&DataType::Float32)
             .map_err(|e| e.to_string())?
@@ -679,9 +696,9 @@ fn get_int_columns(
     columns: &[&str],
 ) -> Result<Vec<Vec<i32>>, Box<dyn std::error::Error>> {
     let mut result = Vec::new();
-    for col_name in columns {
+    for column_name in columns {
         let values: Vec<i32> = data
-            .column(col_name)
+            .column(column_name)
             .map_err(|e| e.to_string())?
             .cast(&DataType::Int32)
             .map_err(|e| e.to_string())?
@@ -733,39 +750,39 @@ mod tests {
 
     /// Build a minimal, already engineered/scaled/encoded frame (ticker and the
     /// categorical columns are integer-encoded) for windowing tests.
-    fn make_encoded_frame(num_tickers: i32, rows_per_ticker: usize) -> DataFrame {
-        let total = num_tickers as usize * rows_per_ticker;
+    fn make_encoded_frame(ticker_count: i32, rows_per_ticker: usize) -> DataFrame {
+        let total = ticker_count as usize * rows_per_ticker;
         let mut ticker = Vec::with_capacity(total);
         let mut timestamp = Vec::with_capacity(total);
         let mut close = Vec::with_capacity(total);
         let mut daily_return = Vec::with_capacity(total);
-        for t in 0..num_tickers {
-            for r in 0..rows_per_ticker {
-                ticker.push(t);
-                timestamp.push((r as i64) * 86_400_000);
-                close.push(100.0_f64 + r as f64);
-                daily_return.push(0.01_f32 * (r as f32 + t as f32));
+        for ticker_id in 0..ticker_count {
+            for row in 0..rows_per_ticker {
+                ticker.push(ticker_id);
+                timestamp.push((row as i64) * 86_400_000);
+                close.push(100.0_f64 + row as f64);
+                daily_return.push(0.01_f32 * (row as f32 + ticker_id as f32));
             }
         }
-        let ones_f = vec![1.0_f64; total];
-        let ones_i = vec![1_i32; total];
+        let ones_float = vec![1.0_f64; total];
+        let ones_int = vec![1_i32; total];
         DataFrame::new(vec![
             Column::new("ticker".into(), ticker),
             Column::new("timestamp".into(), timestamp),
-            Column::new("open_price".into(), ones_f.clone()),
-            Column::new("high_price".into(), ones_f.clone()),
-            Column::new("low_price".into(), ones_f.clone()),
+            Column::new("open_price".into(), ones_float.clone()),
+            Column::new("high_price".into(), ones_float.clone()),
+            Column::new("low_price".into(), ones_float.clone()),
             Column::new("close_price".into(), close),
-            Column::new("volume".into(), ones_f.clone()),
-            Column::new("volume_weighted_average_price".into(), ones_f),
+            Column::new("volume".into(), ones_float.clone()),
+            Column::new("volume_weighted_average_price".into(), ones_float),
             Column::new("daily_return".into(), daily_return),
-            Column::new("day_of_week".into(), ones_i.clone()),
-            Column::new("day_of_month".into(), ones_i.clone()),
-            Column::new("day_of_year".into(), ones_i.clone()),
-            Column::new("month".into(), ones_i.clone()),
-            Column::new("year".into(), ones_i.clone()),
-            Column::new("sector".into(), ones_i.clone()),
-            Column::new("industry".into(), ones_i),
+            Column::new("day_of_week".into(), ones_int.clone()),
+            Column::new("day_of_month".into(), ones_int.clone()),
+            Column::new("day_of_year".into(), ones_int.clone()),
+            Column::new("month".into(), ones_int.clone()),
+            Column::new("year".into(), ones_int.clone()),
+            Column::new("sector".into(), ones_int.clone()),
+            Column::new("industry".into(), ones_int),
         ])
         .unwrap()
     }
@@ -866,6 +883,43 @@ mod tests {
             .into_no_null_iter()
             .collect();
         assert!(returns.iter().all(|r| (r - 0.1).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_clean_data_fills_null_sector_with_the_stored_default() {
+        // A null sector or industry must land on the same value the database writes by default,
+        // or the concept splits into two categories: rows loaded from `equity_details` encode as
+        // "NOT AVAILABLE" while any null-bearing frame encodes as something else. Because these
+        // are static columns, `encode_categoricals` drops rows whose value is absent from the
+        // training mapping rather than folding them into a fallback, so the split is silent.
+        let mut engineered = engineer_features(raw_two_ticker_frame()).unwrap();
+        engineered
+            .with_column(Column::new(
+                "sector".into(),
+                vec![None::<&str>, None, None, None],
+            ))
+            .unwrap();
+        engineered
+            .with_column(Column::new(
+                "industry".into(),
+                vec![None::<&str>, None, None, None],
+            ))
+            .unwrap();
+
+        let cleaned = clean_data(engineered).unwrap();
+        for column in ["sector", "industry"] {
+            let values: Vec<&str> = cleaned
+                .column(column)
+                .unwrap()
+                .str()
+                .unwrap()
+                .into_no_null_iter()
+                .collect();
+            assert!(
+                values.iter().all(|v| *v == crate::data::details::UNKNOWN),
+                "{column} fell back to {values:?} instead of the schema default"
+            );
+        }
     }
 
     #[test]

@@ -266,13 +266,13 @@ pub fn generate_predictions(
         .to_vec()
         .map_err(|e| PredictionError::Inference(format!("{e:?}")))?;
 
-    let num_quantiles = model_state.parameters().quantiles().len();
+    let quantile_count = model_state.parameters().quantiles().len();
     // The output schema is fixed at quantile_10/quantile_50/quantile_90, so a
     // model with any other quantile count cannot be served correctly; fail
     // loudly instead of indexing out of bounds or mislabeling values.
-    if num_quantiles != 3 {
+    if quantile_count != 3 {
         return Err(PredictionError::Postprocessing(format!(
-            "Expected exactly 3 quantiles (10/50/90); the loaded model has {num_quantiles}"
+            "Expected exactly 3 quantiles (10/50/90); the loaded model has {quantile_count}"
         )));
     }
     let mut results = Vec::new();
@@ -298,9 +298,9 @@ pub fn generate_predictions(
             .unwrap_or("UNKNOWN");
 
         for t in 0..output_length {
-            let base_idx = (sample_idx * output_length + t) * num_quantiles;
+            let base_idx = (sample_idx * output_length + t) * quantile_count;
 
-            let scaled: Vec<f64> = (0..num_quantiles)
+            let scaled: Vec<f64> = (0..quantile_count)
                 .map(|q| predictions_data[base_idx + q] as f64)
                 .collect();
             let quantiles = unscale_and_sort_quantiles(&scaled, model_state.scaler());

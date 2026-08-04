@@ -8,7 +8,7 @@ use std::path::Path;
 
 use polars::prelude::*;
 
-use crate::models::tide::config::ModelParameters;
+use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{
     apply_scaling, clean_data, encode_categoricals, engineer_features, CategoryMapping, Data,
     FeatureMappings, Scaler, CATEGORICAL_COLUMNS, CONTINUOUS_COLUMNS, STATIC_CATEGORICAL_COLUMNS,

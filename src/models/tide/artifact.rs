@@ -17,16 +17,16 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use tracing::{debug, info, warn};
 
-use crate::models::tide::config::ModelParameters;
+use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{FeatureMappings, Scaler};
-use crate::models::tide::model::TideModel;
+use crate::models::tide::model::TiDEModel;
 
 // --------------------------------------------------------------------------
 // The loaded artifact
 // --------------------------------------------------------------------------
 
 pub struct ModelState {
-    model: TideModel<NdArray>,
+    model: TiDEModel<NdArray>,
     parameters: ModelParameters,
     scaler: Scaler,
     mappings: FeatureMappings,
@@ -45,7 +45,7 @@ impl ModelState {
     /// Constructs a `ModelState` from a fully loaded artifact.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        model: TideModel<NdArray>,
+        model: TiDEModel<NdArray>,
         parameters: ModelParameters,
         scaler: Scaler,
         mappings: FeatureMappings,
@@ -70,7 +70,7 @@ impl ModelState {
         }
     }
 
-    pub fn model(&self) -> &TideModel<NdArray> {
+    pub fn model(&self) -> &TiDEModel<NdArray> {
         &self.model
     }
 
@@ -111,7 +111,7 @@ impl ModelState {
     }
 }
 
-// SAFETY: TideModel<NdArray> is not Sync due to burn's Param<T> using an RwLock
+// SAFETY: TiDEModel<NdArray> is not Sync due to burn's Param<T> using an RwLock
 // with a non-Sync FnOnce inside. We guard all access behind a Mutex, so this is safe.
 unsafe impl Send for ModelState {}
 unsafe impl Sync for ModelState {}
@@ -373,7 +373,7 @@ fn extract_tar_gz(tar_path: &Path, dest: &Path) -> Result<(), ArtifactError> {
 
 fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelState, ArtifactError> {
     let parameters_path = dir.join("tide_parameters.json");
-    let parameters = crate::models::tide::config::ModelParameters::load(&parameters_path)
+    let parameters = crate::models::tide::configuration::ModelParameters::load(&parameters_path)
         .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
     let scaler_path = dir.join("tide_data_scaler.json");
@@ -388,15 +388,15 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         serde_json::from_str(&mappings_content)
             .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
-    let num_quantiles = parameters.quantiles().len();
-    let model = crate::models::tide::model::TideModel::load(
+    let quantile_count = parameters.quantiles().len();
+    let model = crate::models::tide::model::TiDEModel::load(
         dir,
         parameters.input_size(),
         parameters.hidden_size(),
-        parameters.num_encoder_layers(),
-        parameters.num_decoder_layers(),
+        parameters.encoder_layer_count(),
+        parameters.decoder_layer_count(),
         parameters.output_length(),
-        num_quantiles,
+        quantile_count,
         parameters.dropout_rate(),
     )
     .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
