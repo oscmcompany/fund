@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct ModelParameters {
     input_size: usize,
     hidden_size: usize,
-    num_encoder_layers: usize,
-    num_decoder_layers: usize,
+    encoder_layer_count: usize,
+    decoder_layer_count: usize,
     output_length: usize,
     input_length: usize,
     dropout_rate: f64,
@@ -23,9 +23,9 @@ impl Default for ModelParameters {
         Self {
             input_size: 0,
             hidden_size: 64,
-            num_encoder_layers: 3,
-            num_decoder_layers: 2,
-            output_length: 5,
+            encoder_layer_count: 3,
+            decoder_layer_count: 2,
+            output_length: 1,
             input_length: 35,
             dropout_rate: 0.1,
             quantiles: vec![0.1, 0.5, 0.9],
@@ -53,8 +53,8 @@ impl ModelParameters {
     pub fn for_tests(
         input_size: usize,
         hidden_size: usize,
-        num_encoder_layers: usize,
-        num_decoder_layers: usize,
+        encoder_layer_count: usize,
+        decoder_layer_count: usize,
         output_length: usize,
         input_length: usize,
         dropout_rate: f64,
@@ -64,8 +64,8 @@ impl ModelParameters {
         Self {
             input_size,
             hidden_size,
-            num_encoder_layers,
-            num_decoder_layers,
+            encoder_layer_count,
+            decoder_layer_count,
             output_length,
             input_length,
             dropout_rate,
@@ -74,9 +74,23 @@ impl ModelParameters {
         }
     }
 
+    /// Reads parameters from a training artifact, rejecting window lengths of zero.
+    ///
+    /// A zero `output_length` produces no horizon steps, so inference returns an empty set and a
+    /// corrupt artifact is indistinguishable from a session with nothing to forecast. Refusing it
+    /// here keeps the failure at the boundary where the untrusted file is read.
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let params: Self = serde_json::from_str(&content)?;
+        if params.output_length == 0 || params.input_length == 0 {
+            return Err(format!(
+                "Model parameters at {} have a zero window length (input_length {}, output_length {})",
+                path.display(),
+                params.input_length,
+                params.output_length
+            )
+            .into());
+        }
         Ok(params)
     }
 
@@ -88,12 +102,12 @@ impl ModelParameters {
         self.hidden_size
     }
 
-    pub fn num_encoder_layers(&self) -> usize {
-        self.num_encoder_layers
+    pub fn encoder_layer_count(&self) -> usize {
+        self.encoder_layer_count
     }
 
-    pub fn num_decoder_layers(&self) -> usize {
-        self.num_decoder_layers
+    pub fn decoder_layer_count(&self) -> usize {
+        self.decoder_layer_count
     }
 
     pub fn output_length(&self) -> usize {
@@ -125,20 +139,20 @@ mod tests {
     fn test_default_parameters() {
         let params = ModelParameters::default();
         assert_eq!(params.hidden_size(), 64);
-        assert_eq!(params.output_length(), 5);
+        assert_eq!(params.output_length(), 1);
         assert_eq!(params.input_length(), 35);
         assert_eq!(params.quantiles(), [0.1, 0.5, 0.9]);
     }
 
     #[test]
     fn test_new_applies_defaults_for_architecture() {
-        let params = ModelParameters::new(448, 35, 5);
-        assert_eq!(params.input_size(), 448);
+        let params = ModelParameters::new(428, 35, 1);
+        assert_eq!(params.input_size(), 428);
         assert_eq!(params.input_length(), 35);
-        assert_eq!(params.output_length(), 5);
+        assert_eq!(params.output_length(), 1);
         assert_eq!(params.hidden_size(), 64);
-        assert_eq!(params.num_encoder_layers(), 3);
-        assert_eq!(params.num_decoder_layers(), 2);
+        assert_eq!(params.encoder_layer_count(), 3);
+        assert_eq!(params.decoder_layer_count(), 2);
         assert_eq!(params.dropout_rate(), 0.1);
         assert_eq!(params.quantiles(), [0.1, 0.5, 0.9]);
         assert_eq!(params.huber_delta(), 0.5);
@@ -149,8 +163,8 @@ mod tests {
         let json = r#"{
             "input_size": 100,
             "hidden_size": 64,
-            "num_encoder_layers": 3,
-            "num_decoder_layers": 2,
+            "encoder_layer_count": 3,
+            "decoder_layer_count": 2,
             "output_length": 5,
             "input_length": 35,
             "dropout_rate": 0.1,
@@ -160,5 +174,30 @@ mod tests {
         let params: ModelParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.input_size(), 100);
         assert_eq!(params.hidden_size(), 64);
+    }
+
+    #[test]
+    fn test_load_rejects_a_zero_window_length() {
+        // A zero output_length yields no horizon steps, so inference would return an empty set and
+        // the corrupt artifact would read as a session with nothing to forecast.
+        let directory = tempfile::tempdir().unwrap();
+        let write = |name: &str, output_length: usize, input_length: usize| {
+            let path = directory.path().join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                         "decoder_layer_count": 2, "output_length": {output_length},
+                         "input_length": {input_length}, "dropout_rate": 0.1,
+                         "quantiles": [0.1, 0.5, 0.9], "huber_delta": 0.5}}"#
+                ),
+            )
+            .unwrap();
+            path
+        };
+
+        assert!(ModelParameters::load(&write("zero_output.json", 0, 35)).is_err());
+        assert!(ModelParameters::load(&write("zero_input.json", 1, 0)).is_err());
+        assert!(ModelParameters::load(&write("valid.json", 1, 35)).is_ok());
     }
 }

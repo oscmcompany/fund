@@ -12,15 +12,15 @@ use rand::SeedableRng;
 use tracing::info;
 
 use crate::models::tide::batch::{build_input_tensor, build_target_tensor};
-use crate::models::tide::config::ModelParameters;
+use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::TrainingDataset;
 use crate::models::tide::loss::quantile_loss;
-use crate::models::tide::model::TideModel;
+use crate::models::tide::model::TiDEModel;
 
 /// The training backend: reverse-mode autodiff over the CPU NdArray backend.
 pub type TrainBackend = Autodiff<NdArray>;
 
-pub struct TrainConfig {
+pub struct TrainConfiguration {
     learning_rate: f64,
     epoch_count: usize,
     batch_size: usize,
@@ -31,12 +31,12 @@ pub struct TrainConfig {
 /// Why a training configuration was rejected.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("invalid training configuration: {reason}")]
-pub struct TrainConfigError {
+pub struct TrainConfigurationError {
     pub reason: String,
 }
 
-impl TrainConfig {
-    /// Constructs a validated `TrainConfig`.
+impl TrainConfiguration {
+    /// Constructs a validated `TrainConfiguration`.
     ///
     /// `batch_size` is the one that bites hardest: it reaches `slice::chunks`, which panics on
     /// zero, so a zero batch size aborts the training task rather than failing it. A non-positive
@@ -47,9 +47,9 @@ impl TrainConfig {
         batch_size: usize,
         early_stopping_patience: usize,
         min_delta: f64,
-    ) -> Result<Self, TrainConfigError> {
+    ) -> Result<Self, TrainConfigurationError> {
         let reject = |reason: &str| {
-            Err(TrainConfigError {
+            Err(TrainConfigurationError {
                 reason: reason.to_string(),
             })
         };
@@ -95,7 +95,7 @@ impl TrainConfig {
     }
 }
 
-impl Default for TrainConfig {
+impl Default for TrainConfiguration {
     fn default() -> Self {
         Self {
             learning_rate: 0.001,
@@ -151,13 +151,13 @@ impl EarlyStopping {
 /// Train the model, returning the best-checkpoint model and the per-epoch
 /// training loss history.
 pub fn train(
-    mut model: TideModel<TrainBackend>,
+    mut model: TiDEModel<TrainBackend>,
     train_dataset: &TrainingDataset,
     valid_dataset: Option<&TrainingDataset>,
     parameters: &ModelParameters,
-    config: &TrainConfig,
+    configuration: &TrainConfiguration,
     device: &<TrainBackend as Backend>::Device,
-) -> (TideModel<TrainBackend>, Vec<f64>) {
+) -> (TiDEModel<TrainBackend>, Vec<f64>) {
     let num_samples = train_dataset.len();
     let mut losses = Vec::new();
     if num_samples == 0 {
@@ -166,7 +166,7 @@ pub fn train(
 
     let mut optimizer = AdamConfig::new()
         .with_epsilon(1e-8)
-        .init::<TrainBackend, TideModel<TrainBackend>>();
+        .init::<TrainBackend, TiDEModel<TrainBackend>>();
 
     // Deterministic shuffle so runs are reproducible.
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
@@ -174,14 +174,14 @@ pub fn train(
     let mut best_model = model.clone();
     let mut early_stopping = EarlyStopping::new();
 
-    for epoch in 0..config.epoch_count {
+    for epoch in 0..configuration.epoch_count {
         let mut order: Vec<usize> = (0..num_samples).collect();
         order.shuffle(&mut rng);
 
         let mut loss_sum = 0.0_f64;
         let mut batch_count = 0usize;
 
-        for batch_indices in order.chunks(config.batch_size) {
+        for batch_indices in order.chunks(configuration.batch_size) {
             let input = build_input_tensor::<TrainBackend>(
                 train_dataset,
                 batch_indices,
@@ -210,7 +210,7 @@ pub fn train(
 
             let gradients = loss.backward();
             let gradient_params = GradientsParams::from_grads(gradients, &model);
-            model = optimizer.step(config.learning_rate, model, gradient_params);
+            model = optimizer.step(configuration.learning_rate, model, gradient_params);
         }
 
         let train_loss = if batch_count > 0 {
@@ -222,7 +222,7 @@ pub fn train(
 
         let stopping_loss = match valid_dataset {
             Some(valid) if !valid.is_empty() => {
-                validation_loss(&model, valid, parameters, config.batch_size)
+                validation_loss(&model, valid, parameters, configuration.batch_size)
             }
             _ => train_loss,
         };
@@ -236,8 +236,8 @@ pub fn train(
 
         let (snapshot, stop) = early_stopping.observe(
             stopping_loss,
-            config.min_delta,
-            config.early_stopping_patience,
+            configuration.min_delta,
+            configuration.early_stopping_patience,
         );
         if snapshot {
             best_model = model.clone();
@@ -253,7 +253,7 @@ pub fn train(
 
 /// Mean validation loss using the dropout-disabled inner (`NdArray`) model.
 fn validation_loss(
-    model: &TideModel<TrainBackend>,
+    model: &TiDEModel<TrainBackend>,
     valid: &TrainingDataset,
     parameters: &ModelParameters,
     batch_size: usize,
@@ -302,37 +302,37 @@ mod tests {
     /// aborts the training task rather than failing it. A non-positive learning rate is quieter and
     /// worse: training completes and learns nothing.
     #[test]
-    fn test_train_config_rejects_values_that_break_the_loop() {
+    fn test_train_configuration_rejects_values_that_break_the_loop() {
         assert!(
-            TrainConfig::new(0.001, 20, 0, 3, 1e-5).is_err(),
+            TrainConfiguration::new(0.001, 20, 0, 3, 1e-5).is_err(),
             "zero batch"
         );
         assert!(
-            TrainConfig::new(0.001, 0, 512, 3, 1e-5).is_err(),
+            TrainConfiguration::new(0.001, 0, 512, 3, 1e-5).is_err(),
             "zero epochs"
         );
         assert!(
-            TrainConfig::new(0.0, 20, 512, 3, 1e-5).is_err(),
+            TrainConfiguration::new(0.0, 20, 512, 3, 1e-5).is_err(),
             "zero learning rate"
         );
         assert!(
-            TrainConfig::new(-0.1, 20, 512, 3, 1e-5).is_err(),
+            TrainConfiguration::new(-0.1, 20, 512, 3, 1e-5).is_err(),
             "negative learning rate"
         );
         assert!(
-            TrainConfig::new(f64::NAN, 20, 512, 3, 1e-5).is_err(),
+            TrainConfiguration::new(f64::NAN, 20, 512, 3, 1e-5).is_err(),
             "non-finite"
         );
         assert!(
-            TrainConfig::new(0.001, 20, 512, 3, -1.0).is_err(),
+            TrainConfiguration::new(0.001, 20, 512, 3, -1.0).is_err(),
             "negative min_delta"
         );
     }
 
     #[test]
-    fn test_train_config_accepts_the_defaults() {
-        let defaults = TrainConfig::default();
-        assert!(TrainConfig::new(
+    fn test_train_configuration_accepts_the_defaults() {
+        let defaults = TrainConfiguration::default();
+        assert!(TrainConfiguration::new(
             defaults.learning_rate(),
             defaults.epoch_count(),
             defaults.batch_size(),
@@ -422,19 +422,19 @@ mod tests {
         );
 
         let device = Default::default();
-        let model = TideModel::<TrainBackend>::new(
+        let model = TiDEModel::<TrainBackend>::new(
             &device,
             parameters.input_size(),
             parameters.hidden_size(),
-            parameters.num_encoder_layers(),
-            parameters.num_decoder_layers(),
+            parameters.encoder_layer_count(),
+            parameters.decoder_layer_count(),
             parameters.output_length(),
             parameters.quantiles().len(),
             parameters.dropout_rate(),
         );
         let initial = model.clone();
 
-        let config = TrainConfig {
+        let configuration = TrainConfiguration {
             learning_rate: 0.01,
             epoch_count: 10,
             batch_size: 16,
@@ -442,11 +442,12 @@ mod tests {
             min_delta: 1e9,
         };
 
-        let (best, losses) = train(model, &dataset, None, &parameters, &config, &device);
+        let (best, losses) = train(model, &dataset, None, &parameters, &configuration, &device);
         assert_eq!(losses.len(), 10);
 
-        let initial_loss = validation_loss(&initial, &dataset, &parameters, config.batch_size);
-        let best_loss = validation_loss(&best, &dataset, &parameters, config.batch_size);
+        let initial_loss =
+            validation_loss(&initial, &dataset, &parameters, configuration.batch_size);
+        let best_loss = validation_loss(&best, &dataset, &parameters, configuration.batch_size);
         assert!(
             best_loss < initial_loss,
             "best model was not checkpointed: {best_loss} vs initial {initial_loss}"
@@ -472,18 +473,18 @@ mod tests {
         );
 
         let device = Default::default();
-        let model = TideModel::<TrainBackend>::new(
+        let model = TiDEModel::<TrainBackend>::new(
             &device,
             parameters.input_size(),
             parameters.hidden_size(),
-            parameters.num_encoder_layers(),
-            parameters.num_decoder_layers(),
+            parameters.encoder_layer_count(),
+            parameters.decoder_layer_count(),
             parameters.output_length(),
             parameters.quantiles().len(),
             parameters.dropout_rate(),
         );
 
-        let config = TrainConfig {
+        let configuration = TrainConfiguration {
             learning_rate: 0.01,
             epoch_count: 80,
             batch_size: 16,
@@ -491,7 +492,7 @@ mod tests {
             min_delta: 0.0,
         };
 
-        let (_model, losses) = train(model, &dataset, None, &parameters, &config, &device);
+        let (_model, losses) = train(model, &dataset, None, &parameters, &configuration, &device);
         assert!(losses.len() >= 2);
         let first = losses.first().unwrap();
         let last = losses.last().unwrap();

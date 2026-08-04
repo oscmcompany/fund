@@ -7,9 +7,9 @@
 use burn::backend::NdArray;
 
 use crate::models::tide::batch::build_input_tensor;
-use crate::models::tide::config::ModelParameters;
+use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::TrainingDataset;
-use crate::models::tide::model::TideModel;
+use crate::models::tide::model::TiDEModel;
 
 const EVAL_BATCH: usize = 4096;
 
@@ -33,7 +33,7 @@ impl EvalMetrics {
 /// Run the (inner, non-autodiff) model over the validation dataset and compute
 /// the metrics. Returns zeros for an empty or target-less dataset.
 pub fn evaluate(
-    model: &TideModel<NdArray>,
+    model: &TiDEModel<NdArray>,
     dataset: &TrainingDataset,
     parameters: &ModelParameters,
 ) -> Result<EvalMetrics, Box<dyn std::error::Error>> {
@@ -45,8 +45,8 @@ pub fn evaluate(
 
     let output_length = parameters.output_length();
     let quantiles = parameters.quantiles();
-    let num_quantiles = quantiles.len();
-    if num_quantiles == 0 {
+    let quantile_count = quantiles.len();
+    if quantile_count == 0 {
         return Ok(EvalMetrics::zero());
     }
 
@@ -56,7 +56,7 @@ pub fn evaluate(
 
     let device = Default::default();
     let mut predictions: Vec<f32> =
-        Vec::with_capacity(sample_count * output_length * num_quantiles);
+        Vec::with_capacity(sample_count * output_length * quantile_count);
     let indices: Vec<usize> = (0..sample_count).collect();
     for chunk in indices.chunks(EVAL_BATCH) {
         let input = build_input_tensor::<NdArray>(
@@ -76,7 +76,7 @@ pub fn evaluate(
     // evaluation rather than an error. That can only happen if the forward pass returned a
     // different shape than the parameters describe -- a real mismatch, but one worth reporting as
     // an error the trainer can log rather than as a crash mid-run.
-    let expected_predictions = sample_count * output_length * num_quantiles;
+    let expected_predictions = sample_count * output_length * quantile_count;
     if predictions.len() < expected_predictions {
         return Err(format!(
             "model returned {} prediction values, expected {} for {} samples x {} horizon x {} quantiles",
@@ -84,7 +84,7 @@ pub fn evaluate(
             expected_predictions,
             sample_count,
             output_length,
-            num_quantiles
+            quantile_count
         )
         .into());
     }
@@ -97,7 +97,7 @@ pub fn evaluate(
     for sample in 0..sample_count {
         for t in 0..output_length {
             let target = targets[[sample, t, 0]] as f64;
-            let base = (sample * output_length + t) * num_quantiles;
+            let base = (sample * output_length + t) * quantile_count;
 
             let mut row_loss = 0.0_f64;
             for (q_index, &quantile) in quantiles.iter().enumerate() {
@@ -174,9 +174,9 @@ fn closest_to(values: &[f64], target: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::tide::config::ModelParameters;
+    use crate::models::tide::configuration::ModelParameters;
     use crate::models::tide::data::TrainingDataset;
-    use crate::models::tide::model::TideModel;
+    use crate::models::tide::model::TiDEModel;
 
     // ---------------------------------------------------------------------------
     // argmin / argmax / closest_to
@@ -385,11 +385,11 @@ mod tests {
         }
     }
 
-    /// Build a TideModel that matches `make_tiny_dataset`: input_size=32,
-    /// output_length=1, num_quantiles=3.
-    fn make_tiny_model() -> TideModel<NdArray> {
+    /// Build a TiDEModel that matches `make_tiny_dataset`: input_size=32,
+    /// output_length=1, quantile_count=3.
+    fn make_tiny_model() -> TiDEModel<NdArray> {
         let device = Default::default();
-        TideModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0)
+        TiDEModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0)
     }
 
     /// Build ModelParameters aligned with `make_tiny_dataset` and
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_empty_quantiles_returns_zero() {
-        // num_quantiles == 0 triggers the early return after argmin/argmax/closest_to.
+        // quantile_count == 0 triggers the early return after argmin/argmax/closest_to.
         let model = make_tiny_model();
         let dataset = make_tiny_dataset(4, true);
         // Use a model whose quantile list is empty.

@@ -8,7 +8,7 @@ use burn::prelude::*;
 
 /// Compute the mean quantile loss.
 ///
-/// - `predictions`: `[batch, output_length * num_quantiles]` (the raw model output).
+/// - `predictions`: `[batch, output_length * quantile_count]` (the raw model output).
 /// - `targets`: `[batch, output_length]`.
 /// - `quantiles`: the quantile levels, e.g. `[0.1, 0.5, 0.9]`.
 /// - `huber_delta`: when `> 0`, applies Huber smoothing to the per-element error.
@@ -20,9 +20,9 @@ pub fn quantile_loss<B: Backend>(
     output_length: usize,
 ) -> Tensor<B, 1> {
     let [batch, _] = predictions.dims();
-    let num_quantiles = quantiles.len();
+    let quantile_count = quantiles.len();
     let device = predictions.device();
-    let reshaped = predictions.reshape([batch, output_length, num_quantiles]);
+    let reshaped = predictions.reshape([batch, output_length, quantile_count]);
 
     let mut total: Option<Tensor<B, 1>> = None;
     for (index, &quantile) in quantiles.iter().enumerate() {
@@ -67,7 +67,7 @@ pub fn quantile_loss<B: Backend>(
 
     total
         .expect("quantiles must not be empty")
-        .div_scalar(num_quantiles as f64)
+        .div_scalar(quantile_count as f64)
 }
 
 #[cfg(test)]

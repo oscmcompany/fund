@@ -217,22 +217,30 @@ pub(crate) fn unscale_and_sort_quantiles(
     unscaled
 }
 
-/// Timestamp (UTC midnight, milliseconds) for horizon step `step`, where step 0 is `now`'s date.
+/// Timestamp for horizon step `step`, where step 0 is the Eastern session `now` falls in.
+///
+/// Midnight *Eastern*, not UTC. The evaluation pass selects forecasts with
+/// [`crate::data::calendar::eastern_day_bounds`], and a UTC midnight sits at 20:00 the previous
+/// Eastern day under daylight time -- so a UTC-stamped forecast lands in the wrong session's
+/// window and the morning's inference run is never read by that day's passes.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
-    (now + Duration::days(step as i64))
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always a valid time")
-        .and_utc()
-        .timestamp_millis()
+    let session = crate::data::calendar::eastern_date(now) + Duration::days(step as i64);
+    crate::data::calendar::eastern_midnight(session).timestamp_millis()
 }
 
 pub fn generate_predictions(
     data: DataFrame,
     model_state: &ModelState,
 ) -> Result<serde_json::Value, PredictionError> {
-    let tide_data = Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings())
-        .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
+    // One `now` for the whole run. The session the synthesized future row carries and the session
+    // the output is stamped with are both derived from it, so the features and the label cannot
+    // describe different days -- which is the shape of the bug this replaced.
+    let now = Utc::now();
+    let session = crate::data::calendar::eastern_date(now);
+
+    let tide_data =
+        Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings(), session)
+            .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
 
     let output_length = model_state.parameters().output_length();
     let dataset_input_length = model_state.parameters().input_length();
@@ -266,13 +274,13 @@ pub fn generate_predictions(
         .to_vec()
         .map_err(|e| PredictionError::Inference(format!("{e:?}")))?;
 
-    let num_quantiles = model_state.parameters().quantiles().len();
+    let quantile_count = model_state.parameters().quantiles().len();
     // The output schema is fixed at quantile_10/quantile_50/quantile_90, so a
     // model with any other quantile count cannot be served correctly; fail
     // loudly instead of indexing out of bounds or mislabeling values.
-    if num_quantiles != 3 {
+    if quantile_count != 3 {
         return Err(PredictionError::Postprocessing(format!(
-            "Expected exactly 3 quantiles (10/50/90); the loaded model has {num_quantiles}"
+            "Expected exactly 3 quantiles (10/50/90); the loaded model has {quantile_count}"
         )));
     }
     let mut results = Vec::new();
@@ -288,8 +296,6 @@ pub fn generate_predictions(
     let reverse_ticker_map: std::collections::HashMap<i32, &String> =
         ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
 
-    let now = Utc::now();
-
     for sample_idx in 0..num_samples {
         let ticker_id = dataset.static_categorical[[sample_idx, 0, 0]];
         let ticker = reverse_ticker_map
@@ -298,9 +304,9 @@ pub fn generate_predictions(
             .unwrap_or("UNKNOWN");
 
         for t in 0..output_length {
-            let base_idx = (sample_idx * output_length + t) * num_quantiles;
+            let base_idx = (sample_idx * output_length + t) * quantile_count;
 
-            let scaled: Vec<f64> = (0..num_quantiles)
+            let scaled: Vec<f64> = (0..quantile_count)
                 .map(|q| predictions_data[base_idx + q] as f64)
                 .collect();
             let quantiles = unscale_and_sort_quantiles(&scaled, model_state.scaler());
@@ -315,8 +321,11 @@ pub fn generate_predictions(
         }
     }
 
-    // Select the final horizon step, now + (output_length - 1) days, for the caller to persist.
-    let target_date = step_timestamp_milliseconds(now, output_length - 1);
+    // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
+    // liquidation flattens every position the same session, so a forecast further out describes a
+    // holding period this strategy never has. Selected explicitly rather than as the last step, so
+    // widening `output_length` for research does not silently move the traded signal.
+    let target_date = step_timestamp_milliseconds(now, 0);
 
     let final_predictions: Vec<serde_json::Value> = results
         .into_iter()
@@ -738,22 +747,67 @@ mod tests {
     }
 
     #[test]
-    fn test_step_timestamp_step_zero_is_today_midnight() {
-        // Horizon step t is now + t days at midnight: step 0 is today, and the persisted
-        // target is step output_length - 1.
+    fn test_predictions_are_visible_to_the_same_session_evaluation() {
+        // The 09:00 Eastern run exists to feed the same session's evaluation passes, which select
+        // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
+        // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
+        // morning is never the one read this afternoon.
+        use crate::data::calendar::{eastern_date, eastern_day_bounds};
+
+        for day in [
+            "2026-08-03",
+            "2026-08-04",
+            "2026-08-05",
+            "2026-08-06",
+            "2026-08-07",
+        ] {
+            // 13:00Z is 09:00 Eastern while daylight time is in effect.
+            let now = chrono::DateTime::parse_from_rfc3339(&format!("{day}T13:00:00Z"))
+                .unwrap()
+                .with_timezone(&Utc);
+            let stamp = DateTime::<Utc>::from_timestamp_millis(step_timestamp_milliseconds(now, 0))
+                .unwrap();
+            let (start, end) = eastern_day_bounds(eastern_date(now));
+            assert!(
+                stamp >= start && stamp < end,
+                "{day}: forecast stamped {stamp} is outside the session window [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_step_timestamp_step_zero_is_the_current_eastern_session() {
+        // Step t is the Eastern session t days out, stamped at Eastern midnight. 15:30Z is 11:30
+        // Eastern, so step 0 is that same session rather than the one UTC is already into.
+        use crate::data::calendar::eastern_midnight;
+
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let midnight = chrono::NaiveDate::from_ymd_opt(2026, 6, 9)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
-        assert_eq!(step_timestamp_milliseconds(now, 0), midnight);
+        let session = chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        assert_eq!(
+            step_timestamp_milliseconds(now, 0),
+            eastern_midnight(session).timestamp_millis()
+        );
         assert_eq!(
             step_timestamp_milliseconds(now, 4),
-            midnight + 4 * 86_400_000
+            eastern_midnight(session + Duration::days(4)).timestamp_millis()
+        );
+    }
+
+    #[test]
+    fn test_late_evening_eastern_still_stamps_the_current_session() {
+        // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
+        // forecast a session forward, which is the failure this function exists to avoid.
+        use crate::data::calendar::eastern_midnight;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            step_timestamp_milliseconds(now, 0),
+            eastern_midnight(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap())
+                .timestamp_millis()
         );
     }
 
@@ -1044,15 +1098,49 @@ mod tests {
     }
 
     #[test]
-    fn test_step_timestamp_advances_one_day_per_step() {
+    fn test_step_timestamp_advances_one_session_per_step() {
+        // Compared against `eastern_midnight` rather than a fixed 86,400,000 ms stride: successive
+        // Eastern midnights are 23 or 25 hours apart across a daylight-saving transition, so a
+        // fixed stride asserts something that is only true away from March and November.
+        use crate::data::calendar::eastern_midnight;
+
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let step0 = step_timestamp_milliseconds(now, 0);
-        let step1 = step_timestamp_milliseconds(now, 1);
-        let step7 = step_timestamp_milliseconds(now, 7);
-        assert_eq!(step1 - step0, 86_400_000);
-        assert_eq!(step7 - step0, 7 * 86_400_000);
+        let session = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        for step in [0usize, 1, 7] {
+            assert_eq!(
+                step_timestamp_milliseconds(now, step),
+                eastern_midnight(session + Duration::days(step as i64)).timestamp_millis(),
+                "step {step} did not land on its Eastern session midnight"
+            );
+        }
+    }
+
+    #[test]
+    fn test_step_timestamp_crosses_daylight_saving_transitions() {
+        // Eastern time springs forward 2026-03-08 and falls back 2026-11-01. Stepping across either
+        // boundary must still land on the session's own midnight, which a fixed day-length stride
+        // would miss by an hour in each direction.
+        use crate::data::calendar::eastern_midnight;
+
+        for (start, label) in [
+            ("2026-03-06T17:00:00Z", "spring forward"),
+            ("2026-10-30T17:00:00Z", "fall back"),
+        ] {
+            let now = chrono::DateTime::parse_from_rfc3339(start)
+                .unwrap()
+                .with_timezone(&Utc);
+            let session = crate::data::calendar::eastern_date(now);
+            for step in 0..5usize {
+                let expected = eastern_midnight(session + Duration::days(step as i64));
+                assert_eq!(
+                    step_timestamp_milliseconds(now, step),
+                    expected.timestamp_millis(),
+                    "{label}: step {step} did not land on {expected}"
+                );
+            }
+        }
     }
 
     #[test]

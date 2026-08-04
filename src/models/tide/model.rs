@@ -34,7 +34,7 @@ impl<B: Backend> ResidualBlock<B> {
 }
 
 #[derive(Module, Debug)]
-pub struct TideModel<B: Backend> {
+pub struct TiDEModel<B: Backend> {
     feature_projection_1: nn::Linear<B>,
     feature_projection_2: nn::Linear<B>,
     encoder_blocks: Vec<ResidualBlock<B>>,
@@ -42,19 +42,19 @@ pub struct TideModel<B: Backend> {
     output_projection: nn::Linear<B>,
     final_layer_norm: nn::LayerNorm<B>,
     output_length: usize,
-    num_quantiles: usize,
+    quantile_count: usize,
 }
 
-impl TideModel<NdArray> {
+impl TiDEModel<NdArray> {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         directory_path: &std::path::Path,
         input_size: usize,
         hidden_size: usize,
-        num_encoder_layers: usize,
-        num_decoder_layers: usize,
+        encoder_layer_count: usize,
+        decoder_layer_count: usize,
         output_length: usize,
-        num_quantiles: usize,
+        quantile_count: usize,
         dropout_rate: f64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let device = Default::default();
@@ -62,10 +62,10 @@ impl TideModel<NdArray> {
             &device,
             input_size,
             hidden_size,
-            num_encoder_layers,
-            num_decoder_layers,
+            encoder_layer_count,
+            decoder_layer_count,
             output_length,
-            num_quantiles,
+            quantile_count,
             dropout_rate,
         );
 
@@ -89,31 +89,31 @@ impl TideModel<NdArray> {
     }
 }
 
-impl<B: Backend> TideModel<B> {
+impl<B: Backend> TiDEModel<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &B::Device,
         input_size: usize,
         hidden_size: usize,
-        num_encoder_layers: usize,
-        num_decoder_layers: usize,
+        encoder_layer_count: usize,
+        decoder_layer_count: usize,
         output_length: usize,
-        num_quantiles: usize,
+        quantile_count: usize,
         dropout_rate: f64,
     ) -> Self {
         let feature_projection_1 = nn::LinearConfig::new(input_size, hidden_size * 2).init(device);
         let feature_projection_2 = nn::LinearConfig::new(hidden_size * 2, hidden_size).init(device);
 
-        let encoder_blocks = (0..num_encoder_layers)
+        let encoder_blocks = (0..encoder_layer_count)
             .map(|_| ResidualBlock::new(device, hidden_size, dropout_rate))
             .collect();
 
-        let decoder_blocks = (0..num_decoder_layers)
+        let decoder_blocks = (0..decoder_layer_count)
             .map(|_| ResidualBlock::new(device, hidden_size, dropout_rate))
             .collect();
 
         let output_projection =
-            nn::LinearConfig::new(hidden_size, output_length * num_quantiles).init(device);
+            nn::LinearConfig::new(hidden_size, output_length * quantile_count).init(device);
 
         let final_layer_norm = nn::LayerNormConfig::new(hidden_size).init(device);
 
@@ -125,12 +125,12 @@ impl<B: Backend> TideModel<B> {
             output_projection,
             final_layer_norm,
             output_length,
-            num_quantiles,
+            quantile_count,
         }
     }
 
     /// Persist the model weights as a Burn record at `directory_path/tide_states`,
-    /// the exact stem [`TideModel::<NdArray>::load`] reads back. The on-disk file
+    /// the exact stem [`TiDEModel::<NdArray>::load`] reads back. The on-disk file
     /// gets the recorder's own extension; the loader re-derives it from the stem.
     pub fn save(&self, directory_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(directory_path)?;
@@ -165,7 +165,7 @@ impl<B: Backend> TideModel<B> {
         let combined = burn::tensor::activation::relu(combined);
 
         let output = self.output_projection.forward(combined);
-        output.reshape([batch_size, self.output_length * self.num_quantiles])
+        output.reshape([batch_size, self.output_length * self.quantile_count])
     }
 }
 
@@ -180,24 +180,24 @@ mod tests {
         let input_size = 100;
         let hidden_size = 32;
         let output_length = 5;
-        let num_quantiles = 3;
+        let quantile_count = 3;
         let batch_size = 4;
 
-        let model: TideModel<NdArray> = TideModel::new(
+        let model: TiDEModel<NdArray> = TiDEModel::new(
             &device,
             input_size,
             hidden_size,
             2,
             2,
             output_length,
-            num_quantiles,
+            quantile_count,
             0.1,
         );
 
         let input = Tensor::<NdArray, 2>::zeros([batch_size, input_size], &device);
         let output = model.forward(input);
 
-        assert_eq!(output.dims(), [batch_size, output_length * num_quantiles]);
+        assert_eq!(output.dims(), [batch_size, output_length * quantile_count]);
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         // No tide_states record in the directory: load must error rather than
         // fall back to random weights and report success.
         let dir = tempfile::tempdir().unwrap();
-        let result = TideModel::<NdArray>::load(dir.path(), 24, 16, 2, 1, 5, 3, 0.0);
+        let result = TiDEModel::<NdArray>::load(dir.path(), 24, 16, 2, 1, 5, 3, 0.0);
         assert!(result.is_err());
         let message = result.err().unwrap().to_string();
         assert!(message.contains("Failed to load model weights"));
@@ -224,7 +224,7 @@ mod tests {
     fn test_forward_applies_relu_before_output_projection() {
         let device = Default::default();
         let input_size = 12;
-        let model: TideModel<NdArray> = TideModel::new(&device, input_size, 8, 1, 1, 2, 3, 0.0);
+        let model: TiDEModel<NdArray> = TiDEModel::new(&device, input_size, 8, 1, 1, 2, 3, 0.0);
 
         let input = Tensor::<NdArray, 1>::from_floats(
             (0..(4 * input_size))
@@ -272,7 +272,7 @@ mod tests {
     fn test_save_load_round_trip_preserves_forward() {
         let device = Default::default();
         let input_size = 24;
-        let model: TideModel<NdArray> = TideModel::new(&device, input_size, 16, 2, 1, 5, 3, 0.0);
+        let model: TiDEModel<NdArray> = TiDEModel::new(&device, input_size, 16, 2, 1, 5, 3, 0.0);
 
         // A non-trivial input so a random-weight fallback would differ.
         let input = Tensor::<NdArray, 1>::from_floats(
@@ -289,7 +289,7 @@ mod tests {
         model.save(dir.path()).unwrap();
 
         let loaded =
-            TideModel::<NdArray>::load(dir.path(), input_size, 16, 2, 1, 5, 3, 0.0).unwrap();
+            TiDEModel::<NdArray>::load(dir.path(), input_size, 16, 2, 1, 5, 3, 0.0).unwrap();
         let actual: Vec<f32> = loaded.forward(input).to_data().to_vec().unwrap();
 
         assert_eq!(expected.len(), actual.len());

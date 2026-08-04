@@ -29,17 +29,17 @@ use fund::data::details;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
-use fund::models::tide::config::ModelParameters;
+use fund::models::tide::configuration::ModelParameters;
 use fund::models::tide::data::input_feature_size;
 use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
 use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
-use fund::models::tide::model::TideModel;
+use fund::models::tide::model::TiDEModel;
 use fund::models::tide::predict::consolidate_data;
-use fund::models::tide::train::{train, TrainBackend, TrainConfig};
+use fund::models::tide::train::{train, TrainBackend, TrainConfiguration};
 
 const INPUT_LENGTH: usize = 35;
-const OUTPUT_LENGTH: usize = 5;
+const OUTPUT_LENGTH: usize = 1;
 const VALIDATION_SPLIT: f64 = 0.8;
 
 /// S3 prefix for the trainer's own bar archive.
@@ -147,24 +147,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let parameters = ModelParameters::new(input_size, INPUT_LENGTH, OUTPUT_LENGTH);
 
     let device = <TrainBackend as Backend>::Device::default();
-    let model = TideModel::<TrainBackend>::new(
+    let model = TiDEModel::<TrainBackend>::new(
         &device,
         input_size,
         parameters.hidden_size(),
-        parameters.num_encoder_layers(),
-        parameters.num_decoder_layers(),
+        parameters.encoder_layer_count(),
+        parameters.decoder_layer_count(),
         parameters.output_length(),
         parameters.quantiles().len(),
         parameters.dropout_rate(),
     );
 
-    let config = training_config()?;
+    let configuration = training_configuration()?;
     let (best_model, losses) = train(
         model,
         &train_dataset,
         Some(&valid_dataset),
         &parameters,
-        &config,
+        &configuration,
         &device,
     );
     info!(
@@ -337,11 +337,11 @@ fn read_positive_env(variable: &str, default: i64) -> Result<i64, Box<dyn std::e
 /// Rebuilt through the validated constructor rather than by assigning a field, so an epoch count of
 /// zero is rejected here with a message rather than reaching the training loop, which would run no
 /// epochs and publish an untrained model that looks exactly like a trained one.
-fn training_config() -> Result<TrainConfig, Box<dyn std::error::Error>> {
-    let defaults = TrainConfig::default();
+fn training_configuration() -> Result<TrainConfiguration, Box<dyn std::error::Error>> {
+    let defaults = TrainConfiguration::default();
     let epoch_count = read_positive_env("FUND_EPOCHS", defaults.epoch_count() as i64)? as usize;
 
-    Ok(TrainConfig::new(
+    Ok(TrainConfiguration::new(
         defaults.learning_rate(),
         epoch_count,
         defaults.batch_size(),
@@ -654,21 +654,21 @@ mod tests {
         }
     }
 
-    /// The docstring on `training_config` claims a zero epoch count is rejected with a message.
+    /// The docstring on `training_configuration` claims a zero epoch count is rejected with a message.
     /// Nothing proved that until now — and an accepted zero would publish an untrained model that
     /// looks exactly like a trained one.
     #[test]
     #[serial]
     fn test_a_zero_epoch_count_is_rejected() {
         let _guard = EnvironmentVariableGuard::set("FUND_EPOCHS", "0");
-        assert!(training_config().is_err());
+        assert!(training_configuration().is_err());
     }
 
     #[test]
     #[serial]
     fn test_a_malformed_epoch_count_is_rejected() {
         let _guard = EnvironmentVariableGuard::set("FUND_EPOCHS", "twenty");
-        assert!(training_config().is_err());
+        assert!(training_configuration().is_err());
     }
 
     #[test]
@@ -676,8 +676,8 @@ mod tests {
     fn test_an_absent_epoch_count_keeps_the_default() {
         let _guard = EnvironmentVariableGuard::unset("FUND_EPOCHS");
         assert_eq!(
-            training_config().unwrap().epoch_count(),
-            TrainConfig::default().epoch_count()
+            training_configuration().unwrap().epoch_count(),
+            TrainConfiguration::default().epoch_count()
         );
     }
 

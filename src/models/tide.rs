@@ -4,7 +4,7 @@
 
 pub mod artifact;
 pub mod batch;
-pub mod config;
+pub mod configuration;
 pub mod data;
 pub mod drift;
 pub mod evaluate;
