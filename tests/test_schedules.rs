@@ -224,8 +224,25 @@ fn parse_expression(expression: &str, job_name: &str) -> CronExpression {
 }
 
 /// Every Eastern time comparison in the job body.
+///
+/// The connectors between them are not parsed, and [`gate_admits`] applies every bound with `AND`.
+/// A gate joined with `OR` would therefore be modelled as its own intersection: PostgreSQL could
+/// admit both candidate UTC firings while the once-per-session assertion still passed, which is the
+/// one failure this file exists to catch. Disjunction is refused rather than misread, on the same
+/// principle as [`parse_field`].
 fn parse_gate(body: &str, job_name: &str) -> Vec<GateBound> {
     const MARKER: &str = "(now() AT TIME ZONE 'America/New_York')::time";
+
+    let predicate = body
+        .split_once("WHERE")
+        .map_or("", |(_, predicate)| predicate);
+    assert!(
+        !predicate
+            .split(|character: char| !character.is_ascii_alphabetic())
+            .any(|token| token.eq_ignore_ascii_case("or")),
+        "job '{job_name}': disjunctive gates are not modelled by this test"
+    );
+
     let mut bounds = Vec::new();
 
     for segment in body.split(MARKER).skip(1) {
@@ -271,11 +288,11 @@ fn gate_admits(bounds: &[GateBound], moment: NaiveTime) -> bool {
 /// The UTC-to-Eastern conversion is the same `eastern_datetime` production uses, so this checks the
 /// schedule against the conversion the application will really perform rather than a second
 /// implementation that could drift from it.
-fn firings_by_session(
+fn firings_by_eastern_date(
     expression: &CronExpression,
     gate: &[GateBound],
 ) -> BTreeMap<NaiveDate, Vec<NaiveTime>> {
-    let mut by_session: BTreeMap<NaiveDate, Vec<NaiveTime>> = BTreeMap::new();
+    let mut by_eastern_date: BTreeMap<NaiveDate, Vec<NaiveTime>> = BTreeMap::new();
     let mut date = NaiveDate::from_ymd_opt(YEAR, 1, 1).expect("a valid start of year");
     let end = NaiveDate::from_ymd_opt(YEAR, 12, 31).expect("a valid end of year");
 
@@ -292,7 +309,7 @@ fn firings_by_session(
                         .expect("every UTC wall-clock time exists");
                     let eastern = eastern_datetime(instant);
                     if gate_admits(gate, eastern.time()) {
-                        by_session
+                        by_eastern_date
                             .entry(eastern.date())
                             .or_default()
                             .push(eastern.time());
@@ -305,10 +322,10 @@ fn firings_by_session(
             .expect("the year ends before the epoch does");
     }
 
-    for times in by_session.values_mut() {
+    for times in by_eastern_date.values_mut() {
         times.sort_unstable();
     }
-    by_session
+    by_eastern_date
 }
 
 /// Every date in the year the expression's day-of-week field admits.
@@ -317,8 +334,8 @@ fn firings_by_session(
 /// let a job that goes silent for half the year pass: dropping one of the two candidate UTC hours
 /// leaves the surviving hour correct in one daylight-saving regime and outside the gate in the
 /// other, so the missing days vanish from the map rather than disagreeing with it.
-fn expected_sessions(expression: &CronExpression) -> Vec<NaiveDate> {
-    let mut sessions = Vec::new();
+fn expected_eastern_dates(expression: &CronExpression) -> Vec<NaiveDate> {
+    let mut dates = Vec::new();
     let mut date = NaiveDate::from_ymd_opt(YEAR, 1, 1).expect("a valid start of year");
     let end = NaiveDate::from_ymd_opt(YEAR, 12, 31).expect("a valid end of year");
 
@@ -327,13 +344,13 @@ fn expected_sessions(expression: &CronExpression) -> Vec<NaiveDate> {
             .days_of_week
             .contains(&date.weekday().num_days_from_sunday())
         {
-            sessions.push(date);
+            dates.push(date);
         }
         date = date
             .succ_opt()
             .expect("the year ends before the epoch does");
     }
-    sessions
+    dates
 }
 
 /// The whole point: a gated job fires at the same Eastern times on every trading weekday of the
@@ -369,22 +386,22 @@ fn test_every_gated_schedule_keeps_the_same_eastern_clock_all_year() {
             job.name
         );
 
-        let by_session = firings_by_session(&expression, &gate);
+        let by_eastern_date = firings_by_eastern_date(&expression, &gate);
 
         // Checked before the per-day comparison below, because a day with no firing at all is
         // absent from the map rather than present with the wrong times — so comparing only what is
         // there would silently accept a job that stops firing for half the year.
         assert_eq!(
-            by_session.keys().copied().collect::<Vec<NaiveDate>>(),
-            expected_sessions(&expression),
+            by_eastern_date.keys().copied().collect::<Vec<NaiveDate>>(),
+            expected_eastern_dates(&expression),
             "job '{}' does not fire on every day its schedule admits",
             job.name
         );
 
-        for (session, times) in &by_session {
+        for (eastern_date, times) in &by_eastern_date {
             assert_eq!(
                 times, &expected,
-                "job '{}' fires at a different Eastern schedule on {session}",
+                "job '{}' fires at a different Eastern schedule on {eastern_date}",
                 job.name
             );
         }
@@ -409,19 +426,19 @@ fn test_gated_schedules_never_fire_on_a_weekend() {
         let expression = parse_expression(&job.expression, &job.name);
         let gate = parse_gate(&job.body, &job.name);
 
-        let sessions: Vec<NaiveDate> = firings_by_session(&expression, &gate)
+        let weekend_dates: Vec<NaiveDate> = firings_by_eastern_date(&expression, &gate)
             .into_keys()
-            .filter(|session| {
+            .filter(|eastern_date| {
                 matches!(
-                    session.weekday(),
+                    eastern_date.weekday(),
                     chrono::Weekday::Sat | chrono::Weekday::Sun
                 )
             })
             .collect();
 
         assert!(
-            sessions.is_empty(),
-            "job '{}' fires on {sessions:?}, which are not trading days",
+            weekend_dates.is_empty(),
+            "job '{}' fires on {weekend_dates:?}, which are not trading days",
             job.name
         );
     }
@@ -456,11 +473,11 @@ fn test_a_once_daily_job_fires_exactly_once_per_session() {
             job.name
         );
 
-        for (session, times) in firings_by_session(&expression, &gate) {
+        for (eastern_date, times) in firings_by_eastern_date(&expression, &gate) {
             assert_eq!(
                 times.len(),
                 1,
-                "job '{}' passed its gate {} times on {session}",
+                "job '{}' passed its gate {} times on {eastern_date}",
                 job.name,
                 times.len()
             );
@@ -528,4 +545,26 @@ fn test_gate_parsing_reads_bounds_and_their_inclusivity() {
     );
 
     assert!(parse_gate("DELETE FROM cron.job_run_details", "job").is_empty());
+}
+
+/// A disjunctive gate must be refused, not silently read as a conjunction.
+///
+/// `gate_admits` applies every bound with `AND`. Modelling an `OR` gate that way describes a
+/// narrower window than PostgreSQL would evaluate, so both candidate UTC firings could pass in
+/// production while `test_a_once_daily_job_fires_exactly_once_per_session` still saw one.
+#[test]
+fn test_the_gate_parser_refuses_disjunction() {
+    let conjunctive = "SELECT emit_event('x', '{}'::jsonb) \
+                       WHERE (now() AT TIME ZONE 'America/New_York')::time >= TIME '09:00' \
+                         AND (now() AT TIME ZONE 'America/New_York')::time < TIME '09:20'";
+    let disjunctive = conjunctive.replace(" AND ", " OR ");
+
+    // The precondition: the conjunctive form parses, so the rejection below is the OR and not
+    // some other difference between the two strings.
+    assert_eq!(parse_gate(conjunctive, "job").len(), 2);
+
+    assert!(
+        std::panic::catch_unwind(|| parse_gate(&disjunctive, "job")).is_err(),
+        "an OR-joined gate must be refused"
+    );
 }

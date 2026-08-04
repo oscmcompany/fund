@@ -5,11 +5,11 @@
 //! database; the notify trigger only fires in the database; the alignment guarantee in
 //! `load_aligned_closes` depends on how the query is planned, not on how the Rust reads.
 //!
-//! Session windows are always built with `SessionDate::at(now).bounds()`, never
-//! `SessionDate::at(now).bounds()`. The second is the UTC calendar date, which between 20:00
-//! Eastern and midnight names *tomorrow* — so the window starts four hours in the future and
-//! excludes the rows the test just seeded. It is the trading day these queries are bounded by, and
-//! a test that assumes the two coincide fails for four hours every evening.
+//! Session windows are always built with `SessionDate::at(now).bounds()`, never from
+//! `now.date_naive()`. The second is the UTC calendar date, which between 20:00 Eastern and
+//! midnight names *tomorrow* — so the window starts four hours in the future and excludes the rows
+//! the test just seeded. It is the trading day these queries are bounded by, and a test that
+//! assumes the two coincide fails for four hours every evening.
 
 mod common;
 
@@ -279,8 +279,11 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
     let pool = fresh_pool().await;
     let today = SessionDate::at(Utc::now());
 
+    // Negative: the window this loader serves is trailing history, so the fixture must run
+    // backwards from today. Seeding forwards puts the whole window in the future, and the
+    // alignment assertion then proves nothing about the historical lower bound.
     for offset in 0..5 {
-        let date = today.plus_calendar_days(offset);
+        let date = today.plus_calendar_days(-offset);
         common::seed_bar(&pool, "AAAA", date, 100.0 + offset as f64).await;
         // BBBB is missing one session in the middle of the window.
         if offset != 2 {

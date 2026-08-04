@@ -632,14 +632,21 @@ in {
     # which timezone it is in -- pg_cron has `cron.timezone = UTC` in the settings above -- and this
     # one was reading it from host state nobody sets, so "23:00 UTC" was a hope rather than a fact.
     #
-    # Checked independently of the entry below, and prepended rather than appended, for the reason
-    # in the comment at the top of this script: a machine provisioned before the pin existed has the
-    # training entry already, so a check that rode along with it would never run there. A crontab
-    # variable applies to the entries that follow it, so position is not cosmetic.
-    if crontab -l 2>/dev/null | grep -qE '^CRON_TZ=UTC$'; then
+    # Checked independently of the entry below, for the reason in the comment at the top of this
+    # script: a machine provisioned before the pin existed has the training entry already, so a
+    # check that rode along with it would never run there.
+    #
+    # A crontab variable applies only to the entries *below* it, so presence is not proof. A second
+    # assignment above the trainer entry would leave that schedule in the host timezone while a
+    # grep for CRON_TZ=UTC anywhere still passed. Rather than test for that, this normalizes: every
+    # CRON_TZ line is stripped and exactly one is prepended, so the managed crontab carries a single
+    # timezone declaration at the top and every entry inherits it regardless of the order they were
+    # installed in. Idempotent, and it makes the invariant true instead of merely checked.
+    if [ "$(crontab -l 2>/dev/null | grep -c '^CRON_TZ=' || true)" = "1" ] \
+       && crontab -l 2>/dev/null | head -n 1 | grep -qE '^CRON_TZ=UTC$'; then
       echo "Cron timezone already pinned to UTC"
     else
-      (echo 'CRON_TZ=UTC'; crontab -l 2>/dev/null || true) | crontab -
+      (echo 'CRON_TZ=UTC'; crontab -l 2>/dev/null | grep -v '^CRON_TZ=' || true) | crontab -
       echo "Pinned cron timezone to UTC (host is $(date +%Z), offset $(date +%z))"
     fi
 

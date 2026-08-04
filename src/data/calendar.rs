@@ -40,10 +40,17 @@ const HORIZON_DAYS_BACKWARD: i64 = 30;
 /// and its label computed from two separate expressions. None of those is expressible here.
 ///
 /// There are exactly two ways in. [`SessionDate::at`] converts an instant, which is the only
-/// correct way to answer "what trading day is it now". [`SessionDate::from_date`] takes a date that
-/// is *already* a session — parsed from a command-line argument, read from a `DATE` column, or
-/// returned by an exchange API that publishes Eastern dates. A `NaiveDate` obtained any other way
-/// has no business becoming one of these.
+/// correct way to answer "what trading day is it now". [`SessionDate::from_date`] takes a date
+/// already expressed in Eastern terms — parsed from a command-line argument, read from a `DATE`
+/// column, or returned by an exchange API that publishes Eastern dates. A `NaiveDate` obtained any
+/// other way, and a UTC date in particular, has no business becoming one of these.
+///
+/// **What it guarantees is the timezone, not tradability.** A `SessionDate` is a calendar date in
+/// the frame the exchange keeps; it is not proof that the market opens that day. Weekends and
+/// holidays are perfectly representable, and [`SessionDate::plus_calendar_days`] will land on them.
+/// Whether a date trades is [`TradingCalendar::is_trading_day`]'s question, and it is the only
+/// thing that can answer it — the calendar is fetched from Alpaca, and a holiday table in the type
+/// system would be a second source that can disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(transparent)]
 pub struct SessionDate(NaiveDate);

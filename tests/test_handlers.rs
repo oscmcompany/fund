@@ -579,7 +579,17 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     let pool = fresh_pool().await;
     let mut server = mockito::Server::new_async().await;
 
-    let session_date = SessionDate::at(Utc::now());
+    // A fixed instant on the wrong side of UTC midnight: 00:30Z on 4 August is 20:30 on 3 August in
+    // New York. The session is therefore 2026-08-03, and the activities request below asserts that
+    // date — so a regression sending the UTC date instead of `session_date.date()` fails here
+    // rather than only during the four hours a day when the two disagree.
+    let session_date = SessionDate::at(
+        chrono::DateTime::parse_from_rfc3339("2026-08-04T00:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc),
+    );
+    assert_eq!(session_date.to_string(), "2026-08-03");
+
     let (start, _end) = session_date.bounds();
     let opened = start + Duration::hours(14);
     let closed = start + Duration::hours(18);
@@ -608,6 +618,12 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
             "GET",
             mockito::Matcher::Regex(r"^/v2/account/activities/FILL".into()),
         )
+        // The path prefix alone would match a request carrying any date. Alpaca is asked for one
+        // session, and which session that is comes from the Eastern derivation under test.
+        .match_query(mockito::Matcher::UrlEncoded(
+            "date".into(),
+            "2026-08-03".into(),
+        ))
         .with_status(200)
         .with_body(format!(
             r#"[{{"id":"a1","activity_type":"FILL","transaction_time":"{}",
@@ -747,12 +763,12 @@ fn mean_reverting_short_price(history: &HashMap<Ticker, Vec<f64>>) -> f64 {
 
 /// An instant inside the session, so the risk gate's hold-window check has room.
 ///
-/// Built from the **Eastern** date, not `SessionDate::at(Utc::now())`. Between 20:00 Eastern and
-/// midnight the two name different days, and a fixture anchored to the UTC date lands outside the
-/// session it is meant to sit inside — which is a test that fails for four hours every evening and
-/// passes every time anyone looks at it during the day.
+/// Built from the **Eastern** date via `SessionDate::at`, not from `Utc::now().date_naive()`.
+/// Between 20:00 Eastern and midnight the two name different days, and a fixture anchored to the
+/// UTC date lands outside the session it is meant to sit inside — which is a test that fails for
+/// four hours every evening and passes every time anyone looks at it during the day.
 ///
-/// `eastern_day_bounds` returns UTC instants, so the offset below is from Eastern midnight.
+/// `SessionDate::bounds` returns UTC instants, so the offset below is from Eastern midnight.
 fn session_instant() -> chrono::DateTime<Utc> {
     let today = SessionDate::at(Utc::now());
     let (start, _) = today.bounds();

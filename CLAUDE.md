@@ -91,10 +91,13 @@ This is a collection of guidelines and references.
   calendar date — that is what the exchange's day is, not a display preference. A session is
   `data::calendar::SessionDate`, never a bare `NaiveDate`: derive one from an instant with `SessionDate::at`
   and convert back with `.midnight()`/`.bounds()`, never via `Utc::now().date_naive()` or a hardcoded offset
-- `SessionDate::from_date` is for dates that arrive already being sessions — a parsed argument, a `DATE`
+- `SessionDate::from_date` is for dates already expressed in Eastern terms — a parsed argument, a `DATE`
   column, an exchange calendar entry — so transport modules (`common::alpaca`, `common::massive`,
   `common::aws`) keep `NaiveDate` and the wrap happens at the domain boundary; render Eastern only at the
   display boundary, and stamp test fixtures with `.midnight()` so they match how bars really arrive
+- `SessionDate` guarantees the timezone, not tradability: weekends and holidays are representable and
+  `plus_calendar_days` will land on them, so only `TradingCalendar::is_trading_day` answers whether a date
+  trades — never infer it from the type
 - Write `Eastern` or `America/New_York`, never `EST` or `EDT` — each names only half the year; elapsed
   durations and timeouts carry no zone, so measure them on a monotonic clock (`tokio::time::Instant`), and
   schedule trading jobs with a UTC cron expression gated on the Eastern wall clock, a pairing that

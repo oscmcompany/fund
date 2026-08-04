@@ -1321,6 +1321,56 @@ mod tests {
         assert_eq!(day_of_week, vec![1, 7]);
     }
 
+    /// The covariates must come from the Eastern date, on an instant where Eastern and UTC disagree.
+    ///
+    /// The fixture above cannot prove this. A daily bar is stamped at Eastern midnight, which is
+    /// 04:00 or 05:00 the *same* UTC day, so `date_naive()` and `SessionDate::at` return the same
+    /// date for it and the assertion holds under either implementation.
+    ///
+    /// 01:00Z on 10 June is 21:00 on 9 June in New York — Wednesday in UTC, Tuesday in Eastern.
+    /// Reading the UTC date here yields 3; the session's own weekday is 2.
+    #[test]
+    fn test_engineer_features_reads_the_eastern_date_where_the_two_disagree() {
+        let late_evening = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // The precondition, so this cannot pass by the two agreeing: the UTC weekday is Wednesday.
+        assert_eq!(
+            late_evening.date_naive().weekday().number_from_monday(),
+            3,
+            "the fixture must sit on an instant where UTC and Eastern name different days"
+        );
+
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["AAA"]),
+            Column::new("timestamp".into(), vec![late_evening.timestamp_millis()]),
+            Column::new("open_price".into(), vec![1.0_f64]),
+            Column::new("high_price".into(), vec![1.0_f64]),
+            Column::new("low_price".into(), vec![1.0_f64]),
+            Column::new("close_price".into(), vec![10.0_f64]),
+            Column::new("volume".into(), vec![1.0_f64]),
+            Column::new("volume_weighted_average_price".into(), vec![1.0_f64]),
+            Column::new("sector".into(), vec!["S"]),
+            Column::new("industry".into(), vec!["I"]),
+        ])
+        .unwrap();
+
+        let engineered = engineer_features(frame).unwrap();
+        let read = |name: &str| {
+            engineered
+                .column(name)
+                .unwrap()
+                .i32()
+                .unwrap()
+                .get(0)
+                .unwrap()
+        };
+        assert_eq!(read("day_of_week"), 2, "Tuesday in Eastern, not Wednesday");
+        assert_eq!(read("day_of_month"), 9);
+        assert_eq!(read("month"), 6);
+    }
+
     #[test]
     fn test_split_by_timestamp_boundary_row_goes_to_train() {
         // Train is date <= split, validation is date > split. With 11 daily rows (0..=10 days)
