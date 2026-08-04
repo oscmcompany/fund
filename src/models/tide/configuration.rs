@@ -25,7 +25,7 @@ impl Default for ModelParameters {
             hidden_size: 64,
             encoder_layer_count: 3,
             decoder_layer_count: 2,
-            output_length: 5,
+            output_length: 1,
             input_length: 35,
             dropout_rate: 0.1,
             quantiles: vec![0.1, 0.5, 0.9],
@@ -125,17 +125,17 @@ mod tests {
     fn test_default_parameters() {
         let params = ModelParameters::default();
         assert_eq!(params.hidden_size(), 64);
-        assert_eq!(params.output_length(), 5);
+        assert_eq!(params.output_length(), 1);
         assert_eq!(params.input_length(), 35);
         assert_eq!(params.quantiles(), [0.1, 0.5, 0.9]);
     }
 
     #[test]
     fn test_new_applies_defaults_for_architecture() {
-        let params = ModelParameters::new(448, 35, 5);
-        assert_eq!(params.input_size(), 448);
+        let params = ModelParameters::new(428, 35, 1);
+        assert_eq!(params.input_size(), 428);
         assert_eq!(params.input_length(), 35);
-        assert_eq!(params.output_length(), 5);
+        assert_eq!(params.output_length(), 1);
         assert_eq!(params.hidden_size(), 64);
         assert_eq!(params.encoder_layer_count(), 3);
         assert_eq!(params.decoder_layer_count(), 2);

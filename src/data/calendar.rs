@@ -61,7 +61,8 @@ pub fn eastern_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
     (start, end)
 }
 
-fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
+/// Midnight Eastern on `date`, as the equivalent UTC instant.
+pub(crate) fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
     let local_midnight = date
         .and_hms_opt(0, 0, 0)
         .expect("midnight is a valid wall-clock time");

@@ -217,14 +217,15 @@ pub(crate) fn unscale_and_sort_quantiles(
     unscaled
 }
 
-/// Timestamp (UTC midnight, milliseconds) for horizon step `step`, where step 0 is `now`'s date.
+/// Timestamp for horizon step `step`, where step 0 is the Eastern session `now` falls in.
+///
+/// Midnight *Eastern*, not UTC. The evaluation pass selects forecasts with
+/// [`crate::data::calendar::eastern_day_bounds`], and a UTC midnight sits at 20:00 the previous
+/// Eastern day under daylight time -- so a UTC-stamped forecast lands in the wrong session's
+/// window and the morning's inference run is never read by that day's passes.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
-    (now + Duration::days(step as i64))
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always a valid time")
-        .and_utc()
-        .timestamp_millis()
+    let session = crate::data::calendar::eastern_date(now) + Duration::days(step as i64);
+    crate::data::calendar::eastern_midnight(session).timestamp_millis()
 }
 
 pub fn generate_predictions(
@@ -315,8 +316,11 @@ pub fn generate_predictions(
         }
     }
 
-    // Select the final horizon step, now + (output_length - 1) days, for the caller to persist.
-    let target_date = step_timestamp_milliseconds(now, output_length - 1);
+    // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
+    // liquidation flattens every position the same session, so a forecast further out describes a
+    // holding period this strategy never has. Selected explicitly rather than as the last step, so
+    // widening `output_length` for research does not silently move the traded signal.
+    let target_date = step_timestamp_milliseconds(now, 0);
 
     let final_predictions: Vec<serde_json::Value> = results
         .into_iter()
@@ -738,22 +742,67 @@ mod tests {
     }
 
     #[test]
-    fn test_step_timestamp_step_zero_is_today_midnight() {
-        // Horizon step t is now + t days at midnight: step 0 is today, and the persisted
-        // target is step output_length - 1.
+    fn test_predictions_are_visible_to_the_same_session_evaluation() {
+        // The 09:00 Eastern run exists to feed the same session's evaluation passes, which select
+        // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
+        // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
+        // morning is never the one read this afternoon.
+        use crate::data::calendar::{eastern_date, eastern_day_bounds};
+
+        for day in [
+            "2026-08-03",
+            "2026-08-04",
+            "2026-08-05",
+            "2026-08-06",
+            "2026-08-07",
+        ] {
+            // 13:00Z is 09:00 Eastern while daylight time is in effect.
+            let now = chrono::DateTime::parse_from_rfc3339(&format!("{day}T13:00:00Z"))
+                .unwrap()
+                .with_timezone(&Utc);
+            let stamp = DateTime::<Utc>::from_timestamp_millis(step_timestamp_milliseconds(now, 0))
+                .unwrap();
+            let (start, end) = eastern_day_bounds(eastern_date(now));
+            assert!(
+                stamp >= start && stamp < end,
+                "{day}: forecast stamped {stamp} is outside the session window [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_step_timestamp_step_zero_is_the_current_eastern_session() {
+        // Step t is the Eastern session t days out, stamped at Eastern midnight. 15:30Z is 11:30
+        // Eastern, so step 0 is that same session rather than the one UTC is already into.
+        use crate::data::calendar::eastern_midnight;
+
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let midnight = chrono::NaiveDate::from_ymd_opt(2026, 6, 9)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
-        assert_eq!(step_timestamp_milliseconds(now, 0), midnight);
+        let session = chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap();
+        assert_eq!(
+            step_timestamp_milliseconds(now, 0),
+            eastern_midnight(session).timestamp_millis()
+        );
         assert_eq!(
             step_timestamp_milliseconds(now, 4),
-            midnight + 4 * 86_400_000
+            eastern_midnight(session + Duration::days(4)).timestamp_millis()
+        );
+    }
+
+    #[test]
+    fn test_late_evening_eastern_still_stamps_the_current_session() {
+        // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
+        // forecast a session forward, which is the failure this function exists to avoid.
+        use crate::data::calendar::eastern_midnight;
+
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            step_timestamp_milliseconds(now, 0),
+            eastern_midnight(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap())
+                .timestamp_millis()
         );
     }
 

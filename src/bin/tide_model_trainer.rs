@@ -39,7 +39,7 @@ use fund::models::tide::predict::consolidate_data;
 use fund::models::tide::train::{train, TrainBackend, TrainConfiguration};
 
 const INPUT_LENGTH: usize = 35;
-const OUTPUT_LENGTH: usize = 5;
+const OUTPUT_LENGTH: usize = 1;
 const VALIDATION_SPLIT: f64 = 0.8;
 
 /// S3 prefix for the trainer's own bar archive.
