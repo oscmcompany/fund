@@ -10,13 +10,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Utc};
 use polars::prelude::*;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, Ticker};
+use crate::data::calendar::SessionDate;
 
 /// Rows per insert chunk.
 ///
@@ -50,7 +51,7 @@ pub enum BarsError {
 #[derive(Debug, Default)]
 pub struct FetchedBars {
     pub bars: Vec<EquityBar>,
-    pub dates_failed: Vec<NaiveDate>,
+    pub dates_failed: Vec<SessionDate>,
 }
 
 /// Fetches whole-market daily bars for each of `dates`.
@@ -60,11 +61,11 @@ pub struct FetchedBars {
 ///
 /// A failed date is recorded and stepped over rather than aborting, which would discard every date
 /// already retrieved. The upsert makes re-running a range cheap.
-pub async fn fetch_daily_bars(client: &MassiveClient, dates: &[NaiveDate]) -> FetchedBars {
+pub async fn fetch_daily_bars(client: &MassiveClient, dates: &[SessionDate]) -> FetchedBars {
     let mut fetched = FetchedBars::default();
 
     for date in dates {
-        match client.fetch_grouped_daily(*date).await {
+        match client.fetch_grouped_daily(date.date()).await {
             Ok(bars) => fetched.bars.extend(bars),
             Err(error) => {
                 warn!(%date, %error, "Failed to fetch a session's bars, continuing");
@@ -363,7 +364,7 @@ pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
 /// universe caches.
 #[derive(Default)]
 pub struct CloseHistoryCache {
-    inner: tokio::sync::Mutex<Option<(NaiveDate, AlignedCloses)>>,
+    inner: tokio::sync::Mutex<Option<(SessionDate, AlignedCloses)>>,
 }
 
 impl CloseHistoryCache {
@@ -383,7 +384,7 @@ impl CloseHistoryCache {
         sessions: usize,
         now: DateTime<Utc>,
     ) -> Result<AlignedCloses, BarsError> {
-        let today = crate::data::calendar::eastern_date(now);
+        let today = SessionDate::at(now);
 
         if let Some((cached_date, closes)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
@@ -400,8 +401,7 @@ impl CloseHistoryCache {
 
     /// Replaces the cached history. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, closes: HashMap<Ticker, Vec<f64>>) {
-        *self.inner.lock().await =
-            Some((crate::data::calendar::eastern_date(now), Arc::new(closes)));
+        *self.inner.lock().await = Some((SessionDate::at(now), Arc::new(closes)));
     }
 
     /// Drops the cached history so the next caller reloads it.

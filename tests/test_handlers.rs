@@ -9,13 +9,13 @@ mod common;
 
 use std::collections::HashMap;
 
-use chrono::{Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{Duration, NaiveTime, Utc};
 use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
 };
 use fund::common::types::{BarInterval, Ticker};
 use fund::data::bars;
-use fund::data::calendar::TradingCalendar;
+use fund::data::calendar::{SessionDate, TradingCalendar};
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;
@@ -50,12 +50,12 @@ async fn fresh_pool() -> PgPool {
 
 /// A calendar whose session runs 09:30 to 16:00 today, so `minutes_until_close` answers something.
 fn calendar_for_today() -> TradingCalendar {
-    let today = fund::data::calendar::eastern_date(Utc::now());
+    let today = SessionDate::at(Utc::now());
     let days = (0..5)
         .filter_map(|offset| {
-            let date = today - Duration::days(offset);
+            let date = today.plus_calendar_days(-offset);
             CalendarDay::new(
-                date,
+                date.date(),
                 NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
                 NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
             )
@@ -579,8 +579,8 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     let pool = fresh_pool().await;
     let mut server = mockito::Server::new_async().await;
 
-    let session_date = fund::data::calendar::eastern_date(Utc::now());
-    let (start, _end) = fund::data::calendar::eastern_day_bounds(session_date);
+    let session_date = SessionDate::at(Utc::now());
+    let (start, _end) = session_date.bounds();
     let opened = start + Duration::hours(14);
     let closed = start + Duration::hours(18);
 
@@ -652,8 +652,8 @@ async fn test_the_account_sync_is_idempotent() {
 
     let pool = fresh_pool().await;
     let mut server = mockito::Server::new_async().await;
-    let session_date = fund::data::calendar::eastern_date(Utc::now());
-    let (start, _end) = fund::data::calendar::eastern_day_bounds(session_date);
+    let session_date = SessionDate::at(Utc::now());
+    let (start, _end) = session_date.bounds();
 
     let _account = server
         .mock("GET", "/v2/account")
@@ -747,14 +747,14 @@ fn mean_reverting_short_price(history: &HashMap<Ticker, Vec<f64>>) -> f64 {
 
 /// An instant inside the session, so the risk gate's hold-window check has room.
 ///
-/// Built from the **Eastern** date, not `Utc::now().date_naive()`. Between 20:00 Eastern and
+/// Built from the **Eastern** date, not `SessionDate::at(Utc::now())`. Between 20:00 Eastern and
 /// midnight the two name different days, and a fixture anchored to the UTC date lands outside the
 /// session it is meant to sit inside — which is a test that fails for four hours every evening and
 /// passes every time anyone looks at it during the day.
 ///
 /// `eastern_day_bounds` returns UTC instants, so the offset below is from Eastern midnight.
 fn session_instant() -> chrono::DateTime<Utc> {
-    let today: NaiveDate = fund::data::calendar::eastern_date(Utc::now());
-    let (start, _) = fund::data::calendar::eastern_day_bounds(today);
+    let today = SessionDate::at(Utc::now());
+    let (start, _) = today.bounds();
     start + Duration::hours(11) // 11:00 Eastern, mid-session
 }

@@ -12,14 +12,14 @@
 //! list. Asking Alpaca means asking for its *current* tradable set, so every symbol delisted since
 //! the start date would be missing from its own history.
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use tracing::{error, info, warn};
 
 use fund::common::database::connect_pool;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
 use fund::data::bars;
-use fund::data::calendar::eastern_date;
+use fund::data::calendar::SessionDate;
 
 const USAGE: &str = "Usage: seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]";
 
@@ -34,13 +34,13 @@ const CHUNK_DAYS: i64 = 30;
 /// Inclusive date range, validated on construction.
 #[derive(Debug, PartialEq, Eq)]
 struct SeedRange {
-    start: NaiveDate,
-    end: NaiveDate,
+    start: SessionDate,
+    end: SessionDate,
 }
 
 impl SeedRange {
     /// Rejects an inverted range, so a `SeedRange` in scope is proof the window is orderable.
-    fn new(start: NaiveDate, end: NaiveDate) -> Result<Self, String> {
+    fn new(start: SessionDate, end: SessionDate) -> Result<Self, String> {
         if start > end {
             return Err(format!(
                 "Invalid range: start date {start} must be on or before end date {end}"
@@ -57,12 +57,14 @@ impl SeedRange {
         let mut chunks = Vec::new();
         let mut window_start = self.start;
         while window_start <= self.end {
-            let window_end = (window_start + Duration::days(CHUNK_DAYS - 1)).min(self.end);
+            let window_end = window_start
+                .plus_calendar_days(CHUNK_DAYS - 1)
+                .min(self.end);
             chunks.push(SeedRange {
                 start: window_start,
                 end: window_end,
             });
-            window_start = window_end + Duration::days(1);
+            window_start = window_end.plus_calendar_days(1);
         }
         chunks
     }
@@ -73,19 +75,20 @@ impl SeedRange {
     /// where the database is empty, and the published calendar is one of the things that is not
     /// there yet. A weekend costs one request and answers with nothing, which is cheap enough that
     /// filtering is not worth a dependency on data the caller may not have.
-    fn dates(&self) -> Vec<NaiveDate> {
+    fn dates(&self) -> Vec<SessionDate> {
         let mut dates = Vec::new();
         let mut date = self.start;
         while date <= self.end {
             dates.push(date);
-            date += Duration::days(1);
+            date = date.plus_calendar_days(1);
         }
         dates
     }
 }
 
-fn parse_date(value: &str) -> Result<NaiveDate, String> {
+fn parse_date(value: &str) -> Result<SessionDate, String> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map(SessionDate::from_date)
         .map_err(|error| format!("Invalid date '{value}': expected YYYY-MM-DD ({error})"))
 }
 
@@ -93,7 +96,7 @@ fn parse_date(value: &str) -> Result<NaiveDate, String> {
 ///
 /// `today` is a parameter rather than read from the clock here, because a function that reads the
 /// wall clock cannot be tested across the hours where the Eastern date and the UTC date disagree.
-fn parse_arguments(arguments: &[String], today: NaiveDate) -> Result<SeedRange, String> {
+fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<SeedRange, String> {
     match arguments {
         [] => Err(format!("Start date is required\n{USAGE}")),
         [start] => SeedRange::new(parse_date(start)?, today),
@@ -133,7 +136,7 @@ async fn main() {
     let tracing_guard = init_tracing("seed-equity-bars.log", Some("info"), "seed-equity-bars");
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let range = match parse_arguments(&arguments, eastern_date(Utc::now())) {
+    let range = match parse_arguments(&arguments, SessionDate::at(Utc::now())) {
         Ok(range) => range,
         Err(message) => {
             eprintln!("{message}");
@@ -246,8 +249,10 @@ async fn seed_chunk(
 mod tests {
     use super::*;
 
-    fn date(value: &str) -> NaiveDate {
-        NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("a valid test date")
+    fn date(value: &str) -> SessionDate {
+        SessionDate::from_date(
+            NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("a valid test date"),
+        )
     }
 
     #[test]
@@ -319,13 +324,13 @@ mod tests {
         for window in chunks.windows(2) {
             assert_eq!(
                 window[1].start,
-                window[0].end + Duration::days(1),
+                window[0].end.plus_calendar_days(1),
                 "chunks must abut without a gap or an overlap"
             );
         }
 
         for chunk in &chunks {
-            let span = (chunk.end - chunk.start).num_days() + 1;
+            let span = (chunk.end.date() - chunk.start.date()).num_days() + 1;
             assert!(span <= CHUNK_DAYS, "chunk of {span} days exceeds the bound");
         }
     }
@@ -353,7 +358,7 @@ mod tests {
         assert_eq!(dates[0], date("2026-01-01"));
         assert_eq!(dates[9], date("2026-01-10"));
         for window in dates.windows(2) {
-            assert_eq!(window[1], window[0] + Duration::days(1));
+            assert_eq!(window[1], window[0].plus_calendar_days(1));
         }
     }
 

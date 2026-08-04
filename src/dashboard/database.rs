@@ -8,7 +8,7 @@
 //! it was handed, which is what makes win rate, profit factor, and period returns testable without
 //! a database.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
@@ -18,6 +18,7 @@ use crate::common::types::{PairID, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
 };
+use crate::data::calendar::SessionDate;
 use crate::portfolio::pairs::CloseReason;
 
 /// Sessions of account history fetched for the equity curve.
@@ -88,7 +89,7 @@ async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sql
     rows.into_iter()
         .map(|row| {
             Ok(AccountSnapshot {
-                session_date: row.try_get("session_date")?,
+                session_date: SessionDate::from_date(row.try_get("session_date")?),
                 equity: row.try_get("equity")?,
                 cash: row.try_get("cash")?,
                 buying_power: row.try_get("buying_power")?,
@@ -301,7 +302,7 @@ fn percentage_change(baseline: Decimal, latest: Decimal) -> Option<f64> {
 /// exactly one week back is a Saturday two times in seven.
 fn baseline_at_or_before(
     history: &[AccountSnapshot],
-    cutoff: NaiveDate,
+    cutoff: SessionDate,
 ) -> Option<&AccountSnapshot> {
     history
         .iter()
@@ -316,15 +317,15 @@ pub fn compute_period_returns(history: &[AccountSnapshot]) -> PeriodReturns {
     };
 
     let horizon = |days: i64| {
-        baseline_at_or_before(history, latest.session_date - Duration::days(days))
+        baseline_at_or_before(history, latest.session_date.plus_calendar_days(-days))
             .and_then(|baseline| percentage_change(baseline.equity, latest.equity))
     };
 
     // Year to date measures from the last session of the previous year, so the first session of
     // January is a full day of performance rather than a flat zero.
-    let year_start = NaiveDate::from_ymd_opt(latest.session_date.year(), 1, 1);
+    let year_start = NaiveDate::from_ymd_opt(latest.session_date.date().year(), 1, 1);
     let year_to_date = year_start
-        .and_then(|start| baseline_at_or_before(history, start.pred_opt()?))
+        .and_then(|start| baseline_at_or_before(history, SessionDate::from_date(start.pred_opt()?)))
         .or_else(|| history.first())
         .and_then(|baseline| percentage_change(baseline.equity, latest.equity));
 
@@ -434,7 +435,7 @@ pub fn compute_closed_summary(closed: &[ClosedPair]) -> ClosedSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
     use std::str::FromStr;
 
     fn decimal(value: &str) -> Decimal {
@@ -443,7 +444,9 @@ mod tests {
 
     fn snapshot(date: &str, equity: &str) -> AccountSnapshot {
         AccountSnapshot {
-            session_date: NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
+            session_date: SessionDate::from_date(
+                NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
+            ),
             equity: decimal(equity),
             cash: decimal("0"),
             buying_power: decimal("0"),

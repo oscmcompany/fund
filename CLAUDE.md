@@ -86,6 +86,19 @@ This is a collection of guidelines and references.
   handled and the compiler flags missing cases when variants change
 - Wrap primitive types in tuple structs to enforce domain type safety (e.g., `struct Price(f64)`); never accept
   a raw `f64` or `String` where a specific domain value is required
+- Time has exactly two kinds and they never mix: an instant is a moment on the timeline and is always UTC
+  (`DateTime<Utc>`, `TIMESTAMPTZ`), while a session is a trading day and is always an `America/New_York`
+  calendar date — that is what the exchange's day is, not a display preference. A session is
+  `data::calendar::SessionDate`, never a bare `NaiveDate`: derive one from an instant with `SessionDate::at`
+  and convert back with `.midnight()`/`.bounds()`, never via `Utc::now().date_naive()` or a hardcoded offset
+- `SessionDate::from_date` is for dates that arrive already being sessions — a parsed argument, a `DATE`
+  column, an exchange calendar entry — so transport modules (`common::alpaca`, `common::massive`,
+  `common::aws`) keep `NaiveDate` and the wrap happens at the domain boundary; render Eastern only at the
+  display boundary, and stamp test fixtures with `.midnight()` so they match how bars really arrive
+- Write `Eastern` or `America/New_York`, never `EST` or `EDT` — each names only half the year; elapsed
+  durations and timeouts carry no zone, so measure them on a monotonic clock (`tokio::time::Instant`), and
+  schedule trading jobs with a UTC cron expression gated on the Eastern wall clock, a pairing that
+  `tests/test_schedules.rs` enforces
 - Model state machines with two enums (states and transitions) matched as a tuple:
   `match (current_state, transition) { ... }` — keeps business logic exhaustive and legible
 - Design structs to be flat and normalized: each struct represents one concept with only its own fields;

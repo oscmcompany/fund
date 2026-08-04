@@ -32,13 +32,98 @@ const HORIZON_DAYS_FORWARD: i64 = 90;
 /// case. Thirty days is generous.
 const HORIZON_DAYS_BACKWARD: i64 = 30;
 
-/// The Eastern calendar date at an instant.
+/// A trading day, identified by its `America/New_York` calendar date.
 ///
-/// The trading day rolls over at Eastern midnight, not UTC midnight, and the two differ for five
-/// hours of every day. Every cache key, session comparison, and "is this still today" check in the
-/// system goes through here.
-pub fn eastern_date(instant: DateTime<Utc>) -> NaiveDate {
-    instant.with_timezone(&New_York).date_naive()
+/// The type exists to make a session and an instant impossible to confuse. Both used to be spelled
+/// `NaiveDate`/`DateTime`, and every timekeeping bug this system has had was that confusion: a
+/// session derived from `Utc::now().date_naive()`, a forecast stamped at UTC midnight, a session
+/// and its label computed from two separate expressions. None of those is expressible here.
+///
+/// There are exactly two ways in. [`SessionDate::at`] converts an instant, which is the only
+/// correct way to answer "what trading day is it now". [`SessionDate::from_date`] takes a date that
+/// is *already* a session — parsed from a command-line argument, read from a `DATE` column, or
+/// returned by an exchange API that publishes Eastern dates. A `NaiveDate` obtained any other way
+/// has no business becoming one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct SessionDate(NaiveDate);
+
+impl SessionDate {
+    /// The trading day an instant falls in.
+    ///
+    /// The trading day rolls over at Eastern midnight, not UTC midnight, and the two differ for
+    /// four or five hours of every day. Every cache key, session comparison, and "is this still
+    /// today" check in the system goes through here.
+    pub fn at(instant: DateTime<Utc>) -> Self {
+        Self(instant.with_timezone(&New_York).date_naive())
+    }
+
+    /// Wraps a date that is already known to be a session.
+    ///
+    /// For values that arrive as session dates rather than being derived from a clock: a parsed
+    /// argument, a `DATE` column, an exchange calendar entry. Deriving one from an instant is
+    /// [`SessionDate::at`]'s job, and going through `date_naive()` to reach here is the bug this
+    /// type prevents.
+    pub fn from_date(date: NaiveDate) -> Self {
+        Self(date)
+    }
+
+    /// The underlying calendar date, for formatting and for binding to a `DATE` column.
+    pub fn date(self) -> NaiveDate {
+        self.0
+    }
+
+    /// Midnight Eastern on this session, as the equivalent UTC instant.
+    ///
+    /// Eastern shifts at 02:00 so local midnight always exists, but `earliest()` with a UTC
+    /// fallback is used anyway so a timezone database change cannot panic a caller.
+    pub fn midnight(self) -> DateTime<Utc> {
+        let local_midnight = self
+            .0
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid wall-clock time");
+        New_York
+            .from_local_datetime(&local_midnight)
+            .earliest()
+            .map(|zoned| zoned.with_timezone(&Utc))
+            .unwrap_or_else(|| local_midnight.and_utc())
+    }
+
+    /// The half-open UTC interval `[start, end)` covering this session.
+    ///
+    /// The inverse of [`SessionDate::at`], so queries can bound a timestamp column directly. A
+    /// predicate like `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column
+    /// behind an expression, defeating chunk exclusion and the index — a one-day export becomes a
+    /// full scan. Resolving bounds here keeps `column >= $start AND column < $end` sargable.
+    pub fn bounds(self) -> (DateTime<Utc>, DateTime<Utc>) {
+        (self.midnight(), self.plus_calendar_days(1).midnight())
+    }
+
+    /// This session shifted by whole **calendar** days.
+    ///
+    /// Named for the distinction it must not lose: this steps over weekends and holidays, unlike
+    /// [`TradingCalendar::previous_trading_day`] and [`TradingCalendar::next_trading_day`], which
+    /// land on published sessions. Used to bound fetch ranges, where overshooting is free.
+    pub fn plus_calendar_days(self, days: i64) -> Self {
+        Self(self.0 + Duration::days(days))
+    }
+
+    /// Whether this date falls on a weekend.
+    ///
+    /// Not a substitute for [`TradingCalendar::is_trading_day`] — it knows nothing about holidays —
+    /// but useful for bounding a fetch range before the calendar is available.
+    pub fn is_weekend(self) -> bool {
+        matches!(
+            self.0.weekday(),
+            chrono::Weekday::Sat | chrono::Weekday::Sun
+        )
+    }
+}
+
+impl std::fmt::Display for SessionDate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 /// The Eastern wall-clock time at an instant.
@@ -46,31 +131,14 @@ pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
     instant.with_timezone(&New_York).time()
 }
 
-/// The half-open UTC interval `[start, end)` covering one Eastern calendar date.
+/// The Eastern wall-clock date and time at an instant.
 ///
-/// The inverse of [`eastern_date`], so queries can bound a timestamp column directly. A predicate
-/// like `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column behind an
-/// expression, defeating chunk exclusion and the index — a one-day export becomes a full scan.
-/// Resolving bounds here keeps `column >= $start AND column < $end` sargable.
-///
-/// Eastern shifts at 02:00 so local midnight always exists, but `earliest()` with a UTC fallback is
-/// used anyway so a timezone database change cannot panic the export.
-pub fn eastern_day_bounds(date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start = eastern_midnight(date);
-    let end = eastern_midnight(date + Duration::days(1));
-    (start, end)
-}
-
-/// Midnight Eastern on `date`, as the equivalent UTC instant.
-pub(crate) fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
-    let local_midnight = date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a valid wall-clock time");
-    New_York
-        .from_local_datetime(&local_midnight)
-        .earliest()
-        .map(|zoned| zoned.with_timezone(&Utc))
-        .unwrap_or_else(|| local_midnight.and_utc())
+/// For callers that need both halves as one value — naming an artifact after the session that
+/// produced it, where the date must be the Eastern one and the time is what orders two runs within
+/// it. Reading [`SessionDate::at`] and [`eastern_time`] separately would work, but only because
+/// both resolve the same zone; taking them from one conversion means they cannot disagree.
+pub fn eastern_datetime(instant: DateTime<Utc>) -> chrono::NaiveDateTime {
+    instant.with_timezone(&New_York).naive_local()
 }
 
 /// Published trading sessions over a bounded horizon.
@@ -80,16 +148,20 @@ pub(crate) fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
 /// with their real hours.
 #[derive(Debug, Clone, Default)]
 pub struct TradingCalendar {
-    days: BTreeMap<NaiveDate, CalendarDay>,
+    days: BTreeMap<SessionDate, CalendarDay>,
 }
 
 impl TradingCalendar {
     /// Builds a calendar from published days.
+    ///
+    /// This is the boundary where a date Alpaca sent over the wire becomes a [`SessionDate`].
+    /// [`CalendarDay`] stays on `NaiveDate` because it is what the transport parsed; everything
+    /// above this line deals in sessions.
     pub fn from_days(days: Vec<CalendarDay>) -> Self {
         Self {
             days: days
                 .into_iter()
-                .map(|day| (day.session_date(), day))
+                .map(|day| (SessionDate::from_date(day.session_date()), day))
                 .collect(),
         }
     }
@@ -99,12 +171,12 @@ impl TradingCalendar {
     /// A date outside the published horizon answers `false`. That is deliberately conservative: the
     /// caller cannot distinguish "holiday" from "we do not know", and the safe response to not
     /// knowing is to sit out rather than to trade into a closed or unknown market.
-    pub fn is_trading_day(&self, date: NaiveDate) -> bool {
+    pub fn is_trading_day(&self, date: SessionDate) -> bool {
         self.days.contains_key(&date)
     }
 
     /// The published session for `date`, if it trades.
-    pub fn session(&self, date: NaiveDate) -> Option<&CalendarDay> {
+    pub fn session(&self, date: SessionDate) -> Option<&CalendarDay> {
         self.days.get(&date)
     }
 
@@ -113,7 +185,7 @@ impl TradingCalendar {
     /// Distinct from [`TradingCalendar::is_trading_day`]: a date inside the horizon with no session
     /// is a holiday, while a date outside it is unknown. Both answer `false` to "does it trade",
     /// but only the second means the calendar needs refreshing.
-    pub fn covers(&self, date: NaiveDate) -> bool {
+    pub fn covers(&self, date: SessionDate) -> bool {
         match self.horizon() {
             Some((first, last)) => date >= first && date <= last,
             None => false,
@@ -121,7 +193,7 @@ impl TradingCalendar {
     }
 
     /// The first and last published dates, if any.
-    pub fn horizon(&self) -> Option<(NaiveDate, NaiveDate)> {
+    pub fn horizon(&self) -> Option<(SessionDate, SessionDate)> {
         let first = *self.days.keys().next()?;
         let last = *self.days.keys().next_back()?;
         Some((first, last))
@@ -139,17 +211,17 @@ impl TradingCalendar {
     /// The most recent trading day strictly before `date`.
     ///
     /// This is what the post-close bar sync asks for: the session whose bars are now final.
-    pub fn previous_trading_day(&self, date: NaiveDate) -> Option<NaiveDate> {
+    pub fn previous_trading_day(&self, date: SessionDate) -> Option<SessionDate> {
         self.days.range(..date).next_back().map(|(day, _)| *day)
     }
 
     /// The next trading day on or after `date`.
-    pub fn next_trading_day(&self, date: NaiveDate) -> Option<NaiveDate> {
+    pub fn next_trading_day(&self, date: SessionDate) -> Option<SessionDate> {
         self.days.range(date..).next().map(|(day, _)| *day)
     }
 
     /// Every trading day in an inclusive range.
-    pub fn trading_days_in_range(&self, start: NaiveDate, end: NaiveDate) -> Vec<NaiveDate> {
+    pub fn trading_days_in_range(&self, start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
         self.days.range(start..=end).map(|(day, _)| *day).collect()
     }
 
@@ -161,7 +233,7 @@ impl TradingCalendar {
     /// close from the published calendar rather than assuming 16:00 is what makes it correct on a
     /// half-day.
     pub fn minutes_until_close(&self, instant: DateTime<Utc>) -> Option<i64> {
-        let session = self.session(eastern_date(instant))?;
+        let session = self.session(SessionDate::at(instant))?;
         let now = eastern_time(instant);
         if now >= session.session_close() {
             return None;
@@ -171,7 +243,7 @@ impl TradingCalendar {
 
     /// Whether the regular session is open at `instant`.
     pub fn is_open_at(&self, instant: DateTime<Utc>) -> bool {
-        match self.session(eastern_date(instant)) {
+        match self.session(SessionDate::at(instant)) {
             Some(session) => {
                 let now = eastern_time(instant);
                 now >= session.session_open() && now < session.session_close()
@@ -188,7 +260,7 @@ impl TradingCalendar {
 /// rather than an elapsed duration means the rollover invalidates without a timer.
 #[derive(Default)]
 pub struct CalendarCache {
-    inner: tokio::sync::Mutex<Option<(NaiveDate, TradingCalendar)>>,
+    inner: tokio::sync::Mutex<Option<(SessionDate, TradingCalendar)>>,
 }
 
 impl CalendarCache {
@@ -206,7 +278,7 @@ impl CalendarCache {
         client: &TradingClient,
         now: DateTime<Utc>,
     ) -> Result<TradingCalendar, ClientError> {
-        let today = eastern_date(now);
+        let today = SessionDate::at(now);
 
         if let Some((cached_date, calendar)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
@@ -214,9 +286,10 @@ impl CalendarCache {
             }
         }
 
-        let start = today - Duration::days(HORIZON_DAYS_BACKWARD);
-        let end = today + Duration::days(HORIZON_DAYS_FORWARD);
-        let calendar = TradingCalendar::from_days(client.fetch_calendar(start, end).await?);
+        let start = today.plus_calendar_days(-HORIZON_DAYS_BACKWARD);
+        let end = today.plus_calendar_days(HORIZON_DAYS_FORWARD);
+        let calendar =
+            TradingCalendar::from_days(client.fetch_calendar(start.date(), end.date()).await?);
 
         if calendar.is_empty() {
             // Reported rather than cached: an empty calendar would otherwise pin "nothing trades"
@@ -235,29 +308,21 @@ impl CalendarCache {
 
     /// Replaces the cached calendar. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, calendar: TradingCalendar) {
-        *self.inner.lock().await = Some((eastern_date(now), calendar));
+        *self.inner.lock().await = Some((SessionDate::at(now), calendar));
     }
-}
-
-/// Whether `date` falls on a weekend.
-///
-/// Not a substitute for [`TradingCalendar::is_trading_day`] — it knows nothing about holidays — but
-/// useful for bounding a fetch range before the calendar is available.
-pub fn is_weekend(date: NaiveDate) -> bool {
-    matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    fn date(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
     }
 
-    fn day(date_value: NaiveDate, open: (u32, u32), close: (u32, u32)) -> CalendarDay {
+    fn day(date_value: SessionDate, open: (u32, u32), close: (u32, u32)) -> CalendarDay {
         CalendarDay::new(
-            date_value,
+            date_value.date(),
             NaiveTime::from_hms_opt(open.0, open.1, 0).unwrap(),
             NaiveTime::from_hms_opt(close.0, close.1, 0).unwrap(),
         )
@@ -397,10 +462,10 @@ mod tests {
     #[test]
     fn test_eastern_date_rolls_at_eastern_midnight() {
         let late_evening = "2026-06-11T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(eastern_date(late_evening), date(2026, 6, 10));
+        assert_eq!(SessionDate::at(late_evening), date(2026, 6, 10));
 
         let morning = "2026-06-11T13:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(eastern_date(morning), date(2026, 6, 11));
+        assert_eq!(SessionDate::at(morning), date(2026, 6, 11));
     }
 
     /// Daylight saving must be handled by the timezone database, not by an offset constant.
@@ -423,7 +488,7 @@ mod tests {
     /// Eastern is UTC-4, so the day runs 04:00 to 04:00 UTC.
     #[test]
     fn test_eastern_day_bounds_span_the_local_day_in_summer() {
-        let (start, end) = eastern_day_bounds(date(2026, 6, 10));
+        let (start, end) = date(2026, 6, 10).bounds();
         assert_eq!(start.to_rfc3339(), "2026-06-10T04:00:00+00:00");
         assert_eq!(end.to_rfc3339(), "2026-06-11T04:00:00+00:00");
         assert_eq!((end - start).num_hours(), 24);
@@ -433,7 +498,7 @@ mod tests {
     /// get one of these two cases wrong.
     #[test]
     fn test_eastern_day_bounds_span_the_local_day_in_winter() {
-        let (start, end) = eastern_day_bounds(date(2026, 1, 14));
+        let (start, end) = date(2026, 1, 14).bounds();
         assert_eq!(start.to_rfc3339(), "2026-01-14T05:00:00+00:00");
         assert_eq!(end.to_rfc3339(), "2026-01-15T05:00:00+00:00");
     }
@@ -442,14 +507,14 @@ mod tests {
     /// would silently include or exclude an hour of rows on exactly these two days a year.
     #[test]
     fn test_eastern_day_bounds_handle_daylight_saving_transitions() {
-        let (spring_start, spring_end) = eastern_day_bounds(date(2026, 3, 8));
+        let (spring_start, spring_end) = date(2026, 3, 8).bounds();
         assert_eq!(
             (spring_end - spring_start).num_hours(),
             23,
             "spring forward is a 23-hour day"
         );
 
-        let (autumn_start, autumn_end) = eastern_day_bounds(date(2026, 11, 1));
+        let (autumn_start, autumn_end) = date(2026, 11, 1).bounds();
         assert_eq!(
             (autumn_end - autumn_start).num_hours(),
             25,
@@ -462,17 +527,59 @@ mod tests {
     #[test]
     fn test_eastern_day_bounds_round_trip_against_eastern_date() {
         let day = date(2026, 6, 10);
-        let (start, end) = eastern_day_bounds(day);
-        assert_eq!(eastern_date(start), day);
-        assert_eq!(eastern_date(end - Duration::seconds(1)), day);
-        assert_eq!(eastern_date(end), day + Duration::days(1));
+        let (start, end) = day.bounds();
+        assert_eq!(SessionDate::at(start), day);
+        assert_eq!(SessionDate::at(end - Duration::seconds(1)), day);
+        assert_eq!(SessionDate::at(end), day.plus_calendar_days(1));
+    }
+
+    /// The case the trainer's artifact identifier depends on. A run that starts at 23:00 UTC and
+    /// takes over an hour finishes on the *next* UTC date but the same Eastern evening, so a
+    /// UTC-formatted identifier names the session after the one it was built for.
+    #[test]
+    fn test_eastern_datetime_names_the_session_the_instant_belongs_to() {
+        // 00:30 UTC on 1 August is 20:30 on 31 July in New York.
+        let after_utc_midnight = "2026-08-01T00:30:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        // The precondition, so this cannot pass by agreeing with UTC: the UTC date is a day later.
+        assert_eq!(after_utc_midnight.date_naive(), date(2026, 8, 1).date());
+
+        assert_eq!(
+            eastern_datetime(after_utc_midnight).date(),
+            date(2026, 7, 31).date()
+        );
+        assert_eq!(
+            eastern_datetime(after_utc_midnight)
+                .format("%Y-%m-%d-%H-%M-%S")
+                .to_string(),
+            "2026-07-31-20-30-00"
+        );
+    }
+
+    /// The two must not be able to disagree — the run identifier's date prefix is read back and
+    /// compared against a date produced by `SessionDate::at`.
+    #[test]
+    fn test_eastern_datetime_agrees_with_eastern_date() {
+        for instant in [
+            "2026-08-01T00:30:00Z",
+            "2026-01-14T13:30:00Z",
+            "2026-03-08T07:00:00Z",
+            "2026-11-01T05:30:00Z",
+        ] {
+            let parsed = instant.parse::<DateTime<Utc>>().unwrap();
+            assert_eq!(
+                eastern_datetime(parsed).date(),
+                SessionDate::at(parsed).date(),
+                "{instant} disagreed"
+            );
+        }
     }
 
     #[test]
     fn test_is_weekend() {
-        assert!(is_weekend(date(2026, 11, 28)));
-        assert!(is_weekend(date(2026, 11, 29)));
-        assert!(!is_weekend(date(2026, 11, 27)));
+        assert!(date(2026, 11, 28).is_weekend());
+        assert!(date(2026, 11, 29).is_weekend());
+        assert!(!date(2026, 11, 27).is_weekend());
     }
 
     #[tokio::test]

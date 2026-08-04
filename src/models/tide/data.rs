@@ -9,6 +9,7 @@ use chrono::Datelike;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::data::calendar::SessionDate;
 use crate::data::details::UNKNOWN as UNKNOWN_SECTOR_OR_INDUSTRY;
 
 pub type CategoryMapping = HashMap<String, i32>;
@@ -181,7 +182,7 @@ impl Data {
         data: DataFrame,
         scaler: &Scaler,
         mappings: &FeatureMappings,
-        target_session: chrono::NaiveDate,
+        target_session: SessionDate,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let data = append_forecast_session_rows(data, target_session)?;
         let data = engineer_features(data)?;
@@ -422,10 +423,9 @@ fn window_frame(
 /// duplicate a real row.
 pub(crate) fn append_forecast_session_rows(
     data: DataFrame,
-    target_session: chrono::NaiveDate,
+    target_session: SessionDate,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    let target_milliseconds =
-        crate::data::calendar::eastern_midnight(target_session).timestamp_millis();
+    let target_milliseconds = target_session.midnight().timestamp_millis();
 
     let sorted = data
         .sort(
@@ -544,10 +544,15 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
         return Err(message.into());
     }
 
-    for (i, &ts) in timestamp_values.iter().enumerate() {
-        let datetime = chrono::DateTime::from_timestamp_millis(ts)
+    for (index, &timestamp_milliseconds) in timestamp_values.iter().enumerate() {
+        let instant = chrono::DateTime::from_timestamp_millis(timestamp_milliseconds)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-        let date = datetime.date_naive();
+        // Through `SessionDate`, not `date_naive()`. These are the covariates describing the
+        // trading day a bar belongs to, so they must come from the Eastern date. Reading the UTC
+        // date agreed only because a daily bar is stamped at Eastern midnight, which lands in the
+        // morning of the same UTC day -- a coincidence of the offset's sign that would reverse if
+        // the stamp ever moved later in the session.
+        let date = SessionDate::at(instant).date();
 
         // Monday = 1 .. Sunday = 7, per polars `dt.weekday()`.
         day_of_week.push(date.weekday().number_from_monday() as i32);
@@ -556,9 +561,11 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
         month.push(date.month() as i32);
         year.push(date.year());
 
-        let same_ticker = i > 0 && tickers[i] == tickers[i - 1];
-        if same_ticker && close_prices[i - 1] != 0.0 {
-            daily_return.push(Some(((close_prices[i] / close_prices[i - 1]) - 1.0) as f32));
+        let same_ticker = index > 0 && tickers[index] == tickers[index - 1];
+        if same_ticker && close_prices[index - 1] != 0.0 {
+            daily_return.push(Some(
+                ((close_prices[index] / close_prices[index - 1]) - 1.0) as f32,
+            ));
         } else {
             daily_return.push(None);
         }
@@ -1020,9 +1027,10 @@ mod tests {
         for index in 0..ticker_count {
             for row in 0..rows_per_ticker {
                 ticker.push(names[index]);
-                let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap()
-                    + chrono::Duration::days(row as i64);
-                timestamp.push(crate::data::calendar::eastern_midnight(date).timestamp_millis());
+                let date =
+                    SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
+                        .plus_calendar_days(row as i64);
+                timestamp.push(date.midnight().timestamp_millis());
                 close.push(100.0 + row as f64);
             }
         }
@@ -1042,7 +1050,7 @@ mod tests {
     }
 
     /// The session a pre-open run forecasts: the day after the newest bar in the frame.
-    fn forecast_session(frame: &DataFrame) -> chrono::NaiveDate {
+    fn forecast_session(frame: &DataFrame) -> SessionDate {
         let newest = frame
             .column("timestamp")
             .unwrap()
@@ -1050,9 +1058,8 @@ mod tests {
             .unwrap()
             .max()
             .unwrap();
-        crate::data::calendar::eastern_date(
-            chrono::DateTime::from_timestamp_millis(newest).unwrap(),
-        ) + chrono::Duration::days(1)
+        SessionDate::at(chrono::DateTime::from_timestamp_millis(newest).unwrap())
+            .plus_calendar_days(1)
     }
 
     /// Everything `apply_existing_scaler` does to a frame, minus the scaler and mappings.
@@ -1146,8 +1153,7 @@ mod tests {
         let engineered =
             engineer_features(append_forecast_session_rows(frame, session).unwrap()).unwrap();
 
-        let target_milliseconds =
-            crate::data::calendar::eastern_midnight(session).timestamp_millis();
+        let target_milliseconds = session.midnight().timestamp_millis();
         let timestamps: Vec<i64> = engineered
             .column("timestamp")
             .unwrap()
@@ -1169,7 +1175,7 @@ mod tests {
             .collect();
         assert_eq!(
             day_of_week[row],
-            session.weekday().number_from_monday() as i32,
+            session.date().weekday().number_from_monday() as i32,
             "the appended row's calendar must match the forecast session"
         );
     }
@@ -1184,8 +1190,7 @@ mod tests {
         let session = forecast_session(&frame);
         let cleaned = prepared(append_forecast_session_rows(frame, session).unwrap());
 
-        let target_milliseconds =
-            crate::data::calendar::eastern_midnight(session).timestamp_millis();
+        let target_milliseconds = session.midnight().timestamp_millis();
         let surviving = cleaned
             .column("timestamp")
             .unwrap()
@@ -1200,7 +1205,7 @@ mod tests {
         );
 
         // Any instant inside the forecast session must stamp that same session.
-        let noon = crate::data::calendar::eastern_midnight(session) + chrono::Duration::hours(12);
+        let noon = session.midnight() + chrono::Duration::hours(12);
         assert_eq!(
             crate::models::tide::predict::step_timestamp_milliseconds(noon, 0),
             target_milliseconds,
@@ -1219,9 +1224,8 @@ mod tests {
             .unwrap()
             .max()
             .unwrap();
-        let already_present = crate::data::calendar::eastern_date(
-            chrono::DateTime::from_timestamp_millis(newest).unwrap(),
-        );
+        let already_present =
+            SessionDate::at(chrono::DateTime::from_timestamp_millis(newest).unwrap());
         let appended = append_forecast_session_rows(frame.clone(), already_present).unwrap();
         assert_eq!(
             appended.height(),
@@ -1280,18 +1284,17 @@ mod tests {
     #[test]
     fn test_engineer_features_day_of_week_is_monday_based_one_to_seven() {
         // Monday = 1 .. Sunday = 7.
-        let monday = chrono::NaiveDate::from_ymd_opt(2026, 6, 8)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
-        let sunday = chrono::NaiveDate::from_ymd_opt(2026, 6, 14)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis();
+        //
+        // Stamped at Eastern midnight, which is how a daily bar actually arrives. Built at UTC
+        // midnight instead — as this fixture was — every date reads as the previous Eastern day,
+        // and the assertion below became [7, 6]. The fixture, not the feature, was wrong.
+        let session = |year, month, day| {
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap())
+                .midnight()
+                .timestamp_millis()
+        };
+        let monday = session(2026, 6, 8);
+        let sunday = session(2026, 6, 14);
 
         let frame = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAA", "AAA"]),

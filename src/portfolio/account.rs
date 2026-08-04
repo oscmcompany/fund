@@ -10,14 +10,14 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::alpaca::{AccountActivity, AccountSnapshot, ClientError, TradingClient};
-use crate::data::calendar::eastern_day_bounds;
+use crate::data::calendar::SessionDate;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
 /// The activity type carrying trade fills.
@@ -41,7 +41,7 @@ pub enum AccountError {
 /// What one post-close sync did.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AccountSyncSummary {
-    pub session_date: NaiveDate,
+    pub session_date: SessionDate,
     pub equity: Decimal,
     pub activities_stored: u64,
     pub pairs_attributed: usize,
@@ -52,17 +52,17 @@ pub struct AccountSyncSummary {
 pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
-    session_date: NaiveDate,
+    session_date: SessionDate,
 ) -> Result<AccountSyncSummary, AccountError> {
     let account = client.fetch_account().await?;
     store_snapshot(pool, session_date, &account).await?;
 
     let activities = client
-        .fetch_activities(FILL_ACTIVITY_TYPE, session_date)
+        .fetch_activities(FILL_ACTIVITY_TYPE, session_date.date())
         .await?;
     let activities_stored = store_activities(pool, &activities).await?;
 
-    let (start, end) = eastern_day_bounds(session_date);
+    let (start, end) = session_date.bounds();
     let closed = pairs::load_closed_between(pool, start, end).await?;
     let attribution = attribute(&closed, &activities);
 
@@ -94,7 +94,7 @@ pub async fn sync_account(
 /// Writes one session's balances, overwriting any existing row for the date.
 pub async fn store_snapshot(
     pool: &PgPool,
-    session_date: NaiveDate,
+    session_date: SessionDate,
     account: &AccountSnapshot,
 ) -> Result<(), AccountError> {
     sqlx::query!(
@@ -110,7 +110,7 @@ pub async fn store_snapshot(
                long_market_value  = EXCLUDED.long_market_value,
                short_market_value = EXCLUDED.short_market_value,
                fetched_at         = now()"#,
-        session_date,
+        session_date.date(),
         account.equity(),
         account.cash(),
         account.buying_power(),
@@ -178,11 +178,11 @@ pub async fn store_activities(
 /// [`crate::portfolio::risk::RiskGate::new`].
 pub async fn load_equity_for(
     pool: &PgPool,
-    session_date: NaiveDate,
+    session_date: SessionDate,
 ) -> Result<Option<Decimal>, AccountError> {
     let row = sqlx::query!(
         r#"SELECT equity AS "equity!" FROM account_snapshots WHERE session_date = $1"#,
-        session_date,
+        session_date.date(),
     )
     .fetch_optional(pool)
     .await?;
@@ -248,8 +248,8 @@ pub fn attribute(closed: &[ClosedPair], activities: &[AccountActivity]) -> Attri
 }
 
 /// The instant bounds of a session date, for callers that need them alongside a sync.
-pub fn session_bounds(session_date: NaiveDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    eastern_day_bounds(session_date)
+pub fn session_bounds(session_date: SessionDate) -> (DateTime<Utc>, DateTime<Utc>) {
+    session_date.bounds()
 }
 
 #[cfg(test)]
@@ -257,6 +257,7 @@ mod tests {
     use super::*;
     use crate::common::types::{PairID, Ticker};
     use crate::portfolio::pairs::CloseReason;
+    use chrono::NaiveDate;
 
     fn ticker(raw: &str) -> Ticker {
         Ticker::new(raw).unwrap()
@@ -382,7 +383,9 @@ mod tests {
 
     #[test]
     fn test_session_bounds_are_half_open_across_the_eastern_day() {
-        let (start, end) = session_bounds(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+        let (start, end) = session_bounds(SessionDate::from_date(
+            NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+        ));
         assert!(start < end);
         assert_eq!((end - start).num_hours(), 24);
     }

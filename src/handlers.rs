@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
@@ -21,7 +21,7 @@ use crate::common::events::{self, Command, EventError};
 use crate::common::massive::MassiveClient;
 use crate::common::types::BarInterval;
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
-use crate::data::calendar::{eastern_date, CalendarCache, TradingCalendar};
+use crate::data::calendar::{CalendarCache, SessionDate, TradingCalendar};
 use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
@@ -240,7 +240,7 @@ async fn dispatch(state: &ServiceState, command: Command) -> Result<Value, Handl
 /// rather than on schedules of their own — both only matter immediately before a session.
 async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError> {
     let now = Utc::now();
-    let today = eastern_date(now);
+    let today = SessionDate::at(now);
 
     let calendar = state.calendar_cache.get(&state.trading, now).await?;
     if !calendar.is_trading_day(today) {
@@ -282,14 +282,16 @@ async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError>
         artifact::download_and_load_model(&state.s3_client, &state.bucket, &artifact_key, None)
             .await?;
 
-    let artifact_age_days = artifact_age_days(model_state.run_id(), today);
-    if artifact_age_days.is_some_and(|age| age >= 1) {
-        // Not an error and not an event of its own. Running on yesterday's model is a normal
-        // outcome of two machines that share no database, and the age is recorded here so a session
-        // that was decided by a stale model says so in its own completion row.
+    let artifact_staleness_sessions =
+        artifact_staleness_sessions(model_state.run_id(), &calendar, today);
+    if artifact_staleness_sessions.is_some_and(|sessions| sessions >= 1) {
+        // Not an error and not an event of its own. Running on an older model is a normal outcome
+        // of two machines that share no database, and the staleness is recorded here so a session
+        // that was decided by one says so in its own completion row.
         warn!(
             run_id = model_state.run_id(),
-            artifact_age_days, "Predictions are running on a model older than today"
+            artifact_staleness_sessions,
+            "Predictions are running on a model that missed at least one session"
         );
     }
 
@@ -301,7 +303,7 @@ async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError>
         "correlation_id": correlation_id,
         "model_run_id": model_state.run_id(),
         "artifact_key": artifact_key,
-        "artifact_age_days": artifact_age_days,
+        "artifact_staleness_sessions": artifact_staleness_sessions,
         "predictions": predictions,
         "rows_written": rows,
         "universe": universe.len(),
@@ -355,7 +357,7 @@ async fn run_inference(
 /// Every five minutes: price the book, close what should close, open into vacant slots.
 async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, HandlerError> {
     let now = Utc::now();
-    let today = eastern_date(now);
+    let today = SessionDate::at(now);
 
     let calendar = state.calendar_cache.get(&state.trading, now).await?;
     if !calendar.is_trading_day(today) {
@@ -408,7 +410,7 @@ async fn handle_portfolio_liquidation(state: &ServiceState) -> Result<Value, Han
 /// Post-close: balances, activities, and pair attribution from Alpaca.
 async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError> {
     let now = Utc::now();
-    let today = eastern_date(now);
+    let today = SessionDate::at(now);
 
     let calendar = state.calendar_cache.get(&state.trading, now).await?;
     if !calendar.is_trading_day(today) {
@@ -425,7 +427,7 @@ async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError
 /// half-synced database. The chain is emitted only on success for the same reason.
 async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerError> {
     let now = Utc::now();
-    let today = eastern_date(now);
+    let today = SessionDate::at(now);
 
     let calendar = state.calendar_cache.get(&state.trading, now).await?;
     if !calendar.is_trading_day(today) {
@@ -445,7 +447,7 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
     // the previous `unwrap_or(today)` then collapsed the window to a single session — closing none
     // of the gap the constant exists to close, and saying nothing about it.
     let span = calendar.trading_days_in_range(
-        today - Duration::days(BAR_SYNC_LOOKBACK_SESSIONS as i64 * 4),
+        today.plus_calendar_days(-(BAR_SYNC_LOOKBACK_SESSIONS as i64 * 4)),
         today,
     );
     let sessions: Vec<_> = if span.len() > BAR_SYNC_LOOKBACK_SESSIONS {
@@ -501,7 +503,7 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
 /// partial export deletes rows that never reached S3, and nothing afterwards can tell that it
 /// happened.
 async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerError> {
-    let today = eastern_date(Utc::now());
+    let today = SessionDate::at(Utc::now());
     let export = export::export_database(&state.pool, &state.s3_client, &state.bucket, today).await;
 
     if !export.is_clean() {
@@ -537,12 +539,12 @@ async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerEr
 async fn previous_session_gaps(
     state: &ServiceState,
     calendar: &TradingCalendar,
-    today: NaiveDate,
+    today: SessionDate,
 ) -> Result<Vec<String>, HandlerError> {
     let Some(previous) = calendar.previous_trading_day(today) else {
         return Ok(Vec::new());
     };
-    let (start, end) = crate::data::calendar::eastern_day_bounds(previous);
+    let (start, end) = previous.bounds();
 
     let rows = sqlx::query!(
         r#"
@@ -570,14 +572,44 @@ async fn previous_session_gaps(
     Ok(rows.into_iter().map(|row| row.event_type).collect())
 }
 
-/// How many days old the artifact's run identifier is, when it can be read as a date.
+/// How many trading sessions the artifact skipped, when its run identifier can be read as a date.
+///
+/// Zero is the healthy answer, and calendar days cannot express that. The trainer publishes after
+/// one session's close for the *next* session, so a healthy artifact is always dated at least one
+/// calendar day back — one midweek, three across a weekend, four across a long one. Counting days
+/// reported every one of those as stale; counting the sessions strictly between the artifact's date
+/// and today reports none of them, and still reports a genuinely skipped night.
+///
+/// Bounded by the calendar's horizon, so an artifact older than [`HORIZON_DAYS_BACKWARD`] undercounts.
+/// That only understates a number already past the threshold, so the warning still fires.
 ///
 /// `None` rather than a guess when the run identifier is not date-prefixed. The trainer names runs
-/// `YYYY-MM-DD-HH-MM-SS-mmm`, but a hand-uploaded artifact need not, and reporting an age computed
-/// from an unparsed prefix would be worse than reporting none.
-fn artifact_age_days(run_id: &str, today: NaiveDate) -> Option<i64> {
-    let date = NaiveDate::parse_from_str(run_id.get(..10)?, "%Y-%m-%d").ok()?;
-    Some((today - date).num_days())
+/// `YYYY-MM-DD-HH-MM-SS-mmm`, but a hand-uploaded artifact need not, and reporting staleness
+/// computed from an unparsed prefix would be worse than reporting none.
+///
+/// [`HORIZON_DAYS_BACKWARD`]: crate::data::calendar
+fn artifact_staleness_sessions(
+    run_id: &str,
+    calendar: &TradingCalendar,
+    today: SessionDate,
+) -> Option<i64> {
+    // The run identifier's date prefix is an Eastern session, written by the trainer through
+    // `eastern_datetime`, so wrapping it is `from_date`'s case rather than a derivation.
+    let artifact_date =
+        SessionDate::from_date(NaiveDate::parse_from_str(run_id.get(..10)?, "%Y-%m-%d").ok()?);
+    // Half-open on both ends: the artifact's own session is not a session it missed, and today's
+    // has not happened yet. `trading_days_in_range` takes an inclusive range and panics on an
+    // inverted one, so the empty case is answered here rather than passed down.
+    let first_missed = artifact_date.plus_calendar_days(1);
+    let last_missed = today.plus_calendar_days(-1);
+    if first_missed > last_missed {
+        return Some(0);
+    }
+    Some(
+        calendar
+            .trading_days_in_range(first_missed, last_missed)
+            .len() as i64,
+    )
 }
 
 /// Re-runs commands that were requested today and never finished.
@@ -607,39 +639,107 @@ pub async fn recover(state: Arc<ServiceState>) {
 }
 
 /// Reads the current Eastern date, for callers that need it alongside a handler.
-pub fn session_date(now: DateTime<Utc>) -> NaiveDate {
-    eastern_date(now)
+pub fn session_date(now: DateTime<Utc>) -> SessionDate {
+    SessionDate::at(now)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-        NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid")
+    fn date(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(
+            NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
+        )
     }
 
-    /// The trainer names runs `YYYY-MM-DD-...`, which is what makes the age readable at all.
+    /// Weekday sessions spanning 2026-07-27 to 2026-08-07. 2026-08-01 is a Saturday and
+    /// 2026-08-02 a Sunday, so the weekend is absent.
+    fn weekday_calendar() -> TradingCalendar {
+        use crate::common::alpaca::CalendarDay;
+        let open = chrono::NaiveTime::from_hms_opt(9, 30, 0).expect("valid time");
+        let close = chrono::NaiveTime::from_hms_opt(16, 0, 0).expect("valid time");
+        let days = (0..12)
+            .map(|offset| date(2026, 7, 27).plus_calendar_days(offset))
+            .filter(|day| !day.is_weekend())
+            .map(|day| {
+                CalendarDay::new(day.date(), open, close).expect("test session must be valid")
+            })
+            .collect();
+        TradingCalendar::from_days(days)
+    }
+
+    /// The trainer names runs `YYYY-MM-DD-...`, which is what makes staleness readable at all.
     #[test]
-    fn test_artifact_age_reads_the_date_prefix() {
+    fn test_artifact_staleness_reads_the_date_prefix() {
+        let calendar = weekday_calendar();
+        // 2026-07-30 is a Thursday, 2026-07-31 the Friday after it.
         assert_eq!(
-            artifact_age_days("2026-07-29-16-21-25-195", date(2026, 7, 31)),
-            Some(2)
+            artifact_staleness_sessions("2026-07-30-19-21-25-195", &calendar, date(2026, 7, 31)),
+            Some(0)
+        );
+        // 2026-07-29 is the Wednesday, so Thursday's session was skipped.
+        assert_eq!(
+            artifact_staleness_sessions("2026-07-29-19-21-25-195", &calendar, date(2026, 7, 31)),
+            Some(1)
+        );
+    }
+
+    /// The case a calendar-day count gets wrong, and the reason this is measured in sessions.
+    ///
+    /// The trainer publishes after one session's close for the next session, so Friday evening's
+    /// artifact is what Monday is *supposed* to run on. Three calendar days separate them and zero
+    /// trading sessions do. Counting days warned on every healthy Monday.
+    #[test]
+    fn test_an_artifact_from_friday_is_not_stale_on_monday() {
+        let calendar = weekday_calendar();
+        let friday = date(2026, 7, 31);
+        let monday = date(2026, 8, 3);
+        assert_eq!(
+            (monday.date() - friday.date()).num_days(),
+            3,
+            "three calendar days apart"
         );
         assert_eq!(
-            artifact_age_days("2026-07-31-16-21-25-195", date(2026, 7, 31)),
+            artifact_staleness_sessions("2026-07-31-19-21-25-195", &calendar, monday),
+            Some(0),
+            "the weekend holds no session to have missed"
+        );
+        // And a real skip is still caught across the same weekend.
+        assert_eq!(
+            artifact_staleness_sessions("2026-07-30-19-21-25-195", &calendar, monday),
+            Some(1),
+            "Friday's session was missed"
+        );
+    }
+
+    /// An artifact dated today or later has missed nothing, and must not index an inverted range.
+    #[test]
+    fn test_an_artifact_from_today_has_missed_no_sessions() {
+        let calendar = weekday_calendar();
+        assert_eq!(
+            artifact_staleness_sessions("2026-07-31-19-21-25-195", &calendar, date(2026, 7, 31)),
+            Some(0)
+        );
+        assert_eq!(
+            artifact_staleness_sessions("2026-08-03-19-21-25-195", &calendar, date(2026, 7, 31)),
             Some(0)
         );
     }
 
-    /// A run identifier that is not date-prefixed yields no age. Reporting a number derived from an
-    /// unparsed prefix would put a fabricated staleness into the completion payload, which is worse
-    /// than reporting that it is unknown.
+    /// A run identifier that is not date-prefixed yields no staleness. Reporting a number derived
+    /// from an unparsed prefix would put a fabricated value into the completion payload, which is
+    /// worse than reporting that it is unknown.
     #[test]
-    fn test_an_undatable_run_identifier_has_no_age() {
-        assert_eq!(artifact_age_days("manual-upload", date(2026, 7, 31)), None);
-        assert_eq!(artifact_age_days("short", date(2026, 7, 31)), None);
-        assert_eq!(artifact_age_days("", date(2026, 7, 31)), None);
+    fn test_an_undatable_run_identifier_has_no_staleness() {
+        let calendar = weekday_calendar();
+        let today = date(2026, 7, 31);
+        assert_eq!(
+            artifact_staleness_sessions("manual-upload", &calendar, today),
+            None
+        );
+        assert_eq!(artifact_staleness_sessions("short", &calendar, today), None);
+        assert_eq!(artifact_staleness_sessions("", &calendar, today), None);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 
 #![allow(dead_code)]
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
+use fund::data::calendar::SessionDate;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -218,21 +219,18 @@ pub async fn reset_tables(pool: &PgPool) {
 /// pairs, which makes every test built on it pass while asserting nothing. That is the trap
 /// recorded in `statistical_arbitrage_test_fixtures`.
 pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64) {
-    let today = Utc::now().date_naive();
+    let today = SessionDate::at(Utc::now());
 
     for (index, ticker) in tickers.iter().enumerate() {
         let mut price = 100.0 + index as f64 * 20.0;
-        let mut session_date = today - Duration::days(sessions - 1);
+        let mut session_date = today.plus_calendar_days(-(sessions - 1));
 
         for step in 0..sessions {
             let common = 0.012 * (step as f64 * 0.7).sin();
             let idiosyncratic = 0.012 * (step as f64 * 1.9 + index as f64).sin();
             price *= (0.8 * common + 0.6 * idiosyncratic).exp();
 
-            let timestamp = session_date
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is a valid time")
-                .and_utc();
+            let timestamp = session_date.midnight();
 
             sqlx::query(
                 "INSERT INTO equity_bars \
@@ -253,17 +251,14 @@ pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64
             .await
             .expect("Failed to seed an equity bar");
 
-            session_date += Duration::days(1);
+            session_date = session_date.plus_calendar_days(1);
         }
     }
 }
 
 /// Inserts one daily bar for a ticker at a specific date, for gap and alignment tests.
-pub async fn seed_bar(pool: &PgPool, ticker: &str, date: NaiveDate, close: f64) {
-    let timestamp = date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is a valid time")
-        .and_utc();
+pub async fn seed_bar(pool: &PgPool, ticker: &str, date: SessionDate, close: f64) {
+    let timestamp = date.midnight();
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \

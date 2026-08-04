@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, TradingClient};
 use crate::common::types::{EquityPrediction, Ticker};
-use crate::data::calendar::{eastern_date, eastern_day_bounds, TradingCalendar};
+use crate::data::calendar::{SessionDate, TradingCalendar};
 use crate::data::details::{self, DetailsError};
 use crate::data::universe::Universe;
 use crate::models::tide::predict;
@@ -445,7 +445,7 @@ async fn close_what_should_close(
 async fn current_model_run_id(
     context: &EvaluationContext<'_>,
 ) -> Result<Option<String>, EvaluationError> {
-    let (start, end) = eastern_day_bounds(eastern_date(context.now));
+    let (start, end) = SessionDate::at(context.now).bounds();
     let row = sqlx::query!(
         r#"SELECT model_run_id AS "model_run_id!"
            FROM equity_predictions
@@ -464,7 +464,7 @@ async fn current_model_run_id(
 async fn previous_session_equity(
     context: &EvaluationContext<'_>,
 ) -> Result<Option<rust_decimal::Decimal>, EvaluationError> {
-    let today = eastern_date(context.now);
+    let today = SessionDate::at(context.now);
     let Some(previous) = context.calendar.previous_trading_day(today) else {
         return Ok(None);
     };
@@ -483,7 +483,7 @@ async fn build_screen_inputs(
     held: &HashSet<Ticker>,
     prices: &mut HashMap<Ticker, f64>,
 ) -> Result<ScreenedUniverse, EvaluationError> {
-    let (start, end) = eastern_day_bounds(eastern_date(context.now));
+    let (start, end) = SessionDate::at(context.now).bounds();
     let predictions = predict::load_predictions_between(context.pool, start, end).await?;
     if predictions.is_empty() {
         info!("No predictions for the current session; no entries will be screened");
