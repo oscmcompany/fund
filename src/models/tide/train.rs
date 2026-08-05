@@ -220,17 +220,26 @@ pub fn train(
         };
         losses.push(train_loss);
 
-        let stopping_loss = match valid_dataset {
-            Some(valid) if !valid.is_empty() => {
-                validation_loss(&model, valid, parameters, configuration.batch_size)
-            }
-            _ => train_loss,
+        // Kept separate from `stopping_loss` so the log can say which one it is. When there is no
+        // validation set, early stopping falls back to the training loss — and logging that
+        // fallback under `validation_loss` produced a line where the two losses matched exactly,
+        // which reads as a suspiciously well-generalizing model rather than as an absent split.
+        let measured_validation_loss = match valid_dataset {
+            Some(valid) if !valid.is_empty() => Some(validation_loss(
+                &model,
+                valid,
+                parameters,
+                configuration.batch_size,
+            )),
+            _ => None,
         };
+        let stopping_loss = measured_validation_loss.unwrap_or(train_loss);
 
         info!(
             epoch = epoch + 1,
-            train_loss = train_loss,
-            validation_loss = stopping_loss,
+            train_loss,
+            validation_loss = ?measured_validation_loss,
+            stopping_loss,
             "Epoch complete"
         );
 

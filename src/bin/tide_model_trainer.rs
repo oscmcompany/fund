@@ -30,7 +30,7 @@ use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
 use fund::models::tide::configuration::ModelParameters;
-use fund::models::tide::data::input_feature_size;
+use fund::models::tide::data::{input_feature_size, DatasetKind, ValidationSplit};
 use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
 use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
@@ -139,14 +139,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let fit_result = fit(filtered)?;
 
-    let train_dataset =
-        fit_result
-            .data
-            .get_dataset("train", VALIDATION_SPLIT, INPUT_LENGTH, OUTPUT_LENGTH)?;
-    let valid_dataset =
-        fit_result
-            .data
-            .get_dataset("validate", VALIDATION_SPLIT, INPUT_LENGTH, OUTPUT_LENGTH)?;
+    let validation_split = ValidationSplit::new(VALIDATION_SPLIT)?;
+    let train_dataset = fit_result.data.get_dataset(
+        DatasetKind::Train(validation_split),
+        INPUT_LENGTH,
+        OUTPUT_LENGTH,
+    )?;
+    let valid_dataset = fit_result.data.get_dataset(
+        DatasetKind::Validate(validation_split),
+        INPUT_LENGTH,
+        OUTPUT_LENGTH,
+    )?;
     info!(
         train_samples = train_dataset.len(),
         validation_samples = valid_dataset.len(),

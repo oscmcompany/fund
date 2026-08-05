@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::common::types::{EquityPrediction, Ticker};
 use crate::data::calendar::SessionDate;
 use crate::models::tide::artifact::ModelState;
-use crate::models::tide::data::Data;
+use crate::models::tide::data::{Data, DatasetKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PredictionError {
@@ -184,7 +184,7 @@ pub fn filter_to_trained_tickers(
 
     let ticker_series = Series::new("valid_ticker".into(), &trained_tickers);
 
-    let original_count = data.height();
+    let original_rows = data.height();
     let filtered = data
         .lazy()
         .with_column(col("ticker").cast(DataType::String).str().to_uppercase())
@@ -196,13 +196,16 @@ pub fn filter_to_trained_tickers(
         return Err(PredictionError::NoMatchingTickers);
     }
 
-    let original_tickers = original_count;
-    let filtered_tickers = filtered.height();
-    if original_tickers != filtered_tickers {
+    // Rows, not tickers. The frame carries one row per ticker per bar, so these counts are roughly
+    // the ticker count times the lookback — reported under a `tickers` name they read as a universe
+    // two orders of magnitude larger than it is.
+    let filtered_rows = filtered.height();
+    if original_rows != filtered_rows {
         info!(
-            original = original_tickers,
-            filtered = filtered_tickers,
-            dropped = original_tickers - filtered_tickers,
+            original_rows,
+            filtered_rows,
+            dropped_rows = original_rows - filtered_rows,
+            trained_tickers = trained_tickers.len(),
             "Filtered to trained tickers"
         );
     }
@@ -253,7 +256,7 @@ pub fn generate_predictions(
     let output_length = model_state.parameters().output_length();
     let dataset_input_length = model_state.parameters().input_length();
     let dataset = tide_data
-        .get_dataset("predict", 0.8, dataset_input_length, output_length)
+        .get_dataset(DatasetKind::Predict, dataset_input_length, output_length)
         .map_err(|e| PredictionError::DatasetCreation(e.to_string()))?;
 
     if dataset.is_empty() {
@@ -430,51 +433,45 @@ pub fn validate_predictions(predictions: &[serde_json::Value]) -> Result<(), Str
 ///
 /// These come from our own pipeline, so a missing or mistyped field is a bug upstream. It fails
 /// loudly with the offending field and ticker rather than persisting placeholders.
+///
+/// The failure is a plain message rather than a `sqlx::Error::Decode`, which is what it used to be.
+/// Nothing here came from the database — this is our own in-memory JSON — so reporting a malformed
+/// payload as a decode error sent the reader looking at the wrong machine.
 fn prediction_from_json(
     prediction: &serde_json::Value,
     correlation_id: Uuid,
     model_run_id: &str,
-) -> Result<EquityPrediction, sqlx::Error> {
+) -> Result<EquityPrediction, String> {
     let ticker = prediction
         .get("ticker")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| sqlx::Error::Decode("Prediction is missing a string ticker field".into()))?;
+        .ok_or_else(|| "Prediction is missing a string ticker field".to_string())?;
 
     let timestamp_milliseconds = prediction
         .get("timestamp")
         .and_then(|value| value.as_i64())
         .ok_or_else(|| {
-            sqlx::Error::Decode(
-                format!("Prediction for ticker {ticker} is missing an integer timestamp field")
-                    .into(),
-            )
+            format!("Prediction for ticker {ticker} is missing an integer timestamp field")
         })?;
     let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp_milliseconds)
         .filter(|_| timestamp_milliseconds > 0)
         .ok_or_else(|| {
-            sqlx::Error::Decode(
-                format!(
-                    "Prediction for ticker {ticker} has an invalid timestamp: {timestamp_milliseconds}"
-                )
-                .into(),
+            format!(
+                "Prediction for ticker {ticker} has an invalid timestamp: {timestamp_milliseconds}"
             )
         })?;
 
-    let quantile = |field: &str| -> Result<f64, sqlx::Error> {
+    let quantile = |field: &str| -> Result<f64, String> {
         prediction
             .get(field)
             .and_then(|value| value.as_f64())
             .ok_or_else(|| {
-                sqlx::Error::Decode(
-                    format!("Prediction for ticker {ticker} is missing a numeric {field} field")
-                        .into(),
-                )
+                format!("Prediction for ticker {ticker} is missing a numeric {field} field")
             })
     };
 
-    let validated_ticker = Ticker::new(ticker).ok_or_else(|| {
-        sqlx::Error::Decode(format!("Invalid ticker in prediction payload: {ticker}").into())
-    })?;
+    let validated_ticker = Ticker::new(ticker)
+        .ok_or_else(|| format!("Invalid ticker in prediction payload: {ticker}"))?;
     // `EquityPrediction::new` enforces the quantile ordering invariant, so a crossed set from the
     // model is rejected here rather than stored. Every downstream use -- the confidence measure,
     // the directional signal -- produces plausible nonsense from crossed quantiles rather than
@@ -488,9 +485,20 @@ fn prediction_from_json(
         quantile("quantile_50")?,
         quantile("quantile_90")?,
     )
-    .map_err(|error| {
-        sqlx::Error::Decode(format!("Prediction for ticker {ticker} is invalid: {error}").into())
-    })
+    .map_err(|error| format!("Prediction for ticker {ticker} is invalid: {error}"))
+}
+
+/// Why writing a prediction batch failed.
+///
+/// Two variants because the two failures point at different machines: a malformed payload is a bug
+/// in this process's own model output, and a database error is the database. Collapsing them, as
+/// the `sqlx::Error` return did, made every model bug read as a storage problem.
+#[derive(Debug, thiserror::Error)]
+pub enum InsertPredictionsError {
+    #[error("prediction payload is malformed: {0}")]
+    Payload(String),
+    #[error("{0}")]
+    Database(#[from] sqlx::Error),
 }
 
 pub async fn insert_predictions(
@@ -498,7 +506,7 @@ pub async fn insert_predictions(
     predictions: &[serde_json::Value],
     correlation_id: Uuid,
     model_run_id: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, InsertPredictionsError> {
     if predictions.is_empty() {
         return Ok(0);
     }
@@ -506,7 +514,8 @@ pub async fn insert_predictions(
     let validated: Vec<EquityPrediction> = predictions
         .iter()
         .map(|prediction| prediction_from_json(prediction, correlation_id, model_run_id))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<_, _>>()
+        .map_err(InsertPredictionsError::Payload)?;
 
     let mut rows_affected: u64 = 0;
     let mut transaction = pool.begin().await?;
@@ -1359,5 +1368,79 @@ mod tests {
 
         let result = unscale_and_sort_quantiles(&[], &scaler);
         assert!(result.is_empty());
+    }
+
+    fn valid_prediction_payload() -> serde_json::Value {
+        serde_json::json!({
+            "ticker": "AAPL",
+            "timestamp": 1_760_000_000_000i64,
+            "quantile_10": -0.01,
+            "quantile_50": 0.0,
+            "quantile_90": 0.01,
+        })
+    }
+
+    fn convert(payload: &serde_json::Value) -> Result<EquityPrediction, String> {
+        prediction_from_json(payload, Uuid::nil(), "2026-08-05-00-00-00-000")
+    }
+
+    #[test]
+    fn test_prediction_from_json_accepts_a_well_formed_payload() {
+        let prediction = convert(&valid_prediction_payload()).expect("the fixture must convert");
+        assert_eq!(prediction.ticker().as_str(), "AAPL");
+        assert_eq!(prediction.quantile_50(), 0.0);
+    }
+
+    /// Every field this reads comes from our own pipeline, so each of these is an upstream bug. The
+    /// message has to name the offending field and, where it can, the ticker — the payload is a
+    /// batch of thousands and "a field is missing" would not narrow it.
+    #[test]
+    fn test_prediction_from_json_names_the_field_it_rejects() {
+        for (field, expected_fragment) in [
+            ("ticker", "string ticker field"),
+            ("timestamp", "integer timestamp field"),
+            ("quantile_10", "numeric quantile_10 field"),
+            ("quantile_50", "numeric quantile_50 field"),
+            ("quantile_90", "numeric quantile_90 field"),
+        ] {
+            let mut payload = valid_prediction_payload();
+            payload.as_object_mut().unwrap().remove(field);
+
+            let error = convert(&payload).expect_err("a missing {field} must be rejected");
+            assert!(
+                error.contains(expected_fragment),
+                "removing {field} produced `{error}`, which does not name the field"
+            );
+        }
+    }
+
+    #[test]
+    fn test_prediction_from_json_rejects_a_non_positive_timestamp() {
+        let mut payload = valid_prediction_payload();
+        payload["timestamp"] = serde_json::json!(0i64);
+
+        let error = convert(&payload).expect_err("a zero timestamp must be rejected");
+        assert!(error.contains("invalid timestamp"), "got `{error}`");
+    }
+
+    #[test]
+    fn test_prediction_from_json_rejects_a_ticker_the_domain_type_refuses() {
+        let mut payload = valid_prediction_payload();
+        payload["ticker"] = serde_json::json!("NOTATICKER123");
+
+        let error = convert(&payload).expect_err("an unusable ticker must be rejected");
+        assert!(error.contains("Invalid ticker"), "got `{error}`");
+    }
+
+    /// Crossed quantiles are the failure this conversion exists to stop: every downstream use of a
+    /// prediction produces plausible nonsense from them rather than failing, so a crossed set that
+    /// reaches the table is never detected again.
+    #[test]
+    fn test_prediction_from_json_rejects_crossed_quantiles() {
+        let mut payload = valid_prediction_payload();
+        payload["quantile_10"] = serde_json::json!(0.05);
+
+        let error = convert(&payload).expect_err("crossed quantiles must be rejected");
+        assert!(error.contains("AAPL"), "got `{error}`");
     }
 }

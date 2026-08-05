@@ -240,6 +240,46 @@ pub fn input_feature_size(input_length: usize, output_length: usize) -> usize {
         + STATIC_CATEGORICAL_COLUMNS.len()
 }
 
+/// The fraction of the observed time range that goes to training.
+///
+/// Strictly between 0 and 1. At either endpoint one side of the split is empty, and an empty side
+/// is not an error anywhere downstream — [`window_frame`] simply yields no windows, training runs
+/// on nothing or validates against nothing, and the run reports a loss computed over zero rows.
+/// Rejecting the endpoint here is the only place that failure is still legible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidationSplit(f64);
+
+impl ValidationSplit {
+    pub fn new(fraction: f64) -> Result<Self, String> {
+        if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 {
+            return Err(format!(
+                "the validation split must be a fraction strictly between 0 and 1, got {fraction}"
+            ));
+        }
+        Ok(Self(fraction))
+    }
+
+    fn fraction(self) -> f64 {
+        self.0
+    }
+}
+
+/// Which dataset [`Data::get_dataset`] should window out of the engineered frame.
+///
+/// The split rides on the two variants that consume it rather than on the call, because inference
+/// has no meaningful value to pass: it reads the whole frame. The previous `&str` selector took a
+/// split regardless, so the predict call site carried a `0.8` that did nothing — and, worse, its
+/// `_` arm turned any unrecognized string into training data rather than an error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DatasetKind {
+    /// One window per ticker at the end of its series, no targets.
+    Predict,
+    /// All sliding windows at or before the cutoff, with the future `daily_return` as targets.
+    Train(ValidationSplit),
+    /// All sliding windows after the cutoff, with the future `daily_return` as targets.
+    Validate(ValidationSplit),
+}
+
 pub struct Data {
     pub data: DataFrame,
     pub scaler: Scaler,
@@ -290,8 +330,9 @@ impl Data {
     /// `min + (max - min) * validation_split`. Rows at or before the cutoff are training.
     pub fn split_by_timestamp(
         &self,
-        validation_split: f64,
+        validation_split: ValidationSplit,
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
+        let validation_split = validation_split.fraction();
         let timestamps = self.data.column("timestamp").map_err(|e| e.to_string())?;
         let timestamps = timestamps.i64().map_err(|e| e.to_string())?;
         let minimum_timestamp = timestamps.min().unwrap_or(0);
@@ -307,24 +348,21 @@ impl Data {
     }
 
     /// Build a windowed dataset.
-    ///
-    /// - `predict` → one window per ticker at the end of its series, no targets.
-    /// - `train` / `validate` → all sliding windows over the corresponding date
-    ///   split, with the future `daily_return` window as targets.
     pub fn get_dataset(
         &self,
-        data_type: &str,
-        validation_split: f64,
+        kind: DatasetKind,
         input_length: usize,
         output_length: usize,
     ) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
-        match data_type {
-            "predict" => window_frame(&self.data, input_length, output_length, true, false),
-            "validate" => {
+        match kind {
+            DatasetKind::Predict => {
+                window_frame(&self.data, input_length, output_length, true, false)
+            }
+            DatasetKind::Validate(validation_split) => {
                 let (_, valid) = self.split_by_timestamp(validation_split)?;
                 window_frame(&valid, input_length, output_length, false, true)
             }
-            _ => {
+            DatasetKind::Train(validation_split) => {
                 let (train, _) = self.split_by_timestamp(validation_split)?;
                 window_frame(&train, input_length, output_length, false, true)
             }
@@ -1228,10 +1266,14 @@ mod tests {
         )
     }
 
+    fn split_of(fraction: f64) -> ValidationSplit {
+        ValidationSplit::new(fraction).expect("the fixture split must be in range")
+    }
+
     #[test]
     fn test_get_dataset_predict_one_window_per_ticker() {
         let data = empty_data(make_encoded_frame(3, 6));
-        let dataset = data.get_dataset("predict", 0.8, 2, 1).unwrap();
+        let dataset = data.get_dataset(DatasetKind::Predict, 2, 1).unwrap();
         // One prediction window per ticker, no targets.
         assert_eq!(dataset.len(), 3);
         assert!(dataset.targets.is_none());
@@ -1243,7 +1285,9 @@ mod tests {
     #[test]
     fn test_get_dataset_train_has_targets() {
         let data = empty_data(make_encoded_frame(2, 10));
-        let dataset = data.get_dataset("train", 0.8, 3, 2).unwrap();
+        let dataset = data
+            .get_dataset(DatasetKind::Train(split_of(0.8)), 3, 2)
+            .unwrap();
         let sample_count = dataset.len();
         assert!(sample_count > 0);
         let targets = dataset.targets.expect("train dataset must have targets");
@@ -1252,10 +1296,47 @@ mod tests {
         assert_eq!(targets.shape()[0], sample_count);
     }
 
+    /// Both endpoints leave one side of the split empty, and nothing downstream reports that as a
+    /// failure — the run trains on no windows and records a loss over zero rows. The constructor is
+    /// the only place it is still visible.
+    #[test]
+    fn test_validation_split_rejects_values_outside_the_open_unit_interval() {
+        for rejected in [0.0, 1.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
+            assert!(
+                ValidationSplit::new(rejected).is_err(),
+                "expected {rejected} to be rejected"
+            );
+        }
+        assert!(ValidationSplit::new(0.8).is_ok());
+    }
+
+    /// The predict variant carries no split, so inference cannot pass one that does nothing — which
+    /// is what the `0.8` at the old predict call site was. This is a compile-time property; the
+    /// assertion here records that predicting reads the whole frame rather than a split of it.
+    #[test]
+    fn test_predict_windows_the_whole_frame_rather_than_a_split() {
+        let frame = make_encoded_frame(1, 10);
+        let data = empty_data(frame);
+
+        let predicted = data.get_dataset(DatasetKind::Predict, 3, 1).unwrap();
+        // One window at the end of the ticker's full series.
+        assert_eq!(predicted.len(), 1);
+
+        // A split that keeps only the first 20% of the range cannot reach the predict path, so the
+        // predict window count is unchanged by any split value.
+        let trained = data
+            .get_dataset(DatasetKind::Train(split_of(0.2)), 3, 1)
+            .unwrap();
+        assert!(
+            trained.len() < 10,
+            "the training split must cover fewer windows than the full frame"
+        );
+    }
+
     #[test]
     fn test_split_by_timestamp_partitions_rows() {
         let data = empty_data(make_encoded_frame(1, 10));
-        let (train, valid) = data.split_by_timestamp(0.8).unwrap();
+        let (train, valid) = data.split_by_timestamp(split_of(0.8)).unwrap();
         assert_eq!(train.height() + valid.height(), 10);
         assert!(train.height() > 0);
         assert!(valid.height() > 0);
@@ -1713,7 +1794,7 @@ mod tests {
         // Train is date <= split, validation is date > split. With 11 daily rows (0..=10 days)
         // and split 0.8 the cutoff lands exactly on day 8, which must belong to train.
         let data = empty_data(make_encoded_frame(1, 11));
-        let (train, valid) = data.split_by_timestamp(0.8).unwrap();
+        let (train, valid) = data.split_by_timestamp(split_of(0.8)).unwrap();
         assert_eq!(train.height(), 9);
         assert_eq!(valid.height(), 2);
     }
