@@ -84,7 +84,6 @@ pub struct ScreenInput {
     ticker: Ticker,
     closes: Vec<f64>,
     price: f64,
-    sector: String,
     expected_return: f64,
     confidence: f64,
     is_shortable: bool,
@@ -100,7 +99,6 @@ impl ScreenInput {
         ticker: Ticker,
         closes: Vec<f64>,
         price: f64,
-        sector: String,
         expected_return: f64,
         confidence: f64,
         is_shortable: bool,
@@ -124,7 +122,6 @@ impl ScreenInput {
             ticker,
             closes,
             price,
-            sector,
             expected_return,
             confidence,
             is_shortable,
@@ -137,10 +134,6 @@ impl ScreenInput {
 
     pub fn price(&self) -> f64 {
         self.price
-    }
-
-    pub fn sector(&self) -> &str {
-        &self.sector
     }
 
     pub fn expected_return(&self) -> f64 {
@@ -514,22 +507,27 @@ pub fn select_disjoint(
             continue;
         }
 
-        // Both legs at once: a same-sector pair asks for two of that sector's allowance, and
-        // admitting it one leg at a time could take a sector past the cap.
-        let mut requested: HashMap<&str, usize> = HashMap::new();
-        for ticker in [candidate.long_ticker(), candidate.short_ticker()] {
-            if let Some(sector) = sectors.get(ticker) {
-                *requested.entry(sector.as_str()).or_default() += 1;
+        let long_sector = sectors.get(candidate.long_ticker()).map(String::as_str);
+        let short_sector = sectors.get(candidate.short_ticker()).map(String::as_str);
+        let taken = |sector: &str| legs_per_sector.get(sector).copied().unwrap_or(0);
+
+        // Both legs are weighed together, and the same-sector case is why: asking twice for one
+        // allowance, a leg at a time, would let such a pair take its sector one past the cap.
+        let fits = match (long_sector, short_sector) {
+            (Some(long), Some(short)) if long == short => {
+                taken(long) + 2 <= MAXIMUM_LEGS_PER_SECTOR
             }
-        }
-        let over_cap = requested.iter().any(|(sector, legs)| {
-            legs_per_sector.get(sector).copied().unwrap_or(0) + legs > MAXIMUM_LEGS_PER_SECTOR
-        });
-        if over_cap {
+            (Some(long), Some(short)) => {
+                taken(long) < MAXIMUM_LEGS_PER_SECTOR && taken(short) < MAXIMUM_LEGS_PER_SECTOR
+            }
+            (Some(sector), None) | (None, Some(sector)) => taken(sector) < MAXIMUM_LEGS_PER_SECTOR,
+            (None, None) => true,
+        };
+        if !fits {
             continue;
         }
-        for (sector, legs) in requested {
-            *legs_per_sector.entry(sector).or_default() += legs;
+        for sector in [long_sector, short_sector].into_iter().flatten() {
+            *legs_per_sector.entry(sector).or_default() += 1;
         }
         used.insert(candidate.long_ticker().clone());
         used.insert(candidate.short_ticker().clone());
@@ -712,23 +710,9 @@ mod tests {
         );
     }
 
-    fn input(
-        name: &str,
-        closes: Vec<f64>,
-        price: f64,
-        sector: &str,
-        expected_return: f64,
-    ) -> ScreenInput {
-        ScreenInput::new(
-            ticker(name),
-            closes,
-            price,
-            sector.to_string(),
-            expected_return,
-            0.9,
-            true,
-        )
-        .expect("test input must be constructible")
+    fn input(name: &str, closes: Vec<f64>, price: f64, expected_return: f64) -> ScreenInput {
+        ScreenInput::new(ticker(name), closes, price, expected_return, 0.9, true)
+            .expect("test input must be constructible")
     }
 
     // --- the spread model ---
@@ -882,14 +866,8 @@ mod tests {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         vec![
-            input(
-                "AAAA",
-                leader.clone(),
-                *leader.last().unwrap(),
-                "Technology",
-                0.03,
-            ),
-            input("BBBB", follower.clone(), stretched, "Utilities", -0.02),
+            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
+            input("BBBB", follower.clone(), stretched, -0.02),
         ]
     }
 
@@ -921,14 +899,8 @@ mod tests {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         let inputs = vec![
-            input(
-                "AAAA",
-                leader.clone(),
-                *leader.last().unwrap(),
-                "Technology",
-                -0.02,
-            ),
-            input("BBBB", follower, stretched, "Utilities", 0.03),
+            input("AAAA", leader.clone(), *leader.last().unwrap(), -0.02),
+            input("BBBB", follower, stretched, 0.03),
         ];
         assert!(score_candidates(&inputs).is_empty());
     }
@@ -953,37 +925,29 @@ mod tests {
 
         let stretched = mirrored.last().unwrap() * 1.5;
         let inputs = vec![
-            input(
-                "AAAA",
-                leader.clone(),
-                *leader.last().unwrap(),
-                "Technology",
-                0.03,
-            ),
-            input("BBBB", mirrored, stretched, "Utilities", -0.02),
+            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
+            input("BBBB", mirrored, stretched, -0.02),
         ];
         assert!(score_candidates(&inputs).is_empty());
     }
 
-    /// The screen must produce same-sector pairs, not refuse them.
+    /// Two cointegrated names are a candidate, whatever sectors they are in.
     ///
-    /// This asserts the reverse of what it used to. A same-sector spread is the canonical
-    /// statistical arbitrage trade, and within-sector correlation is where the `[0.5, 0.95]` band is
-    /// most densely populated — so the old rule removed disproportionately many of the best
-    /// candidates. Concentration is now bounded in `select_disjoint` instead.
+    /// This replaces a test asserting the reverse. A same-sector spread is the canonical statistical
+    /// arbitrage trade, and within-sector correlation is where the `[0.5, 0.95]` band is most
+    /// densely populated, so the old rule removed disproportionately many of the best candidates.
+    ///
+    /// Sector cannot even be *expressed* here any more: `ScreenInput` no longer carries one, because
+    /// nothing in scoring reads it. That is the strongest statement of the change — the screen has
+    /// no sector to consider. Concentration is bounded in `select_disjoint` instead, and the tests
+    /// for it are below.
     #[test]
-    fn test_same_sector_pairs_are_screened_rather_than_refused() {
+    fn test_scoring_does_not_consider_sector() {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         let inputs = vec![
-            input(
-                "AAAA",
-                leader.clone(),
-                *leader.last().unwrap(),
-                "Technology",
-                0.03,
-            ),
-            input("BBBB", follower, stretched, "Technology", -0.02),
+            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
+            input("BBBB", follower, stretched, -0.02),
         ];
 
         let candidates = score_candidates(&inputs);
@@ -991,7 +955,7 @@ mod tests {
         assert_eq!(
             candidates.len(),
             1,
-            "two cointegrated names in one sector are a candidate"
+            "two cointegrated names are a candidate"
         );
         assert_eq!(candidates[0].long_ticker().as_str(), "AAAA");
         assert_eq!(candidates[0].short_ticker().as_str(), "BBBB");
@@ -1003,16 +967,8 @@ mod tests {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         let mut inputs = screenable_inputs();
-        inputs[1] = ScreenInput::new(
-            ticker("BBBB"),
-            follower,
-            stretched,
-            "Utilities".to_string(),
-            -0.02,
-            0.9,
-            false,
-        )
-        .unwrap();
+        inputs[1] =
+            ScreenInput::new(ticker("BBBB"), follower, stretched, -0.02, 0.9, false).unwrap();
         let _ = leader;
         assert!(score_candidates(&inputs).is_empty());
     }
@@ -1022,18 +978,11 @@ mod tests {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         let inputs = vec![
-            input(
-                "AAAA",
-                leader.clone(),
-                *leader.last().unwrap(),
-                "Technology",
-                0.03,
-            ),
+            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
             ScreenInput::new(
                 ticker("BBBB"),
                 follower,
                 stretched,
-                "Utilities".to_string(),
                 -0.02,
                 CONFIDENCE_FLOOR - 0.01,
                 true,
@@ -1049,25 +998,15 @@ mod tests {
             ticker("AAAA"),
             vec![100.0; CORRELATION_WINDOW_SESSIONS - 1],
             100.0,
-            "Technology".to_string(),
             0.01,
             0.9,
-            true,
+            true
         )
         .is_none());
 
         let mut with_zero = vec![100.0; CORRELATION_WINDOW_SESSIONS];
         with_zero[3] = 0.0;
-        assert!(ScreenInput::new(
-            ticker("AAAA"),
-            with_zero,
-            100.0,
-            "Technology".to_string(),
-            0.01,
-            0.9,
-            true,
-        )
-        .is_none());
+        assert!(ScreenInput::new(ticker("AAAA"), with_zero, 100.0, 0.01, 0.9, true).is_none());
     }
 
     // --- selection ---
@@ -1082,7 +1021,7 @@ mod tests {
 
     /// The nth distinct pair of symbols: `("LAAA", "SAAA")`, `("LBBB", "SBBB")`, and so on.
     /// `Ticker` admits letters only, so the index is spelled rather than numbered.
-    fn nth_pair(index: usize) -> (String, String) {
+    fn pair_for_index(index: usize) -> (String, String) {
         let letter = (b'A' + index as u8) as char;
         (
             format!("L{letter}{letter}{letter}"),
@@ -1095,7 +1034,7 @@ mod tests {
         count: usize,
         sector: &str,
     ) -> (Vec<PairCandidate>, HashMap<Ticker, String>) {
-        let symbols: Vec<(String, String)> = (0..count).map(nth_pair).collect();
+        let symbols: Vec<(String, String)> = (0..count).map(pair_for_index).collect();
         let candidates = symbols
             .iter()
             .enumerate()
@@ -1131,7 +1070,7 @@ mod tests {
     /// A cross-sector pair spends one leg in each sector, so the same allowance goes twice as far.
     #[test]
     fn test_a_cross_sector_pair_costs_one_leg_in_each_sector() {
-        let symbols: Vec<(String, String)> = (0..6).map(nth_pair).collect();
+        let symbols: Vec<(String, String)> = (0..6).map(pair_for_index).collect();
         let candidates: Vec<PairCandidate> = symbols
             .iter()
             .enumerate()
@@ -1191,8 +1130,12 @@ mod tests {
         assert_eq!(selected.len(), MAXIMUM_LEGS_PER_SECTOR / 2);
     }
 
-    /// An empty sector map caps nothing, which is what a database with no `equity_details` rows
-    /// looks like. Recorded so the seeding requirement is visible rather than assumed.
+    /// An empty sector map caps nothing.
+    ///
+    /// Recorded as a property of this function, not as a claim about the system: `build_screen_inputs`
+    /// refuses a ticker with no sector before it can become a candidate, precisely so an unmeasurable
+    /// name cannot slip past the cap. What this pins is that the *cap* is the only thing doing the
+    /// capping — remove the upstream filter and concentration becomes unbounded, silently.
     #[test]
     fn test_an_empty_sector_map_constrains_nothing() {
         let (candidates, _) = same_sector_candidates(5, "Technology");

@@ -510,6 +510,13 @@ async fn build_screen_inputs(
     // Only forecasts that can produce a candidate: in the universe, with a sector, with enough
     // history, and not already on the book. Every test here is a set lookup, because this runs once
     // per forecast on a pass that runs every five minutes.
+    //
+    // The sector test survives the removal of the different-sector rule, for a new reason. A ticker
+    // whose sector is unknown cannot be counted against `MAXIMUM_LEGS_PER_SECTOR`, so admitting one
+    // would let missing metadata quietly become unbounded concentration. Refusing to *open* what
+    // cannot be measured is the conservative side of that trade; `select_disjoint` still tolerates
+    // an unknown sector on a *held* leg, because a position already on the book cannot be
+    // retroactively declined.
     let eligible: Vec<&EquityPrediction> = predictions
         .iter()
         .filter(|prediction| {
@@ -536,7 +543,6 @@ async fn build_screen_inputs(
                 ticker.clone(),
                 context.close_history.get(ticker)?.clone(),
                 *prices.get(ticker)?,
-                sectors.get(ticker)?.clone(),
                 prediction.expected_return(),
                 prediction.confidence(),
                 context.universe.is_shortable(ticker),
