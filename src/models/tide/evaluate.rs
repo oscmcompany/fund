@@ -124,6 +124,8 @@ pub fn evaluate(
         return Ok(EvalMetrics::zero());
     }
 
+    crate::models::tide::batch::validate_input_shape(dataset, parameters)?;
+
     let indices = QuantileIndices::locate(quantiles);
 
     let device = Default::default();

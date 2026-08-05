@@ -264,6 +264,11 @@ pub fn generate_predictions(
 
     info!(samples = dataset.len(), "Prediction dataset created");
 
+    // Before the forward pass, not inside it: a mismatch between this data and the loaded weights
+    // is an artifact problem, and it should read as one rather than as a tensor panic.
+    crate::models::tide::batch::validate_input_shape(&dataset, model_state.parameters())
+        .map_err(PredictionError::DatasetCreation)?;
+
     let device = Default::default();
     let num_samples = dataset.len();
 
@@ -777,10 +782,8 @@ mod tests {
         means.insert("daily_return".to_string(), 0.0);
         let mut standard_deviations = std::collections::HashMap::new();
         standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler {
-            means,
-            standard_deviations,
-        };
+        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
+            .expect("test scaler statistics must be usable");
 
         // Crossed raw quantiles (q10 > q50) must come back monotonic.
         let sorted = unscale_and_sort_quantiles(&[0.05, 0.02, 0.03], &scaler);
@@ -1110,10 +1113,8 @@ mod tests {
         means.insert("daily_return".to_string(), 0.0);
         let mut standard_deviations = std::collections::HashMap::new();
         standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler {
-            means,
-            standard_deviations,
-        };
+        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
+            .expect("test scaler statistics must be usable");
 
         // Already-sorted quantiles must come back unchanged.
         let result = unscale_and_sort_quantiles(&[0.01, 0.02, 0.03], &scaler);
@@ -1127,10 +1128,8 @@ mod tests {
         means.insert("daily_return".to_string(), 0.005);
         let mut standard_deviations = std::collections::HashMap::new();
         standard_deviations.insert("daily_return".to_string(), 0.01);
-        let scaler = crate::models::tide::data::Scaler {
-            means,
-            standard_deviations,
-        };
+        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
+            .expect("test scaler statistics must be usable");
 
         let result = unscale_and_sort_quantiles(&[-1.0, 0.0, 1.0], &scaler);
         // -1.0 * 0.01 + 0.005 = -0.005, 0.0 * 0.01 + 0.005 = 0.005, 1.0 * 0.01 + 0.005 = 0.015
@@ -1351,10 +1350,8 @@ mod tests {
         means.insert("daily_return".to_string(), 0.0);
         let mut standard_deviations = std::collections::HashMap::new();
         standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler {
-            means,
-            standard_deviations,
-        };
+        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
+            .expect("test scaler statistics must be usable");
 
         let result = unscale_and_sort_quantiles(&[0.05], &scaler);
         assert_eq!(result.len(), 1);
@@ -1367,10 +1364,8 @@ mod tests {
         means.insert("daily_return".to_string(), 0.0);
         let mut standard_deviations = std::collections::HashMap::new();
         standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler {
-            means,
-            standard_deviations,
-        };
+        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
+            .expect("test scaler statistics must be usable");
 
         let result = unscale_and_sort_quantiles(&[], &scaler);
         assert!(result.is_empty());

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 
 use chrono::Datelike;
 use polars::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use crate::data::calendar::SessionDate;
 use crate::data::details::UNKNOWN as UNKNOWN_SECTOR_OR_INDUSTRY;
@@ -19,80 +18,141 @@ pub fn selector_by_names(names: &[&str]) -> Vec<PlSmallStr> {
     names.iter().map(|name| PlSmallStr::from(*name)).collect()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Per-column standardization statistics, fitted during training and reloaded at inference.
+///
+/// **Holding one is proof it can scale.** Every mean is finite and every standard deviation is
+/// finite and strictly positive, checked once in [`Scaler::new`], so no call site re-checks and none
+/// can silently substitute a default.
+///
+/// That guarantee is the point of the type rather than decoration. This value crosses a machine
+/// boundary as a JSON file, and the failure it prevents is silent: a scaler that degrades to the
+/// identity produces predictions on the wrong scale, the service reports a successful load, and
+/// nothing downstream can distinguish them from good ones — the only remaining validation is
+/// `EquityPrediction::new`'s quantile ordering, which wrong-scale values satisfy perfectly well.
+///
+/// Deliberately not `Deserialize`: deriving it would reintroduce a path into the type that skips
+/// the constructor, which is the hole this closes.
+#[derive(Debug, Clone)]
 pub struct Scaler {
-    pub means: HashMap<String, f64>,
-    pub standard_deviations: HashMap<String, f64>,
+    means: HashMap<String, f64>,
+    standard_deviations: HashMap<String, f64>,
 }
 
 impl Scaler {
-    #[allow(clippy::type_complexity)]
-    pub fn load(
-        path: &std::path::Path,
-    ) -> Result<(Self, Vec<String>, Vec<String>, Vec<String>), Box<dyn std::error::Error>> {
+    /// Constructs a scaler, rejecting statistics that cannot standardize a column.
+    ///
+    /// A non-finite mean poisons every scaled value; a zero or negative standard deviation makes
+    /// the transform degenerate or sign-flipping, and its inverse meaningless.
+    pub fn new(
+        means: HashMap<String, f64>,
+        standard_deviations: HashMap<String, f64>,
+    ) -> Result<Self, String> {
+        for (column, mean) in &means {
+            if !mean.is_finite() {
+                return Err(format!(
+                    "Mean for column `{column}` is {mean}, which is not finite"
+                ));
+            }
+        }
+        for (column, standard_deviation) in &standard_deviations {
+            if !standard_deviation.is_finite() || *standard_deviation <= 0.0 {
+                return Err(format!(
+                    "Standard deviation for column `{column}` is {standard_deviation}, which cannot scale"
+                ));
+            }
+        }
+        Ok(Self {
+            means,
+            standard_deviations,
+        })
+    }
+
+    pub fn means(&self) -> &HashMap<String, f64> {
+        &self.means
+    }
+
+    pub fn standard_deviations(&self) -> &HashMap<String, f64> {
+        &self.standard_deviations
+    }
+
+    /// Reads a scaler from a training artifact, rejecting anything it cannot verify.
+    ///
+    /// **Every branch here refuses rather than defaults.** The previous version replaced an
+    /// unparsable `means` entry with `0.0`, an unparsable `standard_deviations` entry with `1.0`,
+    /// and a missing object with an empty map — which is exactly identity scaling, reported as a
+    /// successful load.
+    ///
+    /// The column lists the artifact was fitted with are checked against this build's constants and
+    /// then dropped. Checking them is the whole of their value: an artifact fitted on a different
+    /// column set would otherwise load without complaint and scale a different set than the weights
+    /// were trained on. Carrying them further served nothing — no caller read them.
+    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let display = path.display();
         let content = std::fs::read_to_string(path)?;
         let raw: serde_json::Value = serde_json::from_str(&content)?;
 
-        let means: HashMap<String, f64> = raw["means"]
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let statistics = |field: &str| -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+            let object = raw[field]
+                .as_object()
+                .ok_or_else(|| format!("Scaler artifact at {display} has no `{field}` object"))?;
+            object
+                .iter()
+                .map(|(column, value)| {
+                    value.as_f64().map(|number| (column.clone(), number)).ok_or_else(|| {
+                        format!(
+                            "Scaler artifact at {display} has a non-numeric `{field}` entry for column `{column}`"
+                        )
+                        .into()
+                    })
+                })
+                .collect()
+        };
 
-        let standard_deviations: HashMap<String, f64> = raw["standard_deviations"]
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(1.0)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let means = statistics("means")?;
+        let standard_deviations = statistics("standard_deviations")?;
 
-        let continuous_columns: Vec<String> = raw["continuous_columns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        for (field, expected) in [
+            ("continuous_columns", CONTINUOUS_COLUMNS),
+            ("categorical_columns", CATEGORICAL_COLUMNS),
+            ("static_categorical_columns", STATIC_CATEGORICAL_COLUMNS),
+        ] {
+            let array = raw[field]
+                .as_array()
+                .ok_or_else(|| format!("Scaler artifact at {display} has no `{field}` list"))?;
+            let found: Vec<&str> = array.iter().filter_map(|value| value.as_str()).collect();
+            if found != expected {
+                return Err(format!(
+                    "Scaler artifact at {display} was fitted on {field} {found:?}, but this build \
+                     expects {expected:?}"
+                )
+                .into());
+            }
+        }
 
-        let categorical_columns: Vec<String> = raw["categorical_columns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // The scaler is fitted over every continuous column, so a missing one means the artifact
+        // and this build disagree about the feature set even though the column list matched.
+        for column in CONTINUOUS_COLUMNS {
+            if !means.contains_key(*column) || !standard_deviations.contains_key(*column) {
+                return Err(format!(
+                    "Scaler artifact at {display} has no statistics for continuous column `{column}`"
+                )
+                .into());
+            }
+        }
 
-        let static_categorical_columns: Vec<String> = raw["static_categorical_columns"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok((
-            Self {
-                means,
-                standard_deviations,
-            },
-            continuous_columns,
-            categorical_columns,
-            static_categorical_columns,
-        ))
+        Self::new(means, standard_deviations)
+            .map_err(|reason| format!("Scaler artifact at {display} is unusable: {reason}").into())
     }
 
+    /// Maps a scaled value back to its original units.
+    ///
+    /// Falls back to the identity for a column the scaler does not carry, which is reachable only
+    /// for a column outside `CONTINUOUS_COLUMNS` — [`Scaler::load`] rejects an artifact missing any
+    /// of those.
     pub fn inverse_transform_value(&self, column: &str, value: f64) -> f64 {
         let mean = self.means.get(column).copied().unwrap_or(0.0);
-        let std = self.standard_deviations.get(column).copied().unwrap_or(1.0);
-        value * std + mean
+        let standard_deviation = self.standard_deviations.get(column).copied().unwrap_or(1.0);
+        value * standard_deviation + mean
     }
 }
 
@@ -674,13 +734,13 @@ pub(crate) fn apply_scaling(
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let mut result = data;
     for column_name in CONTINUOUS_COLUMNS {
-        let mean = scaler.means.get(*column_name).copied().unwrap_or(0.0);
-        let std = scaler
-            .standard_deviations
+        let mean = scaler.means().get(*column_name).copied().unwrap_or(0.0);
+        // `Scaler::new` rejects a non-positive standard deviation, so no zero guard is needed here.
+        let standard_deviation = scaler
+            .standard_deviations()
             .get(*column_name)
             .copied()
             .unwrap_or(1.0);
-        let std = if std == 0.0 { 1e-8 } else { std };
 
         let values: Vec<f32> = result
             .column(column_name)
@@ -690,7 +750,7 @@ pub(crate) fn apply_scaling(
             .f64()
             .map_err(|e| e.to_string())?
             .into_no_null_iter()
-            .map(|v| ((v - mean) / std) as f32)
+            .map(|value| ((value - mean) / standard_deviation) as f32)
             .collect();
 
         result
@@ -764,17 +824,49 @@ pub(crate) fn encode_categoricals(
     Ok(result)
 }
 
+/// Rejects a column carrying nulls before its values are read positionally.
+///
+/// `into_no_null_iter` does not skip nulls and does not check for them: it reads the raw value
+/// sitting in the null slot, which is whatever the buffer happens to hold — `0.0` in practice, but
+/// that is an implementation detail rather than a guarantee. The count therefore matches the frame
+/// and nothing fails, so a null `close_price` is scaled and fed to the model as though someone had
+/// observed it.
+///
+/// **A silent wrong value, not a crash.** Checking the extracted length instead would be inert,
+/// because the length is never wrong. The null count is the only thing that carries the
+/// information.
+///
+/// The same family of trap produced a real bug fixed in #1035, where a null `sector` put later rows
+/// on the wrong ticker.
+fn reject_null_column(
+    column: &Column,
+    column_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nulls = column.null_count();
+    if nulls > 0 {
+        return Err(format!(
+            "Column `{column_name}` has {nulls} null value(s) in {} rows; reading it positionally \
+             would substitute the raw buffer value and treat it as a real observation",
+            column.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn get_float_columns(
     data: &DataFrame,
     columns: &[&str],
 ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
     let mut result = Vec::new();
     for column_name in columns {
-        let values: Vec<f32> = data
+        let cast = data
             .column(column_name)
             .map_err(|e| e.to_string())?
             .cast(&DataType::Float32)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        reject_null_column(&cast, column_name)?;
+        let values: Vec<f32> = cast
             .f32()
             .map_err(|e| e.to_string())?
             .into_no_null_iter()
@@ -790,11 +882,13 @@ fn get_int_columns(
 ) -> Result<Vec<Vec<i32>>, Box<dyn std::error::Error>> {
     let mut result = Vec::new();
     for column_name in columns {
-        let values: Vec<i32> = data
+        let cast = data
             .column(column_name)
             .map_err(|e| e.to_string())?
             .cast(&DataType::Int32)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        reject_null_column(&cast, column_name)?;
+        let values: Vec<i32> = cast
             .i32()
             .map_err(|e| e.to_string())?
             .into_no_null_iter()
@@ -802,6 +896,173 @@ fn get_int_columns(
         result.push(values);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod scaler_boundary_tests {
+    use super::*;
+
+    fn statistics(value: f64) -> HashMap<String, f64> {
+        HashMap::from([("close_price".to_string(), value)])
+    }
+
+    fn well_formed_artifact() -> serde_json::Value {
+        let entries: HashMap<&str, f64> = CONTINUOUS_COLUMNS
+            .iter()
+            .map(|column| (*column, 1.0))
+            .collect();
+        serde_json::json!({
+            "means": entries,
+            "standard_deviations": entries,
+            "continuous_columns": CONTINUOUS_COLUMNS,
+            "categorical_columns": CATEGORICAL_COLUMNS,
+            "static_categorical_columns": STATIC_CATEGORICAL_COLUMNS,
+        })
+    }
+
+    fn load_artifact(artifact: &serde_json::Value) -> Result<Scaler, String> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tide_data_scaler.json");
+        std::fs::write(&path, serde_json::to_string(artifact).unwrap()).unwrap();
+        Scaler::load(&path).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn test_a_well_formed_artifact_loads() {
+        assert!(load_artifact(&well_formed_artifact()).is_ok());
+    }
+
+    /// A standard deviation of zero divides, and a negative one flips the sign of every scaled
+    /// value while still looking like a number.
+    #[test]
+    fn test_new_rejects_a_standard_deviation_that_cannot_scale() {
+        for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                Scaler::new(statistics(0.0), statistics(unusable)).is_err(),
+                "a standard deviation of {unusable} must be refused"
+            );
+        }
+        assert!(Scaler::new(statistics(0.0), statistics(1e-8)).is_ok());
+    }
+
+    #[test]
+    fn test_new_rejects_a_non_finite_mean() {
+        assert!(Scaler::new(statistics(f64::NAN), statistics(1.0)).is_err());
+        assert!(Scaler::new(statistics(f64::NEG_INFINITY), statistics(1.0)).is_err());
+    }
+
+    /// The headline case. A missing object used to yield an empty map, every lookup then fell back
+    /// to mean 0.0 and deviation 1.0, and scaling became the identity — reported as a successful
+    /// load, producing predictions on the wrong scale that nothing downstream can detect.
+    #[test]
+    fn test_load_refuses_a_missing_statistics_object_rather_than_scaling_by_identity() {
+        for field in ["means", "standard_deviations"] {
+            let mut artifact = well_formed_artifact();
+            artifact.as_object_mut().unwrap().remove(field);
+            let error = load_artifact(&artifact).expect_err("a missing object must be refused");
+            assert!(
+                error.contains(field),
+                "the error should name the missing field, got: {error}"
+            );
+        }
+    }
+
+    /// Same failure by a different route: an entry that is present but not a number used to be
+    /// silently replaced with the identity value for its field.
+    #[test]
+    fn test_load_refuses_a_non_numeric_entry() {
+        let mut artifact = well_formed_artifact();
+        artifact["means"]["close_price"] = serde_json::json!("not a number");
+        let error = load_artifact(&artifact).expect_err("a non-numeric entry must be refused");
+        assert!(
+            error.contains("close_price"),
+            "the error should name the column, got: {error}"
+        );
+    }
+
+    /// An artifact fitted on a different column set loaded without complaint and scaled a
+    /// different set than the weights were trained on.
+    #[test]
+    fn test_load_refuses_an_artifact_fitted_on_a_different_column_set() {
+        let mut artifact = well_formed_artifact();
+        artifact["continuous_columns"] = serde_json::json!(["close_price", "an_extra_feature"]);
+        let error = load_artifact(&artifact).expect_err("a column mismatch must be refused");
+        assert!(
+            error.contains("continuous_columns"),
+            "the error should name the list that disagreed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn test_load_refuses_an_artifact_missing_a_continuous_column_statistic() {
+        let mut artifact = well_formed_artifact();
+        artifact["means"]
+            .as_object_mut()
+            .unwrap()
+            .remove("close_price");
+        let error = load_artifact(&artifact).expect_err("a missing statistic must be refused");
+        assert!(error.contains("close_price"), "got: {error}");
+    }
+
+    /// `into_no_null_iter` skips nulls, so one null yields a column shorter than the frame and
+    /// `window_frame` then indexes it out of bounds. The diagnostic has to name the column,
+    /// because the panic it replaces named nothing.
+    #[test]
+    fn test_a_null_in_a_continuous_column_is_refused_rather_than_read_as_a_value() {
+        let data = DataFrame::new(vec![
+            Column::new("close_price".into(), &[Some(1.0_f64), None, Some(3.0)]),
+            Column::new("open_price".into(), &[1.0_f64, 2.0, 3.0]),
+        ])
+        .unwrap();
+
+        // The behaviour being guarded against, pinned because it is not what the review that
+        // raised this described: `into_no_null_iter` neither skips the null nor fails on it. The
+        // count comes back correct and the null slot reads as a fabricated observation, which is
+        // exactly why checking the extracted length instead would have been an inert guard.
+        let raw: Vec<f32> = data
+            .column("close_price")
+            .unwrap()
+            .cast(&DataType::Float32)
+            .unwrap()
+            .f32()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(
+            raw.len(),
+            3,
+            "nulls are not skipped, so no length is ever wrong"
+        );
+
+        let error = get_float_columns(&data, &["close_price", "open_price"])
+            .expect_err("a null must be refused, not silently read");
+        assert!(
+            error.to_string().contains("close_price"),
+            "the error must name the column: {error}"
+        );
+    }
+
+    #[test]
+    fn test_a_null_in_a_categorical_column_is_refused() {
+        let data = DataFrame::new(vec![Column::new(
+            "sector".into(),
+            &[Some(1_i32), None, Some(3)],
+        )])
+        .unwrap();
+
+        assert!(get_int_columns(&data, &["sector"]).is_err());
+    }
+
+    #[test]
+    fn test_complete_columns_are_accepted() {
+        let data = DataFrame::new(vec![Column::new(
+            "close_price".into(),
+            &[1.0_f64, 2.0, 3.0],
+        )])
+        .unwrap();
+        let columns = get_float_columns(&data, &["close_price"]).unwrap();
+        assert_eq!(columns[0].len(), 3);
+    }
 }
 
 #[cfg(test)]

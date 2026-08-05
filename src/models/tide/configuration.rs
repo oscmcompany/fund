@@ -81,17 +81,54 @@ impl ModelParameters {
     /// here keeps the failure at the boundary where the untrusted file is read.
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let params: Self = serde_json::from_str(&content)?;
-        if params.output_length == 0 || params.input_length == 0 {
+        let parameters: Self = serde_json::from_str(&content)?;
+        if parameters.output_length == 0 || parameters.input_length == 0 {
             return Err(format!(
                 "Model parameters at {} have a zero window length (input_length {}, output_length {})",
                 path.display(),
-                params.input_length,
-                params.output_length
+                parameters.input_length,
+                parameters.output_length
             )
             .into());
         }
-        Ok(params)
+        parameters
+            .validate_quantiles()
+            .map_err(|reason| format!("Model parameters at {}: {reason}", path.display()))?;
+        Ok(parameters)
+    }
+
+    /// Rejects a quantile list the rest of the pipeline cannot consume.
+    ///
+    /// Three consumers read this list and each responds to a bad one differently: `quantile_loss`
+    /// pairs it positionally with tensor slices, `evaluate`'s index helpers unwrap a `partial_cmp`
+    /// and so **panic on a non-finite value**, and the prediction path sizes its output by the
+    /// count. Validating once here is what lets all three treat `quantiles()` as trustworthy
+    /// instead of each inventing its own guard.
+    ///
+    /// Note what is deliberately *not* required: sorted order, and a `0.5` entry. Positions are
+    /// located rather than assumed, so an artifact may list its quantiles in any order, and a list
+    /// without an exact median resolves to the nearest one.
+    fn validate_quantiles(&self) -> Result<(), String> {
+        if self.quantiles.is_empty() {
+            return Err("the quantile list is empty, so the model predicts nothing".to_string());
+        }
+        for quantile in &self.quantiles {
+            if !quantile.is_finite() {
+                return Err(format!("quantile {quantile} is not finite"));
+            }
+            if *quantile <= 0.0 || *quantile >= 1.0 {
+                return Err(format!("quantile {quantile} is outside (0, 1)"));
+            }
+        }
+        for (index, quantile) in self.quantiles.iter().enumerate() {
+            if self.quantiles[..index].contains(quantile) {
+                return Err(format!(
+                    "quantile {quantile} appears more than once, so two output columns carry the \
+                     same prediction"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn input_size(&self) -> usize {
@@ -174,6 +211,60 @@ mod tests {
         let params: ModelParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.input_size(), 100);
         assert_eq!(params.hidden_size(), 64);
+    }
+
+    fn load_with_quantiles(quantiles: &str) -> Result<ModelParameters, String> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tide_parameters.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                     "decoder_layer_count": 2, "output_length": 1, "input_length": 35,
+                     "dropout_rate": 0.1, "quantiles": {quantiles}, "huber_delta": 0.5}}"#
+            ),
+        )
+        .unwrap();
+        ModelParameters::load(&path).map_err(|error| error.to_string())
+    }
+
+    /// Three consumers read this list and each responded to a bad one differently. The non-finite
+    /// case is the sharp one: `evaluate`'s index helpers unwrap a `partial_cmp`, so a NaN quantile
+    /// panicked on the pre-open inference path rather than reporting a bad artifact.
+    #[test]
+    fn test_load_rejects_a_quantile_list_the_pipeline_cannot_consume() {
+        assert!(load_with_quantiles("[]").is_err(), "empty");
+        assert!(load_with_quantiles("[0.1, 0.5, 0.5]").is_err(), "duplicate");
+        assert!(load_with_quantiles("[0.0, 0.5, 0.9]").is_err(), "zero");
+        assert!(load_with_quantiles("[0.1, 0.5, 1.0]").is_err(), "one");
+        assert!(load_with_quantiles("[0.1, 0.5, 1.5]").is_err(), "above one");
+        assert!(load_with_quantiles("[0.1, -0.5, 0.9]").is_err(), "negative");
+    }
+
+    /// serde_json cannot represent NaN, so a corrupt artifact expresses it as a literal that
+    /// deserializes into one. Guarded because it is the value that panics rather than misbehaves.
+    #[test]
+    fn test_load_rejects_a_non_finite_quantile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tide_parameters.json");
+        // 1e400 overflows f64 and deserializes to infinity.
+        std::fs::write(
+            &path,
+            r#"{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                "decoder_layer_count": 2, "output_length": 1, "input_length": 35,
+                "dropout_rate": 0.1, "quantiles": [0.1, 0.5, 1e400], "huber_delta": 0.5}"#,
+        )
+        .unwrap();
+        assert!(ModelParameters::load(&path).is_err());
+    }
+
+    /// Order is deliberately not a requirement: `evaluate` locates the lowest, highest, and nearest
+    /// to the median rather than assuming positions, so an artifact may list them any way round.
+    /// A list without an exact 0.5 is likewise fine.
+    #[test]
+    fn test_load_accepts_an_unsorted_list_and_one_without_an_exact_median() {
+        assert!(load_with_quantiles("[0.9, 0.1, 0.5]").is_ok());
+        assert!(load_with_quantiles("[0.2, 0.8]").is_ok());
     }
 
     #[test]
