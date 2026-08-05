@@ -188,7 +188,16 @@ pub fn write_artifact_json(
     for (name, contents) in &staged {
         // Same directory as the destination, so the rename stays within one filesystem.
         let temporary = directory.join(format!("{name}.partial"));
-        std::fs::write(&temporary, contents)?;
+        if let Err(error) = std::fs::write(&temporary, contents) {
+            // Leave nothing behind on the way out. A surviving `.partial` would be packaged into
+            // the tarball and shipped, and on the next run it is the stale half of exactly the
+            // mixed-artifact state this staging exists to prevent.
+            for (orphan, _) in &renames {
+                let _ = std::fs::remove_file(orphan);
+            }
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         renames.push((temporary, directory.join(name)));
     }
 

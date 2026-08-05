@@ -62,6 +62,14 @@ pub fn validate_input_shape(
             dataset.future_categorical.shape()[1],
             output_length,
         ),
+        // Always one by construction, and read as `[sample, 0, feature]` regardless — so a dataset
+        // built some other way with a zero-length axis would panic on a index this loop otherwise
+        // never looks at.
+        (
+            "static categorical",
+            dataset.static_categorical.shape()[1],
+            1,
+        ),
     ] {
         if available < required {
             return Err(format!(
@@ -187,6 +195,17 @@ mod tests {
         let error = validate_input_shape(&short, &parameters(32))
             .expect_err("a short window must be refused");
         assert!(error.contains("past continuous"), "got: {error}");
+    }
+
+    /// `build_input_tensor` reads `[sample, 0, feature]` from the static block unconditionally, so
+    /// a zero-length time axis panics on an index the other three checks never look at.
+    #[test]
+    fn test_a_zero_length_static_axis_is_refused() {
+        let mut degenerate = dataset(7, 5, 3);
+        degenerate.static_categorical = ndarray::Array3::zeros((4, 0, 3));
+        let error = validate_input_shape(&degenerate, &parameters(32))
+            .expect_err("a static block with no time axis must be refused");
+        assert!(error.contains("static categorical"), "got: {error}");
     }
 
     #[test]

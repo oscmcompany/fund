@@ -20,9 +20,14 @@ pub fn selector_by_names(names: &[&str]) -> Vec<PlSmallStr> {
 
 /// Per-column standardization statistics, fitted during training and reloaded at inference.
 ///
-/// **Holding one is proof it can scale.** Every mean is finite and every standard deviation is
-/// finite and strictly positive, checked once in [`Scaler::new`], so no call site re-checks and none
-/// can silently substitute a default.
+/// **Holding one is proof that every column it carries can be scaled.** [`Scaler::new`] checks that
+/// each mean is finite, each standard deviation is finite and strictly positive, and that the two
+/// maps name the same columns — so no column is half-described and no call site re-checks.
+///
+/// It is deliberately *not* proof that a particular column is present, because a scaler over one
+/// column is a legitimate value: the unscale path asks only for `daily_return`. Covering every
+/// entry in `CONTINUOUS_COLUMNS` is a property of an *artifact*, not of the type, and
+/// [`Scaler::load`] is where it is enforced.
 ///
 /// That guarantee is the point of the type rather than decoration. This value crosses a machine
 /// boundary as a JSON file, and the failure it prevents is silent: a scaler that degrades to the
@@ -43,6 +48,10 @@ impl Scaler {
     ///
     /// A non-finite mean poisons every scaled value; a zero or negative standard deviation makes
     /// the transform degenerate or sign-flipping, and its inverse meaningless.
+    ///
+    /// The two maps must also name the same columns. A column with a mean but no deviation would
+    /// otherwise fall back to `1.0` and a column with a deviation but no mean to `0.0` — half of
+    /// the identity scaling this type exists to prevent, reached through the front door.
     pub fn new(
         means: HashMap<String, f64>,
         standard_deviations: HashMap<String, f64>,
@@ -53,11 +62,23 @@ impl Scaler {
                     "Mean for column `{column}` is {mean}, which is not finite"
                 ));
             }
+            if !standard_deviations.contains_key(column) {
+                return Err(format!(
+                    "Column `{column}` has a mean but no standard deviation, so scaling it would \
+                     silently divide by one"
+                ));
+            }
         }
         for (column, standard_deviation) in &standard_deviations {
             if !standard_deviation.is_finite() || *standard_deviation <= 0.0 {
                 return Err(format!(
                     "Standard deviation for column `{column}` is {standard_deviation}, which cannot scale"
+                ));
+            }
+            if !means.contains_key(column) {
+                return Err(format!(
+                    "Column `{column}` has a standard deviation but no mean, so scaling it would \
+                     silently centre on zero"
                 ));
             }
         }
@@ -119,7 +140,19 @@ impl Scaler {
             let array = raw[field]
                 .as_array()
                 .ok_or_else(|| format!("Scaler artifact at {display} has no `{field}` list"))?;
-            let found: Vec<&str> = array.iter().filter_map(|value| value.as_str()).collect();
+            // Every element must be a string. Skipping the ones that are not would let
+            // `["close_price", 42]` collapse to a list that compares equal to a shorter expected
+            // one — a malformed artifact passing the check written to catch malformed artifacts.
+            let found: Vec<&str> = array
+                .iter()
+                .map(|value| {
+                    value.as_str().ok_or_else(|| {
+                        format!(
+                            "Scaler artifact at {display} has a non-string entry {value} in `{field}`"
+                        )
+                    })
+                })
+                .collect::<Result<_, String>>()?;
             if found != expected {
                 return Err(format!(
                     "Scaler artifact at {display} was fitted on {field} {found:?}, but this build \
@@ -951,6 +984,46 @@ mod scaler_boundary_tests {
         assert!(Scaler::new(statistics(f64::NEG_INFINITY), statistics(1.0)).is_err());
     }
 
+    /// Half a description is the identity scaling this type exists to prevent, reached through the
+    /// constructor rather than the loader: a missing deviation divides by one, a missing mean
+    /// centres on zero.
+    #[test]
+    fn test_new_rejects_a_column_described_by_only_one_of_the_two_maps() {
+        assert!(
+            Scaler::new(statistics(0.0), HashMap::new()).is_err(),
+            "a mean with no standard deviation"
+        );
+        assert!(
+            Scaler::new(HashMap::new(), statistics(1.0)).is_err(),
+            "a standard deviation with no mean"
+        );
+        assert!(Scaler::new(statistics(0.0), statistics(1.0)).is_ok());
+    }
+
+    /// A `Scaler` over one column is a legitimate value — the unscale path asks only for
+    /// `daily_return` — so full coverage is an artifact property enforced in `load`, not a type
+    /// property enforced in `new`. Pinned so the two checks are not conflated later.
+    #[test]
+    fn test_new_accepts_a_scaler_over_a_single_column() {
+        assert!(Scaler::new(statistics(0.0), statistics(1.0)).is_ok());
+    }
+
+    /// `filter_map` would have dropped the non-string and compared the remainder, so an artifact
+    /// declaring one more column than this build knows about could match a shorter expected list.
+    #[test]
+    fn test_load_refuses_a_non_string_entry_in_a_column_list() {
+        let mut artifact = well_formed_artifact();
+        let mut columns: Vec<serde_json::Value> = CONTINUOUS_COLUMNS
+            .iter()
+            .map(|column| serde_json::json!(column))
+            .collect();
+        columns.push(serde_json::json!(42));
+        artifact["continuous_columns"] = serde_json::Value::Array(columns);
+
+        let error = load_artifact(&artifact).expect_err("a non-string entry must be refused");
+        assert!(error.contains("non-string"), "got: {error}");
+    }
+
     /// The headline case. A missing object used to yield an empty map, every lookup then fell back
     /// to mean 0.0 and deviation 1.0, and scaling became the identity — reported as a successful
     /// load, producing predictions on the wrong scale that nothing downstream can detect.
@@ -1004,9 +1077,12 @@ mod scaler_boundary_tests {
         assert!(error.contains("close_price"), "got: {error}");
     }
 
-    /// `into_no_null_iter` skips nulls, so one null yields a column shorter than the frame and
-    /// `window_frame` then indexes it out of bounds. The diagnostic has to name the column,
-    /// because the panic it replaces named nothing.
+    /// A null must be refused before its column is read positionally.
+    ///
+    /// `into_no_null_iter` neither skips nulls nor fails on them — it returns the raw value in the
+    /// null slot, so the count is always right and a null `close_price` becomes a fabricated
+    /// observation. The assertion below pins that, because it is the reason the guard is on the
+    /// null count rather than on the extracted length.
     #[test]
     fn test_a_null_in_a_continuous_column_is_refused_rather_than_read_as_a_value() {
         let data = DataFrame::new(vec![

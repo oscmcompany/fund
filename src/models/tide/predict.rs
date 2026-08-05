@@ -624,6 +624,21 @@ pub async fn load_predictions_between(
 mod tests {
     use super::*;
 
+    /// A scaler over `daily_return` alone, which is all `unscale_and_sort_quantiles` reads.
+    ///
+    /// Built through the validated constructor, so a future tightening of the `Scaler` contract
+    /// fails here once rather than in five separate fixtures.
+    fn daily_return_scaler(
+        mean: f64,
+        standard_deviation: f64,
+    ) -> crate::models::tide::data::Scaler {
+        crate::models::tide::data::Scaler::new(
+            std::collections::HashMap::from([("daily_return".to_string(), mean)]),
+            std::collections::HashMap::from([("daily_return".to_string(), standard_deviation)]),
+        )
+        .expect("test scaler statistics must be usable")
+    }
+
     #[test]
     fn test_filter_equity_bars_above_thresholds() {
         let data = DataFrame::new(vec![
@@ -778,12 +793,7 @@ mod tests {
 
     #[test]
     fn test_unscale_and_sort_quantiles_repairs_crossing() {
-        let mut means = std::collections::HashMap::new();
-        means.insert("daily_return".to_string(), 0.0);
-        let mut standard_deviations = std::collections::HashMap::new();
-        standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
-            .expect("test scaler statistics must be usable");
+        let scaler = daily_return_scaler(0.0, 1.0);
 
         // Crossed raw quantiles (q10 > q50) must come back monotonic.
         let sorted = unscale_and_sort_quantiles(&[0.05, 0.02, 0.03], &scaler);
@@ -1109,12 +1119,7 @@ mod tests {
 
     #[test]
     fn test_unscale_and_sort_quantiles_already_sorted() {
-        let mut means = std::collections::HashMap::new();
-        means.insert("daily_return".to_string(), 0.0);
-        let mut standard_deviations = std::collections::HashMap::new();
-        standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
-            .expect("test scaler statistics must be usable");
+        let scaler = daily_return_scaler(0.0, 1.0);
 
         // Already-sorted quantiles must come back unchanged.
         let result = unscale_and_sort_quantiles(&[0.01, 0.02, 0.03], &scaler);
@@ -1124,12 +1129,7 @@ mod tests {
     #[test]
     fn test_unscale_and_sort_quantiles_with_nonzero_mean_and_std() {
         // inverse_transform = value * std + mean
-        let mut means = std::collections::HashMap::new();
-        means.insert("daily_return".to_string(), 0.005);
-        let mut standard_deviations = std::collections::HashMap::new();
-        standard_deviations.insert("daily_return".to_string(), 0.01);
-        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
-            .expect("test scaler statistics must be usable");
+        let scaler = daily_return_scaler(0.005, 0.01);
 
         let result = unscale_and_sort_quantiles(&[-1.0, 0.0, 1.0], &scaler);
         // -1.0 * 0.01 + 0.005 = -0.005, 0.0 * 0.01 + 0.005 = 0.005, 1.0 * 0.01 + 0.005 = 0.015
@@ -1346,12 +1346,7 @@ mod tests {
 
     #[test]
     fn test_unscale_and_sort_quantiles_single_element() {
-        let mut means = std::collections::HashMap::new();
-        means.insert("daily_return".to_string(), 0.0);
-        let mut standard_deviations = std::collections::HashMap::new();
-        standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
-            .expect("test scaler statistics must be usable");
+        let scaler = daily_return_scaler(0.0, 1.0);
 
         let result = unscale_and_sort_quantiles(&[0.05], &scaler);
         assert_eq!(result.len(), 1);
@@ -1360,12 +1355,7 @@ mod tests {
 
     #[test]
     fn test_unscale_and_sort_quantiles_empty_input() {
-        let mut means = std::collections::HashMap::new();
-        means.insert("daily_return".to_string(), 0.0);
-        let mut standard_deviations = std::collections::HashMap::new();
-        standard_deviations.insert("daily_return".to_string(), 1.0);
-        let scaler = crate::models::tide::data::Scaler::new(means, standard_deviations)
-            .expect("test scaler statistics must be usable");
+        let scaler = daily_return_scaler(0.0, 1.0);
 
         let result = unscale_and_sort_quantiles(&[], &scaler);
         assert!(result.is_empty());
