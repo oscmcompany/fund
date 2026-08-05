@@ -224,7 +224,7 @@ pub(crate) fn unscale_and_sort_quantiles(
         .iter()
         .map(|value| scaler.inverse_transform_value("daily_return", *value))
         .collect();
-    unscaled.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    unscaled.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     unscaled
 }
 

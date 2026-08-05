@@ -360,10 +360,11 @@ mod tests {
         output_length: usize,
     ) -> TrainingDataset {
         let mut past_continuous = ndarray::Array3::<f32>::zeros((sample_count, input_length, 7));
-        for s in 0..sample_count {
-            for t in 0..input_length {
-                for f in 0..7 {
-                    past_continuous[[s, t, f]] = ((s + t + f) as f32) * 0.01;
+        for sample_index in 0..sample_count {
+            for time_index in 0..input_length {
+                for feature_index in 0..7 {
+                    past_continuous[[sample_index, time_index, feature_index]] =
+                        ((sample_index + time_index + feature_index) as f32) * 0.01;
                 }
             }
         }
@@ -371,9 +372,9 @@ mod tests {
         let future_categorical = ndarray::Array3::<i32>::ones((sample_count, output_length, 5));
         let static_categorical = ndarray::Array3::<i32>::ones((sample_count, 1, 3));
         let mut targets = ndarray::Array3::<f32>::zeros((sample_count, output_length, 1));
-        for s in 0..sample_count {
-            for t in 0..output_length {
-                targets[[s, t, 0]] = 0.5;
+        for sample_index in 0..sample_count {
+            for step_index in 0..output_length {
+                targets[[sample_index, step_index, 0]] = 0.5;
             }
         }
         TrainingDataset {

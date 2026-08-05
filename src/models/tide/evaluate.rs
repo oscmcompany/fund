@@ -199,7 +199,7 @@ fn argmin(values: &[f64]) -> usize {
     values
         .iter()
         .enumerate()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .min_by(|left, right| left.1.partial_cmp(right.1).unwrap())
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
@@ -208,7 +208,7 @@ fn argmax(values: &[f64]) -> usize {
     values
         .iter()
         .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .max_by(|left, right| left.1.partial_cmp(right.1).unwrap())
         .map(|(index, _)| index)
         .unwrap_or(0)
 }
@@ -217,10 +217,10 @@ fn closest_to(values: &[f64], target: f64) -> usize {
     values
         .iter()
         .enumerate()
-        .min_by(|a, b| {
-            (a.1 - target)
+        .min_by(|left, right| {
+            (left.1 - target)
                 .abs()
-                .partial_cmp(&(b.1 - target).abs())
+                .partial_cmp(&(right.1 - target).abs())
                 .unwrap()
         })
         .map(|(index, _)| index)
