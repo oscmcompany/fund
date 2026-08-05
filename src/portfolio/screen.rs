@@ -1,8 +1,10 @@
 //! Pair selection: which two symbols, which way round, and how strong the signal.
 //!
 //! The screen is quadratic in the eligible universe, so everything cheap runs first: the confidence
-//! floor, the shortable check, and the different-sector rule all shrink the input before a single
-//! correlation is computed.
+//! floor and the shortable check shrink the input before a single correlation is computed.
+//!
+//! Sector is not one of those tests. It constrains the *book* rather than the pair, so it is applied
+//! during selection — see [`MAXIMUM_LEGS_PER_SECTOR`].
 //!
 //! [`SpreadModel`] is load-bearing. An open pair's model is rebuilt from its *stored* hedge ratio
 //! rather than refitted, so entry and exit measure the same spread.
@@ -46,6 +48,22 @@ pub const STOP_LOSS_Z_SCORE: f64 = 4.0;
 
 /// Minimum model confidence for a ticker to be eligible for either leg.
 pub const CONFIDENCE_FLOOR: f64 = 0.5;
+
+/// Legs the book may hold in one sector at once.
+///
+/// This is the constraint the different-sector rule was reaching for, applied where it belongs. A
+/// reservoir of same-sector spreads ranks by the same industry factor at the top, so ten selected
+/// pairs can be one bet held ten times. That is a property of the *selection across the book*, not
+/// of any individual candidate — a single same-sector pair is a perfectly good trade, and is in
+/// fact the classic one.
+///
+/// Counted in legs rather than pairs so held and candidate positions measure the same way from a
+/// flat ticker set, and because a same-sector pair genuinely sits entirely inside one sector while
+/// a cross-sector pair only half does. Against a ten-pair book, six legs is a little under a third
+/// of the twenty on offer: enough for three same-sector pairs in one industry, not enough for the
+/// book to become an industry bet. Note it is absolute, so lowering
+/// [`crate::portfolio::size::MAXIMUM_CONCURRENT_PAIRS`] far enough would make it inert.
+pub const MAXIMUM_LEGS_PER_SECTOR: usize = 6;
 
 /// Tickers needed before a screen can produce anything.
 const MINIMUM_ELIGIBLE_TICKERS: usize = 2;
@@ -340,14 +358,20 @@ impl PairCandidate {
 ///
 /// A pair survives four tests, in increasing order of cost:
 ///
-/// 1. Both legs clear the confidence floor, the short leg is shortable, and the two come from
-///    different sectors.
+/// 1. Both legs clear the confidence floor and at least one is shortable.
 /// 2. Their log returns correlate *positively*, within `[CORRELATION_MINIMUM, CORRELATION_MAXIMUM]`.
 /// 3. The spread, oriented so the short leg is the expensive one, is at or above `ENTRY_Z_SCORE`.
 /// 4. The model agrees with that orientation — it expects the long leg to out-return the short.
 ///
 /// Test four is the model doing more than gating eligibility: without it a pair can open whose
 /// spread says buy A and sell B while the forecast says the opposite.
+///
+/// **Sector is not tested here.** A same-sector spread is the canonical statistical arbitrage
+/// trade — two companies facing the same demand, the same input costs, and the same regulator,
+/// whose relative price has something to mean-revert toward — and refusing those removes exactly
+/// the pairs most likely to cointegrate, which is the property the whole strategy rests on. The
+/// real concern was never the pair but the book, so it is answered in [`select_disjoint`] by
+/// [`MAXIMUM_LEGS_PER_SECTOR`].
 ///
 /// No disjointness constraint is applied — the returned list is the full reservoir and pairs may
 /// share tickers. [`select_disjoint`] is the cheap second half.
@@ -372,12 +396,6 @@ pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
             let first = eligible[first_index];
             let second = eligible[second_index];
 
-            // Different sectors. This is a constraint on the book rather than on the pair: a
-            // reservoir of same-sector spreads ranks by the same industry factor at the top, and
-            // ten such pairs is one bet held ten times.
-            if first.sector == second.sector {
-                continue;
-            }
             // At least one leg has to be shortable or there is no orientation to take.
             if !first.is_shortable && !second.is_shortable {
                 continue;
@@ -455,15 +473,24 @@ fn orient(first: &ScreenInput, second: &ScreenInput) -> Option<PairCandidate> {
     None
 }
 
-/// Greedily takes up to `limit` candidates that share no ticker with each other or with `held`.
+/// Greedily takes up to `limit` candidates that share no ticker with each other or with `held`,
+/// and that keep every sector within [`MAXIMUM_LEGS_PER_SECTOR`].
 ///
 /// Disjointness is why rejecting a candidate changes what is available below it: excluding one pair
 /// frees both of its tickers, so a pair further down that was skipped for a collision becomes
-/// selectable. Re-selecting is therefore not the same as taking the next item off the list.
+/// selectable. Re-selecting is therefore not the same as taking the next item off the list. The
+/// sector cap behaves the same way and for the same reason.
+///
+/// **The cap is seeded from the book, not from this pass.** `held` carries the legs already open,
+/// so a sector at its limit stays at its limit rather than admitting a fresh allocation every time
+/// the evaluator runs. A held ticker whose sector is unknown — a name whose `equity_details` row
+/// went away, say — contributes to no sector rather than to a fabricated one; it still blocks
+/// re-entry through `used`.
 pub fn select_disjoint(
     candidates: &[PairCandidate],
     limit: usize,
     held: &HashSet<Ticker>,
+    sectors: &HashMap<Ticker, String>,
 ) -> Vec<PairCandidate> {
     if limit == 0 {
         return Vec::new();
@@ -472,12 +499,37 @@ pub fn select_disjoint(
     let mut used: HashSet<Ticker> = held.clone();
     let mut selected: Vec<PairCandidate> = Vec::with_capacity(limit);
 
+    let mut legs_per_sector: HashMap<&str, usize> = HashMap::new();
+    for ticker in held {
+        if let Some(sector) = sectors.get(ticker) {
+            *legs_per_sector.entry(sector.as_str()).or_default() += 1;
+        }
+    }
+
     for candidate in candidates {
         if selected.len() == limit {
             break;
         }
         if used.contains(candidate.long_ticker()) || used.contains(candidate.short_ticker()) {
             continue;
+        }
+
+        // Both legs at once: a same-sector pair asks for two of that sector's allowance, and
+        // admitting it one leg at a time could take a sector past the cap.
+        let mut requested: HashMap<&str, usize> = HashMap::new();
+        for ticker in [candidate.long_ticker(), candidate.short_ticker()] {
+            if let Some(sector) = sectors.get(ticker) {
+                *requested.entry(sector.as_str()).or_default() += 1;
+            }
+        }
+        let over_cap = requested.iter().any(|(sector, legs)| {
+            legs_per_sector.get(sector).copied().unwrap_or(0) + legs > MAXIMUM_LEGS_PER_SECTOR
+        });
+        if over_cap {
+            continue;
+        }
+        for (sector, legs) in requested {
+            *legs_per_sector.entry(sector).or_default() += legs;
         }
         used.insert(candidate.long_ticker().clone());
         used.insert(candidate.short_ticker().clone());
@@ -913,8 +965,14 @@ mod tests {
         assert!(score_candidates(&inputs).is_empty());
     }
 
+    /// The screen must produce same-sector pairs, not refuse them.
+    ///
+    /// This asserts the reverse of what it used to. A same-sector spread is the canonical
+    /// statistical arbitrage trade, and within-sector correlation is where the `[0.5, 0.95]` band is
+    /// most densely populated — so the old rule removed disproportionately many of the best
+    /// candidates. Concentration is now bounded in `select_disjoint` instead.
     #[test]
-    fn test_same_sector_pairs_are_rejected() {
+    fn test_same_sector_pairs_are_screened_rather_than_refused() {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
         let stretched = follower.last().unwrap() * 1.5;
         let inputs = vec![
@@ -927,7 +985,16 @@ mod tests {
             ),
             input("BBBB", follower, stretched, "Technology", -0.02),
         ];
-        assert!(score_candidates(&inputs).is_empty());
+
+        let candidates = score_candidates(&inputs);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "two cointegrated names in one sector are a candidate"
+        );
+        assert_eq!(candidates[0].long_ticker().as_str(), "AAAA");
+        assert_eq!(candidates[0].short_ticker().as_str(), "BBBB");
     }
 
     /// Without a shortable short leg there is no position to take, whatever the spread says.
@@ -1005,6 +1072,136 @@ mod tests {
 
     // --- selection ---
 
+    /// Assigns every named ticker to one sector, for the selection tests.
+    fn sector_map(assignments: &[(&str, &str)]) -> HashMap<Ticker, String> {
+        assignments
+            .iter()
+            .map(|(symbol, sector)| (ticker(symbol), (*sector).to_string()))
+            .collect()
+    }
+
+    /// The nth distinct pair of symbols: `("LAAA", "SAAA")`, `("LBBB", "SBBB")`, and so on.
+    /// `Ticker` admits letters only, so the index is spelled rather than numbered.
+    fn nth_pair(index: usize) -> (String, String) {
+        let letter = (b'A' + index as u8) as char;
+        (
+            format!("L{letter}{letter}{letter}"),
+            format!("S{letter}{letter}{letter}"),
+        )
+    }
+
+    /// `count` distinct pairs, both legs of each in `sector`, ranked best first.
+    fn same_sector_candidates(
+        count: usize,
+        sector: &str,
+    ) -> (Vec<PairCandidate>, HashMap<Ticker, String>) {
+        let symbols: Vec<(String, String)> = (0..count).map(nth_pair).collect();
+        let candidates = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, (long, short))| candidate(long, short, (count - index) as f64))
+            .collect();
+        let assignments: Vec<(&str, &str)> = symbols
+            .iter()
+            .flat_map(|(long, short)| [(long.as_str(), sector), (short.as_str(), sector)])
+            .collect();
+        (candidates, sector_map(&assignments))
+    }
+
+    /// The cap is what stops a reservoir of same-sector spreads becoming one bet held ten times.
+    /// Both legs sit in the sector, so each pair spends two of the six legs on offer.
+    #[test]
+    fn test_selection_stops_at_the_sector_cap() {
+        let (candidates, sectors) = same_sector_candidates(6, "Technology");
+
+        let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
+
+        assert_eq!(
+            selected.len(),
+            MAXIMUM_LEGS_PER_SECTOR / 2,
+            "six legs allows three same-sector pairs, not six"
+        );
+        assert_eq!(
+            selected[0].long_ticker().as_str(),
+            "LAAA",
+            "the best candidates are the ones kept"
+        );
+    }
+
+    /// A cross-sector pair spends one leg in each sector, so the same allowance goes twice as far.
+    #[test]
+    fn test_a_cross_sector_pair_costs_one_leg_in_each_sector() {
+        let symbols: Vec<(String, String)> = (0..6).map(nth_pair).collect();
+        let candidates: Vec<PairCandidate> = symbols
+            .iter()
+            .enumerate()
+            .map(|(index, (long, short))| candidate(long, short, (6 - index) as f64))
+            .collect();
+        let assignments: Vec<(&str, &str)> = symbols
+            .iter()
+            .flat_map(|(long, short)| {
+                [
+                    (long.as_str(), "Technology"),
+                    (short.as_str(), "Healthcare"),
+                ]
+            })
+            .collect();
+        let sectors = sector_map(&assignments);
+
+        let selected = select_disjoint(&candidates, 10, &HashSet::new(), &sectors);
+
+        assert_eq!(
+            selected.len(),
+            MAXIMUM_LEGS_PER_SECTOR,
+            "one leg per sector per pair, so six pairs fit inside a six-leg cap"
+        );
+    }
+
+    /// Seeded from the book, not from the pass. Otherwise a sector at its limit would be handed a
+    /// fresh allowance every five minutes.
+    #[test]
+    fn test_the_cap_counts_legs_already_held() {
+        let (candidates, mut sectors) = same_sector_candidates(3, "Technology");
+        let held: HashSet<Ticker> = ["HELDA", "HELDB", "HELDC", "HELDD"]
+            .iter()
+            .map(|symbol| ticker(symbol))
+            .collect();
+        for symbol in ["HELDA", "HELDB", "HELDC", "HELDD"] {
+            sectors.insert(ticker(symbol), "Technology".to_string());
+        }
+
+        let selected = select_disjoint(&candidates, 10, &held, &sectors);
+
+        assert_eq!(
+            selected.len(),
+            1,
+            "four legs held leaves room for one more pair, not three"
+        );
+    }
+
+    /// A held ticker with no sector row contributes to no sector rather than to a fabricated one,
+    /// and still blocks re-entry through the disjointness check.
+    #[test]
+    fn test_a_held_ticker_without_a_sector_does_not_consume_an_allowance() {
+        let (candidates, sectors) = same_sector_candidates(3, "Technology");
+        let held: HashSet<Ticker> = ["ZZZZ"].iter().map(|symbol| ticker(symbol)).collect();
+
+        let selected = select_disjoint(&candidates, 10, &held, &sectors);
+
+        assert_eq!(selected.len(), MAXIMUM_LEGS_PER_SECTOR / 2);
+    }
+
+    /// An empty sector map caps nothing, which is what a database with no `equity_details` rows
+    /// looks like. Recorded so the seeding requirement is visible rather than assumed.
+    #[test]
+    fn test_an_empty_sector_map_constrains_nothing() {
+        let (candidates, _) = same_sector_candidates(5, "Technology");
+
+        let selected = select_disjoint(&candidates, 10, &HashSet::new(), &HashMap::new());
+
+        assert_eq!(selected.len(), 5);
+    }
+
     fn candidate(long: &str, short: &str, rank: f64) -> PairCandidate {
         PairCandidate::new(
             PairID::new(ticker(long), ticker(short)),
@@ -1041,7 +1238,7 @@ mod tests {
             candidate("AAAA", "CCCC", 3.0),
             candidate("DDDD", "EEEE", 2.0),
         ];
-        let selected = select_disjoint(&candidates, 3, &HashSet::new());
+        let selected = select_disjoint(&candidates, 3, &HashSet::new(), &HashMap::new());
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].short_ticker().as_str(), "BBBB");
         assert_eq!(selected[1].long_ticker().as_str(), "DDDD");
@@ -1056,7 +1253,7 @@ mod tests {
             candidate("CCCC", "DDDD", 3.0),
         ];
         let held: HashSet<Ticker> = [ticker("BBBB")].into_iter().collect();
-        let selected = select_disjoint(&candidates, 3, &held);
+        let selected = select_disjoint(&candidates, 3, &held, &HashMap::new());
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].long_ticker().as_str(), "CCCC");
     }
@@ -1067,8 +1264,11 @@ mod tests {
             candidate("AAAA", "BBBB", 4.0),
             candidate("CCCC", "DDDD", 3.0),
         ];
-        assert_eq!(select_disjoint(&candidates, 1, &HashSet::new()).len(), 1);
-        assert!(select_disjoint(&candidates, 0, &HashSet::new()).is_empty());
+        assert_eq!(
+            select_disjoint(&candidates, 1, &HashSet::new(), &HashMap::new()).len(),
+            1
+        );
+        assert!(select_disjoint(&candidates, 0, &HashSet::new(), &HashMap::new()).is_empty());
     }
 
     #[test]

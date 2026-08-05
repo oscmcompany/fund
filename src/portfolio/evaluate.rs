@@ -196,7 +196,8 @@ pub async fn run_pass(
     let candidates = screen::score_candidates(&screened.inputs);
     summary.candidates_screened = candidates.len();
 
-    let selected = screen::select_disjoint(&candidates, gate.vacant_slots(), &held);
+    let selected =
+        screen::select_disjoint(&candidates, gate.vacant_slots(), &held, &screened.sectors);
     let sized = size::size_pairs(&selected, account.equity(), &context.sizing);
     let (approved, refusals) = gate.admit_all(&sized);
     summary.entries_refused = refusals
@@ -475,6 +476,9 @@ async fn previous_session_equity(
 struct ScreenedUniverse {
     inputs: Vec<ScreenInput>,
     model_run_id: Option<String>,
+    /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs
+    /// too, and those are filtered out of `inputs` before it ever sees them.
+    sectors: HashMap<Ticker, String>,
 }
 
 /// Assembles the screen's inputs, fetching only the prices the exit half did not already have.
@@ -490,6 +494,7 @@ async fn build_screen_inputs(
         return Ok(ScreenedUniverse {
             inputs: Vec::new(),
             model_run_id: None,
+            sectors: HashMap::new(),
         });
     }
 
@@ -549,6 +554,7 @@ async fn build_screen_inputs(
     Ok(ScreenedUniverse {
         inputs,
         model_run_id,
+        sectors,
     })
 }
 
