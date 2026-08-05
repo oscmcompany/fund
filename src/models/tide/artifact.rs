@@ -8,6 +8,7 @@
 //! format is the only contract between them.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
@@ -26,7 +27,15 @@ use crate::models::tide::model::TiDEModel;
 // --------------------------------------------------------------------------
 
 pub struct ModelState {
-    model: TiDEModel<NdArray>,
+    /// The loaded weights, behind a mutex because the forward pass mutates them.
+    ///
+    /// Burn stores each parameter as a `core::cell::OnceCell`, and `Param::val` initializes it
+    /// through `get_or_init` — so a forward pass writes through a shared reference and
+    /// `TiDEModel<NdArray>` is therefore `!Sync`. The mutex is not here to arbitrate contention;
+    /// there is exactly one caller. It is here so this type is `Sync` by construction, which the
+    /// prediction handler needs: it holds a `&ModelState` across an await and `JoinSet::spawn`
+    /// requires the resulting future to be `Send`.
+    model: Mutex<TiDEModel<NdArray>>,
     parameters: ModelParameters,
     scaler: Scaler,
     mappings: FeatureMappings,
@@ -56,7 +65,7 @@ impl ModelState {
         load_timestamp: i64,
     ) -> Self {
         Self {
-            model,
+            model: Mutex::new(model),
             parameters,
             scaler,
             mappings,
@@ -66,8 +75,15 @@ impl ModelState {
         }
     }
 
-    pub fn model(&self) -> &TiDEModel<NdArray> {
-        &self.model
+    /// Borrows the model for a forward pass.
+    ///
+    /// A poisoned lock is recovered from rather than propagated. Poisoning here means a previous
+    /// forward pass panicked, but the weights carry no invariant that a panic could leave half
+    /// written: the only mutation is `OnceCell::get_or_init` caching a materialized tensor, and a
+    /// panic during initialization leaves the cell empty rather than partly filled. Failing every
+    /// later session because one earlier one panicked would be the worse outcome.
+    pub fn model(&self) -> MutexGuard<'_, TiDEModel<NdArray>> {
+        self.model.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn parameters(&self) -> &ModelParameters {
@@ -95,10 +111,16 @@ impl ModelState {
     }
 }
 
-// SAFETY: TiDEModel<NdArray> is not Sync due to burn's Param<T> using an RwLock
-// with a non-Sync FnOnce inside. We guard all access behind a Mutex, so this is safe.
-unsafe impl Send for ModelState {}
-unsafe impl Sync for ModelState {}
+/// `ModelState` must stay `Send + Sync` — the prediction handler holds a `&ModelState` across an
+/// await inside a future that `JoinSet::spawn` requires to be `Send`. That used to be asserted with
+/// `unsafe impl`; it is now a property the compiler derives from the `Mutex` around the model, and
+/// this is what makes the difference visible. Removing the mutex fails here rather than in
+/// `bin/fund.rs`, several call layers from the cause.
+#[allow(dead_code)]
+fn model_state_is_send_and_sync() {
+    fn require<T: Send + Sync>() {}
+    require::<ModelState>();
+}
 
 // --------------------------------------------------------------------------
 // Reading: resolve, download, load

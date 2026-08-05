@@ -347,9 +347,16 @@ async fn run_inference(
     let array = predictions.as_array().cloned().unwrap_or_default();
     predict::validate_predictions(&array).map_err(at("validate"))?;
 
+    // Split back apart rather than propagated as one error: a malformed payload is a bug in the
+    // model output this function just produced, and belongs with the other pipeline stages; a
+    // database failure is the database, and keeps reading as one.
     let rows =
         predict::insert_predictions(&state.pool, &array, correlation_id, model_state.run_id())
-            .await?;
+            .await
+            .map_err(|error| match error {
+                predict::InsertPredictionsError::Payload(message) => at("insert")(message),
+                predict::InsertPredictionsError::Database(error) => HandlerError::Database(error),
+            })?;
 
     Ok((array.len(), rows))
 }
