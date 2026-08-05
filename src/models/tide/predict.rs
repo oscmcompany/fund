@@ -117,7 +117,7 @@ pub fn consolidate_data(
 /// Drops tickers whose trailing averages fall below the liquidity thresholds.
 ///
 /// **Both bounds are inclusive**, matching [`crate::models::tide::fit::filter_training_bars`] and
-/// [`crate::data::universe::Universe::is_liquid`]. The three read the same two constants, so a
+/// [`crate::data::universe::LiquidityRow`]'s liquidity test. The three read the same two constants, so a
 /// difference in the comparison alone is enough to reopen the train/serve gap those constants were
 /// introduced to close: an exclusive test here would admit a ticker to the universe, train on it,
 /// and then refuse to predict for it at exactly the threshold.
@@ -684,7 +684,7 @@ mod tests {
     }
 
     /// The threshold itself must pass, because the other two sites that read these constants let it
-    /// pass. `filter_training_bars` and `Universe::is_liquid` both compare inclusively and both have
+    /// pass. `filter_training_bars` and `LiquidityRow::is_liquid` both compare inclusively and both have
     /// a boundary test; this one had neither, and was the site that diverged. A ticker averaging
     /// exactly $10.00 was admitted to the universe, trained on, and dropped at inference.
     #[test]

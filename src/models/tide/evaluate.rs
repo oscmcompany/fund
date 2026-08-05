@@ -299,10 +299,28 @@ mod tests {
     /// This deliberately reimplements nothing: it lays out the fixture and hands each row to the
     /// production accumulator. Every assertion below therefore fails if the pinball split, the
     /// median selection, or the coverage bounds change in the shipped code.
+    ///
+    /// The two length assertions are the point of the helper as much as the accumulator call is.
+    /// Every metric here is a mean, so a fixture with more prediction rows than targets would zip
+    /// short, divide by a smaller row count, and produce a plausible number for a table nobody
+    /// wrote — the failure this whole change exists to remove, reintroduced in the fixture instead
+    /// of the code.
     fn metrics_from(predictions: &[[f64; 3]], targets: &[f64], quantiles: &[f64]) -> EvalMetrics {
+        assert_eq!(
+            predictions.len(),
+            targets.len(),
+            "fixture must give every prediction row a target"
+        );
+        assert_eq!(
+            quantiles.len(),
+            3,
+            "rows are [f64; 3], so a shorter list would leave predictions unscored and a longer one \
+             would index past the row"
+        );
+
         let indices = QuantileIndices::locate(quantiles);
         let mut accumulator = MetricAccumulator::default();
-        for (row, &target) in predictions.iter().zip(targets) {
+        for (row, &target) in predictions.iter().zip(targets.iter()) {
             accumulator.add_row(row, target, quantiles, indices);
         }
         accumulator.finish()
