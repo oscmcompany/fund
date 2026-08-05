@@ -62,9 +62,9 @@ fn fit_scaler(data: &DataFrame) -> Result<Scaler, Box<dyn std::error::Error>> {
         standard_deviations.insert((*column).to_string(), std);
     }
 
-    Ok(Scaler {
-        means,
-        standard_deviations,
+    Scaler::new(means, standard_deviations).map_err(|reason| {
+        format!("Fitted scaler is unusable, so training would produce a bad artifact: {reason}")
+            .into()
     })
 }
 
@@ -143,6 +143,16 @@ pub fn filter_training_bars(
 
 /// Write the three artifact JSON files (scaler, mappings, parameters) the
 /// inference loader reads, into `directory`.
+///
+/// Each file is serialized to a temporary name and renamed into place, and every rename happens
+/// after every serialization. A reader therefore never sees a half-written file, and the window in
+/// which the three could disagree shrinks from "between two writes" — which spans serializing a
+/// scaler over every continuous column — to three consecutive renames.
+///
+/// This is a narrowed window rather than an atomic set, and the distinction is worth stating: POSIX
+/// gives atomicity per rename, not across three. Closing it completely would mean staging a
+/// directory and renaming that. The mixed-artifact failure this guards against is a crash *during*
+/// the writes, which is where essentially all of the wall clock is.
 pub fn write_artifact_json(
     directory: &Path,
     scaler: &Scaler,
@@ -152,26 +162,48 @@ pub fn write_artifact_json(
     std::fs::create_dir_all(directory)?;
 
     let scaler_json = serde_json::json!({
-        "means": scaler.means,
-        "standard_deviations": scaler.standard_deviations,
+        "means": scaler.means(),
+        "standard_deviations": scaler.standard_deviations(),
         "continuous_columns": CONTINUOUS_COLUMNS,
         "categorical_columns": CATEGORICAL_COLUMNS,
         "static_categorical_columns": STATIC_CATEGORICAL_COLUMNS,
     });
-    std::fs::write(
-        directory.join("tide_data_scaler.json"),
-        serde_json::to_string_pretty(&scaler_json)?,
-    )?;
 
-    std::fs::write(
-        directory.join("tide_data_mappings.json"),
-        serde_json::to_string_pretty(mappings)?,
-    )?;
+    let staged = [
+        (
+            "tide_data_scaler.json",
+            serde_json::to_string_pretty(&scaler_json)?,
+        ),
+        (
+            "tide_data_mappings.json",
+            serde_json::to_string_pretty(mappings)?,
+        ),
+        (
+            "tide_parameters.json",
+            serde_json::to_string_pretty(parameters)?,
+        ),
+    ];
 
-    std::fs::write(
-        directory.join("tide_parameters.json"),
-        serde_json::to_string_pretty(parameters)?,
-    )?;
+    let mut renames = Vec::with_capacity(staged.len());
+    for (name, contents) in &staged {
+        // Same directory as the destination, so the rename stays within one filesystem.
+        let temporary = directory.join(format!("{name}.partial"));
+        if let Err(error) = std::fs::write(&temporary, contents) {
+            // Leave nothing behind on the way out. A surviving `.partial` would be packaged into
+            // the tarball and shipped, and on the next run it is the stale half of exactly the
+            // mixed-artifact state this staging exists to prevent.
+            for (orphan, _) in &renames {
+                let _ = std::fs::remove_file(orphan);
+            }
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+        renames.push((temporary, directory.join(name)));
+    }
+
+    for (temporary, destination) in renames {
+        std::fs::rename(&temporary, &destination)?;
+    }
 
     Ok(())
 }
@@ -218,9 +250,9 @@ mod tests {
     fn test_fit_scaler_has_all_continuous_columns() {
         let result = fit(raw_frame()).unwrap();
         for column in CONTINUOUS_COLUMNS {
-            assert!(result.scaler.means.contains_key(*column));
-            assert!(result.scaler.standard_deviations.contains_key(*column));
-            assert!(*result.scaler.standard_deviations.get(*column).unwrap() != 0.0);
+            assert!(result.scaler.means().contains_key(*column));
+            assert!(result.scaler.standard_deviations().contains_key(*column));
+            assert!(*result.scaler.standard_deviations().get(*column).unwrap() != 0.0);
         }
     }
 
@@ -282,6 +314,39 @@ mod tests {
         assert_eq!(tickers, vec!["AAPL"]);
     }
 
+    /// The staging files must not survive a successful write. A leftover `.partial` would be
+    /// packaged into the tarball and shipped, and on the next run it would be the stale half of
+    /// exactly the mixed-artifact state the staging exists to prevent.
+    #[test]
+    fn test_write_artifact_json_leaves_no_staging_files_behind() {
+        let result = fit(raw_frame()).unwrap();
+        let parameters = ModelParameters::new(448, 35, 5);
+        let directory = tempfile::tempdir().unwrap();
+
+        write_artifact_json(
+            directory.path(),
+            &result.scaler,
+            &result.mappings,
+            &parameters,
+        )
+        .unwrap();
+
+        let written: Vec<String> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            !written.iter().any(|name| name.ends_with(".partial")),
+            "staging files survived the write: {written:?}"
+        );
+        assert_eq!(
+            written.len(),
+            3,
+            "expected exactly the three artifact files: {written:?}"
+        );
+    }
+
     #[test]
     fn test_write_artifact_json_round_trips_via_loader() {
         let result = fit(raw_frame()).unwrap();
@@ -289,12 +354,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_artifact_json(dir.path(), &result.scaler, &result.mappings, &parameters).unwrap();
 
-        // The inference-side loaders must read what we wrote.
-        let (scaler, continuous_columns, _, static_columns) =
-            Scaler::load(&dir.path().join("tide_data_scaler.json")).unwrap();
-        assert_eq!(continuous_columns.len(), CONTINUOUS_COLUMNS.len());
-        assert_eq!(static_columns.len(), STATIC_CATEGORICAL_COLUMNS.len());
-        assert!(scaler.means.contains_key("daily_return"));
+        // The inference-side loaders must read what we wrote. `Scaler::load` now checks the column
+        // lists against this build's constants itself, so reaching this line at all is the
+        // assertion that the three lists round-tripped intact.
+        let scaler = Scaler::load(&dir.path().join("tide_data_scaler.json")).unwrap();
+        assert!(scaler.means().contains_key("daily_return"));
 
         let loaded_parameters =
             ModelParameters::load(&dir.path().join("tide_parameters.json")).unwrap();

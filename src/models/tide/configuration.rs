@@ -3,6 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The quantile levels `equity_predictions` has columns for, ascending.
+///
+/// This is a storage contract rather than a modelling preference: the table names its three columns
+/// `quantile_10`, `quantile_50`, and `quantile_90`, and those names are shipped. A model trained on
+/// other levels needs a schema migration, not a different constant here.
+pub const SERVED_QUANTILES: [f64; 3] = [0.1, 0.5, 0.9];
+
 /// TiDE model hyperparameters, persisted as `tide_parameters.json` in the training artifact and
 /// reloaded at inference time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,17 +88,72 @@ impl ModelParameters {
     /// here keeps the failure at the boundary where the untrusted file is read.
     pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let params: Self = serde_json::from_str(&content)?;
-        if params.output_length == 0 || params.input_length == 0 {
+        let parameters: Self = serde_json::from_str(&content)?;
+        if parameters.output_length == 0 || parameters.input_length == 0 {
             return Err(format!(
                 "Model parameters at {} have a zero window length (input_length {}, output_length {})",
                 path.display(),
-                params.input_length,
-                params.output_length
+                parameters.input_length,
+                parameters.output_length
             )
             .into());
         }
-        Ok(params)
+        parameters
+            .validate_quantiles()
+            .map_err(|reason| format!("Model parameters at {}: {reason}", path.display()))?;
+        Ok(parameters)
+    }
+
+    /// Rejects a quantile list the rest of the pipeline cannot consume.
+    ///
+    /// Three consumers read this list and each responds to a bad one differently: `quantile_loss`
+    /// pairs it positionally with tensor slices, `evaluate`'s index helpers unwrap a `partial_cmp`
+    /// and so **panic on a non-finite value**, and the prediction path sizes its output by the
+    /// count. Validating once here is what lets all three treat `quantiles()` as trustworthy
+    /// instead of each inventing its own guard.
+    ///
+    /// **The served set is fixed, because the storage columns are.** `equity_predictions` has
+    /// `quantile_10`, `quantile_50`, and `quantile_90`, and `generate_predictions` sorts the model's
+    /// output and assigns it to those three positionally. An artifact trained on `[0.1, 0.3, 0.9]`
+    /// is internally coherent and would load, predict, and store its 30th percentile under
+    /// `quantile_50` — which `EquityPrediction::expected_return` then returns as the model's median
+    /// view, with nothing anywhere to notice. Being usable is not the same as being the thing the
+    /// schema says it is.
+    ///
+    /// Order is still not required: positions are located rather than assumed, so an artifact may
+    /// list the three any way round.
+    fn validate_quantiles(&self) -> Result<(), String> {
+        if self.quantiles.is_empty() {
+            return Err("the quantile list is empty, so the model predicts nothing".to_string());
+        }
+        for quantile in &self.quantiles {
+            if !quantile.is_finite() {
+                return Err(format!("quantile {quantile} is not finite"));
+            }
+            if *quantile <= 0.0 || *quantile >= 1.0 {
+                return Err(format!("quantile {quantile} is outside (0, 1)"));
+            }
+        }
+
+        let mut sorted = self.quantiles.clone();
+        sorted.sort_by(|left, right| left.partial_cmp(right).expect("finiteness checked above"));
+        sorted.dedup();
+        if sorted.len() != self.quantiles.len() {
+            return Err(format!(
+                "the quantile list {:?} repeats a level, so two output columns carry the same \
+                 prediction",
+                self.quantiles
+            ));
+        }
+        if sorted != SERVED_QUANTILES {
+            return Err(format!(
+                "the quantile list {:?} is not the served set {SERVED_QUANTILES:?}; \
+                 `equity_predictions` stores exactly those three levels by name, so any other set \
+                 would be filed under the wrong column",
+                self.quantiles
+            ));
+        }
+        Ok(())
     }
 
     pub fn input_size(&self) -> usize {
@@ -174,6 +236,83 @@ mod tests {
         let params: ModelParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.input_size(), 100);
         assert_eq!(params.hidden_size(), 64);
+    }
+
+    fn load_with_quantiles(quantiles: &str) -> Result<ModelParameters, String> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tide_parameters.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                     "decoder_layer_count": 2, "output_length": 1, "input_length": 35,
+                     "dropout_rate": 0.1, "quantiles": {quantiles}, "huber_delta": 0.5}}"#
+            ),
+        )
+        .unwrap();
+        ModelParameters::load(&path).map_err(|error| error.to_string())
+    }
+
+    /// Three consumers read this list and each responded to a bad one differently. The non-finite
+    /// case is the sharp one: `evaluate`'s index helpers unwrap a `partial_cmp`, so a NaN quantile
+    /// panicked on the pre-open inference path rather than reporting a bad artifact.
+    #[test]
+    fn test_load_rejects_a_quantile_list_the_pipeline_cannot_consume() {
+        assert!(load_with_quantiles("[]").is_err(), "empty");
+        assert!(load_with_quantiles("[0.1, 0.5, 0.5]").is_err(), "duplicate");
+        assert!(load_with_quantiles("[0.0, 0.5, 0.9]").is_err(), "zero");
+        assert!(load_with_quantiles("[0.1, 0.5, 1.0]").is_err(), "one");
+        assert!(load_with_quantiles("[0.1, 0.5, 1.5]").is_err(), "above one");
+        assert!(load_with_quantiles("[0.1, -0.5, 0.9]").is_err(), "negative");
+    }
+
+    /// serde_json cannot represent NaN, so a corrupt artifact expresses it as a literal that
+    /// deserializes into one. Guarded because it is the value that panics rather than misbehaves.
+    #[test]
+    fn test_load_rejects_a_non_finite_quantile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tide_parameters.json");
+        // 1e400 overflows f64 and deserializes to infinity.
+        std::fs::write(
+            &path,
+            r#"{"input_size": 100, "hidden_size": 64, "encoder_layer_count": 3,
+                "decoder_layer_count": 2, "output_length": 1, "input_length": 35,
+                "dropout_rate": 0.1, "quantiles": [0.1, 0.5, 1e400], "huber_delta": 0.5}"#,
+        )
+        .unwrap();
+        assert!(ModelParameters::load(&path).is_err());
+    }
+
+    /// Order is deliberately not a requirement: `evaluate` locates the lowest, highest, and nearest
+    /// to the median rather than assuming positions, so an artifact may list them any way round.
+    #[test]
+    fn test_load_accepts_the_served_set_in_any_order() {
+        assert!(load_with_quantiles("[0.1, 0.5, 0.9]").is_ok());
+        assert!(load_with_quantiles("[0.9, 0.1, 0.5]").is_ok());
+    }
+
+    /// The levels are a storage contract, not a preference. `equity_predictions` names its three
+    /// columns after them and `generate_predictions` fills those positionally after sorting, so an
+    /// artifact trained on `[0.1, 0.3, 0.9]` would file its 30th percentile under `quantile_50` and
+    /// `expected_return` would return it as the model's median view.
+    ///
+    /// Every case below is internally coherent — finite, distinct, inside `(0, 1)` — and would have
+    /// passed had the check stopped at "usable".
+    #[test]
+    fn test_load_rejects_a_coherent_but_non_canonical_quantile_set() {
+        assert!(
+            load_with_quantiles("[0.1, 0.3, 0.9]").is_err(),
+            "shifted median"
+        );
+        assert!(
+            load_with_quantiles("[0.05, 0.5, 0.95]").is_err(),
+            "wider band"
+        );
+        assert!(load_with_quantiles("[0.2, 0.8]").is_err(), "two levels");
+        assert!(
+            load_with_quantiles("[0.1, 0.25, 0.5, 0.9]").is_err(),
+            "four levels"
+        );
     }
 
     #[test]

@@ -30,9 +30,6 @@ pub struct ModelState {
     parameters: ModelParameters,
     scaler: Scaler,
     mappings: FeatureMappings,
-    continuous_columns: Vec<String>,
-    categorical_columns: Vec<String>,
-    static_categorical_columns: Vec<String>,
     artifact_key: String,
     /// Training run id: the timestamp segment of the artifact key. Written to
     /// `equity_predictions.model_run_id`, which is how a prediction is traced back to the artifact
@@ -43,15 +40,17 @@ pub struct ModelState {
 
 impl ModelState {
     /// Constructs a `ModelState` from a fully loaded artifact.
+    ///
+    /// The column lists the artifact was fitted with are no longer carried here. They are checked
+    /// against this build's constants inside [`crate::models::tide::data::Scaler::load`] and then
+    /// dropped: verifying them is what they were for, nothing read them afterwards, and keeping a
+    /// copy that is provably equal to the constants invited a future caller to trust the copy.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: TiDEModel<NdArray>,
         parameters: ModelParameters,
         scaler: Scaler,
         mappings: FeatureMappings,
-        continuous_columns: Vec<String>,
-        categorical_columns: Vec<String>,
-        static_categorical_columns: Vec<String>,
         artifact_key: String,
         run_id: String,
         load_timestamp: i64,
@@ -61,9 +60,6 @@ impl ModelState {
             parameters,
             scaler,
             mappings,
-            continuous_columns,
-            categorical_columns,
-            static_categorical_columns,
             artifact_key,
             run_id,
             load_timestamp,
@@ -84,18 +80,6 @@ impl ModelState {
 
     pub fn mappings(&self) -> &FeatureMappings {
         &self.mappings
-    }
-
-    pub fn continuous_columns(&self) -> &[String] {
-        &self.continuous_columns
-    }
-
-    pub fn categorical_columns(&self) -> &[String] {
-        &self.categorical_columns
-    }
-
-    pub fn static_categorical_columns(&self) -> &[String] {
-        &self.static_categorical_columns
     }
 
     pub fn artifact_key(&self) -> &str {
@@ -377,9 +361,8 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
     let scaler_path = dir.join("tide_data_scaler.json");
-    let (scaler, continuous_columns, categorical_columns, static_categorical_columns) =
-        crate::models::tide::data::Scaler::load(&scaler_path)
-            .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+    let scaler = crate::models::tide::data::Scaler::load(&scaler_path)
+        .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
 
     let mappings_path = dir.join("tide_data_mappings.json");
     let mappings_content = std::fs::read_to_string(&mappings_path)
@@ -415,9 +398,6 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         parameters,
         scaler,
         mappings,
-        continuous_columns,
-        categorical_columns,
-        static_categorical_columns,
         artifact_key.to_string(),
         run_id_from_artifact_key(artifact_key),
         load_timestamp,
