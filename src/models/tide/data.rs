@@ -240,20 +240,25 @@ pub fn input_feature_size(input_length: usize, output_length: usize) -> usize {
         + STATIC_CATEGORICAL_COLUMNS.len()
 }
 
-/// The fraction of the observed time range that goes to training.
+/// The fraction of the observed time range that goes to **training**; the remainder validates.
+///
+/// Named for the side it measures rather than for the split it defines. "Validation split" is
+/// ambiguous across the field — some libraries mean the held-out fraction by it — and a type whose
+/// name reads backwards is worse than a bare `f64`, because `TrainingFraction::new(0.2)` looks
+/// deliberate. At 0.2 this trains on a fifth of the window and every guard still passes.
 ///
 /// Strictly between 0 and 1. At either endpoint one side of the split is empty, and an empty side
 /// is not an error anywhere downstream — [`window_frame`] simply yields no windows, training runs
 /// on nothing or validates against nothing, and the run reports a loss computed over zero rows.
 /// Rejecting the endpoint here is the only place that failure is still legible.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ValidationSplit(f64);
+pub struct TrainingFraction(f64);
 
-impl ValidationSplit {
+impl TrainingFraction {
     pub fn new(fraction: f64) -> Result<Self, String> {
         if !fraction.is_finite() || fraction <= 0.0 || fraction >= 1.0 {
             return Err(format!(
-                "the validation split must be a fraction strictly between 0 and 1, got {fraction}"
+                "the training fraction must be strictly between 0 and 1, got {fraction}"
             ));
         }
         Ok(Self(fraction))
@@ -275,9 +280,9 @@ pub enum DatasetKind {
     /// One window per ticker at the end of its series, no targets.
     Predict,
     /// All sliding windows at or before the cutoff, with the future `daily_return` as targets.
-    Train(ValidationSplit),
+    Train(TrainingFraction),
     /// All sliding windows after the cutoff, with the future `daily_return` as targets.
-    Validate(ValidationSplit),
+    Validate(TrainingFraction),
 }
 
 pub struct Data {
@@ -327,18 +332,18 @@ impl Data {
     }
 
     /// Split the engineered frame into (train, validate) by a global date cutoff at
-    /// `min + (max - min) * validation_split`. Rows at or before the cutoff are training.
+    /// `min + (max - min) * training_fraction`. Rows at or before the cutoff are training.
     pub fn split_by_timestamp(
         &self,
-        validation_split: ValidationSplit,
+        training_fraction: TrainingFraction,
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
-        let validation_split = validation_split.fraction();
+        let training_fraction = training_fraction.fraction();
         let timestamps = self.data.column("timestamp").map_err(|e| e.to_string())?;
         let timestamps = timestamps.i64().map_err(|e| e.to_string())?;
         let minimum_timestamp = timestamps.min().unwrap_or(0);
         let maximum_timestamp = timestamps.max().unwrap_or(0);
         let cutoff = minimum_timestamp
-            + (((maximum_timestamp - minimum_timestamp) as f64) * validation_split) as i64;
+            + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction) as i64;
 
         let train_mask = timestamps.lt_eq(cutoff);
         let valid_mask = timestamps.gt(cutoff);
@@ -358,12 +363,12 @@ impl Data {
             DatasetKind::Predict => {
                 window_frame(&self.data, input_length, output_length, true, false)
             }
-            DatasetKind::Validate(validation_split) => {
-                let (_, valid) = self.split_by_timestamp(validation_split)?;
+            DatasetKind::Validate(training_fraction) => {
+                let (_, valid) = self.split_by_timestamp(training_fraction)?;
                 window_frame(&valid, input_length, output_length, false, true)
             }
-            DatasetKind::Train(validation_split) => {
-                let (train, _) = self.split_by_timestamp(validation_split)?;
+            DatasetKind::Train(training_fraction) => {
+                let (train, _) = self.split_by_timestamp(training_fraction)?;
                 window_frame(&train, input_length, output_length, false, true)
             }
         }
@@ -1266,8 +1271,8 @@ mod tests {
         )
     }
 
-    fn split_of(fraction: f64) -> ValidationSplit {
-        ValidationSplit::new(fraction).expect("the fixture split must be in range")
+    fn fraction_of(value: f64) -> TrainingFraction {
+        TrainingFraction::new(value).expect("the fixture fraction must be in range")
     }
 
     #[test]
@@ -1286,7 +1291,7 @@ mod tests {
     fn test_get_dataset_train_has_targets() {
         let data = empty_data(make_encoded_frame(2, 10));
         let dataset = data
-            .get_dataset(DatasetKind::Train(split_of(0.8)), 3, 2)
+            .get_dataset(DatasetKind::Train(fraction_of(0.8)), 3, 2)
             .unwrap();
         let sample_count = dataset.len();
         assert!(sample_count > 0);
@@ -1300,14 +1305,14 @@ mod tests {
     /// failure — the run trains on no windows and records a loss over zero rows. The constructor is
     /// the only place it is still visible.
     #[test]
-    fn test_validation_split_rejects_values_outside_the_open_unit_interval() {
+    fn test_training_fraction_rejects_values_outside_the_open_unit_interval() {
         for rejected in [0.0, 1.0, -0.1, 1.5, f64::NAN, f64::INFINITY] {
             assert!(
-                ValidationSplit::new(rejected).is_err(),
+                TrainingFraction::new(rejected).is_err(),
                 "expected {rejected} to be rejected"
             );
         }
-        assert!(ValidationSplit::new(0.8).is_ok());
+        assert!(TrainingFraction::new(0.8).is_ok());
     }
 
     /// The predict variant carries no split, so inference cannot pass one that does nothing — which
@@ -1325,7 +1330,7 @@ mod tests {
         // A split that keeps only the first 20% of the range cannot reach the predict path, so the
         // predict window count is unchanged by any split value.
         let trained = data
-            .get_dataset(DatasetKind::Train(split_of(0.2)), 3, 1)
+            .get_dataset(DatasetKind::Train(fraction_of(0.2)), 3, 1)
             .unwrap();
         assert!(
             trained.len() < 10,
@@ -1336,7 +1341,7 @@ mod tests {
     #[test]
     fn test_split_by_timestamp_partitions_rows() {
         let data = empty_data(make_encoded_frame(1, 10));
-        let (train, valid) = data.split_by_timestamp(split_of(0.8)).unwrap();
+        let (train, valid) = data.split_by_timestamp(fraction_of(0.8)).unwrap();
         assert_eq!(train.height() + valid.height(), 10);
         assert!(train.height() > 0);
         assert!(valid.height() > 0);
@@ -1794,7 +1799,7 @@ mod tests {
         // Train is date <= split, validation is date > split. With 11 daily rows (0..=10 days)
         // and split 0.8 the cutoff lands exactly on day 8, which must belong to train.
         let data = empty_data(make_encoded_frame(1, 11));
-        let (train, valid) = data.split_by_timestamp(split_of(0.8)).unwrap();
+        let (train, valid) = data.split_by_timestamp(fraction_of(0.8)).unwrap();
         assert_eq!(train.height(), 9);
         assert_eq!(valid.height(), 2);
     }

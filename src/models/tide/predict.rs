@@ -1406,7 +1406,9 @@ mod tests {
             let mut payload = valid_prediction_payload();
             payload.as_object_mut().unwrap().remove(field);
 
-            let error = convert(&payload).expect_err("a missing {field} must be rejected");
+            let Err(error) = convert(&payload) else {
+                panic!("removing {field} must leave the payload rejected");
+            };
             assert!(
                 error.contains(expected_fragment),
                 "removing {field} produced `{error}`, which does not name the field"
