@@ -182,11 +182,11 @@ pub async fn list_run_folders(
         .into_paginator()
         .send();
     while let Some(page) = pages.next().await {
-        let page = page.map_err(|e| ArtifactError::S3(e.to_string()))?;
+        let page = page.map_err(|error| ArtifactError::S3(error.to_string()))?;
         folders.extend(
             page.common_prefixes()
                 .iter()
-                .filter_map(|p| p.prefix().map(String::from)),
+                .filter_map(|prefix| prefix.prefix().map(String::from)),
         );
     }
     Ok(folders)
@@ -256,9 +256,9 @@ fn resolve_local_artifact_key(
 
     let mut entries: Vec<PathBuf> = std::fs::read_dir(local_dir)
         .map_err(|_| ArtifactError::NoArtifacts)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
         .collect();
 
     entries.sort();
@@ -320,13 +320,13 @@ pub async fn download_and_load_model(
         .key(key)
         .send()
         .await
-        .map_err(|e| ArtifactError::S3(e.to_string()))?;
+        .map_err(|error| ArtifactError::S3(error.to_string()))?;
 
     let bytes = response
         .body
         .collect()
         .await
-        .map_err(|e| ArtifactError::S3(e.to_string()))?
+        .map_err(|error| ArtifactError::S3(error.to_string()))?
         .into_bytes();
 
     let tmp_file = extract_path.join("model.tar.gz");
@@ -336,7 +336,7 @@ pub async fn download_and_load_model(
     load_model_from_directory(extract_path, key)
 }
 
-fn extract_tar_gz(tar_path: &Path, dest: &Path) -> Result<(), ArtifactError> {
+fn extract_tar_gz(tar_path: &Path, destination: &Path) -> Result<(), ArtifactError> {
     let file = std::fs::File::open(tar_path)?;
     let decoder = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
@@ -362,14 +362,14 @@ fn extract_tar_gz(tar_path: &Path, dest: &Path) -> Result<(), ArtifactError> {
             continue;
         }
 
-        let dest_path = dest.join(&path);
+        let destination_path = destination.join(&path);
         if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&dest_path)?;
+            std::fs::create_dir_all(&destination_path)?;
         } else {
-            if let Some(parent) = dest_path.parent() {
+            if let Some(parent) = destination_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut output = std::fs::File::create(&dest_path)?;
+            let mut output = std::fs::File::create(&destination_path)?;
             std::io::copy(&mut entry, &mut output)?;
         }
     }
@@ -380,18 +380,18 @@ fn extract_tar_gz(tar_path: &Path, dest: &Path) -> Result<(), ArtifactError> {
 fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelState, ArtifactError> {
     let parameters_path = dir.join("tide_parameters.json");
     let parameters = crate::models::tide::configuration::ModelParameters::load(&parameters_path)
-        .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+        .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
 
     let scaler_path = dir.join("tide_data_scaler.json");
     let scaler = crate::models::tide::data::Scaler::load(&scaler_path)
-        .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+        .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
 
     let mappings_path = dir.join("tide_data_mappings.json");
     let mappings_content = std::fs::read_to_string(&mappings_path)
-        .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+        .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
     let mappings: crate::models::tide::data::FeatureMappings =
         serde_json::from_str(&mappings_content)
-            .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+            .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
 
     let quantile_count = parameters.quantiles().len();
     let model = crate::models::tide::model::TiDEModel::load(
@@ -404,7 +404,7 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         quantile_count,
         parameters.dropout_rate(),
     )
-    .map_err(|e| ArtifactError::ModelLoad(e.to_string()))?;
+    .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
 
     let load_timestamp = Utc::now().timestamp();
 
@@ -481,7 +481,7 @@ pub async fn upload_artifact(
         .content_type(content_type)
         .send()
         .await
-        .map_err(|e| ArtifactWriteError::S3(e.to_string()))?;
+        .map_err(|error| ArtifactWriteError::S3(error.to_string()))?;
     Ok(())
 }
 
@@ -830,11 +830,11 @@ mod tests {
 
     #[test]
     fn test_package_dir_to_tar_gz_is_flat_and_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("tide_parameters.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join("tide_states.mpk"), b"weights").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("tide_parameters.json"), b"{}").unwrap();
+        std::fs::write(directory.path().join("tide_states.mpk"), b"weights").unwrap();
 
-        let bytes = package_dir_to_tar_gz(dir.path()).unwrap();
+        let bytes = package_dir_to_tar_gz(directory.path()).unwrap();
 
         let decoder = flate2::read::GzDecoder::new(bytes.as_slice());
         let mut archive = tar::Archive::new(decoder);

@@ -51,15 +51,19 @@ fn fit_scaler(data: &DataFrame) -> Result<Scaler, Box<dyn std::error::Error>> {
     for column in CONTINUOUS_COLUMNS {
         let series = data
             .column(column)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .cast(&DataType::Float64)
-            .map_err(|e| e.to_string())?;
-        let values = series.f64().map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
+        let values = series.f64().map_err(|error| error.to_string())?;
         let mean = values.mean().unwrap_or(0.0);
-        let std = values.std(1).unwrap_or(0.0);
-        let std = if std == 0.0 { 1e-8 } else { std };
+        let standard_deviation = values.std(1).unwrap_or(0.0);
+        let standard_deviation = if standard_deviation == 0.0 {
+            1e-8
+        } else {
+            standard_deviation
+        };
         means.insert((*column).to_string(), mean);
-        standard_deviations.insert((*column).to_string(), std);
+        standard_deviations.insert((*column).to_string(), standard_deviation);
     }
 
     Scaler::new(means, standard_deviations).map_err(|reason| {
@@ -83,11 +87,11 @@ fn build_mapping(
 ) -> Result<CategoryMapping, Box<dyn std::error::Error>> {
     let mut values: Vec<String> = data
         .column(column)
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
-        .map(|s| s.to_string())
+        .map(|name| name.to_string())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
@@ -109,21 +113,21 @@ pub fn filter_training_bars(
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let close_prices = data
         .column("close_price")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .cast(&DataType::Float64)
-        .map_err(|e| e.to_string())?;
-    let close_prices = close_prices.f64().map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    let close_prices = close_prices.f64().map_err(|error| error.to_string())?;
     let volumes = data
         .column("volume")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .cast(&DataType::Float64)
-        .map_err(|e| e.to_string())?;
-    let volumes = volumes.f64().map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    let volumes = volumes.f64().map_err(|error| error.to_string())?;
     let tickers = data
         .column("ticker")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
     let mask: BooleanChunked = close_prices
         .into_iter()
@@ -137,7 +141,7 @@ pub fn filter_training_bars(
         })
         .collect();
 
-    let filtered = data.filter(&mask).map_err(|e| e.to_string())?;
+    let filtered = data.filter(&mask).map_err(|error| error.to_string())?;
     Ok(filtered)
 }
 
@@ -351,17 +355,23 @@ mod tests {
     fn test_write_artifact_json_round_trips_via_loader() {
         let result = fit(raw_frame()).unwrap();
         let parameters = ModelParameters::new(448, 35, 5);
-        let dir = tempfile::tempdir().unwrap();
-        write_artifact_json(dir.path(), &result.scaler, &result.mappings, &parameters).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        write_artifact_json(
+            directory.path(),
+            &result.scaler,
+            &result.mappings,
+            &parameters,
+        )
+        .unwrap();
 
         // The inference-side loaders must read what we wrote. `Scaler::load` now checks the column
         // lists against this build's constants itself, so reaching this line at all is the
         // assertion that the three lists round-tripped intact.
-        let scaler = Scaler::load(&dir.path().join("tide_data_scaler.json")).unwrap();
+        let scaler = Scaler::load(&directory.path().join("tide_data_scaler.json")).unwrap();
         assert!(scaler.means().contains_key("daily_return"));
 
         let loaded_parameters =
-            ModelParameters::load(&dir.path().join("tide_parameters.json")).unwrap();
+            ModelParameters::load(&directory.path().join("tide_parameters.json")).unwrap();
         assert_eq!(loaded_parameters.input_size(), 448);
     }
 }

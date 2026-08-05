@@ -16,66 +16,76 @@ pub enum DriftStatus {
 pub struct DriftResult {
     pub status: DriftStatus,
     pub message: String,
-    pub current_crps: f64,
-    pub baseline_crps: Option<f64>,
+    pub current_continuous_ranked_probability_score: f64,
+    pub baseline_continuous_ranked_probability_score: Option<f64>,
 }
 
-/// Check whether `current_crps` has degraded relative to the mean of
-/// `prior_crps` by more than `degradation_threshold` (a fraction, e.g. 0.20).
+/// Check whether `current_continuous_ranked_probability_score` has degraded relative to the mean of
+/// `prior_continuous_ranked_probability_scores` by more than `degradation_threshold` (a fraction, e.g. 0.20).
 /// Fewer than `minimum_runs` prior values yields `InsufficientHistory`; the
 /// baseline is floored at 1e-8 so a near-zero history cannot flag noise.
 pub fn check_drift(
-    current_crps: f64,
-    prior_crps: &[f64],
+    current_continuous_ranked_probability_score: f64,
+    prior_continuous_ranked_probability_scores: &[f64],
     minimum_runs: usize,
     degradation_threshold: f64,
 ) -> DriftResult {
     // The emptiness check is separate from the `minimum_runs` check on purpose. With
     // `minimum_runs` of 0 the comparison below is false for an empty slice, so the function would
-    // continue and divide by zero: `baseline_crps` becomes NaN, `NaN.max(1e-8)` collapses the limit
+    // continue and divide by zero: `baseline_continuous_ranked_probability_score` becomes NaN, `NaN.max(1e-8)` collapses the limit
     // to the floor so almost any current value reports drift, and the NaN then fails JSON
     // serialization at the call site.
-    if prior_crps.is_empty() || prior_crps.len() < minimum_runs {
+    if prior_continuous_ranked_probability_scores.is_empty()
+        || prior_continuous_ranked_probability_scores.len() < minimum_runs
+    {
         let message = format!(
             "Insufficient evaluation history: {} run(s) recorded, {} required for baseline.",
-            prior_crps.len(),
+            prior_continuous_ranked_probability_scores.len(),
             minimum_runs
         );
         return DriftResult {
             status: DriftStatus::InsufficientHistory,
             message,
-            current_crps,
-            baseline_crps: None,
+            current_continuous_ranked_probability_score,
+            baseline_continuous_ranked_probability_score: None,
         };
     }
 
-    let baseline_crps = prior_crps.iter().sum::<f64>() / prior_crps.len() as f64;
-    let degradation_limit = baseline_crps.max(1e-8) * (1.0 + degradation_threshold);
+    let baseline_continuous_ranked_probability_score = prior_continuous_ranked_probability_scores
+        .iter()
+        .sum::<f64>()
+        / prior_continuous_ranked_probability_scores.len() as f64;
+    let degradation_limit =
+        baseline_continuous_ranked_probability_score.max(1e-8) * (1.0 + degradation_threshold);
 
-    if current_crps > degradation_limit {
+    if current_continuous_ranked_probability_score > degradation_limit {
         let message = format!(
-            "Drift detected: current CRPS {current_crps:.6} exceeds baseline \
-             {baseline_crps:.6} by more than {:.0}%.",
+            "Drift detected: current CRPS {current_continuous_ranked_probability_score:.6} exceeds baseline \
+             {baseline_continuous_ranked_probability_score:.6} by more than {:.0}%.",
             degradation_threshold * 100.0
         );
         return DriftResult {
             status: DriftStatus::DriftDetected,
             message,
-            current_crps,
-            baseline_crps: Some(baseline_crps),
+            current_continuous_ranked_probability_score,
+            baseline_continuous_ranked_probability_score: Some(
+                baseline_continuous_ranked_probability_score,
+            ),
         };
     }
 
     let message = format!(
-        "No drift detected: current CRPS {current_crps:.6} is within {:.0}% of \
-         baseline {baseline_crps:.6}.",
+        "No drift detected: current CRPS {current_continuous_ranked_probability_score:.6} is within {:.0}% of \
+         baseline {baseline_continuous_ranked_probability_score:.6}.",
         degradation_threshold * 100.0
     );
     DriftResult {
         status: DriftStatus::NoDrift,
         message,
-        current_crps,
-        baseline_crps: Some(baseline_crps),
+        current_continuous_ranked_probability_score,
+        baseline_continuous_ranked_probability_score: Some(
+            baseline_continuous_ranked_probability_score,
+        ),
     }
 }
 
@@ -90,15 +100,15 @@ mod tests {
     fn test_empty_history_is_insufficient_regardless_of_minimum_runs() {
         let result = check_drift(0.5, &[], 0, 0.2);
         assert_eq!(result.status, DriftStatus::InsufficientHistory);
-        assert_eq!(result.baseline_crps, None);
+        assert_eq!(result.baseline_continuous_ranked_probability_score, None);
     }
 
     #[test]
     fn test_insufficient_history_below_minimum_runs() {
         let result = check_drift(0.5, &[0.3, 0.3], 3, 0.20);
         assert_eq!(result.status, DriftStatus::InsufficientHistory);
-        assert_eq!(result.baseline_crps, None);
-        assert_eq!(result.current_crps, 0.5);
+        assert_eq!(result.baseline_continuous_ranked_probability_score, None);
+        assert_eq!(result.current_continuous_ranked_probability_score, 0.5);
     }
 
     #[test]
@@ -107,14 +117,20 @@ mod tests {
         // exactly at the limit is not drift.
         let result = check_drift(0.36, &[0.3, 0.3, 0.3], 3, 0.20);
         assert_eq!(result.status, DriftStatus::NoDrift);
-        assert_eq!(result.baseline_crps, Some(0.3));
+        assert_eq!(
+            result.baseline_continuous_ranked_probability_score,
+            Some(0.3)
+        );
     }
 
     #[test]
     fn test_drift_detected_just_over_limit() {
         let result = check_drift(0.361, &[0.3, 0.3, 0.3], 3, 0.20);
         assert_eq!(result.status, DriftStatus::DriftDetected);
-        assert_eq!(result.baseline_crps, Some(0.3));
+        assert_eq!(
+            result.baseline_continuous_ranked_probability_score,
+            Some(0.3)
+        );
         assert!(result.message.contains("Drift detected"));
     }
 
@@ -123,7 +139,7 @@ mod tests {
         // mean(0.2, 0.3, 0.4) = 0.3 -> limit 0.36.
         let result = check_drift(0.35, &[0.2, 0.3, 0.4], 3, 0.20);
         assert_eq!(result.status, DriftStatus::NoDrift);
-        assert!((result.baseline_crps.unwrap() - 0.3).abs() < 1e-12);
+        assert!((result.baseline_continuous_ranked_probability_score.unwrap() - 0.3).abs() < 1e-12);
     }
 
     #[test]

@@ -150,17 +150,24 @@ impl EarlyStopping {
 
 /// Train the model, returning the best-checkpoint model and the per-epoch
 /// training loss history.
+///
+/// `validation_dataset` drives early stopping. When it is `None` or empty, the **training** loss is
+/// used as the stopping metric instead — which makes early stopping measure fit rather than
+/// generalization, so it will happily run to the epoch limit on a model that has memorized the
+/// window. The caller is expected to reject an empty validation split rather than rely on this;
+/// `bin/tide_model_trainer.rs` does. The fallback exists so a deliberately validation-free run
+/// (the overfitting tests below) still terminates, not as a supported production path.
 pub fn train(
     mut model: TiDEModel<TrainBackend>,
     train_dataset: &TrainingDataset,
-    valid_dataset: Option<&TrainingDataset>,
+    validation_dataset: Option<&TrainingDataset>,
     parameters: &ModelParameters,
     configuration: &TrainConfiguration,
     device: &<TrainBackend as Backend>::Device,
 ) -> (TiDEModel<TrainBackend>, Vec<f64>) {
-    let num_samples = train_dataset.len();
+    let sample_count = train_dataset.len();
     let mut losses = Vec::new();
-    if num_samples == 0 {
+    if sample_count == 0 {
         return (model, losses);
     }
 
@@ -175,7 +182,7 @@ pub fn train(
     let mut early_stopping = EarlyStopping::new();
 
     for epoch in 0..configuration.epoch_count {
-        let mut order: Vec<usize> = (0..num_samples).collect();
+        let mut order: Vec<usize> = (0..sample_count).collect();
         order.shuffle(&mut rng);
 
         let mut loss_sum = 0.0_f64;
@@ -224,10 +231,10 @@ pub fn train(
         // validation set, early stopping falls back to the training loss — and logging that
         // fallback under `validation_loss` produced a line where the two losses matched exactly,
         // which reads as a suspiciously well-generalizing model rather than as an absent split.
-        let measured_validation_loss = match valid_dataset {
-            Some(valid) if !valid.is_empty() => Some(validation_loss(
+        let measured_validation_loss = match validation_dataset {
+            Some(validation) if !validation.is_empty() => Some(validation_loss(
                 &model,
-                valid,
+                validation,
                 parameters,
                 configuration.batch_size,
             )),
@@ -263,27 +270,27 @@ pub fn train(
 /// Mean validation loss using the dropout-disabled inner (`NdArray`) model.
 fn validation_loss(
     model: &TiDEModel<TrainBackend>,
-    valid: &TrainingDataset,
+    validation: &TrainingDataset,
     parameters: &ModelParameters,
     batch_size: usize,
 ) -> f64 {
     let inner = model.valid();
     let device = <NdArray as Backend>::Device::default();
-    let sample_count = valid.len();
+    let sample_count = validation.len();
     let indices: Vec<usize> = (0..sample_count).collect();
 
     let mut loss_sum = 0.0_f64;
     let mut batch_count = 0usize;
     for chunk in indices.chunks(batch_size) {
         let input = build_input_tensor::<NdArray>(
-            valid,
+            validation,
             chunk,
             parameters.input_length(),
             parameters.output_length(),
             &device,
         );
         let target =
-            build_target_tensor::<NdArray>(valid, chunk, parameters.output_length(), &device);
+            build_target_tensor::<NdArray>(validation, chunk, parameters.output_length(), &device);
         let prediction = inner.forward(input);
         let loss = quantile_loss(
             prediction,
@@ -355,25 +362,26 @@ mod tests {
     /// A tiny dataset whose target is a constant the model can fit; used to prove
     /// the autodiff + optimizer + loss wiring actually reduces loss.
     fn overfit_dataset(
-        num_samples: usize,
+        sample_count: usize,
         input_length: usize,
         output_length: usize,
     ) -> TrainingDataset {
-        let mut past_continuous = ndarray::Array3::<f32>::zeros((num_samples, input_length, 7));
-        for s in 0..num_samples {
-            for t in 0..input_length {
-                for f in 0..7 {
-                    past_continuous[[s, t, f]] = ((s + t + f) as f32) * 0.01;
+        let mut past_continuous = ndarray::Array3::<f32>::zeros((sample_count, input_length, 7));
+        for sample_index in 0..sample_count {
+            for time_index in 0..input_length {
+                for feature_index in 0..7 {
+                    past_continuous[[sample_index, time_index, feature_index]] =
+                        ((sample_index + time_index + feature_index) as f32) * 0.01;
                 }
             }
         }
-        let past_categorical = ndarray::Array3::<i32>::ones((num_samples, input_length, 5));
-        let future_categorical = ndarray::Array3::<i32>::ones((num_samples, output_length, 5));
-        let static_categorical = ndarray::Array3::<i32>::ones((num_samples, 1, 3));
-        let mut targets = ndarray::Array3::<f32>::zeros((num_samples, output_length, 1));
-        for s in 0..num_samples {
-            for t in 0..output_length {
-                targets[[s, t, 0]] = 0.5;
+        let past_categorical = ndarray::Array3::<i32>::ones((sample_count, input_length, 5));
+        let future_categorical = ndarray::Array3::<i32>::ones((sample_count, output_length, 5));
+        let static_categorical = ndarray::Array3::<i32>::ones((sample_count, 1, 3));
+        let mut targets = ndarray::Array3::<f32>::zeros((sample_count, output_length, 1));
+        for sample_index in 0..sample_count {
+            for step_index in 0..output_length {
+                targets[[sample_index, step_index, 0]] = 0.5;
             }
         }
         TrainingDataset {
