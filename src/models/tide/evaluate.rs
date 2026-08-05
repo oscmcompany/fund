@@ -322,7 +322,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn test_eval_metrics_zero_fields_are_zero() {
+    fn test_evaluation_metrics_zero_fields_are_zero() {
         let metrics = EvaluationMetrics::zero();
         assert_eq!(metrics.continuous_ranked_probability_score, 0.0);
         assert_eq!(metrics.directional_accuracy, 0.0);

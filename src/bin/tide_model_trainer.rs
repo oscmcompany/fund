@@ -158,6 +158,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if train_dataset.is_empty() {
         return Err("No training samples produced from the lookback window".into());
     }
+    // Failing here rather than training anyway, because every downstream consequence of an empty
+    // validation split is silent. Early stopping falls back to the training loss, `evaluate`
+    // short-circuits to `EvaluationMetrics::zero()`, and the metadata below publishes `crps: 0.0`
+    // -- the best score possible. That zero then sits in the drift baseline for
+    // DRIFT_PRIOR_RUN_COUNT runs, dragging down the mean every later run is measured against. A
+    // run that produced no validation data reads as a flawless one.
+    if validation_dataset.is_empty() {
+        return Err("No validation samples produced from the lookback window".into());
+    }
 
     let input_size = input_feature_size(INPUT_LENGTH, OUTPUT_LENGTH);
     let parameters = ModelParameters::new(input_size, INPUT_LENGTH, OUTPUT_LENGTH);

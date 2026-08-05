@@ -150,6 +150,13 @@ impl EarlyStopping {
 
 /// Train the model, returning the best-checkpoint model and the per-epoch
 /// training loss history.
+///
+/// `validation_dataset` drives early stopping. When it is `None` or empty, the **training** loss is
+/// used as the stopping metric instead — which makes early stopping measure fit rather than
+/// generalization, so it will happily run to the epoch limit on a model that has memorized the
+/// window. The caller is expected to reject an empty validation split rather than rely on this;
+/// `bin/tide_model_trainer.rs` does. The fallback exists so a deliberately validation-free run
+/// (the overfitting tests below) still terminates, not as a supported production path.
 pub fn train(
     mut model: TiDEModel<TrainBackend>,
     train_dataset: &TrainingDataset,

@@ -1340,6 +1340,40 @@ mod tests {
         assert!(TrainingFraction::new(0.8).is_ok());
     }
 
+    /// A validation split can yield no windows at all while the training split yields plenty, and
+    /// nothing in this module treats that as an error — `window_frame` just returns an empty
+    /// dataset.
+    ///
+    /// This is the condition `bin/tide_model_trainer.rs` refuses before training, and it pins why
+    /// that guard has to exist. Downstream, an empty validation set is silent in three places at
+    /// once: early stopping falls back to the training loss, [`crate::models::tide::evaluate`]
+    /// short-circuits to zeroed metrics, and the trainer publishes `crps: 0.0` — the best score
+    /// achievable — into the drift baseline that every later run is measured against.
+    ///
+    /// The guard itself is not exercised here; it lives in `run()`, which fetches from S3.
+    #[test]
+    fn test_a_validation_split_can_produce_no_windows_while_training_produces_many() {
+        // 11 rows split at 0.8 leaves 2 validation rows, and a window needs input + output = 4.
+        let data = empty_data(make_encoded_frame(1, 11));
+
+        let training = data
+            .get_dataset(DatasetKind::Train(fraction_of(0.8)), 3, 1)
+            .unwrap();
+        let validation = data
+            .get_dataset(DatasetKind::Validate(fraction_of(0.8)), 3, 1)
+            .unwrap();
+
+        assert!(
+            !training.is_empty(),
+            "the training split must produce windows, or this proves nothing"
+        );
+        assert!(
+            validation.is_empty(),
+            "expected no validation windows from 2 rows, got {}",
+            validation.len()
+        );
+    }
+
     /// The predict variant carries no split, so inference cannot pass one that does nothing — which
     /// is what the `0.8` at the old predict call site was. This is a compile-time property; the
     /// assertion here records that predicting reads the whole frame rather than a split of it.
