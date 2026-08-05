@@ -16,6 +16,12 @@ use uuid::Uuid;
 ///
 /// Training applies them per row and inference per ticker average; both sides must use the same
 /// values, or the scaler and model learn dynamics the service never predicts.
+///
+/// The *comparison* has to match too, and matching values are not enough on their own. All three
+/// readers — `filter_training_bars`, `filter_equity_bars`, and `Universe::is_liquid` — admit the
+/// threshold itself, so a ticker averaging exactly $10.00 is in the universe, in the training set,
+/// and predicted for. Each has a boundary test, because this is the kind of skew that costs one
+/// character and shows up only at the edge of the population.
 pub const MINIMUM_CLOSE_PRICE: f64 = 10.0;
 pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
 

@@ -30,6 +30,80 @@ impl EvalMetrics {
     }
 }
 
+/// The three positions in the quantile list the metrics read, resolved once per evaluation.
+///
+/// The quantiles arrive from the artifact in whatever order training wrote them, so "lowest",
+/// "highest", and "the median" are positions to be found rather than indices 0, 1, and 2.
+#[derive(Debug, Clone, Copy)]
+struct QuantileIndices {
+    lower: usize,
+    median: usize,
+    upper: usize,
+}
+
+impl QuantileIndices {
+    fn locate(quantiles: &[f64]) -> Self {
+        Self {
+            lower: argmin(quantiles),
+            median: closest_to(quantiles, 0.5),
+            upper: argmax(quantiles),
+        }
+    }
+}
+
+/// Running totals behind the three metrics.
+///
+/// This exists so the tests can reach the arithmetic without running the network. They used to
+/// assert against their own copy of the loop below, which meant a change to the pinball split, the
+/// median selection, or the coverage bounds left every one of them green — a suite that named the
+/// thing it could not detect a regression in. One implementation, two callers.
+#[derive(Debug, Default, Clone, Copy)]
+struct MetricAccumulator {
+    pinball_sum: f64,
+    directional_matches: usize,
+    covered: usize,
+    row_count: usize,
+}
+
+impl MetricAccumulator {
+    /// Adds one horizon step: its predictions ordered to match `quantiles`, and the realized target.
+    ///
+    /// `row` must be exactly as long as `quantiles`; both callers slice it that way.
+    fn add_row(&mut self, row: &[f64], target: f64, quantiles: &[f64], indices: QuantileIndices) {
+        for (index, &quantile) in quantiles.iter().enumerate() {
+            let error = target - row[index];
+            self.pinball_sum += if error >= 0.0 {
+                quantile * error
+            } else {
+                (quantile - 1.0) * error
+            };
+        }
+
+        if (row[indices.median] >= 0.0) == (target >= 0.0) {
+            self.directional_matches += 1;
+        }
+
+        if target >= row[indices.lower] && target <= row[indices.upper] {
+            self.covered += 1;
+        }
+
+        self.row_count += 1;
+    }
+
+    /// Averages the totals over the rows added, or returns zeros when none were.
+    fn finish(self) -> EvalMetrics {
+        if self.row_count == 0 {
+            return EvalMetrics::zero();
+        }
+        let rows = self.row_count as f64;
+        EvalMetrics {
+            crps: self.pinball_sum / rows,
+            directional_accuracy: self.directional_matches as f64 / rows,
+            quantile_coverage: self.covered as f64 / rows,
+        }
+    }
+}
+
 /// Run the (inner, non-autodiff) model over the validation dataset and compute
 /// the metrics. Returns zeros for an empty or target-less dataset.
 pub fn evaluate(
@@ -50,15 +124,13 @@ pub fn evaluate(
         return Ok(EvalMetrics::zero());
     }
 
-    let lower_index = argmin(quantiles);
-    let upper_index = argmax(quantiles);
-    let median_index = closest_to(quantiles, 0.5);
+    let indices = QuantileIndices::locate(quantiles);
 
     let device = Default::default();
     let mut predictions: Vec<f32> =
         Vec::with_capacity(sample_count * output_length * quantile_count);
-    let indices: Vec<usize> = (0..sample_count).collect();
-    for chunk in indices.chunks(EVAL_BATCH) {
+    let sample_indices: Vec<usize> = (0..sample_count).collect();
+    for chunk in sample_indices.chunks(EVAL_BATCH) {
         let input = build_input_tensor::<NdArray>(
             dataset,
             chunk,
@@ -89,54 +161,25 @@ pub fn evaluate(
         .into());
     }
 
-    let mut crps_sum = 0.0_f64;
-    let mut directional_matches = 0_usize;
-    let mut covered = 0_usize;
-    let mut row_count = 0_usize;
+    let mut accumulator = MetricAccumulator::default();
+    // Reused across rows: the model emits `f32` and the metrics are computed in `f64`, so each row
+    // is widened once into this buffer rather than allocating one per horizon step.
+    let mut row = Vec::with_capacity(quantile_count);
 
     for sample in 0..sample_count {
-        for t in 0..output_length {
-            let target = targets[[sample, t, 0]] as f64;
-            let base = (sample * output_length + t) * quantile_count;
-
-            let mut row_loss = 0.0_f64;
-            for (q_index, &quantile) in quantiles.iter().enumerate() {
-                let prediction = predictions[base + q_index] as f64;
-                let error = target - prediction;
-                let pinball = if error >= 0.0 {
-                    quantile * error
-                } else {
-                    (quantile - 1.0) * error
-                };
-                row_loss += pinball;
-            }
-            crps_sum += row_loss;
-
-            let q_median = predictions[base + median_index] as f64;
-            if (q_median >= 0.0) == (target >= 0.0) {
-                directional_matches += 1;
-            }
-
-            let q_lower = predictions[base + lower_index] as f64;
-            let q_upper = predictions[base + upper_index] as f64;
-            if target >= q_lower && target <= q_upper {
-                covered += 1;
-            }
-
-            row_count += 1;
+        for step in 0..output_length {
+            let base = (sample * output_length + step) * quantile_count;
+            row.clear();
+            row.extend(
+                predictions[base..base + quantile_count]
+                    .iter()
+                    .map(|&prediction| prediction as f64),
+            );
+            accumulator.add_row(&row, targets[[sample, step, 0]] as f64, quantiles, indices);
         }
     }
 
-    if row_count == 0 {
-        return Ok(EvalMetrics::zero());
-    }
-
-    let rows = row_count as f64;
-    Ok(EvalMetrics {
-        crps: crps_sum / rows,
-        directional_accuracy: directional_matches as f64 / rows,
-        quantile_coverage: covered as f64 / rows,
-    })
+    Ok(accumulator.finish())
 }
 
 fn argmin(values: &[f64]) -> usize {
@@ -247,41 +290,52 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // metrics_from: helper that mirrors evaluate()'s row-level arithmetic so we
-    // can verify the math without running the neural network.
+    // metrics_from: feeds a fixed prediction table through the shipped accumulator
+    // so the math can be checked without running the neural network.
     // ---------------------------------------------------------------------------
 
-    /// Replicates the per-row accumulation in `evaluate` for a fixed prediction
-    /// table where each row has exactly `quantiles.len()` predictions ordered
-    /// lowest to highest quantile.
+    /// Runs `predictions` and `targets` through `MetricAccumulator`, the same type `evaluate` uses.
+    ///
+    /// This deliberately reimplements nothing: it lays out the fixture and hands each row to the
+    /// production accumulator. Every assertion below therefore fails if the pinball split, the
+    /// median selection, or the coverage bounds change in the shipped code.
     fn metrics_from(predictions: &[[f64; 3]], targets: &[f64], quantiles: &[f64]) -> EvalMetrics {
-        let mut crps_sum = 0.0;
-        let mut directional = 0;
-        let mut covered = 0;
-        for (row, &target) in targets.iter().enumerate() {
-            let mut row_loss = 0.0;
-            for (qi, &q) in quantiles.iter().enumerate() {
-                let error = target - predictions[row][qi];
-                row_loss += if error >= 0.0 {
-                    q * error
-                } else {
-                    (q - 1.0) * error
-                };
-            }
-            crps_sum += row_loss;
-            if (predictions[row][1] >= 0.0) == (target >= 0.0) {
-                directional += 1;
-            }
-            if target >= predictions[row][0] && target <= predictions[row][2] {
-                covered += 1;
-            }
+        let indices = QuantileIndices::locate(quantiles);
+        let mut accumulator = MetricAccumulator::default();
+        for (row, &target) in predictions.iter().zip(targets) {
+            accumulator.add_row(row, target, quantiles, indices);
         }
-        let n = targets.len() as f64;
-        EvalMetrics {
-            crps: crps_sum / n,
-            directional_accuracy: directional as f64 / n,
-            quantile_coverage: covered as f64 / n,
-        }
+        accumulator.finish()
+    }
+
+    /// The quantile list is whatever training wrote, so the three positions are found rather than
+    /// assumed. The old test helper hardcoded 0, 1, and 2, which is why it could not have caught
+    /// this: an artifact listing its quantiles in any other order would have had its coverage
+    /// measured between the wrong two bounds.
+    #[test]
+    fn test_quantile_indices_are_located_not_assumed() {
+        let indices = QuantileIndices::locate(&[0.9, 0.1, 0.5]);
+        assert_eq!(indices.lower, 1, "0.1 is at position 1");
+        assert_eq!(indices.median, 2, "0.5 is at position 2");
+        assert_eq!(indices.upper, 0, "0.9 is at position 0");
+    }
+
+    /// Coverage is read from the located bounds, so a shuffled quantile list must produce the same
+    /// answer as a sorted one over the correspondingly shuffled predictions.
+    #[test]
+    fn test_coverage_is_unchanged_by_the_order_of_the_quantile_list() {
+        let sorted = metrics_from(&[[-0.5, 0.0, 0.5]], &[0.3], &[0.1, 0.5, 0.9]);
+        let shuffled = metrics_from(&[[0.5, -0.5, 0.0]], &[0.3], &[0.9, 0.1, 0.5]);
+
+        assert_eq!(sorted.quantile_coverage, 1.0);
+        assert_eq!(shuffled.quantile_coverage, sorted.quantile_coverage);
+        assert_eq!(shuffled.directional_accuracy, sorted.directional_accuracy);
+        assert!(
+            (shuffled.crps - sorted.crps).abs() < 1e-9,
+            "pinball loss pairs each quantile with its own prediction: {} vs {}",
+            shuffled.crps,
+            sorted.crps
+        );
     }
 
     #[test]
