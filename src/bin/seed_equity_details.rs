@@ -3,7 +3,7 @@
 //! Bootstrap tooling, not a scheduled job. Nothing in the running service writes `equity_details`:
 //! Alpaca does not publish sector or industry, so the metadata has one source and it is compiled
 //! into the binary. A fresh database therefore has no sector information until this runs, and the
-//! pair screen's different-sector rule silently admits nothing without it.
+//! pair screen's per-sector cap silently constrains nothing without it.
 //!
 //! Usage: `seed_equity_details`
 //!

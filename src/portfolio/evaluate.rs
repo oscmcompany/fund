@@ -196,7 +196,8 @@ pub async fn run_pass(
     let candidates = screen::score_candidates(&screened.inputs);
     summary.candidates_screened = candidates.len();
 
-    let selected = screen::select_disjoint(&candidates, gate.vacant_slots(), &held);
+    let selected =
+        screen::select_disjoint(&candidates, gate.vacant_slots(), &held, &screened.sectors);
     let sized = size::size_pairs(&selected, account.equity(), &context.sizing);
     let (approved, refusals) = gate.admit_all(&sized);
     summary.entries_refused = refusals
@@ -475,6 +476,9 @@ async fn previous_session_equity(
 struct ScreenedUniverse {
     inputs: Vec<ScreenInput>,
     model_run_id: Option<String>,
+    /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs
+    /// too, and those are filtered out of `inputs` before it ever sees them.
+    sectors: HashMap<Ticker, String>,
 }
 
 /// Assembles the screen's inputs, fetching only the prices the exit half did not already have.
@@ -490,6 +494,7 @@ async fn build_screen_inputs(
         return Ok(ScreenedUniverse {
             inputs: Vec::new(),
             model_run_id: None,
+            sectors: HashMap::new(),
         });
     }
 
@@ -505,6 +510,13 @@ async fn build_screen_inputs(
     // Only forecasts that can produce a candidate: in the universe, with a sector, with enough
     // history, and not already on the book. Every test here is a set lookup, because this runs once
     // per forecast on a pass that runs every five minutes.
+    //
+    // The sector test survives the removal of the different-sector rule, for a new reason. A ticker
+    // whose sector is unknown cannot be counted against `MAXIMUM_LEGS_PER_SECTOR`, so admitting one
+    // would let missing metadata quietly become unbounded concentration. Refusing to *open* what
+    // cannot be measured is the conservative side of that trade; `select_disjoint` still tolerates
+    // an unknown sector on a *held* leg, because a position already on the book cannot be
+    // retroactively declined.
     let eligible: Vec<&EquityPrediction> = predictions
         .iter()
         .filter(|prediction| {
@@ -531,7 +543,6 @@ async fn build_screen_inputs(
                 ticker.clone(),
                 context.close_history.get(ticker)?.clone(),
                 *prices.get(ticker)?,
-                sectors.get(ticker)?.clone(),
                 prediction.expected_return(),
                 prediction.confidence(),
                 context.universe.is_shortable(ticker),
@@ -549,6 +560,7 @@ async fn build_screen_inputs(
     Ok(ScreenedUniverse {
         inputs,
         model_run_id,
+        sectors,
     })
 }
 
