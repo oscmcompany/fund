@@ -145,14 +145,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         INPUT_LENGTH,
         OUTPUT_LENGTH,
     )?;
-    let valid_dataset = fit_result.data.get_dataset(
+    let validation_dataset = fit_result.data.get_dataset(
         DatasetKind::Validate(training_fraction),
         INPUT_LENGTH,
         OUTPUT_LENGTH,
     )?;
     info!(
         train_samples = train_dataset.len(),
-        validation_samples = valid_dataset.len(),
+        validation_samples = validation_dataset.len(),
         "Built windowed datasets"
     );
     if train_dataset.is_empty() {
@@ -178,7 +178,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (best_model, losses) = train(
         model,
         &train_dataset,
-        Some(&valid_dataset),
+        Some(&validation_dataset),
         &parameters,
         &configuration,
         &device,
@@ -190,9 +190,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let inner_model = best_model.valid();
-    let metrics = evaluate(&inner_model, &valid_dataset, &parameters)?;
+    let metrics = evaluate(&inner_model, &validation_dataset, &parameters)?;
     info!(
-        crps = metrics.crps,
+        continuous_ranked_probability_score = metrics.continuous_ranked_probability_score,
         directional_accuracy = metrics.directional_accuracy,
         quantile_coverage = metrics.quantile_coverage,
         "Evaluation metrics"
@@ -235,17 +235,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!(key = model_key, "Uploaded model artifact");
 
     let current_folder = format!("{artifact_prefix}{timestamp}/");
-    let prior_crps = fetch_prior_crps(
-        &s3_client,
-        &bucket,
-        &artifact_prefix,
-        &current_folder,
-        DRIFT_PRIOR_RUN_COUNT,
-    )
-    .await;
+    let prior_continuous_ranked_probability_scores =
+        fetch_prior_continuous_ranked_probability_scores(
+            &s3_client,
+            &bucket,
+            &artifact_prefix,
+            &current_folder,
+            DRIFT_PRIOR_RUN_COUNT,
+        )
+        .await;
     let drift = check_drift(
-        metrics.crps,
-        &prior_crps,
+        metrics.continuous_ranked_probability_score,
+        &prior_continuous_ranked_probability_scores,
         DRIFT_MINIMUM_RUNS,
         DRIFT_DEGRADATION_THRESHOLD,
     );
@@ -253,15 +254,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // with no compiler error, which is the case where a new signal is most likely to be missed.
     match drift.status {
         DriftStatus::DriftDetected => warn!(
-            current_crps = drift.current_crps,
-            baseline_crps = drift.baseline_crps,
+            current_continuous_ranked_probability_score =
+                drift.current_continuous_ranked_probability_score,
+            baseline_continuous_ranked_probability_score =
+                drift.baseline_continuous_ranked_probability_score,
             "Model drift detected"
         ),
         DriftStatus::NoDrift | DriftStatus::InsufficientHistory => info!(
             status = ?drift.status,
-            current_crps = drift.current_crps,
-            baseline_crps = drift.baseline_crps,
-            prior_runs = prior_crps.len(),
+            current_continuous_ranked_probability_score = drift.current_continuous_ranked_probability_score,
+            baseline_continuous_ranked_probability_score = drift.baseline_continuous_ranked_probability_score,
+            prior_runs = prior_continuous_ranked_probability_scores.len(),
             message = drift.message,
             "Drift check complete"
         ),
@@ -281,16 +284,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "final_train_loss": losses.last().copied().unwrap_or_default(),
         "metrics": metrics,
         "train_samples": train_dataset.len(),
-        "validation_samples": valid_dataset.len(),
+        "validation_samples": validation_dataset.len(),
+        // `crps` keys are the published spelling and stay that way; see `EvaluationMetrics`. Renaming
+        // them would orphan every artifact already in the bucket.
         "drift": {
             "status": drift.status,
             "message": drift.message,
-            "baseline_crps": drift.baseline_crps,
-            "prior_runs": prior_crps.len(),
+            "baseline_crps": drift.baseline_continuous_ranked_probability_score,
+            "prior_runs": prior_continuous_ranked_probability_scores.len(),
         },
     });
     // Retried, because the model tarball is already published by this point. A folder holding a
-    // model and no metadata is skipped by `fetch_prior_crps`, so the run vanishes from the drift
+    // model and no metadata is skipped by `fetch_prior_continuous_ranked_probability_scores`, so the run vanishes from the drift
     // baseline for the next DRIFT_PRIOR_RUN_COUNT executions -- and with DRIFT_MINIMUM_RUNS at three,
     // repeated partial publishes suppress drift reporting entirely.
     let metadata_key = format!("{current_folder}run_metadata.json");
@@ -330,7 +335,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Training complete: artifact s3://{bucket}/{model_key}");
     println!(
         "Metrics: CRPS={:.6} directional_accuracy={:.4} quantile_coverage={:.4}",
-        metrics.crps, metrics.directional_accuracy, metrics.quantile_coverage
+        metrics.continuous_ranked_probability_score,
+        metrics.directional_accuracy,
+        metrics.quantile_coverage
     );
     Ok(())
 }
@@ -554,7 +561,7 @@ async fn load_archived_bars(
 /// baseline can be built without downloading every prior run. An unreadable run is skipped and the
 /// rest are kept; only an unlistable prefix yields nothing. Either way a drift baseline that cannot
 /// be read is not a reason to fail a training run.
-async fn fetch_prior_crps(
+async fn fetch_prior_continuous_ranked_probability_scores(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
@@ -569,9 +576,9 @@ async fn fetch_prior_crps(
         }
     };
 
-    let mut prior_crps = Vec::new();
+    let mut prior_continuous_ranked_probability_scores = Vec::new();
     for folder in candidate_folders_descending(folders) {
-        if prior_crps.len() >= run_count {
+        if prior_continuous_ranked_probability_scores.len() >= run_count {
             break;
         }
         if folder == current_folder {
@@ -592,11 +599,11 @@ async fn fetch_prior_crps(
         let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes.into_bytes()) else {
             continue;
         };
-        if let Some(crps) = metadata["metrics"]["crps"].as_f64() {
-            prior_crps.push(crps);
+        if let Some(continuous_ranked_probability_score) = metadata["metrics"]["crps"].as_f64() {
+            prior_continuous_ranked_probability_scores.push(continuous_ranked_probability_score);
         }
     }
-    prior_crps
+    prior_continuous_ranked_probability_scores
 }
 
 #[cfg(test)]

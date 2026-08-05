@@ -302,11 +302,17 @@ impl Data {
             data,
             scaler,
             mappings,
-            continuous_columns: CONTINUOUS_COLUMNS.iter().map(|s| s.to_string()).collect(),
-            categorical_columns: CATEGORICAL_COLUMNS.iter().map(|s| s.to_string()).collect(),
+            continuous_columns: CONTINUOUS_COLUMNS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            categorical_columns: CATEGORICAL_COLUMNS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
             static_categorical_columns: STATIC_CATEGORICAL_COLUMNS
                 .iter()
-                .map(|s| s.to_string())
+                .map(|name| name.to_string())
                 .collect(),
         }
     }
@@ -338,18 +344,27 @@ impl Data {
         training_fraction: TrainingFraction,
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
         let training_fraction = training_fraction.fraction();
-        let timestamps = self.data.column("timestamp").map_err(|e| e.to_string())?;
-        let timestamps = timestamps.i64().map_err(|e| e.to_string())?;
+        let timestamps = self
+            .data
+            .column("timestamp")
+            .map_err(|error| error.to_string())?;
+        let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
         let minimum_timestamp = timestamps.min().unwrap_or(0);
         let maximum_timestamp = timestamps.max().unwrap_or(0);
         let cutoff = minimum_timestamp
             + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction) as i64;
 
         let train_mask = timestamps.lt_eq(cutoff);
-        let valid_mask = timestamps.gt(cutoff);
-        let train = self.data.filter(&train_mask).map_err(|e| e.to_string())?;
-        let valid = self.data.filter(&valid_mask).map_err(|e| e.to_string())?;
-        Ok((train, valid))
+        let validation_mask = timestamps.gt(cutoff);
+        let train = self
+            .data
+            .filter(&train_mask)
+            .map_err(|error| error.to_string())?;
+        let validation = self
+            .data
+            .filter(&validation_mask)
+            .map_err(|error| error.to_string())?;
+        Ok((train, validation))
     }
 
     /// Build a windowed dataset.
@@ -364,8 +379,8 @@ impl Data {
                 window_frame(&self.data, input_length, output_length, true, false)
             }
             DatasetKind::Validate(training_fraction) => {
-                let (_, valid) = self.split_by_timestamp(training_fraction)?;
-                window_frame(&valid, input_length, output_length, false, true)
+                let (_, validation) = self.split_by_timestamp(training_fraction)?;
+                window_frame(&validation, input_length, output_length, false, true)
             }
             DatasetKind::Train(training_fraction) => {
                 let (train, _) = self.split_by_timestamp(training_fraction)?;
@@ -399,9 +414,9 @@ fn window_frame(
     // the encoded id; sorted for deterministic sample ordering.
     let mut tickers: Vec<i32> = frame
         .column("ticker")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .i32()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -417,11 +432,11 @@ fn window_frame(
     for ticker in &tickers {
         let mask = frame
             .column("ticker")
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .i32()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .equal(*ticker);
-        let ticker_data = frame.filter(&mask).map_err(|e| e.to_string())?;
+        let ticker_data = frame.filter(&mask).map_err(|error| error.to_string())?;
 
         if ticker_data.height() < window_size {
             continue;
@@ -568,20 +583,20 @@ pub(crate) fn append_forecast_session_rows(
             ["ticker", "timestamp"],
             SortMultipleOptions::default().with_maintain_order(true),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
     let tickers: Vec<&str> = sorted
         .column("ticker")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
         .collect();
     let timestamps: Vec<i64> = sorted
         .column("timestamp")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .i64()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
         .collect();
 
@@ -607,18 +622,20 @@ pub(crate) fn append_forecast_session_rows(
     }
 
     let source_index = IdxCa::from_vec("index".into(), source_rows);
-    let mut forecast_rows = sorted.take(&source_index).map_err(|e| e.to_string())?;
+    let mut forecast_rows = sorted
+        .take(&source_index)
+        .map_err(|error| error.to_string())?;
     forecast_rows
         .with_column(Column::new(
             "timestamp".into(),
             vec![target_milliseconds; forecast_rows.height()],
         ))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
     let mut combined = sorted;
     combined
         .vstack_mut(&forecast_rows)
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     Ok(combined)
 }
 
@@ -631,9 +648,11 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
             ["ticker", "timestamp"],
             SortMultipleOptions::default().with_maintain_order(true),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
-    let timestamps = data.column("timestamp").map_err(|e| e.to_string())?;
+    let timestamps = data
+        .column("timestamp")
+        .map_err(|error| error.to_string())?;
     let height = data.height();
 
     let mut day_of_week = Vec::with_capacity(height);
@@ -645,24 +664,24 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
 
     let close_prices: Vec<f64> = data
         .column("close_price")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .f64()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
         .collect();
 
     let tickers: Vec<String> = data
         .column("ticker")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
-        .map(|s| s.to_string())
+        .map(|name| name.to_string())
         .collect();
 
     let timestamp_values: Vec<i64> = timestamps
         .i64()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_no_null_iter()
         .collect();
 
@@ -710,22 +729,22 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
     let mut new_data = data.clone();
     new_data
         .with_column(Column::new("day_of_week".into(), day_of_week))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     new_data
         .with_column(Column::new("day_of_month".into(), day_of_month))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     new_data
         .with_column(Column::new("day_of_year".into(), day_of_year))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     new_data
         .with_column(Column::new("month".into(), month))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     new_data
         .with_column(Column::new("year".into(), year))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     new_data
         .with_column(Column::new("daily_return".into(), daily_return))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
     Ok(new_data)
 }
@@ -736,9 +755,9 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
     // `engineer_features` does rather than encoding one and filtering it back out.
     let tickers = data
         .column("ticker")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     if tickers.null_count() > 0 {
         return Err(format!(
             "Equity bars contain {} null ticker values out of {} rows",
@@ -756,28 +775,28 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
 
     let sector_upper: Vec<String> = data
         .column("sector")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
     let industry_upper: Vec<String> = data
         .column("industry")
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .str()
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .into_iter()
         .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
     data.with_column(Column::new("ticker".into(), ticker_upper))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     data.with_column(Column::new("sector".into(), sector_upper))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     data.with_column(Column::new("industry".into(), industry_upper))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
 
     let cleaned = data;
 
@@ -789,10 +808,10 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
     for column in CONTINUOUS_COLUMNS {
         let values = cleaned
             .column(column)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .cast(&DataType::Float64)
-            .map_err(|e| e.to_string())?;
-        let values = values.f64().map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
+        let values = values.f64().map_err(|error| error.to_string())?;
         for (index, value) in values.into_iter().enumerate() {
             if !value.is_some_and(f64::is_finite) {
                 keep_row[index] = false;
@@ -800,7 +819,9 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         }
     }
     let finite_mask: BooleanChunked = keep_row.into_iter().collect();
-    let cleaned = cleaned.filter(&finite_mask).map_err(|e| e.to_string())?;
+    let cleaned = cleaned
+        .filter(&finite_mask)
+        .map_err(|error| error.to_string())?;
     Ok(cleaned)
 }
 
@@ -820,18 +841,18 @@ pub(crate) fn apply_scaling(
 
         let values: Vec<f32> = result
             .column(column_name)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .cast(&DataType::Float64)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .f64()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .into_no_null_iter()
             .map(|value| ((value - mean) / standard_deviation) as f32)
             .collect();
 
         result
             .with_column(Column::new((*column_name).into(), values))
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
     }
     Ok(result)
 }
@@ -852,20 +873,21 @@ pub(crate) fn encode_categoricals(
         if let Some(mapping) = mappings.get(column_name) {
             let values: Vec<Option<i32>> = result
                 .column(column_name)
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .str()
-                .map(|ca| {
-                    ca.into_iter()
-                        .map(|opt_val| opt_val.and_then(|val| mapping.get(val).copied()))
+                .map(|chunked| {
+                    chunked
+                        .into_iter()
+                        .map(|value| value.and_then(|text| mapping.get(text).copied()))
                         .collect()
                 })
                 .or_else(|_| {
                     result
                         .column(column_name)
-                        .map_err(|e| e.to_string())?
+                        .map_err(|error| error.to_string())?
                         .i32()
-                        .map(|ca| ca.into_iter().collect())
-                        .map_err(|e| e.to_string())
+                        .map(|chunked| chunked.into_iter().collect())
+                        .map_err(|error| error.to_string())
                 })?;
 
             // A sentinel merges every unmapped value into one id. For the static columns that
@@ -881,13 +903,16 @@ pub(crate) fn encode_categoricals(
             let is_static = STATIC_CATEGORICAL_COLUMNS.contains(&column_name);
             let unmapped = values.iter().filter(|value| value.is_none()).count();
             let keep: BooleanChunked = values.iter().map(|value| value.is_some()).collect();
-            let encoded: Vec<i32> = values.into_iter().map(|v| v.unwrap_or(-1)).collect();
+            let encoded: Vec<i32> = values
+                .into_iter()
+                .map(|value| value.unwrap_or(-1))
+                .collect();
             result
                 .with_column(Column::new(column_name.into(), encoded))
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
 
             if is_static && unmapped > 0 {
-                result = result.filter(&keep).map_err(|e| e.to_string())?;
+                result = result.filter(&keep).map_err(|error| error.to_string())?;
                 tracing::warn!(
                     column = column_name,
                     dropped_rows = unmapped,
@@ -938,13 +963,13 @@ fn get_float_columns(
     for column_name in columns {
         let cast = data
             .column(column_name)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .cast(&DataType::Float32)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         reject_null_column(&cast, column_name)?;
         let values: Vec<f32> = cast
             .f32()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .into_no_null_iter()
             .collect();
         result.push(values);
@@ -960,13 +985,13 @@ fn get_int_columns(
     for column_name in columns {
         let cast = data
             .column(column_name)
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .cast(&DataType::Int32)
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
         reject_null_column(&cast, column_name)?;
         let values: Vec<i32> = cast
             .i32()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| error.to_string())?
             .into_no_null_iter()
             .collect();
         result.push(values);
@@ -1398,7 +1423,9 @@ mod tests {
             .unwrap()
             .into_no_null_iter()
             .collect();
-        assert!(returns.iter().all(|r| (r - 0.1).abs() < 1e-6));
+        assert!(returns
+            .iter()
+            .all(|daily_return| (daily_return - 0.1).abs() < 1e-6));
     }
 
     #[test]
@@ -1432,7 +1459,9 @@ mod tests {
                 .into_no_null_iter()
                 .collect();
             assert!(
-                values.iter().all(|v| *v == crate::data::details::UNKNOWN),
+                values
+                    .iter()
+                    .all(|value| *value == crate::data::details::UNKNOWN),
                 "{column} fell back to {values:?} instead of the schema default"
             );
         }
@@ -1447,9 +1476,9 @@ mod tests {
         let mut ticker = Vec::with_capacity(total);
         let mut timestamp = Vec::with_capacity(total);
         let mut close = Vec::with_capacity(total);
-        for index in 0..ticker_count {
+        for name in names.iter().take(ticker_count) {
             for row in 0..rows_per_ticker {
-                ticker.push(names[index]);
+                ticker.push(*name);
                 let date =
                     SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
                         .plus_calendar_days(row as i64);

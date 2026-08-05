@@ -11,19 +11,27 @@ use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::TrainingDataset;
 use crate::models::tide::model::TiDEModel;
 
-const EVAL_BATCH: usize = 4096;
+const EVALUATION_BATCH_SIZE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct EvalMetrics {
-    pub crps: f64,
+pub struct EvaluationMetrics {
+    /// Serialized as `crps`, deliberately, even though the field is spelled out.
+    ///
+    /// This value is written into each run's `run_metadata.json` in S3 and read back out of
+    /// *previous* runs' metadata by the trainer's drift check. Every artifact already published
+    /// spells the key `crps`, so renaming it would make the drift baseline read `None` for every
+    /// historical run — and with `DRIFT_MINIMUM_RUNS` at three, that suppresses drift reporting
+    /// entirely until three new runs accumulate, silently.
+    #[serde(rename = "crps")]
+    pub continuous_ranked_probability_score: f64,
     pub directional_accuracy: f64,
     pub quantile_coverage: f64,
 }
 
-impl EvalMetrics {
+impl EvaluationMetrics {
     fn zero() -> Self {
         Self {
-            crps: 0.0,
+            continuous_ranked_probability_score: 0.0,
             directional_accuracy: 0.0,
             quantile_coverage: 0.0,
         }
@@ -91,13 +99,13 @@ impl MetricAccumulator {
     }
 
     /// Averages the totals over the rows added, or returns zeros when none were.
-    fn finish(self) -> EvalMetrics {
+    fn finish(self) -> EvaluationMetrics {
         if self.row_count == 0 {
-            return EvalMetrics::zero();
+            return EvaluationMetrics::zero();
         }
         let rows = self.row_count as f64;
-        EvalMetrics {
-            crps: self.pinball_sum / rows,
+        EvaluationMetrics {
+            continuous_ranked_probability_score: self.pinball_sum / rows,
             directional_accuracy: self.directional_matches as f64 / rows,
             quantile_coverage: self.covered as f64 / rows,
         }
@@ -110,18 +118,18 @@ pub fn evaluate(
     model: &TiDEModel<NdArray>,
     dataset: &TrainingDataset,
     parameters: &ModelParameters,
-) -> Result<EvalMetrics, Box<dyn std::error::Error>> {
+) -> Result<EvaluationMetrics, Box<dyn std::error::Error>> {
     let sample_count = dataset.len();
     let targets = match dataset.targets.as_ref() {
         Some(targets) if sample_count > 0 => targets,
-        _ => return Ok(EvalMetrics::zero()),
+        _ => return Ok(EvaluationMetrics::zero()),
     };
 
     let output_length = parameters.output_length();
     let quantiles = parameters.quantiles();
     let quantile_count = quantiles.len();
     if quantile_count == 0 {
-        return Ok(EvalMetrics::zero());
+        return Ok(EvaluationMetrics::zero());
     }
 
     crate::models::tide::batch::validate_input_shape(dataset, parameters)?;
@@ -132,7 +140,7 @@ pub fn evaluate(
     let mut predictions: Vec<f32> =
         Vec::with_capacity(sample_count * output_length * quantile_count);
     let sample_indices: Vec<usize> = (0..sample_count).collect();
-    for chunk in sample_indices.chunks(EVAL_BATCH) {
+    for chunk in sample_indices.chunks(EVALUATION_BATCH_SIZE) {
         let input = build_input_tensor::<NdArray>(
             dataset,
             chunk,
@@ -141,7 +149,10 @@ pub fn evaluate(
             &device,
         );
         let output = model.forward(input);
-        let mut values: Vec<f32> = output.to_data().to_vec().map_err(|e| format!("{e:?}"))?;
+        let mut values: Vec<f32> = output
+            .to_data()
+            .to_vec()
+            .map_err(|error| format!("{error:?}"))?;
         predictions.append(&mut values);
     }
 
@@ -223,6 +234,33 @@ mod tests {
     use crate::models::tide::data::TrainingDataset;
     use crate::models::tide::model::TiDEModel;
 
+    /// The serialized key is the contract with every artifact already in the bucket, and the Rust
+    /// field name no longer matches it. Nothing else would notice if the `serde(rename)` were
+    /// dropped: the trainer would keep writing metadata, the drift check would keep reading
+    /// `metrics.crps`, and it would find nothing there — reporting `InsufficientHistory` rather
+    /// than an error, which is indistinguishable from a genuinely young bucket.
+    #[test]
+    fn test_metrics_serialize_under_the_published_crps_key() {
+        let metrics = EvaluationMetrics {
+            continuous_ranked_probability_score: 0.25,
+            directional_accuracy: 0.5,
+            quantile_coverage: 0.8,
+        };
+        let serialized = serde_json::to_value(metrics).expect("metrics must serialize");
+
+        assert_eq!(
+            serialized["crps"].as_f64(),
+            Some(0.25),
+            "the drift check reads `metrics.crps`; got {serialized}"
+        );
+        assert!(
+            serialized
+                .get("continuous_ranked_probability_score")
+                .is_none(),
+            "the spelled-out name must not reach the artifact metadata"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // argmin / argmax / closest_to
     // ---------------------------------------------------------------------------
@@ -280,13 +318,13 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // EvalMetrics::zero
+    // EvaluationMetrics::zero
     // ---------------------------------------------------------------------------
 
     #[test]
     fn test_eval_metrics_zero_fields_are_zero() {
-        let metrics = EvalMetrics::zero();
-        assert_eq!(metrics.crps, 0.0);
+        let metrics = EvaluationMetrics::zero();
+        assert_eq!(metrics.continuous_ranked_probability_score, 0.0);
         assert_eq!(metrics.directional_accuracy, 0.0);
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
@@ -307,7 +345,11 @@ mod tests {
     /// short, divide by a smaller row count, and produce a plausible number for a table nobody
     /// wrote — the failure this whole change exists to remove, reintroduced in the fixture instead
     /// of the code.
-    fn metrics_from(predictions: &[[f64; 3]], targets: &[f64], quantiles: &[f64]) -> EvalMetrics {
+    fn metrics_from(
+        predictions: &[[f64; 3]],
+        targets: &[f64],
+        quantiles: &[f64],
+    ) -> EvaluationMetrics {
         assert_eq!(
             predictions.len(),
             targets.len(),
@@ -351,35 +393,50 @@ mod tests {
         assert_eq!(shuffled.quantile_coverage, sorted.quantile_coverage);
         assert_eq!(shuffled.directional_accuracy, sorted.directional_accuracy);
         assert!(
-            (shuffled.crps - sorted.crps).abs() < 1e-9,
+            (shuffled.continuous_ranked_probability_score
+                - sorted.continuous_ranked_probability_score)
+                .abs()
+                < 1e-9,
             "pinball loss pairs each quantile with its own prediction: {} vs {}",
-            shuffled.crps,
-            sorted.crps
+            shuffled.continuous_ranked_probability_score,
+            sorted.continuous_ranked_probability_score
         );
     }
 
     #[test]
     fn test_continuous_ranked_probability_score_positive_error_branch() {
         // target=1.0, all predictions=0.0; error=1.0 >= 0 for every quantile.
-        // row_loss = 0.1*1 + 0.5*1 + 0.9*1 = 1.5; single row so crps=1.5.
+        // row_loss = 0.1*1 + 0.5*1 + 0.9*1 = 1.5; single row so continuous_ranked_probability_score=1.5.
         let metrics = metrics_from(&[[0.0, 0.0, 0.0]], &[1.0], &[0.1, 0.5, 0.9]);
-        assert!((metrics.crps - 1.5).abs() < 1e-9, "crps={}", metrics.crps);
+        assert!(
+            (metrics.continuous_ranked_probability_score - 1.5).abs() < 1e-9,
+            "crps={}",
+            metrics.continuous_ranked_probability_score
+        );
     }
 
     #[test]
     fn test_continuous_ranked_probability_score_negative_error_branch() {
         // target=-1.0, all predictions=0.0; error=-1.0 < 0 for every quantile.
         // pinball = (q-1)*error: (0.1-1)*(-1)=0.9, (0.5-1)*(-1)=0.5, (0.9-1)*(-1)=0.1
-        // row_loss = 1.5; single row so crps=1.5.
+        // row_loss = 1.5; single row so continuous_ranked_probability_score=1.5.
         let metrics = metrics_from(&[[0.0, 0.0, 0.0]], &[-1.0], &[0.1, 0.5, 0.9]);
-        assert!((metrics.crps - 1.5).abs() < 1e-9, "crps={}", metrics.crps);
+        assert!(
+            (metrics.continuous_ranked_probability_score - 1.5).abs() < 1e-9,
+            "crps={}",
+            metrics.continuous_ranked_probability_score
+        );
     }
 
     #[test]
     fn test_continuous_ranked_probability_score_exact_prediction_is_zero() {
-        // When every prediction equals the target, error=0 so crps=0.
+        // When every prediction equals the target, error=0 so continuous_ranked_probability_score=0.
         let metrics = metrics_from(&[[0.3, 0.3, 0.3]], &[0.3], &[0.1, 0.5, 0.9]);
-        assert!((metrics.crps).abs() < 1e-9, "crps={}", metrics.crps);
+        assert!(
+            (metrics.continuous_ranked_probability_score).abs() < 1e-9,
+            "crps={}",
+            metrics.continuous_ranked_probability_score
+        );
     }
 
     #[test]
@@ -441,18 +498,18 @@ mod tests {
     /// `input_length` and `output_length` so `build_input_tensor` does not
     /// panic, using the tiny 32-input-feature model defined below.
     ///
-    /// input_size = input_length*n_cont + input_length*n_cat + output_length*n_cat + n_static
+    /// input_size = input_length*continuous + input_length*categorical + output_length*categorical + static_categorical
     ///            = 2*7 + 2*5 + 1*5 + 3 = 32
-    fn make_tiny_dataset(num_samples: usize, with_targets: bool) -> TrainingDataset {
+    fn make_tiny_dataset(sample_count: usize, with_targets: bool) -> TrainingDataset {
         let input_length = 2_usize;
         let output_length = 1_usize;
         TrainingDataset {
-            past_continuous: ndarray::Array3::zeros((num_samples, input_length, 7)),
-            past_categorical: ndarray::Array3::zeros((num_samples, input_length, 5)),
-            future_categorical: ndarray::Array3::zeros((num_samples, output_length, 5)),
-            static_categorical: ndarray::Array3::zeros((num_samples, 1, 3)),
+            past_continuous: ndarray::Array3::zeros((sample_count, input_length, 7)),
+            past_categorical: ndarray::Array3::zeros((sample_count, input_length, 5)),
+            future_categorical: ndarray::Array3::zeros((sample_count, output_length, 5)),
+            static_categorical: ndarray::Array3::zeros((sample_count, 1, 3)),
             targets: if with_targets {
-                Some(ndarray::Array3::zeros((num_samples, output_length, 1)))
+                Some(ndarray::Array3::zeros((sample_count, output_length, 1)))
             } else {
                 None
             },
@@ -478,7 +535,7 @@ mod tests {
         let dataset = make_tiny_dataset(0, true);
         let parameters = make_tiny_parameters();
         let metrics = evaluate(&model, &dataset, &parameters).unwrap();
-        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.continuous_ranked_probability_score, 0.0);
         assert_eq!(metrics.directional_accuracy, 0.0);
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
@@ -490,7 +547,7 @@ mod tests {
         let dataset = make_tiny_dataset(4, false);
         let parameters = make_tiny_parameters();
         let metrics = evaluate(&model, &dataset, &parameters).unwrap();
-        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.continuous_ranked_probability_score, 0.0);
         assert_eq!(metrics.directional_accuracy, 0.0);
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
@@ -503,7 +560,7 @@ mod tests {
         // Use a model whose quantile list is empty.
         let parameters = ModelParameters::for_tests(32, 8, 1, 1, 1, 2, 0.0, vec![], 0.5);
         let metrics = evaluate(&model, &dataset, &parameters).unwrap();
-        assert_eq!(metrics.crps, 0.0);
+        assert_eq!(metrics.continuous_ranked_probability_score, 0.0);
         assert_eq!(metrics.directional_accuracy, 0.0);
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
@@ -511,13 +568,17 @@ mod tests {
     #[test]
     fn test_evaluate_with_samples_returns_valid_metrics() {
         // Run the full inference path: sample_count > 0, targets present, quantiles non-empty.
-        // The model is randomly initialised so we only assert the metric ranges, not values.
+        // The model is randomly initialized so we only assert the metric ranges, not values.
         let model = make_tiny_model();
         let dataset = make_tiny_dataset(3, true);
         let parameters = make_tiny_parameters();
         let metrics = evaluate(&model, &dataset, &parameters).unwrap();
-        // crps is a sum of non-negative pinball losses so it must be >= 0.
-        assert!(metrics.crps >= 0.0, "crps={}", metrics.crps);
+        // continuous_ranked_probability_score is a sum of non-negative pinball losses so it must be >= 0.
+        assert!(
+            metrics.continuous_ranked_probability_score >= 0.0,
+            "crps={}",
+            metrics.continuous_ranked_probability_score
+        );
         // directional_accuracy is a fraction in [0,1].
         assert!(
             (0.0..=1.0).contains(&metrics.directional_accuracy),
@@ -534,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_larger_batch_than_eval_batch_size() {
-        // Exercises multi-chunk iteration by exceeding EVAL_BATCH (4096).
+        // Exercises multi-chunk iteration by exceeding EVALUATION_BATCH_SIZE (4096).
         let model = make_tiny_model();
         let dataset = make_tiny_dataset(4097, true);
         let parameters = make_tiny_parameters();

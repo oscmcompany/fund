@@ -213,8 +213,8 @@ mod tests {
     fn test_load_fails_loudly_when_record_is_missing() {
         // No tide_states record in the directory: load must error rather than
         // fall back to random weights and report success.
-        let dir = tempfile::tempdir().unwrap();
-        let result = TiDEModel::<NdArray>::load(dir.path(), 24, 16, 2, 1, 5, 3, 0.0);
+        let directory = tempfile::tempdir().unwrap();
+        let result = TiDEModel::<NdArray>::load(directory.path(), 24, 16, 2, 1, 5, 3, 0.0);
         assert!(result.is_err());
         let message = result.err().unwrap().to_string();
         assert!(message.contains("Failed to load model weights"));
@@ -228,7 +228,7 @@ mod tests {
 
         let input = Tensor::<NdArray, 1>::from_floats(
             (0..(4 * input_size))
-                .map(|i| (i as f32 * 0.37).sin())
+                .map(|index| (index as f32 * 0.37).sin())
                 .collect::<Vec<_>>()
                 .as_slice(),
             &device,
@@ -277,7 +277,7 @@ mod tests {
         // A non-trivial input so a random-weight fallback would differ.
         let input = Tensor::<NdArray, 1>::from_floats(
             (0..(2 * input_size))
-                .map(|i| i as f32 * 0.01)
+                .map(|index| index as f32 * 0.01)
                 .collect::<Vec<_>>()
                 .as_slice(),
             &device,
@@ -285,11 +285,11 @@ mod tests {
         .reshape([2, input_size]);
         let expected: Vec<f32> = model.forward(input.clone()).to_data().to_vec().unwrap();
 
-        let dir = tempfile::tempdir().unwrap();
-        model.save(dir.path()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        model.save(directory.path()).unwrap();
 
         let loaded =
-            TiDEModel::<NdArray>::load(dir.path(), input_size, 16, 2, 1, 5, 3, 0.0).unwrap();
+            TiDEModel::<NdArray>::load(directory.path(), input_size, 16, 2, 1, 5, 3, 0.0).unwrap();
         let actual: Vec<f32> = loaded.forward(input).to_data().to_vec().unwrap();
 
         assert_eq!(expected.len(), actual.len());

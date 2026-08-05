@@ -59,7 +59,7 @@ pub fn consolidate_data(
                 .and(col("close_price").gt(lit(0.0))),
         )
         .collect()
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     let details = equity_details
         .lazy()
@@ -81,7 +81,7 @@ pub fn consolidate_data(
                 .and(col("industry").is_not_null()),
         )
         .collect()
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     let consolidated = bars
         .join(
@@ -91,7 +91,7 @@ pub fn consolidate_data(
             JoinArgs::new(JoinType::Inner),
             None,
         )
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     let columns = [
         "ticker",
@@ -108,7 +108,7 @@ pub fn consolidate_data(
 
     let selected = consolidated
         .select(columns)
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     info!(rows = selected.height(), "Data consolidated");
     Ok(selected)
@@ -146,7 +146,7 @@ pub fn filter_equity_bars(
         )
         .select([col("ticker")])
         .collect()
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     let filtered = data
         .lazy()
@@ -157,7 +157,7 @@ pub fn filter_equity_bars(
             JoinArgs::new(JoinType::Semi),
         )
         .collect()
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     info!(
         before = before_count,
@@ -175,7 +175,7 @@ pub fn filter_to_trained_tickers(
     let trained_tickers: Vec<String> = model_state
         .mappings()
         .get("ticker")
-        .map(|m| m.keys().cloned().collect())
+        .map(|mapping| mapping.keys().cloned().collect())
         .unwrap_or_default();
 
     if trained_tickers.is_empty() {
@@ -190,7 +190,7 @@ pub fn filter_to_trained_tickers(
         .with_column(col("ticker").cast(DataType::String).str().to_uppercase())
         .filter(col("ticker").is_in(lit(ticker_series), false))
         .collect()
-        .map_err(|e| PredictionError::DataConsolidation(e.to_string()))?;
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
     if filtered.height() == 0 {
         return Err(PredictionError::NoMatchingTickers);
@@ -251,13 +251,13 @@ pub fn generate_predictions(
 
     let tide_data =
         Data::apply_existing_scaler(data, model_state.scaler(), model_state.mappings(), session)
-            .map_err(|e| PredictionError::Preprocessing(e.to_string()))?;
+            .map_err(|error| PredictionError::Preprocessing(error.to_string()))?;
 
     let output_length = model_state.parameters().output_length();
     let dataset_input_length = model_state.parameters().input_length();
     let dataset = tide_data
         .get_dataset(DatasetKind::Predict, dataset_input_length, output_length)
-        .map_err(|e| PredictionError::DatasetCreation(e.to_string()))?;
+        .map_err(|error| PredictionError::DatasetCreation(error.to_string()))?;
 
     if dataset.is_empty() {
         return Err(PredictionError::DatasetCreation(
@@ -273,9 +273,9 @@ pub fn generate_predictions(
         .map_err(PredictionError::DatasetCreation)?;
 
     let device = Default::default();
-    let num_samples = dataset.len();
+    let sample_count = dataset.len();
 
-    let indices: Vec<usize> = (0..num_samples).collect();
+    let indices: Vec<usize> = (0..sample_count).collect();
     let inputs = crate::models::tide::batch::build_input_tensor::<NdArray>(
         &dataset,
         &indices,
@@ -288,7 +288,7 @@ pub fn generate_predictions(
     let predictions_data: Vec<f32> = predictions
         .to_data()
         .to_vec()
-        .map_err(|e| PredictionError::Inference(format!("{e:?}")))?;
+        .map_err(|error| PredictionError::Inference(format!("{error:?}")))?;
 
     let quantile_count = model_state.parameters().quantiles().len();
     // The output schema is fixed at quantile_10/quantile_50/quantile_90, so a
@@ -309,27 +309,29 @@ pub fn generate_predictions(
             "the loaded artifact has no 'ticker' categorical mapping".to_string(),
         )
     })?;
-    let reverse_ticker_map: std::collections::HashMap<i32, &String> =
-        ticker_mapping.iter().map(|(k, v)| (*v, k)).collect();
+    let reverse_ticker_map: std::collections::HashMap<i32, &String> = ticker_mapping
+        .iter()
+        .map(|(ticker, id)| (*id, ticker))
+        .collect();
 
-    for sample_idx in 0..num_samples {
-        let ticker_id = dataset.static_categorical[[sample_idx, 0, 0]];
+    for sample_index in 0..sample_count {
+        let ticker_id = dataset.static_categorical[[sample_index, 0, 0]];
         let ticker = reverse_ticker_map
             .get(&ticker_id)
-            .map(|s| s.as_str())
+            .map(|ticker| ticker.as_str())
             .unwrap_or("UNKNOWN");
 
-        for t in 0..output_length {
-            let base_idx = (sample_idx * output_length + t) * quantile_count;
+        for step in 0..output_length {
+            let base_index = (sample_index * output_length + step) * quantile_count;
 
             let scaled: Vec<f64> = (0..quantile_count)
-                .map(|q| predictions_data[base_idx + q] as f64)
+                .map(|quantile| predictions_data[base_index + quantile] as f64)
                 .collect();
             let quantiles = unscale_and_sort_quantiles(&scaled, model_state.scaler());
 
             results.push(serde_json::json!({
                 "ticker": ticker,
-                "timestamp": step_timestamp_milliseconds(now, t),
+                "timestamp": step_timestamp_milliseconds(now, step),
                 "quantile_10": quantiles[0],
                 "quantile_50": quantiles[1],
                 "quantile_90": quantiles[2],
@@ -345,7 +347,7 @@ pub fn generate_predictions(
 
     let final_predictions: Vec<serde_json::Value> = results
         .into_iter()
-        .filter(|r| r["timestamp"] == target_date)
+        .filter(|row| row["timestamp"] == target_date)
         .collect();
 
     info!(count = final_predictions.len(), "Predictions generated");
@@ -406,8 +408,8 @@ pub fn validate_predictions(predictions: &[serde_json::Value]) -> Result<(), Str
 
     let all_timestamp_sets: Vec<Vec<i64>> = timestamps_by_ticker
         .values()
-        .map(|ts| {
-            let mut sorted = ts.clone();
+        .map(|timestamps| {
+            let mut sorted = timestamps.clone();
             sorted.sort();
             sorted
         })
@@ -687,7 +689,7 @@ mod tests {
             .unwrap()
             .into_no_null_iter()
             .collect();
-        assert!(tickers.iter().all(|t| *t == "GOOG"));
+        assert!(tickers.iter().all(|ticker| *ticker == "GOOG"));
     }
 
     #[test]
@@ -709,7 +711,7 @@ mod tests {
             .unwrap()
             .into_no_null_iter()
             .collect();
-        assert!(tickers.iter().all(|t| *t == "GOOG"));
+        assert!(tickers.iter().all(|ticker| *ticker == "GOOG"));
     }
 
     /// The threshold itself must pass, because the other two sites that read these constants let it
@@ -1344,11 +1346,11 @@ mod tests {
 
     #[test]
     fn test_validate_predictions_three_tickers_same_timestamps_ok() {
-        let ts = 1_750_000_000_000i64;
+        let timestamp = 1_750_000_000_000i64;
         let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": ts, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
-            serde_json::json!({"ticker": "MSFT", "timestamp": ts, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": ts, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
+            serde_json::json!({"ticker": "AAPL", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
+            serde_json::json!({"ticker": "MSFT", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
+            serde_json::json!({"ticker": "GOOG", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
         ];
         assert!(validate_predictions(&predictions).is_ok());
     }
