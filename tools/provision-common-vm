@@ -212,19 +212,28 @@ phase_create_vm() {
   done
   [[ $elapsed -ge $timeout ]] && fail "Timed out waiting for VM to reach running state after ${timeout}s"
 
-  # Wait for SSH connectivity
+  # Wait for SSH connectivity.
+  #
+  # Until the VM's SSH route is live, "$VM_NAME.exe.xyz" is answered by the
+  # exe.dev control REPL, which accepts `true` and exits 0. Exit status alone is
+  # therefore not proof the VM answered, so probe with a command the REPL
+  # rejects and require its output back.
   step "Waiting for SSH connectivity"
   local ssh_elapsed=0
-  local ssh_timeout=60
+  local ssh_timeout=180
+  local ssh_connected=false
   while [[ $ssh_elapsed -lt $ssh_timeout ]]; do
-    if ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$VM_NAME.exe.xyz" true 2>/dev/null; then
+    if [[ "$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      "$VM_NAME.exe.xyz" "echo provision-probe" 2>/dev/null)" == "provision-probe" ]]; then
+      ssh_connected=true
       echo "SSH connection established"
       break
     fi
     sleep 3
     ssh_elapsed=$((ssh_elapsed + 3))
   done
-  [[ $ssh_elapsed -ge $ssh_timeout ]] && fail "Timed out waiting for SSH connectivity after ${ssh_timeout}s"
+  [[ "$ssh_connected" == true ]] \
+    || fail "Timed out after ${ssh_timeout}s waiting for $VM_NAME to answer SSH (the exe.dev control REPL is still answering for $VM_NAME.exe.xyz)"
 
   # Apply tag(s)
   step "Tagging VM"
