@@ -196,21 +196,23 @@ phase_create_vm() {
     echo "VM creation initiated"
   fi
 
-  # Poll until running
-  local elapsed=0
+  # Poll until running. SECONDS is a bash builtin counting real elapsed time, so
+  # the deadline covers each poll as well as the sleep between them.
   local timeout=300
-  while [[ $elapsed -lt $timeout ]]; do
+  local deadline=$((SECONDS + timeout))
+  local vm_running=false
+  while (( SECONDS < deadline )); do
     local status
     status="$(ssh exe.dev ls --json 2>/dev/null | jq -r ".vms[] | select(.vm_name == \"$VM_NAME\") | .status" || echo "unknown")"
     if [[ "$status" == "running" ]]; then
+      vm_running=true
       echo "VM '$VM_NAME' is running"
       break
     fi
     echo "  Status: $status (waiting...)"
     sleep 3
-    elapsed=$((elapsed + 3))
   done
-  [[ $elapsed -ge $timeout ]] && fail "Timed out waiting for VM to reach running state after ${timeout}s"
+  [[ "$vm_running" == true ]] || fail "Timed out waiting for VM to reach running state after ${timeout}s"
 
   # Wait for SSH connectivity.
   #
@@ -218,22 +220,31 @@ phase_create_vm() {
   # exe.dev control REPL, which accepts `true` and exits 0. Exit status alone is
   # therefore not proof the VM answered, so probe with a command the REPL
   # rejects and require its output back.
+  #
+  # Match the probe token as a whole line rather than as the entire output, so a
+  # shell startup file or banner writing to stdout cannot fail an otherwise
+  # healthy VM. Capture first and match against the variable: the callers set
+  # `pipefail`, and `grep -q` exits on its first match, which can leave `ssh`
+  # killed by SIGPIPE and fail the pipeline despite a successful probe.
+  # ConnectTimeout bounds the handshake; the keepalive settings bound a session
+  # that stalls after it.
   step "Waiting for SSH connectivity"
-  local ssh_elapsed=0
   local ssh_timeout=180
+  local ssh_deadline=$((SECONDS + ssh_timeout))
   local ssh_connected=false
-  while [[ $ssh_elapsed -lt $ssh_timeout ]]; do
-    if [[ "$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-      "$VM_NAME.exe.xyz" "echo provision-probe" 2>/dev/null)" == "provision-probe" ]]; then
+  while (( SECONDS < ssh_deadline )); do
+    local probe_output
+    probe_output="$(ssh -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+      -o StrictHostKeyChecking=accept-new "$VM_NAME.exe.xyz" "echo provision-probe" 2>/dev/null || true)"
+    if grep -Fqx provision-probe <<<"$probe_output"; then
       ssh_connected=true
       echo "SSH connection established"
       break
     fi
     sleep 3
-    ssh_elapsed=$((ssh_elapsed + 3))
   done
   [[ "$ssh_connected" == true ]] \
-    || fail "Timed out after ${ssh_timeout}s waiting for $VM_NAME to answer SSH (the exe.dev control REPL is still answering for $VM_NAME.exe.xyz)"
+    || fail "Timed out after ${ssh_timeout}s waiting for $VM_NAME.exe.xyz to return the probe string over SSH (check by hand: ssh $VM_NAME.exe.xyz \"echo provision-probe\")"
 
   # Apply tag(s)
   step "Tagging VM"
@@ -297,9 +308,9 @@ phase_reboot() {
   remote "sudo reboot" || true
   sleep 5
 
-  local reboot_elapsed=0
   local reboot_timeout=60
-  while [[ $reboot_elapsed -lt $reboot_timeout ]]; do
+  local reboot_deadline=$((SECONDS + reboot_timeout))
+  while (( SECONDS < reboot_deadline )); do
     local new_boot_id
     if new_boot_id="$(ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$VM_NAME.exe.xyz" \
       "cat /proc/sys/kernel/random/boot_id" 2>/dev/null)" \
@@ -308,7 +319,6 @@ phase_reboot() {
       return 0
     fi
     sleep 3
-    reboot_elapsed=$((reboot_elapsed + 3))
   done
   fail "Timed out waiting for VM to come back after reboot (${reboot_timeout}s)"
 }
