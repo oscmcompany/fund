@@ -5,7 +5,7 @@
 //! into the binary. A fresh database therefore has no sector information until this runs, and the
 //! pair screen's per-sector cap silently constrains nothing without it.
 //!
-//! Usage: `seed_equity_details`
+//! Usage: `seed_equity_details_postgres`
 //!
 //! There are no arguments. The trainer reads the same embedded CSV directly rather than a copy in
 //! a bucket, so PostgreSQL is the only target.
@@ -19,9 +19,9 @@ use tracing::{error, info};
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
     let tracing_guard = init_tracing(
-        "seed-equity-details.log",
+        "seed-equity-details-postgres.log",
         Some("info"),
-        "seed-equity-details",
+        "seed-equity-details-postgres",
     );
 
     let code = match run().await {

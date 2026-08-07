@@ -4,13 +4,19 @@
 -- views over the S3 data lake so production and export data is queryable
 -- immediately.
 --
--- Two prefixes, and they are not interchangeable:
+-- Two prefixes, one owner each, and they are not interchangeable:
 --
 --   data/    the trainer's own archive. Fetched from Massive and written by the
 --            trainer VM, which has no database. This is the training input and
---            it accumulates for as long as the bucket keeps it.
---   exports/ the application's nightly export of its PostgreSQL tables. This is
---            what the 90-day retention window would otherwise discard.
+--            the long-term record of equity bars and ticker metadata; it
+--            accumulates for as long as the bucket keeps it.
+--   exports/ the application's nightly export of the tables only it knows
+--            about -- events, predictions, pairs, account state. This is what
+--            the retention window would otherwise discard.
+--
+-- Bars and ticker metadata appear under data/ and nowhere else. They used to be
+-- exported as well, from the same Massive endpoint by a second path, and two
+-- writers of one fact is one too many.
 --
 -- Requirements:
 --   - AWS credentials configured in the environment (e.g. ~/.aws/credentials)
@@ -52,23 +58,9 @@ FROM read_csv(
 -- Nightly exports (exports/) -- one view per exported table
 -- ---------------------------------------------------------------------------
 
-.print 'Loading equity_bars...'
-DROP VIEW IF EXISTS equity_bars;
-CREATE OR REPLACE VIEW equity_bars AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/bars/**/*.parquet',
-    hive_partitioning = true
-);
-
-.print 'Loading equity_details...'
-DROP VIEW IF EXISTS equity_details;
-CREATE OR REPLACE VIEW equity_details AS
-SELECT *
-FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/equity/details/**/*.parquet',
-    hive_partitioning = true
-);
+-- Bars and ticker metadata are not here. They were exported under this prefix as well as archived
+-- under data/, from the same Massive endpoint, and the trainer's archive is now their single
+-- owner -- query `training_bars` and `training_details` above for them.
 
 .print 'Loading equity_predictions...'
 DROP VIEW IF EXISTS equity_predictions;
