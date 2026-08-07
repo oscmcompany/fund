@@ -14,8 +14,11 @@ This is a collection of guidelines and references.
 - AWS S3 is used for blob storage
 - AWS Secrets Manager stores secrets in secretspec format (`secretspec/{project}/{profile}/{key}`)
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
-- Add in-line code comments only where necessary for clarity; include language-appropriate docstrings for functions and
-  modules
+- Document sparingly and durably - write language-appropriate docstrings for functions, types, and modules, and add
+  in-line comments only where a step is genuinely surprising; a docstring says what something is for, plus any
+  caveat, invariant, or assumption a caller cannot read off the signature — it never restates the implementation,
+  because prose duplicating the code silently falls out of sync and module documentation is a few lines of high-level
+  orientation, not an inventory of its contents
 - Spell identifiers out fully in code (variables, functions, fields, modules): prefer `dataframe` over
   `df`, `message` over `msg`, `error_message` over `err_msg`, `quantity` over `qty`, `index` over `idx`,
   `column` over `col`, `value` over `val`, `volatility` over `vol`, `profit_and_loss` over `pnl`,
