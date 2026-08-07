@@ -31,13 +31,12 @@ devenv --profile application up
 # Provision the application VM from your local machine then SSH in and
 # start services with sync cron.
 provision-production-application-vm
-ssh oscm-fund-production-application.vm.exe.dev
+ssh oscm-fund-production-application.exe.dev
 start-application
 
 # Seed ticker metadata and historical bars into PostgreSQL on the running
-# application. Run without arguments for full usage and options. The pair screen
-# needs 60 sessions of aligned closes and the model 70, so allow six months.
-SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed
+# application. 
+SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres
 
 # Share the VM with the team and publish the dashboard externally.
 ssh exe.dev share add oscm-fund-production-application team
@@ -47,8 +46,12 @@ ssh exe.dev publish oscm-fund-production-application 8084:8084
 # Provision the trainer VM from your local machine then SSH in and install
 # the training cron job.
 provision-production-trainer-vm
-ssh oscm-fund-production-trainer.vm.exe.dev
+ssh oscm-fund-production-trainer.exe.dev
 start-trainer
+
+# Seed the S3 bar archive the trainer trains from. Needed once on a fresh
+# bucket.
+devenv tasks run data:seed:s3
 
 # Launch DuckDB for a local query interface against S3 with all data lake views
 # pre-loaded. Once in the DuckDB shell, run .help for commands and SHOW TABLES

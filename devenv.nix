@@ -683,14 +683,21 @@ in {
     fi
   '';
 
-  # Bars come from Massive and go into PostgreSQL. There is no source or target to choose any more:
-  # the grouped endpoint answers by date rather than by symbol list, and the trainer fetches and
-  # archives its own S3 parquet rather than reading what a seed run left behind.
-  scripts.seed-equity-bars.exec = ''
+  # Seeding, by data type and target. Bars come from Massive either way -- the grouped endpoint
+  # answers by date rather than by symbol list -- but the two targets serve different readers and
+  # have different requirements, which is why they are separate scripts rather than one with a flag.
+  #
+  #   *-postgres  what the application trades from. Needs a database, no AWS.
+  #   *-s3        what the trainer trains from. Needs AWS and Massive, no database.
+  #
+  # Neither one can stand in for the other: the application never reads the archive and the trainer
+  # has no database to read.
+
+  scripts.seed-equity-bars-postgres.exec = ''
     set -euo pipefail
 
     if [ -z "''${SEED_START_DATE:-}" ]; then
-      echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:equity-bars"
+      echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres"
       echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
       echo ""
       echo "  Fetches whole-market daily bars from Massive, one request per session, and upserts"
@@ -699,18 +706,50 @@ in {
       exit 1
     fi
 
-    echo "Seeding equity bars from $SEED_START_DATE to ''${SEED_END_DATE:-today}"
+    echo "Seeding equity bars into PostgreSQL from $SEED_START_DATE to ''${SEED_END_DATE:-today}"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_bars -- \
+    secretspec run -- cargo run --release --bin seed_equity_bars_postgres -- \
       "$SEED_START_DATE" ''${SEED_END_DATE:-}
   '';
 
-  scripts.seed-equity-details.exec = ''
+  scripts.seed-equity-details-postgres.exec = ''
     set -euo pipefail
 
-    echo "Seeding equity details from the embedded CSV"
+    echo "Seeding equity details into PostgreSQL from the embedded CSV"
     ${runtimeEnv}
-    secretspec run -- cargo run --release --bin seed_equity_details
+    secretspec run -- cargo run --release --bin seed_equity_details_postgres
+  '';
+
+  # No required start date, unlike the PostgreSQL side. The archive is repaired by set difference
+  # against what the bucket already holds, so "no arguments" is the useful default -- it means make
+  # the last two years right, whatever is currently missing from them.
+  scripts.seed-equity-bars-s3.exec = ''
+    set -euo pipefail
+
+    # Rejected rather than defaulted. The arguments are positional, so an unset start with a set end
+    # would send exactly one word and the binary would read it as the *start* date -- repairing a
+    # window running from the intended end to today, while the echo below reported the window the
+    # operator meant. Silently repairing the wrong range is worse than refusing to start.
+    if [ -z "''${SEED_START_DATE:-}" ] && [ -n "''${SEED_END_DATE:-}" ]; then
+      echo "SEED_END_DATE is set but SEED_START_DATE is not."
+      echo "  These are positional, so an end date alone would be read as the start date and the"
+      echo "  archive repaired over the wrong window. Set both, or set neither to repair the last"
+      echo "  two years."
+      exit 1
+    fi
+
+    echo "Seeding the S3 equity bar archive from ''${SEED_START_DATE:-two years ago} to ''${SEED_END_DATE:-today}"
+    ${runtimeEnv}
+    secretspec run -- cargo run --release --bin seed_equity_bars_s3 -- \
+      ''${SEED_START_DATE:-} ''${SEED_END_DATE:-}
+  '';
+
+  scripts.seed-equity-details-s3.exec = ''
+    set -euo pipefail
+
+    echo "Archiving equity details to S3 from the embedded CSV"
+    ${runtimeEnv}
+    secretspec run -- cargo run --release --bin seed_equity_details_s3
   '';
 
   tasks = {
@@ -741,34 +780,46 @@ in {
 
     # --- Model training ---
 
-    # Rust-native TiDE training (burn). Fetches its own bars from Massive, archives them to S3,
-    # trains against the accumulated window, and uploads a model.tar.gz the service loads directly.
+    # Rust-native TiDE training (burn). Repairs its own S3 bar archive over the training window --
+    # every weekday in it with no partition is fetched from Massive, so a missed night and a week of
+    # downtime cost the same nothing -- then trains against that window and uploads a model.tar.gz
+    # the service loads directly. A gap older than the window is `data:seed:s3`, which floors at two
+    # years.
     # Needs no Alpaca credentials: the grouped endpoint answers by date, so there is no symbol list
-    # to build and therefore no broker to ask for one.
+    # to build and therefore no broker to ask for one. That is also why the archive scan decides
+    # which sessions to request from weekends rather than from the published trading calendar.
     # The former Python/tinygrad workflow and its Prefect block registration are retired.
     "models:tide:train".exec = ''
       set -euo pipefail
-      echo "Running tide training pipeline (Rust + burn)"
+      echo "Repairing the bar archive and running the tide training pipeline (Rust + burn)"
       ${runtimeEnv}
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
     # --- Data tasks ---
+    #
+    # Two targets with disjoint requirements, so each half preflights its own and says which task to
+    # run instead. `data:seed` runs both, which works on a laptop with `devenv up` and on the
+    # application VM; on the trainer VM, which has no database, only `data:seed:s3` can run. A
+    # silent skip would be the wrong answer there -- a seed that quietly did half its work is how a
+    # deployment ends up with an archive and no trading data, or the reverse.
 
-    # Seed whole-market equity bars from Massive into PostgreSQL over a date range.
-    "data:equity-bars".exec = "seed-equity-bars";
-
-    # Seed ticker metadata from the embedded CSV into PostgreSQL.
-    "data:equity-details".exec = "seed-equity-details";
-
-    # Full bootstrap for an empty database. Details first, because they are fast and carry no date
-    # range, and because the pair screen's sector rule silently admits nothing without them.
-    "data:seed" = {
+    # Bootstrap for an empty database. Details first, because they are fast and carry no date range,
+    # and because the pair screen's sector rule silently admits nothing without them.
+    "data:seed:postgres" = {
       exec = ''
         set -euo pipefail
 
+        if ! psql -h localhost -p 5432 -d fund -c 'SELECT 1' > /dev/null 2>&1; then
+          echo "No PostgreSQL at localhost:5432 (database 'fund')."
+          echo "  This half of the seed writes what the application trades from and needs a"
+          echo "  database. Start one with 'devenv up', or if you are on the trainer VM run"
+          echo "  'devenv tasks run data:seed:s3' instead -- the trainer has no database."
+          exit 1
+        fi
+
         if [ -z "''${SEED_START_DATE:-}" ]; then
-          echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed"
+          echo "Usage: SEED_START_DATE=YYYY-MM-DD devenv tasks run data:seed:postgres"
           echo "  Optional: SEED_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
           echo ""
           echo "  Seeds ticker metadata and daily bars into PostgreSQL. The screen needs 60"
@@ -776,14 +827,46 @@ in {
           exit 1
         fi
 
-        echo "=== Seeding equity details ==="
-        seed-equity-details
+        echo "=== Seeding equity details into PostgreSQL ==="
+        seed-equity-details-postgres
 
         echo ""
-        echo "=== Seeding equity bars ==="
-        seed-equity-bars
+        echo "=== Seeding equity bars into PostgreSQL ==="
+        seed-equity-bars-postgres
       '';
     };
+
+    # Bootstrap and repair for the S3 archive the trainer trains from. Needs no start date: the
+    # range is repaired by set difference against what the bucket already holds, so re-running is
+    # both cheap and the way to close a gap.
+    # Deliberately declares no `after` on the PostgreSQL half. An `after` would order the two when
+    # both run, but it would also drag the database half into a bare `data:seed:s3` -- which is the
+    # one command the trainer VM, having no database, must be able to run on its own. The cost is
+    # that `data:seed` fetches each session from Massive twice, once per target; that is the price
+    # of each half being independently runnable, and the ranges usually differ anyway.
+    "data:seed:s3" = {
+      exec = ''
+        set -euo pipefail
+
+        if [ -z "''${AWS_S3_BUCKET_NAME:-}" ]; then
+          echo "AWS_S3_BUCKET_NAME is not set."
+          echo "  This half of the seed writes what the trainer trains from and needs AWS and"
+          echo "  Massive credentials. If you only wanted the database, run"
+          echo "  'devenv tasks run data:seed:postgres' instead."
+          exit 1
+        fi
+
+        echo "=== Archiving equity details to S3 ==="
+        seed-equity-details-s3
+
+        echo ""
+        echo "=== Seeding the S3 equity bar archive ==="
+        seed-equity-bars-s3
+      '';
+    };
+
+    # `devenv tasks run data:seed` runs both halves through prefix group execution, the way
+    # `checks:rust` runs its subtasks -- so there is deliberately no `data:seed` task to define.
 
     # --- Database lifecycle tasks ---
     # Two lifecycle modes:
@@ -848,7 +931,6 @@ in {
   profiles.application.module = {
     env = {
       DISABLE_DISK_CACHE = "1";
-      BACKFILL_LOOKBACK_DAYS = "730";
       DATABASE_URL = "postgresql://localhost:5432/fund";
       # The inference service reads Burn-native artifacts; track the most
       # recent training run rather than pinning (the old pin protected the
@@ -1002,14 +1084,16 @@ in {
       echo "    database:reset              Drop and recreate empty fund"
       echo "                                database"
       echo "    database:backup             Dump database and upload to S3"
-      echo "    data:seed                   Full data bootstrap (run without"
-      echo "                                arguments for usage)"
-      echo "    data:equity-bars            Seed equity bars (run without"
-      echo "                                arguments for usage)"
-      echo "    data:equity-details         Seed equity details (run without"
-      echo "                                arguments for usage)"
-      echo "    models:tide:train           Train TiDE model and upload"
-      echo "                                artifacts"
+      echo "    data:seed                   Both targets below (needs a"
+      echo "                                database and AWS)"
+      echo "    data:seed:postgres          Bars and details into PostgreSQL"
+      echo "                                (run without arguments for usage)"
+      echo "    data:seed:s3                Bars and details into the S3 archive"
+      echo "                                the trainer reads; repairs whatever"
+      echo "                                is missing, two years by default"
+      echo "    models:tide:train           Repair the S3 bar archive over the"
+      echo "                                training window, train TiDE, and"
+      echo "                                upload artifacts"
     } >&2
   '';
 

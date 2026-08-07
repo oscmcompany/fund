@@ -5,7 +5,7 @@
 //! closes and the model forty, so a fresh deployment cannot trade until something has fetched
 //! several months at once.
 //!
-//! Usage: `seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]`
+//! Usage: `seed_equity_bars_postgres <start YYYY-MM-DD> [end YYYY-MM-DD]`
 //! The end date defaults to today (US/Eastern) when omitted.
 //!
 //! Massive is the only source, because its grouped endpoint takes a **date** rather than a symbol
@@ -21,7 +21,7 @@ use fund::common::observability::init_tracing;
 use fund::data::bars;
 use fund::data::calendar::SessionDate;
 
-const USAGE: &str = "Usage: seed_equity_bars <start YYYY-MM-DD> [end YYYY-MM-DD]";
+const USAGE: &str = "Usage: seed_equity_bars_postgres <start YYYY-MM-DD> [end YYYY-MM-DD]";
 
 /// Calendar days fetched before the rows are written and the buffer released.
 ///
@@ -133,7 +133,11 @@ impl SeedSummary {
 #[tokio::main]
 async fn main() {
     fund::common::crypto::install_default_crypto_provider();
-    let tracing_guard = init_tracing("seed-equity-bars.log", Some("info"), "seed-equity-bars");
+    let tracing_guard = init_tracing(
+        "seed-equity-bars-postgres.log",
+        Some("info"),
+        "seed-equity-bars-postgres",
+    );
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let range = match parse_arguments(&arguments, SessionDate::at(Utc::now())) {

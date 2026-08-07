@@ -1,16 +1,23 @@
-//! Nightly export of the database to S3 as Parquet.
+//! Nightly export of the application's own tables to S3 as Parquet.
 //!
 //! Chained from a completed market data sync rather than scheduled, so it can never run against a
 //! half-synced database. Everything it writes is archival: the trainer fetches its own data from
 //! Massive, so a failed export costs a backup rather than the next day's model.
 //!
-//! Two shapes. **Incremental** tables — events, predictions, bars, account activities — are written
-//! per session date under a Hive-partitioned key. **Snapshot** tables — pairs, account state,
-//! ticker metadata — are written whole each night, because a row can change after the day it was
-//! created (a pair opened Monday closes Tuesday, and the closing is the interesting part).
+//! **Bars and ticker metadata are deliberately absent.** Both used to be exported here and both are
+//! written by the trainer under `data/`, from the same Massive grouped endpoint this application
+//! syncs from — the same rows by two paths, and two writers of one fact is one too many. The
+//! archive under [`crate::data::archive`] owns them and is their long-term record; what remains
+//! here is what only this application knows.
+//!
+//! Two shapes. **Incremental** tables — events, predictions, account activities — are written per
+//! session date under a Hive-partitioned key. **Snapshot** tables — pairs, account state — are
+//! written whole each night, because a row can change after the day it was created (a pair opened
+//! Monday closes Tuesday, and the closing is the interesting part).
 //!
 //! A failure on one table is logged and the rest continue; the caller receives the list so the
-//! completion event can report it.
+//! completion event can report it. That list is also the purge's gate: [`crate::data::purge`] runs
+//! only when every dataset here wrote cleanly.
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
@@ -84,11 +91,6 @@ pub async fn export_database(
         "exports/equity/predictions",
         predictions_frame(pool, start, end)
     );
-    export!(
-        "equity_bars",
-        "exports/equity/bars",
-        bars_frame(pool, start, end)
-    );
     export!("equity_pairs", "exports/equity/pairs", pairs_frame(pool));
     export!(
         "account_snapshots",
@@ -99,11 +101,6 @@ pub async fn export_database(
         "account_activities",
         "exports/account/activities",
         account_activities_frame(pool, start, end)
-    );
-    export!(
-        "equity_details",
-        "exports/equity/details",
-        crate::data::details::load_details_dataframe(pool)
     );
 
     info!(
@@ -217,58 +214,6 @@ async fn predictions_frame(
         Column::new("quantile_10".into(), collect(&rows, |row| row.quantile_10)),
         Column::new("quantile_50".into(), collect(&rows, |row| row.quantile_50)),
         Column::new("quantile_90".into(), collect(&rows, |row| row.quantile_90)),
-    ])
-}
-
-/// Every interval present for the session, not just daily.
-///
-/// Filtering to one interval here would leave intraday rows with no S3 archive at all, and
-/// TimescaleDB's retention policy deletes them on the same 90-day window regardless. The interval
-/// travels as a column so one object still holds the session.
-async fn bars_frame(
-    pool: &PgPool,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-) -> Result<DataFrame, PolarsError> {
-    let rows = sqlx::query!(
-        r#"SELECT ticker AS "ticker!", bar_interval AS "bar_interval!",
-                  timestamp AS "timestamp!", open_price AS "open_price!",
-                  high_price AS "high_price!", low_price AS "low_price!",
-                  close_price AS "close_price!", volume AS "volume!",
-                  volume_weighted_average_price, transactions
-           FROM equity_bars
-           WHERE timestamp >= $1 AND timestamp < $2
-           ORDER BY bar_interval, ticker"#,
-        start,
-        end
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(to_polars_error)?;
-
-    DataFrame::new(vec![
-        Column::new("ticker".into(), collect(&rows, |row| row.ticker.clone())),
-        Column::new(
-            "bar_interval".into(),
-            collect(&rows, |row| row.bar_interval.clone()),
-        ),
-        Column::new(
-            "timestamp".into(),
-            collect(&rows, |row| row.timestamp.timestamp_millis()),
-        ),
-        Column::new("open_price".into(), collect(&rows, |row| row.open_price)),
-        Column::new("high_price".into(), collect(&rows, |row| row.high_price)),
-        Column::new("low_price".into(), collect(&rows, |row| row.low_price)),
-        Column::new("close_price".into(), collect(&rows, |row| row.close_price)),
-        Column::new("volume".into(), collect(&rows, |row| row.volume)),
-        Column::new(
-            "volume_weighted_average_price".into(),
-            collect(&rows, |row| row.volume_weighted_average_price),
-        ),
-        Column::new(
-            "transactions".into(),
-            collect(&rows, |row| row.transactions),
-        ),
     ])
 }
 
@@ -431,7 +376,7 @@ mod tests {
     fn test_summary_totals_only_successful_datasets() {
         let summary = ExportSummary {
             exported: vec![("events".into(), 12), ("equity_pairs".into(), 3)],
-            failed: vec![("equity_bars".into(), "boom".into())],
+            failed: vec![("account_activities".into(), "boom".into())],
         };
         assert_eq!(summary.total_rows(), 15);
         assert!(!summary.is_clean());

@@ -1,18 +1,17 @@
-//! The trainer: fetch, archive, train, publish. Runs on its own machine with no database.
+//! The trainer: repair, load, train, publish. Runs on its own machine with no database.
 //!
 //! It fetches its own bars from Massive and writes its own parquet rather than reading the
 //! application's nightly export, so the only thing crossing between the two VMs is the finished
-//! artifact and a failed export cannot cost the next day's model.
+//! artifact. The archive it owns is the long-term record of those bars; the application exports
+//! only its own tables.
 //!
 //! Frames are built through [`fund::data::bars::bars_to_dataframe`], shared with the application:
 //! if the two diverged, the model would train on columns the inference path does not produce.
 //!
 //! Nothing here touches a database or Alpaca — Massive answers by date, so there is no symbol list
-//! to build and no broker to ask for one.
+//! to build and no broker to ask for one. That is also why [`fund::data::archive`] decides which
+//! sessions to request from weekends rather than from the published trading calendar.
 
-use std::io::Cursor;
-
-use aws_sdk_s3::operation::get_object::GetObjectError;
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
 use chrono::Utc;
@@ -23,7 +22,7 @@ use fund::common::aws::date_partitioned_key;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
 use fund::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use fund::data::bars;
+use fund::data::archive;
 use fund::data::calendar::SessionDate;
 use fund::data::details;
 use fund::models::tide::artifact::{
@@ -42,24 +41,10 @@ const INPUT_LENGTH: usize = 35;
 const OUTPUT_LENGTH: usize = 1;
 const TRAINING_FRACTION: f64 = 0.8;
 
-/// S3 prefix for the trainer's own bar archive.
-///
-/// Deliberately not under `exports/`, which is where the application's nightly database export
-/// lands. The two datasets live in one bucket and describe overlapping facts, and giving them one
-/// prefix would make whichever job ran second the one that mattered.
-const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
-
-/// S3 key for the ticker metadata that accompanies the archive.
-const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
-
-/// Sessions the fetch stage re-requests each night.
-///
-/// Three rather than one: a night the trainer did not run leaves a hole nothing else fills. The
-/// merge below makes the overlap cheap, and guards against a later response omitting rows an
-/// earlier one had.
-const FETCH_LOOKBACK_SESSIONS: i64 = 3;
-
 /// Calendar days of archive the training window spans by default.
+///
+/// Also the window stage one repairs, because there is no point archiving a session stage two will
+/// never load.
 const DEFAULT_LOOKBACK_DAYS: i64 = 365;
 
 /// Attempts to publish `run_metadata.json` before giving up.
@@ -113,14 +98,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Starting tide training"
     );
 
-    // --- stage one: fetch and archive ---
+    // --- stage one: repair the archive ---
+    //
+    // Scanned rather than topped up: every weekday in the window with no partition is fetched, so a
+    // night this did not run, a week of downtime, and an empty bucket are one case. The window is
+    // the same one stage two reads, because archiving a session training will never load buys
+    // nothing. An outage older than that window is a `data:seed:s3` run, which floors at two years.
     //
     // A failure here is logged and stepped over rather than fatal. The archive already holds a
     // year; a night with no new partition trains on 364 days instead of 365, which is a far better
     // outcome than publishing no model because Massive was briefly unreachable.
-    match fetch_and_archive(&s3_client, &bucket, session).await {
-        Ok(rows) => info!(rows, "Session bars archived"),
-        Err(error) => warn!(%error, "Fetch stage failed; training on the existing archive"),
+    let window_start = session.plus_calendar_days(-lookback_days);
+    match MassiveClient::from_env() {
+        Ok(massive) => {
+            match archive::archive_missing_sessions(
+                &s3_client,
+                &massive,
+                &bucket,
+                window_start,
+                session,
+            )
+            .await
+            {
+                Ok(summary) => info!(
+                    sessions_written = summary.sessions_written,
+                    sessions_without_data = summary.sessions_without_data,
+                    sessions_failed = summary.sessions_failed.len(),
+                    bars_written = summary.bars_written,
+                    "Archive repaired"
+                ),
+                Err(error) => {
+                    warn!(%error, "Archive stage failed; training on the existing archive")
+                }
+            }
+        }
+        Err(error) => warn!(%error, "No Massive client; training on the existing archive"),
+    }
+
+    // Outside the arm above, because the metadata comes from a CSV compiled into this binary and
+    // reaching S3 with it needs no Massive credential. Gating it on one meant a bad key left
+    // DuckDB's `training_details` view resolving a stale copy for a reason that had nothing to do
+    // with it.
+    if let Err(error) = archive::archive_details(&s3_client, &bucket, details::embedded_csv()).await
+    {
+        warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
     }
 
     // --- stage two: load the accumulated window ---
@@ -392,153 +413,16 @@ fn training_configuration() -> Result<TrainConfiguration, Box<dyn std::error::Er
     )?)
 }
 
-/// Fetches the most recent sessions' bars from Massive and writes them to the archive.
-///
-/// Returns rows written. No universe and no symbol list: the endpoint is asked for a date and
-/// answers with every stock that traded. `filter_training_bars` applies the thresholds further
-/// down, so pre-filtering here would only decide which names the model may ever have seen — and
-/// building a list from `fetch_tradable_assets` would pin the archive to whatever Alpaca lists
-/// *today*, which is the survivorship problem.
-async fn fetch_and_archive(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    session: SessionDate,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let client = MassiveClient::from_env()?;
-
-    let end = most_recent_weekday(session);
-    let start = end.plus_calendar_days(-(FETCH_LOOKBACK_SESSIONS * 2));
-    let dates: Vec<SessionDate> = (0..=(end.date() - start.date()).num_days())
-        .map(|offset| start.plus_calendar_days(offset))
-        .collect();
-    info!(%start, %end, dates = dates.len(), "Fetching session bars from Massive");
-
-    let fetched = bars::fetch_daily_bars(&client, &dates).await;
-    if !fetched.dates_failed.is_empty() {
-        // Logged rather than fatal, as before: a failed session costs one day of history, and the
-        // next run's overlap window covers it.
-        warn!(
-            dates_failed = ?fetched.dates_failed,
-            "Some sessions could not be fetched; the archive will have gaps until the next run"
-        );
-    }
-    if fetched.bars.is_empty() {
-        return Ok(0);
-    }
-
-    // One partition per session date, so the archive stays date-partitioned and the loader below
-    // can walk it a day at a time.
-    let mut by_date: std::collections::BTreeMap<SessionDate, Vec<_>> =
-        std::collections::BTreeMap::new();
-    for bar in fetched.bars {
-        by_date
-            .entry(SessionDate::at(bar.timestamp()))
-            .or_default()
-            .push(bar);
-    }
-
-    let mut written = 0;
-    for (date, bars_for_date) in by_date {
-        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date.date());
-        let fetched_frame = bars::bars_to_dataframe(&bars_for_date)?;
-
-        // Merged with whatever the partition already holds, not written over it. This matters less
-        // than it did — the grouped endpoint answers by date, so a symbol delisted today still
-        // comes back for the days it was trading — but a plain overwrite would still discard
-        // anything a later response happens to omit, and merging costs nothing.
-        let mut frame = match read_partition(s3_client, bucket, &key).await? {
-            Some(existing) => merge_partitions(existing, fetched_frame)?,
-            None => fetched_frame,
-        };
-
-        let mut buffer: Vec<u8> = Vec::new();
-        ParquetWriter::new(&mut buffer).finish(&mut frame)?;
-
-        upload_artifact(s3_client, bucket, &key, buffer, "application/octet-stream").await?;
-        written += frame.height();
-    }
-
-    upload_artifact(
-        s3_client,
-        bucket,
-        DETAILS_ARCHIVE_KEY,
-        details::embedded_csv().as_bytes().to_vec(),
-        "text/csv",
-    )
-    .await?;
-
-    Ok(written)
-}
-
-/// Reads one archived partition, distinguishing a missing object from a failed request.
-///
-/// `Ok(None)` means the partition genuinely does not exist yet — the documented skip. Every other
-/// failure propagates: a credential error, a throttle, or a network fault silently treated as
-/// "missing" would shorten the training window without any signal, and the model would just be
-/// slightly worse for reasons nothing recorded.
-async fn read_partition(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<DataFrame>, Box<dyn std::error::Error>> {
-    let response = match s3_client.get_object().bucket(bucket).key(key).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return match error.into_service_error() {
-                GetObjectError::NoSuchKey(_) => Ok(None),
-                other => Err(other.into()),
-            }
-        }
-    };
-    let bytes = response.body.collect().await?.into_bytes();
-    Ok(Some(ParquetReader::new(Cursor::new(bytes)).finish()?))
-}
-
-/// Combines an existing partition with a freshly fetched one, newest row winning per key.
-///
-/// The key is `(ticker, bar_interval, timestamp)` — the same primary key `equity_bars` uses, so the
-/// archive and the table agree about what constitutes a duplicate. The fetched rows are appended
-/// last and `UniqueKeepStrategy::Last` keeps them, which makes a re-fetch a correction rather than a
-/// duplicate.
-fn merge_partitions(
-    existing: DataFrame,
-    fetched: DataFrame,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    let combined = concat([existing.lazy(), fetched.lazy()], UnionArgs::default())?
-        .unique_stable(
-            Some(polars::prelude::Selector::ByName {
-                names: vec![
-                    PlSmallStr::from("ticker"),
-                    PlSmallStr::from("bar_interval"),
-                    PlSmallStr::from("timestamp"),
-                ]
-                .into(),
-                strict: false,
-            }),
-            UniqueKeepStrategy::Last,
-        )
-        .collect()?;
-    Ok(combined)
-}
-
-/// The most recent weekday at or before `date`.
-///
-/// A weekday check rather than a calendar lookup. The trainer would otherwise need the published
-/// calendar for one date arithmetic, and a request for a holiday's partition simply returns nothing
-/// — which the loader below already steps over.
-fn most_recent_weekday(date: SessionDate) -> SessionDate {
-    let mut candidate = date;
-    while candidate.is_weekend() {
-        candidate = candidate.plus_calendar_days(-1);
-    }
-    candidate
-}
-
 /// Reads every available daily partition over the lookback window and concatenates them.
 ///
-/// Missing days — weekends, holidays, and nights the fetch stage did not run — are skipped rather
-/// than treated as errors, which is what lets a single failed fetch cost one session of history
-/// instead of the whole run.
+/// Missing days — holidays and sessions Massive has never answered for — are skipped rather than
+/// treated as errors, which is what lets one unavailable session cost a day of history instead of
+/// the whole run. Stage one has already tried to fill everything else.
+///
+/// Weekends are stepped over rather than requested. Stage one never writes a weekend partition, so
+/// a request for one is a guaranteed 404 — about a hundred of them per run. Skipping them here uses
+/// the same predicate the archive scan does, which is what keeps reader and writer agreeing about
+/// which days the archive can hold at all.
 async fn load_archived_bars(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -551,8 +435,12 @@ async fn load_archived_bars(
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut date = start_date;
     while date <= end_date {
-        let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, date.date());
-        if let Some(frame) = read_partition(s3_client, bucket, &key).await? {
+        if date.is_weekend() {
+            date = date.plus_calendar_days(1);
+            continue;
+        }
+        let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
+        if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
             frames.push(frame.lazy());
         }
         date = date.plus_calendar_days(1);
@@ -618,7 +506,6 @@ async fn fetch_prior_continuous_ranked_probability_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
     use serial_test::serial;
 
     /// RAII guard restoring one environment variable on drop, so an assertion failure cannot leave
@@ -649,12 +536,6 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
-    }
-
-    fn date(year: i32, month: u32, day: u32) -> SessionDate {
-        SessionDate::from_date(
-            NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
-        )
     }
 
     #[test]
@@ -723,16 +604,5 @@ mod tests {
             training_configuration().unwrap().epoch_count(),
             TrainConfiguration::default().epoch_count()
         );
-    }
-
-    /// Alpaca publishes no bars on a weekend, so the fetch window has to end on a weekday or the
-    /// last partition of the run is empty.
-    #[test]
-    fn test_most_recent_weekday_walks_back_over_the_weekend() {
-        // 2026-08-01 is a Saturday, 2026-08-02 a Sunday, 2026-08-03 a Monday.
-        assert_eq!(most_recent_weekday(date(2026, 8, 1)), date(2026, 7, 31));
-        assert_eq!(most_recent_weekday(date(2026, 8, 2)), date(2026, 7, 31));
-        assert_eq!(most_recent_weekday(date(2026, 8, 3)), date(2026, 8, 3));
-        assert_eq!(most_recent_weekday(date(2026, 7, 31)), date(2026, 7, 31));
     }
 }
