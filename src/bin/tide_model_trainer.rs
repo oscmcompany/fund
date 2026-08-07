@@ -131,13 +131,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(%error, "Archive stage failed; training on the existing archive")
                 }
             }
-            if let Err(error) =
-                archive::archive_details(&s3_client, &bucket, details::embedded_csv()).await
-            {
-                warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
-            }
         }
         Err(error) => warn!(%error, "No Massive client; training on the existing archive"),
+    }
+
+    // Outside the arm above, because the metadata comes from a CSV compiled into this binary and
+    // reaching S3 with it needs no Massive credential. Gating it on one meant a bad key left
+    // DuckDB's `training_details` view resolving a stale copy for a reason that had nothing to do
+    // with it.
+    if let Err(error) = archive::archive_details(&s3_client, &bucket, details::embedded_csv()).await
+    {
+        warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
     }
 
     // --- stage two: load the accumulated window ---
@@ -411,9 +415,14 @@ fn training_configuration() -> Result<TrainConfiguration, Box<dyn std::error::Er
 
 /// Reads every available daily partition over the lookback window and concatenates them.
 ///
-/// Missing days — weekends, holidays, and sessions Massive has never answered for — are skipped
-/// rather than treated as errors, which is what lets one unavailable session cost a day of history
-/// instead of the whole run. Stage one has already tried to fill everything else.
+/// Missing days — holidays and sessions Massive has never answered for — are skipped rather than
+/// treated as errors, which is what lets one unavailable session cost a day of history instead of
+/// the whole run. Stage one has already tried to fill everything else.
+///
+/// Weekends are stepped over rather than requested. Stage one never writes a weekend partition, so
+/// a request for one is a guaranteed 404 — about a hundred of them per run. Skipping them here uses
+/// the same predicate the archive scan does, which is what keeps reader and writer agreeing about
+/// which days the archive can hold at all.
 async fn load_archived_bars(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -426,6 +435,10 @@ async fn load_archived_bars(
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut date = start_date;
     while date <= end_date {
+        if date.is_weekend() {
+            date = date.plus_calendar_days(1);
+            continue;
+        }
         let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
         if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
             frames.push(frame.lazy());

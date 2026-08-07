@@ -43,6 +43,12 @@ async fn main() {
     std::process::exit(code);
 }
 
+/// Uploads the embedded ticker metadata and returns the byte length written.
+///
+/// Reads `AWS_S3_BUCKET_NAME` from the environment and writes one object at
+/// `data/equity/details/details.csv`, overwriting whatever is there. No database and no Massive
+/// credential are involved: the source is compiled into this binary, so the only way this produces
+/// a wrong object is if the embedded CSV itself is wrong — which the parse below catches first.
 async fn run() -> Result<usize, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;

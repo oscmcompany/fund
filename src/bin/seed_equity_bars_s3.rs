@@ -122,6 +122,12 @@ async fn main() {
     std::process::exit(code);
 }
 
+/// Repairs the archive over `range` and returns what the pass accomplished.
+///
+/// Reads `AWS_S3_BUCKET_NAME` and the Massive credentials from the environment, and writes bar
+/// partitions under `data/equity/bars/`. No database is touched. Only the sessions the bucket is
+/// missing are fetched, so the cost of a run is the size of the gap rather than the size of the
+/// range, and re-running over a repaired range is close to free.
 async fn run(range: &ArchiveRange) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
