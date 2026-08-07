@@ -726,6 +726,18 @@ in {
   scripts.seed-equity-bars-s3.exec = ''
     set -euo pipefail
 
+    # Rejected rather than defaulted. The arguments are positional, so an unset start with a set end
+    # would send exactly one word and the binary would read it as the *start* date -- repairing a
+    # window running from the intended end to today, while the echo below reported the window the
+    # operator meant. Silently repairing the wrong range is worse than refusing to start.
+    if [ -z "''${SEED_START_DATE:-}" ] && [ -n "''${SEED_END_DATE:-}" ]; then
+      echo "SEED_END_DATE is set but SEED_START_DATE is not."
+      echo "  These are positional, so an end date alone would be read as the start date and the"
+      echo "  archive repaired over the wrong window. Set both, or set neither to repair the last"
+      echo "  two years."
+      exit 1
+    fi
+
     echo "Seeding the S3 equity bar archive from ''${SEED_START_DATE:-two years ago} to ''${SEED_END_DATE:-today}"
     ${runtimeEnv}
     secretspec run -- cargo run --release --bin seed_equity_bars_s3 -- \
