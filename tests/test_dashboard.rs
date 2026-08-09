@@ -85,7 +85,7 @@ async fn test_every_query_runs_against_an_empty_database() {
         .await
         .expect("every dashboard query must run against an empty database");
 
-    assert!(data.equity_history.is_empty());
+    assert!(data.account_snapshot_history.is_empty());
     assert!(data.open_pairs.is_empty());
     assert!(data.closed_pairs.is_empty());
     assert!(data.predictions.is_empty());
@@ -168,9 +168,9 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     assert_eq!(data.closed_summary.wins, 1);
     assert_eq!(data.closed_summary.signal_exit_share, Some(100.0));
 
-    assert_eq!(data.equity_history.len(), 2);
-    assert_eq!(data.equity_history[0].equity, decimal("1000000"));
-    assert_eq!(data.equity_history[1].equity, decimal("1010000"));
+    assert_eq!(data.account_snapshot_history.len(), 2);
+    assert_eq!(data.account_snapshot_history[0].equity, decimal("1000000"));
+    assert_eq!(data.account_snapshot_history[1].equity, decimal("1010000"));
     assert_eq!(data.period_returns.one_day, Some(1.0));
 
     assert_eq!(data.predictions.len(), 2);
@@ -356,7 +356,7 @@ async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
 
 /// A reconstructed session must survive the whole read path.
 ///
-/// `fetch_equity_history` reads the balances with `try_get`, which returns an error rather than a
+/// `fetch_account_snapshot_history` reads the balances with `try_get`, which returns an error rather than a
 /// default when the column is NULL — so before the columns were relaxed and the struct made
 /// optional, one backfilled row would have failed *every* query on the page, not just its own
 /// cells. The returns still publish because they are derived from equity, which a reconstructed
@@ -376,7 +376,7 @@ async fn test_a_reconstructed_session_reads_back_without_its_balances() {
         .expect("the dashboard must read a database containing a reconstructed session");
 
     let latest = data
-        .equity_history
+        .account_snapshot_history
         .last()
         .expect("the reconstructed session must be in the history");
     assert_eq!(latest.session_date, today);

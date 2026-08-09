@@ -43,6 +43,13 @@
     then "365"
     else rawLookbackDays;
 
+  # PostgreSQL role. DATABASE_URL below names no user; psql falls back to the OS
+  # user but sqlx does not, failing with `role "anonymous" does not exist`. Set
+  # here rather than in DATABASE_URL, which would bake a machine-specific name
+  # into a Nix store path. Unset when $USER is empty, since devenv's postgres
+  # creates no "postgres" role to fall back to.
+  postgresUser = builtins.getEnv "USER";
+
   # Log directory. VMs use /var/log/fund (provisioned by bootstrap-machine).
   # The runtimeEnv block above detects when that path is not writable (e.g.
   # local laptop without bootstrap) and falls back to an XDG state path.
@@ -144,42 +151,46 @@ in {
     };
   };
 
-  env = {
-    # DuckDB library path for Rust linker
-    LIBRARY_PATH = "${pkgs.duckdb}/lib";
+  env =
+    {
+      # DuckDB library path for Rust linker
+      LIBRARY_PATH = "${pkgs.duckdb}/lib";
 
-    # AWS region
-    AWS_REGION = awsRegion;
-    AWS_DEFAULT_REGION = awsRegion;
+      # AWS region
+      AWS_REGION = awsRegion;
+      AWS_DEFAULT_REGION = awsRegion;
 
-    # Writable log directory for local file logging (see fundLogDir above)
-    FUND_LOG_DIR = fundLogDir;
+      # Writable log directory for local file logging (see fundLogDir above)
+      FUND_LOG_DIR = fundLogDir;
 
-    # PostgreSQL
-    DATABASE_URL = "postgresql://localhost:5432/fund";
-    PGDATABASE = "fund";
+      # PostgreSQL
+      DATABASE_URL = "postgresql://localhost:5432/fund";
+      PGDATABASE = "fund";
 
-    # sqlx compile-time query checking uses the committed .sqlx/ cache rather
-    # than a live database connection; run `cargo sqlx prepare -- --all-features`
-    # to regenerate the cache after changing queries.
-    SQLX_OFFLINE = "true";
+      # sqlx compile-time query checking uses the committed .sqlx/ cache rather
+      # than a live database connection; run `cargo sqlx prepare -- --all-features`
+      # to regenerate the cache after changing queries.
+      SQLX_OFFLINE = "true";
 
-    CC = "clang";
+      CC = "clang";
 
-    # Secretspec CLI configuration
-    SECRETSPEC_PROVIDER = "awssm";
+      # Secretspec CLI configuration
+      SECRETSPEC_PROVIDER = "awssm";
 
-    # Disable AWS CLI pager so secrets output is not paged
-    AWS_PAGER = "";
+      # Disable AWS CLI pager so secrets output is not paged
+      AWS_PAGER = "";
 
-    # S3-compatible endpoint and credentials for the integration test suite.
-    # Set unconditionally rather than inside the test profile so `cargo test`
-    # works from a plain devenv shell; only the MinIO process itself is
-    # profile-scoped.
-    TEST_S3_ENDPOINT = objectStoreEndpoint;
-    TEST_S3_ACCESS_KEY = objectStoreAccessKey;
-    TEST_S3_SECRET_KEY = objectStoreSecretKey;
-  };
+      # S3-compatible endpoint and credentials for the integration test suite.
+      # Set unconditionally rather than inside the test profile so `cargo test`
+      # works from a plain devenv shell; only the MinIO process itself is
+      # profile-scoped.
+      TEST_S3_ENDPOINT = objectStoreEndpoint;
+      TEST_S3_ACCESS_KEY = objectStoreAccessKey;
+      TEST_S3_SECRET_KEY = objectStoreSecretKey;
+    }
+    // pkgs.lib.optionalAttrs (postgresUser != "") {
+      PGUSER = postgresUser;
+    };
 
   services.postgres = {
     enable = true;

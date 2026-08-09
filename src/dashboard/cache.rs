@@ -152,7 +152,7 @@ pub struct ClosedSummary {
 #[derive(Debug, Clone, Default)]
 pub struct DashboardState {
     pub account: Option<AccountSnapshot>,
-    pub equity_history: Vec<AccountSnapshot>,
+    pub account_snapshot_history: Vec<AccountSnapshot>,
     pub period_returns: PeriodReturns,
     pub open_pairs: Vec<OpenPair>,
     pub closed_pairs: Vec<ClosedPair>,
@@ -174,8 +174,8 @@ pub type SharedState = Arc<RwLock<DashboardState>>;
 /// state would discard every event that arrived since the last refresh.
 pub async fn apply_poll(state: &SharedState, data: crate::dashboard::database::DashboardData) {
     let mut guard = state.write().await;
-    guard.account = data.equity_history.last().cloned();
-    guard.equity_history = data.equity_history;
+    guard.account = data.account_snapshot_history.last().cloned();
+    guard.account_snapshot_history = data.account_snapshot_history;
     guard.period_returns = data.period_returns;
     guard.open_pairs = data.open_pairs;
     guard.closed_pairs = data.closed_pairs;

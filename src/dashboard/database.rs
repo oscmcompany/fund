@@ -22,8 +22,8 @@ use crate::dashboard::cache::{
 use crate::data::calendar::SessionDate;
 use crate::portfolio::pairs::CloseReason;
 
-/// Sessions of account history fetched for the equity curve.
-const EQUITY_HISTORY_DAYS: i64 = 365;
+/// Sessions of account snapshots fetched: the equity curve, and the newest row's balances.
+const ACCOUNT_HISTORY_DAYS: i64 = 365;
 
 /// Closed pairs fetched for the trade table and its summary.
 const CLOSED_PAIRS_LIMIT: i64 = 200;
@@ -36,7 +36,7 @@ const RECENT_EVENTS_LIMIT: i64 = 100;
 
 /// One poll cycle's worth of data.
 pub struct DashboardData {
-    pub equity_history: Vec<AccountSnapshot>,
+    pub account_snapshot_history: Vec<AccountSnapshot>,
     pub period_returns: PeriodReturns,
     pub open_pairs: Vec<OpenPair>,
     pub closed_pairs: Vec<ClosedPair>,
@@ -51,15 +51,18 @@ pub struct DashboardData {
 /// Runs every query for one refresh. A failure in any one fails the cycle, and the caller keeps
 /// the previous state.
 pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::Error> {
-    let equity_history = fetch_equity_history(pool).await?;
-    let transfer_sessions = match (equity_history.first(), equity_history.last()) {
+    let account_snapshot_history = fetch_account_snapshot_history(pool).await?;
+    let transfer_sessions = match (
+        account_snapshot_history.first(),
+        account_snapshot_history.last(),
+    ) {
         (Some(first), Some(last)) => {
             fetch_transfer_sessions(pool, first.session_date, last.session_date).await?
         }
         // No history means no baseline to measure from, so there is nothing a transfer could spoil.
         _ => Vec::new(),
     };
-    let period_returns = compute_period_returns(&equity_history, &transfer_sessions);
+    let period_returns = compute_period_returns(&account_snapshot_history, &transfer_sessions);
     let open_pairs = fetch_open_pairs(pool).await?;
     let closed_pairs = fetch_closed_pairs(pool).await?;
     let closed_summary = compute_closed_summary(&closed_pairs);
@@ -69,7 +72,7 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     let latest_bars_inserted_at = fetch_latest_bars_inserted_at(pool).await?;
 
     Ok(DashboardData {
-        equity_history,
+        account_snapshot_history,
         period_returns,
         open_pairs,
         closed_pairs,
@@ -82,19 +85,24 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     })
 }
 
-/// Fetches the account history oldest-first, which is the order every horizon calculation wants.
+/// Fetches whole snapshots oldest-first, which is the order every horizon calculation wants.
 ///
-/// Balances come back as `Option`, because a session reconstructed by `backfill_account_snapshots`
-/// carries equity and four NULLs. Only `equity` is guaranteed, and it is the only column the
-/// horizon calculations read.
-async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sqlx::Error> {
+/// Whole snapshots rather than an equity series, because the newest row is doing double duty: the
+/// horizon calculations read the `equity` column across the series, and `apply_poll` takes the last
+/// row as the account panel, which renders the balances too.
+///
+/// Those balances come back as `Option`, because a session reconstructed by
+/// `backfill_account_snapshots` carries equity and four NULLs. Only `equity` is guaranteed.
+async fn fetch_account_snapshot_history(
+    pool: &PgPool,
+) -> Result<Vec<AccountSnapshot>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT session_date, equity, cash, buying_power, long_market_value, short_market_value
          FROM account_snapshots
          WHERE session_date >= CURRENT_DATE - ($1::BIGINT || ' days')::INTERVAL
          ORDER BY session_date ASC",
     )
-    .bind(EQUITY_HISTORY_DAYS)
+    .bind(ACCOUNT_HISTORY_DAYS)
     .fetch_all(pool)
     .await?;
 
@@ -114,9 +122,9 @@ async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sql
 
 /// Fetches the sessions in which capital moved into or out of the account, within a session range.
 ///
-/// Bounded to the equity history the dashboard displays, because a transfer outside it cannot change
-/// any published figure: every baseline [`compute_period_returns`] measures from comes out of that
-/// same history. Bounding also keeps the scan off the whole table —
+/// Bounded to the snapshot history the dashboard displays, because a transfer outside it cannot
+/// change any published figure: every baseline [`compute_period_returns`] measures from comes out of
+/// that same history. Bounding also keeps the scan off the whole table —
 /// `idx_account_activities_transaction_time` covers this predicate, and there is no index on
 /// `activity_type`.
 ///

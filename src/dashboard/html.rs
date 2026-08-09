@@ -171,7 +171,7 @@ fn render_account_section(state: &DashboardState) -> String {
         format_return(returns.one_month),
         format_return(returns.year_to_date),
         format_return(returns.since_inception),
-        state.equity_history.len(),
+        state.account_snapshot_history.len(),
     );
     section("Account", body)
 }
@@ -602,7 +602,7 @@ mod tests {
                 long_market_value: Some(decimal("400000")),
                 short_market_value: Some(decimal("-400000")),
             }),
-            equity_history: Vec::new(),
+            account_snapshot_history: Vec::new(),
             period_returns: PeriodReturns {
                 one_day: Some(1.25),
                 one_week: Some(-0.5),
