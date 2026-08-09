@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use chrono::{Duration, NaiveTime, Utc};
 use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
+    TRANSFER_ACTIVITY_TYPES,
 };
 use fund::common::types::{BarInterval, Ticker};
 use fund::data::bars;
@@ -64,12 +65,24 @@ fn calendar_for_today() -> TradingCalendar {
     TradingCalendar::from_days(days)
 }
 
-/// Consecutive sessions ending at `session_date`, for tests that pin a fixed date.
+/// The five most recent weekday sessions ending at `session_date`.
+///
+/// Weekends are filtered rather than taken as consecutive calendar days, so
+/// `previous_trading_day` answers what it would in production: Friday for a Monday session, not
+/// Sunday. Without the filter a Monday would silently exercise a calendar that cannot exist, and the
+/// gap test would pass while checking nothing real.
+///
+/// `is_weekend` rather than `is_trading_day` because this *builds* the calendar the latter consults;
+/// it is the case that method's own documentation names, "bounding a fetch range before the calendar
+/// is available". Holidays are not modelled — no test here turns on one.
 fn calendar_ending_at(session_date: SessionDate) -> TradingCalendar {
-    let days = (0..5)
-        .filter_map(|offset| {
+    let days = (0..10)
+        .map(|offset| session_date.plus_calendar_days(-offset))
+        .filter(|date| !date.is_weekend())
+        .take(5)
+        .filter_map(|date| {
             CalendarDay::new(
-                session_date.plus_calendar_days(-offset).date(),
+                date.date(),
                 NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
                 NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
             )
@@ -81,9 +94,10 @@ fn calendar_ending_at(session_date: SessionDate) -> TradingCalendar {
 /// Answers every transfer activity endpoint with an empty list.
 ///
 /// The sync asks for each synced type in turn, so a test mocking only `FILL` would have its
-/// remaining requests go unmatched.
+/// remaining requests go unmatched. Driven by the production constant so a new transfer type cannot
+/// leave these tests quietly mocking the wrong set.
 async fn mock_no_transfers(server: &mut mockito::ServerGuard) {
-    for activity_type in ["CSD", "CSW", "JNLC"] {
+    for activity_type in TRANSFER_ACTIVITY_TYPES {
         server
             .mock(
                 "GET",
@@ -762,10 +776,15 @@ async fn test_the_account_sync_is_idempotent() {
 /// of how much arrived — and it must not be mistaken for a fill along the way. `attribute` counts
 /// anything without a ticker as unattributed, so a transfer reaching it would raise a false alarm
 /// on every session that received capital.
+///
+/// `CSD` is the type a live bank deposit books as, and the one branch the paper account cannot
+/// exercise: paper funds by journal, so `CSD` has no coverage anywhere but here.
 #[tokio::test]
 #[serial]
 async fn test_the_account_sync_stores_transfers_without_attributing_them() {
     use fund::portfolio::account;
+
+    const DEPOSIT_ACTIVITY_TYPE: &str = "CSD";
 
     let pool = fresh_pool().await;
     let mut server = mockito::Server::new_async().await;
@@ -777,7 +796,12 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
         .with_body(account_body(30_000))
         .create_async()
         .await;
-    for activity_type in ["FILL", "CSW"] {
+    // Every type the sync actually asks for answers empty, except the deposit under test. Driven by
+    // the production list so an added type cannot leave a request unmatched here.
+    for activity_type in account::synced_activity_types()
+        .into_iter()
+        .filter(|activity_type| *activity_type != DEPOSIT_ACTIVITY_TYPE)
+    {
         server
             .mock(
                 "GET",
@@ -793,23 +817,14 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
     let _deposit = server
         .mock(
             "GET",
-            mockito::Matcher::Regex(r"^/v2/account/activities/CSD".into()),
+            mockito::Matcher::Regex(format!("^/v2/account/activities/{DEPOSIT_ACTIVITY_TYPE}")),
         )
         .with_status(200)
         .with_body(format!(
-            r#"[{{"id":"deposit-1","activity_type":"CSD","date":"{}",
+            r#"[{{"id":"deposit-1","activity_type":"{DEPOSIT_ACTIVITY_TYPE}","date":"{}",
                   "net_amount":"10000.00","status":"executed"}}]"#,
             session_date.date()
         ))
-        .create_async()
-        .await;
-    let _journal = server
-        .mock(
-            "GET",
-            mockito::Matcher::Regex(r"^/v2/account/activities/JNLC".into()),
-        )
-        .with_status(200)
-        .with_body("[]")
         .create_async()
         .await;
 
@@ -871,7 +886,7 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
         .with_body(account_body(100_000))
         .create_async()
         .await;
-    for activity_type in ["FILL", "CSD", "CSW", "JNLC"] {
+    for activity_type in account::synced_activity_types() {
         server
             .mock(
                 "GET",

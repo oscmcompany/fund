@@ -52,7 +52,13 @@ pub struct DashboardData {
 /// the previous state.
 pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::Error> {
     let equity_history = fetch_equity_history(pool).await?;
-    let transfer_sessions = fetch_transfer_sessions(pool).await?;
+    let transfer_sessions = match (equity_history.first(), equity_history.last()) {
+        (Some(first), Some(last)) => {
+            fetch_transfer_sessions(pool, first.session_date, last.session_date).await?
+        }
+        // No history means no baseline to measure from, so there is nothing a transfer could spoil.
+        _ => Vec::new(),
+    };
     let period_returns = compute_period_returns(&equity_history, &transfer_sessions);
     let open_pairs = fetch_open_pairs(pool).await?;
     let closed_pairs = fetch_closed_pairs(pool).await?;
@@ -102,18 +108,36 @@ async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sql
         .collect()
 }
 
-/// Fetches the sessions in which capital moved into or out of the account.
+/// Fetches the sessions in which capital moved into or out of the account, within a session range.
+///
+/// Bounded to the equity history the dashboard displays, because a transfer outside it cannot change
+/// any published figure: every baseline [`compute_period_returns`] measures from comes out of that
+/// same history. Bounding also keeps the scan off the whole table —
+/// `idx_account_activities_transaction_time` covers this predicate, and there is no index on
+/// `activity_type`.
 ///
 /// Timestamps come back raw and become sessions through [`SessionDate::at`], rather than being
-/// converted in SQL: `(transaction_time AT TIME ZONE 'America/New_York')::date` hides the column
-/// behind an expression, and one place owning the Eastern rollover is worth more than the alternative.
-async fn fetch_transfer_sessions(pool: &PgPool) -> Result<Vec<SessionDate>, sqlx::Error> {
+/// converted in SQL: `(transaction_time AT TIME ZONE 'America/New_York')::date` would hide the column
+/// behind an expression and defeat that index, which is the same reasoning
+/// [`SessionDate::bounds`] documents for itself.
+async fn fetch_transfer_sessions(
+    pool: &PgPool,
+    first: SessionDate,
+    last: SessionDate,
+) -> Result<Vec<SessionDate>, sqlx::Error> {
+    let (start, _) = first.bounds();
+    let (_, end) = last.bounds();
+
     let rows = sqlx::query(
         "SELECT transaction_time
          FROM account_activities
-         WHERE activity_type = ANY($1)",
+         WHERE activity_type = ANY($1)
+           AND transaction_time >= $2
+           AND transaction_time < $3",
     )
     .bind(TRANSFER_ACTIVITY_TYPES)
+    .bind(start)
+    .bind(end)
     .fetch_all(pool)
     .await?;
 
