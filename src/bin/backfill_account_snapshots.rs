@@ -1,20 +1,12 @@
 //! Rebuilds missing `account_snapshots` rows from Alpaca's portfolio history.
 //!
-//! Recovery tooling. `account_snapshots` is written only by the post-close sync, so a session the
-//! sync missed — a failed run, a stopped VM, a `database:reset` — leaves a hole that nothing else
-//! can fill. Every other table has a path back: bars refetch from Massive, activities refetch from
-//! Alpaca, `equity_pairs` restores from a dump. This table had none, which made every schema change
-//! a permanent loss of equity history.
+//! Recovery tooling, and the only import path this table has: a session the post-close sync missed
+//! is otherwise unrecoverable.
 //!
 //! Usage: `backfill_account_snapshots [--dry-run] <start YYYY-MM-DD> [end YYYY-MM-DD]`
-//! The end date defaults to today (Eastern) when omitted.
+//! The end date defaults to today (Eastern) when omitted; `--dry-run` reports without writing.
 //!
-//! Reconstructed rows carry equity and no balances, because equity is all portfolio history
-//! reports. That is enough for the two things the table exists for: the drawdown gate's reference
-//! and the dashboard's return series.
-//!
-//! A dry run reports what it would write and writes nothing, which makes this tool its own gap
-//! inventory — "how bad is it" and "fix it" are the same command with one flag between them.
+//! Reconstructed rows carry equity and no balances, which is all portfolio history reports.
 
 use std::collections::BTreeMap;
 
@@ -63,12 +55,10 @@ fn parse_date(value: &str) -> Result<SessionDate, String> {
 
 /// Parses the arguments, defaulting the end date to today in Eastern.
 ///
-/// `today` is a parameter rather than read from the clock here, because a function that reads the
-/// wall clock cannot be tested across the hours where the Eastern date and the UTC date disagree.
+/// `today` is a parameter rather than read from the clock, because a function that reads the wall
+/// clock cannot be tested across the hours where the Eastern and UTC dates disagree.
 ///
-/// `--dry-run` is accepted in any position rather than only first. It is the flag that makes this
-/// tool safe to point at production, and one that silently became a date argument because it
-/// trailed the range would be a trap.
+/// `--dry-run` is accepted in any position, so a trailing one cannot be read as a date.
 fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<BackfillRequest, String> {
     let dry_run = arguments.iter().any(|argument| argument == "--dry-run");
     let dates: Vec<&String> = arguments
@@ -101,9 +91,8 @@ struct BackfillSummary {
 impl BackfillSummary {
     /// A run that left a gap open must not look successful.
     ///
-    /// Disagreements gate the exit code too. The likeliest cause is a session-mapping error
-    /// shifting the whole curve by a day, which would otherwise be reported as a clean fill of
-    /// entirely wrong numbers.
+    /// Disagreements gate it too: their likeliest cause is a session-mapping skew, which would
+    /// otherwise report a clean fill of wrong numbers.
     fn exit_code(&self) -> i32 {
         if self.unfillable > 0 || self.disagreements > 0 {
             1
@@ -115,9 +104,8 @@ impl BackfillSummary {
 
 /// Decides what to do with each trading day in the range.
 ///
-/// Pure, and separated from both the fetch and the write so the decision can be tested without a
-/// database or a network. `stored` and `reported` are what the two sources say; the calendar says
-/// which days were sessions at all, so weekends and holidays are never counted as gaps.
+/// Pure, so the decision is testable without a database or a network. `trading_days` comes from the
+/// exchange calendar, so weekends and holidays are never counted as gaps.
 fn plan(
     trading_days: &[SessionDate],
     stored: &BTreeMap<SessionDate, Decimal>,
@@ -130,8 +118,7 @@ fn plan(
         match (stored.get(day), reported.get(day)) {
             (Some(held), Some(fetched)) => {
                 summary.present += 1;
-                // Free cross-check: the two sources should agree on a session both know about.
-                // Systematic disagreement is what a one-day session-mapping skew looks like.
+                // Systematic disagreement here is what a one-day session-mapping skew looks like.
                 if held != fetched {
                     summary.disagreements += 1;
                     warn!(
@@ -203,8 +190,8 @@ async fn run(request: &BackfillRequest) -> Result<BackfillSummary, Box<dyn std::
     let client = TradingClient::from_env(AlpacaCredentials::from_env()?);
     let pool = connect_pool().await?;
 
-    // The exchange decides which days were sessions. Deriving them from weekends alone would count
-    // every holiday as a gap this tool cannot close, and report a failure on a correct database.
+    // From the exchange, not from weekends: a holiday derived as a session reports a gap that is
+    // not one, and fails the run against a correct database.
     let calendar = TradingCalendar::from_days(
         client
             .fetch_calendar(request.start.date(), request.end.date())
@@ -242,8 +229,8 @@ async fn run(request: &BackfillRequest) -> Result<BackfillSummary, Box<dyn std::
 
     let mut written = 0;
     for (session, equity) in &fills {
-        // `DO NOTHING` means a row that appeared since the plan was made is left alone rather than
-        // downgraded, so a zero here is a race that resolved correctly, not a failure.
+        // Zero rows means a snapshot appeared since the plan was made; `DO NOTHING` left it alone,
+        // which is the race resolving correctly rather than a failure.
         written += account::store_equity_snapshot(&pool, *session, *equity).await?;
     }
     summary.filled = written as usize;
@@ -326,8 +313,7 @@ mod tests {
         assert!(error.contains("expected YYYY-MM-DD"), "{error}");
     }
 
-    /// The flag must not be mistaken for a date wherever it lands, or a trailing `--dry-run` would
-    /// turn a dry run into a live write against the range the operator was only inspecting.
+    /// A trailing `--dry-run` read as a date would turn an inspection into a live write.
     #[test]
     fn test_the_dry_run_flag_is_recognized_in_any_position() {
         for arguments in [
@@ -368,8 +354,7 @@ mod tests {
         assert_eq!(summary.exit_code(), 0);
     }
 
-    /// A session already recorded is never rewritten, even though portfolio history also has it.
-    /// The stored row may carry balances that portfolio history cannot supply.
+    /// A recorded session is never rewritten: its row may carry balances history cannot supply.
     #[test]
     fn test_a_session_already_present_is_left_alone() {
         let trading_days = vec![date("2026-05-14")];
@@ -382,8 +367,7 @@ mod tests {
         assert_eq!(summary.exit_code(), 0);
     }
 
-    /// The cross-check that would catch a session-mapping skew. A shifted curve makes every
-    /// overlapping session disagree at once, which is why disagreement fails the run.
+    /// A shifted curve makes every overlapping session disagree at once, so disagreement fails.
     #[test]
     fn test_disagreeing_equity_is_reported_and_fails_the_run() {
         let trading_days = vec![date("2026-05-14")];
@@ -397,8 +381,7 @@ mod tests {
         assert_eq!(summary.exit_code(), 1);
     }
 
-    /// A gap neither source can close is the failure this tool exists to surface. Counting it as
-    /// "nothing to do" would report success over a hole that is still there.
+    /// A gap neither source can close must fail, not read as "nothing to do".
     #[test]
     fn test_a_session_neither_source_has_fails_the_run() {
         let trading_days = vec![date("2026-05-14")];
@@ -410,8 +393,7 @@ mod tests {
         assert_eq!(summary.exit_code(), 1);
     }
 
-    /// Portfolio history returns points for non-trading days too. The calendar decides what counts,
-    /// so a weekend inside the range is neither filled nor reported as a gap.
+    /// History reports non-trading days too; the calendar decides what counts as a gap.
     #[test]
     fn test_days_outside_the_calendar_are_not_filled() {
         let trading_days = vec![date("2026-05-15")];

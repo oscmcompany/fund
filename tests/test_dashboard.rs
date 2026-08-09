@@ -64,8 +64,7 @@ async fn store_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
         .expect("Failed to store an account snapshot");
 }
 
-/// The other kind of row: a session rebuilt by `backfill_account_snapshots`, carrying equity and
-/// four NULLs.
+/// The other kind of row: a session rebuilt by `backfill_account_snapshots`.
 async fn store_reconstructed_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
     account::store_equity_snapshot(pool, session_date, decimal(equity))
         .await
@@ -356,11 +355,8 @@ async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
 
 /// A reconstructed session must survive the whole read path.
 ///
-/// `fetch_account_snapshot_history` reads the balances with `try_get`, which returns an error
-/// rather than a default when the column is NULL — so before the columns were relaxed and the
-/// struct made optional, one backfilled row would have failed *every* query on the page, not just
-/// its own cells. The returns still publish because they are derived from equity, which a
-/// reconstructed row does have.
+/// `try_get` errors rather than defaults on NULL, so one backfilled row would fail *every* query on
+/// the page, not just its own cells. The returns still publish, being derived from equity.
 #[tokio::test]
 #[serial]
 async fn test_a_reconstructed_session_reads_back_without_its_balances() {
@@ -381,8 +377,8 @@ async fn test_a_reconstructed_session_reads_back_without_its_balances() {
         .expect("the reconstructed session must be in the history");
     assert_eq!(latest.session_date, today);
     assert_eq!(latest.equity, decimal("22000"));
-    // All four fields, before the exposures. The exposure assertions below are weaker than they
-    // look: both short-circuit on `?`, so `None` proves only that *one* side is absent.
+    // Directly, because the exposures below short-circuit on `?` and prove only that one side is
+    // absent.
     assert_eq!(latest.cash, None);
     assert_eq!(latest.buying_power, None);
     assert_eq!(latest.long_market_value, None);

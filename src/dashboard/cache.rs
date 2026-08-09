@@ -33,11 +33,10 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// Events retained in the ring buffer.
 const EVENT_BUFFER_CAPACITY: usize = 500;
 
-/// One session's account state, as Alpaca reported it after the close.
+/// One session's account state.
 ///
-/// Every balance is optional because a session can also be reconstructed long after it ended, from
-/// portfolio history, which reports equity alone. `equity` is the one field both sources supply,
-/// which is why it is the only one that is not.
+/// Balances are optional because a session reconstructed by `backfill_account_snapshots` has none;
+/// `equity` is the only field both sources supply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
     pub session_date: SessionDate,
@@ -55,8 +54,7 @@ impl AccountSnapshot {
     /// nets a market-neutral book to roughly zero — which is the one number that says nothing
     /// about how much is deployed.
     ///
-    /// `None` for a reconstructed session. Both sides are required rather than defaulted, because
-    /// one side alone is not a smaller exposure — it is an unknown one.
+    /// `None` unless both sides are known: one side alone is an unknown exposure, not a smaller one.
     pub fn gross_exposure(&self) -> Option<Decimal> {
         Some(self.long_market_value?.abs() + self.short_market_value?.abs())
     }
@@ -312,8 +310,7 @@ mod tests {
         assert_eq!(tilted.net_exposure(), Some(decimal("20000")));
     }
 
-    /// A reconstructed session knows its equity and nothing else. Zero would be a lie about a book
-    /// whose composition was never recorded, so both exposures withhold instead.
+    /// An unrecorded book is unknown, not flat, so both exposures withhold rather than return zero.
     #[test]
     fn test_a_reconstructed_session_reports_no_exposure() {
         let mut reconstructed = snapshot("60000", "-40000");

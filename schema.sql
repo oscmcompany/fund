@@ -132,10 +132,8 @@ CREATE INDEX IF NOT EXISTS idx_equity_pairs_closed_at -- noqa: PG01
 CREATE TABLE IF NOT EXISTS account_snapshots (
     session_date        DATE        PRIMARY KEY,
     equity              NUMERIC     NOT NULL,
-    -- Nullable because a session can also be reconstructed after the fact:
-    -- /v2/account/portfolio/history reports equity and nothing else, so a row restored by
-    -- backfill_account_snapshots has no balances to record and writing zeros would fabricate
-    -- them. NULL here means "never captured", not "was zero".
+    -- NULL means "never captured", not "was zero": a session restored by
+    -- backfill_account_snapshots has only the equity portfolio history reports.
     cash                NUMERIC,
     buying_power        NUMERIC,
     long_market_value   NUMERIC,

@@ -85,14 +85,10 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
     })
 }
 
-/// Fetches whole snapshots oldest-first, which is the order every horizon calculation wants.
+/// Fetches whole snapshots oldest-first, the order every horizon calculation wants.
 ///
-/// Whole snapshots rather than an equity series, because the newest row is doing double duty: the
-/// horizon calculations read the `equity` column across the series, and `apply_poll` takes the last
-/// row as the account panel, which renders the balances too.
-///
-/// Those balances come back as `Option`, because a session reconstructed by
-/// `backfill_account_snapshots` carries equity and four NULLs. Only `equity` is guaranteed.
+/// Whole snapshots rather than an equity series because the newest row does double duty:
+/// `apply_poll` takes it as the account panel, which renders the balances too.
 async fn fetch_account_snapshot_history(
     pool: &PgPool,
 ) -> Result<Vec<AccountSnapshot>, sqlx::Error> {
@@ -530,8 +526,7 @@ mod tests {
                 NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
             ),
             equity: decimal(equity),
-            // The horizon calculations read `equity` and `session_date` and nothing else, so these
-            // are left absent rather than zeroed — a zero balance is a claim, `None` is not.
+            // Unread by the horizon calculations, and absent rather than zeroed: zero is a claim.
             cash: None,
             buying_power: None,
             long_market_value: None,

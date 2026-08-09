@@ -22,14 +22,12 @@ else
   exit 1
 fi
 
-# Every nightly export writes a date-partitioned key, so no export object is ever overwritten and
-# versioning costs nothing for them. It exists for the two keys that *are* written in place: the
-# capital flow ledger, which is kept out of the public repository and so has no git history to fall
-# back on, and database/backups/fund-latest.dump.gz, where today a truncated dump silently replaces
-# the only good one.
+# For the two keys written in place: the gitignored capital flow ledger, and
+# database/backups/fund-latest.dump.gz, where a truncated dump would otherwise replace the only good
+# one. Nightly exports write date-partitioned keys and accumulate no versions.
 #
-# Deliberately no lifecycle expiration. The same-key writes are infrequent, and versioning cannot be
-# disabled once enabled -- only suspended -- so rules are easier to add later than to take back.
+# No lifecycle expiration by decision -- versioning cannot be disabled once enabled, only suspended,
+# so rules are easier to add later than to take back.
 echo "Enabling versioning on $BUCKET"
 aws s3api put-bucket-versioning --bucket "$BUCKET" \
   --versioning-configuration Status=Enabled

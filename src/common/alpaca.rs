@@ -460,11 +460,8 @@ const ACTIVITIES_PAGE_SIZE: usize = 100;
 /// orders of magnitude more than ten pairs opening and closing can produce.
 const ACTIVITIES_MAXIMUM_PAGES: usize = 100;
 
-/// Portfolio history resolution: one point per trading day.
-///
-/// The only resolution `account_snapshots` can use, since its primary key is a session date. An
-/// intraday timeframe would return many points per session and force a choice about which one the
-/// session's equity is.
+/// Portfolio history resolution. Daily because `account_snapshots` is keyed by session date, and an
+/// intraday timeframe would return several points per session with no rule for picking one.
 const PORTFOLIO_HISTORY_TIMEFRAME: &str = "1D";
 
 /// What an order is meant to do, carrying the sizing form that side actually accepts.
@@ -698,12 +695,8 @@ impl AccountSnapshot {
 
 /// One point on Alpaca's equity curve: what the account was worth, and when.
 ///
-/// An instant rather than a date, because that is what the API sends and because deciding which
-/// session it belongs to is the caller's job — `SessionDate::at` reads the Eastern calendar day, and
-/// this module deliberately holds no opinion about trading sessions.
-///
-/// This is the whole of what portfolio history reports per point. There are no balances here, which
-/// is why a session restored from it leaves `account_snapshots.cash` and its siblings NULL.
+/// An instant rather than a session date, per the rule that transport modules stay in transport
+/// terms — the caller wraps it with `SessionDate::at`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EquityPoint {
     measured_at: DateTime<Utc>,
@@ -1146,24 +1139,13 @@ impl TradingClient {
 
     /// Fetches the daily equity curve over an inclusive date range.
     ///
-    /// This is the only way to learn what the account was worth on a session that was never
-    /// recorded: `/v2/account` answers for right now, and activities describe changes rather than
-    /// balances. It is what makes a lost `account_snapshots` recoverable.
+    /// **Alpaca's own `end` is exclusive**, so the day after it is what gets sent, making this
+    /// signature inclusive and sparing every caller the knowledge. Verified against the paper
+    /// account 2026-08-09: asking through Monday 2026-06-15 stopped at Friday the 12th. Left
+    /// uncompensated it drops the newest session, which is the one most likely to need repair.
     ///
-    /// Alpaca answers with **parallel arrays** rather than a list of objects, so the two are zipped
-    /// and the shorter one wins — a response whose arrays disagree in length is malformed, and
-    /// indexing one by the other's length would panic on live data. Points with no equity are
-    /// dropped rather than zeroed: Alpaca sends `null` for a day it has nothing for, and a zero
-    /// would be indistinguishable from a wiped-out account.
-    ///
-    /// Equity arrives as a JSON number here, unlike `/v2/account`, which sends strings.
-    ///
-    /// **Alpaca's own `end` is exclusive**, so the day after `end` is what gets sent. Verified
-    /// against the paper account on 2026-08-09: asking through Monday 2026-06-15 returned its last
-    /// point for Friday the 12th, while asking through the 16th included the 15th. Left
-    /// uncompensated, the most recent session would be missing from every response, so a backfill
-    /// would silently never repair the newest gap — the one most likely to exist. The range is made
-    /// inclusive here rather than at the call site so that no caller has to know this.
+    /// Days with a `null` equity are dropped rather than zeroed, since a zero would claim the
+    /// account was worthless rather than unvalued.
     pub async fn fetch_portfolio_history(
         &self,
         start: NaiveDate,
@@ -1313,10 +1295,8 @@ struct AccountResponse {
 }
 
 /// Column-oriented, unlike every other response this module parses: the equity at `timestamp[i]` is
-/// `equity[i]`. The remaining fields Alpaca sends — `profit_loss`, `base_value`, `timeframe` — are
-/// all derivable from the equity series or already known, so they are left off rather than carried.
-///
-/// `equity` is `Option<f64>` because Alpaca sends `null` for a day it has no valuation for.
+/// `equity[i]`. The reader zips them and stops at the shorter, since mismatched lengths are
+/// malformed and indexing one by the other would panic. Alpaca sends `null` for an unvalued day.
 #[derive(Deserialize)]
 struct PortfolioHistoryResponse {
     timestamp: Vec<i64>,
@@ -1978,9 +1958,7 @@ mod tests {
             .expect("portfolio history must parse");
 
         assert_eq!(points.len(), 2);
-        // Both halves of each pair, because asserting the equities alone would pass just as
-        // happily if the timestamps were transposed — and that is the regression that files an
-        // equity against the wrong session.
+        // Both halves: asserting equities alone would pass with the timestamps transposed.
         assert_eq!(points[0].measured_at().timestamp(), 1_778_788_800);
         assert_eq!(points[0].equity(), Decimal::new(2010050, 2));
         assert_eq!(points[1].measured_at().timestamp(), 1_778_875_200);
@@ -1988,10 +1966,8 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// The timestamps above are 20:00 UTC, which is 16:00 Eastern — the close, not the next
-    /// midnight. That is the whole correctness question for this endpoint: a point stamped at
-    /// midnight UTC would read as the *previous* Eastern session and shift the entire equity curve
-    /// back a day, which is the same class of bug `eastern_midnight` exists to prevent.
+    /// The fixture stamps 20:00 UTC, which is the 16:00 Eastern close. A point at midnight UTC
+    /// would read as the previous Eastern session and shift the whole curve back a day.
     #[tokio::test]
     async fn test_a_daily_point_lands_on_the_eastern_session_it_measured() {
         let mut server = mockito::Server::new_async().await;
@@ -2026,13 +2002,8 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// Alpaca's `end` is exclusive, so an inclusive range has to ask for the day after it. The mock
-    /// below only answers `end=2026-05-16`, which is what pins the compensation: drop it and the
-    /// request goes unmatched.
-    ///
-    /// Worth stating plainly because the failure is invisible without it. Every session but the last
-    /// would still come back, the run would report a tidy fill, and the newest gap — the one a
-    /// failed post-close sync just created, and the whole reason to run this — would survive it.
+    /// The mock answers only `end=2026-05-16`, pinning the exclusive-end compensation. Without it
+    /// every session but the last returns and the run reports a tidy fill over a surviving gap.
     #[tokio::test]
     async fn test_the_requested_end_date_is_included_in_the_response() {
         let mut server = mockito::Server::new_async().await;
@@ -2058,8 +2029,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// A `null` equity means Alpaca has no valuation for that day. Zero would be a different claim
-    /// entirely — a wiped-out account — and would land in `account_snapshots` as fact.
+    /// A `null` equity means no valuation; zero would claim a wiped-out account.
     #[tokio::test]
     async fn test_portfolio_history_drops_points_with_no_equity() {
         let mut server = mockito::Server::new_async().await;
@@ -2088,8 +2058,7 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// Arrays that disagree in length are malformed. Truncating to the shorter keeps every pairing
-    /// that is certainly correct; indexing one by the other's length would panic on live data.
+    /// Truncating to the shorter array keeps the pairings that are certainly correct.
     #[tokio::test]
     async fn test_portfolio_history_truncates_mismatched_arrays() {
         let mut server = mockito::Server::new_async().await;

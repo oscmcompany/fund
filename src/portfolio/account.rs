@@ -164,14 +164,11 @@ pub async fn store_snapshot(
     Ok(())
 }
 
-/// Writes a session's equity alone, for a session that was never captured live.
+/// Writes a session's equity alone, leaving the balances NULL because portfolio history reports
+/// none and zero would be a claim.
 ///
-/// The balances are left NULL rather than zeroed, because portfolio history does not report them
-/// and a zero would be a claim about a book whose composition is simply unknown.
-///
-/// `DO NOTHING` rather than the `DO UPDATE` [`store_snapshot`] uses, and that asymmetry is the
-/// point: this row is strictly less informative than one the post-close sync wrote, so a re-run
-/// over an already-populated range must never downgrade a complete snapshot to an equity-only one.
+/// `DO NOTHING`, unlike the `DO UPDATE` in [`store_snapshot`]: this row is strictly less
+/// informative, so a re-run must never downgrade a complete snapshot to an equity-only one.
 pub async fn store_equity_snapshot(
     pool: &PgPool,
     session_date: SessionDate,

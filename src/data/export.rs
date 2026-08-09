@@ -282,9 +282,8 @@ async fn pairs_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
 
 async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
-        // The balances carry no `!`: a session reconstructed from portfolio history records equity
-        // alone. Asserting them non-null would compile and then fail the whole nightly export at
-        // runtime, on the first backfilled row it met.
+        // No `!` on the balances: asserting them non-null compiles and then fails at runtime, on
+        // the first reconstructed row.
         r#"SELECT session_date AS "session_date!",
                   equity::double precision AS "equity!",
                   cash::double precision,
@@ -304,9 +303,7 @@ async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError
             collect(&rows, |row| row.session_date.to_string()),
         ),
         Column::new("equity".into(), collect(&rows, |row| row.equity)),
-        // The return types are spelled out to hold the query above to its word. Re-adding a `!` to
-        // any of these columns would make the field an `f64` again and fail here at compile time,
-        // rather than in production on the first reconstructed row.
+        // Return types spelled out so that re-adding a `!` above fails here at compile time.
         Column::new(
             "cash".into(),
             collect(&rows, |row| -> Option<f64> { row.cash }),

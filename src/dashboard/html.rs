@@ -398,11 +398,8 @@ fn format_dollars(value: Decimal) -> String {
     format!("{sign}${grouped}.{}", &fraction[..2])
 }
 
-/// Formats a dollar amount that a session may not have recorded.
-///
-/// A session reconstructed from portfolio history knows its equity and none of its balances, so
-/// this renders the same dim dash [`format_return`] uses for a withheld return. Both mean the
-/// figure is unavailable rather than zero, and they should read identically on the page.
+/// Formats a dollar amount a session may not have recorded, as the dim dash [`format_return`] uses
+/// for a withheld return. Both mean unavailable rather than zero, and should read alike.
 fn format_optional_dollars(value: Option<Decimal>) -> String {
     match value {
         Some(amount) => format_dollars(amount),
