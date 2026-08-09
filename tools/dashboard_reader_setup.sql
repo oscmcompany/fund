@@ -19,15 +19,16 @@ $$;
 GRANT CONNECT ON DATABASE fund TO dashboard_reader;
 GRANT USAGE ON SCHEMA public TO dashboard_reader;
 
--- Five tables, one per section of the page. equity_bars, equity_predictions, and events are
--- TimescaleDB hypertables; granting on the hypertable covers its existing chunks and the ones
--- created later, so there is nothing to re-run when a chunk rolls over.
+-- equity_bars, equity_predictions, and events are TimescaleDB hypertables; granting on the
+-- hypertable covers its existing chunks and the ones created later, so there is nothing to re-run
+-- when a chunk rolls over.
 --
--- account_activities is deliberately absent. Realized profit and loss is materialized onto
--- equity_pairs by the post-close sync precisely so the dashboard does not re-join activities to
--- legs on every page load, and a grant for a table nothing reads is a grant nobody will remember to
--- remove.
+-- account_activities is read only for its transfer rows. Period returns are raw equity changes and
+-- are wrong across a capital flow, so the page must be able to see that one arrived and withhold
+-- the number. Realized profit and loss is still materialized onto equity_pairs by the post-close
+-- sync, so nothing here re-joins activities to legs on a page load.
 GRANT SELECT ON account_snapshots   TO dashboard_reader;
+GRANT SELECT ON account_activities  TO dashboard_reader;
 GRANT SELECT ON equity_pairs        TO dashboard_reader;
 GRANT SELECT ON equity_predictions  TO dashboard_reader;
 GRANT SELECT ON equity_bars         TO dashboard_reader;

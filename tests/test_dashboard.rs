@@ -278,3 +278,70 @@ async fn test_open_and_closed_pairs_do_not_appear_in_each_others_sections() {
     assert_eq!(open_identifiers, vec!["AAPL-MSFT"]);
     assert_eq!(closed_identifiers, vec!["GOOG-AMZN"]);
 }
+
+/// The whole flow guard, end to end against PostgreSQL.
+///
+/// The unit tests hand `compute_period_returns` a list of sessions directly, which proves the
+/// arithmetic and nothing about how that list is obtained. This exercises the parts only a real
+/// database can: the `activity_type = ANY($1)` array bind, the range predicate, and the Eastern
+/// mapping from a stored `transaction_time` back to the session the guard compares against.
+#[tokio::test]
+#[serial]
+async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
+    use fund::common::alpaca::AccountActivity;
+
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let yesterday = today.plus_calendar_days(-1);
+
+    // A flat book that doubles only because capital arrived: the exact shape the guard exists for.
+    store_equity(&pool, yesterday, "20000").await;
+    store_equity(&pool, today, "30000").await;
+
+    let baseline = fetch_dashboard_data(&pool)
+        .await
+        .expect("the dashboard must read a database with no transfers");
+    assert_eq!(
+        baseline.period_returns.one_day,
+        Some(50.0),
+        "with no transfer recorded this reads as a 50% gain, which is the bug"
+    );
+
+    // Stamped at Eastern midnight, the way a dated transfer arrives from Alpaca.
+    let transfer = |id: &str, session: SessionDate| {
+        AccountActivity::new(
+            id.to_string(),
+            "CSD".to_string(),
+            session.midnight(),
+            None,
+            None,
+            None,
+            None,
+            Some(decimal("10000")),
+            None,
+        )
+    };
+
+    // A transfer far outside the displayed history must not blank the page. It is excluded by the
+    // query's range bound and would be ignored by the guard regardless, so this pins the pair of
+    // them together: an old contribution cannot withhold today's return forever.
+    let ancient = transfer("deposit-ancient", today.plus_calendar_days(-400));
+    account::store_activities(&pool, std::slice::from_ref(&ancient))
+        .await
+        .expect("Failed to store the out-of-range transfer");
+    let unaffected = fetch_dashboard_data(&pool)
+        .await
+        .expect("the dashboard must read a database with an out-of-range transfer");
+    assert_eq!(unaffected.period_returns.one_day, Some(50.0));
+
+    let deposit = transfer("deposit-1", today);
+    account::store_activities(&pool, std::slice::from_ref(&deposit))
+        .await
+        .expect("Failed to store the transfer");
+
+    let guarded = fetch_dashboard_data(&pool)
+        .await
+        .expect("the dashboard must read a database containing a transfer");
+    assert_eq!(guarded.period_returns.one_day, None);
+    assert_eq!(guarded.period_returns.since_inception, None);
+}
