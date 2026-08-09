@@ -202,6 +202,7 @@ async fn test_activities_are_idempotent_on_alpacas_identifier() {
         Some("buy".to_string()),
         Some(Decimal::from(10)),
         Some(Decimal::from(150)),
+        None,
         Some("order-1".to_string()),
     );
 

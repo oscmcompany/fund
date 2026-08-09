@@ -1,12 +1,16 @@
 //! The post-close account sync: what Alpaca says actually happened.
 //!
 //! Three things, in order. Balances land in `account_snapshots`, whose `equity` is what the *next*
-//! session's drawdown gate measures against. Fills land in `account_activities`, keyed by Alpaca's
-//! activity identifier so a re-run conflicts on every row and changes nothing. Then the fills are
-//! attributed back to their pairs.
+//! session's drawdown gate measures against. Fills and transfers land in `account_activities`,
+//! keyed by Alpaca's activity identifier so a re-run conflicts on every row and changes nothing.
+//! Then the fills — and only the fills — are attributed back to their pairs.
 //!
 //! Attribution is a materialization, not a source: `realized_profit_and_loss` exists so the
 //! dashboard need not re-join activities to pairs on every page load.
+//!
+//! Transfers are stored because they are read, not because they are attributed: a capital flow
+//! makes every equity-derived return wrong, and the dashboard withholds those figures rather than
+//! publishing them. Nothing here decides *whose* capital moved — Alpaca does not know.
 
 use std::collections::HashMap;
 
@@ -16,16 +20,26 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::alpaca::{AccountActivity, AccountSnapshot, ClientError, TradingClient};
-use crate::data::calendar::SessionDate;
+use crate::common::alpaca::{
+    AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
+    TRANSFER_ACTIVITY_TYPES,
+};
+use crate::data::calendar::{SessionDate, TradingCalendar};
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
-/// The activity type carrying trade fills.
+/// The activity types this sync fetches and stores.
 ///
-/// Only fills are synced today. Fees, dividends, and interest are real and the table can hold them,
-/// but nothing reads them until the dashboard is rewritten, and syncing a type nothing consumes is
-/// how a column full of untested parsing gets discovered in production.
-pub const FILL_ACTIVITY_TYPE: &str = "FILL";
+/// Fills, because they are attributed to pairs, plus transfers, because a capital flow invalidates
+/// every equity-derived return the dashboard publishes and something has to see it arrive.
+///
+/// `INT`, `DIV`, and `FEE` are deliberately absent. They are return rather than external flow, so
+/// nothing consumes them yet, and syncing a type nothing reads is how a column full of untested
+/// parsing gets discovered in production. They join when the unit ledger needs them.
+pub fn synced_activity_types() -> Vec<&'static str> {
+    std::iter::once(FILL_ACTIVITY_TYPE)
+        .chain(TRANSFER_ACTIVITY_TYPES)
+        .collect()
+}
 
 /// Errors syncing the account.
 #[derive(Debug, thiserror::Error)]
@@ -46,31 +60,58 @@ pub struct AccountSyncSummary {
     pub activities_stored: u64,
     pub pairs_attributed: usize,
     pub activities_unattributed: usize,
+    /// The previous trading session, when it has no snapshot — a hole in the equity series that a
+    /// future time-weighted return cannot chain across.
+    pub previous_session_gap: Option<SessionDate>,
 }
 
 /// Runs the whole post-close sync for one session date.
 pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
+    calendar: &TradingCalendar,
     session_date: SessionDate,
 ) -> Result<AccountSyncSummary, AccountError> {
     let account = client.fetch_account().await?;
     store_snapshot(pool, session_date, &account).await?;
+    let previous_session_gap = missing_previous_snapshot(pool, calendar, session_date).await;
 
-    let activities = client
-        .fetch_activities(FILL_ACTIVITY_TYPE, session_date.date())
-        .await?;
+    // One request per type: Alpaca puts the activity type in the URL path, and the sync already
+    // tolerates several round trips.
+    let mut activities = Vec::new();
+    for activity_type in synced_activity_types() {
+        activities.extend(
+            client
+                .fetch_activities(activity_type, session_date.date())
+                .await?,
+        );
+    }
     let activities_stored = store_activities(pool, &activities).await?;
 
     let (start, end) = session_date.bounds();
     let closed = pairs::load_closed_between(pool, start, end).await?;
-    let attribution = attribute(&closed, &activities);
+    // Only fills reach `attribute`. A transfer has no ticker and no signed cash flow, so passing
+    // one in would count it as unattributed and warn on every session that received capital.
+    let fills: Vec<AccountActivity> = activities
+        .iter()
+        .filter(|activity| activity.activity_type() == FILL_ACTIVITY_TYPE)
+        .cloned()
+        .collect();
+    let attribution = attribute(&closed, &fills);
 
     let mut pairs_attributed = 0;
     for (id, amount) in &attribution.realized {
         if pairs::record_realized_profit_and_loss(pool, *id, *amount).await? {
             pairs_attributed += 1;
         }
+    }
+
+    if let Some(previous) = previous_session_gap {
+        warn!(
+            %previous,
+            %session_date,
+            "Previous trading session has no account snapshot; the equity series has a gap"
+        );
     }
 
     info!(
@@ -87,6 +128,7 @@ pub async fn sync_account(
         equity: account.equity(),
         activities_stored,
         pairs_attributed,
+        previous_session_gap,
         activities_unattributed: attribution.unattributed,
     })
 }
@@ -140,7 +182,8 @@ pub async fn store_activities(
     for chunk in activities.chunks(1_000) {
         let mut query_builder = sqlx::QueryBuilder::new(
             "INSERT INTO account_activities \
-             (id, activity_type, transaction_time, ticker, side, quantity, price, order_id) ",
+             (id, activity_type, transaction_time, ticker, side, quantity, price, net_amount, \
+              order_id) ",
         );
         query_builder.push_values(chunk, |mut builder, activity| {
             builder
@@ -151,6 +194,7 @@ pub async fn store_activities(
                 .push_bind(activity.side().map(str::to_string))
                 .push_bind(activity.shares())
                 .push_bind(activity.price())
+                .push_bind(activity.net_amount())
                 .push_bind(activity.order_id().map(str::to_string));
         });
         query_builder.push(" ON CONFLICT (id) DO NOTHING");
@@ -169,6 +213,35 @@ pub async fn store_activities(
         "Account activities stored"
     );
     Ok(rows_affected)
+}
+
+/// The previous trading session, when it has no snapshot of its own.
+///
+/// A sync that failed at 16:15 leaves a hole nothing else notices, and the equity series is what a
+/// time-weighted return will eventually be folded from — a fold cannot chain across a missing
+/// session, and by the time one is discovered it may be months old.
+/// `/v2/account/portfolio/history` can refill it.
+///
+/// Asking the calendar for the previous session, rather than testing a date against
+/// [`TradingCalendar::is_trading_day`], is deliberate: it only ever returns days it actually holds,
+/// so a date beyond the fetched horizon cannot pass for a holiday. `None` means either no gap or no
+/// calendar reaching back that far, and neither is worth failing the sync over.
+async fn missing_previous_snapshot(
+    pool: &PgPool,
+    calendar: &TradingCalendar,
+    session_date: SessionDate,
+) -> Option<SessionDate> {
+    let previous = calendar.previous_trading_day(session_date)?;
+    match load_equity_for(pool, previous).await {
+        Ok(None) => Some(previous),
+        Ok(Some(_)) => None,
+        // A read failure says nothing about whether a gap exists, and the sync's real work is
+        // already done. Reporting it and continuing beats failing the session over a diagnostic.
+        Err(error) => {
+            warn!(%error, %previous, "Could not check the previous session for a gap");
+            None
+        }
+    }
 }
 
 /// Reads the equity recorded for a session, if one was.
@@ -298,6 +371,7 @@ mod tests {
             Some(Decimal::from(shares)),
             Some(Decimal::from(price)),
             None,
+            None,
         )
     }
 
@@ -371,6 +445,7 @@ mod tests {
             "FEE".to_string(),
             instant(16, 0),
             Some(ticker("AAAA")),
+            None,
             None,
             None,
             None,

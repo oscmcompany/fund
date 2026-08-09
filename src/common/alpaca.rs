@@ -13,7 +13,8 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -688,11 +689,22 @@ impl AccountSnapshot {
     }
 }
 
-/// One account activity: a fill, a fee, a dividend.
+/// The activity type carrying trade fills.
+pub const FILL_ACTIVITY_TYPE: &str = "FILL";
+
+/// Activity types that move capital into or out of the account from outside it.
+///
+/// The distinction that matters is external flow versus return, not cash versus non-cash: `INT`,
+/// `DIV`, and `FEE` also move the balance, but they are performance and must never be netted out of
+/// a return. `CSD` and `CSW` are bank deposits and withdrawals; `JNLC` is cash journalled between
+/// accounts on Alpaca's own books, which is how paper accounts are funded.
+pub const TRANSFER_ACTIVITY_TYPES: [&str; 3] = ["CSD", "CSW", "JNLC"];
+
+/// One account activity: a fill, a fee, a dividend, a transfer.
 ///
 /// Fields beyond the identity are optional because Alpaca omits rather than zeroes, and which ones
 /// are present depends on the activity type — a `FILL` carries a symbol, side, quantity, and price;
-/// a `FEE` carries none of them.
+/// a `FEE` carries none of them; a transfer carries only `net_amount`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountActivity {
     id: String,
@@ -702,6 +714,7 @@ pub struct AccountActivity {
     side: Option<String>,
     shares: Option<Decimal>,
     price: Option<Decimal>,
+    net_amount: Option<Decimal>,
     order_id: Option<String>,
 }
 
@@ -715,6 +728,7 @@ impl AccountActivity {
         side: Option<String>,
         shares: Option<Decimal>,
         price: Option<Decimal>,
+        net_amount: Option<Decimal>,
         order_id: Option<String>,
     ) -> Self {
         Self {
@@ -725,6 +739,7 @@ impl AccountActivity {
             side,
             shares,
             price,
+            net_amount,
             order_id,
         }
     }
@@ -756,6 +771,14 @@ impl AccountActivity {
 
     pub fn price(&self) -> Option<Decimal> {
         self.price
+    }
+
+    /// The signed cash effect of a non-trade activity, as Alpaca reports it.
+    ///
+    /// Transfers carry this instead of quantity and price, so it is the only field that says how
+    /// much a deposit moved. Negative for withdrawals and fees.
+    pub fn net_amount(&self) -> Option<Decimal> {
+        self.net_amount
     }
 
     pub fn order_id(&self) -> Option<&str> {
@@ -1025,12 +1048,10 @@ impl TradingClient {
             let last_id = payloads.last().map(|payload| payload.id.clone());
 
             for payload in payloads {
-                let Some(transaction_time) = payload.transaction_time.or_else(|| {
-                    payload
-                        .date
-                        .and_then(|day| day.and_hms_opt(0, 0, 0))
-                        .map(|naive| naive.and_utc())
-                }) else {
+                let Some(transaction_time) = payload
+                    .transaction_time
+                    .or_else(|| payload.date.map(eastern_midnight))
+                else {
                     undated += 1;
                     continue;
                 };
@@ -1047,6 +1068,11 @@ impl TradingClient {
                         .and_then(decimal_or_none),
                     payload
                         .price
+                        .as_deref()
+                        .map(str::trim)
+                        .and_then(decimal_or_none),
+                    payload
+                        .net_amount
                         .as_deref()
                         .map(str::trim)
                         .and_then(decimal_or_none),
@@ -1079,6 +1105,27 @@ impl TradingClient {
         debug!(activity_type, %date, activities = activities.len(), "Account activities fetched");
         Ok(activities)
     }
+}
+
+/// Midnight Eastern on a settlement date, as the equivalent UTC instant.
+///
+/// Non-trade activities carry a `date` and no time, but `account_activities.transaction_time` is
+/// `NOT NULL`, so an instant has to be chosen. Eastern midnight is the only choice that round-trips:
+/// consumers recover the session with `SessionDate::at`, which reads the Eastern calendar day, so
+/// midnight UTC would resolve to the *previous* session for the whole Eastern evening and file a
+/// transfer against the wrong day's capital flows.
+///
+/// Duplicates `SessionDate::midnight`, which cannot be called from here: it lives in
+/// `data::calendar`, and that module already depends on this one.
+fn eastern_midnight(date: NaiveDate) -> DateTime<Utc> {
+    let local_midnight = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid wall-clock time");
+    New_York
+        .from_local_datetime(&local_midnight)
+        .earliest()
+        .map(|zoned| zoned.with_timezone(&Utc))
+        .unwrap_or_else(|| local_midnight.and_utc())
 }
 
 /// Collapses Alpaca's order status vocabulary into [`OrderState`].
@@ -1201,6 +1248,9 @@ struct ActivityResponse {
     side: Option<String>,
     qty: Option<String>,
     price: Option<String>,
+    /// Present on non-trade activities, which carry a net cash amount rather than a quantity and a
+    /// price.
+    net_amount: Option<String>,
     order_id: Option<String>,
 }
 
@@ -2231,6 +2281,7 @@ mod tests {
                 Some(Decimal::new(10, 0)),
                 Some(Decimal::new(15050, 2)),
                 None,
+                None,
             )
         };
         assert_eq!(
@@ -2259,9 +2310,11 @@ mod tests {
             None,
             None,
             None,
+            Some(Decimal::new(-2, 2)),
             None,
         );
         assert_eq!(fee.signed_cash_flow(), None);
+        assert_eq!(fee.net_amount(), Some(Decimal::new(-2, 2)));
     }
 
     /// `account_activities.transaction_time` is NOT NULL, so an activity with neither a time nor a
@@ -2288,6 +2341,116 @@ mod tests {
 
         assert_eq!(activities.len(), 1);
         assert_eq!(activities[0].id(), "dated");
+        mock.assert_async().await;
+    }
+
+    /// A settlement date carries no time, and the instant synthesized for it decides which session
+    /// the activity lands in. Midnight UTC is still the *previous* Eastern day for the whole
+    /// evening, so a transfer dated the 15th would reconcile against the 14th's capital flows.
+    #[tokio::test]
+    async fn test_dated_activity_resolves_to_its_eastern_session() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"20260515000000000::journal","activity_type":"JNLC",
+                     "date":"2026-05-15","net_amount":"20000","status":"executed"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let activities = client
+            .fetch_activities("JNLC", date(2026, 5, 15))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(
+            activities[0]
+                .transaction_time()
+                .with_timezone(&New_York)
+                .date_naive(),
+            date(2026, 5, 15),
+            "a dated activity must land in the session Alpaca dated it"
+        );
+        mock.assert_async().await;
+    }
+
+    /// A transfer carries neither quantity nor price, so `net_amount` is the only field saying how
+    /// much moved. Dropping it would store the deposit with no amount at all.
+    ///
+    /// The `JNLC` fixture is the shape a real paper account returns; `CSD` is what a bank deposit
+    /// into a live account books as, and has no live coverage until real money moves.
+    #[tokio::test]
+    async fn test_transfer_activities_retain_their_net_amount() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"20260515000000000::journal","activity_type":"JNLC",
+                     "date":"2026-05-15","net_amount":"20000","description":"",
+                     "status":"executed","currency":"USD"},
+                    {"id":"20260515000000001::deposit","activity_type":"CSD",
+                     "date":"2026-05-15","net_amount":"10000.50","status":"executed"},
+                    {"id":"20260515000000002::withdrawal","activity_type":"CSW",
+                     "date":"2026-05-15","net_amount":"-2500.25","status":"executed"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let activities = client
+            .fetch_activities("JNLC", date(2026, 5, 15))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(activities.len(), 3);
+        assert_eq!(activities[0].net_amount(), Some(Decimal::new(20000, 0)));
+        assert_eq!(activities[1].net_amount(), Some(Decimal::new(1000050, 2)));
+        assert_eq!(
+            activities[2].net_amount(),
+            Some(Decimal::new(-250025, 2)),
+            "a withdrawal must keep its sign"
+        );
+        for activity in &activities {
+            assert_eq!(
+                activity.signed_cash_flow(),
+                None,
+                "a transfer is not a two-sided trade and must never be attributed to a pair"
+            );
+        }
+        mock.assert_async().await;
+    }
+
+    /// The fallback must not disturb activities that carry a real time of their own.
+    #[tokio::test]
+    async fn test_timed_activity_keeps_its_transaction_time() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"fill","activity_type":"FILL","transaction_time":"2026-05-15T13:45:00Z",
+                     "symbol":"AAPL","side":"buy","qty":"1","price":"150.00"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let activities = client
+            .fetch_activities("FILL", date(2026, 5, 15))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(
+            activities[0].transaction_time(),
+            "2026-05-15T13:45:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         mock.assert_async().await;
     }
 

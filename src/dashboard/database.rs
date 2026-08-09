@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use tracing::warn;
 
+use crate::common::alpaca::TRANSFER_ACTIVITY_TYPES;
 use crate::common::types::{PairID, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
@@ -51,7 +52,8 @@ pub struct DashboardData {
 /// the previous state.
 pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::Error> {
     let equity_history = fetch_equity_history(pool).await?;
-    let period_returns = compute_period_returns(&equity_history);
+    let transfer_sessions = fetch_transfer_sessions(pool).await?;
+    let period_returns = compute_period_returns(&equity_history, &transfer_sessions);
     let open_pairs = fetch_open_pairs(pool).await?;
     let closed_pairs = fetch_closed_pairs(pool).await?;
     let closed_summary = compute_closed_summary(&closed_pairs);
@@ -96,6 +98,30 @@ async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sql
                 long_market_value: row.try_get("long_market_value")?,
                 short_market_value: row.try_get("short_market_value")?,
             })
+        })
+        .collect()
+}
+
+/// Fetches the sessions in which capital moved into or out of the account.
+///
+/// Timestamps come back raw and become sessions through [`SessionDate::at`], rather than being
+/// converted in SQL: `(transaction_time AT TIME ZONE 'America/New_York')::date` hides the column
+/// behind an expression, and one place owning the Eastern rollover is worth more than the alternative.
+async fn fetch_transfer_sessions(pool: &PgPool) -> Result<Vec<SessionDate>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT transaction_time
+         FROM account_activities
+         WHERE activity_type = ANY($1)",
+    )
+    .bind(TRANSFER_ACTIVITY_TYPES)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(SessionDate::at(
+                row.try_get::<DateTime<Utc>, _>("transaction_time")?,
+            ))
         })
         .collect()
 }
@@ -311,14 +337,36 @@ fn baseline_at_or_before(
 }
 
 /// Computes the return over each horizon from an ascending-ordered account history.
-pub fn compute_period_returns(history: &[AccountSnapshot]) -> PeriodReturns {
+///
+/// **Flow-blind by construction.** Every figure here is a raw equity-to-equity change, so a deposit
+/// inside a horizon reads as performance — a $10,000 contribution into a flat $20,000 book publishes
+/// as +50%. Any horizon spanning a capital flow therefore returns `None` rather than a plausible
+/// wrong number. `nav_per_unit` replaces this calculation outright when the unit ledger lands, at
+/// which point the guard has nothing left to protect; see `.scratchpad/unit_accounting.md`.
+pub fn compute_period_returns(
+    history: &[AccountSnapshot],
+    transfer_sessions: &[SessionDate],
+) -> PeriodReturns {
     let Some(latest) = history.last() else {
         return PeriodReturns::default();
     };
 
+    // Flows are treated as arriving at the end of their session, so a transfer *on* the baseline
+    // session is already inside the baseline equity and does not distort the comparison. Anything
+    // strictly after it does.
+    let change_from = |baseline: &AccountSnapshot| {
+        let spans_a_flow = transfer_sessions
+            .iter()
+            .any(|session| *session > baseline.session_date && *session <= latest.session_date);
+        if spans_a_flow {
+            return None;
+        }
+        percentage_change(baseline.equity, latest.equity)
+    };
+
     let horizon = |days: i64| {
         baseline_at_or_before(history, latest.session_date.plus_calendar_days(-days))
-            .and_then(|baseline| percentage_change(baseline.equity, latest.equity))
+            .and_then(change_from)
     };
 
     // Year to date measures from the last session of the previous year, so the first session of
@@ -327,16 +375,14 @@ pub fn compute_period_returns(history: &[AccountSnapshot]) -> PeriodReturns {
     let year_to_date = year_start
         .and_then(|start| baseline_at_or_before(history, SessionDate::from_date(start.pred_opt()?)))
         .or_else(|| history.first())
-        .and_then(|baseline| percentage_change(baseline.equity, latest.equity));
+        .and_then(change_from);
 
     PeriodReturns {
         one_day: horizon(1),
         one_week: horizon(7),
         one_month: horizon(30),
         year_to_date,
-        since_inception: history
-            .first()
-            .and_then(|baseline| percentage_change(baseline.equity, latest.equity)),
+        since_inception: history.first().and_then(change_from),
     }
 }
 
@@ -471,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_period_returns_are_empty_without_history() {
-        assert_eq!(compute_period_returns(&[]), PeriodReturns::default());
+        assert_eq!(compute_period_returns(&[], &[]), PeriodReturns::default());
     }
 
     #[test]
@@ -480,7 +526,7 @@ mod tests {
             snapshot("2026-07-30", "100000"),
             snapshot("2026-07-31", "101000"),
         ];
-        let returns = compute_period_returns(&history);
+        let returns = compute_period_returns(&history, &[]);
         assert_eq!(returns.one_day, Some(1.0));
         // Nothing sits at or before 2026-07-24, so a weekly return cannot be computed.
         assert_eq!(returns.one_week, None);
@@ -497,7 +543,7 @@ mod tests {
             snapshot("2026-07-31", "110000"),
         ];
         // 2026-07-31 minus seven days is 2026-07-24, a Friday, and it is in the series.
-        assert_eq!(compute_period_returns(&history).one_week, Some(10.0));
+        assert_eq!(compute_period_returns(&history, &[]).one_week, Some(10.0));
 
         let shifted = vec![
             snapshot("2026-07-23", "100000"),
@@ -505,7 +551,7 @@ mod tests {
             snapshot("2026-07-31", "110000"),
         ];
         // The cutoff now falls on a day with no session, so the prior one is used.
-        assert_eq!(compute_period_returns(&shifted).one_week, Some(10.0));
+        assert_eq!(compute_period_returns(&shifted, &[]).one_week, Some(10.0));
     }
 
     #[test]
@@ -515,7 +561,10 @@ mod tests {
             snapshot("2026-01-02", "102000"),
             snapshot("2026-07-31", "120000"),
         ];
-        assert_eq!(compute_period_returns(&history).year_to_date, Some(20.0));
+        assert_eq!(
+            compute_period_returns(&history, &[]).year_to_date,
+            Some(20.0)
+        );
     }
 
     #[test]
@@ -524,7 +573,10 @@ mod tests {
             snapshot("2026-01-02", "100000"),
             snapshot("2026-07-31", "125000"),
         ];
-        assert_eq!(compute_period_returns(&history).year_to_date, Some(25.0));
+        assert_eq!(
+            compute_period_returns(&history, &[]).year_to_date,
+            Some(25.0)
+        );
     }
 
     /// A zero baseline is a division by zero, and it is reachable: the first snapshot of an account
@@ -535,9 +587,72 @@ mod tests {
             snapshot("2026-07-30", "0"),
             snapshot("2026-07-31", "100000"),
         ];
-        let returns = compute_period_returns(&history);
+        let returns = compute_period_returns(&history, &[]);
         assert_eq!(returns.one_day, None);
         assert_eq!(returns.since_inception, None);
+    }
+
+    fn session(date: &str) -> SessionDate {
+        SessionDate::from_date(
+            NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
+        )
+    }
+
+    /// The bug this guard exists for: a flat book that receives a deposit publishes the deposit as
+    /// performance. $10,000 into a flat $20,000 book reads as +50%, and the error never washes out
+    /// of a cumulative series. Withholding the figure is the only correct answer until the return
+    /// series comes from `nav_per_unit`.
+    #[test]
+    fn test_a_horizon_spanning_a_capital_flow_publishes_no_return() {
+        let history = vec![
+            snapshot("2026-07-30", "20000"),
+            snapshot("2026-07-31", "30000"),
+        ];
+
+        let unguarded = compute_period_returns(&history, &[]);
+        assert_eq!(
+            unguarded.one_day,
+            Some(50.0),
+            "without the flow this really is a 50% gain"
+        );
+
+        let guarded = compute_period_returns(&history, &[session("2026-07-31")]);
+        assert_eq!(guarded.one_day, None);
+        assert_eq!(guarded.since_inception, None);
+    }
+
+    /// Flows land at the end of their session, so a transfer *on* the baseline session is already
+    /// inside the baseline equity. Refusing there would blank the dashboard for a year after a
+    /// contribution that does not affect the comparison at all.
+    #[test]
+    fn test_a_flow_on_the_baseline_session_does_not_withhold_the_return() {
+        let history = vec![
+            snapshot("2026-07-30", "20000"),
+            snapshot("2026-07-31", "22000"),
+        ];
+        let returns = compute_period_returns(&history, &[session("2026-07-30")]);
+        assert_eq!(returns.one_day, Some(10.0));
+    }
+
+    /// A flow outside the window says nothing about the window. Only horizons reaching back across
+    /// it are withheld, so a deposit does not blank every figure on the page forever.
+    #[test]
+    fn test_a_flow_outside_the_window_leaves_shorter_horizons_intact() {
+        let history = vec![
+            snapshot("2026-07-24", "100000"),
+            snapshot("2026-07-27", "100000"),
+            snapshot("2026-07-31", "110000"),
+        ];
+        let returns = compute_period_returns(&history, &[session("2026-07-27")]);
+        assert_eq!(
+            returns.one_week, None,
+            "the weekly baseline is 2026-07-24, so its window spans the flow"
+        );
+        assert_eq!(
+            returns.one_day,
+            Some(10.0),
+            "the daily baseline is 2026-07-27 itself, so the flow is already inside it"
+        );
     }
 
     #[test]

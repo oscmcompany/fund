@@ -152,6 +152,9 @@ CREATE TABLE IF NOT EXISTS account_activities (
     side              TEXT,
     quantity          NUMERIC,
     price             NUMERIC,
+    -- Transfers carry a net cash amount instead of a quantity and a price, and it is the only
+    -- field saying how much a deposit moved. Negative for withdrawals and fees.
+    net_amount        NUMERIC,
     order_id          TEXT,
     fetched_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );

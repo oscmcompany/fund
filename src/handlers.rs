@@ -424,7 +424,7 @@ async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
 
-    let summary = account::sync_account(&state.pool, &state.trading, today).await?;
+    let summary = account::sync_account(&state.pool, &state.trading, &calendar, today).await?;
     Ok(serde_json::to_value(summary).unwrap_or_else(|_| json!({})))
 }
 

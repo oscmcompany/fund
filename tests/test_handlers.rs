@@ -64,6 +64,39 @@ fn calendar_for_today() -> TradingCalendar {
     TradingCalendar::from_days(days)
 }
 
+/// Consecutive sessions ending at `session_date`, for tests that pin a fixed date.
+fn calendar_ending_at(session_date: SessionDate) -> TradingCalendar {
+    let days = (0..5)
+        .filter_map(|offset| {
+            CalendarDay::new(
+                session_date.plus_calendar_days(-offset).date(),
+                NaiveTime::from_hms_opt(9, 30, 0).unwrap(),
+                NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            )
+        })
+        .collect();
+    TradingCalendar::from_days(days)
+}
+
+/// Answers every transfer activity endpoint with an empty list.
+///
+/// The sync asks for each synced type in turn, so a test mocking only `FILL` would have its
+/// remaining requests go unmatched.
+async fn mock_no_transfers(server: &mut mockito::ServerGuard) {
+    for activity_type in ["CSD", "CSW", "JNLC"] {
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!("^/v2/account/activities/{activity_type}")),
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+    }
+}
+
 /// A universe holding exactly the named tickers, every one of them shortable.
 fn universe_of(tickers: &[&str]) -> Universe {
     use fund::common::alpaca::TradableAssets;
@@ -636,10 +669,17 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         .create_async()
         .await;
 
+    mock_no_transfers(&mut server).await;
+
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let summary = account::sync_account(&pool, &trading, session_date)
-        .await
-        .expect("the sync must run");
+    let summary = account::sync_account(
+        &pool,
+        &trading,
+        &calendar_ending_at(session_date),
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
 
     assert_eq!(summary.activities_stored, 2);
     assert_eq!(summary.activities_unattributed, 0);
@@ -691,11 +731,14 @@ async fn test_the_account_sync_is_idempotent() {
         .create_async()
         .await;
 
+    mock_no_transfers(&mut server).await;
+
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let first = account::sync_account(&pool, &trading, session_date)
+    let calendar = calendar_ending_at(session_date);
+    let first = account::sync_account(&pool, &trading, &calendar, session_date)
         .await
         .unwrap();
-    let second = account::sync_account(&pool, &trading, session_date)
+    let second = account::sync_account(&pool, &trading, &calendar, session_date)
         .await
         .unwrap();
 
@@ -713,6 +756,151 @@ async fn test_the_account_sync_is_idempotent() {
         .await
         .unwrap();
     assert_eq!(snapshots, 1, "the same session must not stack rows");
+}
+
+/// A deposit has to survive the round trip with its amount, because that amount is the only record
+/// of how much arrived — and it must not be mistaken for a fill along the way. `attribute` counts
+/// anything without a ticker as unattributed, so a transfer reaching it would raise a false alarm
+/// on every session that received capital.
+#[tokio::test]
+#[serial]
+async fn test_the_account_sync_stores_transfers_without_attributing_them() {
+    use fund::portfolio::account;
+
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    let session_date = SessionDate::at(session_instant());
+
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(200)
+        .with_body(account_body(30_000))
+        .create_async()
+        .await;
+    for activity_type in ["FILL", "CSW"] {
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!("^/v2/account/activities/{activity_type}")),
+            )
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+    }
+    // The shape a real account returns: a settlement date, no transaction time, and the amount
+    // carried by `net_amount` rather than a quantity and a price.
+    let _deposit = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/account/activities/CSD".into()),
+        )
+        .with_status(200)
+        .with_body(format!(
+            r#"[{{"id":"deposit-1","activity_type":"CSD","date":"{}",
+                  "net_amount":"10000.00","status":"executed"}}]"#,
+            session_date.date()
+        ))
+        .create_async()
+        .await;
+    let _journal = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/account/activities/JNLC".into()),
+        )
+        .with_status(200)
+        .with_body("[]")
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let summary = account::sync_account(
+        &pool,
+        &trading,
+        &calendar_ending_at(session_date),
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
+
+    assert_eq!(summary.activities_stored, 1);
+    assert_eq!(
+        summary.activities_unattributed, 0,
+        "a transfer is not a fill and must never reach attribution"
+    );
+
+    let (activity_type, net_amount, stored_time): (
+        String,
+        rust_decimal::Decimal,
+        chrono::DateTime<Utc>,
+    ) = sqlx::query_as(
+        "SELECT activity_type, net_amount, transaction_time
+             FROM account_activities WHERE id = 'deposit-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(activity_type, "CSD");
+    assert_eq!(net_amount, rust_decimal::Decimal::new(1000000, 2));
+    assert_eq!(
+        SessionDate::at(stored_time),
+        session_date,
+        "a dated transfer must land in the session Alpaca dated it, not the one before"
+    );
+}
+
+/// Nothing else notices a failed sync: the hole it leaves is silent until a return spanning it is
+/// asked for, which may be months later.
+#[tokio::test]
+#[serial]
+async fn test_the_account_sync_reports_a_missing_previous_session() {
+    use fund::portfolio::account;
+
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    let session_date = SessionDate::at(session_instant());
+    let calendar = calendar_ending_at(session_date);
+    let previous = calendar
+        .previous_trading_day(session_date)
+        .expect("the fixture calendar reaches back");
+
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(200)
+        .with_body(account_body(100_000))
+        .create_async()
+        .await;
+    for activity_type in ["FILL", "CSD", "CSW", "JNLC"] {
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!("^/v2/account/activities/{activity_type}")),
+            )
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+    }
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let with_gap = account::sync_account(&pool, &trading, &calendar, session_date)
+        .await
+        .expect("the sync must run");
+    assert_eq!(
+        with_gap.previous_session_gap,
+        Some(previous),
+        "the previous session has no snapshot and the sync must say so"
+    );
+
+    // Fill the hole and the same sync stops reporting it.
+    account::sync_account(&pool, &trading, &calendar, previous)
+        .await
+        .expect("the sync must run");
+    let repaired = account::sync_account(&pool, &trading, &calendar, session_date)
+        .await
+        .expect("the sync must run");
+    assert_eq!(repaired.previous_session_gap, None);
 }
 
 // ---------------------------------------------------------------------------
