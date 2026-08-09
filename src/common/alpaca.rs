@@ -1978,7 +1978,12 @@ mod tests {
             .expect("portfolio history must parse");
 
         assert_eq!(points.len(), 2);
+        // Both halves of each pair, because asserting the equities alone would pass just as
+        // happily if the timestamps were transposed — and that is the regression that files an
+        // equity against the wrong session.
+        assert_eq!(points[0].measured_at().timestamp(), 1_778_788_800);
         assert_eq!(points[0].equity(), Decimal::new(2010050, 2));
+        assert_eq!(points[1].measured_at().timestamp(), 1_778_875_200);
         assert_eq!(points[1].equity(), Decimal::new(2055916, 2));
         mock.assert_async().await;
     }

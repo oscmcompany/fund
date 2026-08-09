@@ -267,6 +267,29 @@ async fn test_a_session_with_no_snapshot_reads_as_none() {
     assert_eq!(account::load_equity_for(&pool, date).await.unwrap(), None);
 }
 
+/// Every balance column for a session, in schema order.
+///
+/// All four together rather than one at a time, because the invariant is all-or-nothing and nothing
+/// enforces it: the columns are independently nullable and the Rust fields independently optional,
+/// so a writer that filled three of them would satisfy any single-column assertion.
+type Balances = (
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+);
+
+async fn balances_for(pool: &PgPool, session_date: SessionDate) -> Balances {
+    sqlx::query_as(
+        "SELECT cash, buying_power, long_market_value, short_market_value
+         FROM account_snapshots WHERE session_date = $1",
+    )
+    .bind(session_date.date())
+    .fetch_one(pool)
+    .await
+    .expect("the snapshot row must exist")
+}
+
 /// A reconstructed session stores equity and leaves every balance NULL. The four columns were
 /// `NOT NULL` until portfolio history needed to write a row it could only half fill, so this is the
 /// insert that the old schema rejected outright.
@@ -286,13 +309,11 @@ async fn test_a_reconstructed_snapshot_stores_equity_without_balances() {
         Some(Decimal::from(20_559))
     );
 
-    let cash: Option<Decimal> =
-        sqlx::query_scalar("SELECT cash FROM account_snapshots WHERE session_date = $1")
-            .bind(date.date())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(cash, None, "a balance portfolio history cannot supply");
+    assert_eq!(
+        balances_for(&pool, date).await,
+        (None, None, None, None),
+        "portfolio history supplies no balances, so none may be invented"
+    );
 }
 
 /// The asymmetry between the two writers: `store_snapshot` upserts, `store_equity_snapshot` does
@@ -327,13 +348,16 @@ async fn test_a_backfill_never_downgrades_a_complete_snapshot() {
         "equity must not be replaced by the backfilled value"
     );
 
-    let cash: Option<Decimal> =
-        sqlx::query_scalar("SELECT cash FROM account_snapshots WHERE session_date = $1")
-            .bind(date.date())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(cash, Some(Decimal::from(50_000)), "balances must survive");
+    assert_eq!(
+        balances_for(&pool, date).await,
+        (
+            Some(Decimal::from(50_000)),
+            Some(Decimal::from(200_000)),
+            Some(Decimal::from(40_000)),
+            Some(Decimal::from(-40_000)),
+        ),
+        "every balance must survive, not merely the first one checked"
+    );
 }
 
 // ---------------------------------------------------------------------------
