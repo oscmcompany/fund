@@ -83,6 +83,10 @@ pub async fn fetch_dashboard_data(pool: &PgPool) -> Result<DashboardData, sqlx::
 }
 
 /// Fetches the account history oldest-first, which is the order every horizon calculation wants.
+///
+/// Balances come back as `Option`, because a session reconstructed by `backfill_account_snapshots`
+/// carries equity and four NULLs. Only `equity` is guaranteed, and it is the only column the
+/// horizon calculations read.
 async fn fetch_equity_history(pool: &PgPool) -> Result<Vec<AccountSnapshot>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT session_date, equity, cash, buying_power, long_market_value, short_market_value
@@ -518,10 +522,12 @@ mod tests {
                 NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("a valid test date"),
             ),
             equity: decimal(equity),
-            cash: decimal("0"),
-            buying_power: decimal("0"),
-            long_market_value: decimal("0"),
-            short_market_value: decimal("0"),
+            // The horizon calculations read `equity` and `session_date` and nothing else, so these
+            // are left absent rather than zeroed — a zero balance is a claim, `None` is not.
+            cash: None,
+            buying_power: None,
+            long_market_value: None,
+            short_market_value: None,
         }
     }
 

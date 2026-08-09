@@ -720,6 +720,38 @@ in {
     secretspec run -- cargo run --release --bin seed_equity_details_postgres
   '';
 
+  # Repairs account_snapshots from Alpaca's portfolio history. Not a seed: it fills only the
+  # sessions that are missing, and never overwrites one the post-close sync already wrote.
+  scripts.backfill-account-snapshots.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill"
+      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
+      echo "  Optional: BACKFILL_DRY_RUN=1 to report the gaps without writing anything"
+      echo ""
+      echo "  Rebuilds missing account_snapshots rows from /v2/account/portfolio/history."
+      echo "  Reconstructed rows carry equity only -- portfolio history reports no balances."
+      echo "  Needs Alpaca credentials and a database. Safe to re-run: existing rows are left"
+      echo "  alone, so this never downgrades a full snapshot to an equity-only one."
+      exit 1
+    fi
+
+    # Deliberately not defaulted to a dry run. The flag has to be asked for, so that a scripted
+    # invocation that forgets it fails loudly at the usage block above rather than reporting a
+    # tidy plan and writing nothing.
+    DRY_RUN_FLAG=""
+    if [ -n "''${BACKFILL_DRY_RUN:-}" ]; then
+      DRY_RUN_FLAG="--dry-run"
+      echo "Dry run: reporting gaps without writing"
+    fi
+
+    echo "Backfilling account snapshots from $BACKFILL_START_DATE to ''${BACKFILL_END_DATE:-today}"
+    ${runtimeEnv}
+    secretspec run -- cargo run --release --bin backfill_account_snapshots -- \
+      $DRY_RUN_FLAG "$BACKFILL_START_DATE" ''${BACKFILL_END_DATE:-}
+  '';
+
   # No required start date, unlike the PostgreSQL side. The archive is repaired by set difference
   # against what the bucket already holds, so "no arguments" is the useful default -- it means make
   # the last two years right, whatever is currently missing from them.
@@ -896,6 +928,11 @@ in {
       set -euo pipefail
       ${applySchema}
     '';
+
+    # Refills account_snapshots from Alpaca after a reset or a failed post-close
+    # sync. The counterpart to database:backup, and the reason a reset is now
+    # survivable: backup restores equity_pairs, this restores the equity series.
+    "database:backfill".exec = "backfill-account-snapshots";
 
     # --- Lab tasks ---
 

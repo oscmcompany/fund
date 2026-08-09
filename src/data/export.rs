@@ -282,12 +282,15 @@ async fn pairs_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
 
 async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError> {
     let rows = sqlx::query!(
+        // The balances carry no `!`: a session reconstructed from portfolio history records equity
+        // alone. Asserting them non-null would compile and then fail the whole nightly export at
+        // runtime, on the first backfilled row it met.
         r#"SELECT session_date AS "session_date!",
                   equity::double precision AS "equity!",
-                  cash::double precision AS "cash!",
-                  buying_power::double precision AS "buying_power!",
-                  long_market_value::double precision AS "long_market_value!",
-                  short_market_value::double precision AS "short_market_value!"
+                  cash::double precision,
+                  buying_power::double precision,
+                  long_market_value::double precision,
+                  short_market_value::double precision
            FROM account_snapshots
            ORDER BY session_date"#
     )
@@ -301,18 +304,24 @@ async fn account_snapshots_frame(pool: &PgPool) -> Result<DataFrame, PolarsError
             collect(&rows, |row| row.session_date.to_string()),
         ),
         Column::new("equity".into(), collect(&rows, |row| row.equity)),
-        Column::new("cash".into(), collect(&rows, |row| row.cash)),
+        // The return types are spelled out to hold the query above to its word. Re-adding a `!` to
+        // any of these columns would make the field an `f64` again and fail here at compile time,
+        // rather than in production on the first reconstructed row.
+        Column::new(
+            "cash".into(),
+            collect(&rows, |row| -> Option<f64> { row.cash }),
+        ),
         Column::new(
             "buying_power".into(),
-            collect(&rows, |row| row.buying_power),
+            collect(&rows, |row| -> Option<f64> { row.buying_power }),
         ),
         Column::new(
             "long_market_value".into(),
-            collect(&rows, |row| row.long_market_value),
+            collect(&rows, |row| -> Option<f64> { row.long_market_value }),
         ),
         Column::new(
             "short_market_value".into(),
-            collect(&rows, |row| row.short_market_value),
+            collect(&rows, |row| -> Option<f64> { row.short_market_value }),
         ),
     ])
 }

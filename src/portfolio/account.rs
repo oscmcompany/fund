@@ -164,6 +164,31 @@ pub async fn store_snapshot(
     Ok(())
 }
 
+/// Writes a session's equity alone, for a session that was never captured live.
+///
+/// The balances are left NULL rather than zeroed, because portfolio history does not report them
+/// and a zero would be a claim about a book whose composition is simply unknown.
+///
+/// `DO NOTHING` rather than the `DO UPDATE` [`store_snapshot`] uses, and that asymmetry is the
+/// point: this row is strictly less informative than one the post-close sync wrote, so a re-run
+/// over an already-populated range must never downgrade a complete snapshot to an equity-only one.
+pub async fn store_equity_snapshot(
+    pool: &PgPool,
+    session_date: SessionDate,
+    equity: Decimal,
+) -> Result<u64, AccountError> {
+    let result = sqlx::query!(
+        r#"INSERT INTO account_snapshots (session_date, equity)
+           VALUES ($1, $2)
+           ON CONFLICT (session_date) DO NOTHING"#,
+        session_date.date(),
+        equity,
+    )
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Stores activities, keyed by Alpaca's identifier.
 ///
 /// `DO NOTHING` rather than `DO UPDATE`: an activity is an immutable record of something that

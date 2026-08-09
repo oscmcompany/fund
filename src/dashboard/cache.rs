@@ -34,14 +34,18 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 const EVENT_BUFFER_CAPACITY: usize = 500;
 
 /// One session's account state, as Alpaca reported it after the close.
+///
+/// Every balance is optional because a session can also be reconstructed long after it ended, from
+/// portfolio history, which reports equity alone. `equity` is the one field both sources supply,
+/// which is why it is the only one that is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
     pub session_date: SessionDate,
     pub equity: Decimal,
-    pub cash: Decimal,
-    pub buying_power: Decimal,
-    pub long_market_value: Decimal,
-    pub short_market_value: Decimal,
+    pub cash: Option<Decimal>,
+    pub buying_power: Option<Decimal>,
+    pub long_market_value: Option<Decimal>,
+    pub short_market_value: Option<Decimal>,
 }
 
 impl AccountSnapshot {
@@ -50,13 +54,16 @@ impl AccountSnapshot {
     /// Alpaca reports `short_market_value` as a negative number, so summing the two raw values
     /// nets a market-neutral book to roughly zero — which is the one number that says nothing
     /// about how much is deployed.
-    pub fn gross_exposure(&self) -> Decimal {
-        self.long_market_value.abs() + self.short_market_value.abs()
+    ///
+    /// `None` for a reconstructed session. Both sides are required rather than defaulted, because
+    /// one side alone is not a smaller exposure — it is an unknown one.
+    pub fn gross_exposure(&self) -> Option<Decimal> {
+        Some(self.long_market_value?.abs() + self.short_market_value?.abs())
     }
 
     /// Directional tilt: how far the book is from balanced.
-    pub fn net_exposure(&self) -> Decimal {
-        self.long_market_value + self.short_market_value
+    pub fn net_exposure(&self) -> Option<Decimal> {
+        Some(self.long_market_value? + self.short_market_value?)
     }
 }
 
@@ -282,10 +289,10 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid test date"),
             ),
             equity: decimal("100000"),
-            cash: decimal("50000"),
-            buying_power: decimal("200000"),
-            long_market_value: decimal(long),
-            short_market_value: decimal(short),
+            cash: Some(decimal("50000")),
+            buying_power: Some(decimal("200000")),
+            long_market_value: Some(decimal(long)),
+            short_market_value: Some(decimal(short)),
         }
     }
 
@@ -294,15 +301,26 @@ mod tests {
     #[test]
     fn test_gross_exposure_adds_magnitudes_where_net_cancels() {
         let balanced = snapshot("50000", "-50000");
-        assert_eq!(balanced.gross_exposure(), decimal("100000"));
-        assert_eq!(balanced.net_exposure(), decimal("0"));
+        assert_eq!(balanced.gross_exposure(), Some(decimal("100000")));
+        assert_eq!(balanced.net_exposure(), Some(decimal("0")));
     }
 
     #[test]
     fn test_net_exposure_shows_a_directional_tilt() {
         let tilted = snapshot("60000", "-40000");
-        assert_eq!(tilted.gross_exposure(), decimal("100000"));
-        assert_eq!(tilted.net_exposure(), decimal("20000"));
+        assert_eq!(tilted.gross_exposure(), Some(decimal("100000")));
+        assert_eq!(tilted.net_exposure(), Some(decimal("20000")));
+    }
+
+    /// A reconstructed session knows its equity and nothing else. Zero would be a lie about a book
+    /// whose composition was never recorded, so both exposures withhold instead.
+    #[test]
+    fn test_a_reconstructed_session_reports_no_exposure() {
+        let mut reconstructed = snapshot("60000", "-40000");
+        reconstructed.long_market_value = None;
+        reconstructed.short_market_value = None;
+        assert_eq!(reconstructed.gross_exposure(), None);
+        assert_eq!(reconstructed.net_exposure(), None);
     }
 
     #[test]

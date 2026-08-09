@@ -64,6 +64,14 @@ async fn store_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
         .expect("Failed to store an account snapshot");
 }
 
+/// The other kind of row: a session rebuilt by `backfill_account_snapshots`, carrying equity and
+/// four NULLs.
+async fn store_reconstructed_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
+    account::store_equity_snapshot(pool, session_date, decimal(equity))
+        .await
+        .expect("Failed to store a reconstructed account snapshot");
+}
+
 /// Every query, against an empty database.
 ///
 /// The case a raw query is most likely to be wrong in and least likely to be exercised in: a fresh
@@ -344,4 +352,47 @@ async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
         .expect("the dashboard must read a database containing a transfer");
     assert_eq!(guarded.period_returns.one_day, None);
     assert_eq!(guarded.period_returns.since_inception, None);
+}
+
+/// A reconstructed session must survive the whole read path.
+///
+/// `fetch_equity_history` reads the balances with `try_get`, which returns an error rather than a
+/// default when the column is NULL — so before the columns were relaxed and the struct made
+/// optional, one backfilled row would have failed *every* query on the page, not just its own
+/// cells. The returns still publish because they are derived from equity, which a reconstructed
+/// row does have.
+#[tokio::test]
+#[serial]
+async fn test_a_reconstructed_session_reads_back_without_its_balances() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let yesterday = today.plus_calendar_days(-1);
+
+    store_equity(&pool, yesterday, "20000").await;
+    store_reconstructed_equity(&pool, today, "22000").await;
+
+    let data = fetch_dashboard_data(&pool)
+        .await
+        .expect("the dashboard must read a database containing a reconstructed session");
+
+    let latest = data
+        .equity_history
+        .last()
+        .expect("the reconstructed session must be in the history");
+    assert_eq!(latest.session_date, today);
+    assert_eq!(latest.equity, decimal("22000"));
+    assert_eq!(latest.cash, None);
+    assert_eq!(latest.buying_power, None);
+    assert_eq!(
+        latest.gross_exposure(),
+        None,
+        "an unknown book is not a flat one"
+    );
+    assert_eq!(latest.net_exposure(), None);
+
+    assert_eq!(
+        data.period_returns.one_day,
+        Some(10.0),
+        "equity is present, so the return it implies must still publish"
+    );
 }

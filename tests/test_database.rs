@@ -267,6 +267,75 @@ async fn test_a_session_with_no_snapshot_reads_as_none() {
     assert_eq!(account::load_equity_for(&pool, date).await.unwrap(), None);
 }
 
+/// A reconstructed session stores equity and leaves every balance NULL. The four columns were
+/// `NOT NULL` until portfolio history needed to write a row it could only half fill, so this is the
+/// insert that the old schema rejected outright.
+#[tokio::test]
+#[serial]
+async fn test_a_reconstructed_snapshot_stores_equity_without_balances() {
+    let pool = fresh_pool().await;
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+
+    let written = account::store_equity_snapshot(&pool, date, Decimal::from(20_559))
+        .await
+        .unwrap();
+
+    assert_eq!(written, 1);
+    assert_eq!(
+        account::load_equity_for(&pool, date).await.unwrap(),
+        Some(Decimal::from(20_559))
+    );
+
+    let cash: Option<Decimal> =
+        sqlx::query_scalar("SELECT cash FROM account_snapshots WHERE session_date = $1")
+            .bind(date.date())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cash, None, "a balance portfolio history cannot supply");
+}
+
+/// The asymmetry between the two writers: `store_snapshot` upserts, `store_equity_snapshot` does
+/// not. A backfill re-run across a range the post-close sync already covered must not strip the
+/// balances off a complete row, and it is the `DO NOTHING` that guarantees it.
+#[tokio::test]
+#[serial]
+async fn test_a_backfill_never_downgrades_a_complete_snapshot() {
+    use fund::common::alpaca::AccountSnapshot;
+
+    let pool = fresh_pool().await;
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+    let complete = AccountSnapshot::new(
+        Decimal::from(100_000),
+        Decimal::from(50_000),
+        Decimal::from(200_000),
+        Decimal::from(40_000),
+        Decimal::from(-40_000),
+    );
+    account::store_snapshot(&pool, date, &complete)
+        .await
+        .unwrap();
+
+    let written = account::store_equity_snapshot(&pool, date, Decimal::from(999))
+        .await
+        .unwrap();
+
+    assert_eq!(written, 0, "the existing row must be left alone");
+    assert_eq!(
+        account::load_equity_for(&pool, date).await.unwrap(),
+        Some(Decimal::from(100_000)),
+        "equity must not be replaced by the backfilled value"
+    );
+
+    let cash: Option<Decimal> =
+        sqlx::query_scalar("SELECT cash FROM account_snapshots WHERE session_date = $1")
+            .bind(date.date())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(cash, Some(Decimal::from(50_000)), "balances must survive");
+}
+
 // ---------------------------------------------------------------------------
 // bars and predictions
 // ---------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO account_snapshots (session_date, equity)\n           VALUES ($1, $2)\n           ON CONFLICT (session_date) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0f7a95c0b163076eee68a0ce113a85bab6f0a6bda3959e21d67de046f6e18ec4"
+}
