@@ -64,6 +64,13 @@ async fn store_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
         .expect("Failed to store an account snapshot");
 }
 
+/// The other kind of row: a session rebuilt by `backfill_account_snapshots`.
+async fn store_reconstructed_equity(pool: &PgPool, session_date: SessionDate, equity: &str) {
+    account::store_equity_snapshot(pool, session_date, decimal(equity))
+        .await
+        .expect("Failed to store a reconstructed account snapshot");
+}
+
 /// Every query, against an empty database.
 ///
 /// The case a raw query is most likely to be wrong in and least likely to be exercised in: a fresh
@@ -77,7 +84,7 @@ async fn test_every_query_runs_against_an_empty_database() {
         .await
         .expect("every dashboard query must run against an empty database");
 
-    assert!(data.equity_history.is_empty());
+    assert!(data.account_snapshot_history.is_empty());
     assert!(data.open_pairs.is_empty());
     assert!(data.closed_pairs.is_empty());
     assert!(data.predictions.is_empty());
@@ -160,9 +167,9 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     assert_eq!(data.closed_summary.wins, 1);
     assert_eq!(data.closed_summary.signal_exit_share, Some(100.0));
 
-    assert_eq!(data.equity_history.len(), 2);
-    assert_eq!(data.equity_history[0].equity, decimal("1000000"));
-    assert_eq!(data.equity_history[1].equity, decimal("1010000"));
+    assert_eq!(data.account_snapshot_history.len(), 2);
+    assert_eq!(data.account_snapshot_history[0].equity, decimal("1000000"));
+    assert_eq!(data.account_snapshot_history[1].equity, decimal("1010000"));
     assert_eq!(data.period_returns.one_day, Some(1.0));
 
     assert_eq!(data.predictions.len(), 2);
@@ -344,4 +351,48 @@ async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
         .expect("the dashboard must read a database containing a transfer");
     assert_eq!(guarded.period_returns.one_day, None);
     assert_eq!(guarded.period_returns.since_inception, None);
+}
+
+/// A reconstructed session must survive the whole read path.
+///
+/// `try_get` errors rather than defaults on NULL, so one backfilled row would fail *every* query on
+/// the page, not just its own cells. The returns still publish, being derived from equity.
+#[tokio::test]
+#[serial]
+async fn test_a_reconstructed_session_reads_back_without_its_balances() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let yesterday = today.plus_calendar_days(-1);
+
+    store_equity(&pool, yesterday, "20000").await;
+    store_reconstructed_equity(&pool, today, "22000").await;
+
+    let data = fetch_dashboard_data(&pool)
+        .await
+        .expect("the dashboard must read a database containing a reconstructed session");
+
+    let latest = data
+        .account_snapshot_history
+        .last()
+        .expect("the reconstructed session must be in the history");
+    assert_eq!(latest.session_date, today);
+    assert_eq!(latest.equity, decimal("22000"));
+    // Directly, because the exposures below short-circuit on `?` and prove only that one side is
+    // absent.
+    assert_eq!(latest.cash, None);
+    assert_eq!(latest.buying_power, None);
+    assert_eq!(latest.long_market_value, None);
+    assert_eq!(latest.short_market_value, None);
+    assert_eq!(
+        latest.gross_exposure(),
+        None,
+        "an unknown book is not a flat one"
+    );
+    assert_eq!(latest.net_exposure(), None);
+
+    assert_eq!(
+        data.period_returns.one_day,
+        Some(10.0),
+        "equity is present, so the return it implies must still publish"
+    );
 }

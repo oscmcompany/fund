@@ -22,4 +22,14 @@ else
   exit 1
 fi
 
+# For the two keys written in place: the gitignored capital flow ledger, and
+# database/backups/fund-latest.dump.gz, where a truncated dump would otherwise replace the only good
+# one. Nightly exports write date-partitioned keys and accumulate no versions.
+#
+# No lifecycle expiration by decision -- versioning cannot be disabled once enabled, only suspended,
+# so rules are easier to add later than to take back.
+echo "Enabling versioning on $BUCKET"
+aws s3api put-bucket-versioning --bucket "$BUCKET" \
+  --versioning-configuration Status=Enabled
+
 echo "S3 bucket ready: $BUCKET"

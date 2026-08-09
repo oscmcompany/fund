@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT session_date AS \"session_date!\",\n                  equity::double precision AS \"equity!\",\n                  cash::double precision,\n                  buying_power::double precision,\n                  long_market_value::double precision,\n                  short_market_value::double precision\n           FROM account_snapshots\n           ORDER BY session_date",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_date!",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 1,
+        "name": "equity!",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 2,
+        "name": "cash",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 3,
+        "name": "buying_power",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 4,
+        "name": "long_market_value",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "short_market_value",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b73cf691e8ad7f2c6546d3a472657544a58541ebcf0a2ed3230f9487dfb6a59d"
+}

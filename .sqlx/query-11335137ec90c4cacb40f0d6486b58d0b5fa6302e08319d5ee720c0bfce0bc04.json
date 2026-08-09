@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT session_date AS \"session_date!\", equity AS \"equity!\"\n           FROM account_snapshots\n           WHERE session_date BETWEEN $1 AND $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_date!",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 1,
+        "name": "equity!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "11335137ec90c4cacb40f0d6486b58d0b5fa6302e08319d5ee720c0bfce0bc04"
+}

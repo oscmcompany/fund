@@ -33,15 +33,18 @@ const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// Events retained in the ring buffer.
 const EVENT_BUFFER_CAPACITY: usize = 500;
 
-/// One session's account state, as Alpaca reported it after the close.
+/// One session's account state.
+///
+/// Balances are optional because a session reconstructed by `backfill_account_snapshots` has none;
+/// `equity` is the only field both sources supply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountSnapshot {
     pub session_date: SessionDate,
     pub equity: Decimal,
-    pub cash: Decimal,
-    pub buying_power: Decimal,
-    pub long_market_value: Decimal,
-    pub short_market_value: Decimal,
+    pub cash: Option<Decimal>,
+    pub buying_power: Option<Decimal>,
+    pub long_market_value: Option<Decimal>,
+    pub short_market_value: Option<Decimal>,
 }
 
 impl AccountSnapshot {
@@ -50,13 +53,15 @@ impl AccountSnapshot {
     /// Alpaca reports `short_market_value` as a negative number, so summing the two raw values
     /// nets a market-neutral book to roughly zero — which is the one number that says nothing
     /// about how much is deployed.
-    pub fn gross_exposure(&self) -> Decimal {
-        self.long_market_value.abs() + self.short_market_value.abs()
+    ///
+    /// `None` unless both sides are known: one side alone is an unknown exposure, not a smaller one.
+    pub fn gross_exposure(&self) -> Option<Decimal> {
+        Some(self.long_market_value?.abs() + self.short_market_value?.abs())
     }
 
     /// Directional tilt: how far the book is from balanced.
-    pub fn net_exposure(&self) -> Decimal {
-        self.long_market_value + self.short_market_value
+    pub fn net_exposure(&self) -> Option<Decimal> {
+        Some(self.long_market_value? + self.short_market_value?)
     }
 }
 
@@ -145,7 +150,7 @@ pub struct ClosedSummary {
 #[derive(Debug, Clone, Default)]
 pub struct DashboardState {
     pub account: Option<AccountSnapshot>,
-    pub equity_history: Vec<AccountSnapshot>,
+    pub account_snapshot_history: Vec<AccountSnapshot>,
     pub period_returns: PeriodReturns,
     pub open_pairs: Vec<OpenPair>,
     pub closed_pairs: Vec<ClosedPair>,
@@ -167,8 +172,8 @@ pub type SharedState = Arc<RwLock<DashboardState>>;
 /// state would discard every event that arrived since the last refresh.
 pub async fn apply_poll(state: &SharedState, data: crate::dashboard::database::DashboardData) {
     let mut guard = state.write().await;
-    guard.account = data.equity_history.last().cloned();
-    guard.equity_history = data.equity_history;
+    guard.account = data.account_snapshot_history.last().cloned();
+    guard.account_snapshot_history = data.account_snapshot_history;
     guard.period_returns = data.period_returns;
     guard.open_pairs = data.open_pairs;
     guard.closed_pairs = data.closed_pairs;
@@ -282,10 +287,10 @@ mod tests {
                 NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid test date"),
             ),
             equity: decimal("100000"),
-            cash: decimal("50000"),
-            buying_power: decimal("200000"),
-            long_market_value: decimal(long),
-            short_market_value: decimal(short),
+            cash: Some(decimal("50000")),
+            buying_power: Some(decimal("200000")),
+            long_market_value: Some(decimal(long)),
+            short_market_value: Some(decimal(short)),
         }
     }
 
@@ -294,15 +299,25 @@ mod tests {
     #[test]
     fn test_gross_exposure_adds_magnitudes_where_net_cancels() {
         let balanced = snapshot("50000", "-50000");
-        assert_eq!(balanced.gross_exposure(), decimal("100000"));
-        assert_eq!(balanced.net_exposure(), decimal("0"));
+        assert_eq!(balanced.gross_exposure(), Some(decimal("100000")));
+        assert_eq!(balanced.net_exposure(), Some(decimal("0")));
     }
 
     #[test]
     fn test_net_exposure_shows_a_directional_tilt() {
         let tilted = snapshot("60000", "-40000");
-        assert_eq!(tilted.gross_exposure(), decimal("100000"));
-        assert_eq!(tilted.net_exposure(), decimal("20000"));
+        assert_eq!(tilted.gross_exposure(), Some(decimal("100000")));
+        assert_eq!(tilted.net_exposure(), Some(decimal("20000")));
+    }
+
+    /// An unrecorded book is unknown, not flat, so both exposures withhold rather than return zero.
+    #[test]
+    fn test_a_reconstructed_session_reports_no_exposure() {
+        let mut reconstructed = snapshot("60000", "-40000");
+        reconstructed.long_market_value = None;
+        reconstructed.short_market_value = None;
+        assert_eq!(reconstructed.gross_exposure(), None);
+        assert_eq!(reconstructed.net_exposure(), None);
     }
 
     #[test]

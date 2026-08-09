@@ -267,6 +267,96 @@ async fn test_a_session_with_no_snapshot_reads_as_none() {
     assert_eq!(account::load_equity_for(&pool, date).await.unwrap(), None);
 }
 
+/// Every balance column for a session, in schema order.
+///
+/// All four together because nothing enforces all-or-nothing: a writer that filled three would
+/// satisfy any single-column assertion.
+type Balances = (
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+);
+
+async fn balances_for(pool: &PgPool, session_date: SessionDate) -> Balances {
+    sqlx::query_as(
+        "SELECT cash, buying_power, long_market_value, short_market_value
+         FROM account_snapshots WHERE session_date = $1",
+    )
+    .bind(session_date.date())
+    .fetch_one(pool)
+    .await
+    .expect("the snapshot row must exist")
+}
+
+/// A reconstructed session stores equity and leaves every balance NULL — the insert the old
+/// `NOT NULL` schema rejected outright.
+#[tokio::test]
+#[serial]
+async fn test_a_reconstructed_snapshot_stores_equity_without_balances() {
+    let pool = fresh_pool().await;
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+
+    let written = account::store_equity_snapshot(&pool, date, Decimal::from(20_559))
+        .await
+        .unwrap();
+
+    assert_eq!(written, 1);
+    assert_eq!(
+        account::load_equity_for(&pool, date).await.unwrap(),
+        Some(Decimal::from(20_559))
+    );
+
+    assert_eq!(
+        balances_for(&pool, date).await,
+        (None, None, None, None),
+        "portfolio history supplies no balances, so none may be invented"
+    );
+}
+
+/// `store_snapshot` upserts and `store_equity_snapshot` does not, so a backfill re-run over an
+/// already-synced range cannot strip the balances off a complete row.
+#[tokio::test]
+#[serial]
+async fn test_a_backfill_never_downgrades_a_complete_snapshot() {
+    use fund::common::alpaca::AccountSnapshot;
+
+    let pool = fresh_pool().await;
+    let date = SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+    let complete = AccountSnapshot::new(
+        Decimal::from(100_000),
+        Decimal::from(50_000),
+        Decimal::from(200_000),
+        Decimal::from(40_000),
+        Decimal::from(-40_000),
+    );
+    account::store_snapshot(&pool, date, &complete)
+        .await
+        .unwrap();
+
+    let written = account::store_equity_snapshot(&pool, date, Decimal::from(999))
+        .await
+        .unwrap();
+
+    assert_eq!(written, 0, "the existing row must be left alone");
+    assert_eq!(
+        account::load_equity_for(&pool, date).await.unwrap(),
+        Some(Decimal::from(100_000)),
+        "equity must not be replaced by the backfilled value"
+    );
+
+    assert_eq!(
+        balances_for(&pool, date).await,
+        (
+            Some(Decimal::from(50_000)),
+            Some(Decimal::from(200_000)),
+            Some(Decimal::from(40_000)),
+            Some(Decimal::from(-40_000)),
+        ),
+        "every balance must survive, not merely the first one checked"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // bars and predictions
 // ---------------------------------------------------------------------------

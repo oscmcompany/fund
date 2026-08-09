@@ -460,6 +460,10 @@ const ACTIVITIES_PAGE_SIZE: usize = 100;
 /// orders of magnitude more than ten pairs opening and closing can produce.
 const ACTIVITIES_MAXIMUM_PAGES: usize = 100;
 
+/// Portfolio history resolution. Daily because `account_snapshots` is keyed by session date, and an
+/// intraday timeframe would return several points per session with no rule for picking one.
+const PORTFOLIO_HISTORY_TIMEFRAME: &str = "1D";
+
 /// What an order is meant to do, carrying the sizing form that side actually accepts.
 ///
 /// The two variants differ in more than direction. A long leg is submitted as a dollar notional and
@@ -686,6 +690,33 @@ impl AccountSnapshot {
     /// zero and the quantity the exposure cap is about is how much is at work, not how much is net.
     pub fn gross_exposure(&self) -> Decimal {
         self.long_market_value + self.short_market_value.abs()
+    }
+}
+
+/// One point on Alpaca's equity curve: what the account was worth, and when.
+///
+/// An instant rather than a session date, per the rule that transport modules stay in transport
+/// terms — the caller wraps it with `SessionDate::at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquityPoint {
+    measured_at: DateTime<Utc>,
+    equity: Decimal,
+}
+
+impl EquityPoint {
+    pub fn new(measured_at: DateTime<Utc>, equity: Decimal) -> Self {
+        Self {
+            measured_at,
+            equity,
+        }
+    }
+
+    pub fn measured_at(&self) -> DateTime<Utc> {
+        self.measured_at
+    }
+
+    pub fn equity(&self) -> Decimal {
+        self.equity
     }
 }
 
@@ -1105,6 +1136,73 @@ impl TradingClient {
         debug!(activity_type, %date, activities = activities.len(), "Account activities fetched");
         Ok(activities)
     }
+
+    /// Fetches the daily equity curve over an inclusive date range.
+    ///
+    /// **Alpaca's own `end` is exclusive**, so the day after it is what gets sent, making this
+    /// signature inclusive and sparing every caller the knowledge. Verified against the paper
+    /// account 2026-08-09: asking through Monday 2026-06-15 stopped at Friday the 12th. Left
+    /// uncompensated it drops the newest session, which is the one most likely to need repair.
+    ///
+    /// Days with a `null` equity are dropped rather than zeroed, since a zero would claim the
+    /// account was worthless rather than unvalued.
+    pub async fn fetch_portfolio_history(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<EquityPoint>, ClientError> {
+        let url = format!("{}/v2/account/portfolio/history", self.base_url);
+        let exclusive_end = end
+            .succ_opt()
+            .ok_or_else(|| ClientError::Parse(format!("End date {end} has no following day")))?;
+        let response = error_for_status(
+            self.get(&url)
+                .query(&[
+                    ("start", start.to_string().as_str()),
+                    ("end", exclusive_end.to_string().as_str()),
+                    ("timeframe", PORTFOLIO_HISTORY_TIMEFRAME),
+                ])
+                .send()
+                .await?,
+        )
+        .await?;
+
+        let payload: PortfolioHistoryResponse = response.json().await.map_err(|error| {
+            ClientError::Parse(format!(
+                "Failed to parse portfolio history response: {error}"
+            ))
+        })?;
+
+        if payload.timestamp.len() != payload.equity.len() {
+            warn!(
+                timestamps = payload.timestamp.len(),
+                equities = payload.equity.len(),
+                "Portfolio history returned mismatched arrays, using the shorter"
+            );
+        }
+
+        let mut points = Vec::with_capacity(payload.timestamp.len());
+        let mut unusable: usize = 0;
+        for (seconds, equity) in payload.timestamp.iter().zip(payload.equity.iter()) {
+            let (Some(measured_at), Some(equity)) = (
+                DateTime::from_timestamp(*seconds, 0),
+                equity.and_then(Decimal::from_f64_retain),
+            ) else {
+                unusable += 1;
+                continue;
+            };
+            points.push(EquityPoint::new(measured_at, equity.round_dp(2)));
+        }
+
+        if unusable > 0 {
+            warn!(
+                unusable,
+                "Dropped portfolio history points with no equity or an unrepresentable timestamp"
+            );
+        }
+        debug!(%start, %end, points = points.len(), "Portfolio history fetched");
+        Ok(points)
+    }
 }
 
 /// Midnight Eastern on a settlement date, as the equivalent UTC instant.
@@ -1194,6 +1292,15 @@ struct AccountResponse {
     buying_power: String,
     long_market_value: String,
     short_market_value: String,
+}
+
+/// Column-oriented, unlike every other response this module parses: the equity at `timestamp[i]` is
+/// `equity[i]`. The reader zips them and stops at the shorter, since mismatched lengths are
+/// malformed and indexing one by the other would panic. Alpaca sends `null` for an unvalued day.
+#[derive(Deserialize)]
+struct PortfolioHistoryResponse {
+    timestamp: Vec<i64>,
+    equity: Vec<Option<f64>>,
 }
 
 /// Alpaca's wire names are pinned in the `serde` attributes; the Rust fields spell them out where
@@ -1818,6 +1925,165 @@ mod tests {
 
         assert_eq!(days.len(), 1, "the inverted session must be dropped");
         assert_eq!(days[0].session_date(), date(2026, 6, 11));
+        mock.assert_async().await;
+    }
+
+    /// The response is column-oriented, so the pairing is positional and easy to get backwards.
+    /// Two points with distinguishable equities catch a transposition that equal values would hide.
+    #[tokio::test]
+    async fn test_portfolio_history_pairs_each_equity_with_its_own_timestamp() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/v2/account/portfolio/history?start=2026-05-14&end=2026-05-16&timeframe=1D",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"timestamp":[1778788800,1778875200],
+                    "equity":[20100.5,20559.16],
+                    "profit_loss":[0,458.66],"base_value":20100.5,"timeframe":"1D"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let points = client
+            .fetch_portfolio_history(
+                NaiveDate::from_ymd_opt(2026, 5, 14).expect("a valid date"),
+                NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date"),
+            )
+            .await
+            .expect("portfolio history must parse");
+
+        assert_eq!(points.len(), 2);
+        // Both halves: asserting equities alone would pass with the timestamps transposed.
+        assert_eq!(points[0].measured_at().timestamp(), 1_778_788_800);
+        assert_eq!(points[0].equity(), Decimal::new(2010050, 2));
+        assert_eq!(points[1].measured_at().timestamp(), 1_778_875_200);
+        assert_eq!(points[1].equity(), Decimal::new(2055916, 2));
+        mock.assert_async().await;
+    }
+
+    /// The fixture stamps 20:00 UTC, which is the 16:00 Eastern close. A point at midnight UTC
+    /// would read as the previous Eastern session and shift the whole curve back a day.
+    #[tokio::test]
+    async fn test_a_daily_point_lands_on_the_eastern_session_it_measured() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/v2/account/portfolio/history?start=2026-05-15&end=2026-05-16&timeframe=1D",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"timestamp":[1778875200],"equity":[20559.16]}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let points = client
+            .fetch_portfolio_history(
+                NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date"),
+                NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date"),
+            )
+            .await
+            .expect("portfolio history must parse");
+
+        let eastern = points[0]
+            .measured_at()
+            .with_timezone(&New_York)
+            .date_naive();
+        assert_eq!(
+            eastern,
+            NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date")
+        );
+        mock.assert_async().await;
+    }
+
+    /// The mock answers only `end=2026-05-16`, pinning the exclusive-end compensation. Without it
+    /// every session but the last returns and the run reports a tidy fill over a surviving gap.
+    #[tokio::test]
+    async fn test_the_requested_end_date_is_included_in_the_response() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/v2/account/portfolio/history?start=2026-05-15&end=2026-05-16&timeframe=1D",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"timestamp":[1778875200],"equity":[20559.16]}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let day = NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date");
+        let points = client
+            .fetch_portfolio_history(day, day)
+            .await
+            .expect("portfolio history must parse");
+
+        assert_eq!(points.len(), 1, "the end date itself must come back");
+        mock.assert_async().await;
+    }
+
+    /// A `null` equity means no valuation; zero would claim a wiped-out account.
+    #[tokio::test]
+    async fn test_portfolio_history_drops_points_with_no_equity() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/v2/account/portfolio/history?start=2026-05-14&end=2026-05-16&timeframe=1D",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"timestamp":[1778788800,1778875200],"equity":[null,20559.16]}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let points = client
+            .fetch_portfolio_history(
+                NaiveDate::from_ymd_opt(2026, 5, 14).expect("a valid date"),
+                NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date"),
+            )
+            .await
+            .expect("portfolio history must parse");
+
+        assert_eq!(points.len(), 1, "the valueless day must be dropped");
+        assert_eq!(points[0].equity(), Decimal::new(2055916, 2));
+        mock.assert_async().await;
+    }
+
+    /// Truncating to the shorter array keeps the pairings that are certainly correct.
+    #[tokio::test]
+    async fn test_portfolio_history_truncates_mismatched_arrays() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                "/v2/account/portfolio/history?start=2026-05-14&end=2026-05-16&timeframe=1D",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"timestamp":[1778788800,1778875200],"equity":[20100.5]}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let points = client
+            .fetch_portfolio_history(
+                NaiveDate::from_ymd_opt(2026, 5, 14).expect("a valid date"),
+                NaiveDate::from_ymd_opt(2026, 5, 15).expect("a valid date"),
+            )
+            .await
+            .expect("portfolio history must parse");
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].equity(), Decimal::new(2010050, 2));
         mock.assert_async().await;
     }
 

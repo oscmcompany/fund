@@ -161,17 +161,17 @@ fn render_account_section(state: &DashboardState) -> String {
 </table>
 <p class="summary">{} sessions of history</p>"#,
         format_dollars(account.equity),
-        format_dollars(account.cash),
-        format_dollars(account.buying_power),
-        format_dollars(account.gross_exposure()),
-        format_dollars(account.net_exposure()),
+        format_optional_dollars(account.cash),
+        format_optional_dollars(account.buying_power),
+        format_optional_dollars(account.gross_exposure()),
+        format_optional_dollars(account.net_exposure()),
         account.session_date,
         format_return(returns.one_day),
         format_return(returns.one_week),
         format_return(returns.one_month),
         format_return(returns.year_to_date),
         format_return(returns.since_inception),
-        state.equity_history.len(),
+        state.account_snapshot_history.len(),
     );
     section("Account", body)
 }
@@ -398,6 +398,15 @@ fn format_dollars(value: Decimal) -> String {
     format!("{sign}${grouped}.{}", &fraction[..2])
 }
 
+/// Formats a dollar amount a session may not have recorded, as the dim dash [`format_return`] uses
+/// for a withheld return. Both mean unavailable rather than zero, and should read alike.
+fn format_optional_dollars(value: Option<Decimal>) -> String {
+    match value {
+        Some(amount) => format_dollars(amount),
+        None => r#"<span class="dim">—</span>"#.to_string(),
+    }
+}
+
 /// Formats a percentage return with an explicit sign and a colour class.
 fn format_return(value: Option<f64>) -> String {
     match value {
@@ -585,12 +594,12 @@ mod tests {
                     NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid date"),
                 ),
                 equity: decimal("1234567.89"),
-                cash: decimal("500000"),
-                buying_power: decimal("2000000"),
-                long_market_value: decimal("400000"),
-                short_market_value: decimal("-400000"),
+                cash: Some(decimal("500000")),
+                buying_power: Some(decimal("2000000")),
+                long_market_value: Some(decimal("400000")),
+                short_market_value: Some(decimal("-400000")),
             }),
-            equity_history: Vec::new(),
+            account_snapshot_history: Vec::new(),
             period_returns: PeriodReturns {
                 one_day: Some(1.25),
                 one_week: Some(-0.5),

@@ -43,6 +43,13 @@
     then "365"
     else rawLookbackDays;
 
+  # PostgreSQL role. DATABASE_URL below names no user; psql falls back to the OS
+  # user but sqlx does not, failing with `role "anonymous" does not exist`. Set
+  # here rather than in DATABASE_URL, which would bake a machine-specific name
+  # into a Nix store path. Unset when $USER is empty, since devenv's postgres
+  # creates no "postgres" role to fall back to.
+  postgresUser = builtins.getEnv "USER";
+
   # Log directory. VMs use /var/log/fund (provisioned by bootstrap-machine).
   # The runtimeEnv block above detects when that path is not writable (e.g.
   # local laptop without bootstrap) and falls back to an XDG state path.
@@ -144,42 +151,46 @@ in {
     };
   };
 
-  env = {
-    # DuckDB library path for Rust linker
-    LIBRARY_PATH = "${pkgs.duckdb}/lib";
+  env =
+    {
+      # DuckDB library path for Rust linker
+      LIBRARY_PATH = "${pkgs.duckdb}/lib";
 
-    # AWS region
-    AWS_REGION = awsRegion;
-    AWS_DEFAULT_REGION = awsRegion;
+      # AWS region
+      AWS_REGION = awsRegion;
+      AWS_DEFAULT_REGION = awsRegion;
 
-    # Writable log directory for local file logging (see fundLogDir above)
-    FUND_LOG_DIR = fundLogDir;
+      # Writable log directory for local file logging (see fundLogDir above)
+      FUND_LOG_DIR = fundLogDir;
 
-    # PostgreSQL
-    DATABASE_URL = "postgresql://localhost:5432/fund";
-    PGDATABASE = "fund";
+      # PostgreSQL
+      DATABASE_URL = "postgresql://localhost:5432/fund";
+      PGDATABASE = "fund";
 
-    # sqlx compile-time query checking uses the committed .sqlx/ cache rather
-    # than a live database connection; run `cargo sqlx prepare -- --all-features`
-    # to regenerate the cache after changing queries.
-    SQLX_OFFLINE = "true";
+      # sqlx compile-time query checking uses the committed .sqlx/ cache rather
+      # than a live database connection; run `cargo sqlx prepare -- --all-features`
+      # to regenerate the cache after changing queries.
+      SQLX_OFFLINE = "true";
 
-    CC = "clang";
+      CC = "clang";
 
-    # Secretspec CLI configuration
-    SECRETSPEC_PROVIDER = "awssm";
+      # Secretspec CLI configuration
+      SECRETSPEC_PROVIDER = "awssm";
 
-    # Disable AWS CLI pager so secrets output is not paged
-    AWS_PAGER = "";
+      # Disable AWS CLI pager so secrets output is not paged
+      AWS_PAGER = "";
 
-    # S3-compatible endpoint and credentials for the integration test suite.
-    # Set unconditionally rather than inside the test profile so `cargo test`
-    # works from a plain devenv shell; only the MinIO process itself is
-    # profile-scoped.
-    TEST_S3_ENDPOINT = objectStoreEndpoint;
-    TEST_S3_ACCESS_KEY = objectStoreAccessKey;
-    TEST_S3_SECRET_KEY = objectStoreSecretKey;
-  };
+      # S3-compatible endpoint and credentials for the integration test suite.
+      # Set unconditionally rather than inside the test profile so `cargo test`
+      # works from a plain devenv shell; only the MinIO process itself is
+      # profile-scoped.
+      TEST_S3_ENDPOINT = objectStoreEndpoint;
+      TEST_S3_ACCESS_KEY = objectStoreAccessKey;
+      TEST_S3_SECRET_KEY = objectStoreSecretKey;
+    }
+    // pkgs.lib.optionalAttrs (postgresUser != "") {
+      PGUSER = postgresUser;
+    };
 
   services.postgres = {
     enable = true;
@@ -720,6 +731,38 @@ in {
     secretspec run -- cargo run --release --bin seed_equity_details_postgres
   '';
 
+  # Repairs account_snapshots from Alpaca's portfolio history. Not a seed: it fills only the
+  # sessions that are missing, and never overwrites one the post-close sync already wrote.
+  scripts.backfill-account-snapshots.exec = ''
+    set -euo pipefail
+
+    if [ -z "''${BACKFILL_START_DATE:-}" ]; then
+      echo "Usage: BACKFILL_START_DATE=YYYY-MM-DD devenv tasks run database:backfill"
+      echo "  Optional: BACKFILL_END_DATE=YYYY-MM-DD (defaults to today, US/Eastern)"
+      echo "  Optional: BACKFILL_DRY_RUN=1 to report the gaps without writing anything"
+      echo ""
+      echo "  Rebuilds missing account_snapshots rows from /v2/account/portfolio/history."
+      echo "  Reconstructed rows carry equity only -- portfolio history reports no balances."
+      echo "  Needs Alpaca credentials and a database. Safe to re-run: existing rows are left"
+      echo "  alone, so this never downgrades a full snapshot to an equity-only one."
+      exit 1
+    fi
+
+    # Deliberately not defaulted to a dry run. The flag has to be asked for, so that a scripted
+    # invocation that forgets it fails loudly at the usage block above rather than reporting a
+    # tidy plan and writing nothing.
+    DRY_RUN_FLAG=""
+    if [ -n "''${BACKFILL_DRY_RUN:-}" ]; then
+      DRY_RUN_FLAG="--dry-run"
+      echo "Dry run: reporting gaps without writing"
+    fi
+
+    echo "Backfilling account snapshots from $BACKFILL_START_DATE to ''${BACKFILL_END_DATE:-today}"
+    ${runtimeEnv}
+    secretspec run -- cargo run --release --bin backfill_account_snapshots -- \
+      $DRY_RUN_FLAG "$BACKFILL_START_DATE" ''${BACKFILL_END_DATE:-}
+  '';
+
   # No required start date, unlike the PostgreSQL side. The archive is repaired by set difference
   # against what the bucket already holds, so "no arguments" is the useful default -- it means make
   # the last two years right, whatever is currently missing from them.
@@ -896,6 +939,11 @@ in {
       set -euo pipefail
       ${applySchema}
     '';
+
+    # Refills account_snapshots from Alpaca after a reset or a failed post-close
+    # sync. The counterpart to database:backup, and the reason a reset is now
+    # survivable: backup restores equity_pairs, this restores the equity series.
+    "database:backfill".exec = "backfill-account-snapshots";
 
     # --- Lab tasks ---
 
