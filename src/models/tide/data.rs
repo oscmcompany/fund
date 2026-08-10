@@ -343,28 +343,8 @@ impl Data {
         &self,
         training_fraction: TrainingFraction,
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
-        let training_fraction = training_fraction.fraction();
-        let timestamps = self
-            .data
-            .column("timestamp")
-            .map_err(|error| error.to_string())?;
-        let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
-        let minimum_timestamp = timestamps.min().unwrap_or(0);
-        let maximum_timestamp = timestamps.max().unwrap_or(0);
-        let cutoff = minimum_timestamp
-            + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction) as i64;
-
-        let train_mask = timestamps.lt_eq(cutoff);
-        let validation_mask = timestamps.gt(cutoff);
-        let train = self
-            .data
-            .filter(&train_mask)
-            .map_err(|error| error.to_string())?;
-        let validation = self
-            .data
-            .filter(&validation_mask)
-            .map_err(|error| error.to_string())?;
-        Ok((train, validation))
+        let cutoff = training_cutoff(&self.data, training_fraction)?;
+        split_at_cutoff(&self.data, cutoff)
     }
 
     /// Build a windowed dataset.
@@ -388,6 +368,60 @@ impl Data {
             }
         }
     }
+}
+
+/// The timestamp at or before which a row belongs to the training side of the split:
+/// `min + (max - min) * training_fraction`.
+///
+/// Shared with [`crate::models::tide::fit::fit`], which fits the scaler on the rows this selects
+/// while [`Data::split_by_timestamp`] later selects the rows the model trains on. The two must name
+/// the same instant — statistics fitted over a window other than the one they scale are the
+/// look-ahead this function exists to prevent — so the arithmetic lives here once rather than at
+/// both call sites.
+///
+/// A `TrainingFraction` is strictly between 0 and 1, so the cutoff never falls below the minimum
+/// timestamp: the training side is non-empty for any non-empty frame.
+///
+/// The span is measured with `checked_sub` because a column carrying timestamps at both ends of
+/// `i64` wraps it negative in a release build, which puts the cutoff below every row and empties the
+/// training side — surfacing as `fit_scaler` reporting no rows to fit on, which blames the cutoff
+/// for a corrupt column.
+pub(crate) fn training_cutoff(
+    data: &DataFrame,
+    training_fraction: TrainingFraction,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let timestamps = data
+        .column("timestamp")
+        .map_err(|error| error.to_string())?;
+    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
+    let minimum_timestamp = timestamps.min().unwrap_or(0);
+    let maximum_timestamp = timestamps.max().unwrap_or(0);
+
+    let span = maximum_timestamp
+        .checked_sub(minimum_timestamp)
+        .ok_or("The timestamp range is wider than i64, so no training cutoff exists")?;
+    // Only the span needs checking. The fraction is strictly between 0 and 1 and the `as` cast
+    // saturates, so the offset lands in `[0, span]` and the sum in `[minimum, maximum]`.
+    let training_span = ((span as f64) * training_fraction.fraction()) as i64;
+    Ok(minimum_timestamp + training_span)
+}
+
+/// Partition a frame at `cutoff` into (at or before, after).
+pub(crate) fn split_at_cutoff(
+    data: &DataFrame,
+    cutoff: i64,
+) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
+    let timestamps = data
+        .column("timestamp")
+        .map_err(|error| error.to_string())?;
+    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
+    let train = data
+        .filter(&timestamps.lt_eq(cutoff))
+        .map_err(|error| error.to_string())?;
+    let validation = data
+        .filter(&timestamps.gt(cutoff))
+        .map_err(|error| error.to_string())?;
+    Ok((train, validation))
 }
 
 /// Core windowing over a single (already preprocessed) frame.
@@ -1404,6 +1438,26 @@ mod tests {
         assert_eq!(train.height() + valid.height(), 10);
         assert!(train.height() > 0);
         assert!(valid.height() > 0);
+    }
+
+    /// A range wider than `i64` panics on the subtraction in a debug build and wraps in a release
+    /// one — and a wrapped range is negative, which puts the cutoff below every timestamp, empties
+    /// the training side, and surfaces as `fit_scaler` complaining that there are no rows to fit on.
+    /// Naming the range is the point: the message otherwise blames the cutoff for a corrupt column.
+    #[test]
+    fn test_training_cutoff_refuses_an_unrepresentable_timestamp_range() {
+        let data = DataFrame::new(vec![Column::new(
+            "timestamp".into(),
+            vec![i64::MIN, i64::MAX],
+        )])
+        .unwrap();
+
+        let error = training_cutoff(&data, fraction_of(0.8))
+            .expect_err("a timestamp range wider than i64 must be refused");
+        assert!(
+            error.to_string().contains("range"),
+            "the message must name the timestamp range: {error}"
+        );
     }
 
     /// Two tickers, two days each, unsorted on input; close prices chosen so
