@@ -381,6 +381,11 @@ impl Data {
 ///
 /// A `TrainingFraction` is strictly between 0 and 1, so the cutoff never falls below the minimum
 /// timestamp: the training side is non-empty for any non-empty frame.
+///
+/// The span is measured with `checked_sub` because a column carrying timestamps at both ends of
+/// `i64` wraps it negative in a release build, which puts the cutoff below every row and empties the
+/// training side — surfacing as `fit_scaler` reporting no rows to fit on, which blames the cutoff
+/// for a corrupt column.
 pub(crate) fn training_cutoff(
     data: &DataFrame,
     training_fraction: TrainingFraction,
@@ -391,8 +396,14 @@ pub(crate) fn training_cutoff(
     let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
     let minimum_timestamp = timestamps.min().unwrap_or(0);
     let maximum_timestamp = timestamps.max().unwrap_or(0);
-    Ok(minimum_timestamp
-        + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction.fraction()) as i64)
+
+    let span = maximum_timestamp
+        .checked_sub(minimum_timestamp)
+        .ok_or("The timestamp range is wider than i64, so no training cutoff exists")?;
+    // Only the span needs checking. The fraction is strictly between 0 and 1 and the `as` cast
+    // saturates, so the offset lands in `[0, span]` and the sum in `[minimum, maximum]`.
+    let training_span = ((span as f64) * training_fraction.fraction()) as i64;
+    Ok(minimum_timestamp + training_span)
 }
 
 /// Partition a frame at `cutoff` into (at or before, after).
@@ -1427,6 +1438,26 @@ mod tests {
         assert_eq!(train.height() + valid.height(), 10);
         assert!(train.height() > 0);
         assert!(valid.height() > 0);
+    }
+
+    /// A range wider than `i64` panics on the subtraction in a debug build and wraps in a release
+    /// one — and a wrapped range is negative, which puts the cutoff below every timestamp, empties
+    /// the training side, and surfaces as `fit_scaler` complaining that there are no rows to fit on.
+    /// Naming the range is the point: the message otherwise blames the cutoff for a corrupt column.
+    #[test]
+    fn test_training_cutoff_refuses_an_unrepresentable_timestamp_range() {
+        let data = DataFrame::new(vec![Column::new(
+            "timestamp".into(),
+            vec![i64::MIN, i64::MAX],
+        )])
+        .unwrap();
+
+        let error = training_cutoff(&data, fraction_of(0.8))
+            .expect_err("a timestamp range wider than i64 must be refused");
+        assert!(
+            error.to_string().contains("range"),
+            "the message must name the timestamp range: {error}"
+        );
     }
 
     /// Two tickers, two days each, unsorted on input; close prices chosen so
