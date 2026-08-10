@@ -158,9 +158,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- stage three: train and evaluate ---
 
-    let fit_result = fit(filtered)?;
-
+    // The same fraction reaches preprocessing and windowing, because the scaler is fitted on the
+    // rows at or before its cutoff. Passing one value here and another below would fit statistics
+    // over a window other than the one the model trains on.
     let training_fraction = TrainingFraction::new(TRAINING_FRACTION)?;
+
+    let fit_result = fit(filtered, training_fraction)?;
+
     let train_dataset = fit_result.data.get_dataset(
         DatasetKind::Train(training_fraction),
         INPUT_LENGTH,

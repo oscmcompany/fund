@@ -343,28 +343,8 @@ impl Data {
         &self,
         training_fraction: TrainingFraction,
     ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
-        let training_fraction = training_fraction.fraction();
-        let timestamps = self
-            .data
-            .column("timestamp")
-            .map_err(|error| error.to_string())?;
-        let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
-        let minimum_timestamp = timestamps.min().unwrap_or(0);
-        let maximum_timestamp = timestamps.max().unwrap_or(0);
-        let cutoff = minimum_timestamp
-            + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction) as i64;
-
-        let train_mask = timestamps.lt_eq(cutoff);
-        let validation_mask = timestamps.gt(cutoff);
-        let train = self
-            .data
-            .filter(&train_mask)
-            .map_err(|error| error.to_string())?;
-        let validation = self
-            .data
-            .filter(&validation_mask)
-            .map_err(|error| error.to_string())?;
-        Ok((train, validation))
+        let cutoff = training_cutoff(&self.data, training_fraction)?;
+        split_at_cutoff(&self.data, cutoff)
     }
 
     /// Build a windowed dataset.
@@ -388,6 +368,49 @@ impl Data {
             }
         }
     }
+}
+
+/// The timestamp at or before which a row belongs to the training side of the split:
+/// `min + (max - min) * training_fraction`.
+///
+/// Shared with [`crate::models::tide::fit::fit`], which fits the scaler on the rows this selects
+/// while [`Data::split_by_timestamp`] later selects the rows the model trains on. The two must name
+/// the same instant — statistics fitted over a window other than the one they scale are the
+/// look-ahead this function exists to prevent — so the arithmetic lives here once rather than at
+/// both call sites.
+///
+/// A `TrainingFraction` is strictly between 0 and 1, so the cutoff never falls below the minimum
+/// timestamp: the training side is non-empty for any non-empty frame.
+pub(crate) fn training_cutoff(
+    data: &DataFrame,
+    training_fraction: TrainingFraction,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let timestamps = data
+        .column("timestamp")
+        .map_err(|error| error.to_string())?;
+    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
+    let minimum_timestamp = timestamps.min().unwrap_or(0);
+    let maximum_timestamp = timestamps.max().unwrap_or(0);
+    Ok(minimum_timestamp
+        + (((maximum_timestamp - minimum_timestamp) as f64) * training_fraction.fraction()) as i64)
+}
+
+/// Partition a frame at `cutoff` into (at or before, after).
+pub(crate) fn split_at_cutoff(
+    data: &DataFrame,
+    cutoff: i64,
+) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
+    let timestamps = data
+        .column("timestamp")
+        .map_err(|error| error.to_string())?;
+    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
+    let train = data
+        .filter(&timestamps.lt_eq(cutoff))
+        .map_err(|error| error.to_string())?;
+    let validation = data
+        .filter(&timestamps.gt(cutoff))
+        .map_err(|error| error.to_string())?;
+    Ok((train, validation))
 }
 
 /// Core windowing over a single (already preprocessed) frame.
