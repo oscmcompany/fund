@@ -701,6 +701,14 @@ in {
     psql -h localhost -p 5432 -d fund -c "SELECT emit_event('portfolio_evaluation_requested', jsonb_build_object('reason', 'manual'))"
   '';
 
+  # The counterpart the other two assume has already run. Its schedule is a twenty-minute window at
+  # the open, so a service started at any other hour finds no predictions for the session and every
+  # later evaluation screens nothing -- a healthy-looking idle loop that reports `screened: 0` and
+  # never says why. This is the only way to reach the inference path outside that window.
+  scripts.trigger-predictions.exec = ''
+    psql -h localhost -p 5432 -d fund -c "SELECT emit_event('predictions_requested', jsonb_build_object('reason', 'manual'))"
+  '';
+
   scripts.trigger-liquidation.exec = ''
     psql -h localhost -p 5432 -d fund -c "SELECT emit_event('portfolio_liquidation_requested', jsonb_build_object('reason', 'manual'))"
   '';
