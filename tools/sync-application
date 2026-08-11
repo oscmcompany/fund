@@ -45,19 +45,15 @@ log "New commits detected (local=$local_head remote=$remote_head)"
 # Stop devenv by terminating process-compose (the process manager spawned by
 # devenv) which in turn terminates all managed services.
 #
-# `id -un` rather than $USER, which cron does not set. With `set -u` above, reading it aborted this
-# script at this line on every run: the fetch had already happened, so the log recorded "New commits
-# detected" once a minute and the reset below was never reached.
+# $USER is unset under cron, and `set -u` above makes reading it fatal.
 owner="$(id -un)"
 if pkill -TERM -u "$owner" -f "process-compose" 2>/dev/null; then
   log "Sent SIGTERM to process-compose"
 else
   log "WARNING: process-compose not found"
 fi
-# Anchored on the trailing `up`, which is what separates devenv itself from the tmux shell
-# supervising it. `start-application` runs `while true; do devenv --profile application up; sleep 5;
-# done`, and that whole string is the shell's command line, so the unanchored pattern matched the
-# supervisor too and killed the restart loop this script depends on to bring the service back.
+# Anchored: the tmux shell supervising devenv carries the same string and would otherwise match,
+# killing the restart loop.
 if pkill -TERM -u "$owner" -f "devenv --profile application up\$" 2>/dev/null; then
   log "Sent SIGTERM to devenv"
 else
