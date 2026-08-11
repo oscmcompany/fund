@@ -44,12 +44,17 @@ log "New commits detected (local=$local_head remote=$remote_head)"
 
 # Stop devenv by terminating process-compose (the process manager spawned by
 # devenv) which in turn terminates all managed services.
-if pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null; then
+#
+# `id -un` rather than $USER, which cron does not set. With `set -u` above, reading it aborted this
+# script at this line on every run: the fetch had already happened, so the log recorded "New commits
+# detected" once a minute and the reset below was never reached.
+owner="$(id -un)"
+if pkill -TERM -u "$owner" -f "process-compose" 2>/dev/null; then
   log "Sent SIGTERM to process-compose"
 else
   log "WARNING: process-compose not found"
 fi
-if pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null; then
+if pkill -TERM -u "$owner" -f "devenv.*--profile application" 2>/dev/null; then
   log "Sent SIGTERM to devenv"
 else
   log "WARNING: devenv process not found"
