@@ -14,11 +14,15 @@ This is a collection of guidelines and references.
 - AWS S3 is used for blob storage
 - AWS Secrets Manager stores secrets in secretspec format (`secretspec/{project}/{profile}/{key}`)
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
-- Document sparingly and durably - write language-appropriate docstrings for functions, types, and modules, and add
-  in-line comments only where a step is genuinely surprising; a docstring says what something is for, plus any
-  caveat, invariant, or assumption a caller cannot read off the signature — it never restates the implementation,
-  because prose duplicating the code silently falls out of sync and module documentation is a few lines of high-level
-  orientation, not an inventory of its contents
+- Docstrings are one sentence on what the item is for, plus at most two more for a caveat, invariant, or
+  assumption a caller cannot read off the signature; never multi-paragraph, and never longer than the
+  function being documented
+- Module documentation is three lines maximum
+- In-line comments are one line and appear only where a step is genuinely surprising, with two lines the
+  hard ceiling
+- Rationale belongs in the commit message rather than the source — why this approach and not the obvious
+  one, what broke before, what the alternative would cost; the source states the constraint and the commit
+  argues it
 - Spell identifiers out fully in code (variables, functions, fields, modules): prefer `dataframe` over
   `df`, `message` over `msg`, `error_message` over `err_msg`, `quantity` over `qty`, `index` over `idx`,
   `column` over `col`, `value` over `val`, `volatility` over `vol`, `profit_and_loss` over `pnl`,
