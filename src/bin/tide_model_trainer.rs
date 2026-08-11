@@ -508,6 +508,18 @@ async fn load_archived_bars(
             "Some partitions were skipped; training on the rest"
         );
     }
+    // Stepping over a bad partition is the point of the projection, but stepping over most of them
+    // is a different event wearing the same clothes. The sample-count guards downstream only catch a
+    // window that collapsed entirely; this catches one that quietly lost half its history and would
+    // otherwise publish a model trained on the remainder.
+    if unreadable > frames.len() {
+        return Err(format!(
+            "{unreadable} partitions could not be read against {} that could; refusing to train on \
+             the remainder",
+            frames.len()
+        )
+        .into());
+    }
     Ok(concat(frames, UnionArgs::default())?.collect()?)
 }
 
@@ -533,12 +545,15 @@ const TRAINING_BAR_COLUMNS: [(&str, DataType); 8] = [
 /// `concat` rejects the whole set when one member differs. The writer already treats that drift as
 /// recoverable in `merge_or_replace`; this is the same judgement on the read side.
 fn project_training_columns(frame: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    // `strict_cast`, not `cast`: the non-strict form turns an incompatible value into a null, so a
+    // partition whose `close_price` arrived as text would be accepted here and have its rows dropped
+    // silently much later by `clean_data`, reported as a thin session rather than a bad one.
     Ok(frame
         .lazy()
         .select(
             TRAINING_BAR_COLUMNS
                 .iter()
-                .map(|(name, data_type)| col(*name).cast(data_type.clone()))
+                .map(|(name, data_type)| col(*name).strict_cast(data_type.clone()))
                 .collect::<Vec<_>>(),
         )
         .collect()?)
@@ -771,6 +786,26 @@ mod tests {
             .collect()
             .unwrap();
         assert_eq!(combined.height(), 2);
+    }
+
+    /// A column of the right name but the wrong type is refused rather than nulled.
+    ///
+    /// The non-strict cast would accept this and leave `clean_data` to drop the rows much later,
+    /// reporting a thin session instead of a corrupt partition.
+    #[test]
+    fn test_a_partition_with_an_uncastable_column_is_refused() {
+        let frame = df![
+            "ticker" => ["AAPL"],
+            "timestamp" => [1_724_000_000_000i64],
+            "open_price" => ["not a number"],
+            "high_price" => [101.0],
+            "low_price" => [99.0],
+            "close_price" => [100.5],
+            "volume" => [1_000i64],
+            "volume_weighted_average_price" => [100.2],
+        ]
+        .unwrap();
+        assert!(project_training_columns(frame).is_err());
     }
 
     /// A partition genuinely missing a price column is skipped, not silently null-filled — the

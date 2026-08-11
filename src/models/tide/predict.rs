@@ -152,7 +152,10 @@ fn resolve_duplicate_bars(bars: DataFrame) -> Result<DataFrame, PredictionError>
     Ok(deduplicated)
 }
 
-/// The tickers carrying more than one bar for the same session, for the log line above.
+/// The tickers carrying more than one bar for the same session, sorted, for the log line above.
+///
+/// Sorted because `UniqueKeepStrategy::Any` promises no ordering, and a log line that names the same
+/// two symbols in a different order each session cannot be diffed or alerted on.
 fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> {
     let frame = bars
         .clone()
@@ -165,14 +168,17 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
         .collect()
         .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
 
-    Ok(frame
+    // Propagated rather than defaulted to empty: the caller logs this list as the record that a
+    // tie-break happened, so swallowing the error here would report a collapse naming no ticker,
+    // which is the silence this function exists to break.
+    let tickers = frame
         .column("ticker")
-        .and_then(|column| {
-            column
-                .str()
-                .map(|values| values.into_iter().flatten().map(str::to_string).collect())
-        })
-        .unwrap_or_default())
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?
+        .str()
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
+    let mut names: Vec<String> = tickers.into_iter().flatten().map(str::to_string).collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Drops tickers whose trailing averages fall below the liquidity thresholds.

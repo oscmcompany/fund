@@ -530,11 +530,16 @@ in {
         required = ($0 ~ /required[[:space:]]*=[[:space:]]*true/) ? "required" : "optional"
         printf "secretspec/%s/%s/%s\t%s\n", project, profile, $1, required
       }
-    ' "$DEVENV_ROOT/secretspec.toml" | sort > "$declared"
+    ' "$DEVENV_ROOT/secretspec.toml" | LC_ALL=C sort > "$declared"
 
+    # `|| true` on the grep: with pipefail active it returns 1 when the store holds nothing under
+    # the prefix, which aborted the script before it printed anything -- and an empty store is the
+    # case the audit most needs to report, since every required key is then missing.
+    # LC_ALL=C on both sorts, because `comm` below compares bytes while `sort` follows the locale,
+    # and every key contains '/' and '_', which en_US.UTF-8 and C order differently.
     aws secretsmanager list-secrets --max-results 100 \
       --query "SecretList[?starts_with(Name, 'secretspec/$project/')].Name" --output text \
-      | tr '\t' '\n' | grep -v '^$' | sort > "$actual"
+      | tr '\t' '\n' | { grep -v '^$' || true; } | LC_ALL=C sort > "$actual"
 
     echo "secretspec audit for project '$project'"
     echo "  declared in secretspec.toml: $(wc -l < "$declared" | tr -d ' ')"

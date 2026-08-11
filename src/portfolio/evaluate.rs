@@ -149,6 +149,17 @@ pub fn exit_reason(z_score: f64, entry_z_score: f64) -> Option<CloseReason> {
     None
 }
 
+/// The convergence half of [`exit_reason`], for a pair whose stored entry score is not comparable.
+///
+/// Crossing the mean is a statement each window makes about itself, so it survives a change of
+/// window where the relative stop does not.
+pub fn convergence_only(z_score: f64) -> Option<CloseReason> {
+    if !z_score.is_finite() {
+        return None;
+    }
+    (z_score <= CONVERGENCE_Z_SCORE).then_some(CloseReason::Convergence)
+}
+
 /// Runs one evaluation pass.
 pub async fn run_pass(
     context: &EvaluationContext<'_>,
@@ -429,7 +440,30 @@ async fn close_what_should_close(
             "Priced an open pair"
         );
 
-        let Some(mut reason) = exit_reason(z_score, pair.entry_z_score()) else {
+        // A pair that outlived its session is scored on convergence alone.
+        //
+        // `entry_z_score` was standardized against the 60 sessions ending before the pair opened;
+        // this z was standardized against the window ending today. Those are different samples with
+        // different means and deviations, so their difference is not a number of standard
+        // deviations and the relative stop cannot be read from it. Convergence survives because it
+        // asks whether the spread crossed its own mean, which each window answers about itself.
+        //
+        // The 15:45 liquidation is what normally makes this unreachable; arriving here means it did
+        // not run, which is worth a warning on its own.
+        let entry_session = SessionDate::at(pair.opened_at());
+        let current_session = SessionDate::at(context.now);
+        let reason = if entry_session == current_session {
+            exit_reason(z_score, pair.entry_z_score())
+        } else {
+            warn!(
+                pair_id = %pair.pair_id(),
+                %entry_session,
+                %current_session,
+                "Open pair predates this session; scoring convergence only"
+            );
+            convergence_only(z_score)
+        };
+        let Some(mut reason) = reason else {
             continue;
         };
 
@@ -645,6 +679,28 @@ mod tests {
         // wide. That is the asymmetry an absolute threshold cannot express.
         assert_eq!(exit_reason(3.6, 2.0), Some(CloseReason::StopLoss));
         assert_eq!(exit_reason(3.6, 3.0), None);
+    }
+
+    /// A pair from an earlier session is judged on convergence alone.
+    ///
+    /// Its `entry_z_score` was standardized against a different 60-session sample, so the difference
+    /// between the two is not a number of deviations and the relative stop cannot be read from it.
+    #[test]
+    fn test_convergence_only_ignores_the_stop() {
+        assert_eq!(convergence_only(0.0), Some(CloseReason::Convergence));
+        assert_eq!(convergence_only(-2.0), Some(CloseReason::Convergence));
+        // Far beyond any stop, and still held: the comparison that would fire is not available.
+        assert_eq!(convergence_only(9.0), None);
+        assert_eq!(convergence_only(f64::NAN), None);
+    }
+
+    /// The same reading closes under the session-local rule and is held under the cross-session one.
+    #[test]
+    fn test_the_cross_session_rule_differs_from_the_session_local_rule() {
+        let entry = 2.0;
+        let widened = entry + STOP_LOSS_WIDENING;
+        assert_eq!(exit_reason(widened, entry), Some(CloseReason::StopLoss));
+        assert_eq!(convergence_only(widened), None);
     }
 
     /// A pair the screen approves must not be closable by the very next reading of the same spread.

@@ -1,7 +1,6 @@
 //! The train-to-serve contract: an artifact the trainer publishes must load into the inference path.
 //!
-//! Every other model test exercises one side. This one packages exactly what
-//! `tide_model_trainer` stage four writes and loads it back exactly as the service does.
+//! Every other model test exercises one side; this packages what stage four writes and loads it back.
 
 use burn::tensor::backend::Backend;
 
@@ -110,12 +109,12 @@ async fn test_a_published_artifact_loads_into_the_inference_path() {
     assert_eq!(loaded.scaler().means().len(), scaler.means().len());
 }
 
-/// The loaded weights must produce a forward pass of the shape the prediction path indexes into.
+/// The reloaded weights must produce the same forward pass as the model that was saved.
 ///
-/// Loading checks that the record deserializes; only a forward pass checks that it deserialized
-/// into the architecture the parameters describe.
+/// Shape alone would pass against a freshly initialized model, so the assertion is on the values:
+/// that is the difference between "an artifact loaded" and "the trained artifact loaded".
 #[tokio::test]
-async fn test_a_loaded_model_produces_one_row_of_quantiles_per_sample() {
+async fn test_a_loaded_model_reproduces_the_source_forward_pass() {
     let input_size = input_feature_size(INPUT_LENGTH, OUTPUT_LENGTH);
     let parameters = ModelParameters::new(input_size, INPUT_LENGTH, OUTPUT_LENGTH);
 
@@ -148,15 +147,21 @@ async fn test_a_loaded_model_produces_one_row_of_quantiles_per_sample() {
     )
     .expect("the weights must load back");
 
+    // Non-zero input: a zeroed batch can survive a partly-restored layer that a real one would not.
     let batch_size = 4;
-    let input = burn::tensor::Tensor::<burn::backend::NdArray, 2>::zeros(
+    let input = burn::tensor::Tensor::<burn::backend::NdArray, 2>::ones(
         [batch_size, input_size],
         &Default::default(),
     );
-    let output = reloaded.forward(input);
+    let output = reloaded.forward(input.clone());
 
     assert_eq!(
         output.dims(),
         [batch_size, OUTPUT_LENGTH * parameters.quantiles().len()]
     );
+
+    let source_output = burn::module::AutodiffModule::valid(&model).forward(input);
+    output
+        .into_data()
+        .assert_approx_eq(&source_output.into_data(), 5);
 }
