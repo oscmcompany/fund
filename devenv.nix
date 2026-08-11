@@ -435,7 +435,13 @@ in {
     # because the pg_cron blocks it checks are stripped out by
     # tests/common/mod.rs before the schema is applied, so the trading schedules
     # have no other executable cover at all.
-    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules"
+    #
+    # test_model_artifact is the second such exception, and needs no network
+    # either: it packages what the trainer's publish stage writes and loads it
+    # back through the service's own loader. The two sides are built from the
+    # same constants but by different code, and nothing else executes the join
+    # between them.
+    TEST_ARGS="--lib --bins --all-features --test test_database --test test_handlers --test test_dashboard --test test_schedules --test test_model_artifact"
 
     mkdir -p .coverage_output
     export LLVM_COV=$(which llvm-cov)
@@ -836,6 +842,59 @@ in {
       set -euo pipefail
       echo "Repairing the bar archive and running the tide training pipeline (Rust + burn)"
       ${runtimeEnv}
+      secretspec run -- cargo run --release --bin tide_model_trainer
+    '';
+
+    # The same pipeline, run to rehearse it rather than to publish a model. It differs from
+    # `models:tide:train` in exactly two ways, and both are deliberate.
+    #
+    # The artifact prefix is `models/tide-smoke/`. `resolve_artifact_key` serves the
+    # lexicographically greatest folder under whatever prefix it is given, and a rehearsal artifact
+    # is always the newest one -- so publishing it beside the real runs would hand the service a
+    # one-epoch model, silently and until the next nightly run.
+    #
+    # `FUND_EPOCHS` defaults to 1, because what is under test is that the four stages connect, not
+    # that the model converges. Everything else is left alone: the lookback stays the trainer's own
+    # default, so the rehearsal reads the same window the nightly run does.
+    #
+    # `FUND_LOOKBACK_DAYS` has a floor near 250 -- the split reserves the last fifth of the window
+    # for validation and windowing needs 36 sessions of it -- and the trainer now says so before it
+    # touches the network rather than after it has loaded a year of bars.
+    "models:tide:train:smoke".exec = ''
+      set -euo pipefail
+      ${runtimeEnv}
+      export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
+      export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
+      echo "Rehearsing the tide training pipeline ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
+      echo "  Publishing to s3://$AWS_S3_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
+      secretspec run -- cargo run --release --bin tide_model_trainer
+    '';
+
+    # The rehearsal above, pointed at the production archive. It exists because the two buckets do
+    # not hold the same history: the development archive was seeded in one pass from a clean
+    # upstream, so a loader bug that only appears across a schema or provider change is reproducible
+    # in production and nowhere else.
+    #
+    # The one place in this file that overrides FUND_PROFILE, and it is set *before* runtimeEnv
+    # because both the bucket name and the secretspec profile are derived from it. Setting it after
+    # would read production credentials against the development bucket.
+    #
+    # Publishes to `models/tide-smoke/`, exactly as the task above does. Nothing resolves artifacts
+    # from that prefix, so a one-epoch rehearsal cannot become the model the production service
+    # loads -- which is why this is a separate task rather than a flag on `models:tide:train`.
+    #
+    # Not read-only, and that is worth knowing before running it: stage one repairs the production
+    # bar archive over the lookback window, the same write the nightly job makes. That is a gap
+    # being filled rather than a side effect, but it is a write to production data.
+    "models:tide:train:smoke:production".exec = ''
+      set -euo pipefail
+      export FUND_PROFILE="production"
+      ${runtimeEnv}
+      export AWS_S3_MODEL_ARTIFACT_PATH="models/tide-smoke/"
+      export FUND_EPOCHS="''${FUND_EPOCHS:-1}"
+      echo "Rehearsing against PRODUCTION ($FUND_EPOCHS epoch(s), lookback ''${FUND_LOOKBACK_DAYS:-trainer default})"
+      echo "  Reading and repairing s3://$AWS_S3_BUCKET_NAME/data/equity/bars/"
+      echo "  Publishing to s3://$AWS_S3_BUCKET_NAME/$AWS_S3_MODEL_ARTIFACT_PATH, which nothing serves from."
       secretspec run -- cargo run --release --bin tide_model_trainer
     '';
 
