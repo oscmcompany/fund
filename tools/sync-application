@@ -54,7 +54,11 @@ if pkill -TERM -u "$owner" -f "process-compose" 2>/dev/null; then
 else
   log "WARNING: process-compose not found"
 fi
-if pkill -TERM -u "$owner" -f "devenv.*--profile application" 2>/dev/null; then
+# Anchored on the trailing `up`, which is what separates devenv itself from the tmux shell
+# supervising it. `start-application` runs `while true; do devenv --profile application up; sleep 5;
+# done`, and that whole string is the shell's command line, so the unanchored pattern matched the
+# supervisor too and killed the restart loop this script depends on to bring the service back.
+if pkill -TERM -u "$owner" -f "devenv --profile application up\$" 2>/dev/null; then
   log "Sent SIGTERM to devenv"
 else
   log "WARNING: devenv process not found"
