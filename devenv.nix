@@ -20,6 +20,7 @@
   '';
 
   applySchema = ''
+    ${postgresEnv}
     echo "Applying schema..."
     psql -h localhost -p 5432 -d fund \
       -f ${./schema.sql} \
@@ -44,11 +45,21 @@
     else rawLookbackDays;
 
   # PostgreSQL role. DATABASE_URL below names no user; psql falls back to the OS
-  # user but sqlx does not, failing with `role "anonymous" does not exist`. Set
-  # here rather than in DATABASE_URL, which would bake a machine-specific name
-  # into a Nix store path. Unset when $USER is empty, since devenv's postgres
-  # creates no "postgres" role to fall back to.
-  postgresUser = builtins.getEnv "USER";
+  # user but sqlx does not, failing with `role "anonymous" does not exist`.
+  #
+  # Resolved in the shell rather than as an `env` attribute, because the obvious
+  # spelling does not work: `builtins.getEnv "USER"` reads empty under the pure
+  # evaluation devenv performs, so the attribute silently vanished and every
+  # sqlx caller fell back to "anonymous". That is not a hypothetical -- it made
+  # the check-sqlx pre-commit hook reject every Rust commit, with an error
+  # naming a role nobody configured. `id -un` is answerable at run time, which
+  # is the only time the OS user is actually knowable.
+  #
+  # Still not folded into DATABASE_URL, which would bake a machine-specific name
+  # into a Nix store path.
+  postgresEnv = ''
+    export PGUSER="''${PGUSER:-$(id -un)}"
+  '';
 
   # Log directory. VMs use /var/log/fund (provisioned by bootstrap-machine).
   # The runtimeEnv block above detects when that path is not writable (e.g.
@@ -151,46 +162,42 @@ in {
     };
   };
 
-  env =
-    {
-      # DuckDB library path for Rust linker
-      LIBRARY_PATH = "${pkgs.duckdb}/lib";
+  env = {
+    # DuckDB library path for Rust linker
+    LIBRARY_PATH = "${pkgs.duckdb}/lib";
 
-      # AWS region
-      AWS_REGION = awsRegion;
-      AWS_DEFAULT_REGION = awsRegion;
+    # AWS region
+    AWS_REGION = awsRegion;
+    AWS_DEFAULT_REGION = awsRegion;
 
-      # Writable log directory for local file logging (see fundLogDir above)
-      FUND_LOG_DIR = fundLogDir;
+    # Writable log directory for local file logging (see fundLogDir above)
+    FUND_LOG_DIR = fundLogDir;
 
-      # PostgreSQL
-      DATABASE_URL = "postgresql://localhost:5432/fund";
-      PGDATABASE = "fund";
+    # PostgreSQL
+    DATABASE_URL = "postgresql://localhost:5432/fund";
+    PGDATABASE = "fund";
 
-      # sqlx compile-time query checking uses the committed .sqlx/ cache rather
-      # than a live database connection; run `cargo sqlx prepare -- --all-features`
-      # to regenerate the cache after changing queries.
-      SQLX_OFFLINE = "true";
+    # sqlx compile-time query checking uses the committed .sqlx/ cache rather
+    # than a live database connection; run `cargo sqlx prepare -- --all-features`
+    # to regenerate the cache after changing queries.
+    SQLX_OFFLINE = "true";
 
-      CC = "clang";
+    CC = "clang";
 
-      # Secretspec CLI configuration
-      SECRETSPEC_PROVIDER = "awssm";
+    # Secretspec CLI configuration
+    SECRETSPEC_PROVIDER = "awssm";
 
-      # Disable AWS CLI pager so secrets output is not paged
-      AWS_PAGER = "";
+    # Disable AWS CLI pager so secrets output is not paged
+    AWS_PAGER = "";
 
-      # S3-compatible endpoint and credentials for the integration test suite.
-      # Set unconditionally rather than inside the test profile so `cargo test`
-      # works from a plain devenv shell; only the MinIO process itself is
-      # profile-scoped.
-      TEST_S3_ENDPOINT = objectStoreEndpoint;
-      TEST_S3_ACCESS_KEY = objectStoreAccessKey;
-      TEST_S3_SECRET_KEY = objectStoreSecretKey;
-    }
-    // pkgs.lib.optionalAttrs (postgresUser != "") {
-      PGUSER = postgresUser;
-    };
+    # S3-compatible endpoint and credentials for the integration test suite.
+    # Set unconditionally rather than inside the test profile so `cargo test`
+    # works from a plain devenv shell; only the MinIO process itself is
+    # profile-scoped.
+    TEST_S3_ENDPOINT = objectStoreEndpoint;
+    TEST_S3_ACCESS_KEY = objectStoreAccessKey;
+    TEST_S3_SECRET_KEY = objectStoreSecretKey;
+  };
 
   services.postgres = {
     enable = true;
@@ -409,6 +416,7 @@ in {
 
   scripts.test-rust.exec = ''
     set -euo pipefail
+    ${postgresEnv}
     ensure-test-services
     echo "Running Rust tests"
 
@@ -468,6 +476,7 @@ in {
 
   scripts.check-sqlx.exec = ''
     set -euo pipefail
+    ${postgresEnv}
     # The committed .sqlx/ cache can disagree with schema.sql, and every offline
     # build believes the cache. Only a live connection catches that, so a
     # missing database is a failure rather than a pass: exiting 0 here reported
@@ -491,6 +500,128 @@ in {
     echo "Checking sqlx query metadata cache is up to date"
     cargo sqlx prepare --check -- --all-features
     echo "sqlx prepare check passed"
+  '';
+
+  # Reconciles secretspec.toml against what the awssm provider actually holds.
+  #
+  # The two drift in both directions and neither direction announces itself. A profile retired from
+  # the file leaves its secrets live in AWS -- three such profiles were found holding valid Alpaca
+  # credentials nobody could name -- and a key added to the file has no value until someone sets it,
+  # which surfaces as a runtime failure in whatever reads it first.
+  scripts.audit-secrets.exec = ''
+    set -euo pipefail
+
+    declared="$(mktemp)"
+    actual="$(mktemp)"
+    trap 'rm -f "$declared" "$actual"' EXIT
+
+    project="$(awk -F'"' '/^name[[:space:]]*=/ {print $2; exit}' "$DEVENV_ROOT/secretspec.toml")"
+    [ -z "$project" ] && { echo "Could not read the project name from secretspec.toml"; exit 1; }
+
+    # Emits "path<TAB>required" for every key the file declares.
+    awk -v project="$project" '
+      /^\[profiles\./ {
+        line = $0
+        sub(/^\[profiles\./, "", line); sub(/\]$/, "", line); gsub(/"/, "", line)
+        profile = line; in_profile = 1; next
+      }
+      /^\[/ { in_profile = 0; next }
+      in_profile && /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/ {
+        required = ($0 ~ /required[[:space:]]*=[[:space:]]*true/) ? "required" : "optional"
+        printf "secretspec/%s/%s/%s\t%s\n", project, profile, $1, required
+      }
+    ' "$DEVENV_ROOT/secretspec.toml" | sort > "$declared"
+
+    aws secretsmanager list-secrets --max-results 100 \
+      --query "SecretList[?starts_with(Name, 'secretspec/$project/')].Name" --output text \
+      | tr '\t' '\n' | grep -v '^$' | sort > "$actual"
+
+    echo "secretspec audit for project '$project'"
+    echo "  declared in secretspec.toml: $(wc -l < "$declared" | tr -d ' ')"
+    echo "  stored in AWS:               $(wc -l < "$actual" | tr -d ' ')"
+    echo ""
+
+    status=0
+
+    orphans="$(comm -13 <(cut -f1 "$declared") "$actual" || true)"
+    if [ -n "$orphans" ]; then
+      status=1
+      echo "Stored in AWS but not declared -- live credentials nothing reads:"
+      echo "$orphans" | sed 's/^/  /'
+      echo ""
+    fi
+
+    # Optional keys carry defaults in the file, so their absence is a choice rather than a fault.
+    missing_required="$(comm -23 <(awk -F'\t' '$2=="required" {print $1}' "$declared") "$actual" || true)"
+    if [ -n "$missing_required" ]; then
+      status=1
+      echo "Declared required but absent from AWS -- will fail at run time:"
+      echo "$missing_required" | sed 's/^/  /'
+      echo ""
+    fi
+
+    if [ "$status" -eq 0 ]; then
+      echo "No drift: every declared key is stored, and nothing is stored that is not declared."
+    fi
+    exit "$status"
+  '';
+
+  # Reports every PostgreSQL cluster currently listening, and which one owns 5432.
+  #
+  # Two clusters can run at once and only one can hold 5432; devenv writes the port into each data
+  # directory at initialisation, so a directory initialised while 5432 was taken keeps the shifted
+  # port forever afterwards. Everything here hardcodes localhost:5432, so the loser becomes
+  # invisible while still running -- including its pg_cron, which goes on emitting trading events
+  # into whichever database it can reach. That state ran for a week undetected.
+  scripts.doctor-database.exec = ''
+    set -euo pipefail
+    ${postgresEnv}
+
+    expected="$DEVENV_ROOT/.devenv/state/postgres"
+    running=0
+    owner_of_5432=""
+
+    echo "PostgreSQL clusters listening on 5432-5436"
+    for port in 5432 5433 5434 5435 5436; do
+      pg_isready -q -h localhost -p "$port" 2>/dev/null || continue
+      running=$((running + 1))
+      directory="$(psql -h localhost -p "$port" -d postgres -tAc \
+        "SELECT setting FROM pg_settings WHERE name='data_directory'" 2>/dev/null || echo '<unreadable>')"
+      identifier="$(psql -h localhost -p "$port" -d postgres -tAc \
+        "SELECT system_identifier FROM pg_control_system()" 2>/dev/null || echo '?')"
+      echo "  port $port  system_id=$identifier"
+      echo "            $directory"
+      [ "$port" = "5432" ] && owner_of_5432="$directory"
+    done
+
+    echo ""
+    status=0
+
+    if [ "$running" -eq 0 ]; then
+      echo "Nothing is listening. Start one with 'devenv up postgres --detach'."
+      exit 1
+    fi
+
+    if [ "$running" -gt 1 ]; then
+      status=1
+      echo "$running clusters are running. Each carries its own pg_cron, and every scheduler that"
+      echo "  can reach the database on 5432 emits into it -- so scheduled events are duplicated."
+      echo "  Stop the extra one, or remove its data directory to force re-initialisation."
+    fi
+
+    if [ -z "$owner_of_5432" ]; then
+      status=1
+      echo "Nothing owns 5432, which is the port DATABASE_URL and every psql call in this file use."
+    elif [ "$owner_of_5432" != "$expected" ]; then
+      status=1
+      echo "5432 is owned by a data directory other than the development one."
+      echo "  expected: $expected"
+      echo "  actual:   $owner_of_5432"
+      echo "  Everything that connects to localhost:5432 is talking to that other cluster."
+    fi
+
+    [ "$status" -eq 0 ] && echo "One cluster, on 5432, from the development data directory."
+    exit "$status"
   '';
 
   scripts.check-markdown.exec = ''
@@ -1003,6 +1134,15 @@ in {
     # sync. The counterpart to database:backup, and the reason a reset is now
     # survivable: backup restores equity_pairs, this restores the equity series.
     "database:backfill".exec = "backfill-account-snapshots";
+
+    # Reports which cluster owns 5432, and fails when more than one is running.
+    # Run this first when the database behaves as though it holds someone else's data.
+    "database:doctor".exec = "doctor-database";
+
+    # --- Secrets ---
+
+    # Reconciles secretspec.toml against the awssm provider in both directions.
+    "secrets:audit".exec = "audit-secrets";
 
     # --- Lab tasks ---
 
