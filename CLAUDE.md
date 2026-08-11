@@ -16,7 +16,7 @@ This is a collection of guidelines and references.
 - Use `devenv tasks run checks:rust` for comprehensive Rust checks
 - Docstrings are one sentence on what the item is for, plus at most two more for a caveat, invariant, or
   assumption a caller cannot read off the signature; never multi-paragraph, and never longer than the
-  function being documented
+  item it documents
 - Module documentation is three lines maximum
 - In-line comments are one line and appear only where a step is genuinely surprising, with two lines the
   hard ceiling
