@@ -44,12 +44,17 @@ log "New commits detected (local=$local_head remote=$remote_head)"
 
 # Stop devenv by terminating process-compose (the process manager spawned by
 # devenv) which in turn terminates all managed services.
-if pkill -TERM -u "$USER" -f "process-compose" 2>/dev/null; then
+#
+# $USER is unset under cron, and `set -u` above makes reading it fatal.
+owner="$(id -un)"
+if pkill -TERM -u "$owner" -f "process-compose" 2>/dev/null; then
   log "Sent SIGTERM to process-compose"
 else
   log "WARNING: process-compose not found"
 fi
-if pkill -TERM -u "$USER" -f "devenv.*--profile application" 2>/dev/null; then
+# Anchored: the tmux shell supervising devenv carries the same string and would otherwise match,
+# killing the restart loop.
+if pkill -TERM -u "$owner" -f "devenv --profile application up\$" 2>/dev/null; then
   log "Sent SIGTERM to devenv"
 else
   log "WARNING: devenv process not found"
