@@ -40,11 +40,25 @@ pub const ENTRY_Z_SCORE: f64 = 2.0;
 /// crosses back through its own mean, which is the move the position was taken to capture.
 pub const CONVERGENCE_Z_SCORE: f64 = 0.0;
 
-/// Spread z-score at which an open pair is stopped out.
+/// How much further a spread must widen *beyond its own entry* before the pair is stopped out.
 ///
-/// Above the entry threshold, in the same direction, so this fires when the spread widened further
-/// against the position rather than reverting.
-pub const STOP_LOSS_Z_SCORE: f64 = 4.0;
+/// Relative rather than absolute, because an absolute line cannot be right for every pair at once:
+/// with entry admitting anything at or above [`ENTRY_Z_SCORE`], a pair entered above the old fixed
+/// stop of 4.0 was already closable the moment it opened, and three of the first ten pairs opened in
+/// production were stopped on the next pass without the spread ever moving against them. Measuring
+/// from entry is what makes the stop describe adverse movement rather than absolute position.
+///
+/// Expressed in z units, so it is already normalized per pair: one unit is one standard deviation of
+/// *that* pair's own spread.
+pub const STOP_LOSS_WIDENING: f64 = 1.5;
+
+/// Upper bound on the entry z-score.
+///
+/// A data-quality guard, not a strategy rule. Mean reversion is the premise of the whole position,
+/// and a spread this far out is more often an unadjusted corporate action or a regime break than an
+/// opportunity — neither of which reverts. Rejections are counted so the rate is visible rather than
+/// inferred.
+pub const ENTRY_Z_SCORE_CAP: f64 = 5.0;
 
 /// Minimum model confidence for a ticker to be eligible for either leg.
 pub const CONFIDENCE_FLOOR: f64 = 0.5;
@@ -233,6 +247,18 @@ impl SpreadModel {
 
     pub fn hedge_ratio(&self) -> f64 {
         self.hedge_ratio
+    }
+
+    /// The fitted spread mean and dispersion, for the exit path's diagnostic log.
+    ///
+    /// Exposed because a z-score alone cannot be checked against anything: two runs reporting
+    /// different z for one pair are indistinguishable from a price move without these.
+    pub fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    pub fn standard_deviation(&self) -> f64 {
+        self.standard_deviation
     }
 
     /// Standardizes a live observation of the spread against the fitted distribution.
@@ -443,6 +469,19 @@ fn orient(first: &ScreenInput, second: &ScreenInput) -> Option<PairCandidate> {
             continue;
         };
         if z_score < ENTRY_Z_SCORE {
+            continue;
+        }
+        // Bounded above as well as below. Mean reversion is the premise of the position, and a
+        // spread this stretched is more often an unadjusted corporate action or a regime break than
+        // an opportunity.
+        if z_score > ENTRY_Z_SCORE_CAP {
+            debug!(
+                long = %long.ticker,
+                short = %short.ticker,
+                z_score,
+                cap = ENTRY_Z_SCORE_CAP,
+                "Rejected a candidate whose entry spread is beyond the cap"
+            );
             continue;
         }
 
@@ -864,11 +903,56 @@ mod tests {
     /// so the spread reads above the entry threshold.
     fn screenable_inputs() -> Vec<ScreenInput> {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
-        let stretched = follower.last().unwrap() * 1.5;
+        // 1.2%, not the 50% this used to stretch by. The generated series is near-deterministic —
+        // its spread deviation is about 0.3%, two orders below a real pair's — so a 50% dislocation
+        // scored z = 128, a value the screen would never see and the exit rule would close
+        // instantly. Every test built on the fixture was therefore asserting against a candidate
+        // that could not exist. This lands at z ~ 3.0, inside the band the screen actually admits.
+        let stretched = follower.last().unwrap() * 1.012;
         vec![
             input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
             input("BBBB", follower.clone(), stretched, -0.02),
         ]
+    }
+
+    /// Every candidate the screen emits must survive its own entry reading.
+    ///
+    /// The screen and the exit rule were each internally consistent and never checked against one
+    /// another, which is how entries above the old absolute stop of 4.0 were admitted and then
+    /// closed by the next pass. Composing the two here is the only place that gap is visible.
+    #[test]
+    fn test_no_candidate_is_closable_at_its_own_entry() {
+        for candidate in score_candidates(&screenable_inputs()) {
+            let entry = candidate.entry_z_score();
+            assert!(
+                entry <= ENTRY_Z_SCORE_CAP,
+                "the screen emitted z={entry}, beyond the cap of {ENTRY_Z_SCORE_CAP}"
+            );
+            assert_eq!(
+                crate::portfolio::evaluate::exit_reason(entry, entry),
+                None,
+                "a candidate entered at z={entry} would close on its own entry reading"
+            );
+        }
+    }
+
+    /// The cap is an upper bound on what the screen will emit, not advice.
+    #[test]
+    fn test_a_spread_beyond_the_cap_is_not_a_candidate() {
+        let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
+        // Far enough out that the fitted spread cannot place it inside the cap.
+        let dislocated = follower.last().unwrap() * 10.0;
+        let inputs = vec![
+            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
+            input("BBBB", follower.clone(), dislocated, -0.02),
+        ];
+        for candidate in score_candidates(&inputs) {
+            assert!(
+                candidate.entry_z_score() <= ENTRY_Z_SCORE_CAP,
+                "a dislocated spread at z={} cleared the cap",
+                candidate.entry_z_score()
+            );
+        }
     }
 
     /// The spread decides which leg is expensive; the short leg is the expensive one, always. An
@@ -943,14 +1027,9 @@ mod tests {
     /// for it are below.
     #[test]
     fn test_scoring_does_not_consider_sector() {
-        let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
-        let stretched = follower.last().unwrap() * 1.5;
-        let inputs = vec![
-            input("AAAA", leader.clone(), *leader.last().unwrap(), 0.03),
-            input("BBBB", follower, stretched, -0.02),
-        ];
-
-        let candidates = score_candidates(&inputs);
+        // The shared fixture rather than a second hand-rolled dislocation, so the entry score stays
+        // inside the band the screen admits when the fixture is retuned.
+        let candidates = score_candidates(&screenable_inputs());
 
         assert_eq!(
             candidates.len(),
