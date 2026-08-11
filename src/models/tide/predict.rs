@@ -42,15 +42,8 @@ pub fn consolidate_data(
     equity_bars: DataFrame,
     equity_details: DataFrame,
 ) -> Result<DataFrame, PredictionError> {
-    let bars = equity_bars
+    let bars = resolve_duplicate_bars(equity_bars)?
         .lazy()
-        .unique_stable(
-            Some(polars::prelude::Selector::ByName {
-                names: vec![PlSmallStr::from("ticker"), PlSmallStr::from("timestamp")].into(),
-                strict: false,
-            }),
-            UniqueKeepStrategy::Last,
-        )
         .filter(
             col("open_price")
                 .gt(lit(0.0))
@@ -112,6 +105,80 @@ pub fn consolidate_data(
 
     info!(rows = selected.height(), "Data consolidated");
     Ok(selected)
+}
+
+/// Collapses repeated `(ticker, timestamp)` bars, keeping the highest-volume row of each pair.
+///
+/// A provider that serves two instruments under one symbol yields two bars for one session, and
+/// keeping whichever arrived last picked the wrong series for BCPC and OP on every day of a
+/// two-year archive. Volume separates them where price cannot: the two TPC series opened fifty
+/// cents apart, while their volumes differed five-fold.
+///
+/// Every collapse is logged, because a silent tie-break is how the wrong instrument trained for two
+/// years without anything recording that a choice had been made.
+fn resolve_duplicate_bars(bars: DataFrame) -> Result<DataFrame, PredictionError> {
+    let before = bars.height();
+
+    // Ascending volume puts the row worth keeping last, which is the one `Last` then takes. Sorting
+    // the frame is free downstream: `engineer_features` re-sorts by (ticker, timestamp) anyway.
+    let deduplicated = bars
+        .clone()
+        .lazy()
+        .sort(
+            ["volume"],
+            SortMultipleOptions::default().with_maintain_order(true),
+        )
+        .unique_stable(
+            Some(polars::prelude::Selector::ByName {
+                names: vec![PlSmallStr::from("ticker"), PlSmallStr::from("timestamp")].into(),
+                strict: false,
+            }),
+            UniqueKeepStrategy::Last,
+        )
+        .collect()
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
+
+    let collapsed = before.saturating_sub(deduplicated.height());
+    if collapsed > 0 {
+        // Only walked when a collision actually happened, which on clean data is never.
+        let affected = duplicated_tickers(&bars)?;
+        warn!(
+            collapsed,
+            tickers = ?affected,
+            "Duplicate bars for one session; kept the highest-volume row of each"
+        );
+    }
+
+    Ok(deduplicated)
+}
+
+/// The tickers carrying more than one bar for the same session, sorted, for the log line above.
+///
+/// Sorted because `UniqueKeepStrategy::Any` promises no ordering, and a log line that names the same
+/// two symbols in a different order each session cannot be diffed or alerted on.
+fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> {
+    let frame = bars
+        .clone()
+        .lazy()
+        .group_by([col("ticker"), col("timestamp")])
+        .agg([len().alias("bar_count")])
+        .filter(col("bar_count").gt(lit(1u32)))
+        .select([col("ticker")])
+        .unique(None, UniqueKeepStrategy::Any)
+        .collect()
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
+
+    // Propagated rather than defaulted to empty: the caller logs this list as the record that a
+    // tie-break happened, so swallowing the error here would report a collapse naming no ticker,
+    // which is the silence this function exists to break.
+    let tickers = frame
+        .column("ticker")
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?
+        .str()
+        .map_err(|error| PredictionError::DataConsolidation(error.to_string()))?;
+    let mut names: Vec<String> = tickers.into_iter().flatten().map(str::to_string).collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Drops tickers whose trailing averages fall below the liquidity thresholds.
@@ -971,7 +1038,7 @@ mod tests {
 
     #[test]
     fn test_consolidate_data_deduplicates_same_ticker_timestamp() {
-        // Duplicate (ticker, timestamp) pairs should be deduplicated, keeping the last.
+        // Duplicate (ticker, timestamp) pairs collapse to one row.
         let bars = DataFrame::new(vec![
             Column::new("ticker".into(), vec!["AAPL", "AAPL"]),
             Column::new("timestamp".into(), vec![1000i64, 1000]),
@@ -996,6 +1063,59 @@ mod tests {
 
         let result = consolidate_data(bars, details).unwrap();
         assert_eq!(result.height(), 1);
+    }
+
+    /// The real BCPC collision from 2024-07-05, in the order the archive stored it: the thin
+    /// impostor sits *after* the genuine bar, so keeping the last row selected $24.75 over
+    /// $160.51 on every session of a two-year archive.
+    #[test]
+    fn test_consolidate_data_keeps_the_highest_volume_of_a_duplicate_pair() {
+        let bars = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["BCPC", "BCPC"]),
+            Column::new("timestamp".into(), vec![1_720_137_600_000i64; 2]),
+            Column::new("open_price".into(), vec![159.0, 24.0]),
+            Column::new("high_price".into(), vec![161.0, 25.0]),
+            Column::new("low_price".into(), vec![158.0, 24.0]),
+            Column::new("close_price".into(), vec![160.51, 24.75]),
+            Column::new("volume".into(), vec![91_611i64, 3_955]),
+            Column::new("volume_weighted_average_price".into(), vec![160.0f64, 24.5]),
+        ])
+        .unwrap();
+
+        let details = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["BCPC"]),
+            Column::new("sector".into(), vec!["Industrials"]),
+            Column::new("industry".into(), vec!["Specialty Chemicals"]),
+        ])
+        .unwrap();
+
+        let result = consolidate_data(bars, details).unwrap();
+        assert_eq!(result.height(), 1);
+        assert_eq!(
+            result
+                .column("close_price")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0)
+                .unwrap(),
+            160.51,
+            "the genuine high-volume bar must survive, not the row that happens to be last"
+        );
+    }
+
+    /// The tie-break has to be reported, or the wrong-series failure recurs with nothing recording
+    /// that a choice was made.
+    #[test]
+    fn test_duplicated_tickers_names_only_the_colliding_symbols() {
+        let bars = DataFrame::new(vec![
+            Column::new("ticker".into(), vec!["TPC", "TPC", "AAPL"]),
+            Column::new("timestamp".into(), vec![1000i64, 1000, 1000]),
+            Column::new("volume".into(), vec![59_618i64, 303_757, 1_000]),
+        ])
+        .unwrap();
+
+        assert_eq!(duplicated_tickers(&bars).unwrap(), vec!["TPC".to_string()]);
     }
 
     #[test]

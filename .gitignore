@@ -19,6 +19,7 @@ data/*
 **/*.json
 !.sqlx/*.json
 .claude/tasks/
+.claude/settings.local.json*
 .scratchpad/
 .devenv
 .env

@@ -154,11 +154,13 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         .expect("history must load");
     assert_eq!(close_history.len(), 2, "both legs need aligned history");
 
-    // Prices that push the spread well past the entry threshold. Which leg is stretched decides
-    // which becomes the short, so both orderings are quoted and the screen picks.
+    // Prices that push the spread past the entry threshold but not past the cap. Which leg is
+    // stretched decides which becomes the short, so both orderings are quoted and the screen picks.
+    // 1.2% rather than 50%: the seeded series is near-deterministic, so a 50% dislocation scores a
+    // z in the hundreds, which the screen now refuses as a data-quality artifact.
     let snapshot_body = serde_json::json!({
         "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
-        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.5 } },
+        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
 
     let _snapshots = server
@@ -270,7 +272,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
 
     let snapshot_body = serde_json::json!({
         "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
-        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.5 } },
+        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
     let _snapshots = server
         .mock(

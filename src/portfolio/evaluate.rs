@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, TradingClient};
 use crate::common::types::{EquityPrediction, Ticker};
@@ -26,7 +26,7 @@ use crate::portfolio::execute::{self, ExecutionError, ExecutionSettings, OpenOut
 use crate::portfolio::pairs::{self, CloseReason, OpenPair, PairsError};
 use crate::portfolio::risk::RiskGate;
 use crate::portfolio::screen::{
-    self, ScreenInput, CONVERGENCE_Z_SCORE, CORRELATION_WINDOW_SESSIONS, STOP_LOSS_Z_SCORE,
+    self, ScreenInput, CONVERGENCE_Z_SCORE, CORRELATION_WINDOW_SESSIONS, STOP_LOSS_WIDENING,
 };
 use crate::portfolio::size::{self, SizingParameters};
 
@@ -128,20 +128,36 @@ pub struct EvaluationSummary {
 /// Decides whether an open pair should be closed at this spread reading.
 ///
 /// The spread is `ln(short) - hedge_ratio * ln(long)` and entry is always above
-/// [`crate::portfolio::screen::ENTRY_Z_SCORE`], so convergence is a fall back through zero and a
-/// stop is a rise past the stop threshold. There is no sign handling here because the orientation
-/// invariant already removed it.
-pub fn exit_reason(z_score: f64) -> Option<CloseReason> {
-    if !z_score.is_finite() {
+/// [`crate::portfolio::screen::ENTRY_Z_SCORE`], so convergence is a fall back through zero. There is
+/// no sign handling here because the orientation invariant already removed it.
+///
+/// The stop is measured from `entry_z_score` rather than from a fixed line. An absolute stop cannot
+/// be right for every pair at once: it silently forbids entries above itself, and the screen has no
+/// matching upper bound, so pairs were opened already past it and closed on the next pass having
+/// never moved. Convergence stays absolute, because crossing the mean is the move the position was
+/// taken to capture regardless of where it started.
+pub fn exit_reason(z_score: f64, entry_z_score: f64) -> Option<CloseReason> {
+    if !z_score.is_finite() || !entry_z_score.is_finite() {
         return None;
     }
     if z_score <= CONVERGENCE_Z_SCORE {
         return Some(CloseReason::Convergence);
     }
-    if z_score >= STOP_LOSS_Z_SCORE {
+    if z_score >= entry_z_score + STOP_LOSS_WIDENING {
         return Some(CloseReason::StopLoss);
     }
     None
+}
+
+/// The convergence half of [`exit_reason`], for a pair whose stored entry score is not comparable.
+///
+/// Crossing the mean is a statement each window makes about itself, so it survives a change of
+/// window where the relative stop does not.
+pub fn convergence_only(z_score: f64) -> Option<CloseReason> {
+    if !z_score.is_finite() {
+        return None;
+    }
+    (z_score <= CONVERGENCE_Z_SCORE).then_some(CloseReason::Convergence)
 }
 
 /// Runs one evaluation pass.
@@ -402,7 +418,52 @@ async fn close_what_should_close(
         let Some(z_score) = model.z_score(*long_price, *short_price) else {
             continue;
         };
-        let Some(mut reason) = exit_reason(z_score) else {
+
+        // Every input to the z-score, on every pass, whether or not the pair closes.
+        //
+        // A z-score on its own is unfalsifiable: a pair recorded at entry z 6.09 and read at 1.25
+        // five minutes later is indistinguishable from a price move, a refitted distribution, and a
+        // bug, and the exit path previously logged only its decision. These five fields are what
+        // separate those cases, and the pass that does not close anything is the one that needs
+        // them most.
+        debug!(
+            pair_id = %pair.pair_id(),
+            z_score,
+            entry_z_score = pair.entry_z_score(),
+            stop_at = pair.entry_z_score() + screen::STOP_LOSS_WIDENING,
+            spread_mean = model.mean(),
+            spread_standard_deviation = model.standard_deviation(),
+            hedge_ratio = model.hedge_ratio(),
+            stored_hedge_ratio = pair.hedge_ratio(),
+            long_price = *long_price,
+            short_price = *short_price,
+            "Priced an open pair"
+        );
+
+        // A pair that outlived its session is scored on convergence alone.
+        //
+        // `entry_z_score` was standardized against the 60 sessions ending before the pair opened;
+        // this z was standardized against the window ending today. Those are different samples with
+        // different means and deviations, so their difference is not a number of standard
+        // deviations and the relative stop cannot be read from it. Convergence survives because it
+        // asks whether the spread crossed its own mean, which each window answers about itself.
+        //
+        // The 15:45 liquidation is what normally makes this unreachable; arriving here means it did
+        // not run, which is worth a warning on its own.
+        let entry_session = SessionDate::at(pair.opened_at());
+        let current_session = SessionDate::at(context.now);
+        let reason = if entry_session == current_session {
+            exit_reason(z_score, pair.entry_z_score())
+        } else {
+            warn!(
+                pair_id = %pair.pair_id(),
+                %entry_session,
+                %current_session,
+                "Open pair predates this session; scoring convergence only"
+            );
+            convergence_only(z_score)
+        };
+        let Some(mut reason) = reason else {
             continue;
         };
 
@@ -574,27 +635,91 @@ mod tests {
     #[test]
     fn test_the_exit_thresholds_bracket_the_entry_threshold() {
         const _: () = assert!(CONVERGENCE_Z_SCORE < ENTRY_Z_SCORE);
-        const _: () = assert!(ENTRY_Z_SCORE < STOP_LOSS_Z_SCORE);
-        assert_eq!(exit_reason(ENTRY_Z_SCORE), None);
+        const _: () = assert!(STOP_LOSS_WIDENING > 0.0);
+        assert_eq!(exit_reason(ENTRY_Z_SCORE, ENTRY_Z_SCORE), None);
     }
 
     #[test]
     fn test_a_spread_back_through_its_mean_is_convergence() {
-        assert_eq!(exit_reason(0.0), Some(CloseReason::Convergence));
-        assert_eq!(exit_reason(-1.5), Some(CloseReason::Convergence));
+        assert_eq!(exit_reason(0.0, 2.5), Some(CloseReason::Convergence));
+        assert_eq!(exit_reason(-1.5, 2.5), Some(CloseReason::Convergence));
     }
 
     #[test]
     fn test_a_spread_widening_past_the_stop_is_a_stop_loss() {
-        assert_eq!(exit_reason(STOP_LOSS_Z_SCORE), Some(CloseReason::StopLoss));
-        assert_eq!(exit_reason(7.0), Some(CloseReason::StopLoss));
+        let entry = 2.5;
+        assert_eq!(
+            exit_reason(entry + STOP_LOSS_WIDENING, entry),
+            Some(CloseReason::StopLoss)
+        );
+        assert_eq!(exit_reason(entry + 3.0, entry), Some(CloseReason::StopLoss));
     }
 
     /// Between the two thresholds the pair is working as intended and is held.
     #[test]
     fn test_a_spread_inside_the_band_is_held() {
-        assert_eq!(exit_reason(1.0), None);
-        assert_eq!(exit_reason(3.9), None);
+        assert_eq!(exit_reason(1.0, 2.5), None);
+        assert_eq!(exit_reason(2.5 + STOP_LOSS_WIDENING - 0.01, 2.5), None);
+    }
+
+    /// The whole point of measuring from entry: a wide entry gets the same room as a narrow one.
+    ///
+    /// Under the previous absolute stop of 4.0 the first assertion closed a pair that had not moved,
+    /// which is what happened to three of the first ten pairs opened in production.
+    #[test]
+    fn test_the_stop_travels_with_the_entry_spread() {
+        assert_eq!(exit_reason(6.09, 6.09), None, "an untouched pair is held");
+        assert_eq!(exit_reason(6.5, 6.09), None, "still inside its own band");
+        assert_eq!(
+            exit_reason(7.6, 6.09),
+            Some(CloseReason::StopLoss),
+            "widened a full stop beyond entry"
+        );
+        // The same absolute reading is a stop for a pair entered narrow and a hold for one entered
+        // wide. That is the asymmetry an absolute threshold cannot express.
+        assert_eq!(exit_reason(3.6, 2.0), Some(CloseReason::StopLoss));
+        assert_eq!(exit_reason(3.6, 3.0), None);
+    }
+
+    /// A pair from an earlier session is judged on convergence alone.
+    ///
+    /// Its `entry_z_score` was standardized against a different 60-session sample, so the difference
+    /// between the two is not a number of deviations and the relative stop cannot be read from it.
+    #[test]
+    fn test_convergence_only_ignores_the_stop() {
+        assert_eq!(convergence_only(0.0), Some(CloseReason::Convergence));
+        assert_eq!(convergence_only(-2.0), Some(CloseReason::Convergence));
+        // Far beyond any stop, and still held: the comparison that would fire is not available.
+        assert_eq!(convergence_only(9.0), None);
+        assert_eq!(convergence_only(f64::NAN), None);
+    }
+
+    /// The same reading closes under the session-local rule and is held under the cross-session one.
+    #[test]
+    fn test_the_cross_session_rule_differs_from_the_session_local_rule() {
+        let entry = 2.0;
+        let widened = entry + STOP_LOSS_WIDENING;
+        assert_eq!(exit_reason(widened, entry), Some(CloseReason::StopLoss));
+        assert_eq!(convergence_only(widened), None);
+    }
+
+    /// A pair the screen approves must not be closable by the very next reading of the same spread.
+    ///
+    /// This is the composition the two halves never checked against each other. Entry admitted
+    /// anything at or above `ENTRY_Z_SCORE` with no upper bound while the stop was a fixed 4.0, so
+    /// every candidate above 4.0 was born closable. The property holds for any entry the screen can
+    /// now emit, which is what the cap and the relative stop together guarantee.
+    #[test]
+    fn test_no_admissible_entry_is_closable_at_entry() {
+        let mut z = ENTRY_Z_SCORE;
+        while z <= crate::portfolio::screen::ENTRY_Z_SCORE_CAP {
+            assert_eq!(
+                exit_reason(z, z),
+                None,
+                "a pair entered at z={z} must not close on its own entry reading"
+            );
+            z += 0.01;
+        }
     }
 
     /// A non-finite reading is not an exit signal in either direction. Treating it as convergence
@@ -602,8 +727,11 @@ mod tests {
     /// and record the loss reason.
     #[test]
     fn test_a_non_finite_reading_is_not_an_exit_signal() {
-        assert_eq!(exit_reason(f64::NAN), None);
-        assert_eq!(exit_reason(f64::INFINITY), None);
+        assert_eq!(exit_reason(f64::NAN, 2.5), None);
+        assert_eq!(exit_reason(f64::INFINITY, 2.5), None);
+        // A corrupt stored entry is equally disqualifying: the stop would otherwise be computed
+        // against NaN and compare false, silently making the pair unstoppable.
+        assert_eq!(exit_reason(3.0, f64::NAN), None);
     }
 
     #[test]
