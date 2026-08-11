@@ -98,6 +98,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Starting tide training"
     );
 
+    // Before the archive is touched, because everything that would diagnose the window costs
+    // network round trips first and reports the failure as a sample count.
+    validate_lookback_window(lookback_days, session)?;
+
     // --- stage one: repair the archive ---
     //
     // Scanned rather than topped up: every weekday in the window with no partition is fetched, so a
@@ -376,6 +380,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Refuses a lookback window too short for the validation split to hold one window.
+///
+/// `FUND_LOOKBACK_DAYS` has a floor near 250 that its name does not suggest: the split is a cutoff
+/// at [`TRAINING_FRACTION`] of the window's span, and windowing needs `INPUT_LENGTH + OUTPUT_LENGTH`
+/// sessions on the far side of it. Sessions are counted from weekends alone, as the archive scan
+/// does, so holidays make the count optimistic and the exact guards after windowing still stand.
+fn validate_lookback_window(
+    lookback_days: i64,
+    session: SessionDate,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let required_sessions = (INPUT_LENGTH + OUTPUT_LENGTH) as i64;
+    let validation_days = lookback_days - (lookback_days as f64 * TRAINING_FRACTION) as i64;
+
+    let mut available_sessions = 0;
+    let mut date = session.plus_calendar_days(-validation_days);
+    while date <= session {
+        if !date.is_weekend() {
+            available_sessions += 1;
+        }
+        date = date.plus_calendar_days(1);
+    }
+
+    if available_sessions < required_sessions {
+        // Weekdays are five days in seven, so this inverts the session count back into the calendar
+        // days the whole window needs to leave that many after the cutoff.
+        let suggested =
+            (required_sessions as f64 * 7.0 / 5.0 / (1.0 - TRAINING_FRACTION)).ceil() as i64;
+        return Err(format!(
+            "FUND_LOOKBACK_DAYS={lookback_days} leaves about {available_sessions} sessions after \
+             the training cutoff, and windowing needs {required_sessions}. Use at least \
+             {suggested}."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Reads a positive integer from the environment, falling back only when the variable is absent.
 ///
 /// A present-but-unparsable value is an error rather than a fallback. This is a batch job an
@@ -437,6 +478,7 @@ async fn load_archived_bars(
     let start_date = end_date.plus_calendar_days(-lookback_days);
 
     let mut frames: Vec<LazyFrame> = Vec::new();
+    let mut unreadable = 0usize;
     let mut date = start_date;
     while date <= end_date {
         if date.is_weekend() {
@@ -445,7 +487,13 @@ async fn load_archived_bars(
         }
         let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
         if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
-            frames.push(frame.lazy());
+            match project_training_columns(frame) {
+                Ok(projected) => frames.push(projected.lazy()),
+                Err(error) => {
+                    unreadable += 1;
+                    warn!(key, %error, "Skipping a partition the training schema cannot read");
+                }
+            }
         }
         date = date.plus_calendar_days(1);
     }
@@ -453,7 +501,47 @@ async fn load_archived_bars(
     if frames.is_empty() {
         return Err("No equity-bar parquet files found in the lookback window".into());
     }
+    if unreadable > 0 {
+        warn!(
+            unreadable,
+            loaded = frames.len(),
+            "Some partitions were skipped; training on the rest"
+        );
+    }
     Ok(concat(frames, UnionArgs::default())?.collect()?)
+}
+
+/// The bar columns training consumes, in the types [`fund::data::bars::bars_to_dataframe`] writes.
+///
+/// Deliberately a subset of what the archive holds: `bar_interval` and `transactions` are written
+/// but never trained on, so projecting them away costs nothing.
+const TRAINING_BAR_COLUMNS: [(&str, DataType); 8] = [
+    ("ticker", DataType::String),
+    ("timestamp", DataType::Int64),
+    ("open_price", DataType::Float64),
+    ("high_price", DataType::Float64),
+    ("low_price", DataType::Float64),
+    ("close_price", DataType::Float64),
+    ("volume", DataType::Int64),
+    ("volume_weighted_average_price", DataType::Float64),
+];
+
+/// Narrows one partition to [`TRAINING_BAR_COLUMNS`] so partitions written by different versions of
+/// the writer still concatenate.
+///
+/// The archive is two years deep and outlives the schema that wrote any given day of it, and
+/// `concat` rejects the whole set when one member differs. The writer already treats that drift as
+/// recoverable in `merge_or_replace`; this is the same judgement on the read side.
+fn project_training_columns(frame: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    Ok(frame
+        .lazy()
+        .select(
+            TRAINING_BAR_COLUMNS
+                .iter()
+                .map(|(name, data_type)| col(*name).cast(data_type.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .collect()?)
 }
 
 /// CRPS from the most recent prior runs' `run_metadata.json`, newest first.
@@ -608,5 +696,93 @@ mod tests {
             training_configuration().unwrap().epoch_count(),
             TrainConfiguration::default().epoch_count()
         );
+    }
+
+    fn session_on(year: i32, month: u32, day: u32) -> SessionDate {
+        SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap())
+    }
+
+    /// The value in the operator notes for a quick local run. It reaches stage three and fails there
+    /// on a sample count, which is the failure this guard exists to move to the front of the run.
+    #[test]
+    fn test_a_short_lookback_is_rejected() {
+        let error = validate_lookback_window(10, session_on(2026, 8, 11)).unwrap_err();
+        assert!(
+            error.to_string().contains("Use at least"),
+            "the message must name a workable window, got {error}"
+        );
+    }
+
+    #[test]
+    fn test_the_default_lookback_is_accepted() {
+        assert!(validate_lookback_window(DEFAULT_LOOKBACK_DAYS, session_on(2026, 8, 11)).is_ok());
+    }
+
+    /// The suggestion the rejection prints has to be a window the same guard then accepts, or it
+    /// sends the operator round the loop a second time.
+    #[test]
+    fn test_the_suggested_lookback_is_accepted() {
+        let session = session_on(2026, 8, 11);
+        let message = validate_lookback_window(10, session)
+            .unwrap_err()
+            .to_string();
+        let suggested: i64 = message
+            .rsplit_once("Use at least ")
+            .and_then(|(_, tail)| tail.trim_end_matches('.').parse().ok())
+            .expect("the rejection must end with a suggested day count");
+        assert!(validate_lookback_window(suggested, session).is_ok());
+    }
+
+    /// A partition written before `bar_interval` joined the frame, and one written after. Both must
+    /// project to the same schema, because `concat` rejects the window when one member differs.
+    #[test]
+    fn test_partitions_from_either_writer_project_to_one_schema() {
+        let legacy = df![
+            "ticker" => ["AAPL"],
+            "timestamp" => [1_724_000_000_000i64],
+            "open_price" => [100.0],
+            "high_price" => [101.0],
+            "low_price" => [99.0],
+            "close_price" => [100.5],
+            "volume" => [1_000i64],
+            "volume_weighted_average_price" => [100.2],
+        ]
+        .unwrap();
+        let current = df![
+            "ticker" => ["AAPL"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [1_724_086_400_000i64],
+            "open_price" => [100.5],
+            "high_price" => [102.0],
+            "low_price" => [100.0],
+            "close_price" => [101.5],
+            "volume" => [1_100i64],
+            "volume_weighted_average_price" => [101.0],
+            "transactions" => [42i64],
+        ]
+        .unwrap();
+
+        let legacy = project_training_columns(legacy).unwrap();
+        let current = project_training_columns(current).unwrap();
+        assert_eq!(legacy.schema(), current.schema());
+
+        let combined = concat([legacy.lazy(), current.lazy()], UnionArgs::default())
+            .unwrap()
+            .collect()
+            .unwrap();
+        assert_eq!(combined.height(), 2);
+    }
+
+    /// A partition genuinely missing a price column is skipped, not silently null-filled — the
+    /// caller counts the skip and trains on the rest.
+    #[test]
+    fn test_a_partition_missing_a_price_column_is_refused() {
+        let frame = df![
+            "ticker" => ["AAPL"],
+            "timestamp" => [1_724_000_000_000i64],
+            "open_price" => [100.0],
+        ]
+        .unwrap();
+        assert!(project_training_columns(frame).is_err());
     }
 }
