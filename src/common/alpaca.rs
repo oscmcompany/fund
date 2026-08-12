@@ -487,12 +487,20 @@ impl OrderIntent {
         }
     }
 
+    /// Which side of the book this order takes, as Alpaca names it.
+    pub fn side(&self) -> &'static str {
+        match self {
+            OrderIntent::OpenLong { .. } => "buy",
+            OrderIntent::OpenShort { .. } => "sell",
+        }
+    }
+
     /// Builds the request body Alpaca expects.
     ///
     /// `position_intent` is sent explicitly rather than left to Alpaca's inference. Without it a
     /// sell against an existing long is read as a close rather than a short, which for a strategy
     /// that holds both sides of a pair is the difference between opening a hedge and unwinding one.
-    fn to_request(&self) -> OrderRequest {
+    fn to_request(&self, client_order_id: &str) -> OrderRequest {
         match self {
             OrderIntent::OpenLong { ticker, notional } => OrderRequest {
                 symbol: ticker.as_str().to_string(),
@@ -502,6 +510,7 @@ impl OrderIntent {
                 notional: Some(format!("{:.2}", notional.value())),
                 qty: None,
                 position_intent: "buy_to_open",
+                client_order_id: client_order_id.to_string(),
             },
             OrderIntent::OpenShort { ticker, shares } => OrderRequest {
                 symbol: ticker.as_str().to_string(),
@@ -511,6 +520,7 @@ impl OrderIntent {
                 notional: None,
                 qty: Some(shares.get()),
                 position_intent: "sell_to_open",
+                client_order_id: client_order_id.to_string(),
             },
         }
     }
@@ -936,10 +946,24 @@ impl TradingClient {
     }
 
     /// Submits an order and returns Alpaca's order identifier.
-    pub async fn submit_order(&self, intent: &OrderIntent) -> Result<String, ClientError> {
+    /// Sends an order under a caller-chosen `client_order_id`.
+    ///
+    /// The identifier is the caller's because it has to exist before the request does: the session
+    /// log records the intent first, and a crash before Alpaca answers otherwise leaves an order
+    /// nothing can name.
+    pub async fn submit_order(
+        &self,
+        intent: &OrderIntent,
+        client_order_id: &str,
+    ) -> Result<String, ClientError> {
         let url = format!("{}/v2/orders", self.base_url);
-        let response =
-            error_for_status(self.post(&url).json(&intent.to_request()).send().await?).await?;
+        let response = error_for_status(
+            self.post(&url)
+                .json(&intent.to_request(client_order_id))
+                .send()
+                .await?,
+        )
+        .await?;
         let order: OrderResponse = response.json().await.map_err(|error| {
             ClientError::Parse(format!("Failed to parse order response: {error}"))
         })?;
@@ -947,6 +971,7 @@ impl TradingClient {
         info!(
             ticker = %intent.ticker(),
             order_id = %order.id,
+            client_order_id,
             "Order submitted"
         );
         Ok(order.id)
@@ -1318,6 +1343,12 @@ struct OrderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     qty: Option<u32>,
     position_intent: &'static str,
+    /// The caller's own identifier, chosen before the order is sent.
+    ///
+    /// This is what makes an order recoverable after a crash between the session log write and
+    /// Alpaca's response: the broker's identifier does not exist yet at that point, and this one
+    /// does.
+    client_order_id: String,
 }
 
 #[derive(Deserialize)]
@@ -1460,10 +1491,46 @@ impl Snapshot {
     /// name. Callers needing to reject a wide or stale book should read [`Snapshot::latest_quote`]
     /// directly; this is the convenience path, not the careful one.
     pub fn reference_price(&self) -> Option<f64> {
+        self.reference_price_with_source().map(|(price, _)| price)
+    }
+
+    /// [`Snapshot::reference_price`] together with the field it came from.
+    ///
+    /// The two branches are not interchangeable readings of one number — a midpoint moves with the
+    /// book while the last trade can be minutes stale — so a price recorded without its source
+    /// cannot be compared against the same symbol's price on the next pass.
+    pub fn reference_price_with_source(&self) -> Option<(f64, PriceSource)> {
         self.latest_quote
             .as_ref()
-            .map(EquityQuote::mid_price)
-            .or(self.latest_trade_price)
+            .map(|quote| (quote.mid_price(), PriceSource::QuoteMidpoint))
+            .or_else(|| {
+                self.latest_trade_price
+                    .map(|price| (price, PriceSource::LastTrade))
+            })
+    }
+}
+
+/// Which field of a [`Snapshot`] a reference price was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    QuoteMidpoint,
+    LastTrade,
+}
+
+impl PriceSource {
+    /// A stable short name for the session log and the structured logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PriceSource::QuoteMidpoint => "quote_midpoint",
+            PriceSource::LastTrade => "last_trade",
+        }
+    }
+}
+
+impl std::fmt::Display for PriceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -2181,7 +2248,7 @@ mod tests {
             ticker: ticker("AAPL"),
             notional: Dollars::new(Decimal::new(123456, 2)).unwrap(),
         }
-        .to_request();
+        .to_request("client-long");
         assert_eq!(long.side, "buy");
         assert_eq!(long.notional.as_deref(), Some("1234.56"));
         assert_eq!(long.qty, None);
@@ -2191,7 +2258,7 @@ mod tests {
             ticker: ticker("MSFT"),
             shares: shares(40),
         }
-        .to_request();
+        .to_request("client-short");
         assert_eq!(short.side, "sell");
         assert_eq!(short.notional, None);
         assert_eq!(short.qty, Some(40));
@@ -2208,7 +2275,7 @@ mod tests {
                 ticker: ticker("MSFT"),
                 shares: shares(10),
             }
-            .to_request(),
+            .to_request("client-short"),
         )
         .unwrap();
         assert_eq!(body["position_intent"], "sell_to_open");
@@ -2395,10 +2462,13 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let order_id = client
-            .submit_order(&OrderIntent::OpenLong {
-                ticker: ticker("AAPL"),
-                notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
-            })
+            .submit_order(
+                &OrderIntent::OpenLong {
+                    ticker: ticker("AAPL"),
+                    notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
+                },
+                "client-long",
+            )
             .await
             .expect("order must submit");
 

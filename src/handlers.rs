@@ -25,6 +25,9 @@ use crate::data::calendar::{CalendarCache, SessionDate, TradingCalendar};
 use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
+use crate::data::session_log::{
+    self, Observation, PredictionsGenerated, SessionLog, SessionLogError,
+};
 use crate::data::universe::{UniverseCache, UniverseError};
 use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
@@ -67,6 +70,8 @@ pub enum HandlerError {
         stage: &'static str,
         message: String,
     },
+    #[error("session log is unusable: {0}")]
+    SessionLog(#[from] SessionLogError),
     #[error("configuration is missing or unusable: {0}")]
     Configuration(String),
 }
@@ -92,6 +97,8 @@ pub struct ServiceState {
     close_history_cache: CloseHistoryCache,
     sizing: SizingParameters,
     execution: ExecutionSettings,
+    /// The append-only record of what this process observed before it acted.
+    session_log: SessionLog,
     /// Cancelled when the process is asked to stop.
     ///
     /// Held here so a handler can decline to *start* more work it would not be able to finish. The
@@ -133,6 +140,7 @@ impl ServiceState {
             close_history_cache: CloseHistoryCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
+            session_log: SessionLog::from_env()?,
             shutdown,
             in_flight: std::sync::Mutex::new(HashSet::new()),
         })
@@ -140,6 +148,10 @@ impl ServiceState {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn session_log(&self) -> &SessionLog {
+        &self.session_log
     }
 
     /// Claims a command, or reports that one is already running.
@@ -298,6 +310,25 @@ async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError>
     let correlation_id = Uuid::new_v4();
     let (predictions, rows) = run_inference(state, &model_state, correlation_id).await?;
 
+    // The forecasts themselves are not repeated into the log — they are rows in
+    // `equity_predictions` and reach S3 through the nightly export. What only this run knows is
+    // which artifact produced them.
+    state
+        .session_log
+        .record(
+            correlation_id,
+            now,
+            Observation::PredictionsGenerated(PredictionsGenerated {
+                model_run_id: model_state.run_id().to_string(),
+                artifact_key: artifact_key.clone(),
+                artifact_staleness_sessions,
+                predictions,
+                rows_written: rows,
+                universe_size: universe.len(),
+            }),
+        )
+        .await;
+
     Ok(json!({
         "session_date": today,
         "correlation_id": correlation_id,
@@ -396,6 +427,7 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
         close_history: &close_history,
         sizing: state.sizing,
         execution: state.execution,
+        session_log: &state.session_log,
         shutdown: &state.shutdown,
         now,
     };
@@ -410,7 +442,9 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
 /// nothing and costs one API call; a liquidation skipped because the calendar was wrong or
 /// unreachable carries positions overnight. The asymmetry is the whole argument.
 async fn handle_portfolio_liquidation(state: &ServiceState) -> Result<Value, HandlerError> {
-    let summary = evaluate::run_liquidation(&state.pool, &state.trading, Utc::now()).await?;
+    let summary =
+        evaluate::run_liquidation(&state.pool, &state.trading, &state.session_log, Utc::now())
+            .await?;
     Ok(serde_json::to_value(summary).unwrap_or_else(|_| json!({})))
 }
 
@@ -424,7 +458,14 @@ async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
 
-    let summary = account::sync_account(&state.pool, &state.trading, &calendar, today).await?;
+    let summary = account::sync_account(
+        &state.pool,
+        &state.trading,
+        &state.session_log,
+        &calendar,
+        today,
+    )
+    .await?;
     Ok(serde_json::to_value(summary).unwrap_or_else(|_| json!({})))
 }
 
@@ -504,13 +545,35 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
     }))
 }
 
-/// Chained from a completed market data sync: export to S3, then purge.
+/// Chained from a completed market data sync: seal the session log, export to S3, then purge.
 ///
-/// The order is fixed and the purge is conditional on the export being clean. Purging after a
-/// partial export deletes rows that never reached S3, and nothing afterwards can tell that it
-/// happened.
+/// The order is fixed and the purge is conditional on the *database* export being clean. Purging
+/// after a partial export deletes rows that never reached S3, and nothing afterwards can tell that
+/// it happened.
+///
+/// The session log seals independently and does not gate the purge. It holds different data written
+/// by a different path, and letting a failure there hold PostgreSQL rows would couple two things
+/// whose only relationship is that they run on the same schedule.
 async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerError> {
     let today = SessionDate::at(Utc::now());
+
+    let sessions = session_log::export_session_logs(
+        &state.session_log,
+        &state.s3_client,
+        &state.bucket,
+        today,
+    )
+    .await;
+    let session_log_summary = json!({
+        "sessions_exported": sessions.exported.len(),
+        "records_exported": sessions.total_records(),
+        "sessions_failed": sessions.failed.iter().map(|(session_date, error)| json!({
+            "session_date": session_date, "error": error
+        })).collect::<Vec<_>>(),
+        "sessions_deleted": sessions.deleted.len(),
+        "unparsable_lines": sessions.unparsable_lines,
+    });
+
     let export = export::export_database(&state.pool, &state.s3_client, &state.bucket, today).await;
 
     if !export.is_clean() {
@@ -525,6 +588,7 @@ async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerEr
                 "dataset": dataset, "error": error.to_string()
             })).collect::<Vec<_>>(),
             "purged": Value::Null,
+            "session_log": session_log_summary,
         }));
     }
 
@@ -535,6 +599,7 @@ async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerEr
         "total_rows_exported": export.total_rows(),
         "purged_rows": purged.total_rows(),
         "purge_clean": purged.is_clean(),
+        "session_log": session_log_summary,
     }))
 }
 

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -25,6 +26,7 @@ use crate::common::alpaca::{
     TRANSFER_ACTIVITY_TYPES,
 };
 use crate::data::calendar::{SessionDate, TradingCalendar};
+use crate::data::session_log::{AccountObserved, Observation, SessionLog};
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
 /// The activity types this sync fetches and stores.
@@ -69,11 +71,32 @@ pub struct AccountSyncSummary {
 pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
+    session_log: &SessionLog,
     calendar: &TradingCalendar,
     session_date: SessionDate,
 ) -> Result<AccountSyncSummary, AccountError> {
     let account = client.fetch_account().await?;
     store_snapshot(pool, session_date, &account).await?;
+
+    // Recorded in full, not just the equity. Alpaca's portfolio history can report equity for a
+    // past date and nothing can report cash, buying power, or the market values, so this is the
+    // only moment they are observable at all.
+    session_log
+        .record(
+            uuid::Uuid::new_v4(),
+            Utc::now(),
+            Observation::AccountObserved(AccountObserved {
+                // The session this describes, which a sync re-run after Eastern midnight would
+                // otherwise lose: the envelope files a record under the session it *happened* in.
+                session_date: session_date.date(),
+                equity: account.equity().to_f64().unwrap_or_default(),
+                cash: account.cash().to_f64().unwrap_or_default(),
+                buying_power: account.buying_power().to_f64().unwrap_or_default(),
+                long_market_value: account.long_market_value().to_f64().unwrap_or_default(),
+                short_market_value: account.short_market_value().to_f64().unwrap_or_default(),
+            }),
+        )
+        .await;
     let previous_session_gap = missing_previous_snapshot(pool, calendar, session_date).await;
 
     // One request per type: Alpaca puts the activity type in the URL path, and the sync already
