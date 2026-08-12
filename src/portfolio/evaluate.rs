@@ -18,8 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, PriceSource, TradingClient};
 use crate::common::session_log::{
-    CandidateReading, EvaluationPass, ExcludedTickerReading, LiquidationRun, Observation,
-    OpenPairReading, PositionCloseRequested, PriceReading, ScreenInputReading, SessionLog,
+    CandidateReading, ExcludedTickerReading, LiquidationRun, Observation, OpenPairReading,
+    OpenPairsObserved, PassEvaluated, PositionCloseRequested, PriceReading, PricesObserved,
+    ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
 };
 use crate::common::types::{EquityPrediction, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
@@ -189,7 +190,11 @@ pub fn convergence_only(z_score: f64) -> Option<CloseReason> {
     (z_score <= CONVERGENCE_Z_SCORE).then_some(CloseReason::Convergence)
 }
 
-/// Runs one evaluation pass.
+/// Runs one evaluation pass, recording what it measured whether or not it finished.
+///
+/// The pass is written on every path out, failures included: a pass that died after pricing the
+/// book had already observed something, and discarding it leaves the log silent at exactly the
+/// moment it is worth reading.
 pub async fn run_pass(
     context: &EvaluationContext<'_>,
 ) -> Result<EvaluationSummary, EvaluationError> {
@@ -197,11 +202,33 @@ pub async fn run_pass(
     // That thread is what turns "the session lost money" into "it was lost at sizing" or "it was
     // lost at execution".
     let correlation_id = uuid::Uuid::new_v4();
-    let mut summary = EvaluationSummary::default();
-    let mut observation = EvaluationPass {
+    let mut observation = PassEvaluated {
         universe_size: context.universe.len(),
-        ..EvaluationPass::default()
+        ..PassEvaluated::default()
     };
+
+    let result = evaluate_pass(context, correlation_id, &mut observation).await;
+    if let Err(error) = &result {
+        observation.failure = Some(error.to_string());
+    }
+    context
+        .session_log
+        .record(
+            correlation_id,
+            context.now,
+            Observation::PassEvaluated(Box::new(observation)),
+        )
+        .await;
+    result
+}
+
+/// The pass itself, free to propagate: [`run_pass`] records the observation either way.
+async fn evaluate_pass(
+    context: &EvaluationContext<'_>,
+    correlation_id: uuid::Uuid,
+    observation: &mut PassEvaluated,
+) -> Result<EvaluationSummary, EvaluationError> {
+    let mut summary = EvaluationSummary::default();
     let execution = ExecutionContext {
         client: context.trading,
         settings: context.execution,
@@ -215,14 +242,20 @@ pub async fn run_pass(
 
     // --- exits, unconditionally ---
 
-    let mut prices = fetch_prices(context.market_data, &leg_symbols(&open_pairs)).await?;
+    let mut prices = fetch_prices(
+        context,
+        correlation_id,
+        "open_pairs",
+        &leg_symbols(&open_pairs),
+    )
+    .await?;
     let closed = close_what_should_close(
         context,
         &execution,
+        correlation_id,
         &open_pairs,
         &prices,
         &mut summary,
-        &mut observation,
     )
     .await?;
 
@@ -267,15 +300,12 @@ pub async fn run_pass(
         info!(block = block.as_str(), reason = %block, "Entry half skipped");
         summary.entries_blocked = Some(format!("{}: {block}", block.as_str()));
         observation.session_block = summary.entries_blocked.clone();
-        record_pass(context, correlation_id, &mut observation, &prices).await;
         return Ok(summary);
     }
 
-    let screened = build_screen_inputs(context, &held, &mut prices).await?;
+    let screened = build_screen_inputs(context, correlation_id, &held, &mut prices).await?;
     observation.predictions_available = screened.predictions_available;
     observation.eligible_tickers = screened.eligible;
-    observation.screen_inputs = screened.readings.clone();
-    observation.excluded = screened.excluded.clone();
 
     let candidates = screen::score_candidates(&screened.inputs);
     summary.candidates_screened = candidates.len();
@@ -402,7 +432,6 @@ pub async fn run_pass(
     observation
         .candidates
         .sort_by(|left, right| left.pair_id.cmp(&right.pair_id));
-    record_pass(context, correlation_id, &mut observation, &prices).await;
 
     info!(
         closed = summary.pairs_closed.len(),
@@ -411,27 +440,6 @@ pub async fn run_pass(
         "Evaluation pass complete"
     );
     Ok(summary)
-}
-
-/// Writes the pass observation, attaching every price it read.
-///
-/// Called on both paths out of a pass, including the one the risk gate blocks: those two look
-/// identical in a count and are very different days.
-async fn record_pass(
-    context: &EvaluationContext<'_>,
-    correlation_id: uuid::Uuid,
-    observation: &mut EvaluationPass,
-    prices: &HashMap<Ticker, ReferencePrice>,
-) {
-    observation.prices = price_readings(prices);
-    context
-        .session_log
-        .record(
-            correlation_id,
-            context.now,
-            Observation::EvaluationPass(Box::new(std::mem::take(observation))),
-        )
-        .await;
 }
 
 /// What the pre-close liquidation did.
@@ -546,31 +554,29 @@ fn leg_symbols(open_pairs: &[OpenPair]) -> Vec<String> {
     tickers.iter().map(|ticker| ticker.to_string()).collect()
 }
 
-/// Fetches reference prices for a symbol list, keyed by ticker.
+/// Fetches reference prices for a symbol list, keyed by ticker, and records the reading.
 ///
 /// Symbols Alpaca returns with no usable price are simply absent from the map. The callers treat an
-/// absent price as "no reading", never as zero.
+/// absent price as "no reading", never as zero — and the record names them, so an absence has a
+/// cause rather than only a gap.
 async fn fetch_prices(
-    client: &MarketDataClient,
+    context: &EvaluationContext<'_>,
+    correlation_id: uuid::Uuid,
+    purpose: &str,
     symbols: &[String],
 ) -> Result<HashMap<Ticker, ReferencePrice>, EvaluationError> {
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
-    let snapshots = client.fetch_snapshots(symbols).await?;
-    Ok(snapshots
+    let snapshots = context.market_data.fetch_snapshots(symbols).await?;
+    let prices: HashMap<Ticker, ReferencePrice> = snapshots
         .into_iter()
         .filter_map(|snapshot| {
             let (price, source) = snapshot.reference_price_with_source()?;
             Some((snapshot.ticker().clone(), ReferencePrice { price, source }))
         })
-        .collect())
-}
+        .collect();
 
-/// Every price the pass used, as rows for the session log.
-///
-/// Recorded once at pass level, so rows sharing a leg are provably reading the same number.
-fn price_readings(prices: &HashMap<Ticker, ReferencePrice>) -> Vec<PriceReading> {
     let mut readings: Vec<PriceReading> = prices
         .iter()
         .map(|(ticker, reference)| PriceReading {
@@ -580,7 +586,34 @@ fn price_readings(prices: &HashMap<Ticker, ReferencePrice>) -> Vec<PriceReading>
         })
         .collect();
     readings.sort_by(|left, right| left.ticker.cmp(&right.ticker));
-    readings
+
+    let mut unavailable: Vec<UnavailablePrice> = symbols
+        .iter()
+        .filter(|symbol| {
+            !prices
+                .keys()
+                .any(|ticker| ticker.as_str() == symbol.as_str())
+        })
+        .map(|symbol| UnavailablePrice {
+            ticker: symbol.clone(),
+            cause: "no_quote".to_string(),
+        })
+        .collect();
+    unavailable.sort_by(|left, right| left.ticker.cmp(&right.ticker));
+
+    context
+        .session_log
+        .record(
+            correlation_id,
+            context.now,
+            Observation::PricesObserved(PricesObserved {
+                purpose: purpose.to_string(),
+                readings,
+                unavailable,
+            }),
+        )
+        .await;
+    Ok(prices)
 }
 
 /// Prices the open book and closes whatever the spread says to close.
@@ -591,10 +624,10 @@ fn price_readings(prices: &HashMap<Ticker, ReferencePrice>) -> Vec<PriceReading>
 async fn close_what_should_close(
     context: &EvaluationContext<'_>,
     execution: &ExecutionContext<'_>,
+    correlation_id: uuid::Uuid,
     open_pairs: &[OpenPair],
     prices: &HashMap<Ticker, ReferencePrice>,
     summary: &mut EvaluationSummary,
-    observation: &mut EvaluationPass,
 ) -> Result<HashSet<uuid::Uuid>, EvaluationError> {
     let models = screen::exit_models(
         open_pairs
@@ -604,6 +637,7 @@ async fn close_what_should_close(
     );
 
     let mut closed = HashSet::new();
+    let mut readings: Vec<OpenPairReading> = Vec::with_capacity(open_pairs.len());
     for pair in open_pairs {
         // Filled in as the pair is measured and pushed on every path out of the iteration, so a
         // pair that could not be priced is as visible in the log as one that closed.
@@ -630,13 +664,13 @@ async fn close_what_should_close(
             summary.pairs_unpriced += 1;
             warn!(pair_id = %pair.pair_id(), "Open pair could not be priced this pass");
             reading.decision = "unpriced".to_string();
-            observation.open_pairs.push(reading);
+            readings.push(reading);
             continue;
         };
         let Some(model) = models.get(pair.pair_id()) else {
             warn!(pair_id = %pair.pair_id(), "Open pair has no rebuildable spread model");
             reading.decision = "no_spread_model".to_string();
-            observation.open_pairs.push(reading);
+            readings.push(reading);
             continue;
         };
 
@@ -646,7 +680,7 @@ async fn close_what_should_close(
 
         let Some(z_score) = model.z_score(long_price.price, short_price.price) else {
             reading.decision = "unreadable_spread".to_string();
-            observation.open_pairs.push(reading);
+            readings.push(reading);
             continue;
         };
         reading.z_score = Some(z_score);
@@ -698,7 +732,7 @@ async fn close_what_should_close(
             convergence_only(z_score)
         };
         let Some(mut reason) = reason else {
-            observation.open_pairs.push(reading);
+            readings.push(reading);
             continue;
         };
 
@@ -723,7 +757,7 @@ async fn close_what_should_close(
                 );
                 summary.exits_failed.push(pair.pair_id().to_string());
                 reading.decision = "close_failed".to_string();
-                observation.open_pairs.push(reading);
+                readings.push(reading);
                 continue;
             }
         };
@@ -734,12 +768,21 @@ async fn close_what_should_close(
 
         closed.insert(pair.id());
         reading.decision = reason.as_str().to_string();
-        observation.open_pairs.push(reading);
+        readings.push(reading);
         summary.pairs_closed.push(ClosedRecord {
             pair_id: pair.pair_id().to_string(),
             reason: reason.as_str().to_string(),
         });
     }
+
+    context
+        .session_log
+        .record(
+            correlation_id,
+            context.now,
+            Observation::OpenPairsObserved(OpenPairsObserved { readings }),
+        )
+        .await;
     Ok(closed)
 }
 
@@ -779,15 +822,11 @@ async fn previous_session_equity(
 /// The screen's inputs, and the model run they came from.
 struct ScreenedUniverse {
     inputs: Vec<ScreenInput>,
-    /// Forecasts that passed the eligibility filter, before pricing removed any.
+    /// Predictions that passed the eligibility filter, before pricing removed any.
     eligible: usize,
-    /// The same inputs as session-log rows: what the model offered, as the screen received it.
-    readings: Vec<ScreenInputReading>,
-    /// Every forecast the funnel removed, with the first test it failed.
-    excluded: Vec<ExcludedTickerReading>,
     model_run_id: Option<String>,
-    /// Forecasts the session had before any eligibility test, for the session log. The gap between
-    /// this and `inputs.len()` is how much the filters removed.
+    /// Predictions the session had before any eligibility test, for the session log. The gap
+    /// between this and `inputs.len()` is how much the filters removed.
     predictions_available: usize,
     /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs
     /// too, and those are filtered out of `inputs` before it ever sees them.
@@ -795,8 +834,12 @@ struct ScreenedUniverse {
 }
 
 /// Assembles the screen's inputs, fetching only the prices the exit half did not already have.
+///
+/// Records the funnel — what reached the screen and what each removed ticker failed on — before
+/// returning, so the reading exists whether or not the rest of the pass completes.
 async fn build_screen_inputs(
     context: &EvaluationContext<'_>,
+    correlation_id: uuid::Uuid,
     held: &HashSet<Ticker>,
     prices: &mut HashMap<Ticker, ReferencePrice>,
 ) -> Result<ScreenedUniverse, EvaluationError> {
@@ -807,8 +850,6 @@ async fn build_screen_inputs(
         return Ok(ScreenedUniverse {
             inputs: Vec::new(),
             eligible: 0,
-            readings: Vec::new(),
-            excluded: Vec::new(),
             model_run_id: None,
             predictions_available: 0,
             sectors: HashMap::new(),
@@ -866,7 +907,7 @@ async fn build_screen_inputs(
         .filter(|prediction| !prices.contains_key(prediction.ticker()))
         .map(|prediction| prediction.ticker().to_string())
         .collect();
-    prices.extend(fetch_prices(context.market_data, &missing).await?);
+    prices.extend(fetch_prices(context, correlation_id, "screen_candidates", &missing).await?);
 
     let mut inputs: Vec<ScreenInput> = Vec::with_capacity(eligible.len());
     let mut readings: Vec<ScreenInputReading> = Vec::with_capacity(eligible.len());
@@ -913,11 +954,20 @@ async fn build_screen_inputs(
         window = CORRELATION_WINDOW_SESSIONS,
         "Screen inputs assembled"
     );
+    context
+        .session_log
+        .record(
+            correlation_id,
+            context.now,
+            Observation::UniverseScreened(UniverseScreened {
+                inputs: readings,
+                excluded,
+            }),
+        )
+        .await;
     Ok(ScreenedUniverse {
         inputs,
         eligible: eligible.len(),
-        readings,
-        excluded,
         model_run_id,
         predictions_available: predictions.len(),
         sectors,

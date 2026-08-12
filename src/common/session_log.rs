@@ -44,8 +44,14 @@ pub enum SessionLogError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum Observation {
-    /// One five-minute pass: what it saw, what it decided, and what stopped it doing more.
-    EvaluationPass(Box<EvaluationPass>),
+    /// One five-minute pass: what it decided, and what stopped it doing more.
+    PassEvaluated(Box<PassEvaluated>),
+    /// What one price fetch returned, and what it asked for and did not get.
+    PricesObserved(PricesObserved),
+    /// The eligibility funnel: what reached the screen and what did not.
+    UniverseScreened(UniverseScreened),
+    /// Every open pair as one pass measured it, closed or held.
+    OpenPairsObserved(OpenPairsObserved),
     /// An order as it was sent, written before the request leaves the process.
     OrderSubmitted(OrderSubmitted),
     /// How the broker settled that order, filled or not.
@@ -64,7 +70,10 @@ impl Observation {
     /// The stable name this observation serializes under.
     pub fn event_type(&self) -> &'static str {
         match self {
-            Observation::EvaluationPass(_) => "evaluation_pass",
+            Observation::PassEvaluated(_) => "pass_evaluated",
+            Observation::PricesObserved(_) => "prices_observed",
+            Observation::UniverseScreened(_) => "universe_screened",
+            Observation::OpenPairsObserved(_) => "open_pairs_observed",
             Observation::OrderSubmitted(_) => "order_submitted",
             Observation::OrderResolved(_) => "order_resolved",
             Observation::PositionCloseRequested(_) => "position_close_requested",
@@ -75,12 +84,13 @@ impl Observation {
     }
 }
 
-/// One evaluation pass, whole.
+/// One evaluation pass: what it decided and what stopped it.
 ///
-/// `prices` holds every reading once; pair and candidate rows name tickers without repeating it.
-/// `candidates` holds only the pairs the screen scored, not the quadratic cross product.
+/// The readings it acted on are their own records sharing this pass's `correlation_id` — prices,
+/// the screen funnel, the open book. `candidates` stays here because a candidate's decision is not
+/// known until the pass ends.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
-pub struct EvaluationPass {
+pub struct PassEvaluated {
     pub account_equity: Option<f64>,
     pub previous_session_equity: Option<f64>,
     pub gross_exposure_used: Option<f64>,
@@ -96,16 +106,53 @@ pub struct EvaluationPass {
     pub model_run_id: Option<String>,
     /// Why the entry half did not run at all, if it did not.
     pub session_block: Option<String>,
-    pub prices: Vec<PriceReading>,
-    pub open_pairs: Vec<OpenPairReading>,
-    /// Every forecast that reached the screen, as the screen received it.
-    pub screen_inputs: Vec<ScreenInputReading>,
-    /// Every forecast that did not, and the first test it failed.
-    pub excluded: Vec<ExcludedTickerReading>,
+    /// The error that ended the pass early, if one did.
+    ///
+    /// Set on every failing path, so a pass that died after pricing the book still says what it had
+    /// measured. Its absence is the claim that the pass ran to completion.
+    pub failure: Option<String>,
     pub candidates: Vec<CandidateReading>,
 }
 
-/// One forecast as the screen consumed it.
+/// What one price fetch returned.
+///
+/// Written per fetch rather than per pass: the exit half prices the open book and the entry half
+/// asks only for what it is missing, and those are two separate readings of the market.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct PricesObserved {
+    /// What the fetch was for — `open_pairs` or `screen_candidates`.
+    pub purpose: String,
+    pub readings: Vec<PriceReading>,
+    pub unavailable: Vec<UnavailablePrice>,
+}
+
+/// A symbol the fetch asked for and did not get a usable price for.
+///
+/// Distinguishing the causes is the point: an absent price with no cause is indistinguishable from
+/// a symbol nobody asked about.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnavailablePrice {
+    pub ticker: String,
+    /// `no_quote` or `chunk_failed`.
+    pub cause: String,
+}
+
+/// The eligibility funnel for one pass.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct UniverseScreened {
+    /// Every prediction that reached the screen, as the screen received it.
+    pub inputs: Vec<ScreenInputReading>,
+    /// Every prediction that did not, and the first test it failed.
+    pub excluded: Vec<ExcludedTickerReading>,
+}
+
+/// Every open pair as one pass measured it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct OpenPairsObserved {
+    pub readings: Vec<OpenPairReading>,
+}
+
+/// One prediction as the screen consumed it.
 ///
 /// Derived from the stored quantiles and the session's universe, so not recoverable from
 /// `equity_predictions` alone.
@@ -117,7 +164,7 @@ pub struct ScreenInputReading {
     pub is_shortable: bool,
 }
 
-/// One forecast the eligibility filter removed, and why.
+/// One prediction the eligibility filter removed, and why.
 ///
 /// Written every pass, because `held` changes within a session even though the other tests do not.
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -288,12 +288,16 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     // The pass is only useful to a replay if the observation reached the disk. One evaluation
     // record, and one submission and one resolution per leg, all threaded by the pass's identifier.
     let records = recorded(&session_log);
-    let passes = of_type(&records, "evaluation_pass");
+    let passes = of_type(&records, "pass_evaluated");
     assert_eq!(passes.len(), 1, "one record per pass");
     let pass = &passes[0];
     let correlation_id = pass["correlation_id"]
         .as_str()
         .expect("a pass is correlated");
+    assert!(
+        pass["payload"]["failure"].is_null(),
+        "a pass that completed records no failure"
+    );
 
     assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
     let candidate = &pass["payload"]["candidates"][0];
@@ -306,29 +310,48 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
             && candidate["gross_exposure"].is_number(),
         "a candidate that reached the sizer carries what it was sized to"
     );
+
+    // Prices are their own records, one per fetch, sharing the pass's identifier.
+    let priced = of_type(&records, "prices_observed");
+    assert!(!priced.is_empty(), "the prices the pass decided on");
+    let readings: Vec<&serde_json::Value> = priced
+        .iter()
+        .flat_map(|record| record["payload"]["readings"].as_array().unwrap())
+        .collect();
+    assert!(!readings.is_empty());
     assert!(
-        !pass["payload"]["prices"].as_array().unwrap().is_empty(),
-        "the prices the pass decided on must be recorded"
+        readings
+            .iter()
+            .all(|reading| reading["price"].is_number() && reading["price_source"].is_string()),
+        "a price without its source cannot be compared across passes"
     );
     assert!(
-        pass["payload"]["prices"][0]["price_source"].is_string(),
-        "a price without its source cannot be compared across passes"
+        priced
+            .iter()
+            .all(|record| record["payload"]["purpose"].is_string()),
+        "each fetch names what it was for"
     );
 
     // What the model offered the screen, as rows rather than a count. `expected_return` and
     // `confidence` are derived from the stored quantiles, so `equity_predictions` alone cannot
     // reconstruct what the screen actually consumed.
-    let screen_inputs = pass["payload"]["screen_inputs"]
+    let screened = of_type(&records, "universe_screened");
+    assert_eq!(screened.len(), 1, "one funnel per pass");
+    let screen_inputs = screened[0]["payload"]["inputs"]
         .as_array()
         .expect("screen inputs are recorded");
-    assert_eq!(screen_inputs.len(), 2, "both forecasts reached the screen");
+    assert_eq!(
+        screen_inputs.len(),
+        2,
+        "both predictions reached the screen"
+    );
     assert!(screen_inputs
         .iter()
         .all(|input| input["expected_return"].is_number()
             && input["confidence"].is_number()
             && input["is_shortable"].is_boolean()));
     assert!(
-        pass["payload"]["excluded"]
+        screened[0]["payload"]["excluded"]
             .as_array()
             .expect("the funnel is recorded")
             .is_empty(),
@@ -588,9 +611,10 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         assert_eq!(record["payload"]["accepted"], true);
     }
 
-    // And the pass that measured every open pair says so, whether or not the pair closed.
-    let pass = of_type(&records, "evaluation_pass");
-    let measured = pass[0]["payload"]["open_pairs"]
+    // And the reading that measured every open pair says so, whether or not the pair closed.
+    let observed = of_type(&records, "open_pairs_observed");
+    assert_eq!(observed.len(), 1, "one book reading per pass");
+    let measured = observed[0]["payload"]["readings"]
         .as_array()
         .expect("open pairs are recorded");
     assert_eq!(
@@ -606,6 +630,99 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     assert!(
         closed["z_score"].is_number() && closed["spread_mean"].is_number(),
         "the inputs that produced the exit decision are recorded with it"
+    );
+}
+
+/// A pass that dies partway through still says what it had measured.
+///
+/// The book was priced and read before the account call failed, so discarding the observation
+/// would leave the log silent about the one pass worth reading. The failure is named on the record
+/// rather than left as an absence, which is indistinguishable from a crashed process.
+#[tokio::test]
+#[serial]
+async fn test_a_failed_pass_records_what_it_had_already_observed() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
+    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
+        .await
+        .unwrap();
+
+    let entry = PairEntry::new(
+        fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),
+        1.0,
+        2.5,
+        0.03,
+        None,
+    )
+    .unwrap();
+    pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
+
+    let _snapshots = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
+        )
+        .with_status(200)
+        .with_body(r#"{"AAAA":{"latestTrade":{"p":100.0}},"BBBB":{"latestTrade":{"p":50.0}}}"#)
+        .create_async()
+        .await;
+    // The exits are done; the entry half asks for the account and Alpaca is unreachable.
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(500)
+        .with_body("upstream is down")
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
+    let calendar = calendar_for_today();
+    let universe = universe_of(&["AAAA", "BBBB"]);
+
+    let running = CancellationToken::new();
+    let session_log = session_log("test-a-failed-pass-records-what-it-had-already-observed");
+    let context = EvaluationContext {
+        pool: &pool,
+        trading: &trading,
+        market_data: &market_data,
+        calendar: &calendar,
+        universe: &universe,
+        close_history: &close_history,
+        sizing: SizingParameters::default(),
+        execution: settings(),
+        session_log: &session_log,
+        shutdown: &running,
+        now: session_instant(),
+    };
+
+    evaluate::run_pass(&context)
+        .await
+        .expect_err("the account call must fail the pass");
+
+    let records = recorded(&session_log);
+    let passes = of_type(&records, "pass_evaluated");
+    assert_eq!(passes.len(), 1, "a failed pass is still recorded");
+    assert!(
+        passes[0]["payload"]["failure"]
+            .as_str()
+            .expect("the failure is named")
+            .contains("Alpaca"),
+        "the record says what ended the pass"
+    );
+    assert_eq!(
+        passes[0]["payload"]["open_pairs_at_start"], 1,
+        "what the pass had measured before the failure survives"
+    );
+    assert_eq!(
+        of_type(&records, "open_pairs_observed").len(),
+        1,
+        "the book reading was written before the failure and is unaffected by it"
+    );
+    assert!(
+        of_type(&records, "universe_screened").is_empty(),
+        "the pass never reached the screen"
     );
 }
 
