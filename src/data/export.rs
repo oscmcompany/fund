@@ -924,6 +924,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A file written across a mid-session deploy holds both shapes. Every v1 record must survive
+    /// the stricter envelope check, or the deploy silently drops the morning from the archive.
+    #[test]
+    fn test_a_file_written_across_a_deploy_keeps_both_schema_versions() {
+        let directory = temporary_directory("mixed-versions");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session-2026-08-12.jsonl");
+
+        // Verbatim v1 shapes, as the currently deployed build writes them.
+        let v1 = [
+            r#"{"schema_version":1,"event_id":"11111111-1111-1111-1111-111111111111","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:00Z","event_type":"evaluation_pass","payload":{"universe_size":7000,"prices":[{"ticker":"AAAA","price":100.0,"price_source":"last_trade"}],"open_pairs":[],"screen_inputs":[],"excluded":[],"candidates":[]}}"#,
+            r#"{"schema_version":1,"event_id":"33333333-3333-3333-3333-333333333333","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:01Z","event_type":"order_submitted","payload":{"client_order_id":"k-long","ticker":"AAAA","side":"buy","shares":null,"notional":1000.0}}"#,
+            r#"{"schema_version":1,"event_id":"44444444-4444-4444-4444-444444444444","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:02Z","event_type":"liquidation_run","payload":{"pairs_closed":1,"positions_refused":0,"pairs_still_open":[]}}"#,
+        ];
+        // A v2 record appended after the restart, into the same file.
+        let v2 = serde_json::to_string(&Record::new(
+            Uuid::nil(),
+            DateTime::parse_from_rfc3339("2026-08-12T18:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            Observation::PricesObserved(Default::default()),
+        ))
+        .unwrap();
+
+        let mut lines = v1.join("\n");
+        lines.push('\n');
+        lines.push_str(&v2);
+        std::fs::write(&path, lines).unwrap();
+
+        let (frame, unparsable) = read_session_frame(&path).unwrap();
+        assert_eq!(
+            unparsable, 0,
+            "no v1 record may be dropped by the new reader"
+        );
+        assert_eq!(frame.height(), 4, "three v1 records plus one v2");
+        let versions = frame.column("schema_version").unwrap().i64().unwrap();
+        assert_eq!(
+            (versions.get(0), versions.get(3)),
+            (Some(1), Some(2)),
+            "both versions coexist in one file, each row carrying its own"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// Only what has aged out goes, and the window's own edge stays. The local file is the
     /// crash-exact original, so deleting one still inside the window would remove the only thing a
     /// bad Parquet conversion could be repaired from.
