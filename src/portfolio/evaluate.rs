@@ -143,7 +143,7 @@ pub struct EvaluationSummary {
     pub entries_blocked: Option<String>,
     /// Why individual candidates were refused, if any were.
     pub entries_refused: Vec<String>,
-    /// The model run the session's forecasts came from.
+    /// The model run the session's predictions came from.
     ///
     /// Recorded on the pass rather than only on the pair, so a session that opened nothing still
     /// says which model it was deciding with. That is the difference between "the model saw no
@@ -293,7 +293,7 @@ async fn evaluate_pass(
     // Before the gate, not after. A pass blocked by drawdown, capacity, or the hold window is the
     // most common way a session opens nothing, and those are exactly the rows where "which model
     // was deciding" matters — the difference between the model seeing no opportunity and the model
-    // being three days old. Only the identifier is read here; the forecasts themselves stay behind
+    // being three days old. Only the identifier is read here; the predictions themselves stay behind
     // the gate, so a blocked pass still does not pay for the screen.
     summary.model_run_id = current_model_run_id(context).await?;
     observation.model_run_id = summary.model_run_id.clone();
@@ -855,7 +855,7 @@ async fn close_what_should_close(
     Ok(closed)
 }
 
-/// The model run behind the current session's forecasts, without loading the forecasts.
+/// The model run behind the current session's predictions, without loading them.
 ///
 /// One row rather than seven thousand, so this is cheap enough to run before the risk gate on every
 /// pass. See the call site for why it belongs there.
@@ -925,7 +925,7 @@ async fn build_screen_inputs(
         });
     }
 
-    // The newest forecast's run, not the first row's. A re-run leaves a mixed batch, and "whichever
+    // The newest prediction's run, not the first row's. A re-run leaves a mixed batch, and "whichever
     // ticker sorted first" is not an answer worth recording.
     let model_run_id = predictions
         .iter()
@@ -934,9 +934,9 @@ async fn build_screen_inputs(
 
     let sectors = details::load_sectors(context.pool).await?;
 
-    // Only forecasts that can produce a candidate: in the universe, with a sector, with enough
+    // Only predictions that can produce a candidate: in the universe, with a sector, with enough
     // history, and not already on the book. Every test here is a set lookup, because this runs once
-    // per forecast on a pass that runs every five minutes.
+    // per prediction on a pass that runs every five minutes.
     //
     // The sector test survives the removal of the different-sector rule, for a new reason. A ticker
     // whose sector is unknown cannot be counted against `MAXIMUM_LEGS_PER_SECTOR`, so admitting one

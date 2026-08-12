@@ -855,7 +855,7 @@ impl EquityDetail {
     }
 }
 
-/// One ticker's quantile forecast from a single prediction batch.
+/// One ticker's quantile prediction from a single batch.
 ///
 /// The three quantiles are ordered by construction: [`EquityPrediction::new`] rejects a set where
 /// `quantile_10 > quantile_50` or `quantile_50 > quantile_90`. A crossed quantile set is a model or
@@ -951,7 +951,7 @@ impl EquityPrediction {
         self.quantile_90
     }
 
-    /// The median forecast, which is the expected forward return the strategy trades on.
+    /// The median prediction, which is the expected forward return the strategy trades on.
     pub fn expected_return(&self) -> f64 {
         self.quantile_50
     }

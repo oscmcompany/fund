@@ -420,8 +420,8 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
     assert_eq!(closes[&ticker("AAAA")], vec![100.0]);
 }
 
-/// The pass reads only the current session's forecasts. Reading yesterday's when this morning's
-/// inference failed would present a stale forecast as current, and nothing downstream carries the
+/// The pass reads only the current session's predictions. Reading yesterday's when this morning's
+/// inference failed would present a stale prediction as current, and nothing downstream carries the
 /// timestamp far enough to notice.
 #[tokio::test]
 #[serial]
@@ -447,7 +447,7 @@ async fn test_predictions_are_bounded_to_the_session_window() {
     assert_eq!(loaded[0].model_run_id(), "run-today");
 }
 
-/// One row per ticker, the newest. A re-run leaves two forecasts for the same symbol, and feeding
+/// One row per ticker, the newest. A re-run leaves two predictions for the same symbol, and feeding
 /// both into the screen would let one ticker appear on both legs of the same pair.
 #[tokio::test]
 #[serial]

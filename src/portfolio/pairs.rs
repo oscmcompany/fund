@@ -144,7 +144,7 @@ impl PairEntry {
                 value: entry_z_score,
             });
         }
-        // Strictly positive, matching `PairCandidate::new`. Zero means the forecast is neutral
+        // Strictly positive, matching `PairCandidate::new`. Zero means the prediction is neutral
         // between the legs, which `screen::orient` already refuses — so accepting it here would let
         // a future call site build a `PairEntry` the screen would never have produced.
         if !signal_strength.is_finite() || signal_strength <= 0.0 {
@@ -541,7 +541,7 @@ mod tests {
         assert!(PairEntry::new(pair(), 1.0, 2.5, 0.1, None).is_ok());
     }
 
-    /// Zero is rejected as well as negative. A neutral forecast is not a reason to hold a pair, and
+    /// Zero is rejected as well as negative. A neutral prediction is not a reason to hold a pair, and
     /// `PairCandidate::new` already refuses it — the two validators have to agree or a future call
     /// site could build an entry the screen would never have produced.
     #[test]

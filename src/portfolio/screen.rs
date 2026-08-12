@@ -383,7 +383,7 @@ impl PairCandidate {
 /// 4. The model agrees with that orientation — it expects the long leg to out-return the short.
 ///
 /// Test four is the model doing more than gating eligibility: without it a pair can open whose
-/// spread says buy A and sell B while the forecast says the opposite.
+/// spread says buy A and sell B while the prediction says the opposite.
 ///
 /// **Sector is not tested here.** A same-sector spread is the canonical statistical arbitrage
 /// trade — two companies facing the same demand, the same input costs, and the same regulator,
@@ -976,7 +976,7 @@ mod tests {
         }
     }
 
-    /// The spread says buy AAAA and sell BBBB; the forecast says the opposite. Opening on that is a
+    /// The spread says buy AAAA and sell BBBB; the prediction says the opposite. Opening on that is a
     /// position whose two justifications cancel.
     #[test]
     fn test_a_pair_the_model_disagrees_with_is_not_opened() {

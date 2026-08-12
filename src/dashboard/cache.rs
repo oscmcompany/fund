@@ -97,7 +97,7 @@ impl ClosedPair {
     }
 }
 
-/// One ticker's quantile forecast from the most recent prediction batch.
+/// One ticker's quantile prediction from the most recent batch.
 #[derive(Debug, Clone)]
 pub struct Prediction {
     pub ticker: Ticker,

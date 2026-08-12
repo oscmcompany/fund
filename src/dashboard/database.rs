@@ -256,7 +256,7 @@ async fn fetch_closed_pairs(pool: &PgPool) -> Result<Vec<ClosedPair>, sqlx::Erro
     Ok(pairs)
 }
 
-/// Fetches the most recent prediction batch, ranked by median forecast.
+/// Fetches the most recent prediction batch, ranked by median prediction.
 ///
 /// A batch is identified by its shared `correlation_id`, not by timestamp: selecting on the maximum
 /// timestamp alone would mix rows from two runs if one ever wrote a ticker the other did not.

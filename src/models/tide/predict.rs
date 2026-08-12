@@ -297,9 +297,9 @@ pub(crate) fn unscale_and_sort_quantiles(
 
 /// Timestamp for horizon step `step`, where step 0 is the Eastern session `now` falls in.
 ///
-/// Midnight *Eastern*, not UTC. The evaluation pass selects forecasts with
+/// Midnight *Eastern*, not UTC. The evaluation pass selects predictions with
 /// [`crate::data::calendar::eastern_day_bounds`], and a UTC midnight sits at 20:00 the previous
-/// Eastern day under daylight time -- so a UTC-stamped forecast lands in the wrong session's
+/// Eastern day under daylight time -- so a UTC-stamped prediction lands in the wrong session's
 /// window and the morning's inference run is never read by that day's passes.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
     let session = SessionDate::at(now).plus_calendar_days(step as i64);
@@ -407,7 +407,7 @@ pub fn generate_predictions(
     }
 
     // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
-    // liquidation flattens every position the same session, so a forecast further out describes a
+    // liquidation flattens every position the same session, so a prediction further out describes a
     // holding period this strategy never has. Selected explicitly rather than as the last step, so
     // widening `output_length` for research does not silently move the traded signal.
     let target_date = step_timestamp_milliseconds(now, 0);
@@ -628,7 +628,7 @@ pub async fn insert_predictions(
 /// Loads the most recent prediction per ticker within a half-open instant range.
 ///
 /// The range is the current session's Eastern day, so a pass on a morning when the pre-open
-/// inference failed reads nothing rather than reading yesterday's forecast as though it were
+/// inference failed reads nothing rather than reading yesterday's prediction as though it were
 /// today's. A stale artifact is acceptable and logged; a stale *prediction* silently presented as
 /// current is not, because nothing downstream carries the timestamp far enough to notice.
 ///
@@ -884,7 +884,7 @@ mod tests {
     fn test_predictions_are_visible_to_the_same_session_evaluation() {
         // The 09:00 Eastern run exists to feed the same session's evaluation passes, which select
         // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
-        // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
+        // Eastern day's window -- 20:00 the day before, under EDT -- so the prediction written this
         // morning is never the one read this afternoon.
         use crate::common::types::SessionDate;
 
@@ -904,7 +904,7 @@ mod tests {
             let (start, end) = SessionDate::at(now).bounds();
             assert!(
                 stamp >= start && stamp < end,
-                "{day}: forecast stamped {stamp} is outside the session window [{start}, {end})"
+                "{day}: prediction stamped {stamp} is outside the session window [{start}, {end})"
             );
         }
     }
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn test_late_evening_eastern_still_stamps_the_current_session() {
         // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
-        // forecast a session forward, which is the failure this function exists to avoid.
+        // prediction a session forward, which is the failure this function exists to avoid.
         use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
