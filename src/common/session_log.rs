@@ -66,8 +66,8 @@ pub enum Observation {
     OrderResolved(OrderResolved),
     /// A position the application asked Alpaca to close.
     PositionCloseRequested(PositionCloseRequested),
-    /// The pre-close flattening.
-    LiquidationRun(LiquidationRun),
+    /// The pre-close flattening, whether or not it flattened anything.
+    LiquidationAttempted(LiquidationAttempted),
     /// The pre-open inference run, the artifact it resolved, and the forecasts it produced.
     PredictionsGenerated(Box<PredictionsGenerated>),
     /// One activity as Alpaca reported it, fill or transfer.
@@ -91,7 +91,7 @@ impl Observation {
             Observation::OrderSubmitted(_) => "order_submitted",
             Observation::OrderResolved(_) => "order_resolved",
             Observation::PositionCloseRequested(_) => "position_close_requested",
-            Observation::LiquidationRun(_) => "liquidation_run",
+            Observation::LiquidationAttempted(_) => "liquidation_attempted",
             Observation::PredictionsGenerated(_) => "predictions_generated",
             Observation::ActivityObserved(_) => "activity_observed",
             Observation::AccountObserved(_) => "account_observed",
@@ -369,11 +369,18 @@ pub struct PositionCloseRequested {
 }
 
 /// The pre-close flattening.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LiquidationRun {
+///
+/// Written whether or not the flattening succeeded. This is the last fail-safe before positions
+/// carry overnight, and a run that failed at the broker used to leave no trace of having been
+/// attempted at all.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct LiquidationAttempted {
     pub pairs_closed: usize,
     pub positions_refused: usize,
     pub pairs_still_open: Vec<String>,
+    /// The error that ended the run early, if one did. Its absence is the claim that the run
+    /// finished, not that the book is flat — `pairs_still_open` answers that.
+    pub failure: Option<String>,
 }
 
 /// The pre-open inference run and everything it produced.

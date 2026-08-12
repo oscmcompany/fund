@@ -68,6 +68,11 @@ pub struct AccountSyncSummary {
     /// The previous trading session, when it has no snapshot — a hole in the equity series that a
     /// future time-weighted return cannot chain across.
     pub previous_session_gap: Option<SessionDate>,
+    /// True when Alpaca's pagination stopped at its bound, so this session's activities are
+    /// incomplete rather than merely few.
+    pub activities_truncated: bool,
+    /// Activities Alpaca sent with no usable timestamp, which cannot be stored at all.
+    pub activities_undated: usize,
 }
 
 /// Runs the whole post-close sync for one session date.
@@ -106,12 +111,15 @@ pub async fn sync_account(
     // One request per type: Alpaca puts the activity type in the URL path, and the sync already
     // tolerates several round trips.
     let mut activities = Vec::new();
+    let mut activities_truncated = false;
+    let mut activities_undated = 0;
     for activity_type in synced_activity_types() {
-        activities.extend(
-            client
-                .fetch_activities(activity_type, session_date.date())
-                .await?,
-        );
+        let fetched = client
+            .fetch_activities(activity_type, session_date.date())
+            .await?;
+        activities_truncated |= fetched.truncated;
+        activities_undated += fetched.undated;
+        activities.extend(fetched.activities);
     }
     let activities_stored = store_activities(pool, &activities).await?;
 
@@ -192,6 +200,8 @@ pub async fn sync_account(
         pairs_attributed,
         previous_session_gap,
         activities_unattributed: attribution.unattributed,
+        activities_truncated,
+        activities_undated,
     })
 }
 

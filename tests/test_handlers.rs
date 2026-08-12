@@ -863,8 +863,14 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
     assert!(summary.pairs_still_open.is_empty());
     assert!(pairs::load_open_pairs(&pool).await.unwrap().is_empty());
 
-    // The table is mutated in place; the log needs its own record of the transition.
+    // The last fail-safe before positions carry overnight says it ran, and says the book is flat.
     let records = recorded(&log);
+    let attempted = of_type(&records, "liquidation_attempted");
+    assert_eq!(attempted.len(), 1);
+    assert!(attempted[0]["payload"]["failure"].is_null());
+    assert_eq!(attempted[0]["payload"]["pairs_closed"], 2);
+
+    // The table is mutated in place; the log needs its own record of the transition.
     let closed = of_type(&records, "pair_closed");
     assert_eq!(closed.len(), 2, "one record per pair marked closed");
     for record in &closed {
@@ -874,6 +880,46 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
             "a pair that was open when the liquidation reached it"
         );
     }
+}
+
+/// A liquidation that could not reach the broker still records that it was attempted.
+///
+/// This is the last thing standing between an open book and an overnight position. A run that
+/// failed at the bulk close used to leave no trace of having happened at all, which reads exactly
+/// like a liquidation that was never scheduled.
+#[tokio::test]
+#[serial]
+async fn test_a_failed_liquidation_records_the_attempt() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    let _bulk = server
+        .mock("DELETE", mockito::Matcher::Regex(r"^/v2/positions".into()))
+        .with_status(500)
+        .with_body("upstream is down")
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let log = session_log("test-a-failed-liquidation-records-the-attempt");
+    evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
+        .await
+        .expect_err("the bulk close must fail");
+
+    let records = recorded(&log);
+    let attempted = of_type(&records, "liquidation_attempted");
+    assert_eq!(attempted.len(), 1, "the attempt is recorded even so");
+    assert!(
+        attempted[0]["payload"]["failure"]
+            .as_str()
+            .expect("the failure is named")
+            .contains("Alpaca"),
+        "the record says what stopped it"
+    );
+    assert_eq!(
+        attempted[0]["payload"]["pairs_closed"], 0,
+        "nothing was flattened"
+    );
 }
 
 /// A pair whose leg Alpaca refused to close stays open in the record. Marking it closed would leave

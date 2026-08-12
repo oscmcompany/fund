@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::common::alpaca::{ClientError, MarketDataClient, PriceSource, TradingClient};
 use crate::common::session_log::{
-    CandidateReading, ExcludedTickerReading, LiquidationRun, Observation, OpenPairReading,
+    CandidateReading, ExcludedTickerReading, LiquidationAttempted, Observation, OpenPairReading,
     OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PositionCloseRequested, PriceReading,
     PricesObserved, ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
 };
@@ -489,6 +489,33 @@ pub async fn run_liquidation(
     correlation_id: uuid::Uuid,
     now: DateTime<Utc>,
 ) -> Result<LiquidationSummary, EvaluationError> {
+    let mut summary = LiquidationSummary::default();
+    let result = liquidate(pool, client, session_log, correlation_id, now, &mut summary).await;
+
+    session_log
+        .record(
+            correlation_id,
+            now,
+            Observation::LiquidationAttempted(LiquidationAttempted {
+                pairs_closed: summary.pairs_closed,
+                positions_refused: summary.positions_refused,
+                pairs_still_open: summary.pairs_still_open.clone(),
+                failure: result.as_ref().err().map(ToString::to_string),
+            }),
+        )
+        .await;
+    result.map(|()| summary)
+}
+
+/// The flattening itself, free to propagate: [`run_liquidation`] records it either way.
+async fn liquidate(
+    pool: &PgPool,
+    client: &TradingClient,
+    session_log: &SessionLog,
+    correlation_id: uuid::Uuid,
+    now: DateTime<Utc>,
+    summary: &mut LiquidationSummary,
+) -> Result<(), EvaluationError> {
     let outcomes = client.close_all_positions().await?;
 
     // One record per position, not just the totals. The bulk close is the only path that touches
@@ -521,10 +548,7 @@ pub async fn run_liquidation(
         .map(|outcome| outcome.ticker().clone())
         .collect();
 
-    let mut summary = LiquidationSummary {
-        positions_refused: refused.len(),
-        ..Default::default()
-    };
+    summary.positions_refused = refused.len();
 
     for pair in pairs::load_open_pairs(pool).await? {
         if refused.contains(pair.long_ticker()) || refused.contains(pair.short_ticker()) {
@@ -564,19 +588,7 @@ pub async fn run_liquidation(
             "Liquidation did not flatten the book"
         );
     }
-
-    session_log
-        .record(
-            correlation_id,
-            now,
-            Observation::LiquidationRun(LiquidationRun {
-                pairs_closed: summary.pairs_closed,
-                positions_refused: summary.positions_refused,
-                pairs_still_open: summary.pairs_still_open.clone(),
-            }),
-        )
-        .await;
-    Ok(summary)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -605,9 +617,11 @@ async fn fetch_prices(
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
-    let snapshots = context.market_data.fetch_snapshots(symbols).await?;
-    let prices: HashMap<Ticker, ReferencePrice> = snapshots
-        .into_iter()
+    let fetched = context.market_data.fetch_snapshots(symbols).await?;
+    let failed: HashSet<&str> = fetched.failed_symbols.iter().map(String::as_str).collect();
+    let prices: HashMap<Ticker, ReferencePrice> = fetched
+        .snapshots
+        .iter()
         .filter_map(|snapshot| {
             let (price, source) = snapshot.reference_price_with_source()?;
             Some((snapshot.ticker().clone(), ReferencePrice { price, source }))
@@ -633,7 +647,12 @@ async fn fetch_prices(
         })
         .map(|symbol| UnavailablePrice {
             ticker: symbol.clone(),
-            cause: "no_quote".to_string(),
+            cause: if failed.contains(symbol.as_str()) {
+                "chunk_failed"
+            } else {
+                "no_quote"
+            }
+            .to_string(),
         })
         .collect();
     unavailable.sort_by(|left, right| left.ticker.cmp(&right.ticker));

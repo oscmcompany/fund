@@ -741,6 +741,19 @@ pub const FILL_ACTIVITY_TYPE: &str = "FILL";
 /// accounts on Alpaca's own books, which is how paper accounts are funded.
 pub const TRANSFER_ACTIVITY_TYPES: [&str; 3] = ["CSD", "CSW", "JNLC"];
 
+/// What one activity fetch returned, and what it knows it missed.
+///
+/// `truncated` is the one that matters: the page bound is a bound on a loop, not on reality, and a
+/// session that hit it is holding an incomplete record of itself rather than an empty one.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFetch {
+    pub activities: Vec<AccountActivity>,
+    /// Activities dropped for carrying neither a transaction time nor a date.
+    pub undated: usize,
+    /// True when pagination stopped at its bound with more to fetch.
+    pub truncated: bool,
+}
+
 /// One account activity: a fill, a fee, a dividend, a transfer.
 ///
 /// Fields beyond the identity are optional because Alpaca omits rather than zeroes, and which ones
@@ -1165,6 +1178,7 @@ impl TradingClient {
 
     /// Fetches one activity type for a single session date, walking pagination.
     ///
+    ///
     /// Activities with neither a `transaction_time` nor a `date` are dropped with a warning. They
     /// cannot be stored — `account_activities.transaction_time` is `NOT NULL` — and synthesizing a
     /// timestamp would put a fabricated time into the record the dashboard reads as fact.
@@ -1172,7 +1186,7 @@ impl TradingClient {
         &self,
         activity_type: &str,
         date: NaiveDate,
-    ) -> Result<Vec<AccountActivity>, ClientError> {
+    ) -> Result<ActivityFetch, ClientError> {
         let url = format!("{}/v2/account/activities/{activity_type}", self.base_url);
         let date_text = date.to_string();
         let page_size = ACTIVITIES_PAGE_SIZE.to_string();
@@ -1180,6 +1194,7 @@ impl TradingClient {
         let mut activities: Vec<AccountActivity> = Vec::new();
         let mut page_token: Option<String> = None;
         let mut undated: usize = 0;
+        let mut truncated = false;
 
         for page in 0..ACTIVITIES_MAXIMUM_PAGES {
             let mut query: Vec<(&str, &str)> = vec![
@@ -1238,6 +1253,7 @@ impl TradingClient {
             page_token = Some(token);
 
             if page + 1 == ACTIVITIES_MAXIMUM_PAGES {
+                truncated = true;
                 warn!(
                     activity_type,
                     %date,
@@ -1254,7 +1270,11 @@ impl TradingClient {
             );
         }
         debug!(activity_type, %date, activities = activities.len(), "Account activities fetched");
-        Ok(activities)
+        Ok(ActivityFetch {
+            activities,
+            undated,
+            truncated,
+        })
     }
 
     /// Fetches the daily equity curve over an inclusive date range.
@@ -1550,6 +1570,16 @@ impl std::fmt::Display for DataFeed {
     }
 }
 
+/// What one snapshot fetch returned, and what it could not ask about.
+///
+/// A symbol is absent from `snapshots` either because Alpaca had no usable price for it or because
+/// the request carrying it failed. `failed_symbols` is what separates the two.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotFetch {
+    pub snapshots: Vec<Snapshot>,
+    pub failed_symbols: Vec<String>,
+}
+
 /// One symbol's point-in-time market state.
 ///
 /// Every field is optional because Alpaca omits rather than zeroes: a symbol that has not traded
@@ -1704,12 +1734,16 @@ impl MarketDataClient {
     /// narrows the entry set and holds the exits it cannot price, both of which beat pricing
     /// nothing at all. Only a total failure — every chunk failing — is reported as an error, which
     /// keeps that report meaningful for the common single-chunk case.
-    pub async fn fetch_snapshots(&self, symbols: &[String]) -> Result<Vec<Snapshot>, ClientError> {
+    ///
+    /// The failed chunk's symbols come back named. Downstream, a symbol Alpaca had no quote for and
+    /// one whose request never completed are the same absence, and they are not the same problem.
+    pub async fn fetch_snapshots(&self, symbols: &[String]) -> Result<SnapshotFetch, ClientError> {
         if symbols.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SnapshotFetch::default());
         }
 
         let mut snapshots: Vec<Snapshot> = Vec::new();
+        let mut failed_symbols: Vec<String> = Vec::new();
         let mut failed_chunks: usize = 0;
         let mut requests: usize = 0;
         let mut last_error: Option<ClientError> = None;
@@ -1725,6 +1759,7 @@ impl MarketDataClient {
                         "Snapshot chunk failed; its symbols stay unpriced"
                     );
                     failed_chunks += 1;
+                    failed_symbols.extend(chunk.iter().cloned());
                     last_error = Some(error);
                 }
             }
@@ -1741,7 +1776,10 @@ impl MarketDataClient {
             failed_chunks,
             "Snapshots fetched"
         );
-        Ok(snapshots)
+        Ok(SnapshotFetch {
+            snapshots,
+            failed_symbols,
+        })
     }
 
     async fn fetch_snapshot_chunk(&self, symbols: &[String]) -> Result<Vec<Snapshot>, ClientError> {
@@ -2705,8 +2743,8 @@ mod tests {
             .await
             .expect("activities must parse");
 
-        assert_eq!(activities.len(), ACTIVITIES_PAGE_SIZE + 1);
-        assert_eq!(activities.last().unwrap().id(), "activity-tail");
+        assert_eq!(activities.activities.len(), ACTIVITIES_PAGE_SIZE + 1);
+        assert_eq!(activities.activities.last().unwrap().id(), "activity-tail");
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -2783,8 +2821,8 @@ mod tests {
             .await
             .expect("activities must parse");
 
-        assert_eq!(activities.len(), 1);
-        assert_eq!(activities[0].id(), "dated");
+        assert_eq!(activities.activities.len(), 1);
+        assert_eq!(activities.activities[0].id(), "dated");
         mock.assert_async().await;
     }
 
@@ -2812,7 +2850,7 @@ mod tests {
             .expect("activities must parse");
 
         assert_eq!(
-            activities[0]
+            activities.activities[0]
                 .transaction_time()
                 .with_timezone(&New_York)
                 .date_naive(),
@@ -2852,15 +2890,21 @@ mod tests {
             .await
             .expect("activities must parse");
 
-        assert_eq!(activities.len(), 3);
-        assert_eq!(activities[0].net_amount(), Some(Decimal::new(20000, 0)));
-        assert_eq!(activities[1].net_amount(), Some(Decimal::new(1000050, 2)));
+        assert_eq!(activities.activities.len(), 3);
         assert_eq!(
-            activities[2].net_amount(),
+            activities.activities[0].net_amount(),
+            Some(Decimal::new(20000, 0))
+        );
+        assert_eq!(
+            activities.activities[1].net_amount(),
+            Some(Decimal::new(1000050, 2))
+        );
+        assert_eq!(
+            activities.activities[2].net_amount(),
             Some(Decimal::new(-250025, 2)),
             "a withdrawal must keep its sign"
         );
-        for activity in &activities {
+        for activity in &activities.activities {
             assert_eq!(
                 activity.signed_cash_flow(),
                 None,
@@ -2892,7 +2936,7 @@ mod tests {
             .expect("activities must parse");
 
         assert_eq!(
-            activities[0].transaction_time(),
+            activities.activities[0].transaction_time(),
             "2026-05-15T13:45:00Z".parse::<DateTime<Utc>>().unwrap()
         );
         mock.assert_async().await;
@@ -2932,8 +2976,8 @@ mod tests {
             .await
             .expect("snapshot must parse");
 
-        assert_eq!(snapshots.len(), 1);
-        let snapshot = &snapshots[0];
+        assert_eq!(snapshots.snapshots.len(), 1);
+        let snapshot = &snapshots.snapshots[0];
         assert_eq!(snapshot.ticker().as_str(), "AAPL");
         assert_eq!(snapshot.latest_trade_price(), Some(201.5));
         assert_eq!(snapshot.latest_quote().unwrap().bid_price(), 201.0);
@@ -2964,7 +3008,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(snapshots[0].reference_price(), Some(201.5));
+        assert_eq!(snapshots.snapshots[0].reference_price(), Some(201.5));
         mock.assert_async().await;
     }
 
@@ -2989,10 +3033,10 @@ mod tests {
             .unwrap();
 
         assert!(
-            snapshots[0].latest_quote().is_none(),
+            snapshots.snapshots[0].latest_quote().is_none(),
             "half a book is no book"
         );
-        assert_eq!(snapshots[0].reference_price(), Some(150.0));
+        assert_eq!(snapshots.snapshots[0].reference_price(), Some(150.0));
         mock.assert_async().await;
     }
 
@@ -3000,6 +3044,6 @@ mod tests {
     async fn test_empty_symbol_list_makes_no_request() {
         let server = mockito::Server::new_async().await;
         let snapshots = client(server.url()).fetch_snapshots(&[]).await.unwrap();
-        assert!(snapshots.is_empty());
+        assert!(snapshots.snapshots.is_empty());
     }
 }
