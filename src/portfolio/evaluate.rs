@@ -21,8 +21,8 @@ use crate::common::types::{EquityPrediction, Ticker};
 use crate::data::calendar::{SessionDate, TradingCalendar};
 use crate::data::details::{self, DetailsError};
 use crate::data::session_log::{
-    CandidateReading, EvaluationPass, LiquidationRun, Observation, OpenPairReading, PriceReading,
-    SessionLog,
+    CandidateReading, EvaluationPass, ExcludedTickerReading, LiquidationRun, Observation,
+    OpenPairReading, PositionCloseRequested, PriceReading, ScreenInputReading, SessionLog,
 };
 use crate::data::universe::Universe;
 use crate::models::tide::predict;
@@ -275,6 +275,8 @@ pub async fn run_pass(
     let screened = build_screen_inputs(context, &held, &mut prices).await?;
     observation.predictions_available = screened.predictions_available;
     observation.eligible_tickers = screened.inputs.len();
+    observation.screen_inputs = screened.readings.clone();
+    observation.excluded = screened.excluded.clone();
 
     let candidates = screen::score_candidates(&screened.inputs);
     summary.candidates_screened = candidates.len();
@@ -447,6 +449,28 @@ pub async fn run_liquidation(
 ) -> Result<LiquidationSummary, EvaluationError> {
     let correlation_id = uuid::Uuid::new_v4();
     let outcomes = client.close_all_positions().await?;
+
+    // One record per position, not just the totals. The bulk close is the only path that touches
+    // positions the application does not know about — a leg from a pass that died before recording
+    // its pair — and a count cannot name those.
+    for outcome in &outcomes {
+        session_log
+            .record(
+                correlation_id,
+                now,
+                Observation::PositionCloseRequested(PositionCloseRequested {
+                    ticker: outcome.ticker().to_string(),
+                    pair_id: None,
+                    alpaca_order_id: outcome.alpaca_order_id().map(str::to_string),
+                    side: None,
+                    quantity: outcome.quantity(),
+                    reason: "liquidation".to_string(),
+                    accepted: outcome.succeeded(),
+                    status: Some(outcome.status()),
+                }),
+            )
+            .await;
+    }
     let refused: HashSet<Ticker> = outcomes
         .iter()
         .filter(|outcome| !outcome.succeeded())
@@ -671,21 +695,27 @@ async fn close_what_should_close(
         // here would abort the loop, so a single broker error on the first pair would leave every
         // later pair open for another five minutes — turning one stuck position into all of them.
         // The pair stays open in the record, which is the honest state, and the next pass retries.
-        let outcome =
-            match execute::close_pair(execution, pair.long_ticker(), pair.short_ticker()).await {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    error!(
-                        pair_id = %pair.pair_id(),
-                        %error,
-                        "Closing a pair failed; it stays open and the next pass retries"
-                    );
-                    summary.exits_failed.push(pair.pair_id().to_string());
-                    reading.decision = "close_failed".to_string();
-                    observation.open_pairs.push(reading);
-                    continue;
-                }
-            };
+        let outcome = match execute::close_pair(
+            execution,
+            pair.pair_id().as_str(),
+            pair.long_ticker(),
+            pair.short_ticker(),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                error!(
+                    pair_id = %pair.pair_id(),
+                    %error,
+                    "Closing a pair failed; it stays open and the next pass retries"
+                );
+                summary.exits_failed.push(pair.pair_id().to_string());
+                reading.decision = "close_failed".to_string();
+                observation.open_pairs.push(reading);
+                continue;
+            }
+        };
         if outcome.was_already_gone() {
             reason = CloseReason::PositionMissing;
         }
@@ -738,6 +768,10 @@ async fn previous_session_equity(
 /// The screen's inputs, and the model run they came from.
 struct ScreenedUniverse {
     inputs: Vec<ScreenInput>,
+    /// The same inputs as session-log rows: what the model offered, as the screen received it.
+    readings: Vec<ScreenInputReading>,
+    /// Every forecast the funnel removed, with the first test it failed.
+    excluded: Vec<ExcludedTickerReading>,
     model_run_id: Option<String>,
     /// Forecasts the session had before any eligibility test, for the session log. The gap between
     /// this and `inputs.len()` is how much the filters removed.
@@ -759,6 +793,8 @@ async fn build_screen_inputs(
         info!("No predictions for the current session; no entries will be screened");
         return Ok(ScreenedUniverse {
             inputs: Vec::new(),
+            readings: Vec::new(),
+            excluded: Vec::new(),
             model_run_id: None,
             predictions_available: 0,
             sectors: HashMap::new(),
@@ -784,16 +820,32 @@ async fn build_screen_inputs(
     // cannot be measured is the conservative side of that trade; `select_disjoint` still tolerates
     // an unknown sector on a *held* leg, because a position already on the book cannot be
     // retroactively declined.
-    let eligible: Vec<&EquityPrediction> = predictions
-        .iter()
-        .filter(|prediction| {
-            let ticker = prediction.ticker();
-            !held.contains(ticker)
-                && sectors.contains_key(ticker)
-                && context.close_history.contains_key(ticker)
-                && context.universe.contains(ticker)
-        })
-        .collect();
+    // Partitioned rather than filtered, so the tickers that fall out are as recorded as the ones
+    // that stay. The first failing test is the one reported: the order below is the order the
+    // filter applies them in, and a ticker failing two is not two facts.
+    let mut eligible: Vec<&EquityPrediction> = Vec::new();
+    let mut excluded: Vec<ExcludedTickerReading> = Vec::new();
+    for prediction in &predictions {
+        let ticker = prediction.ticker();
+        let reason = if held.contains(ticker) {
+            Some("already_held")
+        } else if !sectors.contains_key(ticker) {
+            Some("no_sector")
+        } else if !context.close_history.contains_key(ticker) {
+            Some("no_close_history")
+        } else if !context.universe.contains(ticker) {
+            Some("outside_universe")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => excluded.push(ExcludedTickerReading {
+                ticker: ticker.to_string(),
+                reason: reason.to_string(),
+            }),
+            None => eligible.push(prediction),
+        }
+    }
 
     let missing: Vec<String> = eligible
         .iter()
@@ -802,20 +854,43 @@ async fn build_screen_inputs(
         .collect();
     prices.extend(fetch_prices(context.market_data, &missing).await?);
 
-    let inputs: Vec<ScreenInput> = eligible
-        .iter()
-        .filter_map(|prediction| {
-            let ticker = prediction.ticker();
-            ScreenInput::new(
-                ticker.clone(),
-                context.close_history.get(ticker)?.clone(),
-                prices.get(ticker)?.price,
-                prediction.expected_return(),
-                prediction.confidence(),
-                context.universe.is_shortable(ticker),
-            )
-        })
-        .collect();
+    let mut inputs: Vec<ScreenInput> = Vec::with_capacity(eligible.len());
+    let mut readings: Vec<ScreenInputReading> = Vec::with_capacity(eligible.len());
+    for prediction in &eligible {
+        let ticker = prediction.ticker();
+        // Eligible and still unpriceable: Alpaca returned no usable quote or trade for it this
+        // pass. That is a fifth way out of the funnel and it belongs with the other four.
+        let (Some(window), Some(reference)) =
+            (context.close_history.get(ticker), prices.get(ticker))
+        else {
+            excluded.push(ExcludedTickerReading {
+                ticker: ticker.to_string(),
+                reason: "unpriced".to_string(),
+            });
+            continue;
+        };
+        let Some(input) = ScreenInput::new(
+            ticker.clone(),
+            window.clone(),
+            reference.price,
+            prediction.expected_return(),
+            prediction.confidence(),
+            context.universe.is_shortable(ticker),
+        ) else {
+            excluded.push(ExcludedTickerReading {
+                ticker: ticker.to_string(),
+                reason: "unusable_input".to_string(),
+            });
+            continue;
+        };
+        readings.push(ScreenInputReading {
+            ticker: ticker.to_string(),
+            expected_return: prediction.expected_return(),
+            confidence: prediction.confidence(),
+            is_shortable: context.universe.is_shortable(ticker),
+        });
+        inputs.push(input);
+    }
 
     info!(
         predictions = predictions.len(),
@@ -826,6 +901,8 @@ async fn build_screen_inputs(
     );
     Ok(ScreenedUniverse {
         inputs,
+        readings,
+        excluded,
         model_run_id,
         predictions_available: predictions.len(),
         sectors,

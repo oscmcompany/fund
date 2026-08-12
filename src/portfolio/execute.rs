@@ -14,9 +14,11 @@ use rust_decimal::prelude::ToPrimitive;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::common::alpaca::{ClientError, OrderIntent, OrderState, TradingClient};
+use crate::common::alpaca::{ClientError, OrderIntent, OrderState, PositionClose, TradingClient};
 use crate::common::types::Ticker;
-use crate::data::session_log::{Observation, OrderResolved, OrderSubmitted, SessionLog};
+use crate::data::session_log::{
+    Observation, OrderResolved, OrderSubmitted, PositionCloseRequested, SessionLog,
+};
 use crate::portfolio::pairs::PairEntry;
 use crate::portfolio::size::SizedPair;
 
@@ -210,7 +212,16 @@ pub async fn open_pair(
             // for it — `PairEntry` is not built until below. Name the held symbol and its size
             // before propagating, because the error carries only the broker's message and the
             // warning above names the leg that *failed*, not the one still on the book.
-            if let Err(error) = context.client.close_position(&short_ticker).await {
+            let unwind = context.client.close_position(&short_ticker).await;
+            record_close(
+                context,
+                &short_ticker,
+                Some(candidate.pair_id().as_str()),
+                "entry_unwind",
+                &unwind,
+            )
+            .await;
+            if let Err(error) = unwind {
                 error!(
                     pair_id = %candidate.pair_id(),
                     held_ticker = %short_ticker,
@@ -256,11 +267,18 @@ pub async fn open_pair(
 /// situation where it is most likely still held. The error is reported after both attempts.
 pub async fn close_pair(
     context: &ExecutionContext<'_>,
+    pair_id: &str,
     long_ticker: &Ticker,
     short_ticker: &Ticker,
 ) -> Result<CloseOutcome, ExecutionError> {
     let long_result = context.client.close_position(long_ticker).await;
     let short_result = context.client.close_position(short_ticker).await;
+
+    // Recorded before the errors are propagated. A leg whose close failed is exactly the one worth
+    // having a record of, and `?` below returns without reaching any later write.
+    for (ticker, result) in [(long_ticker, &long_result), (short_ticker, &short_result)] {
+        record_close(context, ticker, Some(pair_id), "pair_exit", result).await;
+    }
 
     if let Err(error) = &long_result {
         warn!(ticker = %long_ticker, %error, "Closing the long leg failed");
@@ -269,8 +287,8 @@ pub async fn close_pair(
         warn!(ticker = %short_ticker, %error, "Closing the short leg failed");
     }
 
-    let long_closed = long_result?;
-    let short_closed = short_result?;
+    let long_closed = long_result?.is_some();
+    let short_closed = short_result?.is_some();
 
     if long_closed != short_closed {
         warn!(
@@ -285,6 +303,39 @@ pub async fn close_pair(
         long_closed,
         short_closed,
     })
+}
+
+/// Records one close attempt, whatever came of it.
+///
+/// Takes the `Result` rather than a success value so a refused close is as visible as an accepted
+/// one: a leg the broker would not let go of is the state the book is wrong about.
+async fn record_close(
+    context: &ExecutionContext<'_>,
+    ticker: &Ticker,
+    pair_id: Option<&str>,
+    reason: &str,
+    result: &Result<Option<PositionClose>, ClientError>,
+) {
+    let close = result.as_ref().ok().and_then(Option::as_ref);
+    context
+        .session_log
+        .record(
+            context.correlation_id,
+            Utc::now(),
+            Observation::PositionCloseRequested(PositionCloseRequested {
+                ticker: ticker.to_string(),
+                pair_id: pair_id.map(str::to_string),
+                alpaca_order_id: close
+                    .and_then(|close| close.alpaca_order_id())
+                    .map(str::to_string),
+                side: close.and_then(|close| close.side()).map(str::to_string),
+                quantity: close.and_then(PositionClose::quantity),
+                reason: reason.to_string(),
+                accepted: close.is_some(),
+                status: None,
+            }),
+        )
+        .await;
 }
 
 /// Whether a submitted order reached a fill.
@@ -388,7 +439,9 @@ async fn submit_and_confirm(
                         filled_shares,
                         "Order terminated after a partial fill; closing the remainder"
                     );
-                    context.client.close_position(intent.ticker()).await?;
+                    let cleanup = context.client.close_position(intent.ticker()).await;
+                    record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
+                    cleanup?;
                 }
                 return Ok(Filled::No(status));
             }
@@ -420,7 +473,9 @@ async fn submit_and_confirm(
                         }));
                     }
                     resolved!("timed_out".to_string(), None, None, false);
-                    context.client.close_position(intent.ticker()).await?;
+                    let cleanup = context.client.close_position(intent.ticker()).await;
+                    record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
+                    cleanup?;
                     return Ok(Filled::No("timed_out".to_string()));
                 }
                 tokio::time::sleep(context.settings.poll_interval).await;
@@ -456,6 +511,26 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("fund-execute-{name}"));
         let _ = std::fs::remove_dir_all(&directory);
         SessionLog::new(directory).expect("the log directory must be creatable")
+    }
+
+    /// Every record a log holds, in the order it was written.
+    fn recorded(log: &SessionLog) -> Vec<serde_json::Value> {
+        let mut files: Vec<_> = std::fs::read_dir(log.directory())
+            .expect("the log directory must be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .flat_map(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
     }
 
     fn context<'a>(client: &'a TradingClient, log: &'a SessionLog) -> ExecutionContext<'a> {
@@ -722,9 +797,14 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = session_log("close-both-legs");
-        let outcome = close_pair(&context(&client, &log), &ticker("AAAA"), &ticker("BBBB"))
-            .await
-            .expect("the close must succeed");
+        let outcome = close_pair(
+            &context(&client, &log),
+            "AAAA-BBBB",
+            &ticker("AAAA"),
+            &ticker("BBBB"),
+        )
+        .await
+        .expect("the close must succeed");
 
         assert!(!outcome.long_closed());
         assert!(outcome.short_closed());
@@ -756,12 +836,71 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = session_log("close-long-errors");
-        let result = close_pair(&context(&client, &log), &ticker("AAAA"), &ticker("BBBB")).await;
+        let result = close_pair(
+            &context(&client, &log),
+            "AAAA-BBBB",
+            &ticker("AAAA"),
+            &ticker("BBBB"),
+        )
+        .await;
 
         assert!(result.is_err(), "the broker failure must still be reported");
         long.assert_async().await;
         // The assertion that matters: the short close was attempted despite the long leg failing.
         short.assert_async().await;
+    }
+
+    /// Both legs of every exit are recorded, including the leg that had nothing to close.
+    ///
+    /// Exits were invisible for as long as entries were logged and closes were not, which made
+    /// realized profit and loss attributable in one direction only. A close that found no position
+    /// is recorded too: `accepted: false` with no order is a different fact from a filled exit.
+    #[tokio::test]
+    async fn test_closing_a_pair_records_both_legs() {
+        let mut server = mockito::Server::new_async().await;
+        let _long = server
+            .mock("DELETE", "/v2/positions/AAAA?percentage=100")
+            .with_status(200)
+            .with_body(r#"{"id":"close-1","qty":"50","side":"sell"}"#)
+            .create_async()
+            .await;
+        let _short = server
+            .mock("DELETE", "/v2/positions/BBBB?percentage=100")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let log = session_log("records-both-legs");
+        close_pair(
+            &context(&client, &log),
+            "AAAA-BBBB",
+            &ticker("AAAA"),
+            &ticker("BBBB"),
+        )
+        .await
+        .expect("the close must succeed");
+
+        let records = recorded(&log);
+        assert_eq!(records.len(), 2, "one record per leg");
+        assert!(records
+            .iter()
+            .all(|record| record["event_type"] == "position_close_requested"
+                && record["payload"]["pair_id"] == "AAAA-BBBB"
+                && record["payload"]["reason"] == "pair_exit"));
+
+        let filled = &records[0];
+        assert_eq!(filled["payload"]["ticker"], "AAAA");
+        assert_eq!(filled["payload"]["accepted"], true);
+        // The order identifier is the join to the fill: a close is not polled, so the price
+        // arrives later through the post-close activity sync.
+        assert_eq!(filled["payload"]["alpaca_order_id"], "close-1");
+        assert_eq!(filled["payload"]["quantity"], 50.0);
+
+        let missing = &records[1];
+        assert_eq!(missing["payload"]["ticker"], "BBBB");
+        assert_eq!(missing["payload"]["accepted"], false);
+        assert!(missing["payload"]["alpaca_order_id"].is_null());
     }
 
     #[tokio::test]
@@ -780,9 +919,14 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let log = session_log("already-gone");
-        let outcome = close_pair(&context(&client, &log), &ticker("AAAA"), &ticker("BBBB"))
-            .await
-            .unwrap();
+        let outcome = close_pair(
+            &context(&client, &log),
+            "AAAA-BBBB",
+            &ticker("AAAA"),
+            &ticker("BBBB"),
+        )
+        .await
+        .unwrap();
         assert!(outcome.was_already_gone());
     }
 }

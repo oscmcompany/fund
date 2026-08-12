@@ -841,6 +841,38 @@ impl AccountActivity {
     }
 }
 
+/// The order raised to close one position.
+///
+/// The price is deliberately absent: a close is submitted and not polled to a terminal state, so
+/// there is no fill to report yet. `alpaca_order_id` is what joins this to the fill when the
+/// post-close activity sync lands it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionClose {
+    ticker: Ticker,
+    /// Absent when Alpaca accepted the close but returned a body this client could not read.
+    alpaca_order_id: Option<String>,
+    side: Option<String>,
+    quantity: Option<f64>,
+}
+
+impl PositionClose {
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+
+    pub fn side(&self) -> Option<&str> {
+        self.side.as_deref()
+    }
+
+    pub fn quantity(&self) -> Option<f64> {
+        self.quantity
+    }
+}
+
 /// The result of asking Alpaca to close one position during a bulk liquidation.
 ///
 /// Alpaca answers a bulk close with `207 Multi-Status` and a per-symbol status, so a single
@@ -850,11 +882,34 @@ impl AccountActivity {
 pub struct LiquidationOutcome {
     ticker: Ticker,
     status: u16,
+    /// The order Alpaca raised, absent when it refused the close.
+    alpaca_order_id: Option<String>,
+    quantity: Option<f64>,
 }
 
 impl LiquidationOutcome {
     pub fn new(ticker: Ticker, status: u16) -> Self {
-        Self { ticker, status }
+        Self {
+            ticker,
+            status,
+            alpaca_order_id: None,
+            quantity: None,
+        }
+    }
+
+    /// The outcome together with the order that carried it out.
+    pub fn with_order(
+        ticker: Ticker,
+        status: u16,
+        alpaca_order_id: Option<String>,
+        quantity: Option<f64>,
+    ) -> Self {
+        Self {
+            ticker,
+            status,
+            alpaca_order_id,
+            quantity,
+        }
     }
 
     pub fn ticker(&self) -> &Ticker {
@@ -863,6 +918,14 @@ impl LiquidationOutcome {
 
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+
+    pub fn quantity(&self) -> Option<f64> {
+        self.quantity
     }
 
     /// Whether Alpaca accepted the close for this symbol.
@@ -1008,7 +1071,16 @@ impl TradingClient {
     /// Returns `false` when there was no position to close (`404`). That is the expected answer
     /// when a pair is being closed for the second time — after a retry, or after Alpaca liquidated
     /// the leg itself — and treating it as an error would turn a no-op into an incident.
-    pub async fn close_position(&self, ticker: &Ticker) -> Result<bool, ClientError> {
+    /// Closes one position, returning the order Alpaca raised to do it.
+    ///
+    /// `None` means there was no position, which is the expected answer on a retry or after Alpaca
+    /// liquidated the leg itself. The order identifier is surfaced rather than discarded because it
+    /// is the only handle joining an exit to the fill that settles it: the close is not polled to a
+    /// terminal state, so the price arrives later through `account_activities`.
+    pub async fn close_position(
+        &self,
+        ticker: &Ticker,
+    ) -> Result<Option<PositionClose>, ClientError> {
         let url = format!("{}/v2/positions/{}", self.base_url, ticker.as_str());
         let response = self
             .delete(&url)
@@ -1018,11 +1090,29 @@ impl TradingClient {
 
         if response.status().as_u16() == 404 {
             info!(ticker = %ticker, "No position to close");
-            return Ok(false);
+            return Ok(None);
         }
-        error_for_status(response).await?;
-        info!(ticker = %ticker, "Position close submitted");
-        Ok(true)
+        let response = error_for_status(response).await?;
+
+        // A body that will not parse is not a failed close: Alpaca accepted it, and refusing here
+        // would make the caller unwind a position that is already on its way out. The identifier is
+        // lost and the close is not.
+        let order: Option<ClosedPositionOrder> = response.json().await.ok();
+        let alpaca_order_id = order.as_ref().and_then(|order| order.id.clone());
+        info!(
+            ticker = %ticker,
+            order_id = alpaca_order_id.as_deref().unwrap_or("unknown"),
+            "Position close submitted"
+        );
+        Ok(Some(PositionClose {
+            ticker: ticker.clone(),
+            alpaca_order_id,
+            side: order.as_ref().and_then(|order| order.side.clone()),
+            quantity: order
+                .as_ref()
+                .and_then(|order| order.qty.as_ref())
+                .and_then(|quantity| quantity.parse().ok()),
+        }))
     }
 
     /// Closes every open position and cancels every open order.
@@ -1057,7 +1147,16 @@ impl TradingClient {
             if !(200..300).contains(&payload.status) {
                 warn!(ticker = %ticker, status = payload.status, "Alpaca refused to close a position");
             }
-            outcomes.push(LiquidationOutcome::new(ticker, payload.status));
+            outcomes.push(LiquidationOutcome::with_order(
+                ticker,
+                payload.status,
+                payload.body.as_ref().and_then(|order| order.id.clone()),
+                payload
+                    .body
+                    .as_ref()
+                    .and_then(|order| order.qty.as_ref())
+                    .and_then(|quantity| quantity.parse().ok()),
+            ));
         }
 
         info!(
@@ -1372,6 +1471,23 @@ struct PositionResponse {
 struct ClosePositionResponse {
     symbol: String,
     status: u16,
+    /// The order Alpaca raised, present when it accepted the close.
+    body: Option<ClosedPositionOrder>,
+}
+
+/// The order returned by a position close, single or bulk.
+///
+/// Only the identity and the size: a close is submitted and not polled, so `filled_avg_price` is
+/// still null here and the fill arrives later through `account_activities`.
+///
+/// Every field is optional, `id` included. A bulk close answers per symbol, and a symbol Alpaca
+/// refused carries an error object in the same position an order would occupy — so requiring `id`
+/// would make one refused leg fail the parse for the whole liquidation.
+#[derive(Deserialize)]
+struct ClosedPositionOrder {
+    id: Option<String>,
+    qty: Option<String>,
+    side: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2490,10 +2606,11 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        assert!(!client
+        assert!(client
             .close_position(&ticker("AAPL"))
             .await
-            .expect("a missing position is not an error"));
+            .expect("a missing position is not an error")
+            .is_none());
         mock.assert_async().await;
     }
 

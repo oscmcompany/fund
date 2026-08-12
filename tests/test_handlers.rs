@@ -300,6 +300,26 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         "a price without its source cannot be compared across passes"
     );
 
+    // What the model offered the screen, as rows rather than a count. `expected_return` and
+    // `confidence` are derived from the stored quantiles, so `equity_predictions` alone cannot
+    // reconstruct what the screen actually consumed.
+    let screen_inputs = pass["payload"]["screen_inputs"]
+        .as_array()
+        .expect("screen inputs are recorded");
+    assert_eq!(screen_inputs.len(), 2, "both forecasts reached the screen");
+    assert!(screen_inputs
+        .iter()
+        .all(|input| input["expected_return"].is_number()
+            && input["confidence"].is_number()
+            && input["is_shortable"].is_boolean()));
+    assert!(
+        pass["payload"]["excluded"]
+            .as_array()
+            .expect("the funnel is recorded")
+            .is_empty(),
+        "nothing was filtered out in this fixture"
+    );
+
     let submitted = of_type(&records, "order_submitted");
     let resolved = of_type(&records, "order_resolved");
     assert_eq!(submitted.len(), 2, "one submission per leg");
@@ -540,6 +560,38 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     // distinguishes that from a gate refusal, which an empty `pairs_opened` alone cannot.
     assert_eq!(summary.entries_blocked, None);
     assert_eq!(summary.candidates_screened, 0);
+
+    // The exit half is recorded to the same standard as the entry half. Both legs of the pair that
+    // closed, each carrying the order that will settle it — without these, realized profit and loss
+    // is attributable in one direction only.
+    let records = recorded(&session_log);
+    let closes = of_type(&records, "position_close_requested");
+    assert_eq!(closes.len(), 2, "one record per leg of the closed pair");
+    for record in &closes {
+        assert_eq!(record["payload"]["pair_id"], "AAAA-BBBB");
+        assert_eq!(record["payload"]["reason"], "pair_exit");
+        assert_eq!(record["payload"]["accepted"], true);
+    }
+
+    // And the pass that measured every open pair says so, whether or not the pair closed.
+    let pass = of_type(&records, "evaluation_pass");
+    let measured = pass[0]["payload"]["open_pairs"]
+        .as_array()
+        .expect("open pairs are recorded");
+    assert_eq!(
+        measured.len(),
+        4,
+        "every open pair is measured, not just the one that closed"
+    );
+    let closed = measured
+        .iter()
+        .find(|reading| reading["pair_id"] == "AAAA-BBBB")
+        .expect("the converged pair is among them");
+    assert_eq!(closed["decision"], "convergence");
+    assert!(
+        closed["z_score"].is_number() && closed["spread_mean"].is_number(),
+        "the inputs that produced the exit decision are recorded with it"
+    );
 }
 
 /// A pair with no price this pass is held, not closed and not crashed. The pre-close liquidation

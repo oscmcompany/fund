@@ -73,6 +73,8 @@ pub enum Observation {
     OrderSubmitted(OrderSubmitted),
     /// How the broker settled that order, filled or not.
     OrderResolved(OrderResolved),
+    /// A position the application asked Alpaca to close.
+    PositionCloseRequested(PositionCloseRequested),
     /// The pre-close flattening.
     LiquidationRun(LiquidationRun),
     /// The pre-open inference run and the artifact it resolved.
@@ -88,6 +90,7 @@ impl Observation {
             Observation::EvaluationPass(_) => "evaluation_pass",
             Observation::OrderSubmitted(_) => "order_submitted",
             Observation::OrderResolved(_) => "order_resolved",
+            Observation::PositionCloseRequested(_) => "position_close_requested",
             Observation::LiquidationRun(_) => "liquidation_run",
             Observation::PredictionsGenerated(_) => "predictions_generated",
             Observation::AccountObserved(_) => "account_observed",
@@ -123,7 +126,36 @@ pub struct EvaluationPass {
     pub session_block: Option<String>,
     pub prices: Vec<PriceReading>,
     pub open_pairs: Vec<OpenPairReading>,
+    /// Every forecast that reached the screen, as the screen received it.
+    pub screen_inputs: Vec<ScreenInputReading>,
+    /// Every forecast that did not, and the first test it failed.
+    pub excluded: Vec<ExcludedTickerReading>,
     pub candidates: Vec<CandidateReading>,
+}
+
+/// One forecast as the screen consumed it.
+///
+/// `expected_return` and `confidence` are derived from the stored quantiles and `is_shortable` from
+/// the session's universe, so neither is recoverable from `equity_predictions` alone — this is the
+/// only record of what the model actually offered the screen.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ScreenInputReading {
+    pub ticker: String,
+    pub expected_return: f64,
+    pub confidence: f64,
+    pub is_shortable: bool,
+}
+
+/// One forecast the eligibility filter removed, and why.
+///
+/// Written every pass rather than once a session. The tests are nearly static within a day, so most
+/// of this repeats — but `held` is not static, and a rule that says "record the funnel every pass"
+/// has no edge case where the one pass that mattered was the one that skipped it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExcludedTickerReading {
+    pub ticker: String,
+    /// `already_held`, `no_sector`, `no_close_history`, `outside_universe`, or `unpriced`.
+    pub reason: String,
 }
 
 /// One symbol's reference price, and which snapshot field it came from.
@@ -208,6 +240,31 @@ pub struct OrderResolved {
     pub filled_average_price: Option<f64>,
     /// True when the fill was read after a cancel raced it.
     pub filled_after_cancel: bool,
+}
+
+/// One position the application asked Alpaca to close.
+///
+/// **Not symmetrical with [`OrderSubmitted`], and deliberately.** An entry is polled to a terminal
+/// state because the pass cannot proceed without knowing whether the leg filled; an exit is
+/// submitted and left, because blocking on a fill would delay every other exit behind it. So there
+/// is no resolution record and no fill price here — `alpaca_order_id` is the join to the fill when
+/// the post-close activity sync lands it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionCloseRequested {
+    pub ticker: String,
+    /// The pair this leg belonged to, absent when the account is flattened without consulting them.
+    pub pair_id: Option<String>,
+    /// Absent when there was no position, or when Alpaca accepted the close and returned a body
+    /// this client could not read.
+    pub alpaca_order_id: Option<String>,
+    pub side: Option<String>,
+    pub quantity: Option<f64>,
+    /// `pair_exit`, `entry_unwind`, or `liquidation`.
+    pub reason: String,
+    /// False when Alpaca refused the close, or when there was no position to close.
+    pub accepted: bool,
+    /// Alpaca's per-symbol status, on the bulk path that reports one.
+    pub status: Option<u16>,
 }
 
 /// The pre-close flattening.
