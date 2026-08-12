@@ -2745,6 +2745,10 @@ mod tests {
 
         assert_eq!(activities.activities.len(), ACTIVITIES_PAGE_SIZE + 1);
         assert_eq!(activities.activities.last().unwrap().id(), "activity-tail");
+        assert!(
+            !activities.truncated,
+            "this fetch finished inside the page bound"
+        );
         first.assert_async().await;
         second.assert_async().await;
     }
@@ -2823,6 +2827,10 @@ mod tests {
 
         assert_eq!(activities.activities.len(), 1);
         assert_eq!(activities.activities[0].id(), "dated");
+        assert_eq!(
+            activities.undated, 1,
+            "the dropped record is counted, not silently absent"
+        );
         mock.assert_async().await;
     }
 

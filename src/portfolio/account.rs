@@ -122,6 +122,14 @@ pub async fn sync_account(
         activities.extend(fetched.activities);
     }
     let activities_stored = store_activities(pool, &activities).await?;
+    if activities_truncated || activities_undated > 0 {
+        warn!(
+            activities_truncated,
+            activities_undated,
+            %session_date,
+            "Alpaca activities are incomplete for this session"
+        );
+    }
 
     // Our own record of every activity, not just the ones the attribution used. Alpaca's retention
     // bounds how long these can be re-fetched, and `net_amount` — the only field saying how much a

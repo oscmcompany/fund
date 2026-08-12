@@ -191,15 +191,14 @@ impl Drop for CommandGuard<'_> {
 
 /// Dispatches one command, emitting its terminal event either way.
 ///
-/// A command already in flight is dropped with no *event*: the request it came from will be
-/// answered by the run that is already going, and emitting a second terminal outcome would make the
-/// recovery scan's "requested with no terminal outcome" test wrong. It is still recorded, because a
-/// drop and a crash are otherwise the same absence.
+/// A command already in flight is dropped with no *event*: the run already going will answer the
+/// request, and a second terminal outcome would make the recovery scan's "requested with no
+/// terminal outcome" test wrong. It is still recorded, because a drop and a crash are otherwise the
+/// same absence.
 pub async fn handle(state: &ServiceState, command: Command) {
     // Minted here rather than inside each handler, so the command's own record and everything it
     // did carry one identifier. That is what turns a duration into "where the time went".
     let correlation_id = Uuid::new_v4();
-    let now = Utc::now();
 
     let Some(_guard) = state.claim(command) else {
         warn!(
@@ -209,7 +208,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
         record_command(
             state,
             correlation_id,
-            now,
+            Utc::now(),
             CommandFinished {
                 command: command.as_str().to_string(),
                 outcome: "dropped_in_flight".to_string(),
@@ -241,7 +240,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
             record_command(
                 state,
                 correlation_id,
-                now,
+                Utc::now(),
                 CommandFinished {
                     command: command.as_str().to_string(),
                     outcome: completion_outcome(&summary),
@@ -265,7 +264,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
             record_command(
                 state,
                 correlation_id,
-                now,
+                Utc::now(),
                 CommandFinished {
                     command: command.as_str().to_string(),
                     outcome: "errored".to_string(),

@@ -140,10 +140,18 @@ SELECT
     correlation_id,
     event_type,
     session_date,
-    -- Stored as epoch milliseconds so the Parquet column is a plain integer; recovered here, since
-    -- every question worth asking of this table is ordered in time.
-    epoch_ms(created_at) AS created_at,
-    payload
+    -- Stored as epoch milliseconds so the Parquet column is a plain integer. to_timestamp, not
+    -- epoch_ms: the first returns a TIMESTAMPTZ anchored to UTC, the second a bare TIMESTAMP that
+    -- reads as whatever zone the session happens to be in. An instant is always UTC here, and
+    -- session_date beside it is always the Eastern trading day.
+    to_timestamp(created_at / 1000.0) AS created_at,
+    payload,
+    -- From the key layout rather than the file contents, so a filter on them skips whole files.
+    -- session_date is inside each Parquet, so filtering on that alone opens every one, and the
+    -- archive grows by a file per trading day forever.
+    year,
+    month,
+    day
 FROM read_parquet(
     's3://' || getvariable('bucket') || '/exports/session_log/**/*.parquet',
     hive_partitioning = true

@@ -249,6 +249,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
 
     let running = CancellationToken::new();
     let session_log = session_log("test-a-pass-opens-a-pair-and-records-it");
+    let dispatched_correlation_id = uuid::Uuid::new_v4();
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -259,7 +260,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
-        correlation_id: uuid::Uuid::new_v4(),
+        correlation_id: dispatched_correlation_id,
         shutdown: &running,
         now: session_instant(),
     };
@@ -295,6 +296,11 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let correlation_id = pass["correlation_id"]
         .as_str()
         .expect("a pass is correlated");
+    assert_eq!(
+        correlation_id,
+        dispatched_correlation_id.to_string(),
+        "the pass records the identifier the dispatcher supplied, not one of its own"
+    );
     assert!(
         pass["payload"]["failure"].is_null(),
         "a pass that completed records no failure"
@@ -1089,8 +1095,8 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     assert!(
         observed
             .iter()
-            .any(|record| record["payload"]["order_id"].is_string()),
-        "a fill joins back to the order that produced it"
+            .all(|record| record["payload"]["order_id"].is_string()),
+        "every fill joins back to the order that produced it"
     );
 
     // The attribution is the one derived value the log keeps, recorded beside the pair it landed

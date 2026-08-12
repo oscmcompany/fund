@@ -423,7 +423,7 @@ impl SessionLogExportSummary {
 ///
 /// Every file present is exported, not just the retention window: one whole file at a deterministic
 /// key makes a repeat a byte-identical overwrite, so a failed run repairs itself. Local files are
-/// deleted only after a clean run.
+/// deleted only after a clean run that skipped nothing.
 pub async fn export_session_logs(
     log: &SessionLog,
     s3_client: &S3Client,
@@ -441,13 +441,24 @@ pub async fn export_session_logs(
     };
     sessions.sort();
 
-    // Held across the reads so no append can interleave with one. Today's file is sealed by the
-    // clock rather than by anything structural, and a recovery replay can run a pass at any hour.
-    let sealed = log.seal().await;
+    // The seal covers the reads and nothing else. Holding it across the uploads would leave a
+    // concurrent `record` waiting on S3, and a log write that blocks on the network is the one
+    // thing this module promises never to be.
+    let frames = {
+        let _sealed = log.seal().await;
+        sessions
+            .iter()
+            .map(|session_date| {
+                (
+                    *session_date,
+                    read_session_frame(&log.directory().join(file_name(*session_date))),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
 
-    for session_date in &sessions {
-        let path = log.directory().join(file_name(*session_date));
-        match read_session_frame(&path) {
+    for (session_date, frame) in frames {
+        match frame {
             Ok((mut frame, unparsable)) => {
                 summary.unparsable_lines += unparsable;
                 let key = date_partitioned_key(SESSION_LOG_PREFIX, session_date.date());
@@ -460,10 +471,16 @@ pub async fn export_session_logs(
         }
     }
 
-    drop(sealed);
-
-    if summary.is_clean() {
+    // A skipped line is in the original and not in the Parquet, so the original is the only copy of
+    // it. Keeping the file costs a few kilobytes until someone looks; deleting it makes a record
+    // that was merely unreadable permanently gone.
+    if summary.is_clean() && summary.unparsable_lines == 0 {
         summary.deleted = delete_aged_out(log.directory(), &sessions, today);
+    } else if summary.unparsable_lines > 0 {
+        warn!(
+            unparsable_lines = summary.unparsable_lines,
+            "Session logs held back from deletion: their originals hold lines the Parquet does not"
+        );
     }
 
     info!(
@@ -554,26 +571,39 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
         };
         let text = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
 
-        // A record missing any of its envelope is discarded rather than written with nulls, so a
-        // query cannot mistake an unaddressable row for a good one.
-        let (Some(event_id), Some(event_type), Some(created_at)) = (
+        // Every envelope column or none of the row. All six carry a query: correlation_id is the
+        // join, session_date the partition filter, schema_version the shape. A row admitted with
+        // any of them null is unreachable by the queries this archive exists to answer, and is
+        // indistinguishable from a good one until someone counts.
+        let (
+            Some(schema_version),
+            Some(event_id),
+            Some(correlation_id),
+            Some(event_type),
+            Some(session_date),
+            Some(created_at),
+        ) = (
+            record.get("schema_version").and_then(Value::as_i64),
             text("event_id"),
+            text("correlation_id"),
             text("event_type"),
+            text("session_date"),
             text("created_at").and_then(|stamp| {
                 DateTime::parse_from_rfc3339(&stamp)
                     .ok()
                     .map(|instant| instant.timestamp_millis())
             }),
-        ) else {
+        )
+        else {
             unparsable += 1;
             continue;
         };
 
-        schema_versions.push(record.get("schema_version").and_then(Value::as_i64));
+        schema_versions.push(Some(schema_version));
         event_ids.push(Some(event_id));
-        correlation_ids.push(text("correlation_id"));
+        correlation_ids.push(Some(correlation_id));
         event_types.push(Some(event_type));
-        session_dates.push(text("session_date"));
+        session_dates.push(Some(session_date));
         created_ats.push(Some(created_at));
         payloads.push(record.get("payload").map(Value::to_string));
     }
@@ -723,6 +753,7 @@ mod tests {
             unparsable, 2,
             "a missing event_id and an unparseable instant"
         );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -848,6 +879,48 @@ mod tests {
             .expect("one row");
         let parsed: Value = serde_json::from_str(payload).expect("the payload stays valid JSON");
         assert_eq!(parsed["equity"], 104_812.55);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A row missing any envelope column is unreachable by the queries the archive exists for: no
+    /// correlation join, no partition filter, no way to tell which shape it is. Admitting it with
+    /// nulls would make it indistinguishable from a good row until someone counted.
+    #[test]
+    fn test_a_record_missing_any_envelope_column_is_counted_unparsable() {
+        let directory = temporary_directory("envelope-columns");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("session-2026-08-11.jsonl");
+        let complete = serde_json::to_string(&Record::new(
+            Uuid::nil(),
+            instant("2026-08-11T20:15:00Z"),
+            account_observation(),
+        ))
+        .expect("the record must serialize");
+
+        // One line per envelope column, each complete but for that column.
+        let mut lines = vec![complete.clone()];
+        for column in [
+            "schema_version",
+            "event_id",
+            "correlation_id",
+            "event_type",
+            "session_date",
+            "created_at",
+        ] {
+            let mut record: serde_json::Map<String, Value> =
+                serde_json::from_str(&complete).expect("the record must parse");
+            record.remove(column);
+            lines.push(Value::Object(record).to_string());
+        }
+        std::fs::write(&path, lines.join("\n")).expect("the file must be writable");
+
+        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        assert_eq!(
+            frame.height(),
+            1,
+            "only the complete record reaches Parquet"
+        );
+        assert_eq!(unparsable, 6, "one per missing envelope column");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

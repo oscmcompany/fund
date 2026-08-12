@@ -685,6 +685,40 @@ async fn close_what_should_close(
     prices: &HashMap<Ticker, ReferencePrice>,
     summary: &mut EvaluationSummary,
 ) -> Result<HashSet<uuid::Uuid>, EvaluationError> {
+    let mut readings: Vec<OpenPairReading> = Vec::with_capacity(open_pairs.len());
+    let result = close_and_measure(
+        context,
+        execution,
+        open_pairs,
+        prices,
+        summary,
+        &mut readings,
+    )
+    .await;
+
+    context
+        .session_log
+        .record(
+            correlation_id,
+            context.now,
+            Observation::OpenPairsObserved(OpenPairsObserved { readings }),
+        )
+        .await;
+    result
+}
+
+/// The exit loop itself, free to propagate: [`close_what_should_close`] records either way.
+///
+/// Every path out of an iteration pushes its reading first, so a pair measured before the failure
+/// is as visible as one measured after it.
+async fn close_and_measure(
+    context: &EvaluationContext<'_>,
+    execution: &ExecutionContext<'_>,
+    open_pairs: &[OpenPair],
+    prices: &HashMap<Ticker, ReferencePrice>,
+    summary: &mut EvaluationSummary,
+    readings: &mut Vec<OpenPairReading>,
+) -> Result<HashSet<uuid::Uuid>, EvaluationError> {
     let models = screen::exit_models(
         open_pairs
             .iter()
@@ -693,7 +727,6 @@ async fn close_what_should_close(
     );
 
     let mut closed = HashSet::new();
-    let mut readings: Vec<OpenPairReading> = Vec::with_capacity(open_pairs.len());
     for pair in open_pairs {
         // Filled in as the pair is measured and pushed on every path out of the iteration, so a
         // pair that could not be priced is as visible in the log as one that closed.
@@ -820,11 +853,19 @@ async fn close_what_should_close(
         if outcome.was_already_gone() {
             reason = CloseReason::PositionMissing;
         }
-        let updated = pairs::record_close(context.pool, pair.id(), reason, context.now).await?;
+        let updated = match pairs::record_close(context.pool, pair.id(), reason, context.now).await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                reading.decision = "close_failed".to_string();
+                readings.push(reading);
+                return Err(error.into());
+            }
+        };
         context
             .session_log
             .record(
-                correlation_id,
+                execution.correlation_id,
                 context.now,
                 Observation::PairClosed(PairClosed {
                     pair_uuid: pair.id().to_string(),
@@ -843,15 +884,6 @@ async fn close_what_should_close(
             reason: reason.as_str().to_string(),
         });
     }
-
-    context
-        .session_log
-        .record(
-            correlation_id,
-            context.now,
-            Observation::OpenPairsObserved(OpenPairsObserved { readings }),
-        )
-        .await;
     Ok(closed)
 }
 

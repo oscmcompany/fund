@@ -1,7 +1,7 @@
 //! Append-only record of what the application observed before it acted.
 //!
-//! One JSONL file per session on local disk. This is the only original the application owns: every
-//! other store is a fold or a query over it. Sealing and shipping it is [`crate::data::export`]'s.
+//! One JSONL file per session on local disk, and the only original this application owns — every
+//! other store is a fold over it. Sealing and shipping it is [`crate::data::export`]'s.
 
 use std::path::{Path, PathBuf};
 
@@ -15,11 +15,8 @@ use crate::common::types::SessionDate;
 
 /// Version stamped on every record written by this build.
 ///
-/// Readers map old versions forward rather than rewriting files, so this only ever goes up. Nothing
-/// branches on it yet; it exists so that when something does, it can tell the shapes apart. Version
-/// 1 carried the pass's prices, screen inputs, exclusions, and open book inline on `evaluation_pass`
-/// and had no `command_finished`, `pair_opened`, `pair_closed`, `pair_attributed`, or
-/// `activity_observed` at all.
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
+/// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
 pub const SCHEMA_VERSION: u32 = 2;
 
 /// Anything that stops a record reaching the disk.
@@ -105,9 +102,9 @@ impl Observation {
 
 /// One scheduled command, however it ended.
 ///
-/// Written for every firing, including the ones that do no work: a holiday, a duplicate dropped
-/// while the previous run is still going, and a crashed process are otherwise the same absence.
-/// Sharing `correlation_id` with everything the command did is what makes the duration attributable.
+/// Written for every firing, including the ones that do no work: a holiday, a dropped duplicate,
+/// and a crashed process are otherwise the same absence. `correlation_id` is shared with everything
+/// the command did, which is what makes the duration attributable.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CommandFinished {
     pub command: String,
@@ -654,6 +651,139 @@ mod tests {
             long_market_value: Some(50_000.0),
             short_market_value: Some(-50_000.0),
         })
+    }
+
+    /// The wire names are a contract: `tests/test_handlers.rs` selects records by them and the
+    /// DuckDB view documents them as query filters. A typo in one arm compiles and breaks a reader.
+    ///
+    /// Matched exhaustively rather than iterated over a list, so a new variant does not compile
+    /// until it is named here.
+    #[test]
+    fn test_every_observation_serializes_under_its_documented_name() {
+        fn expected(observation: &Observation) -> &'static str {
+            match observation {
+                Observation::CommandFinished(_) => "command_finished",
+                Observation::PassEvaluated(_) => "pass_evaluated",
+                Observation::PricesObserved(_) => "prices_observed",
+                Observation::UniverseScreened(_) => "universe_screened",
+                Observation::OpenPairsObserved(_) => "open_pairs_observed",
+                Observation::PairOpened(_) => "pair_opened",
+                Observation::PairClosed(_) => "pair_closed",
+                Observation::PairAttributed(_) => "pair_attributed",
+                Observation::OrderSubmitted(_) => "order_submitted",
+                Observation::OrderResolved(_) => "order_resolved",
+                Observation::PositionCloseRequested(_) => "position_close_requested",
+                Observation::LiquidationAttempted(_) => "liquidation_attempted",
+                Observation::PredictionsGenerated(_) => "predictions_generated",
+                Observation::ActivityObserved(_) => "activity_observed",
+                Observation::AccountObserved(_) => "account_observed",
+            }
+        }
+
+        for observation in every_observation() {
+            // Against `event_type()`, which the writer logs by, and against the serialized tag,
+            // which is what actually reaches the archive. The two are separate code paths.
+            assert_eq!(observation.event_type(), expected(&observation));
+            let value = serde_json::to_value(Record::new(
+                Uuid::nil(),
+                instant("2026-08-11T20:15:00Z"),
+                observation.clone(),
+            ))
+            .expect("every observation must serialize");
+            assert_eq!(
+                value["event_type"],
+                expected(&observation),
+                "the serialized tag is what a reader filters on"
+            );
+        }
+    }
+
+    /// One value per variant, so the compiler forces this list to grow with the enum.
+    fn every_observation() -> Vec<Observation> {
+        vec![
+            Observation::CommandFinished(CommandFinished {
+                command: "portfolio_evaluation".to_string(),
+                outcome: "completed".to_string(),
+                duration_milliseconds: Some(12),
+                error: None,
+                summary: None,
+            }),
+            Observation::PassEvaluated(Box::default()),
+            Observation::PricesObserved(PricesObserved::default()),
+            Observation::UniverseScreened(UniverseScreened::default()),
+            Observation::OpenPairsObserved(OpenPairsObserved::default()),
+            Observation::PairOpened(PairOpened {
+                pair_uuid: Uuid::nil().to_string(),
+                pair_id: "AAAA-BBBB".to_string(),
+                long_ticker: "AAAA".to_string(),
+                short_ticker: "BBBB".to_string(),
+                hedge_ratio: 1.0,
+                entry_z_score: 2.5,
+                signal_strength: 0.03,
+                model_run_id: None,
+                opened_at: instant("2026-08-11T14:35:00Z"),
+            }),
+            Observation::PairClosed(PairClosed {
+                pair_uuid: Uuid::nil().to_string(),
+                reason: "convergence".to_string(),
+                closed_at: instant("2026-08-11T18:00:00Z"),
+                updated: true,
+            }),
+            Observation::PairAttributed(PairAttributed {
+                pair_uuid: Uuid::nil().to_string(),
+                realized_profit_and_loss: Some(100.0),
+                updated: true,
+            }),
+            Observation::OrderSubmitted(OrderSubmitted {
+                client_order_id: "k-long".to_string(),
+                ticker: "AAAA".to_string(),
+                side: "buy".to_string(),
+                shares: None,
+                notional: Some(1_000.0),
+            }),
+            Observation::OrderResolved(OrderResolved {
+                client_order_id: "k-long".to_string(),
+                alpaca_order_id: Some("o1".to_string()),
+                ticker: "AAAA".to_string(),
+                outcome: "filled".to_string(),
+                filled_shares: Some(10.0),
+                filled_average_price: Some(100.0),
+                filled_after_cancel: false,
+                error: None,
+            }),
+            Observation::PositionCloseRequested(PositionCloseRequested {
+                ticker: "AAAA".to_string(),
+                pair_id: None,
+                alpaca_order_id: None,
+                side: None,
+                quantity: None,
+                reason: "liquidation".to_string(),
+                accepted: true,
+                status: Some(200),
+                error: None,
+            }),
+            Observation::LiquidationAttempted(LiquidationAttempted::default()),
+            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
+                model_run_id: "run-1".to_string(),
+                artifact_key: "models/tide/run-1".to_string(),
+                artifact_staleness_sessions: None,
+                rows_written: 0,
+                universe_size: 0,
+                predictions: Vec::new(),
+            })),
+            Observation::ActivityObserved(ActivityObserved {
+                activity_id: "a1".to_string(),
+                activity_type: "FILL".to_string(),
+                transaction_time: instant("2026-08-11T18:00:00Z"),
+                ticker: Some("AAAA".to_string()),
+                side: Some("buy".to_string()),
+                quantity: Some(10.0),
+                price: Some(100.0),
+                net_amount: None,
+                order_id: Some("o1".to_string()),
+            }),
+            account_observation(),
+        ]
     }
 
     /// A directory unique to this run.
