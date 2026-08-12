@@ -20,8 +20,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
-use crate::common::types::{BarInterval, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{BarInterval, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 
 /// Trailing window over which liquidity is averaged.
 ///
@@ -113,7 +112,7 @@ impl Universe {
     /// Whether `ticker` is eligible to trade at all.
     ///
     /// Backed by a set rather than a scan of [`Universe::tickers`]. The screen asks this once per
-    /// forecast, and a linear scan there turns a seven-thousand-symbol universe into forty-nine
+    /// prediction, and a linear scan there turns a seven-thousand-symbol universe into forty-nine
     /// million comparisons on a pass that runs every five minutes.
     pub fn contains(&self, ticker: &Ticker) -> bool {
         self.eligible.contains(ticker)

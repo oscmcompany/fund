@@ -15,11 +15,11 @@ use sqlx::{PgPool, Row};
 use tracing::warn;
 
 use crate::common::alpaca::TRANSFER_ACTIVITY_TYPES;
-use crate::common::types::{PairID, Ticker};
+use crate::common::types::{PairID, SessionDate, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
 };
-use crate::data::calendar::SessionDate;
+
 use crate::portfolio::pairs::CloseReason;
 
 /// Sessions of account snapshots fetched: the equity curve, and the newest row's balances.
@@ -256,7 +256,7 @@ async fn fetch_closed_pairs(pool: &PgPool) -> Result<Vec<ClosedPair>, sqlx::Erro
     Ok(pairs)
 }
 
-/// Fetches the most recent prediction batch, ranked by median forecast.
+/// Fetches the most recent prediction batch, ranked by median prediction.
 ///
 /// A batch is identified by its shared `correlation_id`, not by timestamp: selecting on the maximum
 /// timestamp alone would mix rows from two runs if one ever wrote a ticker the other did not.

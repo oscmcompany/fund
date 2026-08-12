@@ -20,8 +20,8 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::common::events::Notification;
-use crate::common::types::{PairID, Ticker};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{PairID, SessionDate, Ticker};
+
 use crate::portfolio::pairs::CloseReason;
 
 /// How often the background task refreshes every view from PostgreSQL.
@@ -97,7 +97,7 @@ impl ClosedPair {
     }
 }
 
-/// One ticker's quantile forecast from the most recent prediction batch.
+/// One ticker's quantile prediction from the most recent batch.
 #[derive(Debug, Clone)]
 pub struct Prediction {
     pub ticker: Ticker,

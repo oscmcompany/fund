@@ -25,8 +25,11 @@ use crate::common::alpaca::{
     AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
     TRANSFER_ACTIVITY_TYPES,
 };
-use crate::data::calendar::{SessionDate, TradingCalendar};
-use crate::data::session_log::{AccountObserved, Observation, SessionLog};
+use crate::common::session_log::{
+    AccountObserved, ActivityObserved, Observation, PairAttributed, SessionLog,
+};
+use crate::common::types::SessionDate;
+use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
 /// The activity types this sync fetches and stores.
@@ -65,6 +68,11 @@ pub struct AccountSyncSummary {
     /// The previous trading session, when it has no snapshot — a hole in the equity series that a
     /// future time-weighted return cannot chain across.
     pub previous_session_gap: Option<SessionDate>,
+    /// True when Alpaca's pagination stopped at its bound, so this session's activities are
+    /// incomplete rather than merely few.
+    pub activities_truncated: bool,
+    /// Activities Alpaca sent with no usable timestamp, which cannot be stored at all.
+    pub activities_undated: usize,
 }
 
 /// Runs the whole post-close sync for one session date.
@@ -72,6 +80,7 @@ pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
     session_log: &SessionLog,
+    correlation_id: uuid::Uuid,
     calendar: &TradingCalendar,
     session_date: SessionDate,
 ) -> Result<AccountSyncSummary, AccountError> {
@@ -83,7 +92,7 @@ pub async fn sync_account(
     // only moment they are observable at all.
     session_log
         .record(
-            uuid::Uuid::new_v4(),
+            correlation_id,
             Utc::now(),
             Observation::AccountObserved(AccountObserved {
                 // The session this describes, which a sync re-run after Eastern midnight would
@@ -102,14 +111,48 @@ pub async fn sync_account(
     // One request per type: Alpaca puts the activity type in the URL path, and the sync already
     // tolerates several round trips.
     let mut activities = Vec::new();
+    let mut activities_truncated = false;
+    let mut activities_undated = 0;
     for activity_type in synced_activity_types() {
-        activities.extend(
-            client
-                .fetch_activities(activity_type, session_date.date())
-                .await?,
-        );
+        let fetched = client
+            .fetch_activities(activity_type, session_date.date())
+            .await?;
+        activities_truncated |= fetched.truncated;
+        activities_undated += fetched.undated;
+        activities.extend(fetched.activities);
     }
     let activities_stored = store_activities(pool, &activities).await?;
+    if activities_truncated || activities_undated > 0 {
+        warn!(
+            activities_truncated,
+            activities_undated,
+            %session_date,
+            "Alpaca activities are incomplete for this session"
+        );
+    }
+
+    // Our own record of every activity, not just the ones the attribution used. Alpaca's retention
+    // bounds how long these can be re-fetched, and `net_amount` — the only field saying how much a
+    // deposit or withdrawal moved — reaches no other store this application owns.
+    for activity in &activities {
+        session_log
+            .record(
+                correlation_id,
+                Utc::now(),
+                Observation::ActivityObserved(ActivityObserved {
+                    activity_id: activity.id().to_string(),
+                    activity_type: activity.activity_type().to_string(),
+                    transaction_time: activity.transaction_time(),
+                    ticker: activity.ticker().map(|ticker| ticker.to_string()),
+                    side: activity.side().map(str::to_string),
+                    quantity: activity.shares().and_then(|shares| shares.to_f64()),
+                    price: activity.price().and_then(|price| price.to_f64()),
+                    net_amount: activity.net_amount().and_then(|amount| amount.to_f64()),
+                    order_id: activity.order_id().map(str::to_string),
+                }),
+            )
+            .await;
+    }
 
     let (start, end) = session_date.bounds();
     let closed = pairs::load_closed_between(pool, start, end).await?;
@@ -124,7 +167,19 @@ pub async fn sync_account(
 
     let mut pairs_attributed = 0;
     for (id, amount) in &attribution.realized {
-        if pairs::record_realized_profit_and_loss(pool, *id, *amount).await? {
+        let updated = pairs::record_realized_profit_and_loss(pool, *id, *amount).await?;
+        session_log
+            .record(
+                correlation_id,
+                Utc::now(),
+                Observation::PairAttributed(PairAttributed {
+                    pair_uuid: id.to_string(),
+                    realized_profit_and_loss: amount.to_f64(),
+                    updated,
+                }),
+            )
+            .await;
+        if updated {
             pairs_attributed += 1;
         }
     }
@@ -153,6 +208,8 @@ pub async fn sync_account(
         pairs_attributed,
         previous_session_gap,
         activities_unattributed: attribution.unattributed,
+        activities_truncated,
+        activities_undated,
     })
 }
 

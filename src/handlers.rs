@@ -19,15 +19,16 @@ use uuid::Uuid;
 use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
 use crate::common::events::{self, Command, EventError};
 use crate::common::massive::MassiveClient;
-use crate::common::types::BarInterval;
+use crate::common::session_log::{
+    CommandFinished, Observation, PredictionReading, PredictionsGenerated, SessionLog,
+    SessionLogError,
+};
+use crate::common::types::{BarInterval, SessionDate};
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
-use crate::data::calendar::{CalendarCache, SessionDate, TradingCalendar};
+use crate::data::calendar::{CalendarCache, TradingCalendar};
 use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
-use crate::data::session_log::{
-    self, Observation, PredictionsGenerated, SessionLog, SessionLogError,
-};
 use crate::data::universe::{UniverseCache, UniverseError};
 use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
@@ -190,31 +191,65 @@ impl Drop for CommandGuard<'_> {
 
 /// Dispatches one command, emitting its terminal event either way.
 ///
-/// A command already in flight is dropped with a log line and no event: the request it came from
-/// will be answered by the run that is already going, and emitting a second terminal outcome would
-/// make the recovery scan's "requested with no terminal outcome" test wrong.
+/// A command already in flight is dropped with no *event*: the run already going will answer the
+/// request, and a second terminal outcome would make the recovery scan's "requested with no
+/// terminal outcome" test wrong. It is still recorded, because a drop and a crash are otherwise the
+/// same absence.
 pub async fn handle(state: &ServiceState, command: Command) {
+    // Minted here rather than inside each handler, so the command's own record and everything it
+    // did carry one identifier. That is what turns a duration into "where the time went".
+    let correlation_id = Uuid::new_v4();
+
     let Some(_guard) = state.claim(command) else {
         warn!(
             command = command.as_str(),
             "Command already in flight; this request is dropped"
         );
+        record_command(
+            state,
+            correlation_id,
+            Utc::now(),
+            CommandFinished {
+                command: command.as_str().to_string(),
+                outcome: "dropped_in_flight".to_string(),
+                duration_milliseconds: None,
+                error: None,
+                summary: None,
+            },
+        )
+        .await;
         return;
     };
 
     let started = std::time::Instant::now();
-    let result = dispatch(state, command).await;
+    let result = dispatch(state, command, correlation_id).await;
     let duration_milliseconds = started.elapsed().as_millis() as u64;
 
     match result {
         Ok(mut summary) => {
             if let Value::Object(map) = &mut summary {
-                map.insert("duration_ms".to_string(), json!(duration_milliseconds));
+                map.insert(
+                    "duration_milliseconds".to_string(),
+                    json!(duration_milliseconds),
+                );
             }
             info!(
                 command = command.as_str(),
                 duration_milliseconds, "Command completed"
             );
+            record_command(
+                state,
+                correlation_id,
+                Utc::now(),
+                CommandFinished {
+                    command: command.as_str().to_string(),
+                    outcome: completion_outcome(&summary),
+                    duration_milliseconds: Some(duration_milliseconds),
+                    error: None,
+                    summary: Some(summary.clone()),
+                },
+            )
+            .await;
             if let Err(error) = events::emit_completed(state.pool(), command, summary).await {
                 error!(command = command.as_str(), %error, "Failed to record completion");
             }
@@ -226,6 +261,19 @@ pub async fn handle(state: &ServiceState, command: Command) {
                 duration_milliseconds,
                 "Command failed"
             );
+            record_command(
+                state,
+                correlation_id,
+                Utc::now(),
+                CommandFinished {
+                    command: command.as_str().to_string(),
+                    outcome: "errored".to_string(),
+                    duration_milliseconds: Some(duration_milliseconds),
+                    error: Some(error.to_string()),
+                    summary: None,
+                },
+            )
+            .await;
             if let Err(emit_error) =
                 events::emit_errored(state.pool(), command, &error.to_string()).await
             {
@@ -235,12 +283,40 @@ pub async fn handle(state: &ServiceState, command: Command) {
     }
 }
 
-async fn dispatch(state: &ServiceState, command: Command) -> Result<Value, HandlerError> {
+/// Whether a successful run did its work or declined to.
+///
+/// A handler that returns early names its reason under `skipped`; today the only one is
+/// `not_a_trading_day`. Reading it here rather than matching on it keeps a new skip reason from
+/// silently reading as a completed run.
+fn completion_outcome(summary: &Value) -> String {
+    match summary.get("skipped").and_then(Value::as_str) {
+        Some(reason) => format!("skipped_{reason}"),
+        None => "completed".to_string(),
+    }
+}
+
+async fn record_command(
+    state: &ServiceState,
+    correlation_id: Uuid,
+    now: DateTime<Utc>,
+    finished: CommandFinished,
+) {
+    state
+        .session_log
+        .record(correlation_id, now, Observation::CommandFinished(finished))
+        .await;
+}
+
+async fn dispatch(
+    state: &ServiceState,
+    command: Command,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     match command {
-        Command::Predictions => handle_predictions(state).await,
-        Command::PortfolioEvaluation => handle_portfolio_evaluation(state).await,
-        Command::PortfolioLiquidation => handle_portfolio_liquidation(state).await,
-        Command::AccountSync => handle_account_sync(state).await,
+        Command::Predictions => handle_predictions(state, correlation_id).await,
+        Command::PortfolioEvaluation => handle_portfolio_evaluation(state, correlation_id).await,
+        Command::PortfolioLiquidation => handle_portfolio_liquidation(state, correlation_id).await,
+        Command::AccountSync => handle_account_sync(state, correlation_id).await,
         Command::MarketDataSync => handle_market_data_sync(state).await,
         Command::DatabaseExport => handle_database_export(state).await,
     }
@@ -250,7 +326,10 @@ async fn dispatch(state: &ServiceState, command: Command) -> Result<Value, Handl
 ///
 /// The previous session's post-close commands are checked here, and the artifact resolved here,
 /// rather than on schedules of their own — both only matter immediately before a session.
-async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError> {
+async fn handle_predictions(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     let now = Utc::now();
     let today = SessionDate::at(now);
 
@@ -307,25 +386,30 @@ async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError>
         );
     }
 
-    let correlation_id = Uuid::new_v4();
-    let (predictions, rows) = run_inference(state, &model_state, correlation_id).await?;
+    let (rows, predictions) = run_inference(state, &model_state, correlation_id).await?;
 
-    // The forecasts themselves are not repeated into the log — they are rows in
-    // `equity_predictions` and reach S3 through the nightly export. What only this run knows is
-    // which artifact produced them.
     state
         .session_log
         .record(
             correlation_id,
             now,
-            Observation::PredictionsGenerated(PredictionsGenerated {
+            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
                 model_run_id: model_state.run_id().to_string(),
                 artifact_key: artifact_key.clone(),
                 artifact_staleness_sessions,
-                predictions,
                 rows_written: rows,
                 universe_size: universe.len(),
-            }),
+                predictions: predictions
+                    .iter()
+                    .map(|prediction| PredictionReading {
+                        ticker: prediction.ticker().to_string(),
+                        timestamp: prediction.timestamp(),
+                        quantile_10: prediction.quantile_10(),
+                        quantile_50: prediction.quantile_50(),
+                        quantile_90: prediction.quantile_90(),
+                    })
+                    .collect(),
+            })),
         )
         .await;
 
@@ -335,7 +419,7 @@ async fn handle_predictions(state: &ServiceState) -> Result<Value, HandlerError>
         "model_run_id": model_state.run_id(),
         "artifact_key": artifact_key,
         "artifact_staleness_sessions": artifact_staleness_sessions,
-        "predictions": predictions,
+        "predictions": predictions.len(),
         "rows_written": rows,
         "universe": universe.len(),
         "close_history_tickers": close_history.len(),
@@ -348,7 +432,7 @@ async fn run_inference(
     state: &ServiceState,
     model_state: &artifact::ModelState,
     correlation_id: Uuid,
-) -> Result<(usize, u64), HandlerError> {
+) -> Result<(u64, Vec<crate::common::types::EquityPrediction>), HandlerError> {
     fn at(stage: &'static str) -> impl Fn(String) -> HandlerError {
         move |message| HandlerError::Prediction { stage, message }
     }
@@ -381,7 +465,7 @@ async fn run_inference(
     // Split back apart rather than propagated as one error: a malformed payload is a bug in the
     // model output this function just produced, and belongs with the other pipeline stages; a
     // database failure is the database, and keeps reading as one.
-    let rows =
+    let (rows, predictions) =
         predict::insert_predictions(&state.pool, &array, correlation_id, model_state.run_id())
             .await
             .map_err(|error| match error {
@@ -389,11 +473,14 @@ async fn run_inference(
                 predict::InsertPredictionsError::Database(error) => HandlerError::Database(error),
             })?;
 
-    Ok((array.len(), rows))
+    Ok((rows, predictions))
 }
 
 /// Every five minutes: price the book, close what should close, open into vacant slots.
-async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, HandlerError> {
+async fn handle_portfolio_evaluation(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     let now = Utc::now();
     let today = SessionDate::at(now);
 
@@ -428,6 +515,7 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
         sizing: state.sizing,
         execution: state.execution,
         session_log: &state.session_log,
+        correlation_id,
         shutdown: &state.shutdown,
         now,
     };
@@ -441,15 +529,26 @@ async fn handle_portfolio_evaluation(state: &ServiceState) -> Result<Value, Hand
 /// The calendar is deliberately not consulted. A liquidation on a day with no session closes
 /// nothing and costs one API call; a liquidation skipped because the calendar was wrong or
 /// unreachable carries positions overnight. The asymmetry is the whole argument.
-async fn handle_portfolio_liquidation(state: &ServiceState) -> Result<Value, HandlerError> {
-    let summary =
-        evaluate::run_liquidation(&state.pool, &state.trading, &state.session_log, Utc::now())
-            .await?;
+async fn handle_portfolio_liquidation(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
+    let summary = evaluate::run_liquidation(
+        &state.pool,
+        &state.trading,
+        &state.session_log,
+        correlation_id,
+        Utc::now(),
+    )
+    .await?;
     Ok(serde_json::to_value(summary).unwrap_or_else(|_| json!({})))
 }
 
 /// Post-close: balances, activities, and pair attribution from Alpaca.
-async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError> {
+async fn handle_account_sync(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     let now = Utc::now();
     let today = SessionDate::at(now);
 
@@ -462,6 +561,7 @@ async fn handle_account_sync(state: &ServiceState) -> Result<Value, HandlerError
         &state.pool,
         &state.trading,
         &state.session_log,
+        correlation_id,
         &calendar,
         today,
     )
@@ -557,13 +657,9 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
 async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerError> {
     let today = SessionDate::at(Utc::now());
 
-    let sessions = session_log::export_session_logs(
-        &state.session_log,
-        &state.s3_client,
-        &state.bucket,
-        today,
-    )
-    .await;
+    let sessions =
+        export::export_session_logs(&state.session_log, &state.s3_client, &state.bucket, today)
+            .await;
     let session_log_summary = json!({
         "sessions_exported": sessions.exported.len(),
         "records_exported": sessions.total_records(),
@@ -723,6 +819,27 @@ mod tests {
         SessionDate::from_date(
             NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
         )
+    }
+
+    /// A holiday and a completed run must not read the same. The handlers say why they declined by
+    /// naming a reason, and the outcome carries it rather than collapsing to "it finished".
+    #[test]
+    fn test_a_skipped_run_is_not_recorded_as_completed() {
+        assert_eq!(
+            completion_outcome(
+                &json!({ "skipped": "not_a_trading_day", "session_date": "2026-08-11" })
+            ),
+            "skipped_not_a_trading_day"
+        );
+        assert_eq!(
+            completion_outcome(&json!({ "pairs_opened": ["AAAA-BBBB"] })),
+            "completed"
+        );
+        // A reason this function has never seen still reads as a skip, not as a finished run.
+        assert_eq!(
+            completion_outcome(&json!({ "skipped": "market_halted" })),
+            "skipped_market_halted"
+        );
     }
 
     /// Weekday sessions spanning 2026-07-27 to 2026-08-07. 2026-08-01 is a Saturday and

@@ -18,8 +18,8 @@ use tracing::{error, info};
 
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
+use fund::common::types::SessionDate;
 use fund::data::archive;
-use fund::data::calendar::SessionDate;
 
 const USAGE: &str = "Usage: seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD]";
 

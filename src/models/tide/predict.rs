@@ -11,8 +11,8 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::types::{EquityPrediction, Ticker};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{EquityPrediction, SessionDate, Ticker};
+
 use crate::models::tide::artifact::ModelState;
 use crate::models::tide::data::{Data, DatasetKind};
 
@@ -297,9 +297,9 @@ pub(crate) fn unscale_and_sort_quantiles(
 
 /// Timestamp for horizon step `step`, where step 0 is the Eastern session `now` falls in.
 ///
-/// Midnight *Eastern*, not UTC. The evaluation pass selects forecasts with
+/// Midnight *Eastern*, not UTC. The evaluation pass selects predictions with
 /// [`crate::data::calendar::eastern_day_bounds`], and a UTC midnight sits at 20:00 the previous
-/// Eastern day under daylight time -- so a UTC-stamped forecast lands in the wrong session's
+/// Eastern day under daylight time -- so a UTC-stamped prediction lands in the wrong session's
 /// window and the morning's inference run is never read by that day's passes.
 pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
     let session = SessionDate::at(now).plus_calendar_days(step as i64);
@@ -407,7 +407,7 @@ pub fn generate_predictions(
     }
 
     // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
-    // liquidation flattens every position the same session, so a forecast further out describes a
+    // liquidation flattens every position the same session, so a prediction further out describes a
     // holding period this strategy never has. Selected explicitly rather than as the last step, so
     // widening `output_length` for research does not silently move the traded signal.
     let target_date = step_timestamp_milliseconds(now, 0);
@@ -575,9 +575,9 @@ pub async fn insert_predictions(
     predictions: &[serde_json::Value],
     correlation_id: Uuid,
     model_run_id: &str,
-) -> Result<u64, InsertPredictionsError> {
+) -> Result<(u64, Vec<EquityPrediction>), InsertPredictionsError> {
     if predictions.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let validated: Vec<EquityPrediction> = predictions
@@ -620,13 +620,15 @@ pub async fn insert_predictions(
 
     transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
-    Ok(rows_affected)
+    // Returned rather than reparsed by the caller: these are the exact values that were written,
+    // so the session log records what the database holds and not a second reading of the payload.
+    Ok((rows_affected, validated))
 }
 
 /// Loads the most recent prediction per ticker within a half-open instant range.
 ///
 /// The range is the current session's Eastern day, so a pass on a morning when the pre-open
-/// inference failed reads nothing rather than reading yesterday's forecast as though it were
+/// inference failed reads nothing rather than reading yesterday's prediction as though it were
 /// today's. A stale artifact is acceptable and logged; a stale *prediction* silently presented as
 /// current is not, because nothing downstream carries the timestamp far enough to notice.
 ///
@@ -882,9 +884,9 @@ mod tests {
     fn test_predictions_are_visible_to_the_same_session_evaluation() {
         // The 09:00 Eastern run exists to feed the same session's evaluation passes, which select
         // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
-        // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
+        // Eastern day's window -- 20:00 the day before, under EDT -- so the prediction written this
         // morning is never the one read this afternoon.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         for day in [
             "2026-08-03",
@@ -902,7 +904,7 @@ mod tests {
             let (start, end) = SessionDate::at(now).bounds();
             assert!(
                 stamp >= start && stamp < end,
-                "{day}: forecast stamped {stamp} is outside the session window [{start}, {end})"
+                "{day}: prediction stamped {stamp} is outside the session window [{start}, {end})"
             );
         }
     }
@@ -911,7 +913,7 @@ mod tests {
     fn test_step_timestamp_step_zero_is_the_current_eastern_session() {
         // Step t is the Eastern session t days out, stamped at Eastern midnight. 15:30Z is 11:30
         // Eastern, so step 0 is that same session rather than the one UTC is already into.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
@@ -930,8 +932,8 @@ mod tests {
     #[test]
     fn test_late_evening_eastern_still_stamps_the_current_session() {
         // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
-        // forecast a session forward, which is the failure this function exists to avoid.
-        use crate::data::calendar::SessionDate;
+        // prediction a session forward, which is the failure this function exists to avoid.
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
             .unwrap()
@@ -1274,7 +1276,7 @@ mod tests {
         // Compared against `eastern_midnight` rather than a fixed 86,400,000 ms stride: successive
         // Eastern midnights are 23 or 25 hours apart across a daylight-saving transition, so a
         // fixed stride asserts something that is only true away from March and November.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -1298,7 +1300,7 @@ mod tests {
         // Eastern time springs forward 2026-03-08 and falls back 2026-11-01. Stepping across either
         // boundary must still land on the session's own midnight, which a fixed day-length stride
         // would miss by an hour in each direction.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         for (start, label) in [
             ("2026-03-06T17:00:00Z", "spring forward"),

@@ -14,10 +14,10 @@ use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
     TRANSFER_ACTIVITY_TYPES,
 };
-use fund::common::types::{BarInterval, Ticker};
+use fund::common::session_log::SessionLog;
+use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::bars;
-use fund::data::calendar::{SessionDate, TradingCalendar};
-use fund::data::session_log::SessionLog;
+use fund::data::calendar::TradingCalendar;
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;
@@ -249,6 +249,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
 
     let running = CancellationToken::new();
     let session_log = session_log("test-a-pass-opens-a-pair-and-records-it");
+    let dispatched_correlation_id = uuid::Uuid::new_v4();
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -259,6 +260,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: dispatched_correlation_id,
         shutdown: &running,
         now: session_instant(),
     };
@@ -288,12 +290,21 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     // The pass is only useful to a replay if the observation reached the disk. One evaluation
     // record, and one submission and one resolution per leg, all threaded by the pass's identifier.
     let records = recorded(&session_log);
-    let passes = of_type(&records, "evaluation_pass");
+    let passes = of_type(&records, "pass_evaluated");
     assert_eq!(passes.len(), 1, "one record per pass");
     let pass = &passes[0];
     let correlation_id = pass["correlation_id"]
         .as_str()
         .expect("a pass is correlated");
+    assert_eq!(
+        correlation_id,
+        dispatched_correlation_id.to_string(),
+        "the pass records the identifier the dispatcher supplied, not one of its own"
+    );
+    assert!(
+        pass["payload"]["failure"].is_null(),
+        "a pass that completed records no failure"
+    );
 
     assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
     let candidate = &pass["payload"]["candidates"][0];
@@ -306,29 +317,48 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
             && candidate["gross_exposure"].is_number(),
         "a candidate that reached the sizer carries what it was sized to"
     );
+
+    // Prices are their own records, one per fetch, sharing the pass's identifier.
+    let priced = of_type(&records, "prices_observed");
+    assert!(!priced.is_empty(), "the prices the pass decided on");
+    let readings: Vec<&serde_json::Value> = priced
+        .iter()
+        .flat_map(|record| record["payload"]["readings"].as_array().unwrap())
+        .collect();
+    assert!(!readings.is_empty());
     assert!(
-        !pass["payload"]["prices"].as_array().unwrap().is_empty(),
-        "the prices the pass decided on must be recorded"
+        readings
+            .iter()
+            .all(|reading| reading["price"].is_number() && reading["price_source"].is_string()),
+        "a price without its source cannot be compared across passes"
     );
     assert!(
-        pass["payload"]["prices"][0]["price_source"].is_string(),
-        "a price without its source cannot be compared across passes"
+        priced
+            .iter()
+            .all(|record| record["payload"]["purpose"].is_string()),
+        "each fetch names what it was for"
     );
 
     // What the model offered the screen, as rows rather than a count. `expected_return` and
     // `confidence` are derived from the stored quantiles, so `equity_predictions` alone cannot
     // reconstruct what the screen actually consumed.
-    let screen_inputs = pass["payload"]["screen_inputs"]
+    let screened = of_type(&records, "universe_screened");
+    assert_eq!(screened.len(), 1, "one funnel per pass");
+    let screen_inputs = screened[0]["payload"]["inputs"]
         .as_array()
         .expect("screen inputs are recorded");
-    assert_eq!(screen_inputs.len(), 2, "both forecasts reached the screen");
+    assert_eq!(
+        screen_inputs.len(),
+        2,
+        "both predictions reached the screen"
+    );
     assert!(screen_inputs
         .iter()
         .all(|input| input["expected_return"].is_number()
             && input["confidence"].is_number()
             && input["is_shortable"].is_boolean()));
     assert!(
-        pass["payload"]["excluded"]
+        screened[0]["payload"]["excluded"]
             .as_array()
             .expect("the funnel is recorded")
             .is_empty(),
@@ -352,6 +382,24 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         resolved[0]["payload"]["client_order_id"]
     );
     assert_eq!(resolved[0]["payload"]["outcome"], "filled");
+
+    // The pair itself, with the rationale nothing outside this application knows: which long was
+    // paired with which short, on what hedge ratio, at what entry score.
+    let opened = of_type(&records, "pair_opened");
+    assert_eq!(opened.len(), 1, "the pair that opened is recorded");
+    assert_eq!(opened[0]["payload"]["pair_id"], "AAAA-BBBB");
+    assert_eq!(opened[0]["payload"]["model_run_id"], "run-1");
+    assert!(
+        opened[0]["payload"]["hedge_ratio"].is_number()
+            && opened[0]["payload"]["entry_z_score"].is_number()
+            && opened[0]["payload"]["signal_strength"].is_number()
+    );
+    // The identifier the close and the attribution will join on.
+    assert_eq!(
+        opened[0]["payload"]["pair_uuid"],
+        open[0].id().to_string(),
+        "the record names the row it wrote"
+    );
 
     submit.assert_async().await;
 }
@@ -433,6 +481,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -549,6 +598,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         sizing,
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -588,9 +638,10 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         assert_eq!(record["payload"]["accepted"], true);
     }
 
-    // And the pass that measured every open pair says so, whether or not the pair closed.
-    let pass = of_type(&records, "evaluation_pass");
-    let measured = pass[0]["payload"]["open_pairs"]
+    // And the reading that measured every open pair says so, whether or not the pair closed.
+    let observed = of_type(&records, "open_pairs_observed");
+    assert_eq!(observed.len(), 1, "one book reading per pass");
+    let measured = observed[0]["payload"]["readings"]
         .as_array()
         .expect("open pairs are recorded");
     assert_eq!(
@@ -606,6 +657,100 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     assert!(
         closed["z_score"].is_number() && closed["spread_mean"].is_number(),
         "the inputs that produced the exit decision are recorded with it"
+    );
+}
+
+/// A pass that dies partway through still says what it had measured.
+///
+/// The book was priced and read before the account call failed, so discarding the observation
+/// would leave the log silent about the one pass worth reading. The failure is named on the record
+/// rather than left as an absence, which is indistinguishable from a crashed process.
+#[tokio::test]
+#[serial]
+async fn test_a_failed_pass_records_what_it_had_already_observed() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
+    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
+        .await
+        .unwrap();
+
+    let entry = PairEntry::new(
+        fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),
+        1.0,
+        2.5,
+        0.03,
+        None,
+    )
+    .unwrap();
+    pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
+
+    let _snapshots = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
+        )
+        .with_status(200)
+        .with_body(r#"{"AAAA":{"latestTrade":{"p":100.0}},"BBBB":{"latestTrade":{"p":50.0}}}"#)
+        .create_async()
+        .await;
+    // The exits are done; the entry half asks for the account and Alpaca is unreachable.
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(500)
+        .with_body("upstream is down")
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
+    let calendar = calendar_for_today();
+    let universe = universe_of(&["AAAA", "BBBB"]);
+
+    let running = CancellationToken::new();
+    let session_log = session_log("test-a-failed-pass-records-what-it-had-already-observed");
+    let context = EvaluationContext {
+        pool: &pool,
+        trading: &trading,
+        market_data: &market_data,
+        calendar: &calendar,
+        universe: &universe,
+        close_history: &close_history,
+        sizing: SizingParameters::default(),
+        execution: settings(),
+        session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
+        shutdown: &running,
+        now: session_instant(),
+    };
+
+    evaluate::run_pass(&context)
+        .await
+        .expect_err("the account call must fail the pass");
+
+    let records = recorded(&session_log);
+    let passes = of_type(&records, "pass_evaluated");
+    assert_eq!(passes.len(), 1, "a failed pass is still recorded");
+    assert!(
+        passes[0]["payload"]["failure"]
+            .as_str()
+            .expect("the failure is named")
+            .contains("Alpaca"),
+        "the record says what ended the pass"
+    );
+    assert_eq!(
+        passes[0]["payload"]["open_pairs_at_start"], 1,
+        "what the pass had measured before the failure survives"
+    );
+    assert_eq!(
+        of_type(&records, "open_pairs_observed").len(),
+        1,
+        "the book reading was written before the failure and is unaffected by it"
+    );
+    assert!(
+        of_type(&records, "universe_screened").is_empty(),
+        "the pass never reached the screen"
     );
 }
 
@@ -666,6 +811,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -713,18 +859,73 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let summary = evaluate::run_liquidation(
-        &pool,
-        &trading,
-        &session_log("test-liquidation-flattens-the-book-and-marks-every-pair"),
-        Utc::now(),
-    )
-    .await
-    .expect("the liquidation must run");
+    let log = session_log("test-liquidation-flattens-the-book-and-marks-every-pair");
+    let summary =
+        evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
+            .await
+            .expect("the liquidation must run");
 
     assert_eq!(summary.pairs_closed, 2);
     assert!(summary.pairs_still_open.is_empty());
     assert!(pairs::load_open_pairs(&pool).await.unwrap().is_empty());
+
+    // The last fail-safe before positions carry overnight says it ran, and says the book is flat.
+    let records = recorded(&log);
+    let attempted = of_type(&records, "liquidation_attempted");
+    assert_eq!(attempted.len(), 1);
+    assert!(attempted[0]["payload"]["failure"].is_null());
+    assert_eq!(attempted[0]["payload"]["pairs_closed"], 2);
+
+    // The table is mutated in place; the log needs its own record of the transition.
+    let closed = of_type(&records, "pair_closed");
+    assert_eq!(closed.len(), 2, "one record per pair marked closed");
+    for record in &closed {
+        assert_eq!(record["payload"]["reason"], "end_of_day");
+        assert_eq!(
+            record["payload"]["updated"], true,
+            "a pair that was open when the liquidation reached it"
+        );
+    }
+}
+
+/// A liquidation that could not reach the broker still records that it was attempted.
+///
+/// This is the last thing standing between an open book and an overnight position. A run that
+/// failed at the bulk close used to leave no trace of having happened at all, which reads exactly
+/// like a liquidation that was never scheduled.
+#[tokio::test]
+#[serial]
+async fn test_a_failed_liquidation_records_the_attempt() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    let _bulk = server
+        .mock("DELETE", mockito::Matcher::Regex(r"^/v2/positions".into()))
+        .with_status(500)
+        .with_body("upstream is down")
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let log = session_log("test-a-failed-liquidation-records-the-attempt");
+    evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
+        .await
+        .expect_err("the bulk close must fail");
+
+    let records = recorded(&log);
+    let attempted = of_type(&records, "liquidation_attempted");
+    assert_eq!(attempted.len(), 1, "the attempt is recorded even so");
+    assert!(
+        attempted[0]["payload"]["failure"]
+            .as_str()
+            .expect("the failure is named")
+            .contains("Alpaca"),
+        "the record says what stopped it"
+    );
+    assert_eq!(
+        attempted[0]["payload"]["pairs_closed"], 0,
+        "nothing was flattened"
+    );
 }
 
 /// A pair whose leg Alpaca refused to close stays open in the record. Marking it closed would leave
@@ -765,6 +966,7 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
         &pool,
         &trading,
         &session_log("test-a-refused-leg-leaves-its-pair-open"),
+        uuid::Uuid::new_v4(),
         Utc::now(),
     )
     .await
@@ -840,9 +1042,9 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         .with_status(200)
         .with_body(format!(
             r#"[{{"id":"a1","activity_type":"FILL","transaction_time":"{}",
-                  "symbol":"AAAA","side":"buy","qty":"10","price":"100"}},
+                  "symbol":"AAAA","side":"buy","qty":"10","price":"100","order_id":"o1"}},
                 {{"id":"a2","activity_type":"FILL","transaction_time":"{}",
-                  "symbol":"AAAA","side":"sell","qty":"10","price":"110"}}]"#,
+                  "symbol":"AAAA","side":"sell","qty":"10","price":"110","order_id":"o2"}}]"#,
             (opened + Duration::minutes(1)).to_rfc3339(),
             (closed - Duration::minutes(1)).to_rfc3339(),
         ))
@@ -852,10 +1054,12 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     mock_no_transfers(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
+    let log = session_log("test-the-account-sync-stores-and-attributes-a-session");
     let summary = account::sync_account(
         &pool,
         &trading,
-        &session_log("test-the-account-sync-stores-and-attributes-a-session"),
+        &log,
+        uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -878,6 +1082,30 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         account::load_equity_for(&pool, session_date).await.unwrap(),
         Some(rust_decimal::Decimal::from(102_000))
     );
+
+    // Every activity Alpaca reported, as our own record. `net_amount` in particular reaches no
+    // other store the application owns.
+    let records = recorded(&log);
+    let observed = of_type(&records, "activity_observed");
+    assert_eq!(observed.len(), 2, "one record per activity, fills included");
+    assert!(observed
+        .iter()
+        .all(|record| record["payload"]["activity_id"].is_string()
+            && record["payload"]["activity_type"].is_string()));
+    assert!(
+        observed
+            .iter()
+            .all(|record| record["payload"]["order_id"].is_string()),
+        "every fill joins back to the order that produced it"
+    );
+
+    // The attribution is the one derived value the log keeps, recorded beside the pair it landed
+    // on so the stored figure can be checked against the fills it came from.
+    let attributed = of_type(&records, "pair_attributed");
+    assert_eq!(attributed.len(), 1);
+    assert_eq!(attributed[0]["payload"]["pair_uuid"], id.to_string());
+    assert_eq!(attributed[0]["payload"]["realized_profit_and_loss"], 100.0);
+    assert_eq!(attributed[0]["payload"]["updated"], true);
 }
 
 /// Re-running a sync must change nothing. Alpaca's activity identifier is the primary key, so the
@@ -917,13 +1145,27 @@ async fn test_the_account_sync_is_idempotent() {
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let calendar = calendar_ending_at(session_date);
     let log = session_log("test-the-account-sync-is-idempotent-0");
-    let first = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .unwrap();
+    let first = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .unwrap();
     let log = session_log("test-the-account-sync-is-idempotent-1");
-    let second = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .unwrap();
+    let second = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(first.activities_stored, 1);
     assert_eq!(second.activities_stored, 0);
@@ -1002,6 +1244,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
         &pool,
         &trading,
         &session_log("test-the-account-sync-stores-transfers-without-attributing-them"),
+        uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -1070,9 +1313,16 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let log = session_log("test-the-account-sync-reports-a-missing-previous-session-2");
-    let with_gap = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .expect("the sync must run");
+    let with_gap = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
     assert_eq!(
         with_gap.previous_session_gap,
         Some(previous),
@@ -1080,12 +1330,26 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     );
 
     // Fill the hole and the same sync stops reporting it.
-    account::sync_account(&pool, &trading, &log, &calendar, previous)
-        .await
-        .expect("the sync must run");
-    let repaired = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .expect("the sync must run");
+    account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        previous,
+    )
+    .await
+    .expect("the sync must run");
+    let repaired = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
     assert_eq!(repaired.previous_session_gap, None);
 }
 

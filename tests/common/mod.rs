@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
-use fund::data::calendar::SessionDate;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -324,3 +324,4 @@ pub async fn seed_predictions(
         .expect("Failed to seed a prediction");
     }
 }
+use fund::common::types::SessionDate;

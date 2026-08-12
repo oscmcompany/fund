@@ -18,8 +18,8 @@ use tracing::{error, info, warn};
 use fund::common::database::connect_pool;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
+use fund::common::types::SessionDate;
 use fund::data::bars;
-use fund::data::calendar::SessionDate;
 
 const USAGE: &str = "Usage: seed_equity_bars_postgres <start YYYY-MM-DD> [end YYYY-MM-DD]";
 

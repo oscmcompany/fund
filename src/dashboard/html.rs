@@ -250,7 +250,7 @@ fn render_predictions_section(state: &DashboardState) -> String {
 <tr><th>Ticker</th><th>Q10</th><th>Q50</th><th>Q90</th></tr>
 {rows}
 </table>
-<p class="summary">{run} — {} tickers, ranked by median forecast</p>"#,
+<p class="summary">{run} — {} tickers, ranked by median prediction</p>"#,
         state.predictions.len()
     );
     section("Predictions", body)
@@ -590,7 +590,7 @@ mod tests {
 
         DashboardState {
             account: Some(AccountSnapshot {
-                session_date: crate::data::calendar::SessionDate::from_date(
+                session_date: crate::common::types::SessionDate::from_date(
                     NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid date"),
                 ),
                 equity: decimal("1234567.89"),

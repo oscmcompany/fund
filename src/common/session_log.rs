@@ -1,35 +1,23 @@
 //! Append-only record of what the application observed before it acted.
 //!
-//! One JSONL file per session on local disk, sealed at the close and written to S3 as Parquet.
-//! This is the only original the application owns: every other store is a fold or a query over it.
+//! One JSONL file per session on local disk, and the only original this application owns — every
+//! other store is a fold over it. Sealing and shipping it is [`crate::data::export`]'s.
 
 use std::path::{Path, PathBuf};
 
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client as S3Client;
 use chrono::{DateTime, NaiveDate, Utc};
-use polars::prelude::*;
 use serde::Serialize;
-use serde_json::Value;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 use uuid::Uuid;
 
-use crate::common::aws::date_partitioned_key;
-use crate::data::calendar::SessionDate;
+use crate::common::types::SessionDate;
 
 /// Version stamped on every record written by this build.
 ///
-/// Readers map old versions forward rather than rewriting files, so this only ever goes up.
-pub const SCHEMA_VERSION: u32 = 1;
-
-/// S3 prefix the sealed sessions are written under.
-pub const EXPORT_PREFIX: &str = "exports/session_log";
-
-/// Calendar days of sealed sessions kept on local disk after a clean export.
-///
-/// The window in which a bad Parquet conversion can still be repaired from the original bytes.
-pub const RETENTION_DAYS: i64 = 7;
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
+/// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
@@ -57,18 +45,34 @@ pub enum SessionLogError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum Observation {
-    /// One five-minute pass: what it saw, what it decided, and what stopped it doing more.
-    EvaluationPass(Box<EvaluationPass>),
+    /// One scheduled command, however it ended.
+    CommandFinished(CommandFinished),
+    /// One five-minute pass: what it decided, and what stopped it doing more.
+    PassEvaluated(Box<PassEvaluated>),
+    /// What one price fetch returned, and what it asked for and did not get.
+    PricesObserved(PricesObserved),
+    /// The eligibility funnel: what reached the screen and what did not.
+    UniverseScreened(UniverseScreened),
+    /// Every open pair as one pass measured it, closed or held.
+    OpenPairsObserved(OpenPairsObserved),
+    /// A pair as it was written to the book.
+    PairOpened(PairOpened),
+    /// A pair as it was marked closed.
+    PairClosed(PairClosed),
+    /// What the post-close sync attributed to a closed pair.
+    PairAttributed(PairAttributed),
     /// An order as it was sent, written before the request leaves the process.
     OrderSubmitted(OrderSubmitted),
     /// How the broker settled that order, filled or not.
     OrderResolved(OrderResolved),
     /// A position the application asked Alpaca to close.
     PositionCloseRequested(PositionCloseRequested),
-    /// The pre-close flattening.
-    LiquidationRun(LiquidationRun),
-    /// The pre-open inference run and the artifact it resolved.
-    PredictionsGenerated(PredictionsGenerated),
+    /// The pre-close flattening, whether or not it flattened anything.
+    LiquidationAttempted(LiquidationAttempted),
+    /// The pre-open inference run, the artifact it resolved, and the predictions it produced.
+    PredictionsGenerated(Box<PredictionsGenerated>),
+    /// One activity as Alpaca reported it, fill or transfer.
+    ActivityObserved(ActivityObserved),
     /// The post-close account state, which Alpaca cannot fully report again for a past date.
     AccountObserved(AccountObserved),
 }
@@ -77,23 +81,50 @@ impl Observation {
     /// The stable name this observation serializes under.
     pub fn event_type(&self) -> &'static str {
         match self {
-            Observation::EvaluationPass(_) => "evaluation_pass",
+            Observation::CommandFinished(_) => "command_finished",
+            Observation::PassEvaluated(_) => "pass_evaluated",
+            Observation::PricesObserved(_) => "prices_observed",
+            Observation::UniverseScreened(_) => "universe_screened",
+            Observation::OpenPairsObserved(_) => "open_pairs_observed",
+            Observation::PairOpened(_) => "pair_opened",
+            Observation::PairClosed(_) => "pair_closed",
+            Observation::PairAttributed(_) => "pair_attributed",
             Observation::OrderSubmitted(_) => "order_submitted",
             Observation::OrderResolved(_) => "order_resolved",
             Observation::PositionCloseRequested(_) => "position_close_requested",
-            Observation::LiquidationRun(_) => "liquidation_run",
+            Observation::LiquidationAttempted(_) => "liquidation_attempted",
             Observation::PredictionsGenerated(_) => "predictions_generated",
+            Observation::ActivityObserved(_) => "activity_observed",
             Observation::AccountObserved(_) => "account_observed",
         }
     }
 }
 
-/// One evaluation pass, whole.
+/// One scheduled command, however it ended.
 ///
-/// `prices` holds every reading once; pair and candidate rows name tickers without repeating it.
-/// `candidates` holds only the pairs the screen scored, not the quadratic cross product.
+/// Written for every firing, including the ones that do no work: a holiday, a dropped duplicate,
+/// and a crashed process are otherwise the same absence. `correlation_id` is shared with everything
+/// the command did, which is what makes the duration attributable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommandFinished {
+    pub command: String,
+    /// `completed`, `errored`, `dropped_in_flight`, or `skipped_` and the handler's reason.
+    pub outcome: String,
+    /// Absent for a command that never ran.
+    pub duration_milliseconds: Option<u64>,
+    /// The rendered error, when the command failed.
+    pub error: Option<String>,
+    /// The handler's own summary, as it reached the completion event.
+    pub summary: Option<serde_json::Value>,
+}
+
+/// One evaluation pass: what it decided and what stopped it.
+///
+/// The readings it acted on are their own records sharing this pass's `correlation_id` — prices,
+/// the screen funnel, the open book. `candidates` stays here because a candidate's decision is not
+/// known until the pass ends.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
-pub struct EvaluationPass {
+pub struct PassEvaluated {
     pub account_equity: Option<f64>,
     pub previous_session_equity: Option<f64>,
     pub gross_exposure_used: Option<f64>,
@@ -109,16 +140,53 @@ pub struct EvaluationPass {
     pub model_run_id: Option<String>,
     /// Why the entry half did not run at all, if it did not.
     pub session_block: Option<String>,
-    pub prices: Vec<PriceReading>,
-    pub open_pairs: Vec<OpenPairReading>,
-    /// Every forecast that reached the screen, as the screen received it.
-    pub screen_inputs: Vec<ScreenInputReading>,
-    /// Every forecast that did not, and the first test it failed.
-    pub excluded: Vec<ExcludedTickerReading>,
+    /// The error that ended the pass early, if one did.
+    ///
+    /// Set on every failing path, so a pass that died after pricing the book still says what it had
+    /// measured. Its absence is the claim that the pass ran to completion.
+    pub failure: Option<String>,
     pub candidates: Vec<CandidateReading>,
 }
 
-/// One forecast as the screen consumed it.
+/// What one price fetch returned.
+///
+/// Written per fetch rather than per pass: the exit half prices the open book and the entry half
+/// asks only for what it is missing, and those are two separate readings of the market.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct PricesObserved {
+    /// What the fetch was for — `open_pairs` or `screen_candidates`.
+    pub purpose: String,
+    pub readings: Vec<PriceReading>,
+    pub unavailable: Vec<UnavailablePrice>,
+}
+
+/// A symbol the fetch asked for and did not get a usable price for.
+///
+/// Distinguishing the causes is the point: an absent price with no cause is indistinguishable from
+/// a symbol nobody asked about.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UnavailablePrice {
+    pub ticker: String,
+    /// `no_quote` or `chunk_failed`.
+    pub cause: String,
+}
+
+/// The eligibility funnel for one pass.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct UniverseScreened {
+    /// Every prediction that reached the screen, as the screen received it.
+    pub inputs: Vec<ScreenInputReading>,
+    /// Every prediction that did not, and the first test it failed.
+    pub excluded: Vec<ExcludedTickerReading>,
+}
+
+/// Every open pair as one pass measured it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct OpenPairsObserved {
+    pub readings: Vec<OpenPairReading>,
+}
+
+/// One prediction as the screen consumed it.
 ///
 /// Derived from the stored quantiles and the session's universe, so not recoverable from
 /// `equity_predictions` alone.
@@ -130,7 +198,7 @@ pub struct ScreenInputReading {
     pub is_shortable: bool,
 }
 
-/// One forecast the eligibility filter removed, and why.
+/// One prediction the eligibility filter removed, and why.
 ///
 /// Written every pass, because `held` changes within a session even though the other tests do not.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -195,6 +263,52 @@ pub struct CandidateReading {
     pub refusal: Option<String>,
 }
 
+/// A pair as it was written to the book.
+///
+/// `equity_pairs` is mutated in place three times over a pair's life, so the log needs three
+/// records where the table has one row. This is the only one carrying the entry rationale: nothing
+/// external knows which long was paired with which short, or on what.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairOpened {
+    /// The `equity_pairs` primary key, which the two later records join on.
+    pub pair_uuid: String,
+    pub pair_id: String,
+    pub long_ticker: String,
+    pub short_ticker: String,
+    pub hedge_ratio: f64,
+    pub entry_z_score: f64,
+    pub signal_strength: f64,
+    pub model_run_id: Option<String>,
+    pub opened_at: DateTime<Utc>,
+}
+
+/// A pair as it was marked closed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairClosed {
+    pub pair_uuid: String,
+    /// `convergence`, `stop_loss`, `end_of_day`, or `position_missing`.
+    pub reason: String,
+    pub closed_at: DateTime<Utc>,
+    /// False when the pair was already closed, so this write changed nothing.
+    ///
+    /// A pass racing the pre-close liquidation is the ordinary way to reach it, and the collision
+    /// is worth seeing.
+    pub updated: bool,
+}
+
+/// The attribution the post-close sync wrote to a closed pair.
+///
+/// A record of a write, not of a conclusion — the same kind of thing as [`OrderSubmitted`]. The
+/// amount is derivable from [`PairOpened`], [`PairClosed`], and the session's [`ActivityObserved`]
+/// rows; what is not derivable is that this process put that number on that row and that it landed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairAttributed {
+    pub pair_uuid: String,
+    pub realized_profit_and_loss: Option<f64>,
+    /// False when no closed pair matched, so the attribution landed nowhere.
+    pub updated: bool,
+}
+
 /// An order at the moment it was sent, before the broker has said anything about it.
 ///
 /// Keyed by `client_order_id` because this is written before the request leaves the process, when
@@ -256,25 +370,69 @@ pub struct PositionCloseRequested {
 }
 
 /// The pre-close flattening.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LiquidationRun {
+///
+/// Written whether or not the flattening succeeded. This is the last fail-safe before positions
+/// carry overnight, and a run that failed at the broker used to leave no trace of having been
+/// attempted at all.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct LiquidationAttempted {
     pub pairs_closed: usize,
     pub positions_refused: usize,
     pub pairs_still_open: Vec<String>,
+    /// The error that ended the run early, if one did. Its absence is the claim that the run
+    /// finished, not that the book is flat — `pairs_still_open` answers that.
+    pub failure: Option<String>,
 }
 
-/// The pre-open inference run.
+/// The pre-open inference run and everything it produced.
 ///
-/// The forecasts live in `equity_predictions`; what only this run knows is which artifact made
-/// them.
+/// The quantiles are here rather than left to `equity_predictions` and the nightly export, because
+/// those are the model's actual output and the log is meant to hold the originals. They arrive at
+/// one moment from one place, so unlike the pass readings there is nothing to gain by splitting
+/// them out.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PredictionsGenerated {
     pub model_run_id: String,
     pub artifact_key: String,
     pub artifact_staleness_sessions: Option<i64>,
-    pub predictions: usize,
+    /// Rows the database accepted, which is not the prediction count when an upsert collapses a
+    /// re-run.
     pub rows_written: u64,
     pub universe_size: usize,
+    pub predictions: Vec<PredictionReading>,
+}
+
+/// One ticker's prediction, as the model produced it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PredictionReading {
+    pub ticker: String,
+    pub timestamp: DateTime<Utc>,
+    pub quantile_10: f64,
+    pub quantile_50: f64,
+    pub quantile_90: f64,
+}
+
+/// One activity as Alpaca reported it.
+///
+/// Kept as our own record rather than re-fetched, because Alpaca's retention bounds how long the
+/// question can be asked. `net_amount` is the reason this matters most: it is the only field
+/// saying how much a deposit or withdrawal moved, and it reaches no other store the application
+/// owns.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityObserved {
+    /// Alpaca's activity identifier, which is what makes the sync idempotent.
+    pub activity_id: String,
+    /// `FILL`, `CSD`, `CSW`, or `JNLC`.
+    pub activity_type: String,
+    pub transaction_time: DateTime<Utc>,
+    pub ticker: Option<String>,
+    pub side: Option<String>,
+    pub quantity: Option<f64>,
+    pub price: Option<f64>,
+    /// Set on transfers, which carry this instead of a quantity and price.
+    pub net_amount: Option<f64>,
+    /// Joins a fill back to the order that produced it.
+    pub order_id: Option<String>,
 }
 
 /// The post-close account state.
@@ -434,15 +592,24 @@ impl SessionLog {
     ///
     /// The export takes this before reading, so no reader sees a half-written line. The open handle
     /// is dropped, so the next append reopens the file.
-    async fn seal(&self) -> tokio::sync::MutexGuard<'_, Option<OpenSession>> {
+    pub async fn seal(&self) -> SessionLogGuard<'_> {
         let mut open_session = self.open_session.lock().await;
         *open_session = None;
-        open_session
+        SessionLogGuard {
+            _appends_blocked: open_session,
+        }
     }
 }
 
+/// Proof that no append can run while it is alive.
+///
+/// Opaque on purpose: holding it is the whole contract, and there is nothing inside worth reading.
+pub struct SessionLogGuard<'a> {
+    _appends_blocked: tokio::sync::MutexGuard<'a, Option<OpenSession>>,
+}
+
 /// The file one session's records live in.
-fn file_name(session_date: SessionDate) -> String {
+pub(crate) fn file_name(session_date: SessionDate) -> String {
     format!("session-{}.jsonl", session_date.date())
 }
 
@@ -450,7 +617,7 @@ fn file_name(session_date: SessionDate) -> String {
 ///
 /// `None` rather than an error, because a stray file is something to skip, not to fail a run
 /// over.
-fn session_from_file_name(name: &str) -> Option<SessionDate> {
+pub(crate) fn session_from_file_name(name: &str) -> Option<SessionDate> {
     let date = name.strip_prefix("session-")?.strip_suffix(".jsonl")?;
     let session_date = SessionDate::from_date(NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?);
     // Accepted only if it is exactly what the writer would have produced. `%Y-%m-%d` also parses
@@ -459,245 +626,10 @@ fn session_from_file_name(name: &str) -> Option<SessionDate> {
     (file_name(session_date) == name).then_some(session_date)
 }
 
-// ---------------------------------------------------------------------------
-// Export
-// ---------------------------------------------------------------------------
-
-/// What one export run accomplished.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SessionLogExportSummary {
-    /// `(session_date, records)` for each session written to S3.
-    pub exported: Vec<(NaiveDate, usize)>,
-    /// `(session_date, error)` for each session that failed.
-    pub failed: Vec<(NaiveDate, String)>,
-    /// Sessions whose local file was deleted after the retention window.
-    pub deleted: Vec<NaiveDate>,
-    /// Lines skipped as unreadable, across every session.
-    ///
-    /// A torn final line per crashed session is expected; more than that means something else is
-    /// wrong.
-    pub unparsable_lines: usize,
-}
-
-impl SessionLogExportSummary {
-    pub fn total_records(&self) -> usize {
-        self.exported.iter().map(|(_, records)| records).sum()
-    }
-
-    pub fn is_clean(&self) -> bool {
-        self.failed.is_empty()
-    }
-}
-
-/// Converts every sealed session on disk to Parquet in S3, then deletes what has aged out.
-///
-/// Every file present is exported, not just the retention window: one whole file at a deterministic
-/// key makes a repeat a byte-identical overwrite, so a failed run repairs itself. Local files are
-/// deleted only after a clean run.
-pub async fn export_session_logs(
-    log: &SessionLog,
-    s3_client: &S3Client,
-    bucket: &str,
-    today: SessionDate,
-) -> SessionLogExportSummary {
-    let mut summary = SessionLogExportSummary::default();
-
-    let mut sessions = match sealed_sessions(log.directory(), today) {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            warn!(%error, "Session log directory could not be read; nothing exported");
-            return summary;
-        }
-    };
-    sessions.sort();
-
-    // Held across the reads so no append can interleave with one. Today's file is sealed by the
-    // clock rather than by anything structural, and a recovery replay can run a pass at any hour.
-    let sealed = log.seal().await;
-
-    for session_date in &sessions {
-        let path = log.directory().join(file_name(*session_date));
-        match read_session_frame(&path) {
-            Ok((mut frame, unparsable)) => {
-                summary.unparsable_lines += unparsable;
-                let key = date_partitioned_key(EXPORT_PREFIX, session_date.date());
-                match write_frame(s3_client, bucket, &key, &mut frame).await {
-                    Ok(()) => summary.exported.push((session_date.date(), frame.height())),
-                    Err(error) => summary.failed.push((session_date.date(), error)),
-                }
-            }
-            Err(error) => summary.failed.push((session_date.date(), error)),
-        }
-    }
-
-    drop(sealed);
-
-    if summary.is_clean() {
-        summary.deleted = delete_aged_out(log.directory(), &sessions, today);
-    }
-
-    info!(
-        sessions = summary.exported.len(),
-        records = summary.total_records(),
-        failed = summary.failed.len(),
-        deleted = summary.deleted.len(),
-        unparsable_lines = summary.unparsable_lines,
-        "Session log export finished"
-    );
-    for (session_date, error) in &summary.failed {
-        warn!(%session_date, error, "Session log failed to export");
-    }
-    summary
-}
-
-/// Sessions on disk whose trading day has finished.
-///
-/// Today counts, because this runs after the close; a future-dated file does not, and exporting one
-/// would seal a session still being written.
-fn sealed_sessions(
-    directory: &Path,
-    today: SessionDate,
-) -> Result<Vec<SessionDate>, std::io::Error> {
-    let mut sessions = Vec::new();
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let Some(session_date) = session_from_file_name(&name) else {
-            continue;
-        };
-        if session_date > today {
-            warn!(%session_date, %today, "Session log is dated ahead of today; not sealed");
-            continue;
-        }
-        sessions.push(session_date);
-    }
-    Ok(sessions)
-}
-
-/// Removes the local copies of sessions older than the retention window.
-///
-/// Called only after a clean run, so a session cannot age out without reaching S3. A file that will
-/// not delete is a warning: a stale local copy costs disk and nothing else.
-fn delete_aged_out(
-    directory: &Path,
-    sessions: &[SessionDate],
-    today: SessionDate,
-) -> Vec<NaiveDate> {
-    let oldest_kept = today.plus_calendar_days(-RETENTION_DAYS);
-    let mut deleted = Vec::new();
-    for session_date in sessions.iter().filter(|session| **session < oldest_kept) {
-        let path = directory.join(file_name(*session_date));
-        match std::fs::remove_file(&path) {
-            Ok(()) => deleted.push(session_date.date()),
-            Err(error) => warn!(
-                path = %path.display(),
-                %error,
-                "Aged-out session log could not be deleted"
-            ),
-        }
-    }
-    deleted
-}
-
-/// Reads one session file into a frame, returning it with the number of lines skipped.
-///
-/// Discarding a torn final line is why the original is JSONL rather than Parquet.
-fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-
-    let mut schema_versions: Vec<Option<i64>> = Vec::new();
-    let mut event_ids: Vec<Option<String>> = Vec::new();
-    let mut correlation_ids: Vec<Option<String>> = Vec::new();
-    let mut event_types: Vec<Option<String>> = Vec::new();
-    let mut session_dates: Vec<Option<String>> = Vec::new();
-    let mut created_ats: Vec<Option<i64>> = Vec::new();
-    let mut payloads: Vec<Option<String>> = Vec::new();
-    let mut unparsable = 0usize;
-
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(Value::Object(record)) = serde_json::from_str::<Value>(line) else {
-            unparsable += 1;
-            continue;
-        };
-        let text = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
-
-        // A record missing any of its envelope is discarded rather than written with nulls, so a
-        // query cannot mistake an unaddressable row for a good one.
-        let (Some(event_id), Some(event_type), Some(created_at)) = (
-            text("event_id"),
-            text("event_type"),
-            text("created_at").and_then(|stamp| {
-                DateTime::parse_from_rfc3339(&stamp)
-                    .ok()
-                    .map(|instant| instant.timestamp_millis())
-            }),
-        ) else {
-            unparsable += 1;
-            continue;
-        };
-
-        schema_versions.push(record.get("schema_version").and_then(Value::as_i64));
-        event_ids.push(Some(event_id));
-        correlation_ids.push(text("correlation_id"));
-        event_types.push(Some(event_type));
-        session_dates.push(text("session_date"));
-        created_ats.push(Some(created_at));
-        payloads.push(record.get("payload").map(Value::to_string));
-    }
-
-    if unparsable > 0 {
-        warn!(
-            path = %path.display(),
-            unparsable,
-            "Skipped session log lines that would not parse"
-        );
-    }
-
-    let frame = DataFrame::new(vec![
-        Column::new("schema_version".into(), schema_versions),
-        Column::new("event_id".into(), event_ids),
-        Column::new("correlation_id".into(), correlation_ids),
-        Column::new("event_type".into(), event_types),
-        Column::new("session_date".into(), session_dates),
-        Column::new("created_at".into(), created_ats),
-        Column::new("payload".into(), payloads),
-    ])
-    .map_err(|error| format!("failed to build frame for {}: {error}", path.display()))?;
-
-    Ok((frame, unparsable))
-}
-
-/// Serializes a frame to Parquet and puts it at `key`.
-async fn write_frame(
-    s3_client: &S3Client,
-    bucket: &str,
-    key: &str,
-    frame: &mut DataFrame,
-) -> Result<(), String> {
-    let mut buffer: Vec<u8> = Vec::new();
-    ParquetWriter::new(&mut buffer)
-        .finish(frame)
-        .map_err(|error| format!("failed to serialize Parquet: {error}"))?;
-
-    s3_client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from(buffer))
-        .content_type("application/vnd.apache.parquet")
-        .send()
-        .await
-        .map_err(|error| format!("failed to write s3://{bucket}/{key}: {error}"))?;
-
-    info!(key, records = frame.height(), "Session log exported");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
@@ -719,6 +651,139 @@ mod tests {
             long_market_value: Some(50_000.0),
             short_market_value: Some(-50_000.0),
         })
+    }
+
+    /// The wire names are a contract: `tests/test_handlers.rs` selects records by them and the
+    /// DuckDB view documents them as query filters. A typo in one arm compiles and breaks a reader.
+    ///
+    /// Matched exhaustively rather than iterated over a list, so a new variant does not compile
+    /// until it is named here.
+    #[test]
+    fn test_every_observation_serializes_under_its_documented_name() {
+        fn expected(observation: &Observation) -> &'static str {
+            match observation {
+                Observation::CommandFinished(_) => "command_finished",
+                Observation::PassEvaluated(_) => "pass_evaluated",
+                Observation::PricesObserved(_) => "prices_observed",
+                Observation::UniverseScreened(_) => "universe_screened",
+                Observation::OpenPairsObserved(_) => "open_pairs_observed",
+                Observation::PairOpened(_) => "pair_opened",
+                Observation::PairClosed(_) => "pair_closed",
+                Observation::PairAttributed(_) => "pair_attributed",
+                Observation::OrderSubmitted(_) => "order_submitted",
+                Observation::OrderResolved(_) => "order_resolved",
+                Observation::PositionCloseRequested(_) => "position_close_requested",
+                Observation::LiquidationAttempted(_) => "liquidation_attempted",
+                Observation::PredictionsGenerated(_) => "predictions_generated",
+                Observation::ActivityObserved(_) => "activity_observed",
+                Observation::AccountObserved(_) => "account_observed",
+            }
+        }
+
+        for observation in every_observation() {
+            // Against `event_type()`, which the writer logs by, and against the serialized tag,
+            // which is what actually reaches the archive. The two are separate code paths.
+            assert_eq!(observation.event_type(), expected(&observation));
+            let value = serde_json::to_value(Record::new(
+                Uuid::nil(),
+                instant("2026-08-11T20:15:00Z"),
+                observation.clone(),
+            ))
+            .expect("every observation must serialize");
+            assert_eq!(
+                value["event_type"],
+                expected(&observation),
+                "the serialized tag is what a reader filters on"
+            );
+        }
+    }
+
+    /// One value per variant, so the compiler forces this list to grow with the enum.
+    fn every_observation() -> Vec<Observation> {
+        vec![
+            Observation::CommandFinished(CommandFinished {
+                command: "portfolio_evaluation".to_string(),
+                outcome: "completed".to_string(),
+                duration_milliseconds: Some(12),
+                error: None,
+                summary: None,
+            }),
+            Observation::PassEvaluated(Box::default()),
+            Observation::PricesObserved(PricesObserved::default()),
+            Observation::UniverseScreened(UniverseScreened::default()),
+            Observation::OpenPairsObserved(OpenPairsObserved::default()),
+            Observation::PairOpened(PairOpened {
+                pair_uuid: Uuid::nil().to_string(),
+                pair_id: "AAAA-BBBB".to_string(),
+                long_ticker: "AAAA".to_string(),
+                short_ticker: "BBBB".to_string(),
+                hedge_ratio: 1.0,
+                entry_z_score: 2.5,
+                signal_strength: 0.03,
+                model_run_id: None,
+                opened_at: instant("2026-08-11T14:35:00Z"),
+            }),
+            Observation::PairClosed(PairClosed {
+                pair_uuid: Uuid::nil().to_string(),
+                reason: "convergence".to_string(),
+                closed_at: instant("2026-08-11T18:00:00Z"),
+                updated: true,
+            }),
+            Observation::PairAttributed(PairAttributed {
+                pair_uuid: Uuid::nil().to_string(),
+                realized_profit_and_loss: Some(100.0),
+                updated: true,
+            }),
+            Observation::OrderSubmitted(OrderSubmitted {
+                client_order_id: "k-long".to_string(),
+                ticker: "AAAA".to_string(),
+                side: "buy".to_string(),
+                shares: None,
+                notional: Some(1_000.0),
+            }),
+            Observation::OrderResolved(OrderResolved {
+                client_order_id: "k-long".to_string(),
+                alpaca_order_id: Some("o1".to_string()),
+                ticker: "AAAA".to_string(),
+                outcome: "filled".to_string(),
+                filled_shares: Some(10.0),
+                filled_average_price: Some(100.0),
+                filled_after_cancel: false,
+                error: None,
+            }),
+            Observation::PositionCloseRequested(PositionCloseRequested {
+                ticker: "AAAA".to_string(),
+                pair_id: None,
+                alpaca_order_id: None,
+                side: None,
+                quantity: None,
+                reason: "liquidation".to_string(),
+                accepted: true,
+                status: Some(200),
+                error: None,
+            }),
+            Observation::LiquidationAttempted(LiquidationAttempted::default()),
+            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
+                model_run_id: "run-1".to_string(),
+                artifact_key: "models/tide/run-1".to_string(),
+                artifact_staleness_sessions: None,
+                rows_written: 0,
+                universe_size: 0,
+                predictions: Vec::new(),
+            })),
+            Observation::ActivityObserved(ActivityObserved {
+                activity_id: "a1".to_string(),
+                activity_type: "FILL".to_string(),
+                transaction_time: instant("2026-08-11T18:00:00Z"),
+                ticker: Some("AAAA".to_string()),
+                side: Some("buy".to_string()),
+                quantity: Some(10.0),
+                price: Some(100.0),
+                net_amount: None,
+                order_id: Some("o1".to_string()),
+            }),
+            account_observation(),
+        ]
     }
 
     /// A directory unique to this run.
@@ -870,126 +935,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A crash mid-append leaves a partial final line. Discarding it is the whole reason the
-    /// original is JSONL: the same truncation in a Parquet file loses the entire session.
-    #[test]
-    fn test_a_torn_final_line_is_skipped_rather_than_failing_the_session() {
-        let directory = temporary_directory("torn");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-        let path = directory.join("session-2026-08-11.jsonl");
-        let complete = serde_json::to_string(&Record::new(
-            Uuid::nil(),
-            instant("2026-08-11T14:35:00Z"),
-            account_observation(),
-        ))
-        .expect("the record must serialize");
-        std::fs::write(&path, format!("{complete}\n{{\"schema_version\":1,\"eve"))
-            .expect("the file must be writable");
-
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must still read");
-        assert_eq!(frame.height(), 1);
-        assert_eq!(unparsable, 1);
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// Valid JSON is not enough: a row without an addressable envelope would reach Parquet with
-    /// nulls no query could tell apart from a good record.
-    #[test]
-    fn test_a_record_missing_its_envelope_is_counted_unparsable() {
-        let directory = temporary_directory("envelope");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-        let path = directory.join("session-2026-08-11.jsonl");
-        let complete = serde_json::to_string(&Record::new(
-            Uuid::nil(),
-            instant("2026-08-11T20:15:00Z"),
-            account_observation(),
-        ))
-        .expect("the record must serialize");
-        let lines = [
-            complete.as_str(),
-            r#"{"schema_version":1,"event_type":"account_observed","created_at":"2026-08-11T20:15:00Z"}"#,
-            r#"{"schema_version":1,"event_id":"a","event_type":"account_observed","created_at":"not a time"}"#,
-        ]
-        .join("\n");
-        std::fs::write(&path, lines).expect("the file must be writable");
-
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
-        assert_eq!(
-            frame.height(),
-            1,
-            "only the complete record reaches the frame"
-        );
-        assert_eq!(
-            unparsable, 2,
-            "a missing event_id and an unparseable instant"
-        );
-    }
-
-    #[test]
-    fn test_a_frame_carries_the_envelope_as_columns_and_the_payload_as_json() {
-        let directory = temporary_directory("frame");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-        let path = directory.join("session-2026-08-11.jsonl");
-        let record = Record::new(
-            Uuid::nil(),
-            instant("2026-08-11T20:15:00Z"),
-            account_observation(),
-        );
-        std::fs::write(
-            &path,
-            format!(
-                "{}\n",
-                serde_json::to_string(&record).expect("the record must serialize")
-            ),
-        )
-        .expect("the file must be writable");
-
-        let (frame, _) = read_session_frame(&path).expect("the session must read");
-        assert_eq!(
-            frame.get_column_names(),
-            [
-                "schema_version",
-                "event_id",
-                "correlation_id",
-                "event_type",
-                "session_date",
-                "created_at",
-                "payload"
-            ]
-        );
-        let payload = frame
-            .column("payload")
-            .expect("payload column")
-            .str()
-            .expect("payload is text")
-            .get(0)
-            .expect("one row");
-        let parsed: Value = serde_json::from_str(payload).expect("the payload stays valid JSON");
-        assert_eq!(parsed["equity"], 104_812.55);
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// Today's file is sealed because the export runs after the close; a future-dated one is not,
-    /// and exporting it would seal a session still being written.
-    #[test]
-    fn test_only_sessions_up_to_today_are_sealed() {
-        let directory = temporary_directory("sealed");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-        for name in [
-            "session-2026-08-09.jsonl",
-            "session-2026-08-11.jsonl",
-            "session-2026-08-12.jsonl",
-            "notes.txt",
-        ] {
-            std::fs::write(directory.join(name), "").expect("the file must be writable");
-        }
-
-        let mut sealed = sealed_sessions(&directory, session(2026, 8, 11)).expect("readable");
-        sealed.sort();
-        assert_eq!(sealed, vec![session(2026, 8, 9), session(2026, 8, 11)]);
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
     /// RAII guard that restores an environment variable on drop, panic-safe.
     ///
     /// Tests using this must be marked `#[serial]` to prevent concurrent env access.
@@ -1057,114 +1002,5 @@ mod tests {
         assert_eq!(log.directory(), log_directory.join("sessions"));
         assert!(log.directory().is_dir());
         let _ = std::fs::remove_dir_all(&log_directory);
-    }
-
-    /// The frame survives a Parquet round trip with its envelope typed and its payload intact.
-    ///
-    /// This is the artifact DuckDB reads, so a serialization that silently dropped a column or
-    /// widened the payload out of shape would take the whole archive with it.
-    #[test]
-    fn test_a_session_frame_round_trips_through_parquet() {
-        let directory = temporary_directory("parquet");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-        let path = directory.join("session-2026-08-11.jsonl");
-        let mut lines = String::new();
-        for equity in [104_812.55_f64, 105_000.0] {
-            let record = Record::new(
-                Uuid::new_v4(),
-                instant("2026-08-11T20:15:00Z"),
-                Observation::AccountObserved(AccountObserved {
-                    session_date: session(2026, 8, 11),
-                    equity: Some(equity),
-                    cash: Some(12_000.0),
-                    buying_power: Some(200_000.0),
-                    long_market_value: Some(50_000.0),
-                    short_market_value: Some(-50_000.0),
-                }),
-            );
-            lines.push_str(&serde_json::to_string(&record).expect("the record must serialize"));
-            lines.push('\n');
-        }
-        std::fs::write(&path, lines).expect("the file must be writable");
-
-        let (mut frame, _) = read_session_frame(&path).expect("the session must read");
-        let mut buffer: Vec<u8> = Vec::new();
-        ParquetWriter::new(&mut buffer)
-            .finish(&mut frame)
-            .expect("the frame must serialize to Parquet");
-
-        let restored = ParquetReader::new(std::io::Cursor::new(buffer))
-            .finish()
-            .expect("the Parquet must read back");
-        assert_eq!(restored.height(), 2);
-        assert_eq!(restored.get_column_names(), frame.get_column_names());
-        // The instant survives as milliseconds, which is what lets a reader recover 16:15 Eastern.
-        assert_eq!(
-            restored
-                .column("created_at")
-                .expect("created_at column")
-                .i64()
-                .expect("created_at is an integer")
-                .get(0),
-            Some(instant("2026-08-11T20:15:00Z").timestamp_millis())
-        );
-        let payload = restored
-            .column("payload")
-            .expect("payload column")
-            .str()
-            .expect("payload is text")
-            .get(0)
-            .expect("one row");
-        let parsed: Value = serde_json::from_str(payload).expect("the payload stays valid JSON");
-        assert_eq!(parsed["equity"], 104_812.55);
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// Only what has aged out goes, and the window's own edge stays. The local file is the
-    /// crash-exact original, so deleting one still inside the window would remove the only thing a
-    /// bad Parquet conversion could be repaired from.
-    #[test]
-    fn test_only_sessions_past_the_retention_window_are_deleted() {
-        let directory = temporary_directory("retention");
-        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
-
-        let today = session(2026, 8, 11);
-        let sessions = [
-            today.plus_calendar_days(-RETENTION_DAYS - 1),
-            today.plus_calendar_days(-RETENTION_DAYS),
-            today.plus_calendar_days(-1),
-            today,
-        ];
-        for session_date in sessions {
-            std::fs::write(directory.join(file_name(session_date)), "")
-                .expect("the file must be writable");
-        }
-
-        let deleted = delete_aged_out(&directory, &sessions, today);
-
-        assert_eq!(deleted, vec![sessions[0].date()]);
-        assert!(!directory.join(file_name(sessions[0])).exists());
-        for session_date in &sessions[1..] {
-            assert!(
-                directory.join(file_name(*session_date)).exists(),
-                "{session_date} is still inside the window"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// The key is a pure function of the session, which is what makes a repeat export an overwrite
-    /// rather than a duplicate — and why there is no cursor to keep in sync.
-    #[test]
-    fn test_the_export_key_is_determined_by_the_session_alone() {
-        let key = date_partitioned_key(EXPORT_PREFIX, session(2026, 8, 11).date());
-        assert_eq!(
-            key,
-            "exports/session_log/year=2026/month=08/day=11/data.parquet"
-        );
-        assert_eq!(
-            key,
-            date_partitioned_key(EXPORT_PREFIX, session(2026, 8, 11).date())
-        );
     }
 }

@@ -14,11 +14,12 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use tracing::{info, warn};
 
 use crate::common::alpaca::{CalendarDay, ClientError, TradingClient};
+use crate::common::types::SessionDate;
 
 /// How far forward to fetch published sessions.
 ///
@@ -31,107 +32,6 @@ const HORIZON_DAYS_FORWARD: i64 = 90;
 /// The bar sync asks for the previous trading day, and a long weekend plus a holiday is the worst
 /// case. Thirty days is generous.
 const HORIZON_DAYS_BACKWARD: i64 = 30;
-
-/// A trading day, identified by its `America/New_York` calendar date.
-///
-/// The type exists to make a session and an instant impossible to confuse. Both used to be spelled
-/// `NaiveDate`/`DateTime`, and every timekeeping bug this system has had was that confusion: a
-/// session derived from `Utc::now().date_naive()`, a forecast stamped at UTC midnight, a session
-/// and its label computed from two separate expressions. None of those is expressible here.
-///
-/// There are exactly two ways in. [`SessionDate::at`] converts an instant, which is the only
-/// correct way to answer "what trading day is it now". [`SessionDate::from_date`] takes a date
-/// already expressed in Eastern terms — parsed from a command-line argument, read from a `DATE`
-/// column, or returned by an exchange API that publishes Eastern dates. A `NaiveDate` obtained any
-/// other way, and a UTC date in particular, has no business becoming one of these.
-///
-/// **What it guarantees is the timezone, not tradability.** A `SessionDate` is a calendar date in
-/// the frame the exchange keeps; it is not proof that the market opens that day. Weekends and
-/// holidays are perfectly representable, and [`SessionDate::plus_calendar_days`] will land on them.
-/// Whether a date trades is [`TradingCalendar::is_trading_day`]'s question, and it is the only
-/// thing that can answer it — the calendar is fetched from Alpaca, and a holiday table in the type
-/// system would be a second source that can disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(transparent)]
-pub struct SessionDate(NaiveDate);
-
-impl SessionDate {
-    /// The trading day an instant falls in.
-    ///
-    /// The trading day rolls over at Eastern midnight, not UTC midnight, and the two differ for
-    /// four or five hours of every day. Every cache key, session comparison, and "is this still
-    /// today" check in the system goes through here.
-    pub fn at(instant: DateTime<Utc>) -> Self {
-        Self(instant.with_timezone(&New_York).date_naive())
-    }
-
-    /// Wraps a date that is already known to be a session.
-    ///
-    /// For values that arrive as session dates rather than being derived from a clock: a parsed
-    /// argument, a `DATE` column, an exchange calendar entry. Deriving one from an instant is
-    /// [`SessionDate::at`]'s job, and going through `date_naive()` to reach here is the bug this
-    /// type prevents.
-    pub fn from_date(date: NaiveDate) -> Self {
-        Self(date)
-    }
-
-    /// The underlying calendar date, for formatting and for binding to a `DATE` column.
-    pub fn date(self) -> NaiveDate {
-        self.0
-    }
-
-    /// Midnight Eastern on this session, as the equivalent UTC instant.
-    ///
-    /// Eastern shifts at 02:00 so local midnight always exists, but `earliest()` with a UTC
-    /// fallback is used anyway so a timezone database change cannot panic a caller.
-    pub fn midnight(self) -> DateTime<Utc> {
-        let local_midnight = self
-            .0
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is a valid wall-clock time");
-        New_York
-            .from_local_datetime(&local_midnight)
-            .earliest()
-            .map(|zoned| zoned.with_timezone(&Utc))
-            .unwrap_or_else(|| local_midnight.and_utc())
-    }
-
-    /// The half-open UTC interval `[start, end)` covering this session.
-    ///
-    /// The inverse of [`SessionDate::at`], so queries can bound a timestamp column directly. A
-    /// predicate like `(created_at AT TIME ZONE 'America/New_York')::date = $1` hides the column
-    /// behind an expression, defeating chunk exclusion and the index — a one-day export becomes a
-    /// full scan. Resolving bounds here keeps `column >= $start AND column < $end` sargable.
-    pub fn bounds(self) -> (DateTime<Utc>, DateTime<Utc>) {
-        (self.midnight(), self.plus_calendar_days(1).midnight())
-    }
-
-    /// This session shifted by whole **calendar** days.
-    ///
-    /// Named for the distinction it must not lose: this steps over weekends and holidays, unlike
-    /// [`TradingCalendar::previous_trading_day`] and [`TradingCalendar::next_trading_day`], which
-    /// land on published sessions. Used to bound fetch ranges, where overshooting is free.
-    pub fn plus_calendar_days(self, days: i64) -> Self {
-        Self(self.0 + Duration::days(days))
-    }
-
-    /// Whether this date falls on a weekend.
-    ///
-    /// Not a substitute for [`TradingCalendar::is_trading_day`] — it knows nothing about holidays —
-    /// but useful for bounding a fetch range before the calendar is available.
-    pub fn is_weekend(self) -> bool {
-        matches!(
-            self.0.weekday(),
-            chrono::Weekday::Sat | chrono::Weekday::Sun
-        )
-    }
-}
-
-impl std::fmt::Display for SessionDate {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
 
 /// The Eastern wall-clock time at an instant.
 pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
@@ -321,6 +221,8 @@ impl CalendarCache {
 
 #[cfg(test)]
 mod tests {
+    use chrono::NaiveDate;
+
     use super::*;
 
     fn date(year: i32, month: u32, day: u32) -> SessionDate {
@@ -464,17 +366,6 @@ mod tests {
         assert_eq!(calendar.minutes_until_close(holiday), None);
     }
 
-    /// The Eastern date must roll at Eastern midnight. 03:00 UTC is still the previous evening in
-    /// New York, and a UTC-based key would put it on the wrong trading day.
-    #[test]
-    fn test_eastern_date_rolls_at_eastern_midnight() {
-        let late_evening = "2026-06-11T03:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(SessionDate::at(late_evening), date(2026, 6, 10));
-
-        let morning = "2026-06-11T13:00:00Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(SessionDate::at(morning), date(2026, 6, 11));
-    }
-
     /// Daylight saving must be handled by the timezone database, not by an offset constant.
     /// 13:30 UTC is 09:30 Eastern in summer and 08:30 in winter.
     #[test]
@@ -489,55 +380,6 @@ mod tests {
             eastern_time(winter),
             NaiveTime::from_hms_opt(8, 30, 0).unwrap()
         );
-    }
-
-    /// The bounds must be half-open and must span exactly 24 hours on an ordinary day. In summer
-    /// Eastern is UTC-4, so the day runs 04:00 to 04:00 UTC.
-    #[test]
-    fn test_eastern_day_bounds_span_the_local_day_in_summer() {
-        let (start, end) = date(2026, 6, 10).bounds();
-        assert_eq!(start.to_rfc3339(), "2026-06-10T04:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2026-06-11T04:00:00+00:00");
-        assert_eq!((end - start).num_hours(), 24);
-    }
-
-    /// In winter Eastern is UTC-5, so the same local day is offset by an hour. A fixed offset would
-    /// get one of these two cases wrong.
-    #[test]
-    fn test_eastern_day_bounds_span_the_local_day_in_winter() {
-        let (start, end) = date(2026, 1, 14).bounds();
-        assert_eq!(start.to_rfc3339(), "2026-01-14T05:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2026-01-15T05:00:00+00:00");
-    }
-
-    /// The transition days are 23 and 25 hours long. Bounds computed by adding a fixed 24 hours
-    /// would silently include or exclude an hour of rows on exactly these two days a year.
-    #[test]
-    fn test_eastern_day_bounds_handle_daylight_saving_transitions() {
-        let (spring_start, spring_end) = date(2026, 3, 8).bounds();
-        assert_eq!(
-            (spring_end - spring_start).num_hours(),
-            23,
-            "spring forward is a 23-hour day"
-        );
-
-        let (autumn_start, autumn_end) = date(2026, 11, 1).bounds();
-        assert_eq!(
-            (autumn_end - autumn_start).num_hours(),
-            25,
-            "fall back is a 25-hour day"
-        );
-    }
-
-    /// The bounds must round-trip against `eastern_date`: every instant inside them is that Eastern
-    /// date, and the exclusive end already belongs to the next one.
-    #[test]
-    fn test_eastern_day_bounds_round_trip_against_eastern_date() {
-        let day = date(2026, 6, 10);
-        let (start, end) = day.bounds();
-        assert_eq!(SessionDate::at(start), day);
-        assert_eq!(SessionDate::at(end - Duration::seconds(1)), day);
-        assert_eq!(SessionDate::at(end), day.plus_calendar_days(1));
     }
 
     /// The case the trainer's artifact identifier depends on. A run that starts at 23:00 UTC and
@@ -580,13 +422,6 @@ mod tests {
                 "{instant} disagreed"
             );
         }
-    }
-
-    #[test]
-    fn test_is_weekend() {
-        assert!(date(2026, 11, 28).is_weekend());
-        assert!(date(2026, 11, 29).is_weekend());
-        assert!(!date(2026, 11, 27).is_weekend());
     }
 
     #[tokio::test]

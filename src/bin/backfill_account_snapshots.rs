@@ -17,7 +17,8 @@ use tracing::{error, info, warn};
 use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::database::connect_pool;
 use fund::common::observability::init_tracing;
-use fund::data::calendar::{SessionDate, TradingCalendar};
+use fund::common::types::SessionDate;
+use fund::data::calendar::TradingCalendar;
 use fund::portfolio::account;
 
 const USAGE: &str =

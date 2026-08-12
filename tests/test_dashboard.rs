@@ -15,9 +15,9 @@ mod common;
 use chrono::{Duration, Utc};
 use fund::common::alpaca::AccountSnapshot;
 use fund::common::events::{self, Command, EventType, Outcome};
-use fund::common::types::{PairID, Ticker};
+use fund::common::types::{PairID, SessionDate, Ticker};
 use fund::dashboard::database::fetch_dashboard_data;
-use fund::data::calendar::SessionDate;
+
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};
 use rust_decimal::Decimal;
@@ -173,7 +173,7 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     assert_eq!(data.period_returns.one_day, Some(1.0));
 
     assert_eq!(data.predictions.len(), 2);
-    // Ranked by median forecast, so the positive one leads.
+    // Ranked by median prediction, so the positive one leads.
     assert_eq!(data.predictions[0].ticker.as_str(), "AAPL");
     assert_eq!(
         data.prediction_model_run_id.as_deref(),
