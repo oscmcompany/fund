@@ -15,8 +15,12 @@ use crate::common::types::SessionDate;
 
 /// Version stamped on every record written by this build.
 ///
-/// Readers map old versions forward rather than rewriting files, so this only ever goes up.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up. Nothing
+/// branches on it yet; it exists so that when something does, it can tell the shapes apart. Version
+/// 1 carried the pass's prices, screen inputs, exclusions, and open book inline on `evaluation_pass`
+/// and had no `command_finished`, `pair_opened`, `pair_closed`, `pair_attributed`, or
+/// `activity_observed` at all.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
