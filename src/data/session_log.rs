@@ -20,20 +20,15 @@ use crate::data::calendar::SessionDate;
 
 /// Version stamped on every record written by this build.
 ///
-/// Readers map old versions forward rather than files being rewritten, so this only ever goes up.
-/// See the module note in [`Observation`] for what a change costs.
+/// Readers map old versions forward rather than rewriting files, so this only ever goes up.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// S3 prefix the sealed sessions are written under.
-///
-/// Inside `exports/`, which [`crate::data::export`] already owns, so the bucket keeps two prefixes
-/// with one writer each.
 pub const EXPORT_PREFIX: &str = "exports/session_log";
 
 /// Calendar days of sealed sessions kept on local disk after a clean export.
 ///
-/// The local file is the crash-exact original and Parquet is derived from it, so this is the window
-/// in which a bad conversion can still be repaired from the bytes that were actually written.
+/// The window in which a bad Parquet conversion can still be repaired from the original bytes.
 pub const RETENTION_DAYS: i64 = 7;
 
 /// Anything that stops a record reaching the disk.
@@ -57,13 +52,8 @@ pub enum SessionLogError {
 
 /// One observation, tagged with what kind it is.
 ///
-/// **Observations only.** No slippage, no realized profit and loss, no exposure totals — every one
-/// of those is a query over these rows, and storing a computed value creates a second thing that can
-/// disagree with the first.
-///
-/// Variants are additive. A field added to a payload is optional; a renamed field becomes a new
-/// variant while readers keep understanding the old one, and [`SCHEMA_VERSION`] goes up. Past files
-/// are never rewritten.
+/// Observations only — no slippage, profit and loss, or exposure totals, each of which is a query
+/// over these rows. Variants are additive and past files are never rewritten.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum Observation {
@@ -100,13 +90,8 @@ impl Observation {
 
 /// One evaluation pass, whole.
 ///
-/// `prices` carries every reading the pass used, once; the pair and candidate rows name tickers and
-/// do not repeat the number. That is what makes "did the price move or did the model refit" a join
-/// rather than a guess.
-///
-/// `candidates` holds the pairs the screen actually scored, not the full cross product — that is
-/// quadratic in the eligible universe and would be millions of rows a pass. `candidates_screened`
-/// and `eligible_tickers` are what bound the part that is not enumerated.
+/// `prices` holds every reading once; pair and candidate rows name tickers without repeating it.
+/// `candidates` holds only the pairs the screen scored, not the quadratic cross product.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct EvaluationPass {
     pub account_equity: Option<f64>,
@@ -135,9 +120,8 @@ pub struct EvaluationPass {
 
 /// One forecast as the screen consumed it.
 ///
-/// `expected_return` and `confidence` are derived from the stored quantiles and `is_shortable` from
-/// the session's universe, so neither is recoverable from `equity_predictions` alone — this is the
-/// only record of what the model actually offered the screen.
+/// Derived from the stored quantiles and the session's universe, so not recoverable from
+/// `equity_predictions` alone.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ScreenInputReading {
     pub ticker: String,
@@ -148,9 +132,7 @@ pub struct ScreenInputReading {
 
 /// One forecast the eligibility filter removed, and why.
 ///
-/// Written every pass rather than once a session. The tests are nearly static within a day, so most
-/// of this repeats — but `held` is not static, and a rule that says "record the funnel every pass"
-/// has no edge case where the one pass that mattered was the one that skipped it.
+/// Written every pass, because `held` changes within a session even though the other tests do not.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExcludedTickerReading {
     pub ticker: String,
@@ -169,9 +151,8 @@ pub struct PriceReading {
 
 /// An open pair as this pass measured it, whether or not it closed.
 ///
-/// Every input to the z-score is here because a z-score on its own is unfalsifiable: a pair
-/// recorded at entry 6.09 and read at 1.25 five minutes later is indistinguishable from a price
-/// move, a refitted distribution, and a bug.
+/// Carries every input to the z-score, which on its own cannot distinguish a price move from a
+/// refit.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OpenPairReading {
     pub pair_id: String,
@@ -184,7 +165,7 @@ pub struct OpenPairReading {
     pub z_score: Option<f64>,
     pub entry_z_score: f64,
     pub stop_at: f64,
-    pub entry_session: NaiveDate,
+    pub entry_session: SessionDate,
     pub minutes_held: i64,
     /// `held`, `convergence`, `stop_loss`, `end_of_day`, `position_missing`, `unpriced`,
     /// `no_spread_model`, `unreadable_spread`, or `close_failed`.
@@ -193,10 +174,7 @@ pub struct OpenPairReading {
 
 /// A scored candidate and what became of it.
 ///
-/// The sizing fields are set for every candidate that reached the sizer, including the ones the risk
-/// gate then refused. Recording them only on the orders that went out would leave a refusal
-/// unanswerable in the one dimension that caused it — a pair turned down for gross exposure is a
-/// statement about its size, and the size would be the part that was missing.
+/// The sizing fields are set for every candidate that reached the sizer, refused ones included.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CandidateReading {
     pub pair_id: String,
@@ -219,9 +197,8 @@ pub struct CandidateReading {
 
 /// An order at the moment it was sent, before the broker has said anything about it.
 ///
-/// Written *before* the request leaves the process, which is why it is keyed by `client_order_id`
-/// rather than Alpaca's: the broker's identifier does not exist yet, and a crash in the gap would
-/// otherwise leave a live order that nothing on disk can name.
+/// Keyed by `client_order_id` because this is written before the request leaves the process, when
+/// the broker's identifier does not exist yet.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrderSubmitted {
     pub client_order_id: String,
@@ -235,31 +212,28 @@ pub struct OrderSubmitted {
 
 /// How the broker settled an order.
 ///
-/// One of these follows every [`OrderSubmitted`], filled or not, so a submission with no resolution
-/// means the process died between the two — which is the state worth alarming on.
-///
-/// Slippage is deliberately absent: it is this row joined to the pass that produced the order, and
-/// computing it here would freeze one definition of it into the archive.
+/// One follows every [`OrderSubmitted`], so an unresolved submission means the process died between
+/// the two. Slippage is absent: it is this row joined to the pass that produced the order.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OrderResolved {
     pub client_order_id: String,
-    pub alpaca_order_id: String,
+    /// Absent when the order never reached the broker.
+    pub alpaca_order_id: Option<String>,
     pub ticker: String,
-    /// `filled`, or the broker's terminal status for an order that did not fill.
+    /// `filled`, `submit_failed`, `broker_unreachable`, or the broker's terminal status.
     pub outcome: String,
     pub filled_shares: Option<f64>,
     pub filled_average_price: Option<f64>,
     /// True when the fill was read after a cancel raced it.
     pub filled_after_cancel: bool,
+    /// The broker's error, when the order failed rather than settled.
+    pub error: Option<String>,
 }
 
 /// One position the application asked Alpaca to close.
 ///
-/// **Not symmetrical with [`OrderSubmitted`], and deliberately.** An entry is polled to a terminal
-/// state because the pass cannot proceed without knowing whether the leg filled; an exit is
-/// submitted and left, because blocking on a fill would delay every other exit behind it. So there
-/// is no resolution record and no fill price here — `alpaca_order_id` is the join to the fill when
-/// the post-close activity sync lands it.
+/// Unlike an entry, an exit is not polled to a terminal state, so there is no fill price here —
+/// `alpaca_order_id` is the join to the fill once the post-close activity sync lands it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PositionCloseRequested {
     pub ticker: String,
@@ -276,6 +250,9 @@ pub struct PositionCloseRequested {
     pub accepted: bool,
     /// Alpaca's per-symbol status, on the bulk path that reports one.
     pub status: Option<u16>,
+    /// The broker's error, set only when the request itself failed. `accepted: false` with no
+    /// error means there was no position, which is the opposite state.
+    pub error: Option<String>,
 }
 
 /// The pre-close flattening.
@@ -288,8 +265,8 @@ pub struct LiquidationRun {
 
 /// The pre-open inference run.
 ///
-/// The forecasts themselves are not repeated here — they are rows in `equity_predictions` and reach
-/// S3 through the nightly export. What only this run knows is which artifact produced them.
+/// The forecasts live in `equity_predictions`; what only this run knows is which artifact made
+/// them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PredictionsGenerated {
     pub model_run_id: String,
@@ -302,24 +279,25 @@ pub struct PredictionsGenerated {
 
 /// The post-close account state.
 ///
-/// Recorded in full because Alpaca cannot report most of it again: portfolio history backfills
-/// equity for a past date and nothing backfills cash, buying power, or the market values.
+/// Recorded in full because Alpaca backfills only equity for a past date, never the rest.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountObserved {
     /// The session these balances describe, which is not always the one the record was written in:
     /// a post-close sync re-run after Eastern midnight observes yesterday from today.
-    pub session_date: NaiveDate,
-    pub equity: f64,
-    pub cash: f64,
-    pub buying_power: f64,
-    pub long_market_value: f64,
-    pub short_market_value: f64,
+    pub session_date: SessionDate,
+    /// `None` when the broker's decimal will not fit an `f64`. A fabricated zero would be a false
+    /// observation, which is the one thing this log must not contain.
+    pub equity: Option<f64>,
+    pub cash: Option<f64>,
+    pub buying_power: Option<f64>,
+    pub long_market_value: Option<f64>,
+    pub short_market_value: Option<f64>,
 }
 
 /// One line of the log: an observation with the envelope that makes it addressable.
 ///
-/// `session_date` is derived from `created_at` rather than supplied, so a record cannot be filed
-/// under a session it did not happen in.
+/// `session_date` is derived from `created_at`, so a record cannot be filed under a session it did
+/// not happen in.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Record {
     pub schema_version: u32,
@@ -358,8 +336,8 @@ struct OpenSession {
 
 /// Appends records to the current session's file.
 ///
-/// One handle for the life of the process. The file rolls when the Eastern date does, which is why
-/// the session is taken from the record rather than from a field set at construction.
+/// The file rolls when the Eastern date does, so the session comes from the record rather than from
+/// construction.
 pub struct SessionLog {
     directory: PathBuf,
     open_session: tokio::sync::Mutex<Option<OpenSession>>,
@@ -381,9 +359,7 @@ impl SessionLog {
 
     /// Opens a log at `FUND_SESSION_LOG_DIR`, or `sessions/` under the configured log directory.
     ///
-    /// Defaulting inside `FUND_LOG_DIR` is what lets this ship without a provisioning change: that
-    /// path is already created and already falls back to a writable location on a machine that was
-    /// never bootstrapped.
+    /// Defaulting inside `FUND_LOG_DIR` inherits that path's existing writability fallback.
     pub fn from_env() -> Result<Self, SessionLogError> {
         let directory = match std::env::var("FUND_SESSION_LOG_DIR") {
             Ok(directory) => PathBuf::from(directory),
@@ -399,10 +375,10 @@ impl SessionLog {
         &self.directory
     }
 
-    /// Appends one record and returns once it is on the disk.
+    /// Appends one record and returns once it is fsynced to the disk.
     ///
-    /// Flushed and fsynced before returning, so a caller that awaits this before acting knows the
-    /// observation survives the crash that the action might cause.
+    /// A caller that awaits this before acting knows the observation survives the crash the action
+    /// might cause.
     pub async fn append(&self, record: &Record) -> Result<(), SessionLogError> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
@@ -431,9 +407,8 @@ impl SessionLog {
 
     /// Appends a record, reporting a failure without propagating it.
     ///
-    /// A log write must not become a new way for the fund to stop trading: refusing to act because
-    /// the observation could not be stored is strictly worse than acting unobserved, and the error
-    /// is loud enough to notice the next morning.
+    /// A log write must not become a new way for the fund to stop trading, so acting unobserved
+    /// beats refusing to act.
     pub async fn record(
         &self,
         correlation_id: Uuid,
@@ -454,6 +429,18 @@ impl SessionLog {
     }
 }
 
+impl SessionLog {
+    /// Blocks appends for as long as the returned guard is held.
+    ///
+    /// The export takes this before reading, so no reader sees a half-written line. The open handle
+    /// is dropped, so the next append reopens the file.
+    async fn seal(&self) -> tokio::sync::MutexGuard<'_, Option<OpenSession>> {
+        let mut open_session = self.open_session.lock().await;
+        *open_session = None;
+        open_session
+    }
+}
+
 /// The file one session's records live in.
 fn file_name(session_date: SessionDate) -> String {
     format!("session-{}.jsonl", session_date.date())
@@ -461,8 +448,8 @@ fn file_name(session_date: SessionDate) -> String {
 
 /// Recovers the session from a name built by [`file_name`], or `None` for anything else.
 ///
-/// `None` rather than an error: the directory may hold files this layout knows nothing about, and a
-/// stray one is something to skip rather than to fail a run over.
+/// `None` rather than an error, because a stray file is something to skip, not to fail a run
+/// over.
 fn session_from_file_name(name: &str) -> Option<SessionDate> {
     let date = name.strip_prefix("session-")?.strip_suffix(".jsonl")?;
     let session_date = SessionDate::from_date(NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?);
@@ -485,10 +472,10 @@ pub struct SessionLogExportSummary {
     pub failed: Vec<(NaiveDate, String)>,
     /// Sessions whose local file was deleted after the retention window.
     pub deleted: Vec<NaiveDate>,
-    /// Lines that could not be parsed and were skipped, across every session.
+    /// Lines skipped as unreadable, across every session.
     ///
-    /// A torn final line is what a crash mid-append leaves behind, and is the expected non-zero
-    /// case. A number larger than the number of sessions means something else is wrong.
+    /// A torn final line per crashed session is expected; more than that means something else is
+    /// wrong.
     pub unparsable_lines: usize,
 }
 
@@ -504,14 +491,9 @@ impl SessionLogExportSummary {
 
 /// Converts every sealed session on disk to Parquet in S3, then deletes what has aged out.
 ///
-/// **Every file present is exported, not just the retention window.** The unit is the whole sealed
-/// file at a deterministic key, so a repeat is a byte-identical overwrite rather than a duplicate —
-/// which means there is no cursor to track, a failed run repairs itself on the next one, and a
-/// straggler that landed after the last export is picked up. A process that was down for a fortnight
-/// still ships everything it held.
-///
-/// Local files are deleted only when the whole run was clean, so a session cannot age out of a
-/// window it never left the machine in.
+/// Every file present is exported, not just the retention window: one whole file at a deterministic
+/// key makes a repeat a byte-identical overwrite, so a failed run repairs itself. Local files are
+/// deleted only after a clean run.
 pub async fn export_session_logs(
     log: &SessionLog,
     s3_client: &S3Client,
@@ -529,6 +511,10 @@ pub async fn export_session_logs(
     };
     sessions.sort();
 
+    // Held across the reads so no append can interleave with one. Today's file is sealed by the
+    // clock rather than by anything structural, and a recovery replay can run a pass at any hour.
+    let sealed = log.seal().await;
+
     for session_date in &sessions {
         let path = log.directory().join(file_name(*session_date));
         match read_session_frame(&path) {
@@ -543,6 +529,8 @@ pub async fn export_session_logs(
             Err(error) => summary.failed.push((session_date.date(), error)),
         }
     }
+
+    drop(sealed);
 
     if summary.is_clean() {
         summary.deleted = delete_aged_out(log.directory(), &sessions, today);
@@ -564,9 +552,8 @@ pub async fn export_session_logs(
 
 /// Sessions on disk whose trading day has finished.
 ///
-/// A file dated after `today` is not sealed and is left alone; one dated `today` is, because this
-/// runs after the close. A future-dated file means the clock moved, and exporting it would seal a
-/// session that is still being written.
+/// Today counts, because this runs after the close; a future-dated file does not, and exporting one
+/// would seal a session still being written.
 fn sealed_sessions(
     directory: &Path,
     today: SessionDate,
@@ -591,9 +578,8 @@ fn sealed_sessions(
 
 /// Removes the local copies of sessions older than the retention window.
 ///
-/// Called only after a clean run, so a session cannot age out of a window it never left the machine
-/// in. A file that will not delete is a warning rather than a failure: the copy in S3 is what the
-/// archive rests on, and a stale local file costs disk and nothing else.
+/// Called only after a clean run, so a session cannot age out without reaching S3. A file that will
+/// not delete is a warning: a stale local copy costs disk and nothing else.
 fn delete_aged_out(
     directory: &Path,
     sessions: &[SessionDate],
@@ -615,10 +601,9 @@ fn delete_aged_out(
     deleted
 }
 
-/// Reads one session file into a frame, skipping lines that will not parse.
+/// Reads one session file into a frame, returning it with the number of lines skipped.
 ///
-/// Returns the frame and the number of lines skipped. A torn final line is what a crash mid-append
-/// leaves, and discarding it is the whole reason the original is JSONL rather than Parquet.
+/// Discarding a torn final line is why the original is JSONL rather than Parquet.
 fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
@@ -638,16 +623,28 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
             continue;
         };
         let text = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
+
+        // A record missing any of its envelope is discarded rather than written with nulls, so a
+        // query cannot mistake an unaddressable row for a good one.
+        let (Some(event_id), Some(event_type), Some(created_at)) = (
+            text("event_id"),
+            text("event_type"),
+            text("created_at").and_then(|stamp| {
+                DateTime::parse_from_rfc3339(&stamp)
+                    .ok()
+                    .map(|instant| instant.timestamp_millis())
+            }),
+        ) else {
+            unparsable += 1;
+            continue;
+        };
+
         schema_versions.push(record.get("schema_version").and_then(Value::as_i64));
-        event_ids.push(text("event_id"));
+        event_ids.push(Some(event_id));
         correlation_ids.push(text("correlation_id"));
-        event_types.push(text("event_type"));
+        event_types.push(Some(event_type));
         session_dates.push(text("session_date"));
-        created_ats.push(text("created_at").and_then(|stamp| {
-            DateTime::parse_from_rfc3339(&stamp)
-                .ok()
-                .map(|instant| instant.timestamp_millis())
-        }));
+        created_ats.push(Some(created_at));
         payloads.push(record.get("payload").map(Value::to_string));
     }
 
@@ -715,20 +712,19 @@ mod tests {
 
     fn account_observation() -> Observation {
         Observation::AccountObserved(AccountObserved {
-            session_date: NaiveDate::from_ymd_opt(2026, 8, 11).expect("valid date"),
-            equity: 104_812.55,
-            cash: 12_000.0,
-            buying_power: 200_000.0,
-            long_market_value: 50_000.0,
-            short_market_value: -50_000.0,
+            session_date: session(2026, 8, 11),
+            equity: Some(104_812.55),
+            cash: Some(12_000.0),
+            buying_power: Some(200_000.0),
+            long_market_value: Some(50_000.0),
+            short_market_value: Some(-50_000.0),
         })
     }
 
     /// A directory unique to this run.
     ///
-    /// The name carries the process and a counter rather than the test's name alone: two `cargo
-    /// test` invocations overlapping on one machine would otherwise delete and recreate the same
-    /// path underneath each other, which is a flake that reproduces about once in fifteen runs.
+    /// The process and counter suffix stop two overlapping `cargo test` invocations deleting and
+    /// recreating one path underneath each other.
     fn temporary_directory(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -808,12 +804,13 @@ mod tests {
     fn test_a_fill_records_the_observation_and_not_the_slippage() {
         let filled = OrderResolved {
             client_order_id: "kopep-long".to_string(),
-            alpaca_order_id: "order-1".to_string(),
+            alpaca_order_id: Some("order-1".to_string()),
             ticker: "KO".to_string(),
             outcome: "filled".to_string(),
             filled_shares: Some(412.0),
             filled_average_price: Some(62.44),
             filled_after_cancel: false,
+            error: None,
         };
         let value = serde_json::to_value(&filled).expect("fill must serialize");
         let object = value.as_object().expect("a fill is an object");
@@ -893,6 +890,39 @@ mod tests {
         assert_eq!(frame.height(), 1);
         assert_eq!(unparsable, 1);
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Valid JSON is not enough: a row without an addressable envelope would reach Parquet with
+    /// nulls no query could tell apart from a good record.
+    #[test]
+    fn test_a_record_missing_its_envelope_is_counted_unparsable() {
+        let directory = temporary_directory("envelope");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("session-2026-08-11.jsonl");
+        let complete = serde_json::to_string(&Record::new(
+            Uuid::nil(),
+            instant("2026-08-11T20:15:00Z"),
+            account_observation(),
+        ))
+        .expect("the record must serialize");
+        let lines = [
+            complete.as_str(),
+            r#"{"schema_version":1,"event_type":"account_observed","created_at":"2026-08-11T20:15:00Z"}"#,
+            r#"{"schema_version":1,"event_id":"a","event_type":"account_observed","created_at":"not a time"}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, lines).expect("the file must be writable");
+
+        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        assert_eq!(
+            frame.height(),
+            1,
+            "only the complete record reaches the frame"
+        );
+        assert_eq!(
+            unparsable, 2,
+            "a missing event_id and an unparseable instant"
+        );
     }
 
     #[test]
@@ -1044,12 +1074,12 @@ mod tests {
                 Uuid::new_v4(),
                 instant("2026-08-11T20:15:00Z"),
                 Observation::AccountObserved(AccountObserved {
-                    session_date: NaiveDate::from_ymd_opt(2026, 8, 11).expect("valid date"),
-                    equity,
-                    cash: 12_000.0,
-                    buying_power: 200_000.0,
-                    long_market_value: 50_000.0,
-                    short_market_value: -50_000.0,
+                    session_date: session(2026, 8, 11),
+                    equity: Some(equity),
+                    cash: Some(12_000.0),
+                    buying_power: Some(200_000.0),
+                    long_market_value: Some(50_000.0),
+                    short_market_value: Some(-50_000.0),
                 }),
             );
             lines.push_str(&serde_json::to_string(&record).expect("the record must serialize"));

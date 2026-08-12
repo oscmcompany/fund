@@ -211,9 +211,8 @@ impl RiskGate {
 
     /// Runs `admit` across a selection, returning what passed and what each refusal was.
     ///
-    /// Refusals carry the pair they refused. A bare list of blocks says the gate turned three pairs
-    /// down and cannot say which three, which makes the refusal rate impossible to attribute back to
-    /// the candidates that produced it.
+    /// Refusals carry the pair they refused, so a refusal rate is attributable back to the
+    /// candidates that produced it.
     pub fn admit_all(&mut self, sized: &[SizedPair]) -> (Vec<SizedPair>, Vec<RefusedPair>) {
         let mut approved = Vec::with_capacity(sized.len());
         let mut refusals = Vec::new();
@@ -227,7 +226,10 @@ impl RiskGate {
                         maximum: self.parameters.maximum_concurrent_pairs(),
                     },
                 });
-                break;
+                // `continue`, not `break`: a full book still has to say which candidates it turned
+                // away, and every one after the first would otherwise be recorded as though the
+                // screen dropped it.
+                continue;
             }
             match self.admit(pair) {
                 Some(block) => {
@@ -416,14 +418,22 @@ mod tests {
         assert_eq!(approved.len(), 1);
         assert!(matches!(
             refusals.as_slice(),
-            [RefusedPair {
-                block: RiskBlock::PairCapacity { .. },
-                ..
-            }]
+            [
+                RefusedPair {
+                    block: RiskBlock::PairCapacity { .. },
+                    ..
+                },
+                RefusedPair {
+                    block: RiskBlock::PairCapacity { .. },
+                    ..
+                }
+            ]
         ));
-        // The refusal names the pair it refused, which is what makes a refusal rate attributable
-        // back to the candidate that produced it.
+        // Each refusal names the pair it refused, which is what makes a refusal rate attributable
+        // back to the candidate that produced it — and every pair behind the first is refused too,
+        // rather than left looking as though the screen dropped it.
         assert_eq!(refusals[0].pair_id.as_str(), "CCCC-DDDD");
+        assert_eq!(refusals[1].pair_id.as_str(), "EEEE-FFFF");
     }
 
     #[test]

@@ -843,9 +843,8 @@ impl AccountActivity {
 
 /// The order raised to close one position.
 ///
-/// The price is deliberately absent: a close is submitted and not polled to a terminal state, so
-/// there is no fill to report yet. `alpaca_order_id` is what joins this to the fill when the
-/// post-close activity sync lands it.
+/// The price is absent because a close is not polled to a terminal state; `alpaca_order_id` joins
+/// this to the fill when the post-close activity sync lands it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PositionClose {
     ticker: Ticker,
@@ -1011,9 +1010,8 @@ impl TradingClient {
     /// Submits an order and returns Alpaca's order identifier.
     /// Sends an order under a caller-chosen `client_order_id`.
     ///
-    /// The identifier is the caller's because it has to exist before the request does: the session
-    /// log records the intent first, and a crash before Alpaca answers otherwise leaves an order
-    /// nothing can name.
+    /// The identifier is the caller's because it must exist before the request does, so a crash
+    /// before Alpaca answers still leaves an order something can name.
     pub async fn submit_order(
         &self,
         intent: &OrderIntent,
@@ -1073,10 +1071,8 @@ impl TradingClient {
     /// the leg itself — and treating it as an error would turn a no-op into an incident.
     /// Closes one position, returning the order Alpaca raised to do it.
     ///
-    /// `None` means there was no position, which is the expected answer on a retry or after Alpaca
-    /// liquidated the leg itself. The order identifier is surfaced rather than discarded because it
-    /// is the only handle joining an exit to the fill that settles it: the close is not polled to a
-    /// terminal state, so the price arrives later through `account_activities`.
+    /// `None` means there was no position, the expected answer on a retry. The order identifier is
+    /// the only handle joining an exit to the fill that settles it in `account_activities`.
     pub async fn close_position(
         &self,
         ticker: &Ticker,
@@ -1477,12 +1473,8 @@ struct ClosePositionResponse {
 
 /// The order returned by a position close, single or bulk.
 ///
-/// Only the identity and the size: a close is submitted and not polled, so `filled_avg_price` is
-/// still null here and the fill arrives later through `account_activities`.
-///
-/// Every field is optional, `id` included. A bulk close answers per symbol, and a symbol Alpaca
-/// refused carries an error object in the same position an order would occupy — so requiring `id`
-/// would make one refused leg fail the parse for the whole liquidation.
+/// Every field is optional, `id` included: a bulk close puts an error object where a refused
+/// symbol's order would be, so a required field would fail the parse for the whole liquidation.
 #[derive(Deserialize)]
 struct ClosedPositionOrder {
     id: Option<String>,
@@ -1612,9 +1604,8 @@ impl Snapshot {
 
     /// [`Snapshot::reference_price`] together with the field it came from.
     ///
-    /// The two branches are not interchangeable readings of one number — a midpoint moves with the
-    /// book while the last trade can be minutes stale — so a price recorded without its source
-    /// cannot be compared against the same symbol's price on the next pass.
+    /// A midpoint and a last trade are not interchangeable readings, so a price without its source
+    /// cannot be compared against the same symbol on the next pass.
     pub fn reference_price_with_source(&self) -> Option<(f64, PriceSource)> {
         self.latest_quote
             .as_ref()

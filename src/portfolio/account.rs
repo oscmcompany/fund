@@ -88,12 +88,12 @@ pub async fn sync_account(
             Observation::AccountObserved(AccountObserved {
                 // The session this describes, which a sync re-run after Eastern midnight would
                 // otherwise lose: the envelope files a record under the session it *happened* in.
-                session_date: session_date.date(),
-                equity: account.equity().to_f64().unwrap_or_default(),
-                cash: account.cash().to_f64().unwrap_or_default(),
-                buying_power: account.buying_power().to_f64().unwrap_or_default(),
-                long_market_value: account.long_market_value().to_f64().unwrap_or_default(),
-                short_market_value: account.short_market_value().to_f64().unwrap_or_default(),
+                session_date,
+                equity: account.equity().to_f64(),
+                cash: account.cash().to_f64(),
+                buying_power: account.buying_power().to_f64(),
+                long_market_value: account.long_market_value().to_f64(),
+                short_market_value: account.short_market_value().to_f64(),
             }),
         )
         .await;

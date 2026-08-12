@@ -83,9 +83,8 @@ pub struct EvaluationContext<'a> {
 
 /// A price as one pass read it, with the snapshot field it came from.
 ///
-/// The source travels with the number because the two branches are not interchangeable: a midpoint
-/// moves with the book while a last trade can be minutes stale, so the same symbol read from
-/// different fields on consecutive passes is not one series.
+/// A midpoint moves with the book while a last trade can be minutes stale, so the same symbol read
+/// from different fields on consecutive passes is not one series.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReferencePrice {
     price: f64,
@@ -274,7 +273,7 @@ pub async fn run_pass(
 
     let screened = build_screen_inputs(context, &held, &mut prices).await?;
     observation.predictions_available = screened.predictions_available;
-    observation.eligible_tickers = screened.inputs.len();
+    observation.eligible_tickers = screened.eligible;
     observation.screen_inputs = screened.readings.clone();
     observation.excluded = screened.excluded.clone();
 
@@ -416,9 +415,8 @@ pub async fn run_pass(
 
 /// Writes the pass observation, attaching every price it read.
 ///
-/// Called on both paths out of a pass, including the one the risk gate blocks — a pass that opened
-/// nothing because the drawdown gate fired and one that opened nothing because no pair cleared the
-/// screen look identical in a count and are very different days.
+/// Called on both paths out of a pass, including the one the risk gate blocks: those two look
+/// identical in a count and are very different days.
 async fn record_pass(
     context: &EvaluationContext<'_>,
     correlation_id: uuid::Uuid,
@@ -478,6 +476,9 @@ pub async fn run_liquidation(
                     reason: "liquidation".to_string(),
                     accepted: outcome.succeeded(),
                     status: Some(outcome.status()),
+                    // The bulk path reports a per-symbol status rather than an error body, so a
+                    // refusal is legible from `status` alone.
+                    error: None,
                 }),
             )
             .await;
@@ -568,8 +569,7 @@ async fn fetch_prices(
 
 /// Every price the pass used, as rows for the session log.
 ///
-/// Recorded once at pass level rather than repeated onto each pair, so a candidate row and an open
-/// pair row that share a leg are provably reading the same number.
+/// Recorded once at pass level, so rows sharing a leg are provably reading the same number.
 fn price_readings(prices: &HashMap<Ticker, ReferencePrice>) -> Vec<PriceReading> {
     let mut readings: Vec<PriceReading> = prices
         .iter()
@@ -618,7 +618,7 @@ async fn close_what_should_close(
             z_score: None,
             entry_z_score: pair.entry_z_score(),
             stop_at: pair.entry_z_score() + screen::STOP_LOSS_WIDENING,
-            entry_session: SessionDate::at(pair.opened_at()).date(),
+            entry_session: SessionDate::at(pair.opened_at()),
             minutes_held: pair.minutes_held(context.now),
             decision: "held".to_string(),
         };
@@ -779,6 +779,8 @@ async fn previous_session_equity(
 /// The screen's inputs, and the model run they came from.
 struct ScreenedUniverse {
     inputs: Vec<ScreenInput>,
+    /// Forecasts that passed the eligibility filter, before pricing removed any.
+    eligible: usize,
     /// The same inputs as session-log rows: what the model offered, as the screen received it.
     readings: Vec<ScreenInputReading>,
     /// Every forecast the funnel removed, with the first test it failed.
@@ -804,6 +806,7 @@ async fn build_screen_inputs(
         info!("No predictions for the current session; no entries will be screened");
         return Ok(ScreenedUniverse {
             inputs: Vec::new(),
+            eligible: 0,
             readings: Vec::new(),
             excluded: Vec::new(),
             model_run_id: None,
@@ -912,6 +915,7 @@ async fn build_screen_inputs(
     );
     Ok(ScreenedUniverse {
         inputs,
+        eligible: eligible.len(),
         readings,
         excluded,
         model_run_id,

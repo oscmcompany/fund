@@ -68,8 +68,8 @@ impl Default for ExecutionSettings {
 
 /// Everything an order needs beyond the order itself.
 ///
-/// The log and the correlation identifier travel with the client rather than as further parameters
-/// so that no path can send an order without carrying the thread back to the pass that decided it.
+/// The log travels with the client so no path can send an order without the thread back to the pass
+/// that decided it.
 pub struct ExecutionContext<'a> {
     pub client: &'a TradingClient,
     pub settings: ExecutionSettings,
@@ -307,8 +307,8 @@ pub async fn close_pair(
 
 /// Records one close attempt, whatever came of it.
 ///
-/// Takes the `Result` rather than a success value so a refused close is as visible as an accepted
-/// one: a leg the broker would not let go of is the state the book is wrong about.
+/// Takes the `Result` so a refused close — the state the book is wrong about — is as visible as an
+/// accepted one.
 async fn record_close(
     context: &ExecutionContext<'_>,
     ticker: &Ticker,
@@ -317,6 +317,7 @@ async fn record_close(
     result: &Result<Option<PositionClose>, ClientError>,
 ) {
     let close = result.as_ref().ok().and_then(Option::as_ref);
+    let error = result.as_ref().err().map(ToString::to_string);
     context
         .session_log
         .record(
@@ -333,6 +334,7 @@ async fn record_close(
                 reason: reason.to_string(),
                 accepted: close.is_some(),
                 status: None,
+                error,
             }),
         )
         .await;
@@ -346,13 +348,8 @@ enum Filled {
 
 /// Submits one order and polls until it reaches a terminal state or the timeout expires.
 ///
-/// A timed-out order is cancelled before returning. Leaving it working would mean reporting the leg
-/// as unfilled while Alpaca still holds a live order that could fill afterwards, into a pair the
-/// application has already given up on.
-///
-/// The intent is written to the session log and fsynced *before* the request is sent. That ordering
-/// is the whole point: a crash between the two leaves a record of an order that may exist, which is
-/// recoverable, rather than an order that exists with no record, which is not.
+/// The intent reaches the disk before the request leaves the process, and every exit writes a
+/// resolution, so an unresolved submission means only that the process died.
 async fn submit_and_confirm(
     context: &ExecutionContext<'_>,
     intent: &OrderIntent,
@@ -377,37 +374,82 @@ async fn submit_and_confirm(
         )
         .await;
 
-    let order_id = context
-        .client
-        .submit_order(intent, &client_order_id)
-        .await?;
+    let order_id = match context.client.submit_order(intent, &client_order_id).await {
+        Ok(order_id) => order_id,
+        Err(error) => {
+            // The order never reached the broker, so there is no identifier to resolve it under.
+            // Recorded anyway: a rejection and a crash are otherwise the same absent row.
+            record_resolution(
+                context,
+                OrderResolved {
+                    client_order_id,
+                    alpaca_order_id: None,
+                    ticker: intent.ticker().to_string(),
+                    outcome: "submit_failed".to_string(),
+                    filled_shares: None,
+                    filled_average_price: None,
+                    filled_after_cancel: false,
+                    error: Some(error.to_string()),
+                },
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
+
+    let confirmation = confirm_fill(context, intent, &client_order_id, &order_id).await;
+    if let Err(error) = &confirmation {
+        record_resolution(
+            context,
+            OrderResolved {
+                client_order_id,
+                alpaca_order_id: Some(order_id),
+                ticker: intent.ticker().to_string(),
+                outcome: "broker_unreachable".to_string(),
+                filled_shares: None,
+                filled_average_price: None,
+                filled_after_cancel: false,
+                error: Some(error.to_string()),
+            },
+        )
+        .await;
+    }
+    confirmation
+}
+
+/// Polls a submitted order to a terminal state, recording how it settled.
+///
+/// A timed-out order is cancelled first, so a pair the application gave up on cannot fill behind
+/// its back.
+async fn confirm_fill(
+    context: &ExecutionContext<'_>,
+    intent: &OrderIntent,
+    client_order_id: &str,
+    order_id: &str,
+) -> Result<Filled, ExecutionError> {
     let deadline = tokio::time::Instant::now() + context.settings.fill_timeout;
 
-    /// Records how the broker settled the order, then hands back what the caller returns.
     macro_rules! resolved {
         ($outcome:expr, $shares:expr, $price:expr, $after_cancel:expr) => {
-            context
-                .session_log
-                .record(
-                    context.correlation_id,
-                    Utc::now(),
-                    Observation::OrderResolved(OrderResolved {
-                        client_order_id: client_order_id.clone(),
-                        alpaca_order_id: order_id.clone(),
-                        ticker: intent.ticker().to_string(),
-                        outcome: $outcome,
-                        filled_shares: $shares,
-                        filled_average_price: $price,
-                        filled_after_cancel: $after_cancel,
-                    }),
-                )
-                .await
+            record_resolution(
+                context,
+                OrderResolved {
+                    client_order_id: client_order_id.to_string(),
+                    alpaca_order_id: Some(order_id.to_string()),
+                    ticker: intent.ticker().to_string(),
+                    outcome: $outcome,
+                    filled_shares: $shares,
+                    filled_average_price: $price,
+                    filled_after_cancel: $after_cancel,
+                    error: None,
+                },
+            )
+            .await
         };
     }
 
     loop {
-        let state = context.client.fetch_order(&order_id).await?;
-        match state {
+        match context.client.fetch_order(order_id).await? {
             OrderState::Filled {
                 filled_shares,
                 average_price,
@@ -420,7 +462,7 @@ async fn submit_and_confirm(
                 );
                 return Ok(Filled::Yes(LegFill {
                     ticker: intent.ticker().clone(),
-                    order_id,
+                    order_id: order_id.to_string(),
                     shares: filled_shares,
                     average_price,
                 }));
@@ -452,12 +494,12 @@ async fn submit_and_confirm(
                         order_id,
                         "Order did not reach a terminal state before the timeout; cancelling"
                     );
-                    context.client.cancel_order(&order_id).await?;
+                    context.client.cancel_order(order_id).await?;
                     // Read once more: the cancel may have raced a fill.
                     if let OrderState::Filled {
                         filled_shares,
                         average_price,
-                    } = context.client.fetch_order(&order_id).await?
+                    } = context.client.fetch_order(order_id).await?
                     {
                         resolved!(
                             "filled".to_string(),
@@ -467,7 +509,7 @@ async fn submit_and_confirm(
                         );
                         return Ok(Filled::Yes(LegFill {
                             ticker: intent.ticker().clone(),
-                            order_id,
+                            order_id: order_id.to_string(),
                             shares: filled_shares,
                             average_price,
                         }));
@@ -482,6 +524,18 @@ async fn submit_and_confirm(
             }
         }
     }
+}
+
+/// Writes how the broker settled one order.
+async fn record_resolution(context: &ExecutionContext<'_>, resolved: OrderResolved) {
+    context
+        .session_log
+        .record(
+            context.correlation_id,
+            Utc::now(),
+            Observation::OrderResolved(resolved),
+        )
+        .await;
 }
 
 #[cfg(test)]
@@ -856,11 +910,57 @@ mod tests {
         short.assert_async().await;
     }
 
+    /// The records of one type, preserving write order.
+    fn of_type<'a>(
+        records: &'a [serde_json::Value],
+        event_type: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| record["event_type"] == event_type)
+            .collect()
+    }
+
+    /// A broker rejection resolves the submission rather than leaving it dangling.
+    ///
+    /// An unresolved submission is documented to mean the process died between the write and the
+    /// request; without this the same shape would also mean an ordinary rejection.
+    #[tokio::test]
+    async fn test_a_rejected_submission_still_writes_a_resolution() {
+        let mut server = mockito::Server::new_async().await;
+        let _submit = server
+            .mock("POST", "/v2/orders")
+            .with_status(422)
+            .with_body(r#"{"message":"insufficient buying power"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let log = session_log("rejected-submission");
+        let result = open_pair(&context(&client, &log), &pair(), None).await;
+
+        assert!(result.is_err(), "the broker failure must still be reported");
+        let records = recorded(&log);
+        let submitted = of_type(&records, "order_submitted");
+        let resolved = of_type(&records, "order_resolved");
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(resolved.len(), 1, "every submission reaches a resolution");
+        assert_eq!(resolved[0]["payload"]["outcome"], "submit_failed");
+        assert!(resolved[0]["payload"]["alpaca_order_id"].is_null());
+        assert!(
+            resolved[0]["payload"]["error"].is_string(),
+            "the broker's reason is what separates a rejection from a crash"
+        );
+        assert_eq!(
+            submitted[0]["payload"]["client_order_id"],
+            resolved[0]["payload"]["client_order_id"]
+        );
+    }
+
     /// Both legs of every exit are recorded, including the leg that had nothing to close.
     ///
-    /// Exits were invisible for as long as entries were logged and closes were not, which made
-    /// realized profit and loss attributable in one direction only. A close that found no position
-    /// is recorded too: `accepted: false` with no order is a different fact from a filled exit.
+    /// A close that found no position is a different fact from a filled exit, and both matter to
+    /// attributing realized profit and loss.
     #[tokio::test]
     async fn test_closing_a_pair_records_both_legs() {
         let mut server = mockito::Server::new_async().await;
@@ -903,10 +1003,53 @@ mod tests {
         assert_eq!(filled["payload"]["alpaca_order_id"], "close-1");
         assert_eq!(filled["payload"]["quantity"], 50.0);
 
+        assert!(
+            filled["payload"]["error"].is_null(),
+            "an accepted close has no error"
+        );
+
         let missing = &records[1];
         assert_eq!(missing["payload"]["ticker"], "BBBB");
         assert_eq!(missing["payload"]["accepted"], false);
         assert!(missing["payload"]["alpaca_order_id"].is_null());
+        // No position and a refused close are opposite states, so the absent one carries no error.
+        assert!(missing["payload"]["error"].is_null());
+    }
+
+    /// A close the broker refused is not the same fact as a position that was not there.
+    #[tokio::test]
+    async fn test_a_refused_close_records_the_broker_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _long = server
+            .mock("DELETE", "/v2/positions/AAAA?percentage=100")
+            .with_status(500)
+            .with_body("internal error")
+            .create_async()
+            .await;
+        let _short = server
+            .mock("DELETE", "/v2/positions/BBBB?percentage=100")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let log = session_log("refused-close");
+        let _ = close_pair(
+            &context(&client, &log),
+            "AAAA-BBBB",
+            &ticker("AAAA"),
+            &ticker("BBBB"),
+        )
+        .await;
+
+        let records = recorded(&log);
+        let refused = &records[0];
+        assert_eq!(refused["payload"]["ticker"], "AAAA");
+        assert_eq!(refused["payload"]["accepted"], false);
+        assert!(
+            refused["payload"]["error"].is_string(),
+            "a leg the broker would not release is still held, and the log has to say so"
+        );
     }
 
     #[tokio::test]
