@@ -73,6 +73,8 @@ pub struct EvaluationContext<'a> {
     pub execution: ExecutionSettings,
     /// Where the pass records what it observed before acting on it.
     pub session_log: &'a SessionLog,
+    /// The dispatching command's identifier, carried onto every order the pass sends.
+    pub correlation_id: uuid::Uuid,
     /// Cancelled when the process is asked to stop.
     ///
     /// Checked between pairs in the entry half so the pass stops *starting* positions it could not
@@ -198,10 +200,10 @@ pub fn convergence_only(z_score: f64) -> Option<CloseReason> {
 pub async fn run_pass(
     context: &EvaluationContext<'_>,
 ) -> Result<EvaluationSummary, EvaluationError> {
-    // One identifier for the pass, carried onto every order it sends and every fill they produce.
-    // That thread is what turns "the session lost money" into "it was lost at sizing" or "it was
-    // lost at execution".
-    let correlation_id = uuid::Uuid::new_v4();
+    // The command's identifier, carried onto every order the pass sends and every fill they
+    // produce. That thread is what turns "the session lost money" into "it was lost at sizing" or
+    // "it was lost at execution".
+    let correlation_id = context.correlation_id;
     let mut observation = PassEvaluated {
         universe_size: context.universe.len(),
         ..PassEvaluated::default()
@@ -462,9 +464,9 @@ pub async fn run_liquidation(
     pool: &PgPool,
     client: &TradingClient,
     session_log: &SessionLog,
+    correlation_id: uuid::Uuid,
     now: DateTime<Utc>,
 ) -> Result<LiquidationSummary, EvaluationError> {
-    let correlation_id = uuid::Uuid::new_v4();
     let outcomes = client.close_all_positions().await?;
 
     // One record per position, not just the totals. The bulk close is the only path that touches

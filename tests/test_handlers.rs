@@ -259,6 +259,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -456,6 +457,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -572,6 +574,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         sizing,
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -693,6 +696,7 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -783,6 +787,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         sizing: SizingParameters::default(),
         execution: settings(),
         session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
     };
@@ -834,6 +839,7 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
         &pool,
         &trading,
         &session_log("test-liquidation-flattens-the-book-and-marks-every-pair"),
+        uuid::Uuid::new_v4(),
         Utc::now(),
     )
     .await
@@ -882,6 +888,7 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
         &pool,
         &trading,
         &session_log("test-a-refused-leg-leaves-its-pair-open"),
+        uuid::Uuid::new_v4(),
         Utc::now(),
     )
     .await
@@ -973,6 +980,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         &pool,
         &trading,
         &session_log("test-the-account-sync-stores-and-attributes-a-session"),
+        uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -1034,13 +1042,27 @@ async fn test_the_account_sync_is_idempotent() {
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let calendar = calendar_ending_at(session_date);
     let log = session_log("test-the-account-sync-is-idempotent-0");
-    let first = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .unwrap();
+    let first = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .unwrap();
     let log = session_log("test-the-account-sync-is-idempotent-1");
-    let second = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .unwrap();
+    let second = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(first.activities_stored, 1);
     assert_eq!(second.activities_stored, 0);
@@ -1119,6 +1141,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
         &pool,
         &trading,
         &session_log("test-the-account-sync-stores-transfers-without-attributing-them"),
+        uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -1187,9 +1210,16 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let log = session_log("test-the-account-sync-reports-a-missing-previous-session-2");
-    let with_gap = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .expect("the sync must run");
+    let with_gap = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
     assert_eq!(
         with_gap.previous_session_gap,
         Some(previous),
@@ -1197,12 +1227,26 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     );
 
     // Fill the hole and the same sync stops reporting it.
-    account::sync_account(&pool, &trading, &log, &calendar, previous)
-        .await
-        .expect("the sync must run");
-    let repaired = account::sync_account(&pool, &trading, &log, &calendar, session_date)
-        .await
-        .expect("the sync must run");
+    account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        previous,
+    )
+    .await
+    .expect("the sync must run");
+    let repaired = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar,
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
     assert_eq!(repaired.previous_session_gap, None);
 }
 

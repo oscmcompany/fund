@@ -73,6 +73,7 @@ pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
     session_log: &SessionLog,
+    correlation_id: uuid::Uuid,
     calendar: &TradingCalendar,
     session_date: SessionDate,
 ) -> Result<AccountSyncSummary, AccountError> {
@@ -84,7 +85,7 @@ pub async fn sync_account(
     // only moment they are observable at all.
     session_log
         .record(
-            uuid::Uuid::new_v4(),
+            correlation_id,
             Utc::now(),
             Observation::AccountObserved(AccountObserved {
                 // The session this describes, which a sync re-run after Eastern midnight would

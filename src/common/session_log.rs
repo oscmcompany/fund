@@ -44,6 +44,8 @@ pub enum SessionLogError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event_type", content = "payload", rename_all = "snake_case")]
 pub enum Observation {
+    /// One scheduled command, however it ended.
+    CommandFinished(CommandFinished),
     /// One five-minute pass: what it decided, and what stopped it doing more.
     PassEvaluated(Box<PassEvaluated>),
     /// What one price fetch returned, and what it asked for and did not get.
@@ -70,6 +72,7 @@ impl Observation {
     /// The stable name this observation serializes under.
     pub fn event_type(&self) -> &'static str {
         match self {
+            Observation::CommandFinished(_) => "command_finished",
             Observation::PassEvaluated(_) => "pass_evaluated",
             Observation::PricesObserved(_) => "prices_observed",
             Observation::UniverseScreened(_) => "universe_screened",
@@ -82,6 +85,24 @@ impl Observation {
             Observation::AccountObserved(_) => "account_observed",
         }
     }
+}
+
+/// One scheduled command, however it ended.
+///
+/// Written for every firing, including the ones that do no work: a holiday, a duplicate dropped
+/// while the previous run is still going, and a crashed process are otherwise the same absence.
+/// Sharing `correlation_id` with everything the command did is what makes the duration attributable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommandFinished {
+    pub command: String,
+    /// `completed`, `errored`, `dropped_in_flight`, or `skipped_` and the handler's reason.
+    pub outcome: String,
+    /// Absent for a command that never ran.
+    pub duration_milliseconds: Option<u64>,
+    /// The rendered error, when the command failed.
+    pub error: Option<String>,
+    /// The handler's own summary, as it reached the completion event.
+    pub summary: Option<serde_json::Value>,
 }
 
 /// One evaluation pass: what it decided and what stopped it.
