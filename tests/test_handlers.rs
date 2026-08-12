@@ -990,9 +990,9 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         .with_status(200)
         .with_body(format!(
             r#"[{{"id":"a1","activity_type":"FILL","transaction_time":"{}",
-                  "symbol":"AAAA","side":"buy","qty":"10","price":"100"}},
+                  "symbol":"AAAA","side":"buy","qty":"10","price":"100","order_id":"o1"}},
                 {{"id":"a2","activity_type":"FILL","transaction_time":"{}",
-                  "symbol":"AAAA","side":"sell","qty":"10","price":"110"}}]"#,
+                  "symbol":"AAAA","side":"sell","qty":"10","price":"110","order_id":"o2"}}]"#,
             (opened + Duration::minutes(1)).to_rfc3339(),
             (closed - Duration::minutes(1)).to_rfc3339(),
         ))
@@ -1031,9 +1031,24 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         Some(rust_decimal::Decimal::from(102_000))
     );
 
+    // Every activity Alpaca reported, as our own record. `net_amount` in particular reaches no
+    // other store the application owns.
+    let records = recorded(&log);
+    let observed = of_type(&records, "activity_observed");
+    assert_eq!(observed.len(), 2, "one record per activity, fills included");
+    assert!(observed
+        .iter()
+        .all(|record| record["payload"]["activity_id"].is_string()
+            && record["payload"]["activity_type"].is_string()));
+    assert!(
+        observed
+            .iter()
+            .any(|record| record["payload"]["order_id"].is_string()),
+        "a fill joins back to the order that produced it"
+    );
+
     // The attribution is the one derived value the log keeps, recorded beside the pair it landed
     // on so the stored figure can be checked against the fills it came from.
-    let records = recorded(&log);
     let attributed = of_type(&records, "pair_attributed");
     assert_eq!(attributed.len(), 1);
     assert_eq!(attributed[0]["payload"]["pair_uuid"], id.to_string());

@@ -575,9 +575,9 @@ pub async fn insert_predictions(
     predictions: &[serde_json::Value],
     correlation_id: Uuid,
     model_run_id: &str,
-) -> Result<u64, InsertPredictionsError> {
+) -> Result<(u64, Vec<EquityPrediction>), InsertPredictionsError> {
     if predictions.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let validated: Vec<EquityPrediction> = predictions
@@ -620,7 +620,9 @@ pub async fn insert_predictions(
 
     transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
-    Ok(rows_affected)
+    // Returned rather than reparsed by the caller: these are the exact values that were written,
+    // so the session log records what the database holds and not a second reading of the payload.
+    Ok((rows_affected, validated))
 }
 
 /// Loads the most recent prediction per ticker within a half-open instant range.

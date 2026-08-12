@@ -68,8 +68,10 @@ pub enum Observation {
     PositionCloseRequested(PositionCloseRequested),
     /// The pre-close flattening.
     LiquidationRun(LiquidationRun),
-    /// The pre-open inference run and the artifact it resolved.
-    PredictionsGenerated(PredictionsGenerated),
+    /// The pre-open inference run, the artifact it resolved, and the forecasts it produced.
+    PredictionsGenerated(Box<PredictionsGenerated>),
+    /// One activity as Alpaca reported it, fill or transfer.
+    ActivityObserved(ActivityObserved),
     /// The post-close account state, which Alpaca cannot fully report again for a past date.
     AccountObserved(AccountObserved),
 }
@@ -91,6 +93,7 @@ impl Observation {
             Observation::PositionCloseRequested(_) => "position_close_requested",
             Observation::LiquidationRun(_) => "liquidation_run",
             Observation::PredictionsGenerated(_) => "predictions_generated",
+            Observation::ActivityObserved(_) => "activity_observed",
             Observation::AccountObserved(_) => "account_observed",
         }
     }
@@ -373,18 +376,55 @@ pub struct LiquidationRun {
     pub pairs_still_open: Vec<String>,
 }
 
-/// The pre-open inference run.
+/// The pre-open inference run and everything it produced.
 ///
-/// The forecasts live in `equity_predictions`; what only this run knows is which artifact made
-/// them.
+/// The quantiles are here rather than left to `equity_predictions` and the nightly export, because
+/// those are the model's actual output and the log is meant to hold the originals. They arrive at
+/// one moment from one place, so unlike the pass readings there is nothing to gain by splitting
+/// them out.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PredictionsGenerated {
     pub model_run_id: String,
     pub artifact_key: String,
     pub artifact_staleness_sessions: Option<i64>,
-    pub predictions: usize,
+    /// Rows the database accepted, which is not the forecast count when an upsert collapses a
+    /// re-run.
     pub rows_written: u64,
     pub universe_size: usize,
+    pub predictions: Vec<PredictionReading>,
+}
+
+/// One ticker's forecast, as the model produced it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PredictionReading {
+    pub ticker: String,
+    pub timestamp: DateTime<Utc>,
+    pub quantile_10: f64,
+    pub quantile_50: f64,
+    pub quantile_90: f64,
+}
+
+/// One activity as Alpaca reported it.
+///
+/// Kept as our own record rather than re-fetched, because Alpaca's retention bounds how long the
+/// question can be asked. `net_amount` is the reason this matters most: it is the only field
+/// saying how much a deposit or withdrawal moved, and it reaches no other store the application
+/// owns.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActivityObserved {
+    /// Alpaca's activity identifier, which is what makes the sync idempotent.
+    pub activity_id: String,
+    /// `FILL`, `CSD`, `CSW`, or `JNLC`.
+    pub activity_type: String,
+    pub transaction_time: DateTime<Utc>,
+    pub ticker: Option<String>,
+    pub side: Option<String>,
+    pub quantity: Option<f64>,
+    pub price: Option<f64>,
+    /// Set on transfers, which carry this instead of a quantity and price.
+    pub net_amount: Option<f64>,
+    /// Joins a fill back to the order that produced it.
+    pub order_id: Option<String>,
 }
 
 /// The post-close account state.

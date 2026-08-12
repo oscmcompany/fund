@@ -20,7 +20,8 @@ use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, Tr
 use crate::common::events::{self, Command, EventError};
 use crate::common::massive::MassiveClient;
 use crate::common::session_log::{
-    CommandFinished, Observation, PredictionsGenerated, SessionLog, SessionLogError,
+    CommandFinished, Observation, PredictionReading, PredictionsGenerated, SessionLog,
+    SessionLogError,
 };
 use crate::common::types::{BarInterval, SessionDate};
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
@@ -386,24 +387,30 @@ async fn handle_predictions(
         );
     }
 
-    let (predictions, rows) = run_inference(state, &model_state, correlation_id).await?;
+    let (rows, predictions) = run_inference(state, &model_state, correlation_id).await?;
 
-    // The forecasts themselves are not repeated into the log — they are rows in
-    // `equity_predictions` and reach S3 through the nightly export. What only this run knows is
-    // which artifact produced them.
     state
         .session_log
         .record(
             correlation_id,
             now,
-            Observation::PredictionsGenerated(PredictionsGenerated {
+            Observation::PredictionsGenerated(Box::new(PredictionsGenerated {
                 model_run_id: model_state.run_id().to_string(),
                 artifact_key: artifact_key.clone(),
                 artifact_staleness_sessions,
-                predictions,
                 rows_written: rows,
                 universe_size: universe.len(),
-            }),
+                predictions: predictions
+                    .iter()
+                    .map(|prediction| PredictionReading {
+                        ticker: prediction.ticker().to_string(),
+                        timestamp: prediction.timestamp(),
+                        quantile_10: prediction.quantile_10(),
+                        quantile_50: prediction.quantile_50(),
+                        quantile_90: prediction.quantile_90(),
+                    })
+                    .collect(),
+            })),
         )
         .await;
 
@@ -413,7 +420,7 @@ async fn handle_predictions(
         "model_run_id": model_state.run_id(),
         "artifact_key": artifact_key,
         "artifact_staleness_sessions": artifact_staleness_sessions,
-        "predictions": predictions,
+        "predictions": predictions.len(),
         "rows_written": rows,
         "universe": universe.len(),
         "close_history_tickers": close_history.len(),
@@ -426,7 +433,7 @@ async fn run_inference(
     state: &ServiceState,
     model_state: &artifact::ModelState,
     correlation_id: Uuid,
-) -> Result<(usize, u64), HandlerError> {
+) -> Result<(u64, Vec<crate::common::types::EquityPrediction>), HandlerError> {
     fn at(stage: &'static str) -> impl Fn(String) -> HandlerError {
         move |message| HandlerError::Prediction { stage, message }
     }
@@ -459,7 +466,7 @@ async fn run_inference(
     // Split back apart rather than propagated as one error: a malformed payload is a bug in the
     // model output this function just produced, and belongs with the other pipeline stages; a
     // database failure is the database, and keeps reading as one.
-    let rows =
+    let (rows, predictions) =
         predict::insert_predictions(&state.pool, &array, correlation_id, model_state.run_id())
             .await
             .map_err(|error| match error {
@@ -467,7 +474,7 @@ async fn run_inference(
                 predict::InsertPredictionsError::Database(error) => HandlerError::Database(error),
             })?;
 
-    Ok((array.len(), rows))
+    Ok((rows, predictions))
 }
 
 /// Every five minutes: price the book, close what should close, open into vacant slots.

@@ -25,7 +25,9 @@ use crate::common::alpaca::{
     AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
     TRANSFER_ACTIVITY_TYPES,
 };
-use crate::common::session_log::{AccountObserved, Observation, PairAttributed, SessionLog};
+use crate::common::session_log::{
+    AccountObserved, ActivityObserved, Observation, PairAttributed, SessionLog,
+};
 use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
@@ -112,6 +114,29 @@ pub async fn sync_account(
         );
     }
     let activities_stored = store_activities(pool, &activities).await?;
+
+    // Our own record of every activity, not just the ones the attribution used. Alpaca's retention
+    // bounds how long these can be re-fetched, and `net_amount` — the only field saying how much a
+    // deposit or withdrawal moved — reaches no other store this application owns.
+    for activity in &activities {
+        session_log
+            .record(
+                correlation_id,
+                Utc::now(),
+                Observation::ActivityObserved(ActivityObserved {
+                    activity_id: activity.id().to_string(),
+                    activity_type: activity.activity_type().to_string(),
+                    transaction_time: activity.transaction_time(),
+                    ticker: activity.ticker().map(|ticker| ticker.to_string()),
+                    side: activity.side().map(str::to_string),
+                    quantity: activity.shares().and_then(|shares| shares.to_f64()),
+                    price: activity.price().and_then(|price| price.to_f64()),
+                    net_amount: activity.net_amount().and_then(|amount| amount.to_f64()),
+                    order_id: activity.order_id().map(str::to_string),
+                }),
+            )
+            .await;
+    }
 
     let (start, end) = session_date.bounds();
     let closed = pairs::load_closed_between(pool, start, end).await?;
