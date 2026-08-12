@@ -71,7 +71,13 @@ fn calendar_for_today() -> TradingCalendar {
 /// Every path under test writes one, so a shared directory would let one test's records be read as
 /// another's — and these tests already share a database.
 fn session_log(name: &str) -> SessionLog {
-    let directory = std::env::temp_dir().join(format!("fund-test-handlers-{name}"));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "fund-test-handlers-{name}-{}-{unique}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&directory);
     SessionLog::new(directory).expect("the log directory must be creatable")
 }
@@ -290,7 +296,16 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         .expect("a pass is correlated");
 
     assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
-    assert_eq!(pass["payload"]["candidates"][0]["decision"], "opened");
+    let candidate = &pass["payload"]["candidates"][0];
+    assert_eq!(candidate["decision"], "opened");
+    // Sizing is recorded on the candidate, not only on the orders that went out, so a pair the risk
+    // gate refuses is still answerable in the dimension that caused the refusal.
+    assert!(
+        candidate["long_notional"].is_number()
+            && candidate["short_shares"].is_number()
+            && candidate["gross_exposure"].is_number(),
+        "a candidate that reached the sizer carries what it was sized to"
+    );
     assert!(
         !pass["payload"]["prices"].as_array().unwrap().is_empty(),
         "the prices the pass decided on must be recorded"

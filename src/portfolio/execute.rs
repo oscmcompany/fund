@@ -508,7 +508,13 @@ mod tests {
     /// A log in a directory of this test's own. Every order path writes to one, so the tests
     /// exercise the record-before-submit ordering rather than mocking it away.
     fn session_log(name: &str) -> SessionLog {
-        let directory = std::env::temp_dir().join(format!("fund-execute-{name}"));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "fund-execute-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&directory);
         SessionLog::new(directory).expect("the log directory must be creatable")
     }

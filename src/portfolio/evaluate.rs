@@ -307,12 +307,23 @@ pub async fn run_pass(
                     entry_z_score: candidate.entry_z_score(),
                     signal_strength: candidate.signal_strength(),
                     rank_score: candidate.rank_score(),
+                    long_notional: None,
+                    short_shares: None,
+                    gross_exposure: None,
                     decision: "not_selected".to_string(),
                     refusal: None,
                 },
             )
         })
         .collect();
+    // Every candidate that reached the sizer carries what it was sized to, refused or not.
+    for pair in &sized {
+        if let Some(reading) = candidate_decisions.get_mut(pair.candidate().pair_id().as_str()) {
+            reading.long_notional = pair.long_notional().value().to_f64();
+            reading.short_shares = Some(f64::from(pair.short_shares().get()));
+            reading.gross_exposure = pair.gross_exposure().to_f64();
+        }
+    }
     for refusal in &refusals {
         if let Some(reading) = candidate_decisions.get_mut(refusal.pair_id.as_str()) {
             reading.decision = "risk_refused".to_string();

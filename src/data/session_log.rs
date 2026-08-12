@@ -154,7 +154,8 @@ pub struct ScreenInputReading {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExcludedTickerReading {
     pub ticker: String,
-    /// `already_held`, `no_sector`, `no_close_history`, `outside_universe`, or `unpriced`.
+    /// `already_held`, `no_sector`, `no_close_history`, `outside_universe`, `unpriced`, or
+    /// `unusable_input`.
     pub reason: String,
 }
 
@@ -191,6 +192,11 @@ pub struct OpenPairReading {
 }
 
 /// A scored candidate and what became of it.
+///
+/// The sizing fields are set for every candidate that reached the sizer, including the ones the risk
+/// gate then refused. Recording them only on the orders that went out would leave a refusal
+/// unanswerable in the one dimension that caused it — a pair turned down for gross exposure is a
+/// statement about its size, and the size would be the part that was missing.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CandidateReading {
     pub pair_id: String,
@@ -200,6 +206,11 @@ pub struct CandidateReading {
     pub entry_z_score: f64,
     pub signal_strength: f64,
     pub rank_score: f64,
+    /// Dollars the long leg was sized to, absent for a candidate that was never selected.
+    pub long_notional: Option<f64>,
+    /// Whole shares the short leg was sized to.
+    pub short_shares: Option<f64>,
+    pub gross_exposure: Option<f64>,
     /// `opened`, `not_selected`, `risk_refused`, `unfilled`, or `abandoned_at_shutdown`.
     pub decision: String,
     /// The risk gate's rendered reason, when `decision` is `risk_refused`.
@@ -713,8 +724,19 @@ mod tests {
         })
     }
 
+    /// A directory unique to this run.
+    ///
+    /// The name carries the process and a counter rather than the test's name alone: two `cargo
+    /// test` invocations overlapping on one machine would otherwise delete and recreate the same
+    /// path underneath each other, which is a flake that reproduces about once in fifteen runs.
     fn temporary_directory(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!("fund-session-log-{name}"));
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "fund-session-log-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&directory);
         directory
     }
