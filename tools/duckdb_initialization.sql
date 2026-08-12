@@ -11,8 +11,9 @@
 --            the long-term record of equity bars and ticker metadata; it
 --            accumulates for as long as the bucket keeps it.
 --   exports/ the application's nightly export of the tables only it knows
---            about -- events, predictions, pairs, account state. This is what
---            the retention window would otherwise discard.
+--            about -- events, predictions, pairs, account state -- plus the
+--            session log, which is the original those tables are derived from.
+--            This is what the retention window would otherwise discard.
 --
 -- Bars and ticker metadata appear under data/ and nowhere else. They used to be
 -- exported as well, from the same Massive endpoint by a second path, and two
@@ -107,6 +108,44 @@ CREATE OR REPLACE VIEW events AS
 SELECT *
 FROM read_parquet(
     's3://' || getvariable('bucket') || '/exports/events/**/*.parquet',
+    hive_partitioning = true
+);
+
+-- The session log is the application's own original: what it observed before it acted, appended to
+-- local disk as it happened and sealed to Parquet after the close. Everything above is a fold or a
+-- query over it, so this is where to go when the tables disagree with each other.
+--
+-- The envelope is columns and the body is a JSON string, so filter on event_type and reach into
+-- payload with the JSON operators:
+--
+--   SELECT payload->>'ticker', payload->>'outcome'
+--   FROM session_log WHERE event_type = 'order_resolved';
+--
+--   SELECT unnest(from_json(payload->'readings', '["json"]'))->>'ticker'
+--   FROM session_log WHERE event_type = 'prices_observed';
+--
+-- correlation_id threads a command to everything it did: one command_finished, the pass it ran, the
+-- prices it read, the orders it sent, the fills they produced. Joining on it is how a duration
+-- becomes an answer about where the time went.
+--
+-- schema_version is 2 for anything written after 2026-08-12. Version 1 carried the pass's prices,
+-- screen inputs, exclusions, and open book inline on an evaluation_pass record, and had no
+-- command_finished, pair_opened, pair_closed, pair_attributed, or activity_observed.
+.print 'Loading session_log...'
+DROP VIEW IF EXISTS session_log;
+CREATE OR REPLACE VIEW session_log AS
+SELECT
+    schema_version,
+    event_id,
+    correlation_id,
+    event_type,
+    session_date,
+    -- Stored as epoch milliseconds so the Parquet column is a plain integer; recovered here, since
+    -- every question worth asking of this table is ordered in time.
+    epoch_ms(created_at) AS created_at,
+    payload
+FROM read_parquet(
+    's3://' || getvariable('bucket') || '/exports/session_log/**/*.parquet',
     hive_partitioning = true
 );
 

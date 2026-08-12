@@ -72,7 +72,7 @@ pub enum Observation {
     PositionCloseRequested(PositionCloseRequested),
     /// The pre-close flattening, whether or not it flattened anything.
     LiquidationAttempted(LiquidationAttempted),
-    /// The pre-open inference run, the artifact it resolved, and the forecasts it produced.
+    /// The pre-open inference run, the artifact it resolved, and the predictions it produced.
     PredictionsGenerated(Box<PredictionsGenerated>),
     /// One activity as Alpaca reported it, fill or transfer.
     ActivityObserved(ActivityObserved),
@@ -398,14 +398,14 @@ pub struct PredictionsGenerated {
     pub model_run_id: String,
     pub artifact_key: String,
     pub artifact_staleness_sessions: Option<i64>,
-    /// Rows the database accepted, which is not the forecast count when an upsert collapses a
+    /// Rows the database accepted, which is not the prediction count when an upsert collapses a
     /// re-run.
     pub rows_written: u64,
     pub universe_size: usize,
     pub predictions: Vec<PredictionReading>,
 }
 
-/// One ticker's forecast, as the model produced it.
+/// One ticker's prediction, as the model produced it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PredictionReading {
     pub ticker: String,
