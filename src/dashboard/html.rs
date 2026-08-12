@@ -590,7 +590,7 @@ mod tests {
 
         DashboardState {
             account: Some(AccountSnapshot {
-                session_date: crate::data::calendar::SessionDate::from_date(
+                session_date: crate::common::types::SessionDate::from_date(
                     NaiveDate::from_ymd_opt(2026, 7, 31).expect("a valid date"),
                 ),
                 equity: decimal("1234567.89"),

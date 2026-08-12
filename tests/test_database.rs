@@ -15,9 +15,9 @@ mod common;
 
 use chrono::{Duration, NaiveDate, Utc};
 use fund::common::events::{self, Command, EventType, Outcome};
-use fund::common::types::{BarInterval, PairID, Ticker};
+use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::bars;
-use fund::data::calendar::SessionDate;
+
 use fund::models::tide::predict;
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};

@@ -14,10 +14,10 @@ use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
     TRANSFER_ACTIVITY_TYPES,
 };
-use fund::common::types::{BarInterval, Ticker};
+use fund::common::session_log::SessionLog;
+use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::bars;
-use fund::data::calendar::{SessionDate, TradingCalendar};
-use fund::data::session_log::SessionLog;
+use fund::data::calendar::TradingCalendar;
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;

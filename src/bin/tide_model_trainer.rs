@@ -21,9 +21,9 @@ use tracing::{error, info, warn};
 use fund::common::aws::date_partitioned_key;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
-use fund::common::types::{MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use fund::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use fund::data::archive;
-use fund::data::calendar::SessionDate;
+
 use fund::data::details;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,

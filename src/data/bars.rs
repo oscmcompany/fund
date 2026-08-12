@@ -16,8 +16,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::massive::{MassiveClient, MassiveError};
-use crate::common::types::{BarInterval, EquityBar, Ticker};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{BarInterval, EquityBar, SessionDate, Ticker};
 
 /// Rows per insert chunk.
 ///

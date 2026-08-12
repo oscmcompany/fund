@@ -25,8 +25,9 @@ use crate::common::alpaca::{
     AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
     TRANSFER_ACTIVITY_TYPES,
 };
-use crate::data::calendar::{SessionDate, TradingCalendar};
-use crate::data::session_log::{AccountObserved, Observation, SessionLog};
+use crate::common::session_log::{AccountObserved, Observation, SessionLog};
+use crate::common::types::SessionDate;
+use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
 /// The activity types this sync fetches and stores.

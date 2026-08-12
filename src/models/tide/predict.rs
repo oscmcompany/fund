@@ -11,8 +11,8 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::types::{EquityPrediction, Ticker};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{EquityPrediction, SessionDate, Ticker};
+
 use crate::models::tide::artifact::ModelState;
 use crate::models::tide::data::{Data, DatasetKind};
 
@@ -884,7 +884,7 @@ mod tests {
         // rows with `eastern_day_bounds`. A stamp built at UTC midnight falls in the *previous*
         // Eastern day's window -- 20:00 the day before, under EDT -- so the forecast written this
         // morning is never the one read this afternoon.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         for day in [
             "2026-08-03",
@@ -911,7 +911,7 @@ mod tests {
     fn test_step_timestamp_step_zero_is_the_current_eastern_session() {
         // Step t is the Eastern session t days out, stamped at Eastern midnight. 15:30Z is 11:30
         // Eastern, so step 0 is that same session rather than the one UTC is already into.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T15:30:00Z")
             .unwrap()
@@ -931,7 +931,7 @@ mod tests {
     fn test_late_evening_eastern_still_stamps_the_current_session() {
         // 01:00Z is 21:00 the previous Eastern day. Stamping off the UTC date would jump the
         // forecast a session forward, which is the failure this function exists to avoid.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T01:00:00Z")
             .unwrap()
@@ -1274,7 +1274,7 @@ mod tests {
         // Compared against `eastern_midnight` rather than a fixed 86,400,000 ms stride: successive
         // Eastern midnights are 23 or 25 hours apart across a daylight-saving transition, so a
         // fixed stride asserts something that is only true away from March and November.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -1298,7 +1298,7 @@ mod tests {
         // Eastern time springs forward 2026-03-08 and falls back 2026-11-01. Stepping across either
         // boundary must still land on the session's own midnight, which a fixed day-length stride
         // would miss by an hour in each direction.
-        use crate::data::calendar::SessionDate;
+        use crate::common::types::SessionDate;
 
         for (start, label) in [
             ("2026-03-06T17:00:00Z", "spring forward"),

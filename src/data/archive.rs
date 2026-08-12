@@ -32,8 +32,8 @@ use tracing::{info, warn};
 
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
+use crate::common::types::SessionDate;
 use crate::data::bars;
-use crate::data::calendar::SessionDate;
 
 /// S3 prefix for the bar archive.
 ///

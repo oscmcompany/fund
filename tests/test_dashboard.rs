@@ -15,9 +15,9 @@ mod common;
 use chrono::{Duration, Utc};
 use fund::common::alpaca::AccountSnapshot;
 use fund::common::events::{self, Command, EventType, Outcome};
-use fund::common::types::{PairID, Ticker};
+use fund::common::types::{PairID, SessionDate, Ticker};
 use fund::dashboard::database::fetch_dashboard_data;
-use fund::data::calendar::SessionDate;
+
 use fund::portfolio::account;
 use fund::portfolio::pairs::{self, CloseReason, PairEntry};
 use rust_decimal::Decimal;

@@ -20,8 +20,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
-use crate::common::types::{BarInterval, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{BarInterval, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 
 /// Trailing window over which liquidity is averaged.
 ///

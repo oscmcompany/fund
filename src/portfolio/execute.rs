@@ -15,10 +15,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::common::alpaca::{ClientError, OrderIntent, OrderState, PositionClose, TradingClient};
-use crate::common::types::Ticker;
-use crate::data::session_log::{
+use crate::common::session_log::{
     Observation, OrderResolved, OrderSubmitted, PositionCloseRequested, SessionLog,
 };
+use crate::common::types::Ticker;
 use crate::portfolio::pairs::PairEntry;
 use crate::portfolio::size::SizedPair;
 

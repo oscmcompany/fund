@@ -19,15 +19,13 @@ use uuid::Uuid;
 use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
 use crate::common::events::{self, Command, EventError};
 use crate::common::massive::MassiveClient;
-use crate::common::types::BarInterval;
+use crate::common::session_log::{Observation, PredictionsGenerated, SessionLog, SessionLogError};
+use crate::common::types::{BarInterval, SessionDate};
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
-use crate::data::calendar::{CalendarCache, SessionDate, TradingCalendar};
+use crate::data::calendar::{CalendarCache, TradingCalendar};
 use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
-use crate::data::session_log::{
-    self, Observation, PredictionsGenerated, SessionLog, SessionLogError,
-};
 use crate::data::universe::{UniverseCache, UniverseError};
 use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
@@ -557,13 +555,9 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
 async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerError> {
     let today = SessionDate::at(Utc::now());
 
-    let sessions = session_log::export_session_logs(
-        &state.session_log,
-        &state.s3_client,
-        &state.bucket,
-        today,
-    )
-    .await;
+    let sessions =
+        export::export_session_logs(&state.session_log, &state.s3_client, &state.bucket, today)
+            .await;
     let session_log_summary = json!({
         "sessions_exported": sessions.exported.len(),
         "records_exported": sessions.total_records(),

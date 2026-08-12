@@ -20,8 +20,8 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::common::events::Notification;
-use crate::common::types::{PairID, Ticker};
-use crate::data::calendar::SessionDate;
+use crate::common::types::{PairID, SessionDate, Ticker};
+
 use crate::portfolio::pairs::CloseReason;
 
 /// How often the background task refreshes every view from PostgreSQL.

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use chrono::Datelike;
 use polars::prelude::*;
 
-use crate::data::calendar::SessionDate;
+use crate::common::types::SessionDate;
 use crate::data::details::UNKNOWN as UNKNOWN_SECTOR_OR_INDUSTRY;
 
 pub type CategoryMapping = HashMap<String, i32>;

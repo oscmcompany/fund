@@ -15,11 +15,11 @@ use sqlx::{PgPool, Row};
 use tracing::warn;
 
 use crate::common::alpaca::TRANSFER_ACTIVITY_TYPES;
-use crate::common::types::{PairID, Ticker};
+use crate::common::types::{PairID, SessionDate, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
 };
-use crate::data::calendar::SessionDate;
+
 use crate::portfolio::pairs::CloseReason;
 
 /// Sessions of account snapshots fetched: the equity curve, and the newest row's balances.
