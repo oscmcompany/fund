@@ -974,11 +974,15 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("session-2026-08-12.jsonl");
 
-        // Verbatim v1 shapes, as the currently deployed build writes them.
+        // The five shapes a real v1 session file holds, taken from one on disk rather than guessed.
+        // `predictions_generated` carries `predictions` as a *count* here; in v2 the same field is
+        // an array, which is the one field whose type the version bump changes.
         let v1 = [
             r#"{"schema_version":1,"event_id":"11111111-1111-1111-1111-111111111111","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:00Z","event_type":"evaluation_pass","payload":{"universe_size":7000,"prices":[{"ticker":"AAAA","price":100.0,"price_source":"last_trade"}],"open_pairs":[],"screen_inputs":[],"excluded":[],"candidates":[]}}"#,
             r#"{"schema_version":1,"event_id":"33333333-3333-3333-3333-333333333333","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:01Z","event_type":"order_submitted","payload":{"client_order_id":"k-long","ticker":"AAAA","side":"buy","shares":null,"notional":1000.0}}"#,
-            r#"{"schema_version":1,"event_id":"44444444-4444-4444-4444-444444444444","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:02Z","event_type":"liquidation_run","payload":{"pairs_closed":1,"positions_refused":0,"pairs_still_open":[]}}"#,
+            r#"{"schema_version":1,"event_id":"44444444-4444-4444-4444-444444444444","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:02Z","event_type":"order_resolved","payload":{"client_order_id":"k-long","alpaca_order_id":"o1","ticker":"AAAA","outcome":"filled","filled_shares":10.0,"filled_average_price":100.4,"filled_after_cancel":false,"error":null}}"#,
+            r#"{"schema_version":1,"event_id":"55555555-5555-5555-5555-555555555555","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:03Z","event_type":"position_close_requested","payload":{"ticker":"AAAA","pair_id":"AAAA-BBBB","alpaca_order_id":"o2","side":"long","quantity":10.0,"reason":"pair_exit","accepted":true,"status":null,"error":null}}"#,
+            r#"{"schema_version":1,"event_id":"66666666-6666-6666-6666-666666666666","correlation_id":"77777777-7777-7777-7777-777777777777","session_date":"2026-08-12","created_at":"2026-08-12T13:00:00Z","event_type":"predictions_generated","payload":{"model_run_id":"run-1","artifact_key":"models/tide/run-1","artifact_staleness_sessions":0,"predictions":1043,"rows_written":1043,"universe_size":7000}}"#,
         ];
         // A v2 record appended after the restart, into the same file.
         let v2 = serde_json::to_string(&Record::new(
@@ -1000,10 +1004,10 @@ mod tests {
             unparsable, 0,
             "no v1 record may be dropped by the new reader"
         );
-        assert_eq!(frame.height(), 4, "three v1 records plus one v2");
+        assert_eq!(frame.height(), 6, "five v1 records plus one v2");
         let versions = frame.column("schema_version").unwrap().i64().unwrap();
         assert_eq!(
-            (versions.get(0), versions.get(3)),
+            (versions.get(0), versions.get(5)),
             (Some(1), Some(2)),
             "both versions coexist in one file, each row carrying its own"
         );

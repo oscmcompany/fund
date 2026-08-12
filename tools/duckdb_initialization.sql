@@ -131,6 +131,11 @@ FROM read_parquet(
 -- schema_version is 2 for anything written after 2026-08-12. Version 1 carried the pass's prices,
 -- screen inputs, exclusions, and open book inline on an evaluation_pass record, and had no
 -- command_finished, pair_opened, pair_closed, pair_attributed, or activity_observed.
+--
+-- One field changed type rather than name, which is the case a reader cannot detect on its own:
+-- predictions_generated.predictions was a count in v1 and is the array of quantiles in v2. A query
+-- reading it must filter on schema_version or check the type, or it silently reads a length as a
+-- number of tickers. Only the single v1 session, 2026-08-12, is affected.
 .print 'Loading session_log...'
 DROP VIEW IF EXISTS session_log;
 CREATE OR REPLACE VIEW session_log AS
