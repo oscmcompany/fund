@@ -457,13 +457,27 @@ pub async fn export_session_logs(
             .collect::<Vec<_>>()
     };
 
+    // Only the sessions whose Parquet holds everything their original did. A session is deletable
+    // when it uploaded cleanly *and* skipped nothing, and both are per-session questions: a run-wide
+    // gate would let one bad line in one file stop every other file from ever aging out.
+    let mut deletable: Vec<SessionDate> = Vec::with_capacity(sessions.len());
+    let mut held_back: Vec<NaiveDate> = Vec::new();
     for (session_date, frame) in frames {
         match frame {
             Ok((mut frame, unparsable)) => {
                 summary.unparsable_lines += unparsable;
                 let key = date_partitioned_key(SESSION_LOG_PREFIX, session_date.date());
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
-                    Ok(()) => summary.exported.push((session_date.date(), frame.height())),
+                    Ok(()) => {
+                        summary.exported.push((session_date.date(), frame.height()));
+                        // A skipped line is in the original and not in the Parquet, which makes the
+                        // original its only copy. Keeping one file costs kilobytes; deleting it
+                        // makes a merely unreadable record permanently gone.
+                        match unparsable {
+                            0 => deletable.push(session_date),
+                            _ => held_back.push(session_date.date()),
+                        }
+                    }
                     Err(error) => summary.failed.push((session_date.date(), error)),
                 }
             }
@@ -471,15 +485,11 @@ pub async fn export_session_logs(
         }
     }
 
-    // A skipped line is in the original and not in the Parquet, so the original is the only copy of
-    // it. Keeping the file costs a few kilobytes until someone looks; deleting it makes a record
-    // that was merely unreadable permanently gone.
-    if summary.is_clean() && summary.unparsable_lines == 0 {
-        summary.deleted = delete_aged_out(log.directory(), &sessions, today);
-    } else if summary.unparsable_lines > 0 {
+    summary.deleted = delete_aged_out(log.directory(), &deletable, today);
+    for session_date in &held_back {
         warn!(
-            unparsable_lines = summary.unparsable_lines,
-            "Session logs held back from deletion: their originals hold lines the Parquet does not"
+            %session_date,
+            "Session log held back from deletion: its original holds lines the Parquet does not"
         );
     }
 
@@ -921,6 +931,38 @@ mod tests {
             "only the complete record reaches Parquet"
         );
         assert_eq!(unparsable, 6, "one per missing envelope column");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Holding a file back must not hold every other file back with it.
+    ///
+    /// The gate is per session because the reason for it is: one session's original holds a line
+    /// its Parquet does not. A run-wide gate would let a single bad line stop the whole directory
+    /// from ever ageing out, which on a 25 GB disk is a leak rather than a safeguard.
+    #[test]
+    fn test_one_session_held_back_does_not_hold_back_the_rest() {
+        let directory = temporary_directory("held-back-is-per-session");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+
+        let today = session(2026, 8, 11);
+        let aged_out = [
+            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS - 2),
+            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS - 1),
+        ];
+        for session_date in aged_out {
+            std::fs::write(directory.join(file_name(session_date)), "")
+                .expect("the file must be writable");
+        }
+
+        // Only the first is deletable; the second skipped a line and is held back.
+        let deleted = delete_aged_out(&directory, &aged_out[..1], today);
+
+        assert_eq!(deleted, vec![aged_out[0].date()]);
+        assert!(!directory.join(file_name(aged_out[0])).exists());
+        assert!(
+            directory.join(file_name(aged_out[1])).exists(),
+            "the held-back session keeps its original"
+        );
         let _ = std::fs::remove_dir_all(&directory);
     }
 
