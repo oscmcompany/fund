@@ -54,6 +54,12 @@ pub enum Observation {
     UniverseScreened(UniverseScreened),
     /// Every open pair as one pass measured it, closed or held.
     OpenPairsObserved(OpenPairsObserved),
+    /// A pair as it was written to the book.
+    PairOpened(PairOpened),
+    /// A pair as it was marked closed.
+    PairClosed(PairClosed),
+    /// What the post-close sync attributed to a closed pair.
+    PairAttributed(PairAttributed),
     /// An order as it was sent, written before the request leaves the process.
     OrderSubmitted(OrderSubmitted),
     /// How the broker settled that order, filled or not.
@@ -77,6 +83,9 @@ impl Observation {
             Observation::PricesObserved(_) => "prices_observed",
             Observation::UniverseScreened(_) => "universe_screened",
             Observation::OpenPairsObserved(_) => "open_pairs_observed",
+            Observation::PairOpened(_) => "pair_opened",
+            Observation::PairClosed(_) => "pair_closed",
+            Observation::PairAttributed(_) => "pair_attributed",
             Observation::OrderSubmitted(_) => "order_submitted",
             Observation::OrderResolved(_) => "order_resolved",
             Observation::PositionCloseRequested(_) => "position_close_requested",
@@ -248,6 +257,52 @@ pub struct CandidateReading {
     pub decision: String,
     /// The risk gate's rendered reason, when `decision` is `risk_refused`.
     pub refusal: Option<String>,
+}
+
+/// A pair as it was written to the book.
+///
+/// `equity_pairs` is mutated in place three times over a pair's life, so the log needs three
+/// records where the table has one row. This is the only one carrying the entry rationale: nothing
+/// external knows which long was paired with which short, or on what.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairOpened {
+    /// The `equity_pairs` primary key, which the two later records join on.
+    pub pair_uuid: String,
+    pub pair_id: String,
+    pub long_ticker: String,
+    pub short_ticker: String,
+    pub hedge_ratio: f64,
+    pub entry_z_score: f64,
+    pub signal_strength: f64,
+    pub model_run_id: Option<String>,
+    pub opened_at: DateTime<Utc>,
+}
+
+/// A pair as it was marked closed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairClosed {
+    pub pair_uuid: String,
+    /// `convergence`, `stop_loss`, `end_of_day`, or `position_missing`.
+    pub reason: String,
+    pub closed_at: DateTime<Utc>,
+    /// False when the pair was already closed, so this write changed nothing.
+    ///
+    /// A pass racing the pre-close liquidation is the ordinary way to reach it, and the collision
+    /// is worth seeing.
+    pub updated: bool,
+}
+
+/// What the post-close sync attributed to a closed pair.
+///
+/// The one derived value the log keeps. It is what the database will serve, and recording it
+/// beside the fills it was computed from is what makes a disagreement between the two visible at
+/// all — everything else here stays an observation precisely so it cannot disagree with anything.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PairAttributed {
+    pub pair_uuid: String,
+    pub realized_profit_and_loss: Option<f64>,
+    /// False when no closed pair matched, so the attribution landed nowhere.
+    pub updated: bool,
 }
 
 /// An order at the moment it was sent, before the broker has said anything about it.

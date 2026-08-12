@@ -19,8 +19,8 @@ use tracing::{debug, error, info, warn};
 use crate::common::alpaca::{ClientError, MarketDataClient, PriceSource, TradingClient};
 use crate::common::session_log::{
     CandidateReading, ExcludedTickerReading, LiquidationRun, Observation, OpenPairReading,
-    OpenPairsObserved, PassEvaluated, PositionCloseRequested, PriceReading, PricesObserved,
-    ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
+    OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PositionCloseRequested, PriceReading,
+    PricesObserved, ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
 };
 use crate::common::types::{EquityPrediction, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
@@ -397,8 +397,10 @@ async fn evaluate_pass(
                 // so no later pass can exit it on a signal. The pre-close liquidation is the
                 // backstop, which is why it flattens the *account* rather than known pairs; this
                 // log is what makes the pair reconstructable by hand before then.
-                if let Err(error) = pairs::record_open(context.pool, &entry, context.now).await {
-                    error!(
+                let pair_uuid = match pairs::record_open(context.pool, &entry, context.now).await {
+                    Ok(pair_uuid) => pair_uuid,
+                    Err(error) => {
+                        error!(
                         pair_id = %entry.pair_id(),
                         long_ticker = %long_fill.ticker(),
                         long_shares = long_fill.shares(),
@@ -406,12 +408,32 @@ async fn evaluate_pass(
                         short_ticker = %short_fill.ticker(),
                         short_shares = short_fill.shares(),
                         short_price = short_fill.average_price(),
-                        %error,
-                        "Pair filled at the broker but could not be recorded; the position is live \
-                         with no pair row and will be flattened by the pre-close liquidation"
-                    );
-                    return Err(error.into());
-                }
+                            %error,
+                            "Pair filled at the broker but could not be recorded; the position is \
+                             live with no pair row and will be flattened by the pre-close \
+                             liquidation"
+                        );
+                        return Err(error.into());
+                    }
+                };
+                context
+                    .session_log
+                    .record(
+                        correlation_id,
+                        context.now,
+                        Observation::PairOpened(PairOpened {
+                            pair_uuid: pair_uuid.to_string(),
+                            pair_id: entry.pair_id().to_string(),
+                            long_ticker: entry.long_ticker().to_string(),
+                            short_ticker: entry.short_ticker().to_string(),
+                            hedge_ratio: entry.hedge_ratio(),
+                            entry_z_score: entry.entry_z_score(),
+                            signal_strength: entry.signal_strength(),
+                            model_run_id: entry.model_run_id().map(str::to_string),
+                            opened_at: context.now,
+                        }),
+                    )
+                    .await;
                 if let Some(reading) = candidate_decisions.get_mut(entry.pair_id().as_str()) {
                     reading.decision = "opened".to_string();
                 }
@@ -513,7 +535,20 @@ pub async fn run_liquidation(
             summary.pairs_still_open.push(pair.pair_id().to_string());
             continue;
         }
-        if pairs::record_close(pool, pair.id(), CloseReason::EndOfDay, now).await? {
+        let updated = pairs::record_close(pool, pair.id(), CloseReason::EndOfDay, now).await?;
+        session_log
+            .record(
+                correlation_id,
+                now,
+                Observation::PairClosed(PairClosed {
+                    pair_uuid: pair.id().to_string(),
+                    reason: CloseReason::EndOfDay.as_str().to_string(),
+                    closed_at: now,
+                    updated,
+                }),
+            )
+            .await;
+        if updated {
             summary.pairs_closed += 1;
         }
     }
@@ -766,7 +801,20 @@ async fn close_what_should_close(
         if outcome.was_already_gone() {
             reason = CloseReason::PositionMissing;
         }
-        pairs::record_close(context.pool, pair.id(), reason, context.now).await?;
+        let updated = pairs::record_close(context.pool, pair.id(), reason, context.now).await?;
+        context
+            .session_log
+            .record(
+                correlation_id,
+                context.now,
+                Observation::PairClosed(PairClosed {
+                    pair_uuid: pair.id().to_string(),
+                    reason: reason.as_str().to_string(),
+                    closed_at: context.now,
+                    updated,
+                }),
+            )
+            .await;
 
         closed.insert(pair.id());
         reading.decision = reason.as_str().to_string();

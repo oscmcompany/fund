@@ -377,6 +377,24 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     );
     assert_eq!(resolved[0]["payload"]["outcome"], "filled");
 
+    // The pair itself, with the rationale nothing outside this application knows: which long was
+    // paired with which short, on what hedge ratio, at what entry score.
+    let opened = of_type(&records, "pair_opened");
+    assert_eq!(opened.len(), 1, "the pair that opened is recorded");
+    assert_eq!(opened[0]["payload"]["pair_id"], "AAAA-BBBB");
+    assert_eq!(opened[0]["payload"]["model_run_id"], "run-1");
+    assert!(
+        opened[0]["payload"]["hedge_ratio"].is_number()
+            && opened[0]["payload"]["entry_z_score"].is_number()
+            && opened[0]["payload"]["signal_strength"].is_number()
+    );
+    // The identifier the close and the attribution will join on.
+    assert_eq!(
+        opened[0]["payload"]["pair_uuid"],
+        open[0].id().to_string(),
+        "the record names the row it wrote"
+    );
+
     submit.assert_async().await;
 }
 
@@ -835,19 +853,27 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let summary = evaluate::run_liquidation(
-        &pool,
-        &trading,
-        &session_log("test-liquidation-flattens-the-book-and-marks-every-pair"),
-        uuid::Uuid::new_v4(),
-        Utc::now(),
-    )
-    .await
-    .expect("the liquidation must run");
+    let log = session_log("test-liquidation-flattens-the-book-and-marks-every-pair");
+    let summary =
+        evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
+            .await
+            .expect("the liquidation must run");
 
     assert_eq!(summary.pairs_closed, 2);
     assert!(summary.pairs_still_open.is_empty());
     assert!(pairs::load_open_pairs(&pool).await.unwrap().is_empty());
+
+    // The table is mutated in place; the log needs its own record of the transition.
+    let records = recorded(&log);
+    let closed = of_type(&records, "pair_closed");
+    assert_eq!(closed.len(), 2, "one record per pair marked closed");
+    for record in &closed {
+        assert_eq!(record["payload"]["reason"], "end_of_day");
+        assert_eq!(
+            record["payload"]["updated"], true,
+            "a pair that was open when the liquidation reached it"
+        );
+    }
 }
 
 /// A pair whose leg Alpaca refused to close stays open in the record. Marking it closed would leave
@@ -976,10 +1002,11 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     mock_no_transfers(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
+    let log = session_log("test-the-account-sync-stores-and-attributes-a-session");
     let summary = account::sync_account(
         &pool,
         &trading,
-        &session_log("test-the-account-sync-stores-and-attributes-a-session"),
+        &log,
         uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
@@ -1003,6 +1030,15 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         account::load_equity_for(&pool, session_date).await.unwrap(),
         Some(rust_decimal::Decimal::from(102_000))
     );
+
+    // The attribution is the one derived value the log keeps, recorded beside the pair it landed
+    // on so the stored figure can be checked against the fills it came from.
+    let records = recorded(&log);
+    let attributed = of_type(&records, "pair_attributed");
+    assert_eq!(attributed.len(), 1);
+    assert_eq!(attributed[0]["payload"]["pair_uuid"], id.to_string());
+    assert_eq!(attributed[0]["payload"]["realized_profit_and_loss"], 100.0);
+    assert_eq!(attributed[0]["payload"]["updated"], true);
 }
 
 /// Re-running a sync must change nothing. Alpaca's activity identifier is the primary key, so the

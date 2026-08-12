@@ -25,7 +25,7 @@ use crate::common::alpaca::{
     AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
     TRANSFER_ACTIVITY_TYPES,
 };
-use crate::common::session_log::{AccountObserved, Observation, SessionLog};
+use crate::common::session_log::{AccountObserved, Observation, PairAttributed, SessionLog};
 use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
@@ -126,7 +126,19 @@ pub async fn sync_account(
 
     let mut pairs_attributed = 0;
     for (id, amount) in &attribution.realized {
-        if pairs::record_realized_profit_and_loss(pool, *id, *amount).await? {
+        let updated = pairs::record_realized_profit_and_loss(pool, *id, *amount).await?;
+        session_log
+            .record(
+                correlation_id,
+                Utc::now(),
+                Observation::PairAttributed(PairAttributed {
+                    pair_uuid: id.to_string(),
+                    realized_profit_and_loss: amount.to_f64(),
+                    updated,
+                }),
+            )
+            .await;
+        if updated {
             pairs_attributed += 1;
         }
     }
