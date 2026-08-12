@@ -12,6 +12,7 @@ use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use crate::common::alpaca::AccountSnapshot;
+use crate::common::types::PairID;
 use crate::portfolio::size::{SizedPair, SizingParameters};
 
 /// Fraction of the previous session's equity the account may lose before entries stop.
@@ -209,17 +210,26 @@ impl RiskGate {
     }
 
     /// Runs `admit` across a selection, returning what passed and what each refusal was.
-    pub fn admit_all(&mut self, sized: &[SizedPair]) -> (Vec<SizedPair>, Vec<RiskBlock>) {
+    ///
+    /// Refusals carry the pair they refused, so a refusal rate is attributable back to the
+    /// candidates that produced it.
+    pub fn admit_all(&mut self, sized: &[SizedPair]) -> (Vec<SizedPair>, Vec<RefusedPair>) {
         let mut approved = Vec::with_capacity(sized.len());
-        let mut blocks = Vec::new();
+        let mut refusals = Vec::new();
 
         for pair in sized {
             if self.vacant_slots() == 0 {
-                blocks.push(RiskBlock::PairCapacity {
-                    open: self.open_pair_count,
-                    maximum: self.parameters.maximum_concurrent_pairs(),
+                refusals.push(RefusedPair {
+                    pair_id: pair.candidate().pair_id().clone(),
+                    block: RiskBlock::PairCapacity {
+                        open: self.open_pair_count,
+                        maximum: self.parameters.maximum_concurrent_pairs(),
+                    },
                 });
-                break;
+                // `continue`, not `break`: a full book still has to say which candidates it turned
+                // away, and every one after the first would otherwise be recorded as though the
+                // screen dropped it.
+                continue;
             }
             match self.admit(pair) {
                 Some(block) => {
@@ -229,7 +239,10 @@ impl RiskGate {
                         reason = %block,
                         "Pair refused by the risk gate"
                     );
-                    blocks.push(block);
+                    refusals.push(RefusedPair {
+                        pair_id: pair.candidate().pair_id().clone(),
+                        block,
+                    });
                 }
                 None => approved.push(pair.clone()),
             }
@@ -237,11 +250,18 @@ impl RiskGate {
 
         info!(
             approved = approved.len(),
-            refused = blocks.len(),
+            refused = refusals.len(),
             "Risk gate applied"
         );
-        (approved, blocks)
+        (approved, refusals)
     }
+}
+
+/// One pair the gate turned down, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefusedPair {
+    pub pair_id: PairID,
+    pub block: RiskBlock,
 }
 
 #[cfg(test)]
@@ -393,13 +413,27 @@ mod tests {
             sized("CCCC", "DDDD", 100.0, 1_000),
             sized("EEEE", "FFFF", 100.0, 1_000),
         ];
-        let (approved, blocks) = gate.admit_all(&pairs);
+        let (approved, refusals) = gate.admit_all(&pairs);
 
         assert_eq!(approved.len(), 1);
         assert!(matches!(
-            blocks.as_slice(),
-            [RiskBlock::PairCapacity { .. }]
+            refusals.as_slice(),
+            [
+                RefusedPair {
+                    block: RiskBlock::PairCapacity { .. },
+                    ..
+                },
+                RefusedPair {
+                    block: RiskBlock::PairCapacity { .. },
+                    ..
+                }
+            ]
         ));
+        // Each refusal names the pair it refused, which is what makes a refusal rate attributable
+        // back to the candidate that produced it — and every pair behind the first is refused too,
+        // rather than left looking as though the screen dropped it.
+        assert_eq!(refusals[0].pair_id.as_str(), "CCCC-DDDD");
+        assert_eq!(refusals[1].pair_id.as_str(), "EEEE-FFFF");
     }
 
     #[test]

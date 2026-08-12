@@ -17,6 +17,10 @@
       export FUND_LOG_DIR="''${FUND_LOG_DIR:-/var/log/fund}"
     fi
     mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
+    # The session log is data rather than logs, but it inherits FUND_LOG_DIR's writability
+    # fallback so it needs no provisioning of its own. Point it elsewhere to separate them.
+    export FUND_SESSION_LOG_DIR="''${FUND_SESSION_LOG_DIR:-$FUND_LOG_DIR/sessions}"
+    mkdir -p "$FUND_SESSION_LOG_DIR" 2>/dev/null || true
   '';
 
   applySchema = ''

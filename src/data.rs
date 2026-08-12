@@ -8,6 +8,9 @@
 //! Two S3 prefixes with one owner each. [`archive`] owns `data/`, the trainer's bars and the long-
 //! term record of them; [`export`] owns `exports/`, the application's own tables, which the purge
 //! deletes from PostgreSQL only once they are safely written. Neither writes the other's prefix.
+//!
+//! [`session_log`] is the exception to "tables first": it is written to local disk as it happens and
+//! is the original that PostgreSQL and S3 are both derived from.
 
 pub mod archive;
 pub mod bars;
@@ -15,4 +18,5 @@ pub mod calendar;
 pub mod details;
 pub mod export;
 pub mod purge;
+pub mod session_log;
 pub mod universe;

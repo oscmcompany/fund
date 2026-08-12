@@ -487,12 +487,20 @@ impl OrderIntent {
         }
     }
 
+    /// Which side of the book this order takes, as Alpaca names it.
+    pub fn side(&self) -> &'static str {
+        match self {
+            OrderIntent::OpenLong { .. } => "buy",
+            OrderIntent::OpenShort { .. } => "sell",
+        }
+    }
+
     /// Builds the request body Alpaca expects.
     ///
     /// `position_intent` is sent explicitly rather than left to Alpaca's inference. Without it a
     /// sell against an existing long is read as a close rather than a short, which for a strategy
     /// that holds both sides of a pair is the difference between opening a hedge and unwinding one.
-    fn to_request(&self) -> OrderRequest {
+    fn to_request(&self, client_order_id: &str) -> OrderRequest {
         match self {
             OrderIntent::OpenLong { ticker, notional } => OrderRequest {
                 symbol: ticker.as_str().to_string(),
@@ -502,6 +510,7 @@ impl OrderIntent {
                 notional: Some(format!("{:.2}", notional.value())),
                 qty: None,
                 position_intent: "buy_to_open",
+                client_order_id: client_order_id.to_string(),
             },
             OrderIntent::OpenShort { ticker, shares } => OrderRequest {
                 symbol: ticker.as_str().to_string(),
@@ -511,6 +520,7 @@ impl OrderIntent {
                 notional: None,
                 qty: Some(shares.get()),
                 position_intent: "sell_to_open",
+                client_order_id: client_order_id.to_string(),
             },
         }
     }
@@ -831,6 +841,37 @@ impl AccountActivity {
     }
 }
 
+/// The order raised to close one position.
+///
+/// The price is absent because a close is not polled to a terminal state; `alpaca_order_id` joins
+/// this to the fill when the post-close activity sync lands it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionClose {
+    ticker: Ticker,
+    /// Absent when Alpaca accepted the close but returned a body this client could not read.
+    alpaca_order_id: Option<String>,
+    side: Option<String>,
+    quantity: Option<f64>,
+}
+
+impl PositionClose {
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+
+    pub fn side(&self) -> Option<&str> {
+        self.side.as_deref()
+    }
+
+    pub fn quantity(&self) -> Option<f64> {
+        self.quantity
+    }
+}
+
 /// The result of asking Alpaca to close one position during a bulk liquidation.
 ///
 /// Alpaca answers a bulk close with `207 Multi-Status` and a per-symbol status, so a single
@@ -840,11 +881,34 @@ impl AccountActivity {
 pub struct LiquidationOutcome {
     ticker: Ticker,
     status: u16,
+    /// The order Alpaca raised, absent when it refused the close.
+    alpaca_order_id: Option<String>,
+    quantity: Option<f64>,
 }
 
 impl LiquidationOutcome {
     pub fn new(ticker: Ticker, status: u16) -> Self {
-        Self { ticker, status }
+        Self {
+            ticker,
+            status,
+            alpaca_order_id: None,
+            quantity: None,
+        }
+    }
+
+    /// The outcome together with the order that carried it out.
+    pub fn with_order(
+        ticker: Ticker,
+        status: u16,
+        alpaca_order_id: Option<String>,
+        quantity: Option<f64>,
+    ) -> Self {
+        Self {
+            ticker,
+            status,
+            alpaca_order_id,
+            quantity,
+        }
     }
 
     pub fn ticker(&self) -> &Ticker {
@@ -853,6 +917,14 @@ impl LiquidationOutcome {
 
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    pub fn alpaca_order_id(&self) -> Option<&str> {
+        self.alpaca_order_id.as_deref()
+    }
+
+    pub fn quantity(&self) -> Option<f64> {
+        self.quantity
     }
 
     /// Whether Alpaca accepted the close for this symbol.
@@ -936,10 +1008,23 @@ impl TradingClient {
     }
 
     /// Submits an order and returns Alpaca's order identifier.
-    pub async fn submit_order(&self, intent: &OrderIntent) -> Result<String, ClientError> {
+    /// Sends an order under a caller-chosen `client_order_id`.
+    ///
+    /// The identifier is the caller's because it must exist before the request does, so a crash
+    /// before Alpaca answers still leaves an order something can name.
+    pub async fn submit_order(
+        &self,
+        intent: &OrderIntent,
+        client_order_id: &str,
+    ) -> Result<String, ClientError> {
         let url = format!("{}/v2/orders", self.base_url);
-        let response =
-            error_for_status(self.post(&url).json(&intent.to_request()).send().await?).await?;
+        let response = error_for_status(
+            self.post(&url)
+                .json(&intent.to_request(client_order_id))
+                .send()
+                .await?,
+        )
+        .await?;
         let order: OrderResponse = response.json().await.map_err(|error| {
             ClientError::Parse(format!("Failed to parse order response: {error}"))
         })?;
@@ -947,6 +1032,7 @@ impl TradingClient {
         info!(
             ticker = %intent.ticker(),
             order_id = %order.id,
+            client_order_id,
             "Order submitted"
         );
         Ok(order.id)
@@ -983,7 +1069,14 @@ impl TradingClient {
     /// Returns `false` when there was no position to close (`404`). That is the expected answer
     /// when a pair is being closed for the second time — after a retry, or after Alpaca liquidated
     /// the leg itself — and treating it as an error would turn a no-op into an incident.
-    pub async fn close_position(&self, ticker: &Ticker) -> Result<bool, ClientError> {
+    /// Closes one position, returning the order Alpaca raised to do it.
+    ///
+    /// `None` means there was no position, the expected answer on a retry. The order identifier is
+    /// the only handle joining an exit to the fill that settles it in `account_activities`.
+    pub async fn close_position(
+        &self,
+        ticker: &Ticker,
+    ) -> Result<Option<PositionClose>, ClientError> {
         let url = format!("{}/v2/positions/{}", self.base_url, ticker.as_str());
         let response = self
             .delete(&url)
@@ -993,11 +1086,29 @@ impl TradingClient {
 
         if response.status().as_u16() == 404 {
             info!(ticker = %ticker, "No position to close");
-            return Ok(false);
+            return Ok(None);
         }
-        error_for_status(response).await?;
-        info!(ticker = %ticker, "Position close submitted");
-        Ok(true)
+        let response = error_for_status(response).await?;
+
+        // A body that will not parse is not a failed close: Alpaca accepted it, and refusing here
+        // would make the caller unwind a position that is already on its way out. The identifier is
+        // lost and the close is not.
+        let order: Option<ClosedPositionOrder> = response.json().await.ok();
+        let alpaca_order_id = order.as_ref().and_then(|order| order.id.clone());
+        info!(
+            ticker = %ticker,
+            order_id = alpaca_order_id.as_deref().unwrap_or("unknown"),
+            "Position close submitted"
+        );
+        Ok(Some(PositionClose {
+            ticker: ticker.clone(),
+            alpaca_order_id,
+            side: order.as_ref().and_then(|order| order.side.clone()),
+            quantity: order
+                .as_ref()
+                .and_then(|order| order.qty.as_ref())
+                .and_then(|quantity| quantity.parse().ok()),
+        }))
     }
 
     /// Closes every open position and cancels every open order.
@@ -1032,7 +1143,16 @@ impl TradingClient {
             if !(200..300).contains(&payload.status) {
                 warn!(ticker = %ticker, status = payload.status, "Alpaca refused to close a position");
             }
-            outcomes.push(LiquidationOutcome::new(ticker, payload.status));
+            outcomes.push(LiquidationOutcome::with_order(
+                ticker,
+                payload.status,
+                payload.body.as_ref().and_then(|order| order.id.clone()),
+                payload
+                    .body
+                    .as_ref()
+                    .and_then(|order| order.qty.as_ref())
+                    .and_then(|quantity| quantity.parse().ok()),
+            ));
         }
 
         info!(
@@ -1318,6 +1438,12 @@ struct OrderRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     qty: Option<u32>,
     position_intent: &'static str,
+    /// The caller's own identifier, chosen before the order is sent.
+    ///
+    /// This is what makes an order recoverable after a crash between the session log write and
+    /// Alpaca's response: the broker's identifier does not exist yet at that point, and this one
+    /// does.
+    client_order_id: String,
 }
 
 #[derive(Deserialize)]
@@ -1341,6 +1467,19 @@ struct PositionResponse {
 struct ClosePositionResponse {
     symbol: String,
     status: u16,
+    /// The order Alpaca raised, present when it accepted the close.
+    body: Option<ClosedPositionOrder>,
+}
+
+/// The order returned by a position close, single or bulk.
+///
+/// Every field is optional, `id` included: a bulk close puts an error object where a refused
+/// symbol's order would be, so a required field would fail the parse for the whole liquidation.
+#[derive(Deserialize)]
+struct ClosedPositionOrder {
+    id: Option<String>,
+    qty: Option<String>,
+    side: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1460,10 +1599,45 @@ impl Snapshot {
     /// name. Callers needing to reject a wide or stale book should read [`Snapshot::latest_quote`]
     /// directly; this is the convenience path, not the careful one.
     pub fn reference_price(&self) -> Option<f64> {
+        self.reference_price_with_source().map(|(price, _)| price)
+    }
+
+    /// [`Snapshot::reference_price`] together with the field it came from.
+    ///
+    /// A midpoint and a last trade are not interchangeable readings, so a price without its source
+    /// cannot be compared against the same symbol on the next pass.
+    pub fn reference_price_with_source(&self) -> Option<(f64, PriceSource)> {
         self.latest_quote
             .as_ref()
-            .map(EquityQuote::mid_price)
-            .or(self.latest_trade_price)
+            .map(|quote| (quote.mid_price(), PriceSource::QuoteMidpoint))
+            .or_else(|| {
+                self.latest_trade_price
+                    .map(|price| (price, PriceSource::LastTrade))
+            })
+    }
+}
+
+/// Which field of a [`Snapshot`] a reference price was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    QuoteMidpoint,
+    LastTrade,
+}
+
+impl PriceSource {
+    /// A stable short name for the session log and the structured logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PriceSource::QuoteMidpoint => "quote_midpoint",
+            PriceSource::LastTrade => "last_trade",
+        }
+    }
+}
+
+impl std::fmt::Display for PriceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -2181,7 +2355,7 @@ mod tests {
             ticker: ticker("AAPL"),
             notional: Dollars::new(Decimal::new(123456, 2)).unwrap(),
         }
-        .to_request();
+        .to_request("client-long");
         assert_eq!(long.side, "buy");
         assert_eq!(long.notional.as_deref(), Some("1234.56"));
         assert_eq!(long.qty, None);
@@ -2191,7 +2365,7 @@ mod tests {
             ticker: ticker("MSFT"),
             shares: shares(40),
         }
-        .to_request();
+        .to_request("client-short");
         assert_eq!(short.side, "sell");
         assert_eq!(short.notional, None);
         assert_eq!(short.qty, Some(40));
@@ -2208,7 +2382,7 @@ mod tests {
                 ticker: ticker("MSFT"),
                 shares: shares(10),
             }
-            .to_request(),
+            .to_request("client-short"),
         )
         .unwrap();
         assert_eq!(body["position_intent"], "sell_to_open");
@@ -2395,10 +2569,13 @@ mod tests {
 
         let client = TradingClient::with_base_url(credentials(), server.url());
         let order_id = client
-            .submit_order(&OrderIntent::OpenLong {
-                ticker: ticker("AAPL"),
-                notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
-            })
+            .submit_order(
+                &OrderIntent::OpenLong {
+                    ticker: ticker("AAPL"),
+                    notional: Dollars::new(Decimal::new(5000, 0)).unwrap(),
+                },
+                "client-long",
+            )
             .await
             .expect("order must submit");
 
@@ -2420,10 +2597,11 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        assert!(!client
+        assert!(client
             .close_position(&ticker("AAPL"))
             .await
-            .expect("a missing position is not an error"));
+            .expect("a missing position is not an error")
+            .is_none());
         mock.assert_async().await;
     }
 

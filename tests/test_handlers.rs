@@ -17,6 +17,7 @@ use fund::common::alpaca::{
 use fund::common::types::{BarInterval, Ticker};
 use fund::data::bars;
 use fund::data::calendar::{SessionDate, TradingCalendar};
+use fund::data::session_log::SessionLog;
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;
@@ -63,6 +64,50 @@ fn calendar_for_today() -> TradingCalendar {
         })
         .collect();
     TradingCalendar::from_days(days)
+}
+
+/// A session log in a directory of this test's own.
+///
+/// Every path under test writes one, so a shared directory would let one test's records be read as
+/// another's — and these tests already share a database.
+fn session_log(name: &str) -> SessionLog {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "fund-test-handlers-{name}-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    SessionLog::new(directory).expect("the log directory must be creatable")
+}
+
+/// Every record a log holds, in the order it was written.
+fn recorded(log: &SessionLog) -> Vec<serde_json::Value> {
+    let mut files: Vec<_> = std::fs::read_dir(log.directory())
+        .expect("the log directory must be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect::<Vec<serde_json::Value>>()
+        })
+        .collect()
+}
+
+/// The records of one type, preserving write order.
+fn of_type<'a>(records: &'a [serde_json::Value], event_type: &str) -> Vec<&'a serde_json::Value> {
+    records
+        .iter()
+        .filter(|record| record["event_type"] == event_type)
+        .collect()
 }
 
 /// The five most recent weekday sessions ending at `session_date`.
@@ -203,6 +248,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
+    let session_log = session_log("test-a-pass-opens-a-pair-and-records-it");
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -212,6 +258,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
+        session_log: &session_log,
         shutdown: &running,
         now: session_instant(),
     };
@@ -237,6 +284,75 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         open[0].entry_z_score() > 0.0,
         "the stored entry score must be positive by the orientation invariant"
     );
+
+    // The pass is only useful to a replay if the observation reached the disk. One evaluation
+    // record, and one submission and one resolution per leg, all threaded by the pass's identifier.
+    let records = recorded(&session_log);
+    let passes = of_type(&records, "evaluation_pass");
+    assert_eq!(passes.len(), 1, "one record per pass");
+    let pass = &passes[0];
+    let correlation_id = pass["correlation_id"]
+        .as_str()
+        .expect("a pass is correlated");
+
+    assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
+    let candidate = &pass["payload"]["candidates"][0];
+    assert_eq!(candidate["decision"], "opened");
+    // Sizing is recorded on the candidate, not only on the orders that went out, so a pair the risk
+    // gate refuses is still answerable in the dimension that caused the refusal.
+    assert!(
+        candidate["long_notional"].is_number()
+            && candidate["short_shares"].is_number()
+            && candidate["gross_exposure"].is_number(),
+        "a candidate that reached the sizer carries what it was sized to"
+    );
+    assert!(
+        !pass["payload"]["prices"].as_array().unwrap().is_empty(),
+        "the prices the pass decided on must be recorded"
+    );
+    assert!(
+        pass["payload"]["prices"][0]["price_source"].is_string(),
+        "a price without its source cannot be compared across passes"
+    );
+
+    // What the model offered the screen, as rows rather than a count. `expected_return` and
+    // `confidence` are derived from the stored quantiles, so `equity_predictions` alone cannot
+    // reconstruct what the screen actually consumed.
+    let screen_inputs = pass["payload"]["screen_inputs"]
+        .as_array()
+        .expect("screen inputs are recorded");
+    assert_eq!(screen_inputs.len(), 2, "both forecasts reached the screen");
+    assert!(screen_inputs
+        .iter()
+        .all(|input| input["expected_return"].is_number()
+            && input["confidence"].is_number()
+            && input["is_shortable"].is_boolean()));
+    assert!(
+        pass["payload"]["excluded"]
+            .as_array()
+            .expect("the funnel is recorded")
+            .is_empty(),
+        "nothing was filtered out in this fixture"
+    );
+
+    let submitted = of_type(&records, "order_submitted");
+    let resolved = of_type(&records, "order_resolved");
+    assert_eq!(submitted.len(), 2, "one submission per leg");
+    assert_eq!(resolved.len(), 2, "every submission is resolved");
+    for record in submitted.iter().chain(resolved.iter()) {
+        assert_eq!(
+            record["correlation_id"], correlation_id,
+            "orders thread back to the pass that decided them"
+        );
+    }
+    // The submission is keyed by an identifier chosen before the request was sent, which is what
+    // makes an order recoverable if the process dies between the write and Alpaca's response.
+    assert_eq!(
+        submitted[0]["payload"]["client_order_id"],
+        resolved[0]["payload"]["client_order_id"]
+    );
+    assert_eq!(resolved[0]["payload"]["outcome"], "filled");
+
     submit.assert_async().await;
 }
 
@@ -306,6 +422,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
     let running = CancellationToken::new();
     running.cancel();
 
+    let session_log = session_log("test-a-pass-opens-nothing-once-shutdown-is-requested");
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -315,6 +432,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
+        session_log: &session_log,
         shutdown: &running,
         now: session_instant(),
     };
@@ -420,6 +538,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let sizing = SizingParameters::new(4, 1.0).unwrap();
 
     let running = CancellationToken::new();
+    let session_log = session_log("test-a-pass-closes-a-converged-pair-from-a-full-book");
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -429,6 +548,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         close_history: &close_history,
         sizing,
         execution: settings(),
+        session_log: &session_log,
         shutdown: &running,
         now: session_instant(),
     };
@@ -455,6 +575,38 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     // distinguishes that from a gate refusal, which an empty `pairs_opened` alone cannot.
     assert_eq!(summary.entries_blocked, None);
     assert_eq!(summary.candidates_screened, 0);
+
+    // The exit half is recorded to the same standard as the entry half. Both legs of the pair that
+    // closed, each carrying the order that will settle it — without these, realized profit and loss
+    // is attributable in one direction only.
+    let records = recorded(&session_log);
+    let closes = of_type(&records, "position_close_requested");
+    assert_eq!(closes.len(), 2, "one record per leg of the closed pair");
+    for record in &closes {
+        assert_eq!(record["payload"]["pair_id"], "AAAA-BBBB");
+        assert_eq!(record["payload"]["reason"], "pair_exit");
+        assert_eq!(record["payload"]["accepted"], true);
+    }
+
+    // And the pass that measured every open pair says so, whether or not the pair closed.
+    let pass = of_type(&records, "evaluation_pass");
+    let measured = pass[0]["payload"]["open_pairs"]
+        .as_array()
+        .expect("open pairs are recorded");
+    assert_eq!(
+        measured.len(),
+        4,
+        "every open pair is measured, not just the one that closed"
+    );
+    let closed = measured
+        .iter()
+        .find(|reading| reading["pair_id"] == "AAAA-BBBB")
+        .expect("the converged pair is among them");
+    assert_eq!(closed["decision"], "convergence");
+    assert!(
+        closed["z_score"].is_number() && closed["spread_mean"].is_number(),
+        "the inputs that produced the exit decision are recorded with it"
+    );
 }
 
 /// A pair with no price this pass is held, not closed and not crashed. The pre-close liquidation
@@ -503,6 +655,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
+    let session_log = session_log("test-a-pair-that-cannot-be-priced-is-held-and-counted");
     let context = EvaluationContext {
         pool: &pool,
         trading: &trading,
@@ -512,6 +665,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
+        session_log: &session_log,
         shutdown: &running,
         now: session_instant(),
     };
@@ -559,9 +713,14 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let summary = evaluate::run_liquidation(&pool, &trading, Utc::now())
-        .await
-        .expect("the liquidation must run");
+    let summary = evaluate::run_liquidation(
+        &pool,
+        &trading,
+        &session_log("test-liquidation-flattens-the-book-and-marks-every-pair"),
+        Utc::now(),
+    )
+    .await
+    .expect("the liquidation must run");
 
     assert_eq!(summary.pairs_closed, 2);
     assert!(summary.pairs_still_open.is_empty());
@@ -602,9 +761,14 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let summary = evaluate::run_liquidation(&pool, &trading, Utc::now())
-        .await
-        .unwrap();
+    let summary = evaluate::run_liquidation(
+        &pool,
+        &trading,
+        &session_log("test-a-refused-leg-leaves-its-pair-open"),
+        Utc::now(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.positions_refused, 1);
     assert_eq!(summary.pairs_closed, 1);
@@ -691,6 +855,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     let summary = account::sync_account(
         &pool,
         &trading,
+        &session_log("test-the-account-sync-stores-and-attributes-a-session"),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -751,10 +916,12 @@ async fn test_the_account_sync_is_idempotent() {
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let calendar = calendar_ending_at(session_date);
-    let first = account::sync_account(&pool, &trading, &calendar, session_date)
+    let log = session_log("test-the-account-sync-is-idempotent-0");
+    let first = account::sync_account(&pool, &trading, &log, &calendar, session_date)
         .await
         .unwrap();
-    let second = account::sync_account(&pool, &trading, &calendar, session_date)
+    let log = session_log("test-the-account-sync-is-idempotent-1");
+    let second = account::sync_account(&pool, &trading, &log, &calendar, session_date)
         .await
         .unwrap();
 
@@ -834,6 +1001,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
     let summary = account::sync_account(
         &pool,
         &trading,
+        &session_log("test-the-account-sync-stores-transfers-without-attributing-them"),
         &calendar_ending_at(session_date),
         session_date,
     )
@@ -901,7 +1069,8 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     }
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let with_gap = account::sync_account(&pool, &trading, &calendar, session_date)
+    let log = session_log("test-the-account-sync-reports-a-missing-previous-session-2");
+    let with_gap = account::sync_account(&pool, &trading, &log, &calendar, session_date)
         .await
         .expect("the sync must run");
     assert_eq!(
@@ -911,10 +1080,10 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     );
 
     // Fill the hole and the same sync stops reporting it.
-    account::sync_account(&pool, &trading, &calendar, previous)
+    account::sync_account(&pool, &trading, &log, &calendar, previous)
         .await
         .expect("the sync must run");
-    let repaired = account::sync_account(&pool, &trading, &calendar, session_date)
+    let repaired = account::sync_account(&pool, &trading, &log, &calendar, session_date)
         .await
         .expect("the sync must run");
     assert_eq!(repaired.previous_session_gap, None);
