@@ -299,11 +299,11 @@ pub struct PairClosed {
     pub updated: bool,
 }
 
-/// What the post-close sync attributed to a closed pair.
+/// The attribution the post-close sync wrote to a closed pair.
 ///
-/// The one derived value the log keeps. It is what the database will serve, and recording it
-/// beside the fills it was computed from is what makes a disagreement between the two visible at
-/// all — everything else here stays an observation precisely so it cannot disagree with anything.
+/// A record of a write, not of a conclusion — the same kind of thing as [`OrderSubmitted`]. The
+/// amount is derivable from [`PairOpened`], [`PairClosed`], and the session's [`ActivityObserved`]
+/// rows; what is not derivable is that this process put that number on that row and that it landed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PairAttributed {
     pub pair_uuid: String,
