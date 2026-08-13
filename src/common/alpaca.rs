@@ -1738,11 +1738,16 @@ impl QuoteLimits {
 
     /// Why this book cannot be priced, or `None` if it can.
     ///
+    /// Public because a refused book with no last trade behind it leaves no [`CheckedPrice`] to
+    /// carry the verdict, and that is the reading most worth recording.
+    ///
     /// The midpoint is a safe divisor because [`EquityQuote::new`] has already refused a
     /// non-positive side.
-    fn refusal(&self, quote: &EquityQuote, now: DateTime<Utc>) -> Option<QuoteRejection> {
+    pub fn refusal(&self, quote: &EquityQuote, now: DateTime<Utc>) -> Option<QuoteRejection> {
+        // Magnitude, not sign. A quote stamped after `now` — feed clock skew is ordinary — describes
+        // the current market no better than one stamped too far before it.
         let age = now.signed_duration_since(quote.timestamp());
-        if age > self.maximum_age {
+        if age.abs() > self.maximum_age {
             return Some(QuoteRejection::Stale {
                 age_seconds: age.num_seconds(),
                 limit_seconds: self.maximum_age.num_seconds(),
@@ -3301,10 +3306,17 @@ mod tests {
 
         assert_eq!(checked.price(), 150.60);
         assert_eq!(checked.source(), PriceSource::LastTrade);
-        assert!(matches!(
-            checked.rejection(),
-            Some(QuoteRejection::Wide { .. })
-        ));
+        // The payload, not only the variant: these numbers are the entire reason the rejection is
+        // recorded, and a wrong divisor or a swapped pair reads as a pass against `matches!`.
+        let Some(QuoteRejection::Wide {
+            relative_spread,
+            limit,
+        }) = checked.rejection()
+        else {
+            panic!("a wide book must be refused as wide");
+        };
+        assert!((relative_spread - (150.86 - 128.0) / 139.43).abs() < 1e-9);
+        assert_eq!(limit, MAXIMUM_RELATIVE_QUOTE_SPREAD);
     }
 
     #[test]
@@ -3316,10 +3328,61 @@ mod tests {
             .unwrap();
 
         assert_eq!(checked.source(), PriceSource::LastTrade);
-        assert!(matches!(
-            checked.rejection(),
-            Some(QuoteRejection::Stale { .. })
-        ));
+        let Some(QuoteRejection::Stale {
+            age_seconds,
+            limit_seconds,
+        }) = checked.rejection()
+        else {
+            panic!("a stale quote must be refused as stale");
+        };
+        assert_eq!(age_seconds, MAXIMUM_QUOTE_AGE_SECONDS + 1);
+        assert_eq!(limit_seconds, MAXIMUM_QUOTE_AGE_SECONDS);
+    }
+
+    /// Age is signed, so a quote stamped after `now` reads as negative and would slip past a
+    /// comparison against the limit alone. Feed clock skew is ordinary and a future-dated book
+    /// describes the current market no better than a stale one.
+    #[test]
+    fn test_a_future_dated_quote_is_refused_as_stale() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let quoted_at = now + chrono::Duration::seconds(MAXIMUM_QUOTE_AGE_SECONDS + 1);
+        let checked = sound_book_snapshot(quoted_at)
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        let Some(QuoteRejection::Stale { age_seconds, .. }) = checked.rejection() else {
+            panic!("a future-dated quote must be refused as stale");
+        };
+        assert_eq!(
+            age_seconds,
+            -(MAXIMUM_QUOTE_AGE_SECONDS + 1),
+            "the sign is kept so the log shows a future stamp rather than disguising it"
+        );
+    }
+
+    /// The rendered forms reach the structured logs, where a swapped pair would be read as fact.
+    #[test]
+    fn test_a_rejection_renders_its_own_numbers() {
+        let stale = QuoteRejection::Stale {
+            age_seconds: 90,
+            limit_seconds: 60,
+        };
+        assert_eq!(
+            stale.to_string(),
+            "the quote is 90 seconds old, past the 60 second limit"
+        );
+        assert_eq!(stale.as_str(), "stale_quote");
+
+        let wide = QuoteRejection::Wide {
+            relative_spread: 0.1639,
+            limit: 0.01,
+        };
+        assert_eq!(
+            wide.to_string(),
+            "the book is 0.1639 wide, past the 0.0100 limit"
+        );
+        assert_eq!(wide.as_str(), "wide_quote");
     }
 
     #[test]

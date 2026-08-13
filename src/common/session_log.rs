@@ -163,13 +163,21 @@ pub struct PricesObserved {
 /// A symbol the fetch asked for and did not get a usable price for.
 ///
 /// Distinguishing the causes is the point: an absent price with no cause is indistinguishable from
-/// a symbol nobody asked about.
+/// a symbol nobody asked about. A `quote_rejected` row carries the book it was refused on, because
+/// that is the reading the limits most need to be judged against — the guard cost the pass this
+/// symbol entirely, and "how far outside" is not answerable from the cause alone.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnavailablePrice {
     pub ticker: String,
     /// `no_quote`, `chunk_failed`, or `quote_rejected` when the guard refused the only book there
     /// was and no last trade stood behind it.
     pub cause: String,
+    /// The refused book, set only on `quote_rejected`.
+    pub bid_price: Option<f64>,
+    pub ask_price: Option<f64>,
+    pub quote_timestamp: Option<DateTime<Utc>>,
+    /// `stale_quote` or `wide_quote`.
+    pub quote_rejection: Option<String>,
 }
 
 /// The eligibility funnel for one pass.

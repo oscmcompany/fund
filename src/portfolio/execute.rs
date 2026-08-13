@@ -508,29 +508,37 @@ async fn confirm_fill(
                     );
                     context.client.cancel_order(order_id).await?;
                     // Read once more: the cancel may have raced a fill.
+                    let after_cancel = context.client.fetch_order(order_id).await?;
                     if let OrderState::Filled {
                         status: filled_status,
                         filled_shares,
                         average_price,
-                    } = context.client.fetch_order(order_id).await?
+                    } = &after_cancel
                     {
                         resolved!(
                             "filled".to_string(),
-                            Some(filled_shares),
-                            Some(average_price),
+                            Some(*filled_shares),
+                            Some(*average_price),
                             true,
-                            Some(filled_status)
+                            Some(filled_status.clone())
                         );
                         return Ok(Filled::Yes(LegFill {
                             ticker: intent.ticker().clone(),
                             order_id: order_id.to_string(),
-                            shares: filled_shares,
-                            average_price,
+                            shares: *filled_shares,
+                            average_price: *average_price,
                         }));
                     }
-                    // The status Alpaca last held it at, not the one after the cancel: whether it
-                    // had reached the market at all is the thing a timeout cannot otherwise say.
-                    resolved!("timed_out".to_string(), None, None, false, Some(status));
+                    // The state after the cancel, not the working one that preceded it. An order
+                    // terminated with a partial fill reports those shares here, and recording the
+                    // pre-cancel status would contradict what `broker_status` claims to be.
+                    resolved!(
+                        "timed_out".to_string(),
+                        Some(after_cancel.filled_shares()),
+                        None,
+                        false,
+                        Some(after_cancel.broker_status().to_string())
+                    );
                     let cleanup = context.client.close_position(intent.ticker()).await;
                     record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
                     cleanup?;
@@ -815,6 +823,78 @@ mod tests {
         ));
         cancel.assert_async().await;
         flatten.assert_async().await;
+    }
+
+    /// The cancel can land on an order that had partially filled. The resolution has to report the
+    /// state read *after* the cancel — `broker_status` says it is the status when the row was
+    /// written, and shares that really filled must not be recorded as unknown.
+    #[tokio::test]
+    async fn test_a_timeout_records_the_state_read_after_the_cancel() {
+        let mut server = mockito::Server::new_async().await;
+        let _submit = server
+            .mock("POST", "/v2/orders")
+            .with_status(200)
+            .with_body(r#"{"id":"order-1","status":"accepted"}"#)
+            .create_async()
+            .await;
+        // Working on the first read, terminal on the read after the cancel.
+        let _working = server
+            .mock("GET", "/v2/orders/order-1")
+            .with_status(200)
+            .with_body(r#"{"id":"order-1","status":"pending_new","filled_qty":"0"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _after_cancel = server
+            .mock("GET", "/v2/orders/order-1")
+            .with_status(200)
+            .with_body(r#"{"id":"order-1","status":"canceled","filled_qty":"12"}"#)
+            .create_async()
+            .await;
+        let _cancel = server
+            .mock("DELETE", "/v2/orders/order-1")
+            .with_status(204)
+            .create_async()
+            .await;
+        let _flatten = server
+            .mock("DELETE", "/v2/positions/BBBB?percentage=100")
+            .with_status(200)
+            .with_body(r#"{"id":"cleanup-1"}"#)
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let log = session_log("timeout-after-cancel");
+        let context = ExecutionContext {
+            client: &client,
+            // No timeout at all, so the first poll is already past the deadline and the second read
+            // is unambiguously the post-cancel one.
+            settings: ExecutionSettings::new(Duration::from_millis(0), Duration::from_millis(5)),
+            session_log: &log,
+            correlation_id: Uuid::nil(),
+        };
+
+        open_pair(&context, &pair(), None)
+            .await
+            .expect("a timeout is not an error");
+
+        let resolved: Vec<serde_json::Value> = recorded(&log)
+            .into_iter()
+            .filter(|record| record["event_type"] == "order_resolved")
+            .collect();
+        let timed_out = resolved
+            .iter()
+            .find(|record| record["payload"]["outcome"] == "timed_out")
+            .expect("the timeout must be resolved");
+
+        assert_eq!(
+            timed_out["payload"]["broker_status"], "canceled",
+            "the post-cancel status, not the working one that preceded it"
+        );
+        assert_eq!(
+            timed_out["payload"]["filled_shares"], 12.0,
+            "shares that filled before the cancel are not unknown"
+        );
     }
 
     /// A partial fill that then terminates leaves shares held. Reporting the leg cleanly unfilled

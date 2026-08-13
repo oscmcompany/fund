@@ -17,14 +17,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::common::alpaca::{
-    CheckedPrice, ClientError, MarketDataClient, QuoteLimits, TradingClient,
+    CheckedPrice, ClientError, MarketDataClient, QuoteLimits, QuoteRejection, TradingClient,
 };
 use crate::common::session_log::{
     CandidateReading, ExcludedTickerReading, LiquidationAttempted, Observation, OpenPairReading,
     OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PositionCloseRequested, PriceReading,
     PricesObserved, ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
 };
-use crate::common::types::{EquityPrediction, SessionDate, Ticker};
+use crate::common::types::{EquityPrediction, EquityQuote, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
 use crate::data::details::{self, DetailsError};
 use crate::data::universe::Universe;
@@ -608,12 +608,12 @@ async fn fetch_prices(
     let limits = QuoteLimits::default();
 
     // Each snapshot is read once, with the book kept beside the price it produced. The map the
-    // callers receive has already collapsed the quote away, so this is the only place a refused
-    // book can be recorded — and a log holding only the quotes that passed cannot say whether
-    // `limits` is set anywhere near right.
+    // callers receive has already collapsed the quote away, so a refused book is recorded here or
+    // nowhere — and a log holding only the quotes that passed cannot say whether `limits` is set
+    // anywhere near right.
     let mut prices: HashMap<Ticker, CheckedPrice> = HashMap::new();
     let mut readings: Vec<PriceReading> = Vec::new();
-    let mut refused: HashSet<&str> = HashSet::new();
+    let mut refused: HashMap<&str, (&EquityQuote, QuoteRejection)> = HashMap::new();
 
     for snapshot in &fetched.snapshots {
         let quote = snapshot.latest_quote();
@@ -633,11 +633,15 @@ async fn fetch_prices(
                 prices.insert(snapshot.ticker().clone(), checked);
             }
             // A refused book with no last trade behind it. The symbol goes unpriced, which is the
-            // point of refusing it, but "no quote" would be a lie about why.
-            None if quote.is_some() => {
-                refused.insert(snapshot.ticker().as_str());
+            // point of refusing it, and this is the reading the limits most need judging against —
+            // the guard cost the pass the symbol outright, so the book travels with the cause.
+            None => {
+                if let Some((quote, rejection)) =
+                    quote.and_then(|quote| Some((quote, limits.refusal(quote, context.now)?)))
+                {
+                    refused.insert(snapshot.ticker().as_str(), (quote, rejection));
+                }
             }
-            None => {}
         }
     }
     readings.sort_by(|left, right| left.ticker.cmp(&right.ticker));
@@ -649,16 +653,23 @@ async fn fetch_prices(
                 .keys()
                 .any(|ticker| ticker.as_str() == symbol.as_str())
         })
-        .map(|symbol| UnavailablePrice {
-            ticker: symbol.clone(),
-            cause: if failed.contains(symbol.as_str()) {
-                "chunk_failed"
-            } else if refused.contains(symbol.as_str()) {
-                "quote_rejected"
-            } else {
-                "no_quote"
+        .map(|symbol| {
+            let refusal = refused.get(symbol.as_str());
+            UnavailablePrice {
+                ticker: symbol.clone(),
+                cause: if failed.contains(symbol.as_str()) {
+                    "chunk_failed"
+                } else if refusal.is_some() {
+                    "quote_rejected"
+                } else {
+                    "no_quote"
+                }
+                .to_string(),
+                bid_price: refusal.map(|(quote, _)| quote.bid_price()),
+                ask_price: refusal.map(|(quote, _)| quote.ask_price()),
+                quote_timestamp: refusal.map(|(quote, _)| quote.timestamp()),
+                quote_rejection: refusal.map(|(_, rejection)| rejection.as_str().to_string()),
             }
-            .to_string(),
         })
         .collect();
     unavailable.sort_by(|left, right| left.ticker.cmp(&right.ticker));
