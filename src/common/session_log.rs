@@ -213,9 +213,14 @@ pub struct ScreenInputReading {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ExcludedTickerReading {
     pub ticker: String,
-    /// `already_held`, `no_sector`, `no_close_history`, `outside_universe`, `unpriced`, or
-    /// `unusable_input`.
+    /// `already_held`, `no_sector`, `no_close_history`, `outside_universe`, `unpriced`,
+    /// `unusable_input`, or `structural_break`.
     pub reason: String,
+    /// The reading the reason ruled on, where the name alone does not say how far outside it fell.
+    ///
+    /// Set for `structural_break` and absent for the set-membership tests, which have no number to
+    /// report. A limit can only be moved from the readings it refused.
+    pub detail: Option<String>,
 }
 
 /// One symbol's reference price, and which snapshot field it came from.

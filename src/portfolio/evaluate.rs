@@ -1015,6 +1015,7 @@ async fn build_screen_inputs(
             Some(reason) => excluded.push(ExcludedTickerReading {
                 ticker: ticker.to_string(),
                 reason: reason.to_string(),
+                detail: None,
             }),
             None => eligible.push(prediction),
         }
@@ -1039,22 +1040,27 @@ async fn build_screen_inputs(
             excluded.push(ExcludedTickerReading {
                 ticker: ticker.to_string(),
                 reason: "unpriced".to_string(),
+                detail: None,
             });
             continue;
         };
-        let Some(input) = ScreenInput::new(
+        let input = match ScreenInput::new(
             ticker.clone(),
             window.clone(),
             reference.price(),
             prediction.expected_return(),
             prediction.confidence(),
             context.universe.is_shortable(ticker),
-        ) else {
-            excluded.push(ExcludedTickerReading {
-                ticker: ticker.to_string(),
-                reason: "unusable_input".to_string(),
-            });
-            continue;
+        ) {
+            Ok(input) => input,
+            Err(rejection) => {
+                excluded.push(ExcludedTickerReading {
+                    ticker: ticker.to_string(),
+                    reason: rejection.as_str().to_string(),
+                    detail: rejection.detail(),
+                });
+                continue;
+            }
         };
         readings.push(ScreenInputReading {
             ticker: ticker.to_string(),
