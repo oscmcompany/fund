@@ -167,7 +167,8 @@ pub struct PricesObserved {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UnavailablePrice {
     pub ticker: String,
-    /// `no_quote` or `chunk_failed`.
+    /// `no_quote`, `chunk_failed`, or `quote_rejected` when the guard refused the only book there
+    /// was and no last trade stood behind it.
     pub cause: String,
 }
 
@@ -210,11 +211,22 @@ pub struct ExcludedTickerReading {
 }
 
 /// One symbol's reference price, and which snapshot field it came from.
+///
+/// The book is recorded whether or not the price came from it. A reading that fell back to the last
+/// trade still carries the quote that was refused and the reason, because a log holding only the
+/// quotes that passed cannot say whether the limits are set anywhere near right.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PriceReading {
     pub ticker: String,
     pub price: f64,
     pub price_source: String,
+    /// The book as it was offered. Absent when the snapshot carried no quote at all.
+    pub bid_price: Option<f64>,
+    pub ask_price: Option<f64>,
+    /// When the quote was published, not when it was read — the gap between them is the staleness.
+    pub quote_timestamp: Option<DateTime<Utc>>,
+    /// `stale_quote` or `wide_quote`, set only when a quote existed and the guard refused it.
+    pub quote_rejection: Option<String>,
 }
 
 /// An open pair as this pass measured it, whether or not it closed.
@@ -280,6 +292,17 @@ pub struct PairOpened {
     pub signal_strength: f64,
     pub model_run_id: Option<String>,
     pub opened_at: DateTime<Utc>,
+    /// The prices `entry_z_score` was computed from.
+    ///
+    /// Recorded because the z-score alone cannot be checked after the fact: the spread model is fit
+    /// from daily closes and held for the session, so a z that disagrees with the next pass's is a
+    /// disagreement about these two numbers and nothing else.
+    pub long_decision_price: f64,
+    pub short_decision_price: f64,
+    /// What the legs actually filled at. Distinct from the decision prices, and the gap between
+    /// them is entry slippage.
+    pub long_fill_price: f64,
+    pub short_fill_price: f64,
 }
 
 /// A pair as it was marked closed.
@@ -340,6 +363,12 @@ pub struct OrderResolved {
     pub filled_average_price: Option<f64>,
     /// True when the fill was read after a cancel raced it.
     pub filled_after_cancel: bool,
+    /// Alpaca's own status when this resolution was written, absent when nothing reached it.
+    ///
+    /// `outcome` is this application's word and `timed_out` is the case it cannot explain alone:
+    /// an order Alpaca still held at `pending_new` never reached the market, while one at
+    /// `accepted` reached it and found no contra side.
+    pub broker_status: Option<String>,
     /// The broker's error, when the order failed rather than settled.
     pub error: Option<String>,
 }
@@ -722,6 +751,10 @@ mod tests {
                 signal_strength: 0.03,
                 model_run_id: None,
                 opened_at: instant("2026-08-11T14:35:00Z"),
+                long_decision_price: 100.0,
+                short_decision_price: 50.0,
+                long_fill_price: 100.05,
+                short_fill_price: 49.95,
             }),
             Observation::PairClosed(PairClosed {
                 pair_uuid: Uuid::nil().to_string(),
@@ -749,6 +782,7 @@ mod tests {
                 filled_shares: Some(10.0),
                 filled_average_price: Some(100.0),
                 filled_after_cancel: false,
+                broker_status: Some("filled".to_string()),
                 error: None,
             }),
             Observation::PositionCloseRequested(PositionCloseRequested {
@@ -875,12 +909,38 @@ mod tests {
             filled_shares: Some(412.0),
             filled_average_price: Some(62.44),
             filled_after_cancel: false,
+            broker_status: Some("filled".to_string()),
             error: None,
         };
         let value = serde_json::to_value(&filled).expect("fill must serialize");
         let object = value.as_object().expect("a fill is an object");
         assert!(!object.contains_key("slippage"));
         assert!(!object.contains_key("realized_profit_and_loss"));
+    }
+
+    /// A refused quote has to survive into the record. A log holding only the books that passed
+    /// says nothing about where the limits should sit, which is the whole reason they are recorded.
+    #[test]
+    fn test_a_refused_quote_is_recorded_with_the_book_that_was_refused() {
+        let refused = PriceReading {
+            ticker: "AER".to_string(),
+            price: 150.60,
+            price_source: "last_trade".to_string(),
+            bid_price: Some(128.0),
+            ask_price: Some(150.86),
+            quote_timestamp: Some(instant("2026-08-12T14:40:00Z")),
+            quote_rejection: Some("wide_quote".to_string()),
+        };
+
+        let value = serde_json::to_value(&refused).expect("a reading must serialize");
+        assert_eq!(value["price_source"], "last_trade");
+        assert_eq!(value["quote_rejection"], "wide_quote");
+        assert_eq!(value["bid_price"], 128.0);
+        assert_eq!(value["ask_price"], 150.86);
+        assert!(
+            value["quote_timestamp"].is_string(),
+            "staleness is the gap between the quote and the read, so the quote's own time is kept"
+        );
     }
 
     #[tokio::test]

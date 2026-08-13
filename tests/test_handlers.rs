@@ -203,8 +203,21 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     // stretched decides which becomes the short, so both orderings are quoted and the screen picks.
     // 1.2% rather than 50%: the seeded series is near-deterministic, so a 50% dislocation scores a
     // z in the hundreds, which the screen now refuses as a data-quality artifact.
+    // `AAAA` is quoted as well as traded, so the guard's accepting path is exercised end to end and
+    // the assertion on the recorded book is not vacuous. The book straddles the last trade evenly,
+    // leaving the midpoint equal to it — the fixture's economics are unchanged, only its source.
+    let long_price = last_close(&close_history, "AAAA");
     let snapshot_body = serde_json::json!({
-        "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
+        "AAAA": {
+            "latestTrade": { "p": long_price },
+            "latestQuote": {
+                "t": session_instant().to_rfc3339(),
+                "bp": long_price * 0.9995,
+                "ap": long_price * 1.0005,
+                "bs": 10,
+                "as": 12,
+            },
+        },
         "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
 
@@ -331,6 +344,23 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
             .iter()
             .all(|reading| reading["price"].is_number() && reading["price_source"].is_string()),
         "a price without its source cannot be compared across passes"
+    );
+    // Asserted before the check below, which is otherwise vacuously true the moment the fixture
+    // stops quoting anything.
+    assert!(
+        readings
+            .iter()
+            .any(|reading| reading["price_source"] == "quote_midpoint"),
+        "the fixture must exercise the guard's accepting path"
+    );
+    assert!(
+        readings.iter().all(|reading| {
+            reading["price_source"] != "quote_midpoint"
+                || (reading["bid_price"].is_number()
+                    && reading["ask_price"].is_number()
+                    && reading["quote_timestamp"].is_string())
+        }),
+        "a midpoint must carry the book it was taken from, or the guard cannot be tuned"
     );
     assert!(
         priced

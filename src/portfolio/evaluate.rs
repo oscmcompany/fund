@@ -16,7 +16,9 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::common::alpaca::{ClientError, MarketDataClient, PriceSource, TradingClient};
+use crate::common::alpaca::{
+    CheckedPrice, ClientError, MarketDataClient, QuoteLimits, TradingClient,
+};
 use crate::common::session_log::{
     CandidateReading, ExcludedTickerReading, LiquidationAttempted, Observation, OpenPairReading,
     OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PositionCloseRequested, PriceReading,
@@ -82,26 +84,6 @@ pub struct EvaluationContext<'a> {
     /// this is what keeps the drain's bound honest.
     pub shutdown: &'a CancellationToken,
     pub now: DateTime<Utc>,
-}
-
-/// A price as one pass read it, with the snapshot field it came from.
-///
-/// A midpoint moves with the book while a last trade can be minutes stale, so the same symbol read
-/// from different fields on consecutive passes is not one series.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReferencePrice {
-    price: f64,
-    source: PriceSource,
-}
-
-impl ReferencePrice {
-    pub fn price(self) -> f64 {
-        self.price
-    }
-
-    pub fn source(self) -> PriceSource {
-        self.source
-    }
 }
 
 /// One pair the pass closed.
@@ -431,6 +413,10 @@ async fn evaluate_pass(
                             signal_strength: entry.signal_strength(),
                             model_run_id: entry.model_run_id().map(str::to_string),
                             opened_at: context.now,
+                            long_decision_price: pair.candidate().long_price(),
+                            short_decision_price: pair.candidate().short_price(),
+                            long_fill_price: long_fill.average_price(),
+                            short_fill_price: short_fill.average_price(),
                         }),
                     )
                     .await;
@@ -613,29 +599,47 @@ async fn fetch_prices(
     correlation_id: uuid::Uuid,
     purpose: &str,
     symbols: &[String],
-) -> Result<HashMap<Ticker, ReferencePrice>, EvaluationError> {
+) -> Result<HashMap<Ticker, CheckedPrice>, EvaluationError> {
     if symbols.is_empty() {
         return Ok(HashMap::new());
     }
     let fetched = context.market_data.fetch_snapshots(symbols).await?;
     let failed: HashSet<&str> = fetched.failed_symbols.iter().map(String::as_str).collect();
-    let prices: HashMap<Ticker, ReferencePrice> = fetched
-        .snapshots
-        .iter()
-        .filter_map(|snapshot| {
-            let (price, source) = snapshot.reference_price_with_source()?;
-            Some((snapshot.ticker().clone(), ReferencePrice { price, source }))
-        })
-        .collect();
+    let limits = QuoteLimits::default();
 
-    let mut readings: Vec<PriceReading> = prices
-        .iter()
-        .map(|(ticker, reference)| PriceReading {
-            ticker: ticker.to_string(),
-            price: reference.price,
-            price_source: reference.source.as_str().to_string(),
-        })
-        .collect();
+    // Each snapshot is read once, with the book kept beside the price it produced. The map the
+    // callers receive has already collapsed the quote away, so this is the only place a refused
+    // book can be recorded — and a log holding only the quotes that passed cannot say whether
+    // `limits` is set anywhere near right.
+    let mut prices: HashMap<Ticker, CheckedPrice> = HashMap::new();
+    let mut readings: Vec<PriceReading> = Vec::new();
+    let mut refused: HashSet<&str> = HashSet::new();
+
+    for snapshot in &fetched.snapshots {
+        let quote = snapshot.latest_quote();
+        match snapshot.reference_price_checked(context.now, limits) {
+            Some(checked) => {
+                readings.push(PriceReading {
+                    ticker: snapshot.ticker().to_string(),
+                    price: checked.price(),
+                    price_source: checked.source().as_str().to_string(),
+                    bid_price: quote.map(|quote| quote.bid_price()),
+                    ask_price: quote.map(|quote| quote.ask_price()),
+                    quote_timestamp: quote.map(|quote| quote.timestamp()),
+                    quote_rejection: checked
+                        .rejection()
+                        .map(|rejection| rejection.as_str().to_string()),
+                });
+                prices.insert(snapshot.ticker().clone(), checked);
+            }
+            // A refused book with no last trade behind it. The symbol goes unpriced, which is the
+            // point of refusing it, but "no quote" would be a lie about why.
+            None if quote.is_some() => {
+                refused.insert(snapshot.ticker().as_str());
+            }
+            None => {}
+        }
+    }
     readings.sort_by(|left, right| left.ticker.cmp(&right.ticker));
 
     let mut unavailable: Vec<UnavailablePrice> = symbols
@@ -649,6 +653,8 @@ async fn fetch_prices(
             ticker: symbol.clone(),
             cause: if failed.contains(symbol.as_str()) {
                 "chunk_failed"
+            } else if refused.contains(symbol.as_str()) {
+                "quote_rejected"
             } else {
                 "no_quote"
             }
@@ -682,7 +688,7 @@ async fn close_what_should_close(
     execution: &ExecutionContext<'_>,
     correlation_id: uuid::Uuid,
     open_pairs: &[OpenPair],
-    prices: &HashMap<Ticker, ReferencePrice>,
+    prices: &HashMap<Ticker, CheckedPrice>,
     summary: &mut EvaluationSummary,
 ) -> Result<HashSet<uuid::Uuid>, EvaluationError> {
     let mut readings: Vec<OpenPairReading> = Vec::with_capacity(open_pairs.len());
@@ -715,7 +721,7 @@ async fn close_and_measure(
     context: &EvaluationContext<'_>,
     execution: &ExecutionContext<'_>,
     open_pairs: &[OpenPair],
-    prices: &HashMap<Ticker, ReferencePrice>,
+    prices: &HashMap<Ticker, CheckedPrice>,
     summary: &mut EvaluationSummary,
     readings: &mut Vec<OpenPairReading>,
 ) -> Result<HashSet<uuid::Uuid>, EvaluationError> {
@@ -767,7 +773,7 @@ async fn close_and_measure(
         reading.spread_mean = Some(model.mean());
         reading.spread_standard_deviation = Some(model.standard_deviation());
 
-        let Some(z_score) = model.z_score(long_price.price, short_price.price) else {
+        let Some(z_score) = model.z_score(long_price.price(), short_price.price()) else {
             reading.decision = "unreadable_spread".to_string();
             readings.push(reading);
             continue;
@@ -790,10 +796,10 @@ async fn close_and_measure(
             spread_standard_deviation = model.standard_deviation(),
             hedge_ratio = model.hedge_ratio(),
             stored_hedge_ratio = pair.hedge_ratio(),
-            long_price = long_price.price,
-            long_price_source = %long_price.source,
-            short_price = short_price.price,
-            short_price_source = %short_price.source,
+            long_price = long_price.price(),
+            long_price_source = %long_price.source(),
+            short_price = short_price.price(),
+            short_price_source = %short_price.source(),
             "Priced an open pair"
         );
 
@@ -942,7 +948,7 @@ async fn build_screen_inputs(
     context: &EvaluationContext<'_>,
     correlation_id: uuid::Uuid,
     held: &HashSet<Ticker>,
-    prices: &mut HashMap<Ticker, ReferencePrice>,
+    prices: &mut HashMap<Ticker, CheckedPrice>,
 ) -> Result<ScreenedUniverse, EvaluationError> {
     let (start, end) = SessionDate::at(context.now).bounds();
     let predictions = predict::load_predictions_between(context.pool, start, end).await?;
@@ -1028,7 +1034,7 @@ async fn build_screen_inputs(
         let Some(input) = ScreenInput::new(
             ticker.clone(),
             window.clone(),
-            reference.price,
+            reference.price(),
             prediction.expected_return(),
             prediction.confidence(),
             context.universe.is_shortable(ticker),

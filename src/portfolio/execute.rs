@@ -389,6 +389,7 @@ async fn submit_and_confirm(
                     filled_shares: None,
                     filled_average_price: None,
                     filled_after_cancel: false,
+                    broker_status: None,
                     error: Some(error.to_string()),
                 },
             )
@@ -409,6 +410,7 @@ async fn submit_and_confirm(
                 filled_shares: None,
                 filled_average_price: None,
                 filled_after_cancel: false,
+                broker_status: None,
                 error: Some(error.to_string()),
             },
         )
@@ -430,7 +432,7 @@ async fn confirm_fill(
     let deadline = tokio::time::Instant::now() + context.settings.fill_timeout;
 
     macro_rules! resolved {
-        ($outcome:expr, $shares:expr, $price:expr, $after_cancel:expr) => {
+        ($outcome:expr, $shares:expr, $price:expr, $after_cancel:expr, $broker_status:expr) => {
             record_resolution(
                 context,
                 OrderResolved {
@@ -441,6 +443,7 @@ async fn confirm_fill(
                     filled_shares: $shares,
                     filled_average_price: $price,
                     filled_after_cancel: $after_cancel,
+                    broker_status: $broker_status,
                     error: None,
                 },
             )
@@ -451,6 +454,7 @@ async fn confirm_fill(
     loop {
         match context.client.fetch_order(order_id).await? {
             OrderState::Filled {
+                status,
                 filled_shares,
                 average_price,
             } => {
@@ -458,7 +462,8 @@ async fn confirm_fill(
                     "filled".to_string(),
                     Some(filled_shares),
                     Some(average_price),
-                    false
+                    false,
+                    Some(status)
                 );
                 return Ok(Filled::Yes(LegFill {
                     ticker: intent.ticker().clone(),
@@ -471,7 +476,13 @@ async fn confirm_fill(
                 status,
                 filled_shares,
             } => {
-                resolved!(status.clone(), Some(filled_shares), None, false);
+                resolved!(
+                    status.clone(),
+                    Some(filled_shares),
+                    None,
+                    false,
+                    Some(status.clone())
+                );
                 // A partial fill that then terminated leaves shares held. Close the position rather
                 // than reporting the leg cleanly unfilled.
                 if filled_shares > 0.0 {
@@ -487,16 +498,18 @@ async fn confirm_fill(
                 }
                 return Ok(Filled::No(status));
             }
-            OrderState::Working { .. } => {
+            OrderState::Working { status, .. } => {
                 if tokio::time::Instant::now() >= deadline {
                     warn!(
                         ticker = %intent.ticker(),
                         order_id,
+                        broker_status = status.as_str(),
                         "Order did not reach a terminal state before the timeout; cancelling"
                     );
                     context.client.cancel_order(order_id).await?;
                     // Read once more: the cancel may have raced a fill.
                     if let OrderState::Filled {
+                        status: filled_status,
                         filled_shares,
                         average_price,
                     } = context.client.fetch_order(order_id).await?
@@ -505,7 +518,8 @@ async fn confirm_fill(
                             "filled".to_string(),
                             Some(filled_shares),
                             Some(average_price),
-                            true
+                            true,
+                            Some(filled_status)
                         );
                         return Ok(Filled::Yes(LegFill {
                             ticker: intent.ticker().clone(),
@@ -514,7 +528,9 @@ async fn confirm_fill(
                             average_price,
                         }));
                     }
-                    resolved!("timed_out".to_string(), None, None, false);
+                    // The status Alpaca last held it at, not the one after the cancel: whether it
+                    // had reached the market at all is the thing a timeout cannot otherwise say.
+                    resolved!("timed_out".to_string(), None, None, false, Some(status));
                     let cleanup = context.client.close_position(intent.ticker()).await;
                     record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
                     cleanup?;
