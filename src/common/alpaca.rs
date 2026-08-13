@@ -531,12 +531,18 @@ impl OrderIntent {
 /// Alpaca publishes fifteen order statuses. Collapsing them here rather than at each call site is
 /// what makes the caller's `match` exhaustive over outcomes it can actually respond to — keep
 /// waiting, use the fill, or unwind — instead of over a string it has to remember the meaning of.
+/// Every variant carries the broker's own status alongside the collapse, because the collapse is
+/// what the caller acts on and the raw status is what explains it afterwards. An order this process
+/// gave up on is recorded as `timed_out`, which is our word; whether Alpaca had it as `pending_new`
+/// or `accepted` at that moment is the difference between never reaching the market and reaching it
+/// with no contra side.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderState {
     /// Alpaca still has it: accepted, queued, or partially filled. Ask again.
-    Working { filled_shares: f64 },
+    Working { status: String, filled_shares: f64 },
     /// Terminal and completely filled.
     Filled {
+        status: String,
         filled_shares: f64,
         average_price: f64,
     },
@@ -548,6 +554,15 @@ pub enum OrderState {
 }
 
 impl OrderState {
+    /// Alpaca's own word for where the order stood when this state was read.
+    pub fn broker_status(&self) -> &str {
+        match self {
+            OrderState::Working { status, .. }
+            | OrderState::Filled { status, .. }
+            | OrderState::Abandoned { status, .. } => status,
+        }
+    }
+
     /// Whether Alpaca is finished with this order, however it ended.
     pub fn is_terminal(&self) -> bool {
         match self {
@@ -559,7 +574,7 @@ impl OrderState {
     /// Shares Alpaca reports as filled, whatever state the order reached.
     pub fn filled_shares(&self) -> f64 {
         match self {
-            OrderState::Working { filled_shares }
+            OrderState::Working { filled_shares, .. }
             | OrderState::Filled { filled_shares, .. }
             | OrderState::Abandoned { filled_shares, .. } => *filled_shares,
         }
@@ -1378,7 +1393,8 @@ fn order_state_from(order: OrderResponse) -> Result<OrderState, ClientError> {
         .and_then(|raw| raw.parse::<f64>().ok())
         .unwrap_or(0.0);
 
-    match order.status.as_str() {
+    let status = order.status.clone();
+    match status.as_str() {
         "filled" => {
             let average_price = order
                 .filled_avg_price
@@ -1391,6 +1407,7 @@ fn order_state_from(order: OrderResponse) -> Result<OrderState, ClientError> {
                     ))
                 })?;
             Ok(OrderState::Filled {
+                status: order.status,
                 filled_shares,
                 average_price,
             })
@@ -1401,7 +1418,10 @@ fn order_state_from(order: OrderResponse) -> Result<OrderState, ClientError> {
                 filled_shares,
             })
         }
-        _ => Ok(OrderState::Working { filled_shares }),
+        _ => Ok(OrderState::Working {
+            status: order.status,
+            filled_shares,
+        }),
     }
 }
 
@@ -1626,8 +1646,9 @@ impl Snapshot {
     ///
     /// The midpoint leads because it reflects where the market currently is willing to transact,
     /// while the last trade reports where someone already did — possibly a long time ago in a thin
-    /// name. Callers needing to reject a wide or stale book should read [`Snapshot::latest_quote`]
-    /// directly; this is the convenience path, not the careful one.
+    /// name. It takes any book at all, though, including one too wide or too stale to be a price:
+    /// anything deciding on the number wants [`Snapshot::reference_price_checked`]. This is the
+    /// convenience path, not the careful one.
     pub fn reference_price(&self) -> Option<f64> {
         self.reference_price_with_source().map(|(price, _)| price)
     }
@@ -1644,6 +1665,187 @@ impl Snapshot {
                 self.latest_trade_price
                     .map(|price| (price, PriceSource::LastTrade))
             })
+    }
+
+    /// The careful path: the reference price, with a book that fails `limits` refused.
+    ///
+    /// A refused midpoint falls through to the last trade, and a refusal with no last trade behind
+    /// it yields `None` so the symbol goes unpriced rather than silently mispriced. The refusal
+    /// travels with the price because a caller that cannot see which quotes were rejected cannot
+    /// tell whether `limits` is set anywhere near right.
+    pub fn reference_price_checked(
+        &self,
+        now: DateTime<Utc>,
+        limits: QuoteLimits,
+    ) -> Option<CheckedPrice> {
+        let rejection = match self.latest_quote.as_ref() {
+            Some(quote) => match limits.refusal(quote, now) {
+                None => {
+                    return Some(CheckedPrice {
+                        price: quote.mid_price(),
+                        source: PriceSource::QuoteMidpoint,
+                        rejection: None,
+                    });
+                }
+                Some(rejection) => Some(rejection),
+            },
+            None => None,
+        };
+
+        self.latest_trade_price.map(|price| CheckedPrice {
+            price,
+            source: PriceSource::LastTrade,
+            rejection,
+        })
+    }
+}
+
+/// Seconds a quote may be old before its midpoint stops describing the current market.
+///
+/// Provisional. Chosen loose enough that the last-trade fallback stays the exception, and meant to
+/// be replaced once a session has logged quote ages.
+pub const MAXIMUM_QUOTE_AGE_SECONDS: i64 = 60;
+
+/// Widest bid-ask spread, as a fraction of the midpoint, a quote may carry and still be priced.
+///
+/// Provisional, on the same terms as [`MAXIMUM_QUOTE_AGE_SECONDS`]. A liquid name quotes inside
+/// 0.1%; the readings that produced false entries on 2026-08-12 were an order of magnitude wider.
+pub const MAXIMUM_RELATIVE_QUOTE_SPREAD: f64 = 0.01;
+
+/// What a book must satisfy for its midpoint to be worth taking.
+///
+/// Both bounds describe the book rather than the symbol, so one set covers the universe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuoteLimits {
+    maximum_age: chrono::Duration,
+    maximum_relative_spread: f64,
+}
+
+impl QuoteLimits {
+    /// Constructs limits, refusing bounds that would admit everything or nothing.
+    pub fn new(maximum_age: chrono::Duration, maximum_relative_spread: f64) -> Option<Self> {
+        if maximum_age <= chrono::Duration::zero() {
+            return None;
+        }
+        if !maximum_relative_spread.is_finite() || maximum_relative_spread <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            maximum_age,
+            maximum_relative_spread,
+        })
+    }
+
+    /// Why this book cannot be priced, or `None` if it can.
+    ///
+    /// Public because a refused book with no last trade behind it leaves no [`CheckedPrice`] to
+    /// carry the verdict, and that is the reading most worth recording.
+    ///
+    /// The midpoint is a safe divisor because [`EquityQuote::new`] has already refused a
+    /// non-positive side.
+    pub fn refusal(&self, quote: &EquityQuote, now: DateTime<Utc>) -> Option<QuoteRejection> {
+        // Magnitude, not sign. A quote stamped after `now` — feed clock skew is ordinary — describes
+        // the current market no better than one stamped too far before it.
+        let age = now.signed_duration_since(quote.timestamp());
+        if age.abs() > self.maximum_age {
+            return Some(QuoteRejection::Stale {
+                age_seconds: age.num_seconds(),
+                limit_seconds: self.maximum_age.num_seconds(),
+            });
+        }
+
+        let relative_spread = (quote.ask_price() - quote.bid_price()) / quote.mid_price();
+        if relative_spread > self.maximum_relative_spread {
+            return Some(QuoteRejection::Wide {
+                relative_spread,
+                limit: self.maximum_relative_spread,
+            });
+        }
+
+        None
+    }
+}
+
+impl Default for QuoteLimits {
+    /// The production limits, from [`MAXIMUM_QUOTE_AGE_SECONDS`] and
+    /// [`MAXIMUM_RELATIVE_QUOTE_SPREAD`].
+    fn default() -> Self {
+        Self {
+            maximum_age: chrono::Duration::seconds(MAXIMUM_QUOTE_AGE_SECONDS),
+            maximum_relative_spread: MAXIMUM_RELATIVE_QUOTE_SPREAD,
+        }
+    }
+}
+
+/// Why a quote midpoint was not taken as the reference price.
+///
+/// Each variant carries the reading that produced it, so the session log can say how far outside
+/// the bound the book was rather than only that it was.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuoteRejection {
+    /// The quote is older than the market it is supposed to describe.
+    Stale {
+        age_seconds: i64,
+        limit_seconds: i64,
+    },
+    /// The book is too wide for its midpoint to be a price anyone would transact at.
+    Wide { relative_spread: f64, limit: f64 },
+}
+
+impl QuoteRejection {
+    /// A stable short name for the session log and the structured logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QuoteRejection::Stale { .. } => "stale_quote",
+            QuoteRejection::Wide { .. } => "wide_quote",
+        }
+    }
+}
+
+impl std::fmt::Display for QuoteRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuoteRejection::Stale {
+                age_seconds,
+                limit_seconds,
+            } => write!(
+                formatter,
+                "the quote is {age_seconds} seconds old, past the {limit_seconds} second limit"
+            ),
+            QuoteRejection::Wide {
+                relative_spread,
+                limit,
+            } => write!(
+                formatter,
+                "the book is {relative_spread:.4} wide, past the {limit:.4} limit"
+            ),
+        }
+    }
+}
+
+/// A reference price together with the verdict on the book that was offered.
+///
+/// `rejection` is set when a quote existed and was refused, which is the case the price alone
+/// cannot express: the price then came from the last trade, and the reason it had to is the part
+/// worth recording.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheckedPrice {
+    price: f64,
+    source: PriceSource,
+    rejection: Option<QuoteRejection>,
+}
+
+impl CheckedPrice {
+    pub fn price(&self) -> f64 {
+        self.price
+    }
+
+    pub fn source(&self) -> PriceSource {
+        self.source
+    }
+
+    pub fn rejection(&self) -> Option<QuoteRejection> {
+        self.rejection
     }
 }
 
@@ -2434,6 +2636,7 @@ mod tests {
         assert_eq!(
             order_state_from(order_response("filled", "12", "101.25")).unwrap(),
             OrderState::Filled {
+                status: "filled".to_string(),
                 filled_shares: 12.0,
                 average_price: 101.25,
             }
@@ -3046,6 +3249,190 @@ mod tests {
         );
         assert_eq!(snapshots.snapshots[0].reference_price(), Some(150.0));
         mock.assert_async().await;
+    }
+
+    // --- the quote guard ---
+
+    /// The `AER` reading from 2026-08-12: a book wide enough that its midpoint sat seven percent
+    /// below where the symbol filled all session. The last trade is one of that day's real fills.
+    fn wide_book_snapshot(quoted_at: DateTime<Utc>) -> Snapshot {
+        let ticker = Ticker::new("AER").unwrap();
+        Snapshot {
+            latest_quote: Some(
+                EquityQuote::new(ticker.clone(), quoted_at, 128.0, 150.86, 10, 12).unwrap(),
+            ),
+            latest_trade_price: Some(150.60),
+            minute_bar: None,
+            daily_bar: None,
+            previous_daily_bar: None,
+            ticker,
+        }
+    }
+
+    fn sound_book_snapshot(quoted_at: DateTime<Utc>) -> Snapshot {
+        let ticker = Ticker::new("AER").unwrap();
+        Snapshot {
+            latest_quote: Some(
+                EquityQuote::new(ticker.clone(), quoted_at, 150.58, 150.62, 10, 12).unwrap(),
+            ),
+            latest_trade_price: Some(150.60),
+            minute_bar: None,
+            daily_bar: None,
+            previous_daily_bar: None,
+            ticker,
+        }
+    }
+
+    /// The bug this guard exists for. `reference_price_with_source` is documented as the
+    /// convenience path and takes the midpoint whatever the book looks like; a pair entered on
+    /// 139.43 and read the spread back as converged once a sound quote arrived.
+    #[test]
+    fn test_the_unguarded_path_still_takes_a_wide_midpoint() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let snapshot = wide_book_snapshot(now);
+
+        assert_eq!(
+            snapshot.reference_price_with_source(),
+            Some((139.43, PriceSource::QuoteMidpoint))
+        );
+    }
+
+    #[test]
+    fn test_a_wide_book_is_refused_and_falls_back_to_the_last_trade() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let checked = wide_book_snapshot(now)
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+
+        assert_eq!(checked.price(), 150.60);
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        // The payload, not only the variant: these numbers are the entire reason the rejection is
+        // recorded, and a wrong divisor or a swapped pair reads as a pass against `matches!`.
+        let Some(QuoteRejection::Wide {
+            relative_spread,
+            limit,
+        }) = checked.rejection()
+        else {
+            panic!("a wide book must be refused as wide");
+        };
+        assert!((relative_spread - (150.86 - 128.0) / 139.43).abs() < 1e-9);
+        assert_eq!(limit, MAXIMUM_RELATIVE_QUOTE_SPREAD);
+    }
+
+    #[test]
+    fn test_a_stale_quote_is_refused_however_tight_the_book() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let quoted_at = now - chrono::Duration::seconds(MAXIMUM_QUOTE_AGE_SECONDS + 1);
+        let checked = sound_book_snapshot(quoted_at)
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        let Some(QuoteRejection::Stale {
+            age_seconds,
+            limit_seconds,
+        }) = checked.rejection()
+        else {
+            panic!("a stale quote must be refused as stale");
+        };
+        assert_eq!(age_seconds, MAXIMUM_QUOTE_AGE_SECONDS + 1);
+        assert_eq!(limit_seconds, MAXIMUM_QUOTE_AGE_SECONDS);
+    }
+
+    /// Age is signed, so a quote stamped after `now` reads as negative and would slip past a
+    /// comparison against the limit alone. Feed clock skew is ordinary and a future-dated book
+    /// describes the current market no better than a stale one.
+    #[test]
+    fn test_a_future_dated_quote_is_refused_as_stale() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let quoted_at = now + chrono::Duration::seconds(MAXIMUM_QUOTE_AGE_SECONDS + 1);
+        let checked = sound_book_snapshot(quoted_at)
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        let Some(QuoteRejection::Stale { age_seconds, .. }) = checked.rejection() else {
+            panic!("a future-dated quote must be refused as stale");
+        };
+        assert_eq!(
+            age_seconds,
+            -(MAXIMUM_QUOTE_AGE_SECONDS + 1),
+            "the sign is kept so the log shows a future stamp rather than disguising it"
+        );
+    }
+
+    /// The rendered forms reach the structured logs, where a swapped pair would be read as fact.
+    #[test]
+    fn test_a_rejection_renders_its_own_numbers() {
+        let stale = QuoteRejection::Stale {
+            age_seconds: 90,
+            limit_seconds: 60,
+        };
+        assert_eq!(
+            stale.to_string(),
+            "the quote is 90 seconds old, past the 60 second limit"
+        );
+        assert_eq!(stale.as_str(), "stale_quote");
+
+        let wide = QuoteRejection::Wide {
+            relative_spread: 0.1639,
+            limit: 0.01,
+        };
+        assert_eq!(
+            wide.to_string(),
+            "the book is 0.1639 wide, past the 0.0100 limit"
+        );
+        assert_eq!(wide.as_str(), "wide_quote");
+    }
+
+    #[test]
+    fn test_a_sound_quote_is_taken_and_records_no_rejection() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let checked = sound_book_snapshot(now)
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+
+        assert!((checked.price() - 150.60).abs() < 1e-9);
+        assert_eq!(checked.source(), PriceSource::QuoteMidpoint);
+        assert_eq!(checked.rejection(), None);
+    }
+
+    /// The whole point of refusing a book is that the symbol goes unpriced rather than priced
+    /// wrongly, so a refusal with nothing behind it must not fall through to the midpoint.
+    #[test]
+    fn test_a_refused_quote_with_no_last_trade_leaves_the_symbol_unpriced() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let mut snapshot = wide_book_snapshot(now);
+        snapshot.latest_trade_price = None;
+
+        assert_eq!(
+            snapshot.reference_price_checked(now, QuoteLimits::default()),
+            None
+        );
+    }
+
+    /// No quote at all is not a rejection — it is the ordinary fallback the unguarded path already
+    /// took, and recording it as a refusal would overstate how often the guard fired.
+    #[test]
+    fn test_a_missing_quote_falls_back_without_a_rejection() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let mut snapshot = wide_book_snapshot(now);
+        snapshot.latest_quote = None;
+
+        let checked = snapshot
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        assert_eq!(checked.rejection(), None);
+    }
+
+    #[test]
+    fn test_quote_limits_reject_bounds_that_measure_nothing() {
+        assert!(QuoteLimits::new(chrono::Duration::zero(), 0.01).is_none());
+        assert!(QuoteLimits::new(chrono::Duration::seconds(-1), 0.01).is_none());
+        assert!(QuoteLimits::new(chrono::Duration::seconds(60), 0.0).is_none());
+        assert!(QuoteLimits::new(chrono::Duration::seconds(60), f64::NAN).is_none());
+        assert!(QuoteLimits::new(chrono::Duration::seconds(60), 0.01).is_some());
     }
 
     #[tokio::test]

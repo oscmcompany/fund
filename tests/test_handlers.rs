@@ -203,8 +203,20 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     // stretched decides which becomes the short, so both orderings are quoted and the screen picks.
     // 1.2% rather than 50%: the seeded series is near-deterministic, so a 50% dislocation scores a
     // z in the hundreds, which the screen now refuses as a data-quality artifact.
+    // `AAAA` is quoted as well as traded so the accepted-midpoint path is exercised and the
+    // assertion on the recorded book is not vacuous. The book straddles the trade, so prices hold.
+    let long_price = last_close(&close_history, "AAAA");
     let snapshot_body = serde_json::json!({
-        "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
+        "AAAA": {
+            "latestTrade": { "p": long_price },
+            "latestQuote": {
+                "t": session_instant().to_rfc3339(),
+                "bp": long_price * 0.9995,
+                "ap": long_price * 1.0005,
+                "bs": 10,
+                "as": 12,
+            },
+        },
         "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
 
@@ -331,6 +343,23 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
             .iter()
             .all(|reading| reading["price"].is_number() && reading["price_source"].is_string()),
         "a price without its source cannot be compared across passes"
+    );
+    // Asserted before the check below, which is otherwise vacuously true the moment the fixture
+    // stops quoting anything.
+    assert!(
+        readings
+            .iter()
+            .any(|reading| reading["price_source"] == "quote_midpoint"),
+        "the fixture must exercise the guard's accepting path"
+    );
+    assert!(
+        readings.iter().all(|reading| {
+            reading["price_source"] != "quote_midpoint"
+                || (reading["bid_price"].is_number()
+                    && reading["ask_price"].is_number()
+                    && reading["quote_timestamp"].is_string())
+        }),
+        "a midpoint must carry the book it was taken from, or the guard cannot be tuned"
     );
     assert!(
         priced
@@ -822,6 +851,110 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     assert_eq!(summary.pairs_unpriced, 1);
     assert!(summary.pairs_closed.is_empty());
     assert_eq!(pairs::load_open_pairs(&pool).await.unwrap().len(), 1);
+}
+
+/// A book refused with no last trade behind it is where the guard has its largest effect: the
+/// symbol goes unpriced and neither half of the pass can use it. The refused book has to reach the
+/// record, or the limits cannot be judged against the readings that cost the most.
+#[tokio::test]
+#[serial]
+async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
+    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
+        .await
+        .unwrap();
+
+    let entry = PairEntry::new(
+        fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),
+        1.0,
+        2.5,
+        0.03,
+        None,
+    )
+    .unwrap();
+    pairs::record_open(&pool, &entry, Utc::now()).await.unwrap();
+
+    // A book far too wide to price, and no trade to fall back to.
+    let snapshot_body = serde_json::json!({
+        "AAAA": {
+            "latestQuote": {
+                "t": session_instant().to_rfc3339(),
+                "bp": 90.0, "ap": 110.0, "bs": 10, "as": 12,
+            },
+        },
+        "BBBB": {},
+    });
+    let _snapshots = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
+        )
+        .with_status(200)
+        .with_body(snapshot_body.to_string())
+        .create_async()
+        .await;
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(200)
+        .with_body(account_body(100_000))
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let market_data = MarketDataClient::with_base_url(credentials(), server.url(), DataFeed::Iex);
+    let calendar = calendar_for_today();
+    let universe = universe_of(&["AAAA", "BBBB"]);
+
+    let running = CancellationToken::new();
+    let session_log = session_log("test-a-refused-book-with-no-trade-records-what-was-refused");
+    let context = EvaluationContext {
+        pool: &pool,
+        trading: &trading,
+        market_data: &market_data,
+        calendar: &calendar,
+        universe: &universe,
+        close_history: &close_history,
+        sizing: SizingParameters::default(),
+        execution: settings(),
+        session_log: &session_log,
+        correlation_id: uuid::Uuid::new_v4(),
+        shutdown: &running,
+        now: session_instant(),
+    };
+
+    let summary = evaluate::run_pass(&context)
+        .await
+        .expect("the pass must survive");
+    assert_eq!(summary.pairs_unpriced, 1, "a refused book leaves no price");
+
+    let records = recorded(&session_log);
+    let unavailable: Vec<&serde_json::Value> = of_type(&records, "prices_observed")
+        .iter()
+        .flat_map(|record| record["payload"]["unavailable"].as_array().unwrap())
+        .collect();
+    let refused = unavailable
+        .iter()
+        .find(|entry| entry["ticker"] == "AAAA")
+        .expect("the refused symbol must be named");
+
+    assert_eq!(refused["cause"], "quote_rejected");
+    assert_eq!(refused["quote_rejection"], "wide_quote");
+    assert_eq!(refused["bid_price"], 90.0);
+    assert_eq!(refused["ask_price"], 110.0);
+    assert!(refused["quote_timestamp"].is_string());
+
+    let absent = unavailable
+        .iter()
+        .find(|entry| entry["ticker"] == "BBBB")
+        .expect("a symbol with nothing at all is still named");
+    assert_eq!(absent["cause"], "no_quote");
+    assert!(
+        absent["bid_price"].is_null(),
+        "no book means no book, not a defaulted one"
+    );
 }
 
 // ---------------------------------------------------------------------------
