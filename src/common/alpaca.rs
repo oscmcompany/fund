@@ -2092,11 +2092,7 @@ struct TradePayload {
 
 impl TradePayload {
     /// A trade missing its price or its timestamp is dropped, on the same terms as
-    /// [`QuotePayload::into_equity_quote`].
-    ///
-    /// Dropping an undated trade costs the symbol its fallback price, which is the intent: the last
-    /// trade is what a pass prices on once the book is refused, and one that cannot be dated cannot
-    /// be refused in turn.
+    /// [`QuotePayload::into_equity_quote`], costing the symbol its fallback price.
     fn into_equity_trade(self, ticker: &Ticker) -> Option<EquityTrade> {
         EquityTrade::new(ticker.clone(), self.timestamp?, self.price?)
             .inspect_err(|error| {
@@ -3502,9 +3498,7 @@ mod tests {
     }
 
     /// [`QuoteLimits`] describes a book and nothing describes a trade, so the fallback price is
-    /// taken at any age. Pinning that here so it is a decision on the record rather than an
-    /// oversight; the trade's time now reaches the session log, which is what a bound would be set
-    /// from.
+    /// taken at any age. Pinned here so it reads as a decision rather than an oversight.
     #[test]
     fn test_an_hours_old_trade_is_still_taken_as_the_fallback_price() {
         let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();

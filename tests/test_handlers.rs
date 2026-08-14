@@ -361,13 +361,18 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         }),
         "a midpoint must carry the book it was taken from, or the guard cannot be tuned"
     );
-    // Nothing refuses a trade for being old, so the record is the only place a stale fallback price
-    // can be noticed — and the fallback is the dominant source once the book guard starts firing.
+    // Nothing refuses a trade for being old, so the record is the only place to notice a stale one.
     assert!(
         readings
             .iter()
-            .all(|reading| reading["trade_timestamp"].is_string()),
-        "every reading carries when its last trade printed"
+            .any(|reading| reading["price_source"] == "last_trade"),
+        "the fixture must exercise the fallback path"
+    );
+    assert!(
+        readings.iter().all(|reading| {
+            reading["price_source"] != "last_trade" || reading["trade_timestamp"].is_string()
+        }),
+        "a fallback price must carry when it printed, or its staleness cannot be judged"
     );
     assert!(
         priced
