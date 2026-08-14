@@ -91,16 +91,11 @@ const MINIMUM_SPREAD_OBSERVATIONS: usize = 2;
 
 /// Largest single-session log return a fit window may contain and still be screened.
 ///
-/// A window holding a larger move is not one distribution. The standard deviation and the ordinary
-/// least squares slope then both describe a series that changed level partway through, and the
-/// hedge ratio that comes out of it does not hedge — which is a directional bet wearing a
-/// market-neutral name. The cause is deliberately not consulted: a split artifact and a real
-/// collapse damage the fit identically, and only one of them is fixable by re-fetching.
+/// A window holding a larger move is not one distribution, so the hedge ratio fitted across it does
+/// not hedge. The cause is deliberately not consulted: a split artifact and a real collapse damage
+/// the fit identically, and only one of them is fixable by re-fetching.
 ///
-/// Provisional and deliberately loose, on the same terms as
-/// [`crate::common::alpaca::MAXIMUM_QUOTE_AGE_SECONDS`]. Measured across 1,903 eligible tickers over
-/// 2026-05-01 to 2026-08-12, the worst single-session move has a median of 0.084 and a ninetieth
-/// percentile of 0.247, so this sits clear of ordinary earnings gaps and excludes 3.9% of them.
+/// Provisional, on the same terms as [`crate::common::alpaca::MAXIMUM_QUOTE_AGE_SECONDS`].
 pub const MAXIMUM_SESSION_LOG_RETURN: f64 = 0.40;
 
 /// Why a symbol could not be screened.
@@ -131,9 +126,9 @@ impl ScreenRejection {
     pub fn detail(&self) -> Option<String> {
         match self {
             ScreenRejection::UnusableInput => None,
-            ScreenRejection::StructuralBreak { log_return, limit } => Some(format!(
-                "session log return of {log_return:.4} exceeds the limit of {limit:.4}"
-            )),
+            ScreenRejection::StructuralBreak { log_return, limit } => {
+                Some(format!("log_return={log_return:.4} limit={limit:.4}"))
+            }
         }
     }
 }
@@ -184,13 +179,14 @@ impl ScreenInput {
         // The fitted window and not the whole series: a break older than the window cannot reach
         // the spread model, so excluding on it would refuse a name whose history has since settled.
         let window = &closes[closes.len() - CORRELATION_WINDOW_SESSIONS..];
-        if let Some(log_return) = worst_session_move(window) {
-            if log_return.abs() > MAXIMUM_SESSION_LOG_RETURN {
+        match worst_session_move(window) {
+            Some(log_return) if log_return.abs() > MAXIMUM_SESSION_LOG_RETURN => {
                 return Err(ScreenRejection::StructuralBreak {
                     log_return,
                     limit: MAXIMUM_SESSION_LOG_RETURN,
                 });
             }
+            Some(_) | None => {}
         }
         Ok(Self {
             ticker,
@@ -680,11 +676,13 @@ fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, 
 /// The window's largest single-session move, by magnitude, as a signed log return.
 ///
 /// Signed so the recorded detail says which way the series jumped, and largest rather than first so
-/// the number a bound gets calibrated against is the worst one present. Assumes positive closes,
-/// which [`ScreenInput::new`] establishes before calling.
+/// the number a bound gets calibrated against is the worst one present. Iterates rather than reusing
+/// [`log_returns`], which would collect a vector per ticker on a pass that screens over a thousand.
 fn worst_session_move(window: &[f64]) -> Option<f64> {
-    log_returns(window)
-        .into_iter()
+    window
+        .windows(2)
+        .filter(|pair| pair[0] > 0.0 && pair[1] > 0.0)
+        .map(|pair| (pair[1] / pair[0]).ln())
         .max_by(|left, right| left.abs().total_cmp(&right.abs()))
 }
 
@@ -1221,12 +1219,13 @@ mod tests {
         assert_eq!(limit, MAXIMUM_SESSION_LOG_RETURN);
     }
 
-    /// The limit has to admit ordinary moves, or the guard costs more universe than it saves.
+    /// At the limit exactly, not merely inside it. The comparison is strict, so a move equal to the
+    /// bound is admitted, and testing below the bound would let a change to `>=` pass unnoticed.
     #[test]
-    fn test_screen_input_accepts_a_move_inside_the_limit() {
+    fn test_screen_input_accepts_a_move_at_the_limit() {
         assert!(ScreenInput::new(
             ticker("AAAA"),
-            window_with_one_move(MAXIMUM_SESSION_LOG_RETURN - 0.01),
+            window_with_one_move(MAXIMUM_SESSION_LOG_RETURN),
             100.0,
             0.01,
             0.9,
@@ -1266,10 +1265,12 @@ mod tests {
             limit: MAXIMUM_SESSION_LOG_RETURN,
         };
         assert_eq!(broken.as_str(), "structural_break");
-        assert!(broken
-            .detail()
-            .expect("a break reports its reading")
-            .contains("-2.2800"));
+        // The whole string: the detail exists to be aggregated out of session logs, so the format
+        // is the contract and a `contains` check would not notice it drifting.
+        assert_eq!(
+            broken.detail().expect("a break reports its reading"),
+            format!("log_return=-2.2800 limit={MAXIMUM_SESSION_LOG_RETURN:.4}")
+        );
     }
 
     #[test]
