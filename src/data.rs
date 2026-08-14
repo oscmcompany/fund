@@ -18,4 +18,5 @@ pub mod calendar;
 pub mod details;
 pub mod export;
 pub mod purge;
+pub mod splits;
 pub mod universe;

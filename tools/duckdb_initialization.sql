@@ -55,6 +55,29 @@ FROM read_csv(
     auto_detect = true
 );
 
+-- Every stock split Massive reports, historical and announced, refreshed whole each night. Named
+-- in full because "split" alone collides with the train/validation split the trainer beside it
+-- means by the word. One object
+-- rather than a partition per date: the feed revises and cancels announced splits, so a row that
+-- disappears is a cancellation and the current table is the only authoritative answer.
+--
+-- split_from shares become split_to shares -- a two-for-one forward split is 1 -> 2 and a
+-- one-for-three reverse split is 3 -> 1. execution_date is an Eastern calendar date and may be in
+-- the future. first_seen is when this job first saw the row, not when the split was announced.
+.print 'Loading training_stock_splits...'
+DROP VIEW IF EXISTS training_stock_splits;
+CREATE OR REPLACE VIEW training_stock_splits AS
+SELECT
+    id,
+    ticker,
+    CAST(execution_date AS DATE) AS execution_date,
+    split_from,
+    split_to,
+    to_timestamp(first_seen / 1000.0) AS first_seen
+FROM read_parquet(
+    's3://' || getvariable('bucket') || '/data/equity/corporate_actions/splits.parquet'
+);
+
 -- ---------------------------------------------------------------------------
 -- Nightly exports (exports/) -- one view per exported table
 -- ---------------------------------------------------------------------------

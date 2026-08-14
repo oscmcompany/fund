@@ -21,7 +21,7 @@ use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::common::types::{BarInterval, EquityBar, Ticker};
+use crate::common::types::{BarInterval, EquityBar, EquitySplit, SessionDate, Ticker};
 
 /// Why the client could not be constructed.
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -96,6 +96,72 @@ fn grouped_bars_url(base: &str, date: NaiveDate) -> String {
         base.trim_end_matches('/'),
         date.format("%Y-%m-%d")
     )
+}
+
+/// Builds the first splits URL, on the same normalization as [`grouped_bars_url`].
+///
+/// Unfiltered by date. The whole table is 29 pages and three seconds, so bounding it would buy
+/// nothing and cost a start date nobody could later justify.
+fn splits_url(base: &str) -> String {
+    format!(
+        "{}/v3/reference/splits?limit={SPLITS_PAGE_SIZE}",
+        base.trim_end_matches('/')
+    )
+}
+
+/// Rows per splits page.
+///
+/// The endpoint's documented maximum is 1,000 and it answers a larger value with a validation error
+/// rather than a clamp, so this is a ceiling rather than a preference.
+const SPLITS_PAGE_SIZE: usize = 1_000;
+
+/// Pages followed before a splits fetch gives up.
+///
+/// The full table is 29 pages; this bounds a cursor that never terminates, which would otherwise
+/// spin against the API rather than fail. Generous enough that ordinary growth cannot reach it.
+const SPLITS_PAGE_LIMIT: usize = 200;
+
+/// One row of the splits response.
+///
+/// Massive publishes exactly these five fields — there is no adjustment factor to read, so the
+/// ratio is the whole of what a split says.
+///
+/// Both ratio sides are `f64` because the feed sends fractional ones: 5,344 of 28,135 live rows are
+/// mutual-fund reallocations like `1 -> 1.0056`. A whole-number type does not merely drop those
+/// rows, it fails the whole page they are on, and they are on most pages.
+#[derive(Deserialize, Debug)]
+struct SplitRow {
+    id: String,
+    ticker: String,
+    execution_date: NaiveDate,
+    split_from: f64,
+    split_to: f64,
+}
+
+/// The splits envelope. `next_url` is absent on the last page, which is how pagination ends.
+#[derive(Deserialize)]
+struct SplitsResponse {
+    results: Option<Vec<SplitRow>>,
+    next_url: Option<String>,
+}
+
+/// Converts an untrusted splits row into a validated [`EquitySplit`], or `None`.
+///
+/// Non-common-stock symbols are dropped for the reason [`is_common_stock_symbol`] gives, and a
+/// zero-sided ratio by the constructor's own validation. The execution date is already an exchange
+/// calendar date, so it is wrapped rather than derived from an instant.
+fn parse_split(row: &SplitRow) -> Option<EquitySplit> {
+    if !is_common_stock_symbol(&row.ticker) {
+        return None;
+    }
+    EquitySplit::new(
+        row.id.clone(),
+        Ticker::new(&row.ticker)?,
+        SessionDate::from_date(row.execution_date),
+        row.split_from,
+        row.split_to,
+    )
+    .ok()
 }
 
 /// One row of the grouped-daily response.
@@ -207,6 +273,17 @@ impl MassiveClient {
         Ok(Self::new(MassiveCredentials::from_env()?))
     }
 
+    /// Starts a request carrying the API key as a bearer token rather than a query parameter.
+    ///
+    /// Massive accepts either. The header is used because `reqwest` puts the full URL into the
+    /// `Display` of a decode failure, so a key in the query string reaches every error message and
+    /// log line that reports one — observed while building the splits fetch.
+    fn authorized(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http_client
+            .get(url)
+            .bearer_auth(&self.credentials.api_key)
+    }
+
     /// Constructs a client pointed at an explicit base, for tests against a local HTTP mock.
     #[cfg(test)]
     fn for_tests(base_url: &str) -> Self {
@@ -231,12 +308,8 @@ impl MassiveClient {
         let url = grouped_bars_url(&self.credentials.base_url, date);
 
         let response = self
-            .http_client
-            .get(&url)
-            .query(&[
-                ("adjusted", "true"),
-                ("apiKey", self.credentials.api_key.as_str()),
-            ])
+            .authorized(&url)
+            .query(&[("adjusted", "true")])
             .send()
             .await?;
 
@@ -274,6 +347,56 @@ impl MassiveClient {
             "Grouped daily bars fetched"
         );
         Ok(bars)
+    }
+
+    /// Fetches every stock split Massive knows about, following the cursor to the last page.
+    ///
+    /// The response covers announced-but-unexecuted splits as well as historical ones, so a caller
+    /// holding the result has the feed's whole current opinion rather than a window of it — which is
+    /// what makes replacing the stored table safe when a split is cancelled and disappears.
+    pub async fn fetch_splits(&self) -> Result<Vec<EquitySplit>, MassiveError> {
+        let mut url = splits_url(&self.credentials.base_url);
+        let mut splits: Vec<EquitySplit> = Vec::new();
+        let mut received = 0usize;
+
+        for page in 1..=SPLITS_PAGE_LIMIT {
+            let response = self.authorized(&url).send().await?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(MassiveError::Api { status, body });
+            }
+
+            let payload: SplitsResponse = response
+                .json()
+                .await
+                .map_err(|error| MassiveError::Parse(format!("Failed to parse splits: {error}")))?;
+
+            let rows = payload.results.unwrap_or_default();
+            received += rows.len();
+            splits.extend(rows.iter().filter_map(parse_split));
+
+            let Some(next_url) = payload.next_url else {
+                let dropped = received.saturating_sub(splits.len());
+                if dropped > 0 {
+                    // Routine: the same preferreds, warrants, and units the bar path drops.
+                    warn!(
+                        dropped,
+                        received, "Dropped splits rows that failed validation"
+                    );
+                }
+                info!(splits = splits.len(), pages = page, "Splits fetched");
+                return Ok(splits);
+            };
+            // The cursor URL is absolute and carries no credential, so the key is re-attached by the
+            // `query` call above rather than being present in `next_url` already.
+            url = next_url;
+        }
+
+        Err(MassiveError::Parse(format!(
+            "splits pagination did not end within {SPLITS_PAGE_LIMIT} pages"
+        )))
     }
 }
 
@@ -334,10 +457,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/aggs/grouped/locale/us/market/stocks/2026-06-05")
-            .match_query(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("adjusted".into(), "true".into()),
-                mockito::Matcher::UrlEncoded("apiKey".into(), "test-key".into()),
-            ]))
+            .match_query(mockito::Matcher::UrlEncoded(
+                "adjusted".into(),
+                "true".into(),
+            ))
+            .match_header("authorization", "Bearer test-key")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(body(APPLE))
@@ -495,5 +619,141 @@ mod tests {
             .await
             .expect_err("malformed JSON is an error");
         assert!(matches!(error, MassiveError::Parse(_)), "{error:?}");
+    }
+
+    // --- splits ---
+
+    /// Two rows as the live endpoint returns them: a forward split and a reverse one, with the
+    /// execution date already an Eastern calendar date and no adjustment factor to read.
+    const SPLIT_ROWS: &str = r#"{"execution_date":"2026-07-06","id":"E1","split_from":1,"split_to":2,"ticker":"MNST"},
+        {"execution_date":"2026-10-06","id":"E2","split_from":3,"split_to":1,"ticker":"ETHA"},
+        {"execution_date":"2026-09-14","id":"E3","split_from":1,"split_to":1.0056,"ticker":"NSRSX"}"#;
+
+    #[tokio::test]
+    async fn test_a_splits_response_becomes_validated_splits() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::UrlEncoded("limit".into(), "1000".into()))
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_body(format!(r#"{{"status":"OK","results":[{SPLIT_ROWS}]}}"#))
+            .create_async()
+            .await;
+
+        let splits = MassiveClient::for_tests(&server.url())
+            .fetch_splits()
+            .await
+            .expect("a successful fetch");
+
+        mock.assert_async().await;
+        assert_eq!(splits.len(), 3);
+        assert_eq!(splits[0].ticker().as_str(), "MNST");
+        assert_eq!(
+            splits[0].execution_date(),
+            SessionDate::from_date(date("2026-07-06"))
+        );
+        assert_eq!((splits[0].split_from(), splits[0].split_to()), (1.0, 2.0));
+        assert_eq!(
+            (splits[1].split_from(), splits[1].split_to()),
+            (3.0, 1.0),
+            "a reverse split keeps its ratio the way round the feed reported it"
+        );
+        // Nineteen percent of the live feed looks like this. A whole-number ratio does not drop the
+        // row, it fails the page, so the fetch returned nothing at all against the real endpoint.
+        assert_eq!(
+            (splits[2].split_from(), splits[2].split_to()),
+            (1.0, 1.0056),
+            "a fractional mutual-fund reallocation survives the parse"
+        );
+    }
+
+    /// The whole table is 29 pages, so a fetch that stopped at the first would silently hold the
+    /// most recent thousand splits and nothing older.
+    #[tokio::test]
+    async fn test_the_cursor_is_followed_to_the_last_page() {
+        let mut server = mockito::Server::new_async().await;
+        let cursor = format!("{}/v3/reference/splits?cursor=page-two", server.url());
+        let first = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::UrlEncoded("limit".into(), "1000".into()))
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"OK","results":[{{"execution_date":"2026-07-06","id":"E1","split_from":1,"split_to":2,"ticker":"MNST"}}],"next_url":"{cursor}"}}"#
+            ))
+            .create_async()
+            .await;
+        // The cursor URL carries no credential of its own, so the second request must re-attach it.
+        let second = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::UrlEncoded("cursor".into(), "page-two".into()))
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[{"execution_date":"2026-10-06","id":"E2","split_from":3,"split_to":1,"ticker":"ETHA"}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let splits = MassiveClient::for_tests(&server.url())
+            .fetch_splits()
+            .await
+            .expect("a successful fetch");
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(splits.len(), 2, "both pages reach the caller");
+    }
+
+    /// One unusable row must not cost the whole table, on the same terms the bar path drops a
+    /// malformed instrument: a preferred's lowercase symbol, and a ratio that cannot be divided by.
+    #[tokio::test]
+    async fn test_unusable_split_rows_are_dropped_rather_than_failing_the_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[
+                    {"execution_date":"2026-07-06","id":"E1","split_from":1,"split_to":2,"ticker":"MNST"},
+                    {"execution_date":"2026-07-06","id":"E2","split_from":1,"split_to":2,"ticker":"GSpD"},
+                    {"execution_date":"2026-07-06","id":"E3","split_from":0,"split_to":2,"ticker":"ZERO"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        let splits = MassiveClient::for_tests(&server.url())
+            .fetch_splits()
+            .await
+            .expect("a bad row is dropped, not fatal");
+
+        mock.assert_async().await;
+        assert_eq!(splits.len(), 1);
+        assert_eq!(splits[0].ticker().as_str(), "MNST");
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_splits_request_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(429)
+            .with_body("slow down")
+            .create_async()
+            .await;
+
+        let error = MassiveClient::for_tests(&server.url())
+            .fetch_splits()
+            .await
+            .expect_err("a throttle is an error");
+
+        mock.assert_async().await;
+        assert!(
+            matches!(error, MassiveError::Api { status: 429, .. }),
+            "{error:?}"
+        );
     }
 }

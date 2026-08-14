@@ -27,13 +27,14 @@ use std::io::Cursor;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
+use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use tracing::{info, warn};
 
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
 use crate::common::types::SessionDate;
-use crate::data::bars;
+use crate::data::{bars, splits};
 
 /// S3 prefix for the bar archive.
 ///
@@ -48,6 +49,16 @@ pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
 /// read it: the trainer parses the CSV compiled into its own binary, so this copy can be absent
 /// without a model run noticing.
 pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
+
+/// S3 key for the stock splits the bars are adjusted against.
+///
+/// One object rather than a partition per session, unlike the bars beside it. A split belongs to
+/// its execution date, but the feed revises and cancels announced ones, so a per-date layout would
+/// leave a cancelled split sitting in a partition nothing revisits.
+///
+/// Under `corporate_actions/` rather than a directory of its own, because spinoffs and symbol
+/// changes are the same kind of fact read the same way and belong beside it as sibling files.
+pub const SPLITS_ARCHIVE_KEY: &str = "data/equity/corporate_actions/splits.parquet";
 
 /// Trailing sessions re-fetched even when a partition already exists.
 ///
@@ -372,7 +383,26 @@ async fn write_partition(
     fetched: DataFrame,
 ) -> Result<(), ArchiveError> {
     let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, session.date());
+    write_merged(s3_client, bucket, key, fetched, |existing, fetched, key| {
+        merge_or_replace(existing, fetched, key)
+    })
+    .await
+}
 
+/// The read-merge-write cycle itself, over any key and any way of combining the two frames.
+///
+/// Shared because the bar partitions and the splits table differ only in how they merge — the
+/// compare-and-swap around it, and the reasoning for it, are the same either way.
+async fn write_merged<F>(
+    s3_client: &S3Client,
+    bucket: &str,
+    key: String,
+    fetched: DataFrame,
+    merge: F,
+) -> Result<(), ArchiveError>
+where
+    F: Fn(DataFrame, DataFrame, &str) -> Result<DataFrame, ArchiveError>,
+{
     for attempt in 1..=CONTENDED_WRITE_ATTEMPTS {
         // Merged with whatever the partition already holds rather than written over it. A plain
         // overwrite would discard anything a later response happens to omit, and merging costs one
@@ -380,7 +410,7 @@ async fn write_partition(
         let existing = read_partition_with_etag(s3_client, bucket, &key).await?;
         let (mut frame, precondition) = match existing {
             Some((existing_frame, etag)) => (
-                merge_or_replace(existing_frame, fetched.clone(), &key)?,
+                merge(existing_frame, fetched.clone(), &key)?,
                 Precondition::Match(etag),
             ),
             None => (fetched.clone(), Precondition::Absent),
@@ -438,6 +468,45 @@ fn merge_or_replace(
             Ok(fetched)
         }
     }
+}
+
+/// Fetches the whole splits table and writes it, keeping each row's earliest `first_seen`.
+///
+/// Not a gap scan like [`archive_missing_sessions`], because there are no gaps to find: the feed
+/// answers with its entire current opinion in a few seconds, and that opinion is the answer. Rows
+/// it has stopped reporting are dropped rather than kept, which is the case a per-session layout
+/// could not express.
+pub async fn archive_splits(
+    s3_client: &S3Client,
+    massive: &MassiveClient,
+    bucket: &str,
+    fetched_at: DateTime<Utc>,
+) -> Result<usize, ArchiveError> {
+    let splits = massive
+        .fetch_splits()
+        .await
+        .map_err(|error| ArchiveError::Read {
+            bucket: bucket.to_string(),
+            key: SPLITS_ARCHIVE_KEY.to_string(),
+            message: error.to_string(),
+        })?;
+
+    let frame = splits::splits_to_dataframe(&splits, fetched_at)?;
+    write_merged(
+        s3_client,
+        bucket,
+        SPLITS_ARCHIVE_KEY.to_string(),
+        frame,
+        |existing, fetched, _key| Ok(splits::merge_splits(existing, fetched)?),
+    )
+    .await?;
+
+    info!(
+        key = SPLITS_ARCHIVE_KEY,
+        splits = splits.len(),
+        "Splits table archived"
+    );
+    Ok(splits.len())
 }
 
 /// Writes the ticker metadata that accompanies the archive.

@@ -135,6 +135,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(%error, "Archive stage failed; training on the existing archive")
                 }
             }
+
+            // Refreshed whole rather than topped up, and stepped over on failure like the bars
+            // above. Nothing reads it yet — adjustment is still Massive's, so this accumulates the
+            // history that makes the switch to raw prices possible.
+            match archive::archive_splits(&s3_client, &massive, &bucket, Utc::now()).await {
+                Ok(splits) => info!(splits, "Splits table refreshed"),
+                Err(error) => warn!(%error, "Splits refresh failed; the archive keeps its copy"),
+            }
         }
         Err(error) => warn!(%error, "No Massive client; training on the existing archive"),
     }
