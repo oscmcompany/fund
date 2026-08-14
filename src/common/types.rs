@@ -870,13 +870,12 @@ impl EquityTrade {
 
 /// One stock split as the corporate-actions feed reported it.
 ///
-/// `execution_date` is the session the ratio takes effect on, and the feed publishes splits once
-/// they are announced, so a date in the future is ordinary here rather than a fault. The ratio reads
-/// `split_from` shares becoming `split_to` shares: a two-for-one forward split is `1 -> 2`, and a
-/// one-for-three reverse split is `3 -> 1`.
+/// The ratio reads `split_from` shares becoming `split_to` shares, so a two-for-one forward split
+/// is `1 -> 2` and a one-for-three reverse split is `3 -> 1`. Both sides are real rather than whole
+/// numbers, because a fifth of the live feed is fractional mutual-fund reallocations.
 ///
-/// Both sides are real rather than whole numbers. Nineteen percent of the live feed is fractional —
-/// mutual-fund reallocations like `1 -> 1.0056` — and a whole-number type rejects every one of them.
+/// `execution_date` may be in the future: the feed publishes splits once announced, and can later
+/// revise or cancel one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EquitySplit {
     id: String,

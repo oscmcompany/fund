@@ -64,6 +64,10 @@ FROM read_csv(
 -- split_from shares become split_to shares -- a two-for-one forward split is 1 -> 2 and a
 -- one-for-three reverse split is 3 -> 1. execution_date is an Eastern calendar date and may be in
 -- the future. first_seen is when this job first saw the row, not when the split was announced.
+--
+-- On a bucket where the trainer has not yet run, the object does not exist and this one CREATE
+-- prints an IO error and is skipped; every other view still loads, and this one appears after the
+-- first refresh. training_details has the same fixed-key exposure.
 .print 'Loading training_stock_splits...'
 DROP VIEW IF EXISTS training_stock_splits;
 CREATE OR REPLACE VIEW training_stock_splits AS

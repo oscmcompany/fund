@@ -1,4 +1,4 @@
-//! The corporate-actions table the bar archive is adjusted against.
+//! The stock splits the bar archive will be adjusted against; nothing reads them yet.
 //!
 //! One S3 object rather than a partition per session: a split belongs to its execution date, but
 //! the feed revises and cancels announced ones, so only the whole table is ever authoritative.
@@ -47,7 +47,15 @@ pub fn splits_to_dataframe(
 /// keeping it would adjust prices across a split that never happened. Only `first_seen` survives
 /// from the stored copy, taking the earlier of the two so a row keeps the date we first saw it
 /// rather than the date of the latest fetch.
+///
+/// An empty fetch is the exception, and keeps the stored table. Replacing means an upstream answering
+/// success with nothing would erase every corporate action we hold, and the feed has never held
+/// nothing — it goes back to 1978.
 pub fn merge_splits(existing: DataFrame, fetched: DataFrame) -> Result<DataFrame, PolarsError> {
+    if fetched.height() == 0 {
+        return Ok(existing);
+    }
+
     let previously_seen = existing
         .lazy()
         .select([col("id"), col("first_seen").alias("previous_first_seen")])
@@ -199,6 +207,26 @@ mod tests {
             first_seen_by_id(&merged, "S2"),
             Some(instant("2026-08-14T02:00:00Z").timestamp_millis()),
             "a split seen for the first time is stamped with this fetch"
+        );
+    }
+
+    /// The replace-the-row-set rule inverted: an upstream answering success with an empty page
+    /// would otherwise erase every corporate action we hold, and log it as a refresh.
+    #[test]
+    fn test_an_empty_fetch_keeps_the_stored_table() {
+        let stored = splits_to_dataframe(
+            &[split("S1", "MNST", "2026-07-06", 1.0, 2.0)],
+            instant("2026-08-01T02:00:00Z"),
+        )
+        .unwrap();
+        let nothing = splits_to_dataframe(&[], instant("2026-08-14T02:00:00Z")).unwrap();
+
+        let merged = merge_splits(stored, nothing).expect("the merge must succeed");
+
+        assert_eq!(merged.height(), 1, "the stored table survives");
+        assert_eq!(
+            merged.column("id").unwrap().str().unwrap().get(0),
+            Some("S1")
         );
     }
 

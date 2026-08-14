@@ -44,6 +44,9 @@ pub enum MassiveError {
     /// Massive answered successfully with something that could not be interpreted.
     #[error("Massive response could not be parsed: {0}")]
     Parse(String),
+    /// A paginated response pointed somewhere the credential must not follow.
+    #[error("Massive cursor pointed at {host}, which is not the configured API host")]
+    Cursor { host: String },
 }
 
 /// Massive API credentials.
@@ -100,13 +103,27 @@ fn grouped_bars_url(base: &str, date: NaiveDate) -> String {
 
 /// Builds the first splits URL, on the same normalization as [`grouped_bars_url`].
 ///
-/// Unfiltered by date. The whole table is 29 pages and three seconds, so bounding it would buy
-/// nothing and cost a start date nobody could later justify.
+/// Unfiltered by date, because the whole table is 29 pages and three seconds.
 fn splits_url(base: &str) -> String {
     format!(
         "{}/v3/reference/splits?limit={SPLITS_PAGE_SIZE}",
         base.trim_end_matches('/')
     )
+}
+
+/// Whether a cursor URL points at the same origin as the configured base.
+///
+/// `next_url` arrives in the response body and the request following it carries the API key, so
+/// without this the response chooses where the credential is sent. Anything unparseable is refused.
+fn same_origin(base: &str, cursor: &str) -> bool {
+    match (reqwest::Url::parse(base), reqwest::Url::parse(cursor)) {
+        (Ok(base), Ok(cursor)) => {
+            base.scheme() == cursor.scheme()
+                && base.host_str() == cursor.host_str()
+                && base.port_or_known_default() == cursor.port_or_known_default()
+        }
+        _ => false,
+    }
 }
 
 /// Rows per splits page.
@@ -121,14 +138,10 @@ const SPLITS_PAGE_SIZE: usize = 1_000;
 /// spin against the API rather than fail. Generous enough that ordinary growth cannot reach it.
 const SPLITS_PAGE_LIMIT: usize = 200;
 
-/// One row of the splits response.
+/// One row of the splits response; these five fields are all Massive publishes.
 ///
-/// Massive publishes exactly these five fields — there is no adjustment factor to read, so the
-/// ratio is the whole of what a split says.
-///
-/// Both ratio sides are `f64` because the feed sends fractional ones: 5,344 of 28,135 live rows are
-/// mutual-fund reallocations like `1 -> 1.0056`. A whole-number type does not merely drop those
-/// rows, it fails the whole page they are on, and they are on most pages.
+/// Both ratio sides are `f64` because a fifth of the feed is fractional, and a whole-number type
+/// fails the whole page such a row is on rather than dropping the row.
 #[derive(Deserialize, Debug)]
 struct SplitRow {
     id: String,
@@ -389,8 +402,16 @@ impl MassiveClient {
                 info!(splits = splits.len(), pages = page, "Splits fetched");
                 return Ok(splits);
             };
-            // The cursor URL is absolute and carries no credential, so the key is re-attached by the
-            // `query` call above rather than being present in `next_url` already.
+            // Checked before it is followed, because the request that follows re-attaches the bearer
+            // token and this URL came out of the response body.
+            if !same_origin(&self.credentials.base_url, &next_url) {
+                return Err(MassiveError::Cursor {
+                    host: reqwest::Url::parse(&next_url)
+                        .ok()
+                        .and_then(|cursor| cursor.host_str().map(str::to_string))
+                        .unwrap_or_else(|| "an unparseable URL".to_string()),
+                });
+            }
             url = next_url;
         }
 
@@ -732,6 +753,55 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].ticker().as_str(), "MNST");
+    }
+
+    /// The cursor comes out of the response body and the next request carries the API key, so a
+    /// response naming another host would choose where the credential is sent.
+    #[tokio::test]
+    async fn test_a_cursor_pointing_off_host_is_refused_before_the_key_follows_it() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/v3/reference/splits")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[{"execution_date":"2026-07-06","id":"E1","split_from":1,"split_to":2,"ticker":"MNST"}],"next_url":"https://attacker.example/v3/reference/splits?cursor=x"}"#,
+            )
+            .create_async()
+            .await;
+
+        let error = MassiveClient::for_tests(&server.url())
+            .fetch_splits()
+            .await
+            .expect_err("an off-host cursor must not be followed");
+
+        first.assert_async().await;
+        assert!(
+            matches!(&error, MassiveError::Cursor { host } if host == "attacker.example"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn test_same_origin_admits_the_configured_host_and_nothing_else() {
+        let base = "https://api.massive.com";
+        assert!(same_origin(
+            base,
+            "https://api.massive.com/v3/reference/splits?cursor=x"
+        ));
+        assert!(
+            !same_origin(base, "https://api.massive.com.evil.test/v3"),
+            "suffix"
+        );
+        assert!(
+            !same_origin(base, "http://api.massive.com/v3"),
+            "scheme downgrade"
+        );
+        assert!(
+            !same_origin(base, "https://api.massive.com:8443/v3"),
+            "port"
+        );
+        assert!(!same_origin(base, "not a url"), "unparseable");
     }
 
     #[tokio::test]

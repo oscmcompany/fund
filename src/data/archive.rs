@@ -50,7 +50,7 @@ pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
 /// without a model run noticing.
 pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 
-/// S3 key for the stock splits the bars are adjusted against.
+/// S3 key for the stock splits the bars will be adjusted against; nothing reads it yet.
 ///
 /// One object rather than a partition per session, unlike the bars beside it. A split belongs to
 /// its execution date, but the feed revises and cancels announced ones, so a per-date layout would
@@ -472,6 +472,9 @@ fn merge_or_replace(
 
 /// Fetches the whole splits table and writes it, keeping each row's earliest `first_seen`.
 ///
+/// Accumulates the history that makes the switch to unadjusted bars possible; nothing reads the
+/// result yet.
+///
 /// Not a gap scan like [`archive_missing_sessions`], because there are no gaps to find: the feed
 /// answers with its entire current opinion in a few seconds, and that opinion is the answer. Rows
 /// it has stopped reporting are dropped rather than kept, which is the case a per-session layout
@@ -490,6 +493,17 @@ pub async fn archive_splits(
             key: SPLITS_ARCHIVE_KEY.to_string(),
             message: error.to_string(),
         })?;
+
+    // Refused before the write rather than merged away inside it, so a cold bucket does not get an
+    // empty object either. A feed that answers success with nothing is an outage, not an emptied
+    // table.
+    if splits.is_empty() {
+        warn!(
+            key = SPLITS_ARCHIVE_KEY,
+            "Splits fetch returned nothing; keeping the stored table"
+        );
+        return Ok(0);
+    }
 
     let frame = splits::splits_to_dataframe(&splits, fetched_at)?;
     write_merged(
