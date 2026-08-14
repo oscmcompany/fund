@@ -1,7 +1,6 @@
-//! Split adjustment as a fold over raw bars and the splits table; nothing calls it yet.
+//! Split adjustment as a read-time fold over raw bars and the splits table.
 //!
-//! Read-time rather than write-time because both stores freeze a bar after a few sessions, so a
-//! factor applied once is a factor frozen in whatever the feed knew that night.
+//! Nothing calls it yet; the readers and the switch to unadjusted prices follow.
 
 use std::collections::HashMap;
 
@@ -32,7 +31,7 @@ impl SplitTable {
 
         let mut by_ticker: HashMap<String, Vec<(SessionDate, f64)>> = HashMap::new();
         for row in 0..frame.height() {
-            let (Some(ticker), Some(execution_date), Some(from), Some(to)) = (
+            let (Some(ticker), Some(execution_date), Some(split_from), Some(split_to)) = (
                 tickers.get(row),
                 execution_dates.get(row),
                 splits_from.get(row),
@@ -43,15 +42,24 @@ impl SplitTable {
             let Ok(execution_date) = NaiveDate::parse_from_str(execution_date, "%Y-%m-%d") else {
                 continue;
             };
-            // Guarded rather than assumed: the ratio is a divisor below, and a frame can be read
-            // from an object this build did not write.
-            if !from.is_finite() || !to.is_finite() || from <= 0.0 || to <= 0.0 {
+            // Guarded rather than assumed, because a frame can be read from an object this build
+            // did not write. Both sides *and* the quotient: two negatives divide to a plausible
+            // ratio, and two positives can still overflow or underflow to one that is not.
+            if !split_from.is_finite()
+                || !split_to.is_finite()
+                || split_from <= 0.0
+                || split_to <= 0.0
+            {
+                continue;
+            }
+            let ratio = split_from / split_to;
+            if !ratio.is_finite() || ratio <= 0.0 {
                 continue;
             }
             by_ticker
                 .entry(ticker.to_string())
                 .or_default()
-                .push((SessionDate::from_date(execution_date), from / to));
+                .push((SessionDate::from_date(execution_date), ratio));
         }
 
         Ok(Self { by_ticker })
@@ -64,8 +72,13 @@ impl SplitTable {
     /// already reflects it. The upper bound is what keeps an *announced* split out: the table
     /// carries them months ahead, and applying one would restate today's history onto a basis the
     /// market has not moved to, leaving it incomparable with the live quote it gets screened against.
+    ///
+    /// Always a usable factor. Each ratio is finite and positive, but a product of them need not
+    /// be, and an unusable one falls back to 1.0 — the same answer an unknown ticker gets — so no
+    /// caller has to re-check a number it is about to divide by.
     pub fn factor_at(&self, ticker: &str, session: SessionDate, as_of: SessionDate) -> f64 {
-        self.by_ticker
+        let factor: f64 = self
+            .by_ticker
             .get(ticker)
             .map(|splits| {
                 splits
@@ -76,7 +89,13 @@ impl SplitTable {
                     .map(|(_, ratio)| ratio)
                     .product()
             })
-            .unwrap_or(1.0)
+            .unwrap_or(1.0);
+
+        if factor.is_finite() && factor > 0.0 {
+            factor
+        } else {
+            1.0
+        }
     }
 
     /// Whether any split is known, which is what makes skipping the whole fold safe.
@@ -366,17 +385,24 @@ mod tests {
         assert!(adjusted.equals(&raw));
     }
 
-    /// A stored object this build did not write can carry anything; a zero side would divide by
-    /// zero and a malformed date would silently land in the wrong window.
+    /// A stored object this build did not write can carry anything, and every one of these reaches
+    /// a divisor: a malformed date lands the split in the wrong window, and a factor of zero or
+    /// infinity saturates volume to `i64::MAX` and sends every price to infinity.
+    ///
+    /// `DDDD` and `EEEE` are why the sides and the quotient are both checked. Two positives divide
+    /// to a factor that is neither, and two negatives divide to one that looks entirely ordinary —
+    /// so neither guard catches what the other does.
     #[test]
     fn test_unreadable_rows_are_skipped_rather_than_indexed() {
         let frame = df![
-            "id" => ["E1", "E2", "E3"],
-            "ticker" => ["AAAA", "BBBB", "CCCC"],
-            "execution_date" => ["2026-07-06", "not a date", "2026-07-06"],
-            "split_from" => [1.0, 1.0, 0.0],
-            "split_to" => [2.0, 2.0, 2.0],
-            "first_seen" => [0i64, 0, 0],
+            "id" => ["E1", "E2", "E3", "E4", "E5", "E6"],
+            "ticker" => ["AAAA", "BBBB", "CCCC", "DDDD", "EEEE", "FFFF"],
+            "execution_date" => [
+                "2026-07-06", "not a date", "2026-07-06", "2026-07-06", "2026-07-06", "2026-07-06",
+            ],
+            "split_from" => [1.0, 1.0, 0.0, 1e308, -1.0, 1e-308],
+            "split_to" => [2.0, 2.0, 2.0, 1e-308, -2.0, 1e308],
+            "first_seen" => [0i64, 0, 0, 0, 0, 0],
         ]
         .unwrap();
 
@@ -384,14 +410,31 @@ mod tests {
 
         assert_eq!(
             table.factor_at("AAAA", session("2026-07-02"), session("2026-08-13")),
-            0.5
+            0.5,
+            "an ordinary ratio still indexes"
         );
-        for skipped in ["BBBB", "CCCC"] {
+        for skipped in ["BBBB", "CCCC", "DDDD", "EEEE", "FFFF"] {
             assert_eq!(
                 table.factor_at(skipped, session("2026-07-02"), session("2026-08-13")),
                 1.0,
                 "{skipped}"
             );
         }
+    }
+
+    /// The contract `adjust_bars` divides by. Each stored ratio is finite and positive, but their
+    /// product need not be, and a caller that had to re-check would be re-checking everywhere.
+    #[test]
+    fn test_a_factor_that_compounds_out_of_range_falls_back_to_one() {
+        let overflowing = table(&[
+            split("AAAA", "2026-07-06", 1e200, 1.0),
+            split("AAAA", "2026-07-07", 1e200, 1.0),
+        ]);
+
+        assert_eq!(
+            overflowing.factor_at("AAAA", session("2026-07-02"), session("2026-08-13")),
+            1.0,
+            "a product past f64 is not a factor to scale prices by"
+        );
     }
 }
