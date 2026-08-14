@@ -1,0 +1,397 @@
+//! Split adjustment as a fold over raw bars and the splits table; nothing calls it yet.
+//!
+//! Read-time rather than write-time because both stores freeze a bar after a few sessions, so a
+//! factor applied once is a factor frozen in whatever the feed knew that night.
+
+use std::collections::HashMap;
+
+use chrono::NaiveDate;
+use polars::prelude::*;
+
+use crate::common::types::SessionDate;
+
+/// The splits table indexed for lookup, as read from the archive.
+///
+/// Holds only the ratio and the date, because that is all an adjustment needs — the identifier and
+/// provenance answer other questions.
+#[derive(Debug, Clone, Default)]
+pub struct SplitTable {
+    by_ticker: HashMap<String, Vec<(SessionDate, f64)>>,
+}
+
+impl SplitTable {
+    /// Builds the index from the stored frame, ignoring rows it cannot read.
+    ///
+    /// A row that fails to parse is skipped rather than fatal: the table covers the whole market
+    /// back to 1978, and one unreadable row should not cost the adjustment of every other ticker.
+    pub fn from_dataframe(frame: &DataFrame) -> Result<Self, PolarsError> {
+        let tickers = frame.column("ticker")?.str()?;
+        let execution_dates = frame.column("execution_date")?.str()?;
+        let splits_from = frame.column("split_from")?.f64()?;
+        let splits_to = frame.column("split_to")?.f64()?;
+
+        let mut by_ticker: HashMap<String, Vec<(SessionDate, f64)>> = HashMap::new();
+        for row in 0..frame.height() {
+            let (Some(ticker), Some(execution_date), Some(from), Some(to)) = (
+                tickers.get(row),
+                execution_dates.get(row),
+                splits_from.get(row),
+                splits_to.get(row),
+            ) else {
+                continue;
+            };
+            let Ok(execution_date) = NaiveDate::parse_from_str(execution_date, "%Y-%m-%d") else {
+                continue;
+            };
+            // Guarded rather than assumed: the ratio is a divisor below, and a frame can be read
+            // from an object this build did not write.
+            if !from.is_finite() || !to.is_finite() || from <= 0.0 || to <= 0.0 {
+                continue;
+            }
+            by_ticker
+                .entry(ticker.to_string())
+                .or_default()
+                .push((SessionDate::from_date(execution_date), from / to));
+        }
+
+        Ok(Self { by_ticker })
+    }
+
+    /// The factor putting a bar of `ticker` on `session` onto `as_of`'s share basis.
+    ///
+    /// Splits are applied when they execute strictly after the bar and no later than `as_of`. The
+    /// lower bound is exclusive because a split executes at the open, so the bar stamped that day
+    /// already reflects it. The upper bound is what keeps an *announced* split out: the table
+    /// carries them months ahead, and applying one would restate today's history onto a basis the
+    /// market has not moved to, leaving it incomparable with the live quote it gets screened against.
+    pub fn factor_at(&self, ticker: &str, session: SessionDate, as_of: SessionDate) -> f64 {
+        self.by_ticker
+            .get(ticker)
+            .map(|splits| {
+                splits
+                    .iter()
+                    .filter(|(execution_date, _)| {
+                        *execution_date > session && *execution_date <= as_of
+                    })
+                    .map(|(_, ratio)| ratio)
+                    .product()
+            })
+            .unwrap_or(1.0)
+    }
+
+    /// Whether any split is known, which is what makes skipping the whole fold safe.
+    pub fn is_empty(&self) -> bool {
+        self.by_ticker.is_empty()
+    }
+}
+
+/// Columns holding a price, which scale with the factor.
+const PRICE_COLUMNS: [&str; 5] = [
+    "open_price",
+    "high_price",
+    "low_price",
+    "close_price",
+    "volume_weighted_average_price",
+];
+
+/// Restates raw bars onto `as_of`'s share basis.
+///
+/// Prices scale by the factor and volume by its inverse, because a two-for-one split halves the
+/// price and doubles the share count. Returns the frame untouched when no split is known, which is
+/// the ordinary case for most of the market.
+pub fn adjust_bars(
+    frame: DataFrame,
+    table: &SplitTable,
+    as_of: SessionDate,
+) -> Result<DataFrame, PolarsError> {
+    if table.is_empty() {
+        return Ok(frame);
+    }
+
+    // The factor depends on a per-ticker date range rather than a key, so it is not a join. Computed
+    // once here and reused across the columns instead of rescanning the table for each of them.
+    let factors = bar_factors(&frame, table, as_of)?;
+
+    let mut adjusted = frame;
+    for name in PRICE_COLUMNS {
+        let Ok(column) = adjusted.column(name) else {
+            continue;
+        };
+        let scaled: Float64Chunked = column
+            .f64()?
+            .into_iter()
+            .zip(&factors)
+            .map(|(price, factor)| price.map(|price| price * factor))
+            .collect();
+        adjusted.with_column(scaled.into_series().with_name(name.into()))?;
+    }
+
+    if let Ok(column) = adjusted.column("volume") {
+        // Against the factor, not with it: a two-for-one halves the price and doubles the shares.
+        let scaled: Int64Chunked = column
+            .i64()?
+            .into_iter()
+            .zip(&factors)
+            .map(|(volume, factor)| volume.map(|volume| (volume as f64 / factor).round() as i64))
+            .collect();
+        adjusted.with_column(scaled.into_series().with_name("volume".into()))?;
+    }
+
+    Ok(adjusted)
+}
+
+/// One factor per row, in frame order.
+fn bar_factors(
+    frame: &DataFrame,
+    table: &SplitTable,
+    as_of: SessionDate,
+) -> Result<Vec<f64>, PolarsError> {
+    let tickers = frame.column("ticker")?.str()?;
+    let timestamps = frame.column("timestamp")?.i64()?;
+
+    Ok((0..frame.height())
+        .map(|row| {
+            let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
+                return 1.0;
+            };
+            let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
+                return 1.0;
+            };
+            table.factor_at(ticker, SessionDate::at(instant), as_of)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{EquitySplit, Ticker};
+    use crate::data::splits::splits_to_dataframe;
+
+    fn session(value: &str) -> SessionDate {
+        SessionDate::from_date(value.parse().expect("a valid session date"))
+    }
+
+    fn split(ticker: &str, execution_date: &str, from: f64, to: f64) -> EquitySplit {
+        EquitySplit::new(
+            format!("{ticker}-{execution_date}"),
+            Ticker::new(ticker).expect("a valid ticker"),
+            session(execution_date),
+            from,
+            to,
+        )
+        .expect("a valid split")
+    }
+
+    fn table(splits: &[EquitySplit]) -> SplitTable {
+        let frame = splits_to_dataframe(splits, "2026-08-14T02:00:00Z".parse().unwrap())
+            .expect("a frame must build");
+        SplitTable::from_dataframe(&frame).expect("the table must index")
+    }
+
+    /// The live case that started this, with the numbers taken from the feed: `MNST` closed a raw
+    /// 96.38 on 2026-06-26 and split two-for-one on 2026-08-11, and Massive's own `adjusted=true`
+    /// answers 48.19 for that session.
+    #[test]
+    fn test_a_bar_before_a_split_is_restated_onto_the_current_basis() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+
+        let factor = table.factor_at("MNST", session("2026-06-26"), session("2026-08-14"));
+
+        assert!((96.38 * factor - 48.19).abs() < 1e-9, "factor was {factor}");
+    }
+
+    /// `NVDA`'s ten-for-one, the largest recent factor, checked against the same feed. A ratio this
+    /// far from one is where an inverted factor stops being subtle.
+    #[test]
+    fn test_a_ten_for_one_scales_by_a_tenth_and_not_by_ten() {
+        let table = table(&[split("NVDA", "2024-06-10", 1.0, 10.0)]);
+
+        let factor = table.factor_at("NVDA", session("2024-06-07"), session("2024-08-14"));
+
+        assert!((factor - 0.1).abs() < 1e-12, "factor was {factor}");
+    }
+
+    /// A split executes at the open, so the bar stamped that day already reflects it and applying
+    /// the ratio again would halve a price that was never doubled.
+    #[test]
+    fn test_the_bar_on_the_execution_date_is_already_post_split() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+
+        assert_eq!(
+            table.factor_at("MNST", session("2026-08-11"), session("2026-08-14")),
+            1.0
+        );
+        assert_eq!(
+            table.factor_at("MNST", session("2026-08-12"), session("2026-08-14")),
+            1.0,
+            "a bar after the split needs no restating either"
+        );
+    }
+
+    /// The trap the upper bound exists for. The feed carries announced splits months ahead, and
+    /// applying one would restate today's history onto a basis the market has not moved to — leaving
+    /// it incomparable with the live quote the screen measures it against.
+    #[test]
+    fn test_an_announced_split_does_not_restate_todays_history() {
+        let table = table(&[split("DPU", "2026-12-17", 50.0, 1.0)]);
+
+        assert_eq!(
+            table.factor_at("DPU", session("2026-08-01"), session("2026-08-13")),
+            1.0,
+            "a split that has not executed yet must not touch anything"
+        );
+        assert_eq!(
+            table.factor_at("DPU", session("2026-08-01"), session("2026-12-18")),
+            50.0,
+            "and must apply once it has"
+        );
+    }
+
+    /// Two splits between the bar and today compound rather than replacing one another.
+    #[test]
+    fn test_successive_splits_compound() {
+        let table = table(&[
+            split("AAAA", "2026-03-02", 1.0, 2.0),
+            split("AAAA", "2026-06-01", 1.0, 3.0),
+        ]);
+
+        let factor = table.factor_at("AAAA", session("2026-01-05"), session("2026-08-13"));
+
+        assert!((factor - 1.0 / 6.0).abs() < 1e-12, "factor was {factor}");
+    }
+
+    #[test]
+    fn test_a_reverse_split_raises_the_earlier_price() {
+        let table = table(&[split("TGOSY", "2026-10-05", 5.0, 1.0)]);
+
+        let factor = table.factor_at("TGOSY", session("2026-09-01"), session("2026-10-06"));
+
+        assert_eq!(factor, 5.0);
+    }
+
+    #[test]
+    fn test_a_ticker_with_no_splits_is_left_alone() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+
+        assert_eq!(
+            table.factor_at("AAPL", session("2026-06-26"), session("2026-08-14")),
+            1.0
+        );
+    }
+
+    fn bars(ticker: &str, session_date: &str, close: f64, volume: i64) -> DataFrame {
+        df![
+            "ticker" => [ticker],
+            "bar_interval" => ["1Day"],
+            "timestamp" => [session(session_date).midnight().timestamp_millis()],
+            "open_price" => [close],
+            "high_price" => [close],
+            "low_price" => [close],
+            "close_price" => [close],
+            "volume" => [volume],
+            "volume_weighted_average_price" => [Some(close)],
+            "transactions" => [Some(1_000i64)],
+        ]
+        .expect("a frame must build")
+    }
+
+    /// Prices scale with the factor and volume against it: a two-for-one halves the price and
+    /// doubles the shares, and a frame that moved only one of them is internally inconsistent.
+    #[test]
+    fn test_the_fold_scales_prices_down_and_volume_up() {
+        let table = table(&[split("MNST", "2026-08-11", 1.0, 2.0)]);
+
+        let adjusted = adjust_bars(
+            bars("MNST", "2026-06-26", 96.38, 1_000_000),
+            &table,
+            session("2026-08-14"),
+        )
+        .expect("the fold must apply");
+
+        let close = adjusted.column("close_price").unwrap().f64().unwrap();
+        assert!((close.get(0).unwrap() - 48.19).abs() < 1e-9);
+        assert_eq!(
+            adjusted.column("volume").unwrap().i64().unwrap().get(0),
+            Some(2_000_000)
+        );
+        assert!(
+            (adjusted
+                .column("volume_weighted_average_price")
+                .unwrap()
+                .f64()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                - 48.19)
+                .abs()
+                < 1e-9,
+            "the volume-weighted price is a price too"
+        );
+    }
+
+    /// The output has to stay loadable by everything that reads a bar frame, so the fold must not
+    /// leave its working column behind or drop one it did not touch.
+    #[test]
+    fn test_the_fold_preserves_the_frame_schema() {
+        let raw = bars("MNST", "2026-06-26", 96.38, 1_000_000);
+        let expected: Vec<String> = raw
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+
+        let adjusted = adjust_bars(
+            raw,
+            &table(&[split("MNST", "2026-07-06", 1.0, 2.0)]),
+            session("2026-08-13"),
+        )
+        .expect("the fold must apply");
+
+        let actual: Vec<String> = adjusted
+            .get_column_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_an_empty_table_returns_the_frame_untouched() {
+        let raw = bars("MNST", "2026-06-26", 96.38, 1_000_000);
+
+        let adjusted = adjust_bars(raw.clone(), &SplitTable::default(), session("2026-08-14"))
+            .expect("the fold must apply");
+
+        assert!(adjusted.equals(&raw));
+    }
+
+    /// A stored object this build did not write can carry anything; a zero side would divide by
+    /// zero and a malformed date would silently land in the wrong window.
+    #[test]
+    fn test_unreadable_rows_are_skipped_rather_than_indexed() {
+        let frame = df![
+            "id" => ["E1", "E2", "E3"],
+            "ticker" => ["AAAA", "BBBB", "CCCC"],
+            "execution_date" => ["2026-07-06", "not a date", "2026-07-06"],
+            "split_from" => [1.0, 1.0, 0.0],
+            "split_to" => [2.0, 2.0, 2.0],
+            "first_seen" => [0i64, 0, 0],
+        ]
+        .unwrap();
+
+        let table = SplitTable::from_dataframe(&frame).expect("the table must index");
+
+        assert_eq!(
+            table.factor_at("AAAA", session("2026-07-02"), session("2026-08-13")),
+            0.5
+        );
+        for skipped in ["BBBB", "CCCC"] {
+            assert_eq!(
+                table.factor_at(skipped, session("2026-07-02"), session("2026-08-13")),
+                1.0,
+                "{skipped}"
+            );
+        }
+    }
+}

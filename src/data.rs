@@ -12,6 +12,7 @@
 //! [`export`] also seals and ships [`crate::common::session_log`], the local original that both
 //! PostgreSQL and S3 are derived from.
 
+pub mod adjust;
 pub mod archive;
 pub mod bars;
 pub mod calendar;
