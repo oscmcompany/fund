@@ -22,10 +22,12 @@ pub fn splits_to_dataframe(
     let mut splits_from: Vec<f64> = Vec::with_capacity(splits.len());
     let mut splits_to: Vec<f64> = Vec::with_capacity(splits.len());
 
+    // Through the stored-form accessors rather than `Display`, which is a presentation concern and
+    // would silently change these columns if it were ever reformatted.
     for split in splits {
         identifiers.push(split.id().to_string());
-        tickers.push(split.ticker().to_string());
-        execution_dates.push(split.execution_date().to_string());
+        tickers.push(split.ticker().as_str().to_string());
+        execution_dates.push(split.execution_date().date().format("%Y-%m-%d").to_string());
         splits_from.push(split.split_from());
         splits_to.push(split.split_to());
     }

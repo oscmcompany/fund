@@ -114,6 +114,9 @@ pub enum ArchiveError {
     },
     #[error("gave up on {key} after {attempts} concurrent writes by another pass")]
     Contended { key: String, attempts: usize },
+    /// The upstream feed failed, before any bucket was touched.
+    #[error("failed to fetch from Massive: {0}")]
+    Feed(String),
     #[error("failed to build a bar frame: {0}")]
     Frame(#[from] PolarsError),
 }
@@ -488,11 +491,7 @@ pub async fn archive_splits(
     let splits = massive
         .fetch_splits()
         .await
-        .map_err(|error| ArchiveError::Read {
-            bucket: bucket.to_string(),
-            key: SPLITS_ARCHIVE_KEY.to_string(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| ArchiveError::Feed(error.to_string()))?;
 
     // Refused before the write rather than merged away inside it, so a cold bucket does not get an
     // empty object either. A feed that answers success with nothing is an outage, not an emptied
@@ -511,7 +510,19 @@ pub async fn archive_splits(
         bucket,
         SPLITS_ARCHIVE_KEY.to_string(),
         frame,
-        |existing, fetched, _key| Ok(splits::merge_splits(existing, fetched)?),
+        // Falls back rather than propagating, for the reason `merge_or_replace` does: a stored
+        // object whose schema stopped matching would otherwise fail every future refresh too.
+        |existing, fetched, key| match splits::merge_splits(existing, fetched.clone()) {
+            Ok(merged) => Ok(merged),
+            Err(error) => {
+                warn!(
+                    key,
+                    %error,
+                    "Could not merge the stored splits table; replacing it with the fetched rows"
+                );
+                Ok(fetched)
+            }
+        },
     )
     .await?;
 

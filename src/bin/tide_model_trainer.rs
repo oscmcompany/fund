@@ -137,9 +137,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Refreshed whole rather than topped up, and stepped over on failure like the bars
-            // above. Nothing reads it yet — adjustment is still Massive's, so this accumulates the
-            // history that makes the switch to raw prices possible.
-            match archive::archive_splits(&s3_client, &massive, &bucket, Utc::now()).await {
+            // above. No adjustment path consumes it yet; this accumulates the history first.
+            match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
                 Ok(splits) => info!(splits, "Splits table refreshed"),
                 Err(error) => warn!(%error, "Splits refresh failed; the archive keeps its copy"),
             }
