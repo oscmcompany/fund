@@ -868,6 +868,77 @@ impl EquityTrade {
     }
 }
 
+/// One stock split as the corporate-actions feed reported it.
+///
+/// The ratio reads `split_from` shares becoming `split_to` shares, so a two-for-one forward split
+/// is `1 -> 2` and a one-for-three reverse split is `3 -> 1`. Both sides are real rather than whole
+/// numbers, because a fifth of the live feed is fractional mutual-fund reallocations.
+///
+/// `execution_date` may be in the future: the feed publishes splits once announced, and can later
+/// revise or cancel one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EquitySplit {
+    id: String,
+    ticker: Ticker,
+    execution_date: SessionDate,
+    split_from: f64,
+    split_to: f64,
+}
+
+impl EquitySplit {
+    /// Constructs an `EquitySplit`, rejecting a ratio that cannot describe one.
+    ///
+    /// A non-positive or non-finite side would make the adjustment factor a division by zero, a
+    /// sign flip, or a `NaN` that silently poisons every price it touches. An unidentified row
+    /// cannot be merged against a later fetch of the same split.
+    pub fn new(
+        id: String,
+        ticker: Ticker,
+        execution_date: SessionDate,
+        split_from: f64,
+        split_to: f64,
+    ) -> Result<Self, InconsistentRecordError> {
+        if id.trim().is_empty() {
+            return Err(reject("split identifier is empty"));
+        }
+        for (name, side) in [("from", split_from), ("to", split_to)] {
+            if !side.is_finite() || side <= 0.0 {
+                return Err(reject(format!(
+                    "split {name} side {side} is not a positive number"
+                )));
+            }
+        }
+
+        Ok(Self {
+            id,
+            ticker,
+            execution_date,
+            split_from,
+            split_to,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn execution_date(&self) -> SessionDate {
+        self.execution_date
+    }
+
+    pub fn split_from(&self) -> f64 {
+        self.split_from
+    }
+
+    pub fn split_to(&self) -> f64 {
+        self.split_to
+    }
+}
+
 /// Ticker metadata used to constrain pair selection to cross-sector matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityDetail {
@@ -1340,6 +1411,41 @@ mod tests {
             EquityTrade::new(ticker("AAPL"), at, f64::NAN).is_err(),
             "non-finite"
         );
+    }
+
+    fn split(id: &str, from: f64, to: f64) -> Result<EquitySplit, InconsistentRecordError> {
+        EquitySplit::new(
+            id.to_string(),
+            ticker("MNST"),
+            SessionDate::from_date(NaiveDate::from_ymd_opt(2026, 7, 6).unwrap()),
+            from,
+            to,
+        )
+    }
+
+    /// A non-positive side makes the adjustment factor a division by zero or a sign flip, and a
+    /// `NaN` poisons every price it reaches. An unidentified row cannot be merged against a later
+    /// fetch of the same split.
+    #[test]
+    fn test_split_rejects_a_ratio_or_identifier_it_cannot_use() {
+        let forward = split("E1", 1.0, 2.0).expect("a two-for-one must construct");
+        assert_eq!((forward.split_from(), forward.split_to()), (1.0, 2.0));
+        assert!(split("E1", 3.0, 1.0).is_ok(), "a reverse split is ordinary");
+
+        assert!(split("E1", 0.0, 2.0).is_err(), "zero from");
+        assert!(split("E1", 1.0, 0.0).is_err(), "zero to");
+        assert!(split("E1", -1.0, 2.0).is_err(), "negative from");
+        assert!(split("E1", 1.0, f64::NAN).is_err(), "non-finite to");
+        assert!(split("", 1.0, 2.0).is_err(), "empty identifier");
+        assert!(split("   ", 1.0, 2.0).is_err(), "blank identifier");
+    }
+
+    /// Nineteen percent of the live feed is fractional, so a whole-number ratio would silently
+    /// discard every mutual-fund reallocation in it.
+    #[test]
+    fn test_split_accepts_a_fractional_ratio() {
+        let reallocation = split("E1", 1.0, 1.0056).expect("a fractional ratio must construct");
+        assert_eq!(reallocation.split_to(), 1.0056);
     }
 
     fn prediction(

@@ -135,6 +135,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     warn!(%error, "Archive stage failed; training on the existing archive")
                 }
             }
+
+            // Refreshed whole rather than topped up, and stepped over on failure like the bars
+            // above. No adjustment path consumes it yet; this accumulates the history first.
+            match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
+                Ok(splits) => info!(splits, "Splits table refreshed"),
+                Err(error) => warn!(%error, "Splits refresh failed; the archive keeps its copy"),
+            }
         }
         Err(error) => warn!(%error, "No Massive client; training on the existing archive"),
     }
