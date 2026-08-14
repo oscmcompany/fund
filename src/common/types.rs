@@ -824,6 +824,50 @@ impl EquityQuote {
     }
 }
 
+/// The most recent trade in a symbol, as one snapshot reported it.
+///
+/// The timestamp is not optional because the last trade is what the pass prices on whenever the
+/// book is refused, and an undated one cannot be judged for staleness the way [`EquityQuote`] can.
+#[derive(Debug, Clone)]
+pub struct EquityTrade {
+    ticker: Ticker,
+    timestamp: DateTime<Utc>,
+    price: f64,
+}
+
+impl EquityTrade {
+    /// Constructs an `EquityTrade`, rejecting a price that is not one.
+    pub fn new(
+        ticker: Ticker,
+        timestamp: DateTime<Utc>,
+        price: f64,
+    ) -> Result<Self, InconsistentRecordError> {
+        if !price.is_finite() || price <= 0.0 {
+            return Err(reject(format!(
+                "trade price {price} is not a positive number"
+            )));
+        }
+
+        Ok(Self {
+            ticker,
+            timestamp,
+            price,
+        })
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    pub fn timestamp(&self) -> DateTime<Utc> {
+        self.timestamp
+    }
+
+    pub fn price(&self) -> f64 {
+        self.price
+    }
+}
+
 /// Ticker metadata used to constrain pair selection to cross-sector matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityDetail {
@@ -1278,6 +1322,24 @@ mod tests {
         assert!(quote(103.0, 102.0, 5, 5).is_err(), "crossed book");
         assert!(quote(f64::NAN, 102.0, 5, 5).is_err(), "non-finite bid");
         assert!(quote(100.0, 102.0, -1, 5).is_err(), "negative size");
+    }
+
+    #[test]
+    fn test_trade_rejects_a_price_that_is_not_one() {
+        let at = Utc::now();
+        assert_eq!(
+            EquityTrade::new(ticker("AAPL"), at, 201.5).unwrap().price(),
+            201.5
+        );
+        assert!(EquityTrade::new(ticker("AAPL"), at, 0.0).is_err(), "zero");
+        assert!(
+            EquityTrade::new(ticker("AAPL"), at, -1.0).is_err(),
+            "signed"
+        );
+        assert!(
+            EquityTrade::new(ticker("AAPL"), at, f64::NAN).is_err(),
+            "non-finite"
+        );
     }
 
     fn prediction(

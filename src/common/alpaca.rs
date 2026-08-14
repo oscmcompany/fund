@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::common::types::{BarInterval, Dollars, EquityBar, EquityQuote, Ticker};
+use crate::common::types::{BarInterval, Dollars, EquityBar, EquityQuote, EquityTrade, Ticker};
 
 // --------------------------------------------------------------------------
 // Shared configuration and errors
@@ -1610,7 +1610,7 @@ pub struct SnapshotFetch {
 pub struct Snapshot {
     ticker: Ticker,
     latest_quote: Option<EquityQuote>,
-    latest_trade_price: Option<f64>,
+    latest_trade: Option<EquityTrade>,
     minute_bar: Option<EquityBar>,
     daily_bar: Option<EquityBar>,
     previous_daily_bar: Option<EquityBar>,
@@ -1625,8 +1625,8 @@ impl Snapshot {
         self.latest_quote.as_ref()
     }
 
-    pub fn latest_trade_price(&self) -> Option<f64> {
-        self.latest_trade_price
+    pub fn latest_trade(&self) -> Option<&EquityTrade> {
+        self.latest_trade.as_ref()
     }
 
     pub fn minute_bar(&self) -> Option<&EquityBar> {
@@ -1662,8 +1662,9 @@ impl Snapshot {
             .as_ref()
             .map(|quote| (quote.mid_price(), PriceSource::QuoteMidpoint))
             .or_else(|| {
-                self.latest_trade_price
-                    .map(|price| (price, PriceSource::LastTrade))
+                self.latest_trade
+                    .as_ref()
+                    .map(|trade| (trade.price(), PriceSource::LastTrade))
             })
     }
 
@@ -1692,8 +1693,8 @@ impl Snapshot {
             None => None,
         };
 
-        self.latest_trade_price.map(|price| CheckedPrice {
-            price,
+        self.latest_trade.as_ref().map(|trade| CheckedPrice {
+            price: trade.price(),
             source: PriceSource::LastTrade,
             rejection,
         })
@@ -2009,7 +2010,9 @@ impl MarketDataClient {
                     latest_quote: snapshot
                         .latest_quote
                         .and_then(|quote| quote.into_equity_quote(&ticker)),
-                    latest_trade_price: snapshot.latest_trade.and_then(|trade| trade.price),
+                    latest_trade: snapshot
+                        .latest_trade
+                        .and_then(|trade| trade.into_equity_trade(&ticker)),
                     minute_bar: snapshot
                         .minute_bar
                         .and_then(|bar| bar.into_equity_bar(&ticker, BarInterval::OneMinute)),
@@ -2081,8 +2084,26 @@ impl QuotePayload {
 
 #[derive(Deserialize)]
 struct TradePayload {
+    #[serde(rename = "t")]
+    timestamp: Option<DateTime<Utc>>,
     #[serde(rename = "p")]
     price: Option<f64>,
+}
+
+impl TradePayload {
+    /// A trade missing its price or its timestamp is dropped, on the same terms as
+    /// [`QuotePayload::into_equity_quote`].
+    ///
+    /// Dropping an undated trade costs the symbol its fallback price, which is the intent: the last
+    /// trade is what a pass prices on once the book is refused, and one that cannot be dated cannot
+    /// be refused in turn.
+    fn into_equity_trade(self, ticker: &Ticker) -> Option<EquityTrade> {
+        EquityTrade::new(ticker.clone(), self.timestamp?, self.price?)
+            .inspect_err(|error| {
+                debug!(ticker = %ticker, error = %error, "Dropped an incoherent trade");
+            })
+            .ok()
+    }
 }
 
 #[derive(Deserialize)]
@@ -3190,7 +3211,7 @@ mod tests {
         assert_eq!(snapshots.snapshots.len(), 1);
         let snapshot = &snapshots.snapshots[0];
         assert_eq!(snapshot.ticker().as_str(), "AAPL");
-        assert_eq!(snapshot.latest_trade_price(), Some(201.5));
+        assert_eq!(snapshot.latest_trade().unwrap().price(), 201.5);
         assert_eq!(snapshot.latest_quote().unwrap().bid_price(), 201.0);
         assert_eq!(snapshot.minute_bar().unwrap().close_price(), 201.5);
         assert_eq!(snapshot.daily_bar().unwrap().volume(), 2_500_000);
@@ -3232,7 +3253,7 @@ mod tests {
             .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
             .with_status(200)
             .with_body(
-                r#"{"AAPL":{"latestTrade":{"p":150.0},
+                r#"{"AAPL":{"latestTrade":{"t":"2026-06-10T15:59:00Z","p":150.0},
                     "latestQuote":{"t":"2026-06-10T15:59:30Z","bp":149.0,"bs":10,"as":12}}}"#,
             )
             .create_async()
@@ -3251,6 +3272,60 @@ mod tests {
         mock.assert_async().await;
     }
 
+    /// The trade's `t` was the one timestamp the snapshot parse dropped, so a fallback price could
+    /// be any age and the record could not say. Every other component already kept its own.
+    #[tokio::test]
+    async fn test_a_snapshot_keeps_when_the_last_trade_printed() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/stocks/snapshots?symbols=AAPL&feed=iex")
+            .with_status(200)
+            .with_body(FULL_SNAPSHOT)
+            .create_async()
+            .await;
+
+        let snapshots = client(server.url())
+            .fetch_snapshots(&["AAPL".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            snapshots.snapshots[0].latest_trade().unwrap().timestamp(),
+            "2026-06-10T15:59:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        mock.assert_async().await;
+    }
+
+    /// An undated trade costs the symbol its fallback price rather than supplying an unjudgeable
+    /// one, which is the same call [`QuotePayload::into_equity_quote`] makes on a partial book.
+    #[tokio::test]
+    async fn test_a_trade_that_cannot_be_dated_or_priced_is_dropped() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"AAPL":{"latestTrade":{"p":150.0}},
+                    "MSFT":{"latestTrade":{"t":"2026-06-10T15:59:00Z","p":0.0}}}"#,
+            )
+            .create_async()
+            .await;
+
+        let snapshots = client(server.url())
+            .fetch_snapshots(&["AAPL".to_string(), "MSFT".to_string()])
+            .await
+            .unwrap();
+
+        for snapshot in &snapshots.snapshots {
+            assert!(snapshot.latest_trade().is_none());
+            assert_eq!(snapshot.reference_price(), None);
+        }
+        mock.assert_async().await;
+    }
+
     // --- the quote guard ---
 
     /// The `AER` reading from 2026-08-12: a book wide enough that its midpoint sat seven percent
@@ -3261,7 +3336,7 @@ mod tests {
             latest_quote: Some(
                 EquityQuote::new(ticker.clone(), quoted_at, 128.0, 150.86, 10, 12).unwrap(),
             ),
-            latest_trade_price: Some(150.60),
+            latest_trade: Some(EquityTrade::new(ticker.clone(), quoted_at, 150.60).unwrap()),
             minute_bar: None,
             daily_bar: None,
             previous_daily_bar: None,
@@ -3275,7 +3350,7 @@ mod tests {
             latest_quote: Some(
                 EquityQuote::new(ticker.clone(), quoted_at, 150.58, 150.62, 10, 12).unwrap(),
             ),
-            latest_trade_price: Some(150.60),
+            latest_trade: Some(EquityTrade::new(ticker.clone(), quoted_at, 150.60).unwrap()),
             minute_bar: None,
             daily_bar: None,
             previous_daily_bar: None,
@@ -3403,7 +3478,7 @@ mod tests {
     fn test_a_refused_quote_with_no_last_trade_leaves_the_symbol_unpriced() {
         let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
         let mut snapshot = wide_book_snapshot(now);
-        snapshot.latest_trade_price = None;
+        snapshot.latest_trade = None;
 
         assert_eq!(
             snapshot.reference_price_checked(now, QuoteLimits::default()),
@@ -3424,6 +3499,25 @@ mod tests {
             .unwrap();
         assert_eq!(checked.source(), PriceSource::LastTrade);
         assert_eq!(checked.rejection(), None);
+    }
+
+    /// [`QuoteLimits`] describes a book and nothing describes a trade, so the fallback price is
+    /// taken at any age. Pinning that here so it is a decision on the record rather than an
+    /// oversight; the trade's time now reaches the session log, which is what a bound would be set
+    /// from.
+    #[test]
+    fn test_an_hours_old_trade_is_still_taken_as_the_fallback_price() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 12, 14, 40, 0).unwrap();
+        let mut snapshot = wide_book_snapshot(now);
+        let ticker = snapshot.ticker().clone();
+        snapshot.latest_trade =
+            Some(EquityTrade::new(ticker, now - chrono::Duration::hours(6), 150.60).unwrap());
+
+        let checked = snapshot
+            .reference_price_checked(now, QuoteLimits::default())
+            .unwrap();
+        assert_eq!(checked.source(), PriceSource::LastTrade);
+        assert!((checked.price() - 150.60).abs() < 1e-9);
     }
 
     #[test]

@@ -136,6 +136,12 @@ FROM read_parquet(
 -- predictions_generated.predictions was a count in v1 and is the array of quantiles in v2. A query
 -- reading it must filter on schema_version or check the type, or it silently reads a length as a
 -- number of tickers. Only the single v1 session, 2026-08-12, is affected.
+--
+-- Fields are added within a version as well as across one, and an absent key reads as NULL either
+-- way, so "the build predated this field" and "there was nothing to record" are the same answer.
+-- prices_observed.readings[].trade_timestamp and universe_screened.excluded[].detail both start
+-- mid-v2; anything counting them should bound the query below by the first session that has them
+-- rather than treating an early NULL as a zero.
 .print 'Loading session_log...'
 DROP VIEW IF EXISTS session_log;
 CREATE OR REPLACE VIEW session_log AS

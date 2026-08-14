@@ -617,6 +617,7 @@ async fn fetch_prices(
 
     for snapshot in &fetched.snapshots {
         let quote = snapshot.latest_quote();
+        let trade = snapshot.latest_trade();
         match snapshot.reference_price_checked(context.now, limits) {
             Some(checked) => {
                 readings.push(PriceReading {
@@ -629,6 +630,7 @@ async fn fetch_prices(
                     quote_rejection: checked
                         .rejection()
                         .map(|rejection| rejection.as_str().to_string()),
+                    trade_timestamp: trade.map(|trade| trade.timestamp()),
                 });
                 prices.insert(snapshot.ticker().clone(), checked);
             }
