@@ -89,6 +89,50 @@ const MINIMUM_ELIGIBLE_TICKERS: usize = 2;
 /// quantities, and a change to the ticker threshold must not silently move the statistical floor.
 const MINIMUM_SPREAD_OBSERVATIONS: usize = 2;
 
+/// Largest single-session log return a fit window may contain and still be screened.
+///
+/// A window holding a larger move is not one distribution, so the hedge ratio fitted across it does
+/// not hedge. The cause is deliberately not consulted: a split artifact and a real collapse damage
+/// the fit identically, and only one of them is fixable by re-fetching.
+///
+/// Provisional, on the same terms as [`crate::common::alpaca::MAXIMUM_QUOTE_AGE_SECONDS`].
+pub const MAXIMUM_SESSION_LOG_RETURN: f64 = 0.40;
+
+/// Why a symbol could not be screened.
+///
+/// Carried out of [`ScreenInput::new`] rather than collapsed into `None`, so the session log can say
+/// which test a ticker failed and — where the test is a number — by how much.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScreenRejection {
+    /// Too short a history, or a close, live price, or prediction that is not a usable number.
+    UnusableInput,
+    /// One session's move is large enough to dominate the window it sits in.
+    StructuralBreak { log_return: f64, limit: f64 },
+}
+
+impl ScreenRejection {
+    /// The stable name this rejection is recorded under.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScreenRejection::UnusableInput => "unusable_input",
+            ScreenRejection::StructuralBreak { .. } => "structural_break",
+        }
+    }
+
+    /// The numbers behind the rejection, for the ones that have any.
+    ///
+    /// A bound can only be moved from readings it refused, so the reading is recorded and not just
+    /// the verdict. `UnusableInput` has nothing to report beyond its own name.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            ScreenRejection::UnusableInput => None,
+            ScreenRejection::StructuralBreak { log_return, limit } => {
+                Some(format!("log_return={log_return:.4} limit={limit:.4}"))
+            }
+        }
+    }
+}
+
 /// One symbol's inputs to the screen.
 ///
 /// `closes` must be aligned across every input in a batch — position `i` the same session in each
@@ -116,23 +160,35 @@ impl ScreenInput {
         expected_return: f64,
         confidence: f64,
         is_shortable: bool,
-    ) -> Option<Self> {
+    ) -> Result<Self, ScreenRejection> {
         if closes.len() < CORRELATION_WINDOW_SESSIONS {
-            return None;
+            return Err(ScreenRejection::UnusableInput);
         }
         if !price.is_finite() || price <= 0.0 {
-            return None;
+            return Err(ScreenRejection::UnusableInput);
         }
         if closes
             .iter()
             .any(|close| !close.is_finite() || *close <= 0.0)
         {
-            return None;
+            return Err(ScreenRejection::UnusableInput);
         }
         if !expected_return.is_finite() || !confidence.is_finite() {
-            return None;
+            return Err(ScreenRejection::UnusableInput);
         }
-        Some(Self {
+        // The fitted window and not the whole series: a break older than the window cannot reach
+        // the spread model, so excluding on it would refuse a name whose history has since settled.
+        let window = &closes[closes.len() - CORRELATION_WINDOW_SESSIONS..];
+        match worst_session_move(window) {
+            Some(log_return) if log_return.abs() > MAXIMUM_SESSION_LOG_RETURN => {
+                return Err(ScreenRejection::StructuralBreak {
+                    log_return,
+                    limit: MAXIMUM_SESSION_LOG_RETURN,
+                });
+            }
+            Some(_) | None => {}
+        }
+        Ok(Self {
             ticker,
             closes,
             price,
@@ -617,6 +673,19 @@ fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, 
     Some((to_logs(long_closes)?, to_logs(short_closes)?))
 }
 
+/// The window's largest single-session move, by magnitude, as a signed log return.
+///
+/// Signed so the recorded detail says which way the series jumped, and largest rather than first so
+/// the number a bound gets calibrated against is the worst one present. Iterates rather than reusing
+/// [`log_returns`], which would collect a vector per ticker on a pass that screens over a thousand.
+fn worst_session_move(window: &[f64]) -> Option<f64> {
+    window
+        .windows(2)
+        .filter(|pair| pair[0] > 0.0 && pair[1] > 0.0)
+        .map(|pair| (pair[1] / pair[0]).ln())
+        .max_by(|left, right| left.abs().total_cmp(&right.abs()))
+}
+
 /// Period-over-period log returns. One shorter than its input.
 fn log_returns(prices: &[f64]) -> Vec<f64> {
     prices
@@ -1073,19 +1142,143 @@ mod tests {
 
     #[test]
     fn test_screen_input_rejects_a_short_or_unusable_history() {
+        assert_eq!(
+            ScreenInput::new(
+                ticker("AAAA"),
+                vec![100.0; CORRELATION_WINDOW_SESSIONS - 1],
+                100.0,
+                0.01,
+                0.9,
+                true
+            )
+            .expect_err("too short a history must be refused"),
+            ScreenRejection::UnusableInput
+        );
+
+        let mut with_zero = vec![100.0; CORRELATION_WINDOW_SESSIONS];
+        with_zero[3] = 0.0;
+        assert_eq!(
+            ScreenInput::new(ticker("AAAA"), with_zero, 100.0, 0.01, 0.9, true)
+                .expect_err("a non-positive close must be refused"),
+            ScreenRejection::UnusableInput
+        );
+    }
+
+    // --- structural breaks ---
+
+    /// A window holding one persistent level change, the shape a collapse or a split leaves behind.
+    fn window_with_one_move(log_return: f64) -> Vec<f64> {
+        let mut closes = vec![100.0; CORRELATION_WINDOW_SESSIONS];
+        for close in closes.iter_mut().skip(CORRELATION_WINDOW_SESSIONS / 2) {
+            *close = 100.0 * log_return.exp();
+        }
+        closes
+    }
+
+    /// The reason the guard exists. A collapse partway through leaves a series that is not one
+    /// distribution, and nothing about the fit says so — it succeeds, and the dispersion it reports
+    /// describes the level change rather than the spread it is supposed to measure.
+    #[test]
+    fn test_a_broken_window_silently_inflates_the_fitted_dispersion() {
+        let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
+        let clean = SpreadModel::fit(&leader, &follower).expect("the clean fit must succeed");
+
+        let mut broken = follower.clone();
+        for close in broken.iter_mut().skip(CORRELATION_WINDOW_SESSIONS / 2) {
+            *close *= 0.1;
+        }
+        let damaged = SpreadModel::fit(&leader, &broken).expect("the broken fit still succeeds");
+
+        assert!(
+            damaged.standard_deviation() > clean.standard_deviation() * 5.0,
+            "broken standard deviation {} should dwarf the clean {}",
+            damaged.standard_deviation(),
+            clean.standard_deviation()
+        );
+    }
+
+    #[test]
+    fn test_screen_input_rejects_a_window_containing_a_structural_break() {
+        let breached = MAXIMUM_SESSION_LOG_RETURN + 0.01;
+        let rejection = ScreenInput::new(
+            ticker("AAAA"),
+            window_with_one_move(-breached),
+            100.0,
+            0.01,
+            0.9,
+            true,
+        )
+        .expect_err("a window with a break must be refused");
+
+        // The payload, not only the variant: the recorded number is the entire reason the rejection
+        // is written down, and a sign flip or a swapped pair reads as a pass against `matches!`.
+        let ScreenRejection::StructuralBreak { log_return, limit } = rejection else {
+            panic!("expected a structural break, got {rejection:?}");
+        };
+        assert!((log_return + breached).abs() < 1e-9, "got {log_return}");
+        assert_eq!(limit, MAXIMUM_SESSION_LOG_RETURN);
+    }
+
+    /// At the limit exactly, not merely inside it. The comparison is strict, so a move equal to the
+    /// bound is admitted, and testing below the bound would let a change to `>=` pass unnoticed.
+    #[test]
+    fn test_screen_input_accepts_a_move_at_the_limit() {
         assert!(ScreenInput::new(
             ticker("AAAA"),
-            vec![100.0; CORRELATION_WINDOW_SESSIONS - 1],
+            window_with_one_move(MAXIMUM_SESSION_LOG_RETURN),
             100.0,
             0.01,
             0.9,
             true
         )
-        .is_none());
+        .is_ok());
+    }
 
-        let mut with_zero = vec![100.0; CORRELATION_WINDOW_SESSIONS];
-        with_zero[3] = 0.0;
-        assert!(ScreenInput::new(ticker("AAAA"), with_zero, 100.0, 0.01, 0.9, true).is_none());
+    /// Only the fitted window can reach the spread model, so a name whose history has since settled
+    /// is screenable again rather than excluded for as long as the break stays in its series.
+    #[test]
+    fn test_a_break_older_than_the_fitted_window_is_not_rejected() {
+        let mut closes = vec![10.0; 5];
+        closes.extend(vec![100.0; CORRELATION_WINDOW_SESSIONS]);
+        assert!(ScreenInput::new(ticker("AAAA"), closes, 100.0, 0.01, 0.9, true).is_ok());
+    }
+
+    /// Entry only, deliberately. Refusing to measure a pair already on the book would leave it with
+    /// no signal to close on, and a close reduces risk — the asymmetry runs one way.
+    #[test]
+    fn test_the_exit_path_still_measures_a_broken_window() {
+        let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
+        let mut broken = follower.clone();
+        for close in broken.iter_mut().skip(CORRELATION_WINDOW_SESSIONS / 2) {
+            *close *= 0.1;
+        }
+        assert!(SpreadModel::with_hedge_ratio(0.9, &leader, &broken).is_some());
+    }
+
+    #[test]
+    fn test_every_rejection_has_a_stable_name_and_only_breaks_carry_detail() {
+        assert_eq!(ScreenRejection::UnusableInput.as_str(), "unusable_input");
+        assert_eq!(ScreenRejection::UnusableInput.detail(), None);
+
+        let broken = ScreenRejection::StructuralBreak {
+            log_return: -2.28,
+            limit: MAXIMUM_SESSION_LOG_RETURN,
+        };
+        assert_eq!(broken.as_str(), "structural_break");
+        // The whole string: the detail exists to be aggregated out of session logs, so the format
+        // is the contract and a `contains` check would not notice it drifting.
+        assert_eq!(
+            broken.detail().expect("a break reports its reading"),
+            format!("log_return=-2.2800 limit={MAXIMUM_SESSION_LOG_RETURN:.4}")
+        );
+    }
+
+    #[test]
+    fn test_worst_session_move_reports_the_largest_by_magnitude_with_its_sign() {
+        assert_eq!(worst_session_move(&[100.0]), None);
+
+        let move_down = worst_session_move(&[100.0, 110.0, 55.0]).expect("a move must be found");
+        assert!((move_down - (55.0_f64 / 110.0).ln()).abs() < 1e-12);
     }
 
     // --- selection ---
