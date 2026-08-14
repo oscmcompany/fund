@@ -208,7 +208,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let long_price = last_close(&close_history, "AAAA");
     let snapshot_body = serde_json::json!({
         "AAAA": {
-            "latestTrade": { "p": long_price },
+            "latestTrade": { "t": session_instant().to_rfc3339(), "p": long_price },
             "latestQuote": {
                 "t": session_instant().to_rfc3339(),
                 "bp": long_price * 0.9995,
@@ -217,7 +217,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
                 "as": 12,
             },
         },
-        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
+        "BBBB": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
 
     let _snapshots = server
@@ -361,6 +361,19 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         }),
         "a midpoint must carry the book it was taken from, or the guard cannot be tuned"
     );
+    // Nothing refuses a trade for being old, so the record is the only place to notice a stale one.
+    assert!(
+        readings
+            .iter()
+            .any(|reading| reading["price_source"] == "last_trade"),
+        "the fixture must exercise the fallback path"
+    );
+    assert!(
+        readings.iter().all(|reading| {
+            reading["price_source"] != "last_trade" || reading["trade_timestamp"].is_string()
+        }),
+        "a fallback price must carry when it printed, or its staleness cannot be judged"
+    );
     assert!(
         priced
             .iter()
@@ -464,8 +477,8 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         .expect("history must load");
 
     let snapshot_body = serde_json::json!({
-        "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
-        "BBBB": { "latestTrade": { "p": last_close(&close_history, "BBBB") * 1.012 } },
+        "AAAA": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "AAAA") } },
+        "BBBB": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "BBBB") * 1.012 } },
     });
     let _snapshots = server
         .mock(
@@ -580,8 +593,8 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     // Priced at the last close of each leg: the spread sits at roughly its fitted mean, which is
     // at or below the convergence threshold.
     let snapshot_body = serde_json::json!({
-        "AAAA": { "latestTrade": { "p": last_close(&close_history, "AAAA") } },
-        "BBBB": { "latestTrade": { "p": mean_reverting_short_price(&close_history) } },
+        "AAAA": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "AAAA") } },
+        "BBBB": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": mean_reverting_short_price(&close_history) } },
     });
 
     let _snapshots = server
@@ -721,7 +734,10 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
             mockito::Matcher::Regex(r"^/v2/stocks/snapshots".into()),
         )
         .with_status(200)
-        .with_body(r#"{"AAAA":{"latestTrade":{"p":100.0}},"BBBB":{"latestTrade":{"p":50.0}}}"#)
+        .with_body(format!(
+            r#"{{"AAAA":{{"latestTrade":{{"t":"{traded_at}","p":100.0}}}},"BBBB":{{"latestTrade":{{"t":"{traded_at}","p":50.0}}}}}}"#,
+            traded_at = session_instant().to_rfc3339()
+        ))
         .create_async()
         .await;
     // The exits are done; the entry half asks for the account and Alpaca is unreachable.

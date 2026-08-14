@@ -225,9 +225,10 @@ pub struct ExcludedTickerReading {
 
 /// One symbol's reference price, and which snapshot field it came from.
 ///
-/// The book is recorded whether or not the price came from it. A reading that fell back to the last
-/// trade still carries the quote that was refused and the reason, because a log holding only the
-/// quotes that passed cannot say whether the limits are set anywhere near right.
+/// Both readings behind the price are recorded whether or not the price came from them. A reading
+/// that fell back to the last trade still carries the quote that was refused and the reason, because
+/// a log holding only the quotes that passed cannot say whether the limits are set anywhere near
+/// right.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PriceReading {
     pub ticker: String,
@@ -240,6 +241,11 @@ pub struct PriceReading {
     pub quote_timestamp: Option<DateTime<Utc>>,
     /// `stale_quote` or `wide_quote`, set only when a quote existed and the guard refused it.
     pub quote_rejection: Option<String>,
+    /// When the last trade printed, on the same terms as `quote_timestamp`.
+    ///
+    /// Unlike the quote, nothing refuses a trade for being old, so this is the only place a stale
+    /// fallback price can be noticed at all. Absent when the snapshot carried no usable trade.
+    pub trade_timestamp: Option<DateTime<Utc>>,
 }
 
 /// An open pair as this pass measured it, whether or not it closed.
@@ -943,6 +949,7 @@ mod tests {
             ask_price: Some(150.86),
             quote_timestamp: Some(instant("2026-08-12T14:40:00Z")),
             quote_rejection: Some("wide_quote".to_string()),
+            trade_timestamp: Some(instant("2026-08-12T13:12:00Z")),
         };
 
         let value = serde_json::to_value(&refused).expect("a reading must serialize");
@@ -954,6 +961,7 @@ mod tests {
             value["quote_timestamp"].is_string(),
             "staleness is the gap between the quote and the read, so the quote's own time is kept"
         );
+        assert_eq!(value["trade_timestamp"], "2026-08-12T13:12:00Z");
     }
 
     #[tokio::test]
