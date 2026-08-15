@@ -312,8 +312,11 @@ impl MassiveClient {
     /// count rather than an error, and so does this. A caller iterating calendar days therefore
     /// needs no trading-day filter of its own.
     ///
-    /// Prices are split- and dividend-adjusted (`adjusted=true`), matching the `adjustment=all`
-    /// the Alpaca path used, so the two produce comparable series.
+    /// Prices are raw (`adjusted=false`), so a stored bar means the same thing forever and
+    /// [`crate::data::adjust`] restates it at read time.
+    ///
+    /// Asking for the adjustment made every stored bar mean whatever the feed knew the night it was
+    /// written, and nothing revisits an old one.
     pub async fn fetch_grouped_daily(
         &self,
         date: NaiveDate,
@@ -322,7 +325,7 @@ impl MassiveClient {
 
         let response = self
             .authorized(&url)
-            .query(&[("adjusted", "true")])
+            .query(&[("adjusted", "false")])
             .send()
             .await?;
 
@@ -473,14 +476,17 @@ mod tests {
         );
     }
 
+    /// The `adjusted` matcher is load-bearing rather than incidental: it is the only thing that
+    /// fails if the fetch ever asks for adjusted prices again, which would silently reintroduce the
+    /// stored-meaning drift the read-time fold exists to remove.
     #[tokio::test]
-    async fn test_a_grouped_response_becomes_validated_bars() {
+    async fn test_a_grouped_response_becomes_validated_raw_bars() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/v2/aggs/grouped/locale/us/market/stocks/2026-06-05")
             .match_query(mockito::Matcher::UrlEncoded(
                 "adjusted".into(),
-                "true".into(),
+                "false".into(),
             ))
             .match_header("authorization", "Bearer test-key")
             .with_status(200)

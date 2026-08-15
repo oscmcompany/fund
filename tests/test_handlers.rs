@@ -16,6 +16,7 @@ use fund::common::alpaca::{
 };
 use fund::common::session_log::SessionLog;
 use fund::common::types::{BarInterval, SessionDate, Ticker};
+use fund::data::adjust::SplitTable;
 use fund::data::bars;
 use fund::data::calendar::TradingCalendar;
 use fund::data::universe::{LiquidityRow, Universe};
@@ -194,9 +195,15 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     )
     .await;
 
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .expect("history must load");
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .expect("history must load");
     assert_eq!(close_history.len(), 2, "both legs need aligned history");
 
     // Prices that push the spread past the entry threshold but not past the cap. Which leg is
@@ -472,9 +479,15 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
     )
     .await;
 
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .expect("history must load");
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .expect("history must load");
 
     let snapshot_body = serde_json::json!({
         "AAAA": { "latestTrade": { "t": session_instant().to_rfc3339(), "p": last_close(&close_history, "AAAA") } },
@@ -559,9 +572,15 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .unwrap();
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .unwrap();
 
     // Open the maximum number of pairs so the entry half is blocked on capacity, with the pair
     // under test priced at its own mean so it reads as converged.
@@ -714,9 +733,15 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .unwrap();
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .unwrap();
 
     let entry = PairEntry::new(
         fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),
@@ -808,9 +833,15 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .unwrap();
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .unwrap();
 
     let entry = PairEntry::new(
         fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),
@@ -879,9 +910,15 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
     let mut server = mockito::Server::new_async().await;
 
     common::seed_correlated_bars(&pool, &["AAAA", "BBBB"], SESSIONS).await;
-    let close_history = bars::load_aligned_closes(&pool, BarInterval::OneDay, 60)
-        .await
-        .unwrap();
+    let close_history = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        60,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .unwrap();
 
     let entry = PairEntry::new(
         fund::common::types::PairID::new(ticker("AAAA"), ticker("BBBB")),

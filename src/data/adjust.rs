@@ -1,13 +1,16 @@
 //! Split adjustment as a read-time fold over raw bars and the splits table.
 //!
-//! Nothing calls it yet; the readers and the switch to unadjusted prices follow.
+//! Applied by the loaders themselves, so an unadjusted series is not something a caller can hold.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
+use tracing::warn;
 
 use crate::common::types::SessionDate;
+use crate::data::archive::{read_partition, ArchiveError, SPLITS_ARCHIVE_KEY};
 
 /// The splits table indexed for lookup, as read from the archive.
 ///
@@ -101,6 +104,57 @@ impl SplitTable {
     /// Whether any split is known, which is what makes skipping the whole fold safe.
     pub fn is_empty(&self) -> bool {
         self.by_ticker.is_empty()
+    }
+}
+
+/// The splits table read at most once per Eastern date.
+///
+/// A daily table behind a daily cache: the feed publishes an execution date, so a split cannot
+/// start applying part-way through a session. Shaped like [`crate::data::universe::UniverseCache`].
+#[derive(Default)]
+pub struct SplitTableCache {
+    inner: tokio::sync::Mutex<Option<(SessionDate, Arc<SplitTable>)>>,
+}
+
+impl SplitTableCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns today's table, reading it from the archive if the cache is cold or stale.
+    ///
+    /// An absent object yields an empty table rather than an error, which reads every price
+    /// unadjusted. That is the honest answer before the first refresh has run, and it is what the
+    /// stored bars already were; failing instead would stop the pass over a file that has never
+    /// existed on a fresh bucket.
+    pub async fn get(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<SplitTable>, ArchiveError> {
+        let today = SessionDate::at(now);
+
+        if let Some((cached_date, table)) = self.inner.lock().await.as_ref() {
+            if *cached_date == today {
+                return Ok(Arc::clone(table));
+            }
+        }
+
+        let table = match read_partition(s3_client, bucket, SPLITS_ARCHIVE_KEY).await? {
+            Some(frame) => SplitTable::from_dataframe(&frame)?,
+            None => {
+                warn!(
+                    key = SPLITS_ARCHIVE_KEY,
+                    "No splits table in the archive; prices are read unadjusted"
+                );
+                SplitTable::default()
+            }
+        };
+
+        let table = Arc::new(table);
+        *self.inner.lock().await = Some((today, Arc::clone(&table)));
+        Ok(table)
     }
 }
 
