@@ -806,8 +806,12 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
     let today = SessionDate::at(Utc::now());
     let as_of = today.plus_calendar_days(-10);
 
-    // Inside the requested window, and after it. Only the first belongs to an `as_of` ten days back.
+    // Inside the requested window, on the first session outside it, and well past it. A daily bar
+    // is stamped at its own session's Eastern midnight, so the middle one sits exactly on the
+    // half-open interval's upper edge — which an inclusive bound admits and an exclusive one does
+    // not. Only the first belongs to an `as_of` ten days back.
     common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(-1), 10.0).await;
+    common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(1), 55.0).await;
     common::seed_bar(&pool, "AAAA", today, 99.0).await;
 
     let frame =

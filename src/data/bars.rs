@@ -253,8 +253,8 @@ pub async fn load_bars_dataframe(
     as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
     // Anchored to `as_of` rather than the clock, so the window loaded and the basis it is restated
-    // onto are the same day. Both ends are session boundaries: deriving the start from a moved end
-    // would shift the whole window forward and drop its oldest session.
+    // onto are the same day. `bounds` is half-open and a daily bar is stamped at its own session's
+    // midnight, so the upper comparison has to be exclusive or the next session lands inside it.
     let (_, end) = as_of.bounds();
     let start = as_of.plus_calendar_days(-lookback_days).midnight();
 
@@ -271,7 +271,7 @@ pub async fn load_bars_dataframe(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
-          AND timestamp <= $3
+          AND timestamp < $3
         ORDER BY ticker, timestamp
         "#,
         bar_interval.as_str(),
