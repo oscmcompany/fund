@@ -42,6 +42,8 @@ pub enum RiskBlock {
     },
     /// The session's close time is unknown, so the hold window cannot be checked.
     SessionEndUnknown,
+    /// The splits table is missing, so no stored price can be restated onto today's share basis.
+    PricesUnadjustable,
     /// Opening this pair would push gross exposure past the cap.
     GrossExposure { projected: Decimal, cap: Decimal },
 }
@@ -54,6 +56,7 @@ impl RiskBlock {
             RiskBlock::PairCapacity { .. } => "pair_capacity",
             RiskBlock::TooCloseToClose { .. } => "too_close_to_close",
             RiskBlock::SessionEndUnknown => "session_end_unknown",
+            RiskBlock::PricesUnadjustable => "prices_unadjustable",
             RiskBlock::GrossExposure { .. } => "gross_exposure",
         }
     }
@@ -82,6 +85,12 @@ impl std::fmt::Display for RiskBlock {
             RiskBlock::SessionEndUnknown => {
                 write!(formatter, "the session close time is unknown")
             }
+            RiskBlock::PricesUnadjustable => {
+                write!(
+                    formatter,
+                    "the splits table is missing, so prices cannot be restated"
+                )
+            }
             RiskBlock::GrossExposure { projected, cap } => write!(
                 formatter,
                 "projected gross exposure {projected} exceeds the cap of {cap}"
@@ -102,6 +111,8 @@ pub struct RiskGate {
     open_pair_count: usize,
     minutes_until_close: Option<i64>,
     parameters: SizingParameters,
+    /// Whether the splits table was available, so a stored price can be restated onto today.
+    prices_adjustable: bool,
 }
 
 impl RiskGate {
@@ -118,6 +129,7 @@ impl RiskGate {
         open_pair_count: usize,
         minutes_until_close: Option<i64>,
         parameters: SizingParameters,
+        prices_adjustable: bool,
     ) -> Self {
         Self {
             equity: account.equity(),
@@ -126,6 +138,7 @@ impl RiskGate {
             open_pair_count,
             minutes_until_close,
             parameters,
+            prices_adjustable,
         }
     }
 
@@ -176,6 +189,14 @@ impl RiskGate {
                 open: self.open_pair_count,
                 maximum: self.parameters.maximum_concurrent_pairs(),
             });
+        }
+
+        // Prices that cannot be restated are a block for the same reason an unknown close time is:
+        // one policy, that nothing commits to a price it cannot trust. Closing is left alone, since
+        // it reduces exposure rather than committing to a price, and the unconditional end-of-day
+        // liquidation consults no spread model at all.
+        if !self.prices_adjustable {
+            return Some(RiskBlock::PricesUnadjustable);
         }
 
         // An unknown close time is a block, not a pass. The calendar answers `None` for a date
@@ -307,6 +328,7 @@ mod tests {
             open_pair_count,
             minutes_until_close,
             SizingParameters::default(),
+            true,
         )
     }
 
@@ -387,6 +409,29 @@ mod tests {
         assert_eq!(gate.session_block(), Some(RiskBlock::SessionEndUnknown));
     }
 
+    /// One policy across the trainer and both halves of the pass: nothing commits to a price it
+    /// cannot trust. A missing splits table leaves every stored close on an unknown share basis, so
+    /// opening is refused — while closing, which reduces exposure rather than committing, is not
+    /// gated here at all.
+    #[test]
+    fn test_unadjustable_prices_block_entries() {
+        let healthy = gate(&account(100_000, 0, 0), Some(100_000), 0, Some(120));
+        assert_eq!(healthy.session_block(), None);
+
+        let unadjustable = RiskGate::new(
+            &account(100_000, 0, 0),
+            Some(Decimal::from(100_000)),
+            0,
+            Some(120),
+            SizingParameters::default(),
+            false,
+        );
+        assert_eq!(
+            unadjustable.session_block(),
+            Some(RiskBlock::PricesUnadjustable)
+        );
+    }
+
     #[test]
     fn test_admit_charges_exposure_and_refuses_past_the_cap() {
         // Equity 20,000 at a 1.0 multiple is a 20,000 cap; the account already holds 12,000 gross.
@@ -452,6 +497,7 @@ mod tests {
                 minimum: 30,
             },
             RiskBlock::SessionEndUnknown,
+            RiskBlock::PricesUnadjustable,
             RiskBlock::GrossExposure {
                 projected: Decimal::ONE,
                 cap: Decimal::ZERO,
@@ -465,6 +511,7 @@ mod tests {
                 "pair_capacity",
                 "too_close_to_close",
                 "session_end_unknown",
+                "prices_unadjustable",
                 "gross_exposure"
             ]
         );

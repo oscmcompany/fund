@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, SessionDate, Ticker};
+use crate::data::adjust::{self, SplitTable};
 
 /// Rows per insert chunk.
 ///
@@ -29,6 +30,41 @@ const INSERT_CHUNK_ROWS: usize = 1_000;
 /// The model's lookback is 70 sessions and the correlation screen uses 60; 70 calendar days is not
 /// 70 sessions, so this is deliberately wider than either needs.
 pub const HISTORY_LOOKBACK_DAYS: i64 = 120;
+
+/// The bar frame both loaders produce and [`crate::models::tide::predict::consolidate_data`] reads.
+///
+/// Stated here rather than in the trainer, where the PostgreSQL loader satisfying it could not see
+/// it, so the two readers are held to one shape.
+pub const BAR_FRAME_COLUMNS: [(&str, DataType); 8] = [
+    ("ticker", DataType::String),
+    ("timestamp", DataType::Int64),
+    ("open_price", DataType::Float64),
+    ("high_price", DataType::Float64),
+    ("low_price", DataType::Float64),
+    ("close_price", DataType::Float64),
+    ("volume", DataType::Int64),
+    ("volume_weighted_average_price", DataType::Float64),
+];
+
+/// Narrows a frame to [`BAR_FRAME_COLUMNS`] so frames written by different versions still combine.
+///
+/// The archive is two years deep and outlives the schema that wrote any given day of it, and
+/// `concat` rejects the whole set when one member differs.
+///
+/// `strict_cast`, not `cast`: the non-strict form turns an incompatible value into a null, so a
+/// partition whose `close_price` arrived as text would be accepted here and have its rows dropped
+/// silently much later by `clean_data`, reported as a thin session rather than a bad one.
+pub fn project_bar_frame(frame: DataFrame) -> Result<DataFrame, PolarsError> {
+    frame
+        .lazy()
+        .select(
+            BAR_FRAME_COLUMNS
+                .iter()
+                .map(|(name, data_type)| col(*name).strict_cast(data_type.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .collect()
+}
 
 /// Errors syncing or reading bars.
 #[derive(Debug, thiserror::Error)]
@@ -201,18 +237,26 @@ pub fn bars_to_dataframe(bars: &[EquityBar]) -> Result<DataFrame, PolarsError> {
     ])
 }
 
-/// Loads a trailing window of bars at one interval as a frame.
+/// Loads a trailing window of bars at one interval as a frame, restated onto `as_of`'s share basis.
 ///
 /// The interval filter is not optional. Without it a query would mix daily and intraday rows into
 /// one series, and the feature engineering would silently compute returns across incompatible
 /// sampling rates.
+///
+/// Adjustment happens here rather than in the caller because the stored prices are raw, so a loader
+/// that returned them unadjusted would hand out a series no caller should be comparing.
 pub async fn load_bars_dataframe(
     pool: &PgPool,
     bar_interval: BarInterval,
     lookback_days: i64,
+    splits: &SplitTable,
+    as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
-    let end = Utc::now();
-    let start = end - Duration::days(lookback_days);
+    // Anchored to `as_of` rather than the clock, so the window loaded and the basis it is restated
+    // onto are the same day. `bounds` is half-open and a daily bar is stamped at its own session's
+    // midnight, so the upper comparison has to be exclusive or the next session lands inside it.
+    let (_, end) = as_of.bounds();
+    let start = as_of.plus_calendar_days(-lookback_days).midnight();
 
     let rows = sqlx::query!(
         r#"
@@ -227,7 +271,7 @@ pub async fn load_bars_dataframe(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
-          AND timestamp <= $3
+          AND timestamp < $3
         ORDER BY ticker, timestamp
         "#,
         bar_interval.as_str(),
@@ -269,6 +313,8 @@ pub async fn load_bars_dataframe(
         Column::new("volume_weighted_average_price".into(), volume_weighted),
     ])?;
 
+    let dataframe = adjust::adjust_bars(dataframe, splits, as_of)?;
+
     info!(
         rows = dataframe.height(),
         bar_interval = bar_interval.as_str(),
@@ -277,34 +323,44 @@ pub async fn load_bars_dataframe(
     Ok(dataframe)
 }
 
-/// Loads a trailing window of closes per ticker, aligned across tickers by session.
+/// Loads a trailing window of closes per ticker, aligned across tickers by session and restated
+/// onto `as_of`'s share basis.
 ///
 /// Every series has the same length and position `i` is the same session across all of them.
 /// Tickers missing any session are dropped rather than gap-filled — this is why it is not a
 /// `GROUP BY ticker`: two equal-length series covering different dates correlate different days,
 /// and nothing downstream carries a sign that it happened.
 ///
-/// The lower bound on `timestamp` is expressed against the column directly rather than wrapped in
-/// an expression, so hypertable chunk exclusion applies.
+/// Both bounds on `timestamp` are expressed against the column directly rather than wrapped in an
+/// expression, so hypertable chunk exclusion applies. The upper one is what keeps the window and
+/// `as_of` the same day: without it the most recent sessions in the table are taken whatever
+/// `as_of` says, and a replay would load today's closes and restate them onto a past date.
+///
+/// Adjusting per row while the timestamps are still in hand is why the returned shape needs no
+/// dates: it drops them, and a caller adjusting afterwards would have nothing to key the factor on.
 pub async fn load_aligned_closes(
     pool: &PgPool,
     bar_interval: BarInterval,
     sessions: usize,
+    splits: &SplitTable,
+    as_of: SessionDate,
 ) -> Result<HashMap<Ticker, Vec<f64>>, BarsError> {
     if sessions == 0 {
         return Ok(HashMap::new());
     }
 
     // Twice the session count in calendar days covers weekends and holidays with room to spare;
-    // a 60-session window spans roughly 84 calendar days.
-    let earliest = Utc::now() - Duration::days(sessions as i64 * 2);
+    // a 60-session window spans roughly 84 calendar days. Measured back from `as_of` rather than
+    // the clock, so the sessions loaded are the ones the factor restates them onto.
+    let (_, latest) = as_of.bounds();
+    let earliest = latest - Duration::days(sessions as i64 * 2);
 
     let rows = sqlx::query!(
         r#"
         WITH recent_sessions AS (
             SELECT DISTINCT timestamp
             FROM equity_bars
-            WHERE bar_interval = $1 AND timestamp >= $2
+            WHERE bar_interval = $1 AND timestamp >= $2 AND timestamp < $4
             ORDER BY timestamp DESC
             LIMIT $3
         )
@@ -312,12 +368,14 @@ pub async fn load_aligned_closes(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
+          AND timestamp < $4
           AND timestamp IN (SELECT timestamp FROM recent_sessions)
         ORDER BY ticker, timestamp
         "#,
         bar_interval.as_str(),
         earliest,
         sessions as i64,
+        latest,
     )
     .fetch_all(pool)
     .await?;
@@ -333,10 +391,11 @@ pub async fn load_aligned_closes(
         let Some(ticker) = Ticker::new(&row.ticker) else {
             continue;
         };
+        let factor = splits.factor_at(ticker.as_str(), SessionDate::at(row.timestamp), as_of);
         closes_by_ticker
             .entry(ticker)
             .or_default()
-            .push(row.close_price);
+            .push(row.close_price * factor);
     }
 
     let before = closes_by_ticker.len();
@@ -381,6 +440,7 @@ impl CloseHistoryCache {
         pool: &PgPool,
         bar_interval: BarInterval,
         sessions: usize,
+        splits: &SplitTable,
         now: DateTime<Utc>,
     ) -> Result<AlignedCloses, BarsError> {
         let today = SessionDate::at(now);
@@ -391,7 +451,10 @@ impl CloseHistoryCache {
             }
         }
 
-        let closes = Arc::new(load_aligned_closes(pool, bar_interval, sessions).await?);
+        // Keyed by the Eastern date, which is also what the closes were restated onto, so a cache
+        // hit can never hand back a series adjusted for a different day than it is asked about.
+        let closes =
+            Arc::new(load_aligned_closes(pool, bar_interval, sessions, splits, today).await?);
         if !closes.is_empty() {
             *self.inner.lock().await = Some((today, Arc::clone(&closes)));
         }

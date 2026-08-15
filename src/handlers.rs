@@ -24,6 +24,7 @@ use crate::common::session_log::{
     SessionLogError,
 };
 use crate::common::types::{BarInterval, SessionDate};
+use crate::data::adjust::{SplitTable, SplitTableCache};
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
 use crate::data::calendar::{CalendarCache, TradingCalendar};
 use crate::data::details;
@@ -66,6 +67,8 @@ pub enum HandlerError {
     Artifact(#[from] artifact::ArtifactError),
     #[error("tradable universe could not be built: {0}")]
     Universe(#[from] UniverseError),
+    #[error("the corporate-actions archive could not be read: {0}")]
+    Archive(#[from] crate::data::archive::ArchiveError),
     #[error("prediction pipeline failed at {stage}: {message}")]
     Prediction {
         stage: &'static str,
@@ -96,6 +99,8 @@ pub struct ServiceState {
     calendar_cache: CalendarCache,
     universe_cache: UniverseCache,
     close_history_cache: CloseHistoryCache,
+    /// The splits every stored price is restated against, read once per Eastern date.
+    split_table_cache: SplitTableCache,
     sizing: SizingParameters,
     execution: ExecutionSettings,
     /// The append-only record of what this process observed before it acted.
@@ -139,6 +144,7 @@ impl ServiceState {
             calendar_cache: CalendarCache::new(),
             universe_cache: UniverseCache::new(),
             close_history_cache: CloseHistoryCache::new(),
+            split_table_cache: SplitTableCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
             session_log: SessionLog::from_env()?,
@@ -343,12 +349,21 @@ async fn handle_predictions(
         .universe_cache
         .get(&state.trading, &state.pool, now)
         .await?;
+    // An absent table blocks the entry half through the risk gate rather than being papered over
+    // here; the exit half runs on what it has, because closing reduces exposure and the end-of-day
+    // liquidation consults no spread model.
+    let splits = state
+        .split_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await?;
+    let unadjustable = SplitTable::default();
     let close_history = state
         .close_history_cache
         .get(
             &state.pool,
             BarInterval::OneDay,
             CORRELATION_WINDOW_SESSIONS,
+            splits.as_deref().unwrap_or(&unadjustable),
             now,
         )
         .await?;
@@ -386,7 +401,7 @@ async fn handle_predictions(
         );
     }
 
-    let (rows, predictions) = run_inference(state, &model_state, correlation_id).await?;
+    let (rows, predictions) = run_inference(state, &model_state, correlation_id, now).await?;
 
     state
         .session_log
@@ -432,15 +447,29 @@ async fn run_inference(
     state: &ServiceState,
     model_state: &artifact::ModelState,
     correlation_id: Uuid,
+    now: DateTime<Utc>,
 ) -> Result<(u64, Vec<crate::common::types::EquityPrediction>), HandlerError> {
     fn at(stage: &'static str) -> impl Fn(String) -> HandlerError {
         move |message| HandlerError::Prediction { stage, message }
     }
 
-    let equity_bars =
-        bars::load_bars_dataframe(&state.pool, BarInterval::OneDay, HISTORY_LOOKBACK_DAYS)
-            .await
-            .map_err(|error| at("load_bars")(error.to_string()))?;
+    // Fatal here, unlike the evaluation pass: a prediction is a commitment to a price, and the
+    // model would read a two-for-one as a genuine fifty percent fall.
+    let splits = state
+        .split_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await
+        .map_err(|error| at("load_splits")(error.to_string()))?
+        .ok_or_else(|| at("load_splits")("no splits table in the archive".to_string()))?;
+    let equity_bars = bars::load_bars_dataframe(
+        &state.pool,
+        BarInterval::OneDay,
+        HISTORY_LOOKBACK_DAYS,
+        &splits,
+        SessionDate::at(now),
+    )
+    .await
+    .map_err(|error| at("load_bars")(error.to_string()))?;
     let equity_details = details::load_details_dataframe(&state.pool)
         .await
         .map_err(|error| at("load_details")(error.to_string()))?;
@@ -495,17 +524,27 @@ async fn handle_portfolio_evaluation(
         .universe_cache
         .get(&state.trading, &state.pool, now)
         .await?;
+    // An absent table blocks the entry half through the risk gate rather than being papered over
+    // here; the exit half runs on what it has, because closing reduces exposure and the end-of-day
+    // liquidation consults no spread model.
+    let splits = state
+        .split_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await?;
+    let unadjustable = SplitTable::default();
     let close_history = state
         .close_history_cache
         .get(
             &state.pool,
             BarInterval::OneDay,
             CORRELATION_WINDOW_SESSIONS,
+            splits.as_deref().unwrap_or(&unadjustable),
             now,
         )
         .await?;
 
     let context = EvaluationContext {
+        prices_adjustable: splits.is_some(),
         pool: &state.pool,
         trading: &state.trading,
         market_data: &state.market_data,

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ticker AS \"ticker!\",\n               EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS \"timestamp_ms!\",\n               open_price AS \"open_price!\",\n               high_price AS \"high_price!\",\n               low_price AS \"low_price!\",\n               close_price AS \"close_price!\",\n               volume AS \"volume!\",\n               volume_weighted_average_price\n        FROM equity_bars\n        WHERE bar_interval = $1\n          AND timestamp >= $2\n          AND timestamp <= $3\n        ORDER BY ticker, timestamp\n        ",
+  "query": "\n        SELECT ticker AS \"ticker!\",\n               EXTRACT(EPOCH FROM timestamp)::bigint * 1000 AS \"timestamp_ms!\",\n               open_price AS \"open_price!\",\n               high_price AS \"high_price!\",\n               low_price AS \"low_price!\",\n               close_price AS \"close_price!\",\n               volume AS \"volume!\",\n               volume_weighted_average_price\n        FROM equity_bars\n        WHERE bar_interval = $1\n          AND timestamp >= $2\n          AND timestamp < $3\n        ORDER BY ticker, timestamp\n        ",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       true
     ]
   },
-  "hash": "2e54537144a4fd6fd909eaea26a409d1f9d15554655edcd5dca5192c74115668"
+  "hash": "4061dfee2e68b8d8bf7f238482971b2a35fc4d74e8ca774749d3b066b356e0a5"
 }

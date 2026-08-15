@@ -1,0 +1,37 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH recent_sessions AS (\n            SELECT DISTINCT timestamp\n            FROM equity_bars\n            WHERE bar_interval = $1 AND timestamp >= $2 AND timestamp < $4\n            ORDER BY timestamp DESC\n            LIMIT $3\n        )\n        SELECT ticker AS \"ticker!\", timestamp AS \"timestamp!\", close_price AS \"close_price!\"\n        FROM equity_bars\n        WHERE bar_interval = $1\n          AND timestamp >= $2\n          AND timestamp < $4\n          AND timestamp IN (SELECT timestamp FROM recent_sessions)\n        ORDER BY ticker, timestamp\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ticker!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "timestamp!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "close_price!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f40ad9a1bee270efeac433697a0af2654027037c9eee48f08b7c92ca6629981b"
+}

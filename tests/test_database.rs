@@ -16,6 +16,7 @@ mod common;
 use chrono::{Duration, NaiveDate, Utc};
 use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
+use fund::data::adjust::SplitTable;
 use fund::data::bars;
 
 use fund::models::tide::predict;
@@ -382,9 +383,15 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
         }
     }
 
-    let closes = bars::load_aligned_closes(&pool, BarInterval::OneDay, 5)
-        .await
-        .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .expect("the load must succeed");
 
     assert!(closes.contains_key(&ticker("AAAA")));
     assert!(
@@ -414,9 +421,15 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
     .await
     .unwrap();
 
-    let closes = bars::load_aligned_closes(&pool, BarInterval::OneDay, 1)
-        .await
-        .unwrap();
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        1,
+        &SplitTable::default(),
+        SessionDate::at(Utc::now()),
+    )
+    .await
+    .unwrap();
     assert_eq!(closes[&ticker("AAAA")], vec![100.0]);
 }
 
@@ -702,4 +715,128 @@ async fn test_an_unparsable_pair_row_is_dropped_without_failing_the_load() {
     let open = pairs::load_open_pairs(&pool).await.expect("must not fail");
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].pair_id(), &pair("AAAA", "BBBB"));
+}
+
+/// The stored closes are raw, so the loader is what makes them comparable. A caller adjusting
+/// afterwards could not: the returned map has no dates to key a factor on.
+#[tokio::test]
+#[serial]
+async fn test_aligned_closes_are_restated_onto_todays_share_basis() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+
+    // A two-for-one executing in the middle of the window: the two sessions before it are on the
+    // old basis and the two from it onwards are already on the new one.
+    let execution_date = today.plus_calendar_days(-2);
+    for offset in 0..5 {
+        common::seed_bar(&pool, "AAAA", today.plus_calendar_days(-offset), 100.0).await;
+    }
+
+    let splits = SplitTable::from_dataframe(
+        &fund::data::splits::splits_to_dataframe(
+            &[fund::common::types::EquitySplit::new(
+                "E1".to_string(),
+                ticker("AAAA"),
+                execution_date,
+                1.0,
+                2.0,
+            )
+            .unwrap()],
+            Utc::now(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let closes = bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &splits, today)
+        .await
+        .expect("the load must succeed");
+
+    // Ordered oldest first, so the two halved entries lead.
+    assert_eq!(
+        closes[&ticker("AAAA")],
+        vec![50.0, 50.0, 100.0, 100.0, 100.0],
+        "sessions before the execution date are halved and the rest are left alone"
+    );
+}
+
+/// The same guarantee on the frame the model reads, which is a different loader and a different
+/// shape reaching the same rows.
+#[tokio::test]
+#[serial]
+async fn test_the_bar_frame_is_restated_onto_todays_share_basis() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    common::seed_bar(&pool, "AAAA", today.plus_calendar_days(-3), 100.0).await;
+
+    let splits = SplitTable::from_dataframe(
+        &fund::data::splits::splits_to_dataframe(
+            &[fund::common::types::EquitySplit::new(
+                "E1".to_string(),
+                ticker("AAAA"),
+                today.plus_calendar_days(-1),
+                1.0,
+                4.0,
+            )
+            .unwrap()],
+            Utc::now(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let frame = bars::load_bars_dataframe(&pool, BarInterval::OneDay, 10, &splits, today)
+        .await
+        .expect("the load must succeed");
+
+    assert_eq!(
+        frame.column("close_price").unwrap().f64().unwrap().get(0),
+        Some(25.0),
+        "a four-for-one quarters every price before it"
+    );
+}
+
+/// The window a loader reads and the basis it restates onto have to be the same day. Both bounds
+/// used to come off the wall clock while the factor came off `as_of`, so a replay would have loaded
+/// today's sessions and adjusted them to a past date.
+#[tokio::test]
+#[serial]
+async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let as_of = today.plus_calendar_days(-10);
+
+    // Inside the requested window, on the first session outside it, and well past it. A daily bar
+    // is stamped at its own session's Eastern midnight, so the middle one sits exactly on the
+    // half-open interval's upper edge — which an inclusive bound admits and an exclusive one does
+    // not. Only the first belongs to an `as_of` ten days back.
+    common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(-1), 10.0).await;
+    common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(1), 55.0).await;
+    common::seed_bar(&pool, "AAAA", today, 99.0).await;
+
+    let frame =
+        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        frame.height(),
+        1,
+        "a session after `as_of` is outside the window it asked for"
+    );
+    assert_eq!(
+        frame.column("close_price").unwrap().f64().unwrap().get(0),
+        Some(10.0)
+    );
+
+    let closes =
+        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        closes[&ticker("AAAA")],
+        vec![10.0],
+        "the aligned window is bounded above by `as_of` too, not by the latest session stored"
+    );
 }

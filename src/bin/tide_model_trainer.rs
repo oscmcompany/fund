@@ -22,8 +22,9 @@ use fund::common::aws::date_partitioned_key;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
 use fund::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use fund::data::adjust;
 use fund::data::archive;
-
+use fund::data::bars;
 use fund::data::details;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
@@ -137,7 +138,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Refreshed whole rather than topped up, and stepped over on failure like the bars
-            // above. No adjustment path consumes it yet; this accumulates the history first.
+            // above. Stage two reads it, and refuses to train if it is absent entirely.
             match archive::archive_splits(&s3_client, &massive, &bucket, now).await {
                 Ok(splits) => info!(splits, "Splits table refreshed"),
                 Err(error) => warn!(%error, "Splits refresh failed; the archive keeps its copy"),
@@ -157,7 +158,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- stage two: load the accumulated window ---
 
-    let equity_bars = load_archived_bars(&s3_client, &bucket, lookback_days, session).await?;
+    // Fatal where the archive repair above was not: the stored bars are raw, so training without
+    // this table fits a two-for-one split as a genuine fifty percent fall.
+    let splits =
+        match archive::read_partition(&s3_client, &bucket, archive::SPLITS_ARCHIVE_KEY).await? {
+            Some(frame) => adjust::SplitTable::from_dataframe(&frame)?,
+            None => {
+                return Err(format!(
+                    "no splits table at {}; refusing to train on unadjusted prices",
+                    archive::SPLITS_ARCHIVE_KEY
+                )
+                .into())
+            }
+        };
+
+    let equity_bars =
+        load_archived_bars(&s3_client, &bucket, lookback_days, session, &splits).await?;
     info!(rows = equity_bars.height(), "Loaded equity bars from S3");
 
     let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
@@ -480,6 +496,7 @@ async fn load_archived_bars(
     bucket: &str,
     lookback_days: i64,
     session: SessionDate,
+    splits: &adjust::SplitTable,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let end_date = session;
     let start_date = end_date.plus_calendar_days(-lookback_days);
@@ -494,7 +511,7 @@ async fn load_archived_bars(
         }
         let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
         if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
-            match project_training_columns(frame) {
+            match bars::project_bar_frame(frame) {
                 Ok(projected) => frames.push(projected.lazy()),
                 Err(error) => {
                     unreadable += 1;
@@ -527,45 +544,19 @@ async fn load_archived_bars(
         )
         .into());
     }
-    Ok(concat(frames, UnionArgs::default())?.collect()?)
+    // Folded once over the concatenated window rather than per partition: the factor depends on
+    // where a bar sits relative to today, not on which file it came out of.
+    Ok(adjust::adjust_bars(
+        concat(frames, UnionArgs::default())?.collect()?,
+        splits,
+        session,
+    )?)
 }
 
 /// The bar columns training consumes, in the types [`fund::data::bars::bars_to_dataframe`] writes.
 ///
 /// Deliberately a subset of what the archive holds: `bar_interval` and `transactions` are written
 /// but never trained on, so projecting them away costs nothing.
-const TRAINING_BAR_COLUMNS: [(&str, DataType); 8] = [
-    ("ticker", DataType::String),
-    ("timestamp", DataType::Int64),
-    ("open_price", DataType::Float64),
-    ("high_price", DataType::Float64),
-    ("low_price", DataType::Float64),
-    ("close_price", DataType::Float64),
-    ("volume", DataType::Int64),
-    ("volume_weighted_average_price", DataType::Float64),
-];
-
-/// Narrows one partition to [`TRAINING_BAR_COLUMNS`] so partitions written by different versions of
-/// the writer still concatenate.
-///
-/// The archive is two years deep and outlives the schema that wrote any given day of it, and
-/// `concat` rejects the whole set when one member differs. The writer already treats that drift as
-/// recoverable in `merge_or_replace`; this is the same judgement on the read side.
-fn project_training_columns(frame: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    // `strict_cast`, not `cast`: the non-strict form turns an incompatible value into a null, so a
-    // partition whose `close_price` arrived as text would be accepted here and have its rows dropped
-    // silently much later by `clean_data`, reported as a thin session rather than a bad one.
-    Ok(frame
-        .lazy()
-        .select(
-            TRAINING_BAR_COLUMNS
-                .iter()
-                .map(|(name, data_type)| col(*name).strict_cast(data_type.clone()))
-                .collect::<Vec<_>>(),
-        )
-        .collect()?)
-}
-
 /// CRPS from the most recent prior runs' `run_metadata.json`, newest first.
 ///
 /// Read from the standalone metadata object rather than from inside the artifact tarball, so a
@@ -784,8 +775,8 @@ mod tests {
         ]
         .unwrap();
 
-        let legacy = project_training_columns(legacy).unwrap();
-        let current = project_training_columns(current).unwrap();
+        let legacy = bars::project_bar_frame(legacy).unwrap();
+        let current = bars::project_bar_frame(current).unwrap();
         assert_eq!(legacy.schema(), current.schema());
 
         let combined = concat([legacy.lazy(), current.lazy()], UnionArgs::default())
@@ -812,7 +803,7 @@ mod tests {
             "volume_weighted_average_price" => [100.2],
         ]
         .unwrap();
-        assert!(project_training_columns(frame).is_err());
+        assert!(bars::project_bar_frame(frame).is_err());
     }
 
     /// A partition genuinely missing a price column is skipped, not silently null-filled — the
@@ -825,6 +816,6 @@ mod tests {
             "open_price" => [100.0],
         ]
         .unwrap();
-        assert!(project_training_columns(frame).is_err());
+        assert!(bars::project_bar_frame(frame).is_err());
     }
 }
