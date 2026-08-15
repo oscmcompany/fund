@@ -253,8 +253,8 @@ pub async fn load_bars_dataframe(
     as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
     // Anchored to `as_of` rather than the clock, so the window loaded and the basis it is restated
-    // onto are the same day. `bounds` is half-open and a daily bar is stamped at its own session's
-    // midnight, so the upper comparison has to be exclusive or the next session lands inside it.
+    // onto are the same day. `bounds` is half-open, so the upper comparison is exclusive: its end
+    // is the next session's opening instant and belongs to that session, not this one.
     let (_, end) = as_of.bounds();
     let start = as_of.plus_calendar_days(-lookback_days).midnight();
 

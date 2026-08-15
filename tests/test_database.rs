@@ -410,7 +410,9 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
     let today = SessionDate::at(Utc::now());
     common::seed_bar(&pool, "AAAA", today, 100.0).await;
 
-    let timestamp = today.midnight();
+    // Inside the session, like the daily bar above and unlike Eastern midnight — the interval is
+    // what the loader must discriminate on here, not the hour.
+    let timestamp = common::session_close(today);
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
@@ -806,10 +808,8 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
     let today = SessionDate::at(Utc::now());
     let as_of = today.plus_calendar_days(-10);
 
-    // Inside the requested window, on the first session outside it, and well past it. A daily bar
-    // is stamped at its own session's Eastern midnight, so the middle one sits exactly on the
-    // half-open interval's upper edge — which an inclusive bound admits and an exclusive one does
-    // not. Only the first belongs to an `as_of` ten days back.
+    // Inside the requested window, on the first session outside it, and well past it. Only the
+    // first belongs to an `as_of` ten days back.
     common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(-1), 10.0).await;
     common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(1), 55.0).await;
     common::seed_bar(&pool, "AAAA", today, 99.0).await;
@@ -838,5 +838,54 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
         closes[&ticker("AAAA")],
         vec![10.0],
         "the aligned window is bounded above by `as_of` too, not by the latest session stored"
+    );
+}
+
+/// `SessionDate::bounds` is half-open, so a row landing exactly on its upper edge belongs to the
+/// next session and must not load.
+///
+/// Deliberately stamped at Eastern midnight, which is a shape the ingestion path does not produce —
+/// daily bars arrive at the session close, sixteen hours inside the interval, where an inclusive
+/// and an exclusive upper bound agree. This guards the predicate itself rather than reproducing
+/// observed data, so that a provider stamping daily bars at the session start cannot silently widen
+/// every window by a day.
+#[tokio::test]
+#[serial]
+async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
+    let pool = fresh_pool().await;
+    let as_of = SessionDate::at(Utc::now()).plus_calendar_days(-10);
+
+    common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(-1), 10.0).await;
+
+    sqlx::query(
+        "INSERT INTO equity_bars \
+         (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
+         VALUES ('AAAA', 'one_day', $1, 55, 55, 55, 55, 5000000)",
+    )
+    .bind(as_of.plus_calendar_days(1).midnight())
+    .execute(&pool)
+    .await
+    .expect("Failed to seed the boundary bar");
+
+    let frame =
+        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        frame.height(),
+        1,
+        "the upper bound is exclusive, so the next session's opening instant is outside it"
+    );
+
+    let closes =
+        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        closes[&ticker("AAAA")],
+        vec![10.0],
+        "both loaders have to agree about where the window stops"
     );
 }

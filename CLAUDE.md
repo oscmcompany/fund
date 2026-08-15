@@ -101,7 +101,10 @@ This is a collection of guidelines and references.
 - `SessionDate::from_date` is for dates already expressed in Eastern terms — a parsed argument, a `DATE`
   column, an exchange calendar entry — so transport modules (`common::alpaca`, `common::massive`,
   `common::aws`) keep `NaiveDate` and the wrap happens at the domain boundary; render Eastern only at the
-  display boundary, and stamp test fixtures with `.midnight()` so they match how bars really arrive
+  display boundary; `.midnight()` is for genuinely date-only values, such as an Alpaca transfer that
+  arrives with a date and no time, and never for a daily bar — those are stamped at the session
+  close (16:00 Eastern, so 20:00 UTC under daylight saving and 21:00 outside it), and a fixture
+  stamped at midnight sits on the edge of `bounds()` in a way ingestion never produces
 - `SessionDate` guarantees the timezone, not tradability: weekends and holidays are representable and
   `plus_calendar_days` will land on them, so only `TradingCalendar::is_trading_day` answers whether a date
   trades — never infer it from the type
