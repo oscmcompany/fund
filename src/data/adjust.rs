@@ -121,40 +121,37 @@ impl SplitTableCache {
         Self::default()
     }
 
-    /// Returns today's table, reading it from the archive if the cache is cold or stale.
+    /// Returns today's table, or `None` when the archive holds none.
     ///
-    /// An absent object yields an empty table rather than an error, which reads every price
-    /// unadjusted. That is the honest answer before the first refresh has run, and it is what the
-    /// stored bars already were; failing instead would stop the pass over a file that has never
-    /// existed on a fresh bucket.
+    /// Absent is reported rather than flattened to an empty table, because the two mean opposite
+    /// things to a caller: an empty table says no split affects these prices, and a missing one says
+    /// nothing is known about whether one does. Only the caller can decide what it is safe to do
+    /// without that, and it decides differently for opening a position than for closing one.
     pub async fn get(
         &self,
         s3_client: &aws_sdk_s3::Client,
         bucket: &str,
         now: DateTime<Utc>,
-    ) -> Result<Arc<SplitTable>, ArchiveError> {
+    ) -> Result<Option<Arc<SplitTable>>, ArchiveError> {
         let today = SessionDate::at(now);
 
         if let Some((cached_date, table)) = self.inner.lock().await.as_ref() {
             if *cached_date == today {
-                return Ok(Arc::clone(table));
+                return Ok(Some(Arc::clone(table)));
             }
         }
 
-        let table = match read_partition(s3_client, bucket, SPLITS_ARCHIVE_KEY).await? {
-            Some(frame) => SplitTable::from_dataframe(&frame)?,
-            None => {
-                warn!(
-                    key = SPLITS_ARCHIVE_KEY,
-                    "No splits table in the archive; prices are read unadjusted"
-                );
-                SplitTable::default()
-            }
+        let Some(frame) = read_partition(s3_client, bucket, SPLITS_ARCHIVE_KEY).await? else {
+            warn!(
+                key = SPLITS_ARCHIVE_KEY,
+                "No splits table in the archive; prices cannot be adjusted"
+            );
+            return Ok(None);
         };
 
-        let table = Arc::new(table);
+        let table = Arc::new(SplitTable::from_dataframe(&frame)?);
         *self.inner.lock().await = Some((today, Arc::clone(&table)));
-        Ok(table)
+        Ok(Some(table))
     }
 }
 

@@ -71,6 +71,11 @@ pub struct EvaluationContext<'a> {
     pub universe: &'a Universe,
     /// Session-aligned daily closes, from the cache the handler warms once per date.
     pub close_history: &'a HashMap<Ticker, Vec<f64>>,
+    /// Whether the splits table was available, so `close_history` is on today's share basis.
+    ///
+    /// False blocks the entry half at the gate. The exit half runs regardless, because closing
+    /// reduces exposure rather than committing to a price.
+    pub prices_adjustable: bool,
     pub sizing: SizingParameters,
     pub execution: ExecutionSettings,
     /// Where the pass records what it observed before acting on it.
@@ -262,6 +267,7 @@ async fn evaluate_pass(
         remaining_open,
         minutes_until_close,
         context.sizing,
+        context.prices_adjustable,
     );
 
     observation.account_equity = account.equity().to_f64();

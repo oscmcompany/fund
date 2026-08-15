@@ -270,6 +270,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let session_log = session_log("test-a-pass-opens-a-pair-and-records-it");
     let dispatched_correlation_id = uuid::Uuid::new_v4();
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
@@ -527,6 +528,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
 
     let session_log = session_log("test-a-pass-opens-nothing-once-shutdown-is-requested");
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
@@ -650,6 +652,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let running = CancellationToken::new();
     let session_log = session_log("test-a-pass-closes-a-converged-pair-from-a-full-book");
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
@@ -781,6 +784,7 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
     let running = CancellationToken::new();
     let session_log = session_log("test-a-failed-pass-records-what-it-had-already-observed");
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
@@ -878,6 +882,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let running = CancellationToken::new();
     let session_log = session_log("test-a-pair-that-cannot-be-priced-is-held-and-counted");
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
@@ -964,6 +969,7 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
     let running = CancellationToken::new();
     let session_log = session_log("test-a-refused-book-with-no-trade-records-what-was-refused");
     let context = EvaluationContext {
+        prices_adjustable: true,
         pool: &pool,
         trading: &trading,
         market_data: &market_data,
