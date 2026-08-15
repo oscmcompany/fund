@@ -107,10 +107,10 @@ impl SplitTable {
     }
 }
 
-/// The splits table read at most once per Eastern date.
+/// The splits table, reloaded when the cached copy is from an earlier Eastern date.
 ///
 /// A daily table behind a daily cache: the feed publishes an execution date, so a split cannot
-/// start applying part-way through a session. Shaped like [`crate::data::universe::UniverseCache`].
+/// start applying part-way through a session.
 #[derive(Default)]
 pub struct SplitTableCache {
     inner: tokio::sync::Mutex<Option<(SessionDate, Arc<SplitTable>)>>,
@@ -124,9 +124,12 @@ impl SplitTableCache {
     /// Returns today's table, or `None` when the archive holds none.
     ///
     /// Absent is reported rather than flattened to an empty table, because the two mean opposite
-    /// things to a caller: an empty table says no split affects these prices, and a missing one says
-    /// nothing is known about whether one does. Only the caller can decide what it is safe to do
-    /// without that, and it decides differently for opening a position than for closing one.
+    /// things: empty says no split affects these prices, missing says nothing is known about whether
+    /// one does. An absent object is also not cached, so the next pass retries it.
+    ///
+    /// The lock is released before the S3 read and re-taken to store, like
+    /// [`crate::data::bars::CloseHistoryCache`], so two cold callers may both read; both reads are
+    /// deterministic, and the second store is a harmless overwrite.
     pub async fn get(
         &self,
         s3_client: &aws_sdk_s3::Client,

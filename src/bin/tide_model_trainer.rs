@@ -158,11 +158,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- stage two: load the accumulated window ---
 
-    // Fatal where the archive repair above was not. The stored bars are raw, so training without
-    // this table fits a two-for-one split as a genuine fifty percent fall — a wrong model rather
-    // than a slightly thinner one. The application tolerates an absent table because its
-    // structural-break screen refuses any window holding a move that large; training has no such
-    // guard, so refusing here is the guard.
+    // Fatal where the archive repair above was not: the stored bars are raw, so training without
+    // this table fits a two-for-one split as a genuine fifty percent fall.
     let splits =
         match archive::read_partition(&s3_client, &bucket, archive::SPLITS_ARCHIVE_KEY).await? {
             Some(frame) => adjust::SplitTable::from_dataframe(&frame)?,

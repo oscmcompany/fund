@@ -33,10 +33,8 @@ pub const HISTORY_LOOKBACK_DAYS: i64 = 120;
 
 /// The bar frame both loaders produce and [`crate::models::tide::predict::consolidate_data`] reads.
 ///
-/// The contract already existed and was written down in the trainer, where the PostgreSQL loader —
-/// which satisfies it only because its `SELECT` happens to list these columns — could not see it.
-/// Stated here so the two readers are held to one shape, and so the split fold has one shape to
-/// restate.
+/// Stated here rather than in the trainer, where the PostgreSQL loader satisfying it could not see
+/// it, so the two readers are held to one shape.
 pub const BAR_FRAME_COLUMNS: [(&str, DataType); 8] = [
     ("ticker", DataType::String),
     ("timestamp", DataType::Int64),
@@ -254,8 +252,11 @@ pub async fn load_bars_dataframe(
     splits: &SplitTable,
     as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
-    let end = Utc::now();
-    let start = end - Duration::days(lookback_days);
+    // Anchored to `as_of` rather than the clock, so the window loaded and the basis it is restated
+    // onto are the same day. Both ends are session boundaries: deriving the start from a moved end
+    // would shift the whole window forward and drop its oldest session.
+    let (_, end) = as_of.bounds();
+    let start = as_of.plus_calendar_days(-lookback_days).midnight();
 
     let rows = sqlx::query!(
         r#"
@@ -330,8 +331,10 @@ pub async fn load_bars_dataframe(
 /// `GROUP BY ticker`: two equal-length series covering different dates correlate different days,
 /// and nothing downstream carries a sign that it happened.
 ///
-/// The lower bound on `timestamp` is expressed against the column directly rather than wrapped in
-/// an expression, so hypertable chunk exclusion applies.
+/// Both bounds on `timestamp` are expressed against the column directly rather than wrapped in an
+/// expression, so hypertable chunk exclusion applies. The upper one is what keeps the window and
+/// `as_of` the same day: without it the most recent sessions in the table are taken whatever
+/// `as_of` says, and a replay would load today's closes and restate them onto a past date.
 ///
 /// Adjusting per row while the timestamps are still in hand is why the returned shape needs no
 /// dates: it drops them, and a caller adjusting afterwards would have nothing to key the factor on.
@@ -347,15 +350,17 @@ pub async fn load_aligned_closes(
     }
 
     // Twice the session count in calendar days covers weekends and holidays with room to spare;
-    // a 60-session window spans roughly 84 calendar days.
-    let earliest = Utc::now() - Duration::days(sessions as i64 * 2);
+    // a 60-session window spans roughly 84 calendar days. Measured back from `as_of` rather than
+    // the clock, so the sessions loaded are the ones the factor restates them onto.
+    let (_, latest) = as_of.bounds();
+    let earliest = latest - Duration::days(sessions as i64 * 2);
 
     let rows = sqlx::query!(
         r#"
         WITH recent_sessions AS (
             SELECT DISTINCT timestamp
             FROM equity_bars
-            WHERE bar_interval = $1 AND timestamp >= $2
+            WHERE bar_interval = $1 AND timestamp >= $2 AND timestamp < $4
             ORDER BY timestamp DESC
             LIMIT $3
         )
@@ -363,12 +368,14 @@ pub async fn load_aligned_closes(
         FROM equity_bars
         WHERE bar_interval = $1
           AND timestamp >= $2
+          AND timestamp < $4
           AND timestamp IN (SELECT timestamp FROM recent_sessions)
         ORDER BY ticker, timestamp
         "#,
         bar_interval.as_str(),
         earliest,
         sessions as i64,
+        latest,
     )
     .fetch_all(pool)
     .await?;

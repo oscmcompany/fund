@@ -795,3 +795,44 @@ async fn test_the_bar_frame_is_restated_onto_todays_share_basis() {
         "a four-for-one quarters every price before it"
     );
 }
+
+/// The window a loader reads and the basis it restates onto have to be the same day. Both bounds
+/// used to come off the wall clock while the factor came off `as_of`, so a replay would have loaded
+/// today's sessions and adjusted them to a past date.
+#[tokio::test]
+#[serial]
+async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let as_of = today.plus_calendar_days(-10);
+
+    // Inside the requested window, and after it. Only the first belongs to an `as_of` ten days back.
+    common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(-1), 10.0).await;
+    common::seed_bar(&pool, "AAAA", today, 99.0).await;
+
+    let frame =
+        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        frame.height(),
+        1,
+        "a session after `as_of` is outside the window it asked for"
+    );
+    assert_eq!(
+        frame.column("close_price").unwrap().f64().unwrap().get(0),
+        Some(10.0)
+    );
+
+    let closes =
+        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
+            .await
+            .expect("the load must succeed");
+
+    assert_eq!(
+        closes[&ticker("AAAA")],
+        vec![10.0],
+        "the aligned window is bounded above by `as_of` too, not by the latest session stored"
+    );
+}
