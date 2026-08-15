@@ -844,11 +844,8 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
 /// `SessionDate::bounds` is half-open, so a row landing exactly on its upper edge belongs to the
 /// next session and must not load.
 ///
-/// Deliberately stamped at Eastern midnight, which is a shape the ingestion path does not produce —
-/// daily bars arrive at the session close, sixteen hours inside the interval, where an inclusive
-/// and an exclusive upper bound agree. This guards the predicate itself rather than reproducing
-/// observed data, so that a provider stamping daily bars at the session start cannot silently widen
-/// every window by a day.
+/// Stamped at midnight deliberately: real bars arrive sixteen hours inside the interval, where both
+/// bound forms agree, so this guards the predicate rather than reproducing observed data.
 #[tokio::test]
 #[serial]
 async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
