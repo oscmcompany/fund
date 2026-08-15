@@ -7,8 +7,8 @@
 
 #![allow(dead_code)]
 
-use chrono::{DateTime, Utc};
-
+use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::America::New_York;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -207,6 +207,23 @@ pub async fn reset_tables(pool: &PgPool) {
     .expect("Failed to reset the test tables");
 }
 
+/// The instant a daily bar for `date` actually carries: 16:00 Eastern, the regular-session close.
+///
+/// Not `SessionDate::midnight`, which sits on the edge of `bounds()` rather than inside it and is a
+/// shape ingestion never produces. Resolved through the zone rather than by adding sixteen hours,
+/// because the two differ on the days the clocks move and `seed_correlated_bars` walks onto them.
+pub fn session_close(date: SessionDate) -> DateTime<Utc> {
+    let local_close = date
+        .date()
+        .and_hms_opt(16, 0, 0)
+        .expect("16:00 is a valid wall-clock time");
+    New_York
+        .from_local_datetime(&local_close)
+        .earliest()
+        .map(|zoned| zoned.with_timezone(&Utc))
+        .expect("16:00 Eastern exists on every date")
+}
+
 /// Inserts daily bars for each ticker over `sessions` consecutive **calendar** days ending today.
 ///
 /// Calendar days, not trading sessions: the loop applies no weekday filter, so the series includes
@@ -230,7 +247,7 @@ pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64
             let idiosyncratic = 0.012 * (step as f64 * 1.9 + index as f64).sin();
             price *= (0.8 * common + 0.6 * idiosyncratic).exp();
 
-            let timestamp = session_date.midnight();
+            let timestamp = session_close(session_date);
 
             sqlx::query(
                 "INSERT INTO equity_bars \
@@ -258,7 +275,7 @@ pub async fn seed_correlated_bars(pool: &PgPool, tickers: &[&str], sessions: i64
 
 /// Inserts one daily bar for a ticker at a specific date, for gap and alignment tests.
 pub async fn seed_bar(pool: &PgPool, ticker: &str, date: SessionDate, close: f64) {
-    let timestamp = date.midnight();
+    let timestamp = session_close(date);
     sqlx::query(
         "INSERT INTO equity_bars \
          (ticker, bar_interval, timestamp, open_price, high_price, low_price, close_price, volume) \
