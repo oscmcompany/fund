@@ -2,7 +2,7 @@
 //!
 //! One partition per session under `data/equity/bars/year=/month=/day=/data.parquet`, written by
 //! whoever holds Massive credentials — the seeder on a cold bucket, the trainer every night. Both
-//! call [`archive_missing_sessions`], because two implementations of this would drift the way the
+//! call [`archive_sessions`], because two implementations of this would drift the way the
 //! trainer's fetch and load stages once did over Eastern versus UTC dates.
 //!
 //! **What gets fetched is a set difference, not a lookback.** The archive is asked what it already
@@ -164,6 +164,19 @@ pub struct ArchiveSummary {
     pub bars_written: usize,
 }
 
+/// Which sessions in the window a pass asks Massive for.
+///
+/// A rebuild exists because the archive's whole design is that a written partition is left alone,
+/// which is right while the stored bars mean what they meant when written and wrong the moment that
+/// changes. Nothing infers it: re-fetching the market for two years is an operator's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// Sessions with no partition, plus the correction window. What a nightly repair wants.
+    Gaps,
+    /// Every session in the window, whatever the archive already holds.
+    Rebuild,
+}
+
 /// Every weekday in `[start, end]` that the archive should be able to answer for.
 ///
 /// Weekends are excluded because they are never sessions anywhere; holidays are not, because
@@ -186,7 +199,12 @@ fn expected_sessions(start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
 fn sessions_to_request(
     expected: &[SessionDate],
     present: &BTreeSet<SessionDate>,
+    coverage: Coverage,
 ) -> Vec<SessionDate> {
+    if coverage == Coverage::Rebuild {
+        return expected.to_vec();
+    }
+
     // The trailing entries of `expected`, which already excludes weekends, so the window is
     // measured in sessions rather than in calendar days that a weekend can swallow.
     let correction_window: BTreeSet<SessionDate> = expected
@@ -246,24 +264,26 @@ async fn present_sessions(
 /// Safe to run concurrently with another pass over the same bucket, which the trainer's nightly
 /// repair and an operator's seed can be. Each partition is written under a precondition on what was
 /// read, so a racing writer is detected rather than overwritten; see [`write_partition`].
-pub async fn archive_missing_sessions(
+pub async fn archive_sessions(
     s3_client: &S3Client,
     massive: &MassiveClient,
     bucket: &str,
     window_start: SessionDate,
     window_end: SessionDate,
+    coverage: Coverage,
 ) -> Result<ArchiveSummary, ArchiveError> {
     let expected = expected_sessions(window_start, window_end);
     let present = present_sessions(s3_client, bucket, window_start, window_end).await?;
-    let requested = sessions_to_request(&expected, &present);
+    let requested = sessions_to_request(&expected, &present, coverage);
 
     info!(
         %window_start,
         %window_end,
+        ?coverage,
         expected = expected.len(),
         present = present.len(),
         requested = requested.len(),
-        "Scanned the bar archive for gaps"
+        "Scanned the bar archive"
     );
 
     let mut summary = ArchiveSummary {
@@ -276,7 +296,7 @@ pub async fn archive_missing_sessions(
     // weekdays held every bar for all of them in memory before the first write. The same reasoning
     // and the same size as `seed_equity_bars_postgres`, whose chunking predates this.
     for chunk in requested.chunks(CHUNK_SESSIONS) {
-        archive_chunk(s3_client, massive, bucket, chunk, &mut summary).await?;
+        archive_chunk(s3_client, massive, bucket, chunk, coverage, &mut summary).await?;
     }
 
     if !summary.sessions_failed.is_empty() {
@@ -324,6 +344,7 @@ async fn archive_chunk(
     massive: &MassiveClient,
     bucket: &str,
     chunk: &[SessionDate],
+    coverage: Coverage,
     summary: &mut ArchiveSummary,
 ) -> Result<(), ArchiveError> {
     let fetched = bars::fetch_daily_bars(massive, chunk).await;
@@ -349,7 +370,7 @@ async fn archive_chunk(
         let fetched_frame = bars::bars_to_dataframe(&bars_for_session)?;
         let fetched_rows = fetched_frame.height();
 
-        match write_partition(s3_client, bucket, session, fetched_frame).await {
+        match write_partition(s3_client, bucket, session, fetched_frame, coverage).await {
             Ok(()) => {
                 // The rows this pass contributed, not the partition's height. Counting the merged
                 // total reported the archive's size as though every pass had just written it.
@@ -384,12 +405,31 @@ async fn write_partition(
     bucket: &str,
     session: SessionDate,
     fetched: DataFrame,
+    coverage: Coverage,
 ) -> Result<(), ArchiveError> {
     let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, session.date());
     write_merged(s3_client, bucket, key, fetched, |existing, fetched, key| {
-        merge_or_replace(existing, fetched, key)
+        combine(existing, fetched, key, coverage)
     })
     .await
+}
+
+/// How a written partition combines with whatever was already at the key.
+///
+/// A rebuild discards what it read rather than merging into it. Merging keeps any ticker the fresh
+/// response omits, which is the point when filling a gap and exactly wrong when the reason for
+/// rebuilding is that the stored values no longer mean what they used to — that ticker would keep
+/// its old meaning forever, in a partition nothing revisits.
+fn combine(
+    existing: DataFrame,
+    fetched: DataFrame,
+    key: &str,
+    coverage: Coverage,
+) -> Result<DataFrame, ArchiveError> {
+    match coverage {
+        Coverage::Gaps => merge_or_replace(existing, fetched, key),
+        Coverage::Rebuild => Ok(fetched),
+    }
 }
 
 /// The read-merge-write cycle itself, over any key and any way of combining the two frames.
@@ -478,7 +518,7 @@ fn merge_or_replace(
 /// Accumulates the history that makes the switch to unadjusted bars possible; nothing reads the
 /// result yet.
 ///
-/// Not a gap scan like [`archive_missing_sessions`], because there are no gaps to find: the feed
+/// Not a gap scan like [`archive_sessions`], because there are no gaps to find: the feed
 /// answers with its entire current opinion in a few seconds, and that opinion is the answer. Rows
 /// it has stopped reporting are dropped rather than kept, which is the case a per-session layout
 /// could not express.
@@ -740,7 +780,7 @@ mod tests {
     #[test]
     fn test_an_empty_archive_requests_the_whole_window() {
         let expected = expected_sessions(session(2026, 6, 1), session(2026, 6, 5));
-        let requested = sessions_to_request(&expected, &BTreeSet::new());
+        let requested = sessions_to_request(&expected, &BTreeSet::new(), Coverage::Gaps);
         assert_eq!(requested, expected);
     }
 
@@ -756,7 +796,7 @@ mod tests {
             .filter(|date| *date != session(2026, 6, 3))
             .collect();
 
-        let requested = sessions_to_request(&expected, &present);
+        let requested = sessions_to_request(&expected, &present, Coverage::Gaps);
 
         // The hole, plus the trailing sessions after the correction floor (2026-06-17).
         assert_eq!(
@@ -777,7 +817,7 @@ mod tests {
         let expected = expected_sessions(session(2026, 6, 1), end);
         let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
 
-        let requested = sessions_to_request(&expected, &present);
+        let requested = sessions_to_request(&expected, &present, Coverage::Gaps);
 
         assert_eq!(requested, vec![session(2026, 6, 18), session(2026, 6, 19)]);
     }
@@ -796,7 +836,7 @@ mod tests {
         let expected = expected_sessions(session(2026, 6, 1), end);
         let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
 
-        let requested = sessions_to_request(&expected, &present);
+        let requested = sessions_to_request(&expected, &present, Coverage::Gaps);
 
         assert_eq!(
             requested,
@@ -812,7 +852,7 @@ mod tests {
         let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
 
         assert_eq!(
-            sessions_to_request(&expected, &present),
+            sessions_to_request(&expected, &present, Coverage::Gaps),
             vec![session(2026, 6, 1)]
         );
     }
@@ -820,7 +860,28 @@ mod tests {
     /// An empty window requests nothing rather than panicking on the trailing take.
     #[test]
     fn test_an_empty_window_requests_nothing() {
-        assert!(sessions_to_request(&[], &BTreeSet::new()).is_empty());
+        assert!(sessions_to_request(&[], &BTreeSet::new(), Coverage::Gaps).is_empty());
+        assert!(sessions_to_request(&[], &BTreeSet::new(), Coverage::Rebuild).is_empty());
+    }
+
+    /// A rebuild ignores what the archive holds entirely, which is the whole point: the gap scan
+    /// is an optimisation over "fetch the window", and it is the wrong one when the stored bars
+    /// stopped meaning what they meant when written.
+    #[test]
+    fn test_a_rebuild_requests_every_session_however_complete_the_archive_is() {
+        let expected = expected_sessions(session(2026, 6, 1), session(2026, 6, 19));
+        let present: BTreeSet<SessionDate> = expected.iter().copied().collect();
+
+        assert_eq!(
+            sessions_to_request(&expected, &present, Coverage::Rebuild),
+            expected,
+            "a full archive is still fetched in full"
+        );
+        assert_eq!(
+            sessions_to_request(&expected, &BTreeSet::new(), Coverage::Rebuild),
+            expected,
+            "and so is an empty one"
+        );
     }
 
     /// A session Massive has no data for is never written, so the next scan finds it absent and
@@ -838,7 +899,7 @@ mod tests {
             .filter(|date| *date != holiday)
             .collect();
 
-        assert!(sessions_to_request(&expected, &present).contains(&holiday));
+        assert!(sessions_to_request(&expected, &present, Coverage::Gaps).contains(&holiday));
     }
 
     /// The three counts partition the requested set, which is what makes the summary readable as
@@ -958,6 +1019,50 @@ mod tests {
             merged.height(),
             2,
             "a symbol absent from a later response must survive the merge"
+        );
+    }
+
+    /// The behaviour that makes a rebuild worth having, stated against the behaviour it replaces.
+    ///
+    /// Surviving a merge is right when filling a gap and wrong when rebuilding: the reason to
+    /// rebuild is that the stored values stopped meaning what they used to, and a ticker the fresh
+    /// response omits would otherwise keep the old meaning forever, in a partition nothing revisits.
+    #[test]
+    fn test_a_rebuild_replaces_the_partition_where_a_gap_fill_merges_into_it() {
+        let existing = df![
+            "ticker" => ["AAPL", "DELISTED"],
+            "bar_interval" => ["one_day", "one_day"],
+            "timestamp" => [1_i64, 1_i64],
+            "close_price" => [100.0_f64, 200.0_f64],
+        ]
+        .unwrap();
+        let fetched = df![
+            "ticker" => ["AAPL"],
+            "bar_interval" => ["one_day"],
+            "timestamp" => [1_i64],
+            "close_price" => [50.0_f64],
+        ]
+        .unwrap();
+
+        let gap_filled = combine(
+            existing.clone(),
+            fetched.clone(),
+            "some/key",
+            Coverage::Gaps,
+        )
+        .unwrap();
+        assert_eq!(
+            gap_filled.height(),
+            2,
+            "a gap fill keeps what it did not see"
+        );
+
+        let rebuilt = combine(existing, fetched, "some/key", Coverage::Rebuild).unwrap();
+        assert_eq!(rebuilt.height(), 1, "a rebuild keeps only what it fetched");
+        assert_eq!(
+            rebuilt.column("close_price").unwrap().f64().unwrap().get(0),
+            Some(50.0),
+            "and the fetched value, not the stored one"
         );
     }
 }

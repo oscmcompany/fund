@@ -4,12 +4,14 @@
 //! window every night, but only the window it reads — so this exists for the two cases that window
 //! cannot cover: a bucket with nothing in it, and an outage older than the training lookback.
 //!
-//! Usage: `seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD]`
+//! Usage: `seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD] [--rebuild]`
 //! With no arguments the window is the last [`DEFAULT_ARCHIVE_LOOKBACK_DAYS`] days ending today
-//! (US/Eastern), which is the answer to "just make the archive right".
+//! (US/Eastern), which is the answer to "just make the archive right". `--rebuild` re-fetches every
+//! session in the window and replaces what is there, for when the stored bars stopped meaning what
+//! they meant when written.
 //!
 //! Needs Massive and AWS credentials and no database, so it runs from either VM or a laptop. The
-//! work itself is [`fund::data::archive::archive_missing_sessions`] — the same call the trainer
+//! work itself is [`fund::data::archive::archive_sessions`] — the same call the trainer
 //! makes, because a second implementation of the gap scan would drift from this one and the
 //! symptom would be a model quietly trained across a hole.
 
@@ -21,7 +23,7 @@ use fund::common::observability::init_tracing;
 use fund::common::types::SessionDate;
 use fund::data::archive;
 
-const USAGE: &str = "Usage: seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD]";
+const USAGE: &str = "Usage: seed_equity_bars_s3 [start YYYY-MM-DD] [end YYYY-MM-DD] [--rebuild]";
 
 /// Calendar days the archive covers when no start date is given.
 ///
@@ -55,12 +57,30 @@ fn parse_date(value: &str) -> Result<SessionDate, String> {
         .map_err(|error| format!("Invalid date '{value}': expected YYYY-MM-DD ({error})"))
 }
 
-/// Parses the optional positional date arguments.
+/// What a run was asked to do: a window, and whether to re-fetch what is already there.
+#[derive(Debug, PartialEq, Eq)]
+struct SeedRequest {
+    range: ArchiveRange,
+    coverage: archive::Coverage,
+}
+
+/// Parses the optional positional date arguments and the `--rebuild` flag.
 ///
-/// `today` is a parameter rather than read from the clock here, because a function that reads the
-/// wall clock cannot be tested across the hours where the Eastern date and the UTC date disagree.
-fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<ArchiveRange, String> {
-    match arguments {
+/// The flag is extracted before the positions are matched, so it may appear anywhere. `today` is a
+/// parameter rather than read from the clock here, because a function that reads the wall clock
+/// cannot be tested across the hours where the Eastern date and the UTC date disagree.
+fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<SeedRequest, String> {
+    let coverage = if arguments.iter().any(|argument| argument == "--rebuild") {
+        archive::Coverage::Rebuild
+    } else {
+        archive::Coverage::Gaps
+    };
+    let dates: Vec<&String> = arguments
+        .iter()
+        .filter(|argument| *argument != "--rebuild")
+        .collect();
+
+    let range = match dates.as_slice() {
         [] => ArchiveRange::new(
             today.plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS),
             today,
@@ -68,7 +88,9 @@ fn parse_arguments(arguments: &[String], today: SessionDate) -> Result<ArchiveRa
         [start] => ArchiveRange::new(parse_date(start)?, today),
         [start, end] => ArchiveRange::new(parse_date(start)?, parse_date(end)?),
         _ => Err(format!("Too many arguments\n{USAGE}")),
-    }
+    }?;
+
+    Ok(SeedRequest { range, coverage })
 }
 
 #[tokio::main]
@@ -81,8 +103,8 @@ async fn main() {
     );
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let range = match parse_arguments(&arguments, SessionDate::at(Utc::now())) {
-        Ok(range) => range,
+    let request = match parse_arguments(&arguments, SessionDate::at(Utc::now())) {
+        Ok(request) => request,
         Err(message) => {
             eprintln!("{message}");
             drop(tracing_guard);
@@ -90,7 +112,7 @@ async fn main() {
         }
     };
 
-    let code = match run(&range).await {
+    let code = match run(&request).await {
         Ok(summary) => {
             info!(
                 sessions_requested = summary.sessions_requested,
@@ -122,13 +144,13 @@ async fn main() {
     std::process::exit(code);
 }
 
-/// Repairs the archive over `range` and returns what the pass accomplished.
+/// Archives the requested window and returns what the pass accomplished.
 ///
 /// Reads `AWS_S3_BUCKET_NAME` and the Massive credentials from the environment, and writes bar
-/// partitions under `data/equity/bars/`. No database is touched. Only the sessions the bucket is
-/// missing are fetched, so the cost of a run is the size of the gap rather than the size of the
-/// range, and re-running over a repaired range is close to free.
-async fn run(range: &ArchiveRange) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
+/// partitions under `data/equity/bars/`. No database is touched. Under `Coverage::Gaps` only the
+/// sessions the bucket is missing are fetched, so re-running over a repaired range is close to
+/// free; a rebuild deliberately pays for the whole window.
+async fn run(request: &SeedRequest) -> Result<archive::ArchiveSummary, Box<dyn std::error::Error>> {
     let bucket = std::env::var("AWS_S3_BUCKET_NAME")
         .map_err(|_| "AWS_S3_BUCKET_NAME must be set (the equity-bar data bucket)")?;
     let massive = MassiveClient::from_env()?;
@@ -136,15 +158,21 @@ async fn run(range: &ArchiveRange) -> Result<archive::ArchiveSummary, Box<dyn st
 
     info!(
         bucket,
-        start = %range.start,
-        end = %range.end,
+        start = %request.range.start,
+        end = %request.range.end,
+        coverage = ?request.coverage,
         "Seeding the equity bar archive from Massive"
     );
 
-    Ok(
-        archive::archive_missing_sessions(&s3_client, &massive, &bucket, range.start, range.end)
-            .await?,
+    Ok(archive::archive_sessions(
+        &s3_client,
+        &massive,
+        &bucket,
+        request.range.start,
+        request.range.end,
+        request.coverage,
     )
+    .await?)
 }
 
 #[cfg(test)]
@@ -160,10 +188,10 @@ mod tests {
     #[test]
     fn test_no_arguments_covers_the_default_lookback_ending_today() {
         let today = session(2026, 8, 6);
-        let range = parse_arguments(&[], today).unwrap();
-        assert_eq!(range.end, today);
+        let request = parse_arguments(&[], today).unwrap();
+        assert_eq!(request.range.end, today);
         assert_eq!(
-            range.start,
+            request.range.start,
             today.plus_calendar_days(-DEFAULT_ARCHIVE_LOOKBACK_DAYS)
         );
     }
@@ -171,20 +199,20 @@ mod tests {
     #[test]
     fn test_one_argument_runs_from_that_date_to_today() {
         let today = session(2026, 8, 6);
-        let range = parse_arguments(&["2026-01-02".to_string()], today).unwrap();
-        assert_eq!(range.start, session(2026, 1, 2));
-        assert_eq!(range.end, today);
+        let request = parse_arguments(&["2026-01-02".to_string()], today).unwrap();
+        assert_eq!(request.range.start, session(2026, 1, 2));
+        assert_eq!(request.range.end, today);
     }
 
     #[test]
     fn test_two_arguments_bound_both_ends() {
-        let range = parse_arguments(
+        let request = parse_arguments(
             &["2026-01-02".to_string(), "2026-02-03".to_string()],
             session(2026, 8, 6),
         )
         .unwrap();
-        assert_eq!(range.start, session(2026, 1, 2));
-        assert_eq!(range.end, session(2026, 2, 3));
+        assert_eq!(request.range.start, session(2026, 1, 2));
+        assert_eq!(request.range.end, session(2026, 2, 3));
     }
 
     #[test]

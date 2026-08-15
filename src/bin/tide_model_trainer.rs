@@ -115,12 +115,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let window_start = session.plus_calendar_days(-lookback_days);
     match MassiveClient::from_env() {
         Ok(massive) => {
-            match archive::archive_missing_sessions(
+            match archive::archive_sessions(
                 &s3_client,
                 &massive,
                 &bucket,
                 window_start,
                 session,
+                archive::Coverage::Gaps,
             )
             .await
             {
