@@ -30,6 +30,7 @@ use crate::data::calendar::{CalendarCache, TradingCalendar};
 use crate::data::details;
 use crate::data::export;
 use crate::data::purge;
+use crate::data::truncate::{BoundaryTable, BoundaryTableCache};
 use crate::data::universe::{UniverseCache, UniverseError};
 use crate::models::tide::{artifact, predict};
 use crate::portfolio::account;
@@ -101,6 +102,7 @@ pub struct ServiceState {
     close_history_cache: CloseHistoryCache,
     /// The splits every stored price is restated against, read once per Eastern date.
     split_table_cache: SplitTableCache,
+    boundary_table_cache: BoundaryTableCache,
     sizing: SizingParameters,
     execution: ExecutionSettings,
     /// The append-only record of what this process observed before it acted.
@@ -145,6 +147,7 @@ impl ServiceState {
             universe_cache: UniverseCache::new(),
             close_history_cache: CloseHistoryCache::new(),
             split_table_cache: SplitTableCache::new(),
+            boundary_table_cache: BoundaryTableCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
             session_log: SessionLog::from_env()?,
@@ -357,6 +360,14 @@ async fn handle_predictions(
         .get(&state.s3_client, &state.bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
+    // Absent boundaries do not block the way absent splits do. A missing splits table makes every
+    // price wrong by whole factors; a missing boundary table costs a guard that fires on fifteen
+    // liquid names a year, and refusing to trade without it would be the larger failure.
+    let boundaries = state
+        .boundary_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await?;
+    let unbounded = BoundaryTable::default();
     let close_history = state
         .close_history_cache
         .get(
@@ -364,6 +375,7 @@ async fn handle_predictions(
             BarInterval::OneDay,
             CORRELATION_WINDOW_SESSIONS,
             splits.as_deref().unwrap_or(&unadjustable),
+            boundaries.as_deref().unwrap_or(&unbounded),
             now,
         )
         .await?;
@@ -461,11 +473,18 @@ async fn run_inference(
         .await
         .map_err(|error| at("load_splits")(error.to_string()))?
         .ok_or_else(|| at("load_splits")("no splits table in the archive".to_string()))?;
+    let boundaries = state
+        .boundary_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await
+        .map_err(|error| at("load_boundaries")(error.to_string()))?;
+    let unbounded = BoundaryTable::default();
     let equity_bars = bars::load_bars_dataframe(
         &state.pool,
         BarInterval::OneDay,
         HISTORY_LOOKBACK_DAYS,
         &splits,
+        boundaries.as_deref().unwrap_or(&unbounded),
         SessionDate::at(now),
     )
     .await
@@ -532,6 +551,14 @@ async fn handle_portfolio_evaluation(
         .get(&state.s3_client, &state.bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
+    // Absent boundaries do not block the way absent splits do. A missing splits table makes every
+    // price wrong by whole factors; a missing boundary table costs a guard that fires on fifteen
+    // liquid names a year, and refusing to trade without it would be the larger failure.
+    let boundaries = state
+        .boundary_table_cache
+        .get(&state.s3_client, &state.bucket, now)
+        .await?;
+    let unbounded = BoundaryTable::default();
     let close_history = state
         .close_history_cache
         .get(
@@ -539,6 +566,7 @@ async fn handle_portfolio_evaluation(
             BarInterval::OneDay,
             CORRELATION_WINDOW_SESSIONS,
             splits.as_deref().unwrap_or(&unadjustable),
+            boundaries.as_deref().unwrap_or(&unbounded),
             now,
         )
         .await?;

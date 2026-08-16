@@ -18,6 +18,7 @@ use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
+use fund::data::truncate::BoundaryTable;
 
 use fund::models::tide::predict;
 use fund::portfolio::account;
@@ -388,6 +389,7 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
         BarInterval::OneDay,
         5,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -428,6 +430,7 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
         BarInterval::OneDay,
         1,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -750,9 +753,16 @@ async fn test_aligned_closes_are_restated_onto_todays_share_basis() {
     )
     .unwrap();
 
-    let closes = bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &splits, today)
-        .await
-        .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &splits,
+        &BoundaryTable::default(),
+        today,
+    )
+    .await
+    .expect("the load must succeed");
 
     // Ordered oldest first, so the two halved entries lead.
     assert_eq!(
@@ -787,9 +797,16 @@ async fn test_the_bar_frame_is_restated_onto_todays_share_basis() {
     )
     .unwrap();
 
-    let frame = bars::load_bars_dataframe(&pool, BarInterval::OneDay, 10, &splits, today)
-        .await
-        .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        10,
+        &splits,
+        &BoundaryTable::default(),
+        today,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.column("close_price").unwrap().f64().unwrap().get(0),
@@ -814,10 +831,16 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
     common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(1), 55.0).await;
     common::seed_bar(&pool, "AAAA", today, 99.0).await;
 
-    let frame =
-        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.height(),
@@ -829,15 +852,91 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
         Some(10.0)
     );
 
-    let closes =
-        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         closes[&ticker("AAAA")],
         vec![10.0],
         "the aligned window is bounded above by `as_of` too, not by the latest session stored"
+    );
+}
+
+fn boundary_table(rows: &[(&str, SessionDate)]) -> BoundaryTable {
+    use polars::prelude::*;
+    let tickers: Vec<String> = rows.iter().map(|(ticker, _)| ticker.to_string()).collect();
+    let dates: Vec<String> = rows
+        .iter()
+        .map(|(_, date)| date.date().format("%Y-%m-%d").to_string())
+        .collect();
+    let frame = DataFrame::new(vec![
+        Column::new("ticker".into(), tickers),
+        Column::new("date".into(), dates),
+    ])
+    .expect("a frame must build");
+    BoundaryTable::from_dataframe(&frame).expect("the table must build")
+}
+
+/// The case the boundary table exists for, in the shape it really occurred. `RNA` was Avidity
+/// Biosciences until 2026-02-26 and Atrium Therapeutics after it, so a window spanning that date
+/// fits a hedge ratio across two companies' prices and reports nothing unusual.
+#[tokio::test]
+#[serial]
+async fn test_a_window_is_not_read_across_a_boundary() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let boundary = today.plus_calendar_days(-3);
+
+    for offset in 1..=6 {
+        common::seed_bar(
+            &pool,
+            "AAAA",
+            today.plus_calendar_days(-offset),
+            10.0 * offset as f64,
+        )
+        .await;
+    }
+
+    let boundaries = boundary_table(&[("AAAA", boundary)]);
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        10,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        frame.height(),
+        3,
+        "only the sessions from the boundary onward describe the company trading now"
+    );
+
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        6,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert!(
+        !closes.contains_key(&ticker("AAAA")),
+        "a truncated series cannot fill a six-session window, so it is not a candidate"
     );
 }
 
@@ -864,10 +963,16 @@ async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
     .await
     .expect("Failed to seed the boundary bar");
 
-    let frame =
-        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.height(),
@@ -875,10 +980,16 @@ async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
         "the upper bound is exclusive, so the next session's opening instant is outside it"
     );
 
-    let closes =
-        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         closes[&ticker("AAAA")],

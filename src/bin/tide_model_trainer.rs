@@ -27,6 +27,7 @@ use fund::data::adjust;
 use fund::data::archive;
 use fund::data::bars;
 use fund::data::details;
+use fund::data::truncate;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
@@ -203,8 +204,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-    let equity_bars =
-        load_archived_bars(&s3_client, &bucket, lookback_days, session, &splits).await?;
+    // Not fatal where the splits table is, and the asymmetry is deliberate: an absent splits table
+    // makes every price wrong by whole factors, an absent boundary table costs a guard that fires on
+    // a handful of names a year.
+    let boundaries = match archive::read_partition(
+        &s3_client,
+        &bucket,
+        archive::BOUNDARIES_ARCHIVE_KEY,
+    )
+    .await?
+    {
+        Some(frame) => truncate::BoundaryTable::from_dataframe(&frame)?,
+        None => {
+            warn!(
+                key = archive::BOUNDARIES_ARCHIVE_KEY,
+                "No boundary table in the archive; training on unbounded series"
+            );
+            truncate::BoundaryTable::default()
+        }
+    };
+
+    let equity_bars = load_archived_bars(
+        &s3_client,
+        &bucket,
+        lookback_days,
+        session,
+        &splits,
+        &boundaries,
+    )
+    .await?;
     info!(rows = equity_bars.height(), "Loaded equity bars from S3");
 
     let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
@@ -528,6 +556,7 @@ async fn load_archived_bars(
     lookback_days: i64,
     session: SessionDate,
     splits: &adjust::SplitTable,
+    boundaries: &truncate::BoundaryTable,
 ) -> Result<DataFrame, Box<dyn std::error::Error>> {
     let end_date = session;
     let start_date = end_date.plus_calendar_days(-lookback_days);
@@ -577,11 +606,14 @@ async fn load_archived_bars(
     }
     // Folded once over the concatenated window rather than per partition: the factor depends on
     // where a bar sits relative to today, not on which file it came out of.
-    Ok(adjust::adjust_bars(
+    // Bounded before it is folded, for the reason the PostgreSQL loader does it in that order: a
+    // bar the boundary drops should not have a factor applied to it first.
+    let bounded = truncate::truncate_bars(
         concat(frames, UnionArgs::default())?.collect()?,
-        splits,
+        boundaries,
         session,
-    )?)
+    )?;
+    Ok(adjust::adjust_bars(bounded, splits, session)?)
 }
 
 /// The bar columns training consumes, in the types [`fund::data::bars::bars_to_dataframe`] writes.

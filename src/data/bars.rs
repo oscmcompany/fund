@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, SessionDate, Ticker};
 use crate::data::adjust::{self, SplitTable};
+use crate::data::truncate::{self, BoundaryTable};
 
 /// Rows per insert chunk.
 ///
@@ -250,6 +251,7 @@ pub async fn load_bars_dataframe(
     bar_interval: BarInterval,
     lookback_days: i64,
     splits: &SplitTable,
+    boundaries: &BoundaryTable,
     as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
     // Anchored to `as_of` rather than the clock. `bounds` is half-open, so the upper comparison is
@@ -312,6 +314,9 @@ pub async fn load_bars_dataframe(
         Column::new("volume_weighted_average_price".into(), volume_weighted),
     ])?;
 
+    // Truncated before it is adjusted: a bar the boundary drops must not have a factor
+    // applied to it, and the fold is the more expensive of the two.
+    let dataframe = truncate::truncate_bars(dataframe, boundaries, as_of)?;
     let dataframe = adjust::adjust_bars(dataframe, splits, as_of)?;
 
     info!(
@@ -342,6 +347,7 @@ pub async fn load_aligned_closes(
     bar_interval: BarInterval,
     sessions: usize,
     splits: &SplitTable,
+    boundaries: &BoundaryTable,
     as_of: SessionDate,
 ) -> Result<HashMap<Ticker, Vec<f64>>, BarsError> {
     if sessions == 0 {
@@ -386,11 +392,21 @@ pub async fn load_aligned_closes(
         .len();
 
     let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> = HashMap::new();
+    let mut bounded: HashSet<Ticker> = HashSet::new();
     for row in rows {
         let Some(ticker) = Ticker::new(&row.ticker) else {
             continue;
         };
-        let factor = splits.factor_at(ticker.as_str(), SessionDate::at(row.timestamp), as_of);
+        let session = SessionDate::at(row.timestamp);
+        // Dropped rather than kept short: the retain below needs a full-length series, so a ticker
+        // whose boundary falls inside this window loses its alignment and with it its candidacy.
+        if let Some(earliest) = boundaries.earliest_usable_session(ticker.as_str(), as_of) {
+            if session < earliest {
+                bounded.insert(ticker);
+                continue;
+            }
+        }
+        let factor = splits.factor_at(ticker.as_str(), session, as_of);
         closes_by_ticker
             .entry(ticker)
             .or_default()
@@ -399,10 +415,17 @@ pub async fn load_aligned_closes(
 
     let before = closes_by_ticker.len();
     closes_by_ticker.retain(|_, closes| closes.len() == session_count);
+    // Reported apart from the gap count, because the two are different facts about a ticker: one
+    // has a hole in its history, the other has history belonging to a different company.
+    let dropped_at_a_boundary = bounded
+        .iter()
+        .filter(|ticker| !closes_by_ticker.contains_key(*ticker))
+        .count();
 
     info!(
         tickers = closes_by_ticker.len(),
         dropped_for_gaps = before - closes_by_ticker.len(),
+        dropped_at_a_boundary,
         sessions = session_count,
         "Aligned close history loaded"
     );
@@ -440,6 +463,7 @@ impl CloseHistoryCache {
         bar_interval: BarInterval,
         sessions: usize,
         splits: &SplitTable,
+        boundaries: &BoundaryTable,
         now: DateTime<Utc>,
     ) -> Result<AlignedCloses, BarsError> {
         let today = SessionDate::at(now);
@@ -452,8 +476,9 @@ impl CloseHistoryCache {
 
         // Keyed by the Eastern date, which is also what the closes were restated onto, so a cache
         // hit can never hand back a series adjusted for a different day than it is asked about.
-        let closes =
-            Arc::new(load_aligned_closes(pool, bar_interval, sessions, splits, today).await?);
+        let closes = Arc::new(
+            load_aligned_closes(pool, bar_interval, sessions, splits, boundaries, today).await?,
+        );
         if !closes.is_empty() {
             *self.inner.lock().await = Some((today, Arc::clone(&closes)));
         }
