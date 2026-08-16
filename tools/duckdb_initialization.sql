@@ -82,6 +82,23 @@ FROM read_parquet(
     's3://' || getvariable('bucket') || '/data/equity/corporate_actions/splits.parquet'
 );
 
+-- The dates a symbol's series may not be read across. `related_ticker` is where a rename continues
+-- or which company a spinoff distributed, and is null for the reasons that name neither.
+.print 'Loading training_series_boundaries...'
+DROP VIEW IF EXISTS training_series_boundaries;
+CREATE OR REPLACE VIEW training_series_boundaries AS
+SELECT
+    id,
+    ticker,
+    CAST(date AS DATE) AS boundary_date,
+    CAST(process_date AS DATE) AS process_date,
+    reason,
+    related_ticker,
+    to_timestamp(first_seen / 1000.0) AS first_seen
+FROM read_parquet(
+    's3://' || getvariable('bucket') || '/data/equity/corporate_actions/boundaries.parquet'
+);
+
 -- ---------------------------------------------------------------------------
 -- Nightly exports (exports/) -- one view per exported table
 -- ---------------------------------------------------------------------------

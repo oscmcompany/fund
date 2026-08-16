@@ -31,10 +31,11 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use tracing::{info, warn};
 
+use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
 use crate::common::types::SessionDate;
-use crate::data::{bars, splits};
+use crate::data::{bars, boundaries, splits};
 
 /// S3 prefix for the bar archive.
 ///
@@ -59,6 +60,12 @@ pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 /// Under `corporate_actions/` rather than a directory of its own, because spinoffs and symbol
 /// changes are the same kind of fact read the same way and belong beside it as sibling files.
 pub const SPLITS_ARCHIVE_KEY: &str = "data/equity/corporate_actions/splits.parquet";
+
+/// Object holding every date a symbol's price series may not be read across.
+///
+/// Beside the splits table rather than merged into it, because the two are read for opposite
+/// purposes: a split says how to restate a price across a date, a boundary says not to.
+pub const BOUNDARIES_ARCHIVE_KEY: &str = "data/equity/corporate_actions/boundaries.parquet";
 
 /// Trailing sessions re-fetched even when a partition already exists.
 ///
@@ -115,8 +122,14 @@ pub enum ArchiveError {
     #[error("gave up on {key} after {attempts} concurrent writes by another pass")]
     Contended { key: String, attempts: usize },
     /// The upstream feed failed, before any bucket was touched.
-    #[error("failed to fetch from Massive: {0}")]
-    Feed(String),
+    ///
+    /// The vendor is carried because two of them supply this archive, and an operator reading the
+    /// message during an incident needs to know which one to look at.
+    #[error("failed to fetch from {vendor}: {message}")]
+    Feed {
+        vendor: &'static str,
+        message: String,
+    },
     #[error("failed to build a bar frame: {0}")]
     Frame(#[from] PolarsError),
 }
@@ -491,7 +504,10 @@ pub async fn archive_splits(
     let splits = massive
         .fetch_splits()
         .await
-        .map_err(|error| ArchiveError::Feed(error.to_string()))?;
+        .map_err(|error| ArchiveError::Feed {
+            vendor: "Massive",
+            message: error.to_string(),
+        })?;
 
     // Refused before the write rather than merged away inside it, so a cold bucket does not get an
     // empty object either. A feed that answers success with nothing is an outage, not an emptied
@@ -532,6 +548,57 @@ pub async fn archive_splits(
         "Splits table archived"
     );
     Ok(splits.len())
+}
+
+/// Refreshes the series-boundary table over `start..=end`, merging it with what is stored.
+///
+/// Windowed rather than whole, unlike [`archive_splits`]: the endpoint has no all-time form, so
+/// rows outside the range are left as they were. An empty fetch is written rather than refused,
+/// because a range with no corporate action in it is an ordinary answer here.
+pub async fn archive_boundaries(
+    s3_client: &S3Client,
+    market_data: &MarketDataClient,
+    bucket: &str,
+    start: SessionDate,
+    end: SessionDate,
+    fetched_at: DateTime<Utc>,
+) -> Result<usize, ArchiveError> {
+    let fetched = market_data
+        .fetch_corporate_actions(start.date(), end.date())
+        .await
+        .map_err(|error| ArchiveError::Feed {
+            vendor: "Alpaca",
+            message: error.to_string(),
+        })?;
+
+    let frame = boundaries::boundaries_to_dataframe(&fetched, fetched_at)?;
+    write_merged(
+        s3_client,
+        bucket,
+        BOUNDARIES_ARCHIVE_KEY.to_string(),
+        frame,
+        // Fails rather than falling back, which is the opposite of `archive_splits`. Replacing with
+        // the fetch would drop every boundary outside the window, and quietly keeping the stored
+        // table would report a refresh that did not happen — a schema mismatch would then look like
+        // success on every run forever. Nothing is written, so the stored table survives either way.
+        |existing, fetched, key| {
+            boundaries::merge_boundaries(existing, fetched, start, end).map_err(|error| {
+                ArchiveError::Frame(PolarsError::ComputeError(
+                    format!("could not merge the stored boundary table at {key}: {error}").into(),
+                ))
+            })
+        },
+    )
+    .await?;
+
+    info!(
+        key = BOUNDARIES_ARCHIVE_KEY,
+        boundaries = fetched.len(),
+        %start,
+        %end,
+        "Boundary table archived"
+    );
+    Ok(fetched.len())
 }
 
 /// Writes the ticker metadata that accompanies the archive.

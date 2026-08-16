@@ -18,6 +18,7 @@ use chrono::Utc;
 use polars::prelude::*;
 use tracing::{error, info, warn};
 
+use fund::common::alpaca::{AlpacaCredentials, MarketDataClient};
 use fund::common::aws::date_partitioned_key;
 use fund::common::massive::MassiveClient;
 use fund::common::observability::init_tracing;
@@ -154,6 +155,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = archive::archive_details(&s3_client, &bucket, details::embedded_csv()).await
     {
         warn!(%error, "Ticker metadata upload failed; the archive keeps the previous copy");
+    }
+
+    // The one thing here that needs a broker rather than a data vendor: Massive reports splits and
+    // nothing else, so renames, spinoffs, rights and unit separations come from Alpaca. Refreshed
+    // over the training window only — rows outside it survive the merge, so a nightly pass costs
+    // one windowed request rather than a full history.
+    //
+    // Absent credentials warn and continue, like the Massive arm above. The boundary table is not
+    // read yet, and a trainer that refused to run without a broker key would be a worse trade than
+    // one whose boundary table is a night stale.
+    match AlpacaCredentials::from_env() {
+        Ok(credentials) => {
+            let market_data = MarketDataClient::from_env(credentials);
+            match archive::archive_boundaries(
+                &s3_client,
+                &market_data,
+                &bucket,
+                window_start,
+                session,
+                now,
+            )
+            .await
+            {
+                Ok(boundaries) => info!(boundaries, "Boundary table refreshed"),
+                Err(error) => {
+                    warn!(%error, "Boundary refresh failed; the archive keeps its copy")
+                }
+            }
+        }
+        Err(error) => warn!(%error, "No Alpaca credentials; the boundary table is not refreshed"),
     }
 
     // --- stage two: load the accumulated window ---

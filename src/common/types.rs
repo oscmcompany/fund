@@ -939,6 +939,128 @@ impl EquitySplit {
     }
 }
 
+/// Why a symbol's price series must not be read across a date.
+///
+/// Only `Renamed` carries history forward. The rest mean the symbol still denotes the same company
+/// but its price stepped for a reason no return should be computed across, so their bars before the
+/// date are unusable rather than relocatable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundaryReason {
+    /// The company kept trading under `to`, which is where its history continues.
+    ///
+    /// This one row also ends the old symbol's series: whatever trades under it afterwards is a
+    /// different company, so reuse needs no variant of its own.
+    Renamed { to: Ticker },
+    /// The company distributed shares of `spin_off_company`; its price fell by their value.
+    SpunOff { spin_off_company: Ticker },
+    /// Rights were distributed. The price falls by their value and the bar feed never carries a
+    /// price for them, so the step cannot be measured, only avoided.
+    RightsDistributed,
+    /// A unit separated into its components — a rename and a distribution at once, so unlike a
+    /// rename the price steps and the history does not follow.
+    UnitSeparated,
+    /// A reorganization the feed does not classify further; truncating is the conservative reading.
+    Reorganized,
+}
+
+impl BoundaryReason {
+    /// The stored form, and the discriminant a reader matches on.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BoundaryReason::Renamed { .. } => "renamed",
+            BoundaryReason::SpunOff { .. } => "spun_off",
+            BoundaryReason::RightsDistributed => "rights_distributed",
+            BoundaryReason::UnitSeparated => "unit_separated",
+            BoundaryReason::Reorganized => "reorganized",
+        }
+    }
+
+    /// The symbol this one's history continues under, when it continues at all.
+    pub fn successor(&self) -> Option<&Ticker> {
+        match self {
+            BoundaryReason::Renamed { to } => Some(to),
+            BoundaryReason::SpunOff { .. }
+            | BoundaryReason::RightsDistributed
+            | BoundaryReason::UnitSeparated
+            | BoundaryReason::Reorganized => None,
+        }
+    }
+}
+
+/// A date a symbol's series may not be read across.
+///
+/// Held per symbol rather than per company on purpose: no identifier shared by our two providers
+/// survives a rename, so a symbol bounded in time is the strongest identity available.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeriesBoundary {
+    id: String,
+    ticker: Ticker,
+    date: SessionDate,
+    process_date: SessionDate,
+    reason: BoundaryReason,
+}
+
+impl SeriesBoundary {
+    /// Constructs a `SeriesBoundary`, rejecting one that does not divide anything.
+    ///
+    /// A rename onto the same symbol is the case this exists for: the feed reports a company's name
+    /// or CUSIP changing under an unchanged ticker far more often than a real symbol change, and
+    /// such a row bounds nothing while truncating every window that spans it.
+    ///
+    /// The identifier is stored trimmed, because it is the key a refresh matches stored rows on and
+    /// whitespace either side would make one boundary look like two.
+    pub fn new(
+        id: String,
+        ticker: Ticker,
+        date: SessionDate,
+        process_date: SessionDate,
+        reason: BoundaryReason,
+    ) -> Result<Self, InconsistentRecordError> {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            return Err(reject("boundary identifier is empty"));
+        }
+        if reason.successor() == Some(&ticker) {
+            return Err(reject(format!(
+                "boundary for {ticker} names itself as its successor"
+            )));
+        }
+
+        Ok(Self {
+            id,
+            ticker,
+            date,
+            process_date,
+            reason,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn ticker(&self) -> &Ticker {
+        &self.ticker
+    }
+
+    /// The session the price moved: an ex-date, or an effective date.
+    pub fn date(&self) -> SessionDate {
+        self.date
+    }
+
+    /// The session the feed processed the action, which is what its date filter selects on.
+    ///
+    /// Carried because it is the only way a refresh can tell which stored rows it was in a position
+    /// to re-report, and therefore which absences mean an action was cancelled.
+    pub fn process_date(&self) -> SessionDate {
+        self.process_date
+    }
+
+    pub fn reason(&self) -> &BoundaryReason {
+        &self.reason
+    }
+}
+
 /// Ticker metadata used to constrain pair selection to cross-sector matches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EquityDetail {

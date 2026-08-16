@@ -15,6 +15,7 @@
 pub mod adjust;
 pub mod archive;
 pub mod bars;
+pub mod boundaries;
 pub mod calendar;
 pub mod details;
 pub mod export;
