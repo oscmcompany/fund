@@ -1,29 +1,20 @@
 //! The post-close account sync: what Alpaca says actually happened.
 //!
-//! Three things, in order. Balances land in `account_snapshots`, whose `equity` is what the *next*
-//! session's drawdown gate measures against. Fills and transfers land in `account_activities`,
-//! keyed by Alpaca's activity identifier so a re-run conflicts on every row and changes nothing.
-//! Then the fills — and only the fills — are attributed back to their pairs.
-//!
-//! Attribution is a materialization, not a source: `realized_profit_and_loss` exists so the
-//! dashboard need not re-join activities to pairs on every page load.
-//!
-//! Transfers are stored because they are read, not because they are attributed: a capital flow
-//! makes every equity-derived return wrong, and the dashboard withholds those figures rather than
-//! publishing them. Nothing here decides *whose* capital moved — Alpaca does not know.
+//! Balances land in `account_snapshots`, activities in `account_activities` keyed by Alpaca's own
+//! identifier, and then the fills — and only the fills — are attributed back to their pairs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::alpaca::{
     AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
-    TRANSFER_ACTIVITY_TYPES,
+    RETURN_ACTIVITY_TYPES, TRANSFER_ACTIVITY_TYPES,
 };
 use crate::common::session_log::{
     AccountObserved, ActivityObserved, Observation, PairAttributed, SessionLog,
@@ -32,19 +23,24 @@ use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
-/// The activity types this sync fetches and stores.
+/// The activity types this sync asks for by session date.
 ///
 /// Fills, because they are attributed to pairs, plus transfers, because a capital flow invalidates
-/// every equity-derived return the dashboard publishes and something has to see it arrive.
-///
-/// `INT`, `DIV`, and `FEE` are deliberately absent. They are return rather than external flow, so
-/// nothing consumes them yet, and syncing a type nothing reads is how a column full of untested
-/// parsing gets discovered in production. They join when the unit ledger needs them.
+/// every equity-derived return the dashboard publishes. Only fills answer the session they belong
+/// to: a transfer is date-only and created the next morning, so `date=D` returns the one dated
+/// `D-1` and this session's arrives at the next sync.
 pub fn synced_activity_types() -> Vec<&'static str> {
     std::iter::once(FILL_ACTIVITY_TYPE)
         .chain(TRANSFER_ACTIVITY_TYPES)
         .collect()
 }
+
+/// How far back each sync re-asks for [`RETURN_ACTIVITY_TYPES`].
+///
+/// A session's fees are not created until roughly 00:15 UTC the next day, so the session that
+/// incurred them can never observe them. Seven days spans a long weekend with room for a missed
+/// sync, and costs one request whose rows are already stored.
+const RETURN_ACTIVITY_WINDOW_DAYS: i64 = 7;
 
 /// Errors syncing the account.
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +69,11 @@ pub struct AccountSyncSummary {
     pub activities_truncated: bool,
     /// Activities Alpaca sent with no usable timestamp, which cannot be stored at all.
     pub activities_undated: usize,
+    /// Dividends, interest, and fees seen for the first time by this sync, which belong to earlier
+    /// sessions rather than this one.
+    pub return_activities_stored: usize,
+    /// Their net effect on the balance, signed: dividends and interest add, fees subtract.
+    pub return_activities_net: Decimal,
 }
 
 /// Runs the whole post-close sync for one session date.
@@ -121,7 +122,46 @@ pub async fn sync_account(
         activities_undated += fetched.undated;
         activities.extend(fetched.activities);
     }
-    let activities_stored = store_activities(pool, &activities).await?;
+
+    // Asked for over a trailing window rather than this session, because none of these exist yet
+    // when the sync runs. The overlap re-reads rows already stored, which the activity id absorbs.
+    let returns = client
+        .fetch_activities_since(
+            &RETURN_ACTIVITY_TYPES,
+            session_date.date() - chrono::Duration::days(RETURN_ACTIVITY_WINDOW_DAYS),
+        )
+        .await?;
+    activities_truncated |= returns.truncated;
+    activities_undated += returns.undated;
+    let return_activity_ids: HashSet<String> = returns
+        .activities
+        .iter()
+        .map(|activity| activity.id().to_string())
+        .collect();
+    activities.extend(returns.activities);
+
+    let stored = store_activities(pool, &activities).await?;
+    let activities_stored = stored.len() as u64;
+    // Only the rows this sync actually inserted, so a window that re-reads a fee for six more days
+    // does not record it six more times, and a re-run of the session appends nothing.
+    let newly_stored: HashSet<String> = stored.into_iter().collect();
+    let return_activities: Vec<&AccountActivity> = activities
+        .iter()
+        .filter(|activity| {
+            newly_stored.contains(activity.id()) && return_activity_ids.contains(activity.id())
+        })
+        .collect();
+    let return_activities_net: Decimal = return_activities
+        .iter()
+        .filter_map(|activity| activity.net_amount())
+        .sum();
+    if !return_activities.is_empty() {
+        info!(
+            count = return_activities.len(),
+            net = %return_activities_net,
+            "Dividend, interest, and fee activities recorded for earlier sessions"
+        );
+    }
     if activities_truncated || activities_undated > 0 {
         warn!(
             activities_truncated,
@@ -134,7 +174,10 @@ pub async fn sync_account(
     // Our own record of every activity, not just the ones the attribution used. Alpaca's retention
     // bounds how long these can be re-fetched, and `net_amount` — the only field saying how much a
     // deposit or withdrawal moved — reaches no other store this application owns.
-    for activity in &activities {
+    for activity in activities
+        .iter()
+        .filter(|activity| newly_stored.contains(activity.id()))
+    {
         session_log
             .record(
                 correlation_id,
@@ -210,6 +253,8 @@ pub async fn sync_account(
         activities_unattributed: attribution.unattributed,
         activities_truncated,
         activities_undated,
+        return_activities_stored: return_activities.len(),
+        return_activities_net,
     })
 }
 
@@ -273,12 +318,12 @@ pub async fn store_equity_snapshot(
 pub async fn store_activities(
     pool: &PgPool,
     activities: &[AccountActivity],
-) -> Result<u64, AccountError> {
+) -> Result<Vec<String>, AccountError> {
     if activities.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
-    let mut rows_affected: u64 = 0;
+    let mut inserted: Vec<String> = Vec::new();
     let mut transaction = pool.begin().await?;
 
     for chunk in activities.chunks(1_000) {
@@ -299,22 +344,21 @@ pub async fn store_activities(
                 .push_bind(activity.net_amount())
                 .push_bind(activity.order_id().map(str::to_string));
         });
-        query_builder.push(" ON CONFLICT (id) DO NOTHING");
+        query_builder.push(" ON CONFLICT (id) DO NOTHING RETURNING id");
 
-        rows_affected += query_builder
-            .build()
-            .execute(&mut *transaction)
-            .await?
-            .rows_affected();
+        let rows = query_builder.build().fetch_all(&mut *transaction).await?;
+        for row in rows {
+            inserted.push(row.try_get("id")?);
+        }
     }
 
     transaction.commit().await?;
     info!(
-        rows = rows_affected,
+        rows = inserted.len(),
         supplied = activities.len(),
         "Account activities stored"
     );
-    Ok(rows_affected)
+    Ok(inserted)
 }
 
 /// The previous trading session, when it has no snapshot of its own.

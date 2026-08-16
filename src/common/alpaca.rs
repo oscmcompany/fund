@@ -759,6 +759,17 @@ pub const FILL_ACTIVITY_TYPE: &str = "FILL";
 /// accounts on Alpaca's own books, which is how paper accounts are funded.
 pub const TRANSFER_ACTIVITY_TYPES: [&str; 3] = ["CSD", "CSW", "JNLC"];
 
+/// Activity types that move the balance without capital crossing the account boundary.
+///
+/// The complement of [`TRANSFER_ACTIVITY_TYPES`]: these are performance, so a session holding one
+/// still has a publishable return. Listed in full because the withholdings among them — `DIVFEE`,
+/// `DIVNRA`, `DIVFT`, `DIVTW` — are reductions, and syncing `DIV` alone would report gross income
+/// as net.
+pub const RETURN_ACTIVITY_TYPES: [&str; 14] = [
+    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "CGD",
+    "INT", "INTNRA", "INTTW", "FEE",
+];
+
 /// What one activity fetch returned, and what it knows it missed.
 ///
 /// `truncated` is the one that matters: the page bound is a bound on a loop, not on reality, and a
@@ -1195,11 +1206,6 @@ impl TradingClient {
     }
 
     /// Fetches one activity type for a single session date, walking pagination.
-    ///
-    ///
-    /// Activities with neither a `transaction_time` nor a `date` are dropped with a warning. They
-    /// cannot be stored — `account_activities.transaction_time` is `NOT NULL` — and synthesizing a
-    /// timestamp would put a fabricated time into the record the dashboard reads as fact.
     pub async fn fetch_activities(
         &self,
         activity_type: &str,
@@ -1207,6 +1213,41 @@ impl TradingClient {
     ) -> Result<ActivityFetch, ClientError> {
         let url = format!("{}/v2/account/activities/{activity_type}", self.base_url);
         let date_text = date.to_string();
+        self.paginate_activities(&url, &[("date", &date_text)], activity_type)
+            .await
+    }
+
+    /// Fetches every activity of `activity_types` Alpaca has recorded since `after`.
+    ///
+    /// Windowed on Alpaca's record time, not the session an activity belongs to: a fee for session
+    /// S is not created until roughly S+1 00:15 UTC. Callers file each row under its own date.
+    pub async fn fetch_activities_since(
+        &self,
+        activity_types: &[&str],
+        after: NaiveDate,
+    ) -> Result<ActivityFetch, ClientError> {
+        let url = format!("{}/v2/account/activities", self.base_url);
+        let types = activity_types.join(",");
+        let after_text = after.to_string();
+        self.paginate_activities(
+            &url,
+            &[("activity_types", &types), ("after", &after_text)],
+            &types,
+        )
+        .await
+    }
+
+    /// Walks one activity query's pagination into a single fetch result.
+    ///
+    /// Activities with neither a `transaction_time` nor a `date` are dropped with a warning. They
+    /// cannot be stored — `account_activities.transaction_time` is `NOT NULL` — and synthesizing a
+    /// timestamp would put a fabricated time into the record the dashboard reads as fact.
+    async fn paginate_activities(
+        &self,
+        url: &str,
+        base_query: &[(&str, &str)],
+        activity_types: &str,
+    ) -> Result<ActivityFetch, ClientError> {
         let page_size = ACTIVITIES_PAGE_SIZE.to_string();
 
         let mut activities: Vec<AccountActivity> = Vec::new();
@@ -1215,15 +1256,13 @@ impl TradingClient {
         let mut truncated = false;
 
         for page in 0..ACTIVITIES_MAXIMUM_PAGES {
-            let mut query: Vec<(&str, &str)> = vec![
-                ("date", date_text.as_str()),
-                ("page_size", page_size.as_str()),
-            ];
+            let mut query: Vec<(&str, &str)> = base_query.to_vec();
+            query.push(("page_size", page_size.as_str()));
             if let Some(token) = page_token.as_deref() {
                 query.push(("page_token", token));
             }
 
-            let response = error_for_status(self.get(&url).query(&query).send().await?).await?;
+            let response = error_for_status(self.get(url).query(&query).send().await?).await?;
             let payloads: Vec<ActivityResponse> = response.json().await.map_err(|error| {
                 ClientError::Parse(format!("Failed to parse activities response: {error}"))
             })?;
@@ -1273,8 +1312,7 @@ impl TradingClient {
             if page + 1 == ACTIVITIES_MAXIMUM_PAGES {
                 truncated = true;
                 warn!(
-                    activity_type,
-                    %date,
+                    activity_types,
                     pages = ACTIVITIES_MAXIMUM_PAGES,
                     "Activity pagination hit its page bound; the tail was not fetched"
                 );
@@ -1283,11 +1321,15 @@ impl TradingClient {
 
         if undated > 0 {
             warn!(
-                activity_type,
+                activity_types,
                 undated, "Dropped activities carrying neither a transaction time nor a date"
             );
         }
-        debug!(activity_type, %date, activities = activities.len(), "Account activities fetched");
+        debug!(
+            activity_types,
+            activities = activities.len(),
+            "Account activities fetched"
+        );
         Ok(ActivityFetch {
             activities,
             undated,
@@ -3326,6 +3368,95 @@ mod tests {
             "a dated activity must land in the session Alpaca dated it"
         );
         mock.assert_async().await;
+    }
+
+    /// The trailing-window fetch asks the plural endpoint for every return type in one request,
+    /// windowed on Alpaca's record time. Verbatim live payload, fees and all.
+    ///
+    /// The type list is matched whole rather than by a wildcard, so dropping one from the constant
+    /// fails here instead of silently narrowing what a sync asks for.
+    #[tokio::test]
+    async fn test_return_activities_are_fetched_as_one_windowed_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v2/account/activities")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("after".into(), "2026-08-07".into()),
+                mockito::Matcher::UrlEncoded(
+                    "activity_types".into(),
+                    "DIV,DIVCGL,DIVCGS,DIVFEE,DIVFT,DIVNRA,DIVROC,DIVTW,DIVTXEX,CGD,INT,INTNRA,\
+                     INTTW,FEE"
+                        .into(),
+                ),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"20260814000000000::taf","activity_type":"FEE","activity_sub_type":"TAF",
+                     "date":"2026-08-14","net_amount":"-0.07","status":"executed"},
+                    {"id":"20260814000000000::reg","activity_type":"FEE","activity_sub_type":"REG",
+                     "date":"2026-08-14","net_amount":"-0.31","status":"executed"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let fetched = client
+            .fetch_activities_since(&RETURN_ACTIVITY_TYPES, date(2026, 8, 7))
+            .await
+            .expect("activities must parse");
+
+        assert_eq!(fetched.activities.len(), 2);
+        let total: Decimal = fetched
+            .activities
+            .iter()
+            .filter_map(|activity| activity.net_amount())
+            .sum();
+        assert_eq!(
+            total,
+            Decimal::new(-38, 2),
+            "the fee family nets to a cost, not income"
+        );
+        assert!(
+            fetched.activities.iter().all(|activity| activity
+                .transaction_time()
+                .with_timezone(&New_York)
+                .date_naive()
+                == date(2026, 8, 14)),
+            "each row files under its own date, not the window it was fetched by"
+        );
+        mock.assert_async().await;
+    }
+
+    /// A fee has no symbol, so it can never reach a pair through `attribute`. Worth pinning: it is
+    /// why the sync reports these as a session cost rather than a per-pair adjustment.
+    #[tokio::test]
+    async fn test_a_fee_carries_no_ticker_and_no_cash_flow() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"id":"20260814000000000::cat","activity_type":"FEE","activity_sub_type":"CAT",
+                     "date":"2026-08-14","net_amount":"-0.01","status":"executed"}]"#,
+            )
+            .create_async()
+            .await;
+
+        let client = TradingClient::with_base_url(credentials(), server.url());
+        let fetched = client
+            .fetch_activities_since(&["FEE"], date(2026, 8, 7))
+            .await
+            .expect("activities must parse");
+
+        let fee = &fetched.activities[0];
+        assert!(fee.ticker().is_none(), "a fee names no security");
+        assert!(
+            fee.signed_cash_flow().is_none(),
+            "and carries no quantity or price to derive one from"
+        );
+        assert_eq!(fee.net_amount(), Some(Decimal::new(-1, 2)));
     }
 
     /// A transfer carries neither quantity nor price, so `net_amount` is the only field saying how
