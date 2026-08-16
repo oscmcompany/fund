@@ -44,7 +44,8 @@ impl BoundaryTable {
         let related = frame.column("related_ticker")?.str()?;
 
         let mut by_ticker: HashMap<String, Vec<SessionDate>> = HashMap::new();
-        let mut renames: HashMap<String, Vec<(SessionDate, String)>> = HashMap::new();
+        let mut candidates: Vec<(String, SessionDate, String)> = Vec::new();
+        let mut predecessors: HashMap<String, HashSet<String>> = HashMap::new();
         for row in 0..frame.height() {
             let (Some(ticker), Some(date)) = (tickers.get(row), dates.get(row)) else {
                 continue;
@@ -63,12 +64,26 @@ impl BoundaryTable {
 
             if reasons.get(row) == Some("renamed") {
                 if let Some(successor) = related.get(row) {
-                    renames
-                        .entry(ticker.to_string())
+                    candidates.push((ticker.to_string(), date, successor.to_string()));
+                    predecessors
+                        .entry(successor.to_string())
                         .or_default()
-                        .push((date, successor.to_string()));
+                        .insert(ticker.to_string());
                 }
             }
+        }
+
+        // A successor two symbols both claim cannot be stitched, because no rule picks between two
+        // securities' prices; the boundary stands, so the series is bounded rather than joined.
+        let mut renames: HashMap<String, Vec<(SessionDate, String)>> = HashMap::new();
+        for (ticker, date, successor) in candidates {
+            if predecessors
+                .get(&successor)
+                .is_some_and(|claimants| claimants.len() > 1)
+            {
+                continue;
+            }
+            renames.entry(ticker).or_default().push((date, successor));
         }
 
         Ok(Self { by_ticker, renames })
@@ -178,13 +193,12 @@ impl BoundaryTableCache {
     }
 }
 
-/// Re-files each bar under the symbol its company trades as now.
+/// Re-files each bar under the symbol its company trades as now, joining a renamed company's
+/// history to its successor's.
 ///
-/// A renamed company's history sits under a symbol that stopped trading, which leaves the successor
-/// too short to screen while the predecessor is unusable. Relabelling joins them into one series.
-///
-/// Runs before [`truncate_bars`], because the bars it moves are exactly the ones truncation would
-/// otherwise drop, and before the fold, because the fold keys on the symbol a bar now carries.
+/// Runs before [`truncate_bars`] and before the fold, both of which key on the symbol a bar carries.
+/// A moved bar never displaces one the symbol already had, because the feed calls a share class
+/// collapsing into another a rename and both classes traded.
 pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataFrame, PolarsError> {
     if boundaries.is_empty() || frame.height() == 0 {
         return Ok(frame);
@@ -193,10 +207,12 @@ pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataF
     let tickers = frame.column("ticker")?.str()?;
     let timestamps = frame.column("timestamp")?.i64()?;
     let mut relabelled: Vec<String> = Vec::with_capacity(frame.height());
+    let mut was_moved: Vec<bool> = Vec::with_capacity(frame.height());
     let mut moved = 0usize;
     for row in 0..frame.height() {
         let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
             relabelled.push(String::new());
+            was_moved.push(false);
             continue;
         };
         let session =
@@ -205,8 +221,12 @@ pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataF
             Some(successor) => {
                 moved += 1;
                 relabelled.push(successor);
+                was_moved.push(true);
             }
-            None => relabelled.push(ticker.to_string()),
+            None => {
+                relabelled.push(ticker.to_string());
+                was_moved.push(false);
+            }
         }
     }
 
@@ -216,7 +236,22 @@ pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataF
 
     let mut frame = frame;
     frame.with_column(Column::new("ticker".into(), relabelled))?;
-    Ok(frame)
+
+    let was_moved = BooleanChunked::new("was_moved".into(), was_moved);
+    let settled = frame.filter(&!&was_moved)?;
+    let carried = frame.filter(&was_moved)?;
+
+    let kept = carried.lazy().join(
+        settled
+            .clone()
+            .lazy()
+            .select([col("ticker"), col("timestamp")]),
+        [col("ticker"), col("timestamp")],
+        [col("ticker"), col("timestamp")],
+        JoinArgs::new(JoinType::Anti),
+    );
+
+    concat([settled.lazy(), kept], UnionArgs::default())?.collect()
 }
 
 /// Drops the bars of each ticker that predate its most recent boundary.
@@ -481,6 +516,76 @@ mod tests {
             .filter_map(|row| tickers.get(row))
             .collect();
         assert_eq!(labels, vec!["RNAM", "RNAM"], "one company, one symbol");
+    }
+
+    /// The feed calls a share class collapsing into another a rename. `CUK` and `CCL` traded on
+    /// every one of the 86 sessions before it, so moving `CUK`'s bars onto `CCL` would concatenate
+    /// two securities' prices — the exact corruption the boundary table exists to prevent.
+    #[test]
+    fn test_a_moved_bar_never_displaces_one_the_symbol_already_had() {
+        let frame = bars(&[
+            ("CUK", "2026-05-06", 20.0),
+            ("CCL", "2026-05-06", 25.0),
+            ("CUK", "2026-05-07", 21.0),
+            ("CCL", "2026-05-07", 26.0),
+        ]);
+
+        let stitched =
+            stitch_bars(frame, &renamed_table(&[("CUK", "2026-05-08", Some("CCL"))])).unwrap();
+
+        assert_eq!(
+            stitched.height(),
+            2,
+            "CCL already had both sessions, so neither CUK bar is carried over"
+        );
+        let closes = stitched.column("close_price").unwrap().f64().unwrap();
+        let kept: Vec<f64> = (0..stitched.height())
+            .filter_map(|row| closes.get(row))
+            .collect();
+        assert_eq!(kept, vec![25.0, 26.0], "CCL keeps its own prices");
+    }
+
+    /// `GSRT` and `GSRTR` both became `NKLR` on one date — a SPAC's shares and its rights. Neither
+    /// history can be prepended without choosing arbitrarily between two securities, so neither is.
+    #[test]
+    fn test_a_successor_two_symbols_claim_is_not_stitched() {
+        let table = renamed_table(&[
+            ("GSRT", "2025-10-10", Some("NKLR")),
+            ("GSRTR", "2025-10-10", Some("NKLR")),
+        ]);
+
+        assert_eq!(table.current_symbol("GSRT", session("2025-09-01")), None);
+        assert_eq!(table.current_symbol("GSRTR", session("2025-09-01")), None);
+        assert_eq!(
+            table.earliest_usable_session("GSRT", session("2026-08-16")),
+            Some(session("2025-10-10")),
+            "the boundary still stands, so the series is bounded rather than joined"
+        );
+    }
+
+    /// The other side of the same rule: a session the successor never traded is genuinely inherited.
+    #[test]
+    fn test_a_session_the_successor_never_had_is_still_inherited() {
+        let frame = bars(&[
+            ("BK", "2026-05-19", 10.0),
+            ("BK", "2026-05-20", 11.0),
+            ("BNY", "2026-05-20", 99.0),
+        ]);
+
+        let stitched =
+            stitch_bars(frame, &renamed_table(&[("BK", "2026-05-21", Some("BNY"))])).unwrap();
+
+        assert_eq!(
+            stitched.height(),
+            2,
+            "the shared session collapses, the earlier one carries"
+        );
+        let closes = stitched.column("close_price").unwrap().f64().unwrap();
+        let mut kept: Vec<f64> = (0..stitched.height())
+            .filter_map(|row| closes.get(row))
+            .collect();
+        kept.sort_by(|left, right| left.partial_cmp(right).unwrap());
+        assert_eq!(kept, vec![10.0, 99.0]);
     }
 
     /// The reason the fold has to follow renames too. Without it a stitched bar takes whatever
