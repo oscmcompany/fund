@@ -23,24 +23,33 @@ use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
-/// The activity types this sync asks for by session date.
+/// The activity types a session date can be asked for directly.
 ///
-/// Fills, because they are attributed to pairs, plus transfers, because a capital flow invalidates
-/// every equity-derived return the dashboard publishes. Only fills answer the session they belong
-/// to: a transfer is date-only and created the next morning, so `date=D` returns the one dated
-/// `D-1` and this session's arrives at the next sync.
+/// Fills alone, because they are the only type that answers such a query: they carry a real
+/// `transaction_time`, where every other type is date-only and created the following morning, so
+/// `date=D` returns the row dated `D-1`. The rest come through [`windowed_activity_types`].
 pub fn synced_activity_types() -> Vec<&'static str> {
-    std::iter::once(FILL_ACTIVITY_TYPE)
+    vec![FILL_ACTIVITY_TYPE]
+}
+
+/// The activity types asked for over a trailing window instead.
+///
+/// Everything Alpaca stamps with a date rather than a time. A session cannot observe its own fees
+/// or its own transfers — both are created hours after the 16:15 Eastern sync — so asking by
+/// session date would miss each one on the only run that looks for it.
+pub fn windowed_activity_types() -> Vec<&'static str> {
+    RETURN_ACTIVITY_TYPES
+        .iter()
+        .copied()
         .chain(TRANSFER_ACTIVITY_TYPES)
         .collect()
 }
 
-/// How far back each sync re-asks for [`RETURN_ACTIVITY_TYPES`].
+/// How far back each sync re-asks for [`windowed_activity_types`].
 ///
-/// A session's fees are not created until roughly 00:15 UTC the next day, so the session that
-/// incurred them can never observe them. Seven days spans a long weekend with room for a missed
-/// sync, and costs one request whose rows are already stored.
-const RETURN_ACTIVITY_WINDOW_DAYS: i64 = 7;
+/// Seven days spans a long weekend with room for a missed sync, and costs one request whose rows
+/// are already stored.
+const ACTIVITY_WINDOW_DAYS: i64 = 7;
 
 /// Errors syncing the account.
 #[derive(Debug, thiserror::Error)]
@@ -123,22 +132,17 @@ pub async fn sync_account(
         activities.extend(fetched.activities);
     }
 
-    // Asked for over a trailing window rather than this session, because none of these exist yet
-    // when the sync runs. The overlap re-reads rows already stored, which the activity id absorbs.
-    let returns = client
+    // Over a trailing window rather than this session, because none of these exist yet when the
+    // sync runs. The overlap re-reads stored rows, which the activity id absorbs.
+    let windowed = client
         .fetch_activities_since(
-            &RETURN_ACTIVITY_TYPES,
-            session_date.date() - chrono::Duration::days(RETURN_ACTIVITY_WINDOW_DAYS),
+            &windowed_activity_types(),
+            session_date.date() - chrono::Duration::days(ACTIVITY_WINDOW_DAYS),
         )
         .await?;
-    activities_truncated |= returns.truncated;
-    activities_undated += returns.undated;
-    let return_activity_ids: HashSet<String> = returns
-        .activities
-        .iter()
-        .map(|activity| activity.id().to_string())
-        .collect();
-    activities.extend(returns.activities);
+    activities_truncated |= windowed.truncated;
+    activities_undated += windowed.undated;
+    activities.extend(windowed.activities);
 
     let stored = store_activities(pool, &activities).await?;
     let activities_stored = stored.len() as u64;
@@ -148,7 +152,8 @@ pub async fn sync_account(
     let return_activities: Vec<&AccountActivity> = activities
         .iter()
         .filter(|activity| {
-            newly_stored.contains(activity.id()) && return_activity_ids.contains(activity.id())
+            newly_stored.contains(activity.id())
+                && RETURN_ACTIVITY_TYPES.contains(&activity.activity_type())
         })
         .collect();
     let return_activities_net: Decimal = return_activities

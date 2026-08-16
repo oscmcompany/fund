@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use chrono::{Duration, NaiveTime, Utc};
 use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
-    TRANSFER_ACTIVITY_TYPES,
 };
 use fund::common::session_log::SessionLog;
 use fund::common::types::{BarInterval, SessionDate, Ticker};
@@ -136,26 +135,6 @@ fn calendar_ending_at(session_date: SessionDate) -> TradingCalendar {
         })
         .collect();
     TradingCalendar::from_days(days)
-}
-
-/// Answers every transfer activity endpoint with an empty list.
-///
-/// The sync asks for each synced type in turn, so a test mocking only `FILL` would have its
-/// remaining requests go unmatched. Driven by the production constant so a new transfer type cannot
-/// leave these tests quietly mocking the wrong set.
-async fn mock_no_transfers(server: &mut mockito::ServerGuard) {
-    for activity_type in TRANSFER_ACTIVITY_TYPES {
-        server
-            .mock(
-                "GET",
-                mockito::Matcher::Regex(format!("^/v2/account/activities/{activity_type}")),
-            )
-            .with_status(200)
-            .with_body("[]")
-            .expect_at_least(1)
-            .create_async()
-            .await;
-    }
 }
 
 /// Answers the trailing-window request for dividends, interest, and fees with an empty list.
@@ -1267,7 +1246,6 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         .create_async()
         .await;
 
-    mock_no_transfers(&mut server).await;
     mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
@@ -1357,7 +1335,6 @@ async fn test_the_account_sync_is_idempotent() {
         .create_async()
         .await;
 
-    mock_no_transfers(&mut server).await;
     mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
@@ -1425,12 +1402,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
         .with_body(account_body(30_000))
         .create_async()
         .await;
-    // Every type the sync actually asks for answers empty, except the deposit under test. Driven by
-    // the production list so an added type cannot leave a request unmatched here.
-    for activity_type in account::synced_activity_types()
-        .into_iter()
-        .filter(|activity_type| *activity_type != DEPOSIT_ACTIVITY_TYPE)
-    {
+    for activity_type in account::synced_activity_types() {
         server
             .mock(
                 "GET",
@@ -1441,13 +1413,12 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
             .create_async()
             .await;
     }
-    mock_no_return_activities(&mut server).await;
-    // The shape a real account returns: a settlement date, no transaction time, and the amount
-    // carried by `net_amount` rather than a quantity and a price.
+    // On the trailing window, which is the only request that can reach it: a transfer is dated and
+    // created the morning after, so this session's own `date=` query returns the previous one's.
     let _deposit = server
         .mock(
             "GET",
-            mockito::Matcher::Regex(format!("^/v2/account/activities/{DEPOSIT_ACTIVITY_TYPE}")),
+            mockito::Matcher::Regex(r"^/v2/account/activities(\?|$)".into()),
         )
         .with_status(200)
         .with_body(format!(
@@ -1455,6 +1426,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
                   "net_amount":"10000.00","status":"executed"}}]"#,
             session_date.date()
         ))
+        .expect_at_least(1)
         .create_async()
         .await;
 
