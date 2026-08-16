@@ -57,6 +57,13 @@ This is a collection of guidelines and references.
 - If something goes wrong during a task, stop immediately and re-plan rather than continuing
 - Use subagents to keep main context window clean and offload research, exploration, and analysis work
 - Prove changes work before marking tasks complete - run `devenv tasks run` checks, compare behavior, demonstrate correctness
+- Verify against real data before reporting done, and say which route was used: `secretspec run --
+  curl` against Alpaca or Massive, DuckDB over the S3 parquet, or a trainer rehearsal read back from
+  `/var/log/fund/`; when only fixtures were exercised, say so plainly, and ask to be pointed at real
+  data rather than inferring
+- Before filtering a provider feed by date, check whether the filter matches the event's own date or
+  the provider's record time — Alpaca's activity `date=`/`after=` match record time, so a date-only
+  row dated D is returned by a query for D+1
 - For non-trivial changes, pause and ask "Is there a more elegant way?" before implementing
 - Make every change as simple as possible and impact minimal code
 - Find root causes and avoid temporary fixes - maintain high standards
@@ -65,6 +72,10 @@ This is a collection of guidelines and references.
 - Do not introduce abstractions for single-use code
 - Always match existing styles and patterns in the codebase for consistency
 - When fixing a bug, write tests that reproduce the bug before fixing it, then verify the tests pass after the fix
+- Pin test expectations to literals, never to the constant or list the test is checking — an
+  expectation derived from the value under test moves with it and can never fail
+- Prove a new assertion is load-bearing before trusting it: break the code it covers, watch the test
+  fail, restore
 - Do not use emojis in commit messages, GitHub issues, or pull requests - maintain a professional tone
 - When possible, use GitHub's GraphQL API directly for scripts and tools where token efficiency matters
 - When the user indicates pull request review bots have provided feedback, suggest running `/update-pull-request`
