@@ -9,7 +9,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use polars::prelude::*;
 use tracing::warn;
 
-use crate::common::types::SessionDate;
+use crate::common::types::{SessionDate, Ticker};
 use crate::data::archive::{read_partition, ArchiveError, BOUNDARIES_ARCHIVE_KEY};
 
 /// Column the join threshold is carried on, dropped before the frame is returned.
@@ -49,6 +49,12 @@ impl BoundaryTable {
             let (Some(ticker), Some(date)) = (tickers.get(row), dates.get(row)) else {
                 continue;
             };
+            // Validated here rather than on every lookup: the index is keyed by string because
+            // `current_symbol` runs per row over millions of them, as `SplitTable` is for the fold.
+            let Some(ticker) = Ticker::new(ticker) else {
+                continue;
+            };
+            let ticker = ticker.as_str();
             let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
                 continue;
             };

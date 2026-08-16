@@ -360,9 +360,8 @@ async fn handle_predictions(
         .get(&state.s3_client, &state.bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
-    // Absent boundaries do not block the way absent splits do. A missing splits table makes every
-    // price wrong by whole factors; a missing boundary table costs a guard that fires on fifteen
-    // liquid names a year, and refusing to trade without it would be the larger failure.
+    // Absent boundaries do not block the way absent splits do: the guard they provide is worth far
+    // less than the trading refusing to run without it would cost.
     let boundaries = state
         .boundary_table_cache
         .get(&state.s3_client, &state.bucket, now)
@@ -551,9 +550,8 @@ async fn handle_portfolio_evaluation(
         .get(&state.s3_client, &state.bucket, now)
         .await?;
     let unadjustable = SplitTable::default();
-    // Absent boundaries do not block the way absent splits do. A missing splits table makes every
-    // price wrong by whole factors; a missing boundary table costs a guard that fires on fifteen
-    // liquid names a year, and refusing to trade without it would be the larger failure.
+    // Absent boundaries do not block the way absent splits do: the guard they provide is worth far
+    // less than the trading refusing to run without it would cost.
     let boundaries = state
         .boundary_table_cache
         .get(&state.s3_client, &state.bucket, now)

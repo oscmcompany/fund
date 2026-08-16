@@ -446,18 +446,29 @@ pub async fn load_aligned_closes(
         );
     }
 
-    let before = closes_by_ticker.len();
+    // Partitioned by membership rather than counted by subtraction: a ticker truncated away
+    // entirely never reached the map, so it is missing from one count and present in the other.
+    let short: Vec<Ticker> = closes_by_ticker
+        .iter()
+        .filter(|(_, closes)| closes.len() != session_count)
+        .map(|(ticker, _)| ticker.clone())
+        .collect();
     closes_by_ticker.retain(|_, closes| closes.len() == session_count);
-    // Reported apart from the gap count, because the two are different facts about a ticker: one
-    // has a hole in its history, the other has history belonging to a different company.
+
     let dropped_at_a_boundary = bounded
         .iter()
         .filter(|ticker| !closes_by_ticker.contains_key(*ticker))
         .count();
+    // A hole in a history and a history belonging to a different company are different facts, and
+    // a ticker with both is reported as the second: it is the more specific cause.
+    let dropped_for_gaps = short
+        .iter()
+        .filter(|ticker| !bounded.contains(*ticker))
+        .count();
 
     info!(
         tickers = closes_by_ticker.len(),
-        dropped_for_gaps = before - closes_by_ticker.len(),
+        dropped_for_gaps,
         dropped_at_a_boundary,
         sessions = session_count,
         "Aligned close history loaded"

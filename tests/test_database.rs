@@ -947,6 +947,48 @@ async fn test_a_renamed_company_keeps_its_history_under_the_new_symbol() {
     );
 }
 
+/// Both ways a ticker leaves the aligned set, exercised together: a hole in its history, and a
+/// boundary that takes every session it has.
+///
+/// The two are reported as separate counts, which this cannot assert — they are log fields, not
+/// return values — so it covers the exclusions themselves rather than the tally.
+#[tokio::test]
+#[serial]
+async fn test_a_gap_and_a_boundary_both_exclude_a_ticker() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+
+    // Complete: three consecutive sessions, no boundary.
+    for offset in 1..=3 {
+        common::seed_bar(&pool, "GOOD", today.plus_calendar_days(-offset), 10.0).await;
+    }
+    // A hole in the middle, no boundary.
+    common::seed_bar(&pool, "GAPY", today.plus_calendar_days(-1), 10.0).await;
+    common::seed_bar(&pool, "GAPY", today.plus_calendar_days(-3), 10.0).await;
+    // Every session precedes its boundary, so nothing of it survives.
+    for offset in 1..=3 {
+        common::seed_bar(&pool, "BNDY", today.plus_calendar_days(-offset), 10.0).await;
+    }
+
+    let boundaries = boundary_table(&[("BNDY", today, None)]);
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        3,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        closes.keys().collect::<Vec<_>>(),
+        vec![&ticker("GOOD")],
+        "only the complete unbounded series survives"
+    );
+}
+
 /// A predecessor and its successor can trade at the same time — `BK` and `BNY` share about two
 /// dozen sessions — and on those the symbol still trading is the one whose price counts.
 #[tokio::test]

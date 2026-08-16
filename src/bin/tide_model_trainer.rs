@@ -204,9 +204,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-    // Not fatal where the splits table is, and the asymmetry is deliberate: an absent splits table
-    // makes every price wrong by whole factors, an absent boundary table costs a guard that fires on
-    // a handful of names a year.
+    // Not fatal where the splits table is: an absent boundary table costs a guard on a handful of
+    // names, where an absent splits table makes every price wrong by whole factors.
     let boundaries = match archive::read_partition(
         &s3_client,
         &bucket,
