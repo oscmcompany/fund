@@ -15,9 +15,6 @@ use crate::data::archive::{read_partition, ArchiveError, BOUNDARIES_ARCHIVE_KEY}
 /// Column the join threshold is carried on, dropped before the frame is returned.
 const THRESHOLD_COLUMN: &str = "earliest_usable_millis";
 
-/// Column marking a bar the stitch moved, dropped before the frame is returned.
-const MOVED_COLUMN: &str = "moved_by_stitch";
-
 /// Renames followed before a chain is declared circular.
 ///
 /// A symbol changing hands eight times inside one lookback is not something the feed describes; a
@@ -76,9 +73,8 @@ impl BoundaryTable {
             }
         }
 
-        // A successor two symbols both claim cannot be stitched: the feed reports a SPAC's shares
-        // and its rights both becoming one ticker, and no rule picks between two securities' prices
-        // for a session. The boundary still stands, so the series is bounded rather than joined.
+        // A successor two symbols both claim cannot be stitched, because no rule picks between two
+        // securities' prices; the boundary stands, so the series is bounded rather than joined.
         let mut renames: HashMap<String, Vec<(SessionDate, String)>> = HashMap::new();
         for (ticker, date, successor) in candidates {
             if predecessors
@@ -197,17 +193,12 @@ impl BoundaryTableCache {
     }
 }
 
-/// Re-files each bar under the symbol its company trades as now.
+/// Re-files each bar under the symbol its company trades as now, joining a renamed company's
+/// history to its successor's.
 ///
-/// A renamed company's history sits under a symbol that stopped trading, which leaves the successor
-/// too short to screen while the predecessor is unusable. Relabelling joins them into one series.
-///
-/// Runs before [`truncate_bars`], because the bars it moves are exactly the ones truncation would
-/// otherwise drop, and before the fold, because the fold keys on the symbol a bar now carries.
-///
-/// A moved bar never displaces one the symbol already had. The feed reports a share class collapsing
-/// into another as a rename — `CUK` into `CCL`, `CWEN.A` into `CWEN` — and both traded every session
-/// beforehand, so without this the two securities' prices would be concatenated.
+/// Runs before [`truncate_bars`] and before the fold, both of which key on the symbol a bar carries.
+/// A moved bar never displaces one the symbol already had, because the feed calls a share class
+/// collapsing into another a rename and both classes traded.
 pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataFrame, PolarsError> {
     if boundaries.is_empty() || frame.height() == 0 {
         return Ok(frame);
@@ -245,22 +236,22 @@ pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataF
 
     let mut frame = frame;
     frame.with_column(Column::new("ticker".into(), relabelled))?;
-    frame.with_column(Column::new(MOVED_COLUMN.into(), was_moved))?;
 
-    let settled = frame.clone().lazy().filter(col(MOVED_COLUMN).not());
-    let kept = frame.lazy().filter(col(MOVED_COLUMN)).join(
-        settled.clone().select([col("ticker"), col("timestamp")]),
+    let was_moved = BooleanChunked::new("was_moved".into(), was_moved);
+    let settled = frame.filter(&!&was_moved)?;
+    let carried = frame.filter(&was_moved)?;
+
+    let kept = carried.lazy().join(
+        settled
+            .clone()
+            .lazy()
+            .select([col("ticker"), col("timestamp")]),
         [col("ticker"), col("timestamp")],
         [col("ticker"), col("timestamp")],
         JoinArgs::new(JoinType::Anti),
     );
 
-    concat([settled, kept], UnionArgs::default())?
-        .drop(Selector::ByName {
-            names: vec![PlSmallStr::from(MOVED_COLUMN)].into(),
-            strict: false,
-        })
-        .collect()
+    concat([settled.lazy(), kept], UnionArgs::default())?.collect()
 }
 
 /// Drops the bars of each ticker that predate its most recent boundary.
