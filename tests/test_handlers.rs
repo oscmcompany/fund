@@ -449,6 +449,50 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         "the record names the row it wrote"
     );
 
+    // The plan reaches the disk before the orders it calls for, which is the whole reason it is its
+    // own record: a pass that dies mid-entry leaves what it intended next to what it managed. This
+    // asserts the *order* of the writes, not merely that both happened.
+    let entry_plan: Vec<&serde_json::Value> = of_type(&records, "plan_decided")
+        .into_iter()
+        .filter(|record| record["payload"]["phase"] == "entries")
+        .collect();
+    assert_eq!(entry_plan.len(), 1, "one plan per round");
+    assert_eq!(
+        entry_plan[0]["payload"]["actions"][0]["pair_id"],
+        "AAAA-BBBB"
+    );
+    assert_eq!(entry_plan[0]["payload"]["actions"][0]["action"], "open");
+    assert!(
+        entry_plan[0]["payload"]["actions"][0]["long_notional"].is_number(),
+        "an entry is sized before it is sent, so the plan can say what it would have risked"
+    );
+
+    // The *entries* plan specifically. Locating it by event type alone would find the exits plan,
+    // which is written earlier in every pass and would make these assertions hold against any
+    // ordering at all.
+    let position = |predicate: &dyn Fn(&serde_json::Value) -> bool, what: &str| {
+        records
+            .iter()
+            .position(|record| predicate(record))
+            .unwrap_or_else(|| panic!("{what} must be recorded"))
+    };
+    let entry_plan_at = position(
+        &|record| record["event_type"] == "plan_decided" && record["payload"]["phase"] == "entries",
+        "the entries plan",
+    );
+    assert!(
+        entry_plan_at
+            < position(
+                &|record| record["event_type"] == "order_submitted",
+                "an order"
+            ),
+        "the entries plan is written before the first order leaves the process"
+    );
+    assert!(
+        entry_plan_at < position(&|record| record["event_type"] == "pair_opened", "a pair"),
+        "and before the pair it opens"
+    );
+
     submit.assert_async().await;
 }
 

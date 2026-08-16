@@ -1882,6 +1882,19 @@ pub struct CheckedPrice {
 }
 
 impl CheckedPrice {
+    /// A price with no snapshot behind it, for tests of the pure decision path.
+    ///
+    /// Test-only because the guard is the point of this type everywhere else: a price reaches the
+    /// pass by surviving [`Snapshot::reference_price`], never by being asserted.
+    #[cfg(test)]
+    pub(crate) fn for_test(price: f64, source: PriceSource) -> Self {
+        Self {
+            price,
+            source,
+            rejection: None,
+        }
+    }
+
     pub fn price(&self) -> f64 {
         self.price
     }
