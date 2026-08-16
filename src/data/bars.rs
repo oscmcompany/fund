@@ -314,10 +314,12 @@ pub async fn load_bars_dataframe(
         Column::new("volume_weighted_average_price".into(), volume_weighted),
     ])?;
 
-    // Truncated before it is adjusted: a bar the boundary drops must not have a factor
-    // applied to it, and the fold is the more expensive of the two.
+    // Stitched, then truncated, then folded. The stitch moves a renamed company's bars onto the
+    // symbol it trades as now — which are exactly the bars truncation would otherwise drop — and the
+    // fold runs last because it keys on the symbol a bar carries after both.
+    let dataframe = truncate::stitch_bars(dataframe, boundaries)?;
     let dataframe = truncate::truncate_bars(dataframe, boundaries, as_of)?;
-    let dataframe = adjust::adjust_bars(dataframe, splits, as_of)?;
+    let dataframe = adjust::adjust_bars(dataframe, &splits.following_renames(boundaries), as_of)?;
 
     info!(
         rows = dataframe.height(),
@@ -391,13 +393,29 @@ pub async fn load_aligned_closes(
         .collect::<HashSet<_>>()
         .len();
 
-    let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> = HashMap::new();
+    // Splits are re-filed through the same renames the bars are, so a stitched close takes its own
+    // company's factor rather than the one belonging to whoever holds its old symbol now.
+    let splits = splits.following_renames(boundaries);
+
+    // The third element records whether the bar was already filed under this symbol, which decides
+    // the overlap: a predecessor and its successor can both trade for a stretch — BK and BNY share
+    // two dozen sessions — and the symbol still trading is the one whose price is authoritative.
+    let mut dated_closes: HashMap<Ticker, Vec<(SessionDate, f64, bool)>> = HashMap::new();
     let mut bounded: HashSet<Ticker> = HashSet::new();
     for row in rows {
-        let Some(ticker) = Ticker::new(&row.ticker) else {
+        let Some(stored) = Ticker::new(&row.ticker) else {
             continue;
         };
         let session = SessionDate::at(row.timestamp);
+        // Resolved before it is bounded, so a bar moved onto its successor is judged against that
+        // symbol's boundaries rather than against the ones that sent it there.
+        let (ticker, own) = match boundaries.current_symbol(stored.as_str(), session) {
+            Some(successor) => match Ticker::new(&successor) {
+                Some(ticker) => (ticker, false),
+                None => (stored, true),
+            },
+            None => (stored, true),
+        };
         // Dropped rather than kept short: the retain below needs a full-length series, so a ticker
         // whose boundary falls inside this window loses its alignment and with it its candidacy.
         if let Some(earliest) = boundaries.earliest_usable_session(ticker.as_str(), as_of) {
@@ -407,10 +425,25 @@ pub async fn load_aligned_closes(
             }
         }
         let factor = splits.factor_at(ticker.as_str(), session, as_of);
-        closes_by_ticker
+        dated_closes
             .entry(ticker)
             .or_default()
-            .push(row.close_price * factor);
+            .push((session, row.close_price * factor, own));
+    }
+
+    // Sorted because a stitched series arrives in two runs — the successor's rows and the
+    // predecessor's — and the query orders within a symbol, not across a rename.
+    let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> =
+        HashMap::with_capacity(dated_closes.len());
+    for (ticker, mut dated) in dated_closes {
+        // Ordered by session, and within a session the symbol's own bar first, so the deduplication
+        // below keeps it and discards the inherited one.
+        dated.sort_by(|left, right| left.0.cmp(&right.0).then(right.2.cmp(&left.2)));
+        dated.dedup_by_key(|(session, _, _)| *session);
+        closes_by_ticker.insert(
+            ticker,
+            dated.into_iter().map(|(_, close, _)| close).collect(),
+        );
     }
 
     let before = closes_by_ticker.len();

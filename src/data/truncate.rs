@@ -2,7 +2,7 @@
 //!
 //! Applied by the loaders, so a series spanning two companies is not something a caller can hold.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -15,13 +15,20 @@ use crate::data::archive::{read_partition, ArchiveError, BOUNDARIES_ARCHIVE_KEY}
 /// Column the join threshold is carried on, dropped before the frame is returned.
 const THRESHOLD_COLUMN: &str = "earliest_usable_millis";
 
+/// Renames followed before a chain is declared circular.
+///
+/// A symbol changing hands eight times inside one lookback is not something the feed describes; a
+/// table that pointed a symbol back at itself is, and would otherwise loop forever.
+const RENAME_CHAIN_LIMIT: usize = 8;
+
 /// The boundary dates indexed for lookup, as read from the archive.
 ///
-/// Holds only ticker and date: the reason explains a boundary but does not change what a reader
-/// does with one, which is to stop.
+/// Renames are held separately from the rest because only they answer a second question: every
+/// boundary says where a series stops, and a rename also says where it continues.
 #[derive(Debug, Clone, Default)]
 pub struct BoundaryTable {
     by_ticker: HashMap<String, Vec<SessionDate>>,
+    renames: HashMap<String, Vec<(SessionDate, String)>>,
 }
 
 impl BoundaryTable {
@@ -33,8 +40,11 @@ impl BoundaryTable {
     pub fn from_dataframe(frame: &DataFrame) -> Result<Self, PolarsError> {
         let tickers = frame.column("ticker")?.str()?;
         let dates = frame.column("date")?.str()?;
+        let reasons = frame.column("reason")?.str()?;
+        let related = frame.column("related_ticker")?.str()?;
 
         let mut by_ticker: HashMap<String, Vec<SessionDate>> = HashMap::new();
+        let mut renames: HashMap<String, Vec<(SessionDate, String)>> = HashMap::new();
         for row in 0..frame.height() {
             let (Some(ticker), Some(date)) = (tickers.get(row), dates.get(row)) else {
                 continue;
@@ -42,13 +52,20 @@ impl BoundaryTable {
             let Ok(date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
                 continue;
             };
-            by_ticker
-                .entry(ticker.to_string())
-                .or_default()
-                .push(SessionDate::from_date(date));
+            let date = SessionDate::from_date(date);
+            by_ticker.entry(ticker.to_string()).or_default().push(date);
+
+            if reasons.get(row) == Some("renamed") {
+                if let Some(successor) = related.get(row) {
+                    renames
+                        .entry(ticker.to_string())
+                        .or_default()
+                        .push((date, successor.to_string()));
+                }
+            }
         }
 
-        Ok(Self { by_ticker })
+        Ok(Self { by_ticker, renames })
     }
 
     /// The earliest session of `ticker` describing the same company as `as_of` does.
@@ -63,6 +80,43 @@ impl BoundaryTable {
             .filter(|date| **date <= as_of)
             .max()
             .copied()
+    }
+
+    /// The symbol a fact about `ticker` dated `session` belongs to now, if it moved.
+    ///
+    /// Follows every rename dated after the session, so a company renamed twice is reached in two
+    /// steps. A rename dated at or before the session is somebody else's: the symbol was free by
+    /// then, and whoever took it is who `ticker` means from that date on.
+    ///
+    /// Used for splits as well as bars, which is what keeps the fold correct across a rename —
+    /// otherwise a stitched bar takes the successor's splits and misses its own, or the reverse.
+    /// A chain that revisits a symbol stops there rather than going round again, keeping the last
+    /// symbol reached: the table is malformed at that point, and the walk so far is still the best
+    /// answer available.
+    pub fn current_symbol(&self, ticker: &str, session: SessionDate) -> Option<String> {
+        let mut symbol = ticker.to_string();
+        let mut visited: HashSet<String> = HashSet::from([symbol.clone()]);
+        for _ in 0..RENAME_CHAIN_LIMIT {
+            let Some(successor) = self
+                .renames
+                .get(&symbol)
+                .and_then(|renames| {
+                    renames
+                        .iter()
+                        .filter(|(date, _)| *date > session)
+                        .min_by_key(|(date, _)| *date)
+                })
+                .map(|(_, successor)| successor.clone())
+            else {
+                break;
+            };
+            if !visited.insert(successor.clone()) {
+                break;
+            }
+            symbol = successor;
+        }
+
+        (symbol != ticker).then_some(symbol)
     }
 
     /// Whether any boundary is known, which is what makes skipping the whole filter safe.
@@ -116,6 +170,47 @@ impl BoundaryTableCache {
         *self.inner.lock().await = Some((today, Arc::clone(&table)));
         Ok(Some(table))
     }
+}
+
+/// Re-files each bar under the symbol its company trades as now.
+///
+/// A renamed company's history sits under a symbol that stopped trading, which leaves the successor
+/// too short to screen while the predecessor is unusable. Relabelling joins them into one series.
+///
+/// Runs before [`truncate_bars`], because the bars it moves are exactly the ones truncation would
+/// otherwise drop, and before the fold, because the fold keys on the symbol a bar now carries.
+pub fn stitch_bars(frame: DataFrame, boundaries: &BoundaryTable) -> Result<DataFrame, PolarsError> {
+    if boundaries.is_empty() || frame.height() == 0 {
+        return Ok(frame);
+    }
+
+    let tickers = frame.column("ticker")?.str()?;
+    let timestamps = frame.column("timestamp")?.i64()?;
+    let mut relabelled: Vec<String> = Vec::with_capacity(frame.height());
+    let mut moved = 0usize;
+    for row in 0..frame.height() {
+        let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
+            relabelled.push(String::new());
+            continue;
+        };
+        let session =
+            SessionDate::at(DateTime::from_timestamp_millis(timestamp).unwrap_or_default());
+        match boundaries.current_symbol(ticker, session) {
+            Some(successor) => {
+                moved += 1;
+                relabelled.push(successor);
+            }
+            None => relabelled.push(ticker.to_string()),
+        }
+    }
+
+    if moved == 0 {
+        return Ok(frame);
+    }
+
+    let mut frame = frame;
+    frame.with_column(Column::new("ticker".into(), relabelled))?;
+    Ok(frame)
 }
 
 /// Drops the bars of each ticker that predate its most recent boundary.
@@ -186,12 +281,38 @@ mod tests {
         SessionDate::from_date(value.parse().expect("a valid session date"))
     }
 
+    /// Boundaries that stop a series without continuing it, like a spinoff.
     fn table(rows: &[(&str, &str)]) -> BoundaryTable {
-        let tickers: Vec<String> = rows.iter().map(|(ticker, _)| ticker.to_string()).collect();
-        let dates: Vec<String> = rows.iter().map(|(_, date)| date.to_string()).collect();
+        let renames: Vec<(&str, &str, Option<&str>)> = rows
+            .iter()
+            .map(|(ticker, date)| (*ticker, *date, None))
+            .collect();
+        renamed_table(&renames)
+    }
+
+    /// `None` in the third position is a spinoff; `Some` is a rename onto that symbol.
+    fn renamed_table(rows: &[(&str, &str, Option<&str>)]) -> BoundaryTable {
+        let tickers: Vec<String> = rows
+            .iter()
+            .map(|(ticker, _, _)| ticker.to_string())
+            .collect();
+        let dates: Vec<String> = rows.iter().map(|(_, date, _)| date.to_string()).collect();
+        let reasons: Vec<String> = rows
+            .iter()
+            .map(|(_, _, to)| match to {
+                Some(_) => "renamed".to_string(),
+                None => "spun_off".to_string(),
+            })
+            .collect();
+        let related: Vec<Option<String>> = rows
+            .iter()
+            .map(|(_, _, to)| to.map(str::to_string))
+            .collect();
         let frame = DataFrame::new(vec![
             Column::new("ticker".into(), tickers),
             Column::new("date".into(), dates),
+            Column::new("reason".into(), reasons),
+            Column::new("related_ticker".into(), related),
         ])
         .expect("a frame must build");
         BoundaryTable::from_dataframe(&frame).expect("the table must build")
@@ -289,6 +410,104 @@ mod tests {
             .filter_map(|row| tickers.get(row))
             .collect();
         assert_eq!(kept, vec!["AAPL", "AAPL"], "RNA loses its pre-boundary bar");
+    }
+
+    /// A bar predating a rename belongs to the symbol the company trades as now; one from after it
+    /// belongs to whoever took the vacated symbol.
+    #[test]
+    fn test_a_session_resolves_to_the_symbol_its_company_trades_as_now() {
+        let table = renamed_table(&[("RNA", "2026-02-26", Some("RNAM"))]);
+
+        assert_eq!(
+            table.current_symbol("RNA", session("2026-02-24")),
+            Some("RNAM".to_string())
+        );
+        assert_eq!(table.current_symbol("RNA", session("2026-02-26")), None);
+        assert_eq!(table.current_symbol("RNA", session("2026-03-10")), None);
+    }
+
+    #[test]
+    fn test_a_chain_of_renames_is_followed_to_the_end() {
+        let table = renamed_table(&[
+            ("AAA", "2026-03-01", Some("BBB")),
+            ("BBB", "2026-05-01", Some("CCC")),
+        ]);
+
+        assert_eq!(
+            table.current_symbol("AAA", session("2026-01-05")),
+            Some("CCC".to_string())
+        );
+        assert_eq!(
+            table.current_symbol("AAA", session("2026-04-01")),
+            None,
+            "the symbol was already free, so a later bar under it is somebody else's"
+        );
+    }
+
+    /// A table pointing a symbol back at itself is malformed rather than impossible, and would
+    /// otherwise be followed forever.
+    #[test]
+    fn test_a_circular_rename_terminates() {
+        let table = renamed_table(&[
+            ("AAA", "2026-03-01", Some("BBB")),
+            ("BBB", "2026-05-01", Some("AAA")),
+        ]);
+
+        assert_eq!(
+            table.current_symbol("AAA", session("2026-01-05")),
+            Some("BBB".to_string()),
+            "the walk stops where the cycle closes rather than going round again"
+        );
+    }
+
+    #[test]
+    fn test_bars_from_before_a_rename_move_to_the_successor() {
+        let frame = bars(&[("RNA", "2026-02-24", 72.87), ("RNAM", "2026-02-26", 73.10)]);
+
+        let stitched = stitch_bars(
+            frame,
+            &renamed_table(&[("RNA", "2026-02-26", Some("RNAM"))]),
+        )
+        .unwrap();
+
+        let tickers = stitched.column("ticker").unwrap().str().unwrap();
+        let labels: Vec<&str> = (0..stitched.height())
+            .filter_map(|row| tickers.get(row))
+            .collect();
+        assert_eq!(labels, vec!["RNAM", "RNAM"], "one company, one symbol");
+    }
+
+    /// The reason the fold has to follow renames too. Without it a stitched bar takes whatever
+    /// splits are filed under its new symbol and misses the ones filed under its old one.
+    #[test]
+    fn test_a_split_moves_with_the_company_that_declared_it() {
+        let boundaries = renamed_table(&[("RNA", "2026-02-26", Some("RNAM"))]);
+        let splits = crate::data::adjust::SplitTable::from_dataframe(
+            &DataFrame::new(vec![
+                Column::new("ticker".into(), vec!["RNA".to_string(), "RNA".to_string()]),
+                Column::new(
+                    "execution_date".into(),
+                    vec!["2026-02-10".to_string(), "2026-04-01".to_string()],
+                ),
+                Column::new("split_from".into(), vec![1.0, 1.0]),
+                Column::new("split_to".into(), vec![2.0, 4.0]),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+
+        let followed = splits.following_renames(&boundaries);
+
+        assert_eq!(
+            followed.factor_at("RNAM", session("2026-02-01"), session("2026-08-15")),
+            0.5,
+            "the pre-rename split follows the company onto its new symbol"
+        );
+        assert_eq!(
+            followed.factor_at("RNA", session("2026-03-01"), session("2026-08-15")),
+            0.25,
+            "the post-rename split stays with whoever holds the old symbol now"
+        );
     }
 
     #[test]

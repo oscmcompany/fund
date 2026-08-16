@@ -11,6 +11,7 @@ use tracing::warn;
 
 use crate::common::types::SessionDate;
 use crate::data::archive::{read_partition, ArchiveError, SPLITS_ARCHIVE_KEY};
+use crate::data::truncate::BoundaryTable;
 
 /// The splits table indexed for lookup, as read from the archive.
 ///
@@ -99,6 +100,33 @@ impl SplitTable {
         } else {
             1.0
         }
+    }
+
+    /// Re-files each split under the symbol its company trades as now.
+    ///
+    /// Needed because [`crate::data::truncate::stitch_bars`] moves a bar to its company's current
+    /// symbol while the split stays filed under the one in force when it executed. Left unresolved,
+    /// a stitched bar would take the successor's splits and miss its own — and 18 of 330 renames in
+    /// a year have a split on one side of them, so this is not a theoretical gap.
+    pub fn following_renames(&self, boundaries: &BoundaryTable) -> Self {
+        if boundaries.is_empty() {
+            return self.clone();
+        }
+
+        let mut by_ticker: HashMap<String, Vec<(SessionDate, f64)>> = HashMap::new();
+        for (ticker, splits) in &self.by_ticker {
+            for (execution_date, ratio) in splits {
+                let symbol = boundaries
+                    .current_symbol(ticker, *execution_date)
+                    .unwrap_or_else(|| ticker.clone());
+                by_ticker
+                    .entry(symbol)
+                    .or_default()
+                    .push((*execution_date, *ratio));
+            }
+        }
+
+        Self { by_ticker }
     }
 
     /// Whether any split is known, which is what makes skipping the whole fold safe.

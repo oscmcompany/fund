@@ -606,14 +606,17 @@ async fn load_archived_bars(
     }
     // Folded once over the concatenated window rather than per partition: the factor depends on
     // where a bar sits relative to today, not on which file it came out of.
-    // Bounded before it is folded, for the reason the PostgreSQL loader does it in that order: a
-    // bar the boundary drops should not have a factor applied to it first.
-    let bounded = truncate::truncate_bars(
-        concat(frames, UnionArgs::default())?.collect()?,
-        boundaries,
+    // Stitched, bounded, then folded, in the order the PostgreSQL loader uses and for the same
+    // reasons: the stitch rescues the bars truncation would drop, and the fold keys on the symbol a
+    // bar carries after both.
+    let stitched =
+        truncate::stitch_bars(concat(frames, UnionArgs::default())?.collect()?, boundaries)?;
+    let bounded = truncate::truncate_bars(stitched, boundaries, session)?;
+    Ok(adjust::adjust_bars(
+        bounded,
+        &splits.following_renames(boundaries),
         session,
-    )?;
-    Ok(adjust::adjust_bars(bounded, splits, session)?)
+    )?)
 }
 
 /// The bar columns training consumes, in the types [`fund::data::bars::bars_to_dataframe`] writes.
