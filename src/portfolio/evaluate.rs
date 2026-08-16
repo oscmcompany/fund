@@ -23,9 +23,9 @@ use crate::common::alpaca::{
 };
 use crate::common::session_log::{
     CandidateReading, ExcludedTickerReading, LiquidationAttempted, Observation, OpenPairReading,
-    OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PlanDecided, PlannedAction,
-    PositionCloseRequested, PriceReading, PricesObserved, ScreenInputReading, SessionLog,
-    UnavailablePrice, UniverseScreened,
+    OpenPairsObserved, PairClosed, PairOpened, PassEvaluated, PlanDecided, PlanPhase,
+    PlannedAction, PlannedActionKind, PositionCloseRequested, PriceReading, PricesObserved,
+    ScreenInputReading, SessionLog, UnavailablePrice, UniverseScreened,
 };
 use crate::common::types::{EquityPrediction, EquityQuote, PairID, SessionDate, Ticker};
 use crate::data::calendar::TradingCalendar;
@@ -104,8 +104,8 @@ pub struct ClosedRecord {
 
 /// What the exit round read from the world, before any judgment is applied to it.
 ///
-/// Holds `minutes_until_close` and `session` as observed values rather than a clock, which is what
-/// lets [`decide_exits`] be replayed against a stored reading and reach the same plan.
+/// Carries `session` and `now` as observed values rather than a clock, so [`decide_exits`] can be
+/// replayed against a stored reading and reach the same plan.
 pub struct ExitReading {
     pub open_pairs: Vec<OpenPair>,
     pub prices: HashMap<Ticker, CheckedPrice>,
@@ -122,8 +122,6 @@ pub struct PlannedClose {
     pub long_ticker: Ticker,
     pub short_ticker: Ticker,
     pub reason: CloseReason,
-    /// Which reading in the plan this close belongs to, so applying can finish it.
-    pub reading_index: usize,
 }
 
 /// What the exit round resolved to do, and what it measured to get there.
@@ -344,32 +342,32 @@ async fn evaluate_pass(
     record_plan(
         context,
         correlation_id,
-        "exits",
+        PlanPhase::Exits,
         &exit_plan_actions(&exit_plan),
         exit_reading.open_pairs.len(),
     )
     .await;
-    let exits = apply_exits(context, &execution, &exit_plan).await;
+    let (exits, exit_failure) = apply_exits(context, &execution, &exit_plan).await;
 
-    // Recorded whether or not applying succeeded: a pass that died mid-exit still measured the book
-    // it died holding, and that reading is the only account of what it saw.
-    let readings = match &exits {
-        Ok(outcome) => outcome.readings.clone(),
-        Err(_) => exit_plan.readings.clone(),
-    };
+    // From the outcome, not the plan: a pass that died partway through closing had already closed
+    // pairs, and reporting those as held would put the log at odds with the broker and the book.
     context
         .session_log
         .record(
             correlation_id,
             context.now,
-            Observation::OpenPairsObserved(OpenPairsObserved { readings }),
+            Observation::OpenPairsObserved(OpenPairsObserved {
+                readings: exits.readings.clone(),
+            }),
         )
         .await;
-    let exits = exits?;
 
     summary.pairs_unpriced = exit_plan.unpriced;
     summary.pairs_closed = exits.closed_records.clone();
     summary.exits_failed = exits.failed.clone();
+    if let Some(error) = exit_failure {
+        return Err(error);
+    }
 
     let open_pairs = exit_reading.open_pairs;
     let mut prices = exit_reading.prices;
@@ -403,7 +401,7 @@ async fn evaluate_pass(
             info!(block = block.as_str(), reason = %block, "Entry half skipped");
             summary.entries_blocked = Some(format!("{}: {block}", block.as_str()));
             observation.session_block = summary.entries_blocked.clone();
-            record_plan(context, correlation_id, "entries", &[], 0).await;
+            record_plan(context, correlation_id, PlanPhase::Entries, &[], 0).await;
             return Ok(summary);
         }
         Admission::Open => {}
@@ -426,29 +424,27 @@ async fn evaluate_pass(
     record_plan(
         context,
         correlation_id,
-        "entries",
+        PlanPhase::Entries,
         &entry_plan_actions(&entry_plan),
         entry_plan.candidates_screened,
     )
     .await;
 
-    let entries = apply_entries(context, &execution, &entry_plan).await;
+    let (entries, entry_failure) = apply_entries(context, &execution, &entry_plan).await;
 
-    // Recorded on both paths: a pass that died opening its third pair still decided about all of
-    // them, and the candidate readings are the only account of what it meant to do.
-    let candidates = match &entries {
-        Ok(outcome) => outcome.candidates.clone(),
-        Err(_) => entry_plan.candidates.clone(),
-    };
-    observation.candidates = candidates.into_values().collect();
+    // From the outcome on both paths, for the reason the exits round records its readings from one:
+    // a pass that died opening its third pair had already opened two.
+    observation.candidates = entries.candidates.clone().into_values().collect();
     observation
         .candidates
         .sort_by(|left, right| left.pair_id.cmp(&right.pair_id));
-    let entries = entries?;
 
     summary.pairs_opened = entries.opened;
     summary.entries_refused.extend(entries.refused);
     summary.entries_abandoned = entries.abandoned;
+    if let Some(error) = entry_failure {
+        return Err(error);
+    }
 
     info!(
         closed = summary.pairs_closed.len(),
@@ -755,8 +751,9 @@ async fn observe_candidates(
 
 /// Scores, selects, sizes, and admits. Pure, and the round's whole decision.
 ///
-/// Every scored candidate is seeded as `not_selected` and overwritten as it survives each stage, so
-/// a candidate that fell out at selection is recorded as precisely as one that was approved.
+/// Every scored candidate is seeded as `not_selected` and relabelled as it survives each stage —
+/// `risk_refused` if the gate turned it down, `planned` if it cleared — so a candidate that fell out
+/// at selection is recorded as precisely as one that was approved.
 pub fn decide_entries(
     account: &AccountReading,
     reading: &CandidatesReading,
@@ -826,6 +823,16 @@ pub fn decide_entries(
             model_run_id: reading.screened.model_run_id.clone(),
         })
         .collect();
+    // Approved, not yet attempted. Without this an approved pair still reads `not_selected` on the
+    // path where applying fails, contradicting the plan record written moments earlier.
+    for planned in &plan.opens {
+        if let Some(candidate) = plan
+            .candidates
+            .get_mut(planned.pair.candidate().pair_id().as_str())
+        {
+            candidate.decision = "planned".to_string();
+        }
+    }
     plan
 }
 
@@ -834,7 +841,7 @@ async fn apply_entries(
     context: &EvaluationContext<'_>,
     execution: &ExecutionContext<'_>,
     plan: &EntryPlan,
-) -> Result<EntryOutcome, EvaluationError> {
+) -> (EntryOutcome, Option<EvaluationError>) {
     let mut outcome = EntryOutcome {
         candidates: plan.candidates.clone(),
         ..Default::default()
@@ -866,7 +873,11 @@ async fn apply_entries(
             break;
         }
 
-        match execute::open_pair(execution, pair, planned.model_run_id.clone()).await? {
+        let opened = match execute::open_pair(execution, pair, planned.model_run_id.clone()).await {
+            Ok(opened) => opened,
+            Err(error) => return (outcome, Some(error.into())),
+        };
+        match opened {
             OpenOutcome::Opened {
                 entry,
                 long_fill,
@@ -893,7 +904,7 @@ async fn apply_entries(
                              live with no pair row and will be flattened by the pre-close \
                              liquidation"
                         );
-                        return Err(error.into());
+                        return (outcome, Some(error.into()));
                     }
                 };
                 context
@@ -937,7 +948,7 @@ async fn apply_entries(
         }
     }
 
-    Ok(outcome)
+    (outcome, None)
 }
 
 /// The entry plan rendered as log actions, in the order they will be attempted.
@@ -949,7 +960,7 @@ fn entry_plan_actions(plan: &EntryPlan) -> Vec<PlannedAction> {
             let candidate = planned.pair.candidate();
             PlannedAction {
                 pair_id: candidate.pair_id().as_str().to_string(),
-                action: "open".to_string(),
+                action: PlannedActionKind::Open,
                 reason: format!("rank {}", rank + 1),
                 long_ticker: candidate.long_ticker().to_string(),
                 short_ticker: candidate.short_ticker().to_string(),
@@ -967,7 +978,7 @@ fn entry_plan_actions(plan: &EntryPlan) -> Vec<PlannedAction> {
 async fn record_plan(
     context: &EvaluationContext<'_>,
     correlation_id: uuid::Uuid,
-    phase: &str,
+    phase: PlanPhase,
     actions: &[PlannedAction],
     considered: usize,
 ) {
@@ -977,7 +988,7 @@ async fn record_plan(
             correlation_id,
             context.now,
             Observation::PlanDecided(PlanDecided {
-                phase: phase.to_string(),
+                phase,
                 actions: actions.to_vec(),
                 considered,
             }),
@@ -991,7 +1002,7 @@ fn exit_plan_actions(plan: &ExitPlan) -> Vec<PlannedAction> {
         .iter()
         .map(|close| PlannedAction {
             pair_id: close.pair_id.clone(),
-            action: "close".to_string(),
+            action: PlannedActionKind::Close,
             reason: close.reason.as_str().to_string(),
             long_ticker: close.long_ticker.to_string(),
             short_ticker: close.short_ticker.to_string(),
@@ -1134,7 +1145,6 @@ pub fn decide_exits(reading: &ExitReading) -> ExitPlan {
             long_ticker: pair.long_ticker().clone(),
             short_ticker: pair.short_ticker().clone(),
             reason,
-            reading_index: plan.readings.len(),
         });
         plan.readings.push(open_pair_reading);
     }
@@ -1144,22 +1154,29 @@ pub fn decide_exits(reading: &ExitReading) -> ExitPlan {
 
 /// Attempts every close the plan calls for, applying no judgment of its own.
 ///
-/// One pair's close failing must not take the other pairs' exits down with it. Propagating here
-/// would abort the loop, so a single broker error on the first pair would leave every later pair
-/// open for another five minutes — turning one stuck position into all of them. The pair stays open
-/// in the record, which is the honest state, and the next pass retries.
+/// One pair's close failing must not take the others down with it: aborting the loop would turn a
+/// single broker error into every later pair staying open for another five minutes. The pair stays
+/// open in the record, which is the honest state, and the next pass retries.
 async fn apply_exits(
     context: &EvaluationContext<'_>,
     execution: &ExecutionContext<'_>,
     plan: &ExitPlan,
-) -> Result<ExitOutcome, EvaluationError> {
+) -> (ExitOutcome, Option<EvaluationError>) {
     let mut outcome = ExitOutcome {
         readings: plan.readings.clone(),
         ..Default::default()
     };
 
     for close in &plan.closes {
-        let reading = &mut outcome.readings[close.reading_index];
+        // Located by identifier rather than by a stored index: an index is a second thing that can
+        // be wrong about the same list, and nothing here needs one.
+        let Some(reading) = outcome
+            .readings
+            .iter_mut()
+            .find(|reading| reading.pair_id == close.pair_id)
+        else {
+            continue;
+        };
         let broker_outcome = match execute::close_pair(
             execution,
             close.pair_id.as_str(),
@@ -1192,7 +1209,10 @@ async fn apply_exits(
                 Ok(updated) => updated,
                 Err(error) => {
                     reading.decision = "close_failed".to_string();
-                    return Err(error.into());
+                    // The outcome travels with the error. Pairs closed before this one reached the
+                    // broker and the database, and reporting them as never attempted is worse than
+                    // the failure itself.
+                    return (outcome, Some(error.into()));
                 }
             };
         context
@@ -1217,7 +1237,7 @@ async fn apply_exits(
         });
     }
 
-    Ok(outcome)
+    (outcome, None)
 }
 
 /// The model run behind the current session's predictions, without loading them.
@@ -1421,15 +1441,24 @@ mod tests {
 
     /// One open pair, its spread model, and prices placing the spread at `z_at_close`.
     fn exit_reading_for(z_at_close: f64, priced: bool) -> ExitReading {
+        exit_reading_with(z_at_close, priced, true, 0)
+    }
+
+    /// The same, with the spread model optionally withheld and the session optionally advanced.
+    fn exit_reading_with(
+        z_at_close: f64,
+        priced: bool,
+        modelled: bool,
+        sessions_later: i64,
+    ) -> ExitReading {
         use crate::common::alpaca::PriceSource;
 
         let long = Ticker::new("AAAA").unwrap();
         let short = Ticker::new("BBBB").unwrap();
         let pair_id = PairID::new(long.clone(), short.clone());
 
-        // Only the short leg moves. Wiggling both proportionally would hold `ln(short) - ln(long)`
-        // exactly constant, and a spread with no dispersion makes every z-score enormous — the
-        // zero-variance fixture that quietly makes a test assert nothing.
+        // Only the short leg moves: wiggling both proportionally holds `ln(short) - ln(long)`
+        // constant, and a spread with no dispersion is the fixture that makes a test assert nothing.
         let long_closes: Vec<f64> = vec![100.0; CORRELATION_WINDOW_SESSIONS];
         let short_closes: Vec<f64> = (0..CORRELATION_WINDOW_SESSIONS)
             .map(|index| if index % 2 == 0 { 50.0 } else { 51.0 })
@@ -1455,8 +1484,11 @@ mod tests {
 
         let opened_at = DateTime::from_timestamp(1_770_000_000, 0).unwrap();
         let mut models = HashMap::new();
-        models.insert(pair_id.clone(), model);
+        if modelled {
+            models.insert(pair_id.clone(), model);
+        }
 
+        let read_at = opened_at + chrono::Duration::days(sessions_later);
         ExitReading {
             open_pairs: vec![OpenPair::new(
                 uuid::Uuid::nil(),
@@ -1467,8 +1499,8 @@ mod tests {
             )],
             prices,
             models,
-            session: SessionDate::at(opened_at),
-            now: opened_at,
+            session: SessionDate::at(read_at),
+            now: read_at,
         }
     }
 
@@ -1487,7 +1519,7 @@ mod tests {
             "a spread back through its mean has converged"
         );
         assert_eq!(plan.closes[0].reason, CloseReason::Convergence);
-        assert_eq!(plan.closes[0].reading_index, 0);
+        assert_eq!(plan.closes[0].pair_id, "AAAA-BBBB");
         assert_eq!(plan.readings.len(), 1, "every open pair is measured");
         assert_eq!(plan.unpriced, 0);
     }
@@ -1512,6 +1544,45 @@ mod tests {
         assert!(plan.closes.is_empty());
         assert_eq!(plan.readings[0].decision, "held");
         assert_eq!(plan.unpriced, 0);
+    }
+
+    /// A pair that outlived its session is scored on convergence alone, so a spread sitting past
+    /// its stop is *held* rather than stopped out — the two windows standardized against different
+    /// samples, and their difference is not a number of standard deviations.
+    ///
+    /// The branch that picks the rule, not `convergence_only` itself: a wrong session comparison
+    /// would silently apply the session-local stop to an overnight pair.
+    #[test]
+    fn test_a_pair_from_an_earlier_session_is_scored_on_convergence_alone() {
+        let widened = ENTRY_Z_SCORE + STOP_LOSS_WIDENING + 1.0;
+
+        let same_session = decide_exits(&exit_reading_with(widened, true, true, 0));
+        assert_eq!(
+            same_session.closes.len(),
+            1,
+            "within its own session the stop applies"
+        );
+        assert_eq!(same_session.closes[0].reason, CloseReason::StopLoss);
+
+        let overnight = decide_exits(&exit_reading_with(widened, true, true, 1));
+        assert!(
+            overnight.closes.is_empty(),
+            "across sessions the stop is unreadable, so the pair is held"
+        );
+        assert_eq!(overnight.readings[0].decision, "held");
+    }
+
+    /// A pair whose spread model could not be rebuilt is held and named, never closed.
+    #[test]
+    fn test_a_pair_without_a_spread_model_is_held_and_named() {
+        let plan = decide_exits(&exit_reading_with(-1.0, true, false, 0));
+
+        assert!(plan.closes.is_empty());
+        assert_eq!(plan.readings[0].decision, "no_spread_model");
+        assert_eq!(
+            plan.unpriced, 0,
+            "it was priced; what it lacked was the model"
+        );
     }
 
     /// The entry threshold, the convergence threshold, and the stop have to sit in that order or

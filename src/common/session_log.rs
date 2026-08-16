@@ -198,17 +198,33 @@ pub struct OpenPairsObserved {
     pub readings: Vec<OpenPairReading>,
 }
 
+/// Which round of a pass a plan belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPhase {
+    Exits,
+    Entries,
+}
+
+/// What a planned action would do to a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedActionKind {
+    Close,
+    Open,
+}
+
 /// What one round of a pass resolved to do, written before any of it is attempted.
 ///
 /// Its own record rather than a field on [`PassEvaluated`], which is written when the pass ends: a
 /// plan on that row would reach disk only after acting, so a process that died mid-execution would
-/// leave what it *intended* unrecorded and what it *managed* indistinguishable from all it meant to.
+/// leave what it intended unrecorded.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlanDecided {
-    /// Which round decided it — `exits` or `entries`.
-    pub phase: String,
+    pub phase: PlanPhase,
     pub actions: Vec<PlannedAction>,
-    /// What the round weighed and chose not to act on, so an empty plan is legible.
+    /// Everything the round weighed, actions included. Subtract `actions.len()` for what it passed
+    /// over, which is what makes an empty plan legible.
     pub considered: usize,
 }
 
@@ -216,8 +232,7 @@ pub struct PlanDecided {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlannedAction {
     pub pair_id: String,
-    /// `close` or `open`.
-    pub action: String,
+    pub action: PlannedActionKind,
     /// The close reason, or the entry's rank among the candidates that cleared.
     pub reason: String,
     pub long_ticker: String,
@@ -320,7 +335,8 @@ pub struct CandidateReading {
     /// Whole shares the short leg was sized to.
     pub short_shares: Option<f64>,
     pub gross_exposure: Option<f64>,
-    /// `opened`, `not_selected`, `risk_refused`, `unfilled`, or `abandoned_at_shutdown`.
+    /// `opened`, `planned`, `not_selected`, `risk_refused`, `unfilled`, or
+    /// `abandoned_at_shutdown`.
     pub decision: String,
     /// The risk gate's rendered reason, when `decision` is `risk_refused`.
     pub refusal: Option<String>,
@@ -794,10 +810,10 @@ mod tests {
             Observation::UniverseScreened(UniverseScreened::default()),
             Observation::OpenPairsObserved(OpenPairsObserved::default()),
             Observation::PlanDecided(PlanDecided {
-                phase: "entries".to_string(),
+                phase: PlanPhase::Entries,
                 actions: vec![PlannedAction {
                     pair_id: "AAAA-BBBB".to_string(),
-                    action: "open".to_string(),
+                    action: PlannedActionKind::Open,
                     reason: "rank 1".to_string(),
                     long_ticker: "AAAA".to_string(),
                     short_ticker: "BBBB".to_string(),
