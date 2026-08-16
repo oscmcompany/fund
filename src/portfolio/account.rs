@@ -1,17 +1,7 @@
 //! The post-close account sync: what Alpaca says actually happened.
 //!
-//! Three things, in order. Balances land in `account_snapshots`, whose `equity` is what the *next*
-//! session's drawdown gate measures against. Fills, transfers, dividends, interest, and fees land
-//! in `account_activities`, keyed by Alpaca's activity identifier so a re-run conflicts on every
-//! row and changes nothing. Then the fills — and only the fills — are attributed back to their
-//! pairs.
-//!
-//! Attribution is a materialization, not a source: `realized_profit_and_loss` exists so the
-//! dashboard need not re-join activities to pairs on every page load.
-//!
-//! Transfers are stored because they are read, not because they are attributed: a capital flow
-//! makes every equity-derived return wrong, and the dashboard withholds those figures rather than
-//! publishing them. Nothing here decides *whose* capital moved — Alpaca does not know.
+//! Balances land in `account_snapshots`, activities in `account_activities` keyed by Alpaca's own
+//! identifier, and then the fills — and only the fills — are attributed back to their pairs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,11 +23,12 @@ use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
 use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 
-/// The activity types this sync fetches for the session it is syncing.
+/// The activity types this sync asks for by session date.
 ///
 /// Fills, because they are attributed to pairs, plus transfers, because a capital flow invalidates
-/// every equity-derived return the dashboard publishes and something has to see it arrive. Both
-/// carry a `transaction_time`, so asking for the session they belong to returns them.
+/// every equity-derived return the dashboard publishes. Only fills answer the session they belong
+/// to: a transfer is date-only and created the next morning, so `date=D` returns the one dated
+/// `D-1` and this session's arrives at the next sync.
 pub fn synced_activity_types() -> Vec<&'static str> {
     std::iter::once(FILL_ACTIVITY_TYPE)
         .chain(TRANSFER_ACTIVITY_TYPES)
@@ -46,10 +37,9 @@ pub fn synced_activity_types() -> Vec<&'static str> {
 
 /// How far back each sync re-asks for [`RETURN_ACTIVITY_TYPES`].
 ///
-/// A fee for a session is not created until roughly 00:15 UTC the following day, hours after the
-/// 16:15 Eastern sync, so the session that incurred it can never see it — every one is picked up
-/// by a later run. Seven days spans a long weekend with room for a missed sync, and costs one
-/// request whose rows are already stored.
+/// A session's fees are not created until roughly 00:15 UTC the next day, so the session that
+/// incurred them can never observe them. Seven days spans a long weekend with room for a missed
+/// sync, and costs one request whose rows are already stored.
 const RETURN_ACTIVITY_WINDOW_DAYS: i64 = 7;
 
 /// Errors syncing the account.
@@ -82,7 +72,7 @@ pub struct AccountSyncSummary {
     /// Dividends, interest, and fees seen for the first time by this sync, which belong to earlier
     /// sessions rather than this one.
     pub return_activities_stored: usize,
-    /// What those cost, summed and signed: negative is a drag on the sessions they fell in.
+    /// Their net effect on the balance, signed: dividends and interest add, fees subtract.
     pub return_activities_net: Decimal,
 }
 

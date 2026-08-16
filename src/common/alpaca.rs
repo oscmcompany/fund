@@ -762,12 +762,12 @@ pub const TRANSFER_ACTIVITY_TYPES: [&str; 3] = ["CSD", "CSW", "JNLC"];
 /// Activity types that move the balance without capital crossing the account boundary.
 ///
 /// The complement of [`TRANSFER_ACTIVITY_TYPES`]: these are performance, so a session holding one
-/// still has a publishable return. The dividend family is listed in full because the withholdings
-/// and fees among it — `DIVFEE`, `DIVNRA`, `DIVFT`, `DIVTW` — are reductions, and syncing `DIV`
-/// alone would report gross income as net.
-pub const RETURN_ACTIVITY_TYPES: [&str; 13] = [
-    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "INT",
-    "INTNRA", "INTTW", "FEE",
+/// still has a publishable return. Listed in full because the withholdings among them — `DIVFEE`,
+/// `DIVNRA`, `DIVFT`, `DIVTW` — are reductions, and syncing `DIV` alone would report gross income
+/// as net.
+pub const RETURN_ACTIVITY_TYPES: [&str; 14] = [
+    "DIV", "DIVCGL", "DIVCGS", "DIVFEE", "DIVFT", "DIVNRA", "DIVROC", "DIVTW", "DIVTXEX", "CGD",
+    "INT", "INTNRA", "INTTW", "FEE",
 ];
 
 /// What one activity fetch returned, and what it knows it missed.
@@ -1219,10 +1219,8 @@ impl TradingClient {
 
     /// Fetches every activity of `activity_types` Alpaca has recorded since `after`.
     ///
-    /// Windowed on Alpaca's record time rather than the session an activity belongs to, because
-    /// the two differ: a fee for session S is not created until roughly S+1 00:15 UTC, so asking
-    /// for S returns nothing. Callers file each row under its own date and rely on the activity id
-    /// to make the overlap idempotent.
+    /// Windowed on Alpaca's record time, not the session an activity belongs to: a fee for session
+    /// S is not created until roughly S+1 00:15 UTC. Callers file each row under its own date.
     pub async fn fetch_activities_since(
         &self,
         activity_types: &[&str],
@@ -1248,7 +1246,7 @@ impl TradingClient {
         &self,
         url: &str,
         base_query: &[(&str, &str)],
-        activity_type: &str,
+        activity_types: &str,
     ) -> Result<ActivityFetch, ClientError> {
         let page_size = ACTIVITIES_PAGE_SIZE.to_string();
 
@@ -1314,7 +1312,7 @@ impl TradingClient {
             if page + 1 == ACTIVITIES_MAXIMUM_PAGES {
                 truncated = true;
                 warn!(
-                    activity_type,
+                    activity_types,
                     pages = ACTIVITIES_MAXIMUM_PAGES,
                     "Activity pagination hit its page bound; the tail was not fetched"
                 );
@@ -1323,12 +1321,12 @@ impl TradingClient {
 
         if undated > 0 {
             warn!(
-                activity_type,
+                activity_types,
                 undated, "Dropped activities carrying neither a transaction time nor a date"
             );
         }
         debug!(
-            activity_type,
+            activity_types,
             activities = activities.len(),
             "Account activities fetched"
         );
@@ -3374,6 +3372,9 @@ mod tests {
 
     /// The trailing-window fetch asks the plural endpoint for every return type in one request,
     /// windowed on Alpaca's record time. Verbatim live payload, fees and all.
+    ///
+    /// The type list is matched whole rather than by a wildcard, so dropping one from the constant
+    /// fails here instead of silently narrowing what a sync asks for.
     #[tokio::test]
     async fn test_return_activities_are_fetched_as_one_windowed_request() {
         let mut server = mockito::Server::new_async().await;
@@ -3381,7 +3382,12 @@ mod tests {
             .mock("GET", "/v2/account/activities")
             .match_query(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::UrlEncoded("after".into(), "2026-08-07".into()),
-                mockito::Matcher::Regex("activity_types=DIV%2C.*%2CFEE".into()),
+                mockito::Matcher::UrlEncoded(
+                    "activity_types".into(),
+                    "DIV,DIVCGL,DIVCGS,DIVFEE,DIVFT,DIVNRA,DIVROC,DIVTW,DIVTXEX,CGD,INT,INTNRA,\
+                     INTTW,FEE"
+                        .into(),
+                ),
             ]))
             .with_status(200)
             .with_header("content-type", "application/json")
