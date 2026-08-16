@@ -55,6 +55,8 @@ pub enum Observation {
     UniverseScreened(UniverseScreened),
     /// Every open pair as one pass measured it, closed or held.
     OpenPairsObserved(OpenPairsObserved),
+    /// What one round of a pass resolved to do, written before any of it is attempted.
+    PlanDecided(PlanDecided),
     /// A pair as it was written to the book.
     PairOpened(PairOpened),
     /// A pair as it was marked closed.
@@ -86,6 +88,7 @@ impl Observation {
             Observation::PricesObserved(_) => "prices_observed",
             Observation::UniverseScreened(_) => "universe_screened",
             Observation::OpenPairsObserved(_) => "open_pairs_observed",
+            Observation::PlanDecided(_) => "plan_decided",
             Observation::PairOpened(_) => "pair_opened",
             Observation::PairClosed(_) => "pair_closed",
             Observation::PairAttributed(_) => "pair_attributed",
@@ -195,6 +198,50 @@ pub struct OpenPairsObserved {
     pub readings: Vec<OpenPairReading>,
 }
 
+/// Which round of a pass a plan belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPhase {
+    Exits,
+    Entries,
+}
+
+/// What a planned action would do to a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedActionKind {
+    Close,
+    Open,
+}
+
+/// What one round of a pass resolved to do, written before any of it is attempted.
+///
+/// Its own record rather than a field on [`PassEvaluated`], which is written when the pass ends: a
+/// plan on that row would reach disk only after acting, so a process that died mid-execution would
+/// leave what it intended unrecorded.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanDecided {
+    pub phase: PlanPhase,
+    pub actions: Vec<PlannedAction>,
+    /// Everything the round weighed, actions included. Subtract `actions.len()` for what it passed
+    /// over, which is what makes an empty plan legible.
+    pub considered: usize,
+}
+
+/// One thing a plan calls for, carrying enough to reconstruct the attempt if it never completes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlannedAction {
+    pub pair_id: String,
+    pub action: PlannedActionKind,
+    /// The close reason, or the entry's rank among the candidates that cleared.
+    pub reason: String,
+    pub long_ticker: String,
+    pub short_ticker: String,
+    /// Present for an entry, which is sized before it is sent.
+    pub long_notional: Option<f64>,
+    pub short_shares: Option<f64>,
+}
+
 /// One prediction as the screen consumed it.
 ///
 /// Derived from the stored quantiles and the session's universe, so not recoverable from
@@ -288,7 +335,8 @@ pub struct CandidateReading {
     /// Whole shares the short leg was sized to.
     pub short_shares: Option<f64>,
     pub gross_exposure: Option<f64>,
-    /// `opened`, `not_selected`, `risk_refused`, `unfilled`, or `abandoned_at_shutdown`.
+    /// `opened`, `planned`, `not_selected`, `risk_refused`, `unfilled`, or
+    /// `abandoned_at_shutdown`.
     pub decision: String,
     /// The risk gate's rendered reason, when `decision` is `risk_refused`.
     pub refusal: Option<String>,
@@ -715,6 +763,7 @@ mod tests {
                 Observation::PricesObserved(_) => "prices_observed",
                 Observation::UniverseScreened(_) => "universe_screened",
                 Observation::OpenPairsObserved(_) => "open_pairs_observed",
+                Observation::PlanDecided(_) => "plan_decided",
                 Observation::PairOpened(_) => "pair_opened",
                 Observation::PairClosed(_) => "pair_closed",
                 Observation::PairAttributed(_) => "pair_attributed",
@@ -760,6 +809,19 @@ mod tests {
             Observation::PricesObserved(PricesObserved::default()),
             Observation::UniverseScreened(UniverseScreened::default()),
             Observation::OpenPairsObserved(OpenPairsObserved::default()),
+            Observation::PlanDecided(PlanDecided {
+                phase: PlanPhase::Entries,
+                actions: vec![PlannedAction {
+                    pair_id: "AAAA-BBBB".to_string(),
+                    action: PlannedActionKind::Open,
+                    reason: "rank 1".to_string(),
+                    long_ticker: "AAAA".to_string(),
+                    short_ticker: "BBBB".to_string(),
+                    long_notional: Some(1_000.0),
+                    short_shares: Some(12.0),
+                }],
+                considered: 4,
+            }),
             Observation::PairOpened(PairOpened {
                 pair_uuid: Uuid::nil().to_string(),
                 pair_id: "AAAA-BBBB".to_string(),
