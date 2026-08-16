@@ -212,14 +212,15 @@ async fn test_activities_are_idempotent_on_alpacas_identifier() {
         account::store_activities(&pool, std::slice::from_ref(&activity))
             .await
             .unwrap(),
-        1
+        vec![activity.id().to_string()],
+        "the first store reports the row it inserted"
     );
     assert_eq!(
         account::store_activities(&pool, std::slice::from_ref(&activity))
             .await
             .unwrap(),
-        0,
-        "a re-run must conflict rather than duplicate"
+        Vec::<String>::new(),
+        "a re-run must conflict rather than duplicate, and report nothing new"
     );
 
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM account_activities")

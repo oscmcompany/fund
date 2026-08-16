@@ -158,6 +158,23 @@ async fn mock_no_transfers(server: &mut mockito::ServerGuard) {
     }
 }
 
+/// Answers the trailing-window request for dividends, interest, and fees with an empty list.
+///
+/// One request rather than one per type: the sync asks the plural endpoint for the whole family at
+/// once. Anchored so it cannot also swallow the per-type requests the other mocks answer.
+async fn mock_no_return_activities(server: &mut mockito::ServerGuard) {
+    server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/account/activities(\?|$)".into()),
+        )
+        .with_status(200)
+        .with_body("[]")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+}
+
 /// A universe holding exactly the named tickers, every one of them shortable.
 fn universe_of(tickers: &[&str]) -> Universe {
     use fund::common::alpaca::TradableAssets;
@@ -1251,6 +1268,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
         .await;
 
     mock_no_transfers(&mut server).await;
+    mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let log = session_log("test-the-account-sync-stores-and-attributes-a-session");
@@ -1340,6 +1358,7 @@ async fn test_the_account_sync_is_idempotent() {
         .await;
 
     mock_no_transfers(&mut server).await;
+    mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let calendar = calendar_ending_at(session_date);
@@ -1422,6 +1441,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
             .create_async()
             .await;
     }
+    mock_no_return_activities(&mut server).await;
     // The shape a real account returns: a settlement date, no transaction time, and the amount
     // carried by `net_amount` rather than a quantity and a price.
     let _deposit = server
@@ -1509,6 +1529,7 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
             .create_async()
             .await;
     }
+    mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let log = session_log("test-the-account-sync-reports-a-missing-previous-session-2");
@@ -1610,4 +1631,115 @@ fn session_instant() -> chrono::DateTime<Utc> {
     let today = SessionDate::at(Utc::now());
     let (start, _) = today.bounds();
     start + Duration::hours(11) // 11:00 Eastern, mid-session
+}
+
+/// A fee for an earlier session, which is the only way one can ever arrive.
+///
+/// Alpaca does not create a session's fees until roughly 00:15 UTC the following day, hours after
+/// the 16:15 Eastern sync, so the trailing window is what picks them up. This asserts the fee is
+/// stored under its own session, counted as a cost, and never reaches attribution — it has no
+/// symbol, so no pair could claim it.
+#[tokio::test]
+#[serial]
+async fn test_a_fee_from_an_earlier_session_is_stored_as_a_cost() {
+    use fund::portfolio::account;
+
+    let pool = fresh_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    let session_date = SessionDate::at(session_instant());
+    let earlier = session_date.plus_calendar_days(-1);
+
+    let _account = server
+        .mock("GET", "/v2/account")
+        .with_status(200)
+        .with_body(account_body(30_000))
+        .create_async()
+        .await;
+    for activity_type in account::synced_activity_types() {
+        server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!("^/v2/account/activities/{activity_type}")),
+            )
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+    }
+    let _fees = server
+        .mock(
+            "GET",
+            mockito::Matcher::Regex(r"^/v2/account/activities(\?|$)".into()),
+        )
+        .with_status(200)
+        .with_body(format!(
+            r#"[{{"id":"fee-taf","activity_type":"FEE","activity_sub_type":"TAF","date":"{}",
+                  "net_amount":"-0.07","status":"executed"}},
+                {{"id":"fee-reg","activity_type":"FEE","activity_sub_type":"REG","date":"{}",
+                  "net_amount":"-0.31","status":"executed"}}]"#,
+            earlier.date(),
+            earlier.date()
+        ))
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let trading = TradingClient::with_base_url(credentials(), server.url());
+    let log = session_log("test-a-fee-from-an-earlier-session-is-stored-as-a-cost");
+    let summary = account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar_ending_at(session_date),
+        session_date,
+    )
+    .await
+    .expect("the sync must run");
+
+    assert_eq!(summary.return_activities_stored, 2);
+    assert_eq!(
+        summary.return_activities_net,
+        rust_decimal::Decimal::new(-38, 2),
+        "the fee family nets to a drag on the session it fell in"
+    );
+    assert_eq!(
+        summary.activities_unattributed, 0,
+        "a fee has no symbol and must never reach attribution"
+    );
+
+    let stored_time: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT transaction_time FROM account_activities WHERE id = 'fee-taf'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        SessionDate::at(stored_time),
+        earlier,
+        "the fee belongs to the session that incurred it, not the one that fetched it"
+    );
+
+    // The window re-reads the same fees for another six days. Without the insert reporting which
+    // rows were new, each re-read would append another observation for a fee already recorded.
+    account::sync_account(
+        &pool,
+        &trading,
+        &log,
+        uuid::Uuid::new_v4(),
+        &calendar_ending_at(session_date),
+        session_date,
+    )
+    .await
+    .expect("the second sync must run");
+
+    let observed = recorded(&log);
+    let fees: Vec<&serde_json::Value> = of_type(&observed, "activity_observed")
+        .into_iter()
+        .filter(|record| record["payload"]["activity_type"] == "FEE")
+        .collect();
+    assert_eq!(
+        fees.len(),
+        2,
+        "an overlapping window must not record a fee it already recorded"
+    );
 }
