@@ -31,10 +31,11 @@ use chrono::{DateTime, Utc};
 use polars::prelude::*;
 use tracing::{info, warn};
 
+use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
 use crate::common::types::SessionDate;
-use crate::data::{bars, splits};
+use crate::data::{bars, boundaries, splits};
 
 /// S3 prefix for the bar archive.
 ///
@@ -59,6 +60,12 @@ pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 /// Under `corporate_actions/` rather than a directory of its own, because spinoffs and symbol
 /// changes are the same kind of fact read the same way and belong beside it as sibling files.
 pub const SPLITS_ARCHIVE_KEY: &str = "data/equity/corporate_actions/splits.parquet";
+
+/// Object holding every date a symbol's price series may not be read across.
+///
+/// Beside the splits table rather than merged into it, because the two are read for opposite
+/// purposes: a split says how to restate a price across a date, a boundary says not to.
+pub const BOUNDARIES_ARCHIVE_KEY: &str = "data/equity/corporate_actions/boundaries.parquet";
 
 /// Trailing sessions re-fetched even when a partition already exists.
 ///
@@ -532,6 +539,65 @@ pub async fn archive_splits(
         "Splits table archived"
     );
     Ok(splits.len())
+}
+
+/// Refreshes the series-boundary table over `start..=end`, merging it with what is stored.
+///
+/// Windowed rather than whole, unlike [`archive_splits`]: the corporate-actions endpoint has no
+/// all-time form, so the caller says how far back to refresh and rows outside that range are left
+/// as they were.
+///
+/// An empty fetch is written rather than refused, again unlike the splits table. A date range
+/// containing no corporate action is an ordinary answer, so treating it as an outage would leave a
+/// cancelled action in the table forever.
+pub async fn archive_boundaries(
+    s3_client: &S3Client,
+    market_data: &MarketDataClient,
+    bucket: &str,
+    start: SessionDate,
+    end: SessionDate,
+    fetched_at: DateTime<Utc>,
+) -> Result<usize, ArchiveError> {
+    let fetched = market_data
+        .fetch_corporate_actions(start.date(), end.date())
+        .await
+        .map_err(|error| ArchiveError::Feed(error.to_string()))?;
+
+    let frame = boundaries::boundaries_to_dataframe(&fetched, fetched_at)?;
+    write_merged(
+        s3_client,
+        bucket,
+        BOUNDARIES_ARCHIVE_KEY.to_string(),
+        frame,
+        // Falls back rather than propagating, for the reason `archive_splits` does: a stored object
+        // whose schema stopped matching would otherwise fail every future refresh too.
+        |existing, fetched, key| match boundaries::merge_boundaries(
+            existing,
+            fetched.clone(),
+            start,
+            end,
+        ) {
+            Ok(merged) => Ok(merged),
+            Err(error) => {
+                warn!(
+                    key,
+                    %error,
+                    "Could not merge the stored boundary table; replacing it with the fetched rows"
+                );
+                Ok(fetched)
+            }
+        },
+    )
+    .await?;
+
+    info!(
+        key = BOUNDARIES_ARCHIVE_KEY,
+        boundaries = fetched.len(),
+        %start,
+        %end,
+        "Boundary table archived"
+    );
+    Ok(fetched.len())
 }
 
 /// Writes the ticker metadata that accompanies the archive.

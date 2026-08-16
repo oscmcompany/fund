@@ -982,9 +982,11 @@ in {
     # downtime cost the same nothing -- then trains against that window and uploads a model.tar.gz
     # the service loads directly. A gap older than the window is `data:seed:s3`, which floors at two
     # years.
-    # Needs no Alpaca credentials: the grouped endpoint answers by date, so there is no symbol list
-    # to build and therefore no broker to ask for one. That is also why the archive scan decides
-    # which sessions to request from weekends rather than from the published trading calendar.
+    # The bars need no Alpaca credentials: the grouped endpoint answers by date, so there is no
+    # symbol list to build and therefore no broker to ask for one. That is also why the archive scan
+    # decides which sessions to request from weekends rather than from the published trading
+    # calendar. The series-boundary table does need them, because Massive reports splits and nothing
+    # else -- but it warns and skips when they are absent rather than failing the run.
     # The former Python/tinygrad workflow and its Prefect block registration are retired.
     "models:tide:train".exec = ''
       set -euo pipefail

@@ -19,7 +19,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::common::types::{BarInterval, Dollars, EquityBar, EquityQuote, EquityTrade, Ticker};
+use crate::common::types::{
+    BarInterval, BoundaryReason, Dollars, EquityBar, EquityQuote, EquityTrade, SeriesBoundary,
+    SessionDate, Ticker,
+};
 
 // --------------------------------------------------------------------------
 // Shared configuration and errors
@@ -1874,6 +1877,149 @@ impl std::fmt::Display for PriceSource {
     }
 }
 
+/// Rows per corporate-actions page. The endpoint's maximum.
+const CORPORATE_ACTIONS_PAGE_SIZE: usize = 1_000;
+
+/// Page bound for the corporate-actions cursor, so a token that never clears cannot loop forever.
+const CORPORATE_ACTIONS_PAGE_LIMIT: usize = 200;
+
+/// The action types that bound a price series.
+///
+/// Splits are absent deliberately: they come from Massive and are folded rather than bounded.
+/// Mergers and worthless removals are absent because a terminated symbol stops appearing in the bar
+/// feed, so a recent window excludes it without being told to.
+const BOUNDARY_ACTION_TYPES: &str =
+    "name_change,spin_off,rights_distribution,unit_split,reorganization";
+
+/// The corporate-actions envelope: categories keyed by name, plus the cursor.
+#[derive(Debug, Deserialize)]
+struct CorporateActionsResponse {
+    #[serde(default)]
+    corporate_actions: CorporateActionCategories,
+    next_page_token: Option<String>,
+}
+
+/// Every category is optional: the endpoint omits one entirely when a page has none of it.
+#[derive(Debug, Default, Deserialize)]
+struct CorporateActionCategories {
+    #[serde(default)]
+    name_changes: Vec<NameChangePayload>,
+    #[serde(default)]
+    spin_offs: Vec<SpinOffPayload>,
+    #[serde(default)]
+    rights_distributions: Vec<RightsDistributionPayload>,
+    #[serde(default)]
+    unit_splits: Vec<UnitSplitPayload>,
+    #[serde(default)]
+    reorganizations: Vec<ReorganizationPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NameChangePayload {
+    id: String,
+    old_symbol: String,
+    new_symbol: String,
+    process_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpinOffPayload {
+    id: String,
+    source_symbol: String,
+    new_symbol: String,
+    ex_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RightsDistributionPayload {
+    id: String,
+    source_symbol: String,
+    ex_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UnitSplitPayload {
+    id: String,
+    old_symbol: String,
+    effective_date: Option<NaiveDate>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReorganizationPayload {
+    id: String,
+    symbol: String,
+    effective_date: Option<NaiveDate>,
+}
+
+/// Turns one page's categories into boundaries, dropping rows that cannot be one.
+///
+/// Most dropped rows are the feed's CUSIP placeholders in symbol fields — `038CVR031` and the like
+/// — which [`Ticker::new`] rejects for containing digits. A name change whose symbol did not change
+/// is dropped by [`SeriesBoundary::new`], and it is the single most common row in the feed.
+fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary> {
+    let mut boundaries: Vec<SeriesBoundary> = Vec::new();
+    let mut push = |id: String, symbol: &str, date: Option<NaiveDate>, reason: BoundaryReason| {
+        let (Some(ticker), Some(date)) = (Ticker::new(symbol), date) else {
+            return;
+        };
+        if let Ok(boundary) = SeriesBoundary::new(id, ticker, SessionDate::from_date(date), reason)
+        {
+            boundaries.push(boundary);
+        }
+    };
+
+    for payload in categories.name_changes {
+        // The successor has to parse for the row to say anything: a rename onto a CUSIP placeholder
+        // records that the symbol stopped, but not where to follow it.
+        let Some(to) = Ticker::new(&payload.new_symbol) else {
+            continue;
+        };
+        push(
+            payload.id,
+            &payload.old_symbol,
+            payload.process_date,
+            BoundaryReason::Renamed { to },
+        );
+    }
+    for payload in categories.spin_offs {
+        let Some(spin_off_company) = Ticker::new(&payload.new_symbol) else {
+            continue;
+        };
+        push(
+            payload.id,
+            &payload.source_symbol,
+            payload.ex_date,
+            BoundaryReason::SpunOff { spin_off_company },
+        );
+    }
+    for payload in categories.rights_distributions {
+        push(
+            payload.id,
+            &payload.source_symbol,
+            payload.ex_date,
+            BoundaryReason::RightsDistributed,
+        );
+    }
+    for payload in categories.unit_splits {
+        push(
+            payload.id,
+            &payload.old_symbol,
+            payload.effective_date,
+            BoundaryReason::UnitSeparated,
+        );
+    }
+    for payload in categories.reorganizations {
+        push(
+            payload.id,
+            &payload.symbol,
+            payload.effective_date,
+            BoundaryReason::Reorganized,
+        );
+    }
+
+    boundaries
+}
+
 /// REST client for the Alpaca market data API.
 #[derive(Clone)]
 pub struct MarketDataClient {
@@ -1929,6 +2075,78 @@ impl MarketDataClient {
             .get(url)
             .header(HEADER_KEY_ID, self.credentials.key_id())
             .header(HEADER_SECRET_KEY, self.credentials.secret())
+    }
+
+    /// Fetches the corporate actions that bound a price series, between `start` and `end`.
+    ///
+    /// Bounded by a date range rather than fetched whole, unlike the splits table: this endpoint
+    /// has no all-time form, so the caller decides how far back the archive should reach.
+    ///
+    /// Rows the feed reports but this cannot use are dropped and counted rather than failing the
+    /// page, because most of them are expected — the feed puts CUSIP placeholders in symbol fields
+    /// and reports far more unchanged-symbol renames than real ones.
+    pub async fn fetch_corporate_actions(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<SeriesBoundary>, ClientError> {
+        let url = format!("{}/v1/corporate-actions", self.base_url);
+        let start_text = start.to_string();
+        let end_text = end.to_string();
+        let page_size = CORPORATE_ACTIONS_PAGE_SIZE.to_string();
+
+        let mut boundaries: Vec<SeriesBoundary> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut received: usize = 0;
+
+        for page in 1..=CORPORATE_ACTIONS_PAGE_LIMIT {
+            let mut query: Vec<(&str, &str)> = vec![
+                ("start", start_text.as_str()),
+                ("end", end_text.as_str()),
+                ("types", BOUNDARY_ACTION_TYPES),
+                ("limit", page_size.as_str()),
+            ];
+            if let Some(token) = page_token.as_deref() {
+                query.push(("page_token", token));
+            }
+
+            let response = error_for_status(self.get(&url).query(&query).send().await?).await?;
+            let payload: CorporateActionsResponse = response.json().await.map_err(|error| {
+                ClientError::Parse(format!("Failed to parse corporate actions: {error}"))
+            })?;
+
+            let categories = payload.corporate_actions;
+            received += categories.name_changes.len()
+                + categories.spin_offs.len()
+                + categories.rights_distributions.len()
+                + categories.unit_splits.len()
+                + categories.reorganizations.len();
+            boundaries.extend(parse_boundaries(categories));
+
+            let Some(token) = payload.next_page_token else {
+                let dropped = received.saturating_sub(boundaries.len());
+                if dropped > 0 {
+                    // Routine, and the majority: placeholders and renames that changed no symbol.
+                    warn!(
+                        dropped,
+                        received, "Dropped corporate action rows that bound nothing"
+                    );
+                }
+                info!(
+                    boundaries = boundaries.len(),
+                    pages = page,
+                    %start,
+                    %end,
+                    "Corporate actions fetched"
+                );
+                return Ok(boundaries);
+            };
+            page_token = Some(token);
+        }
+
+        Err(ClientError::Parse(format!(
+            "corporate action pagination did not end within {CORPORATE_ACTIONS_PAGE_LIMIT} pages"
+        )))
     }
 
     /// Fetches point-in-time snapshots for `symbols`, in bounded chunks.
@@ -3528,5 +3746,194 @@ mod tests {
         let server = mockito::Server::new_async().await;
         let snapshots = client(server.url()).fetch_snapshots(&[]).await.unwrap();
         assert!(snapshots.snapshots.is_empty());
+    }
+
+    // --- corporate actions ---
+
+    /// Field names and row shapes copied from live responses, including the placeholder rows. The
+    /// splits feed taught that a payload which parses in a test and not against the feed is the
+    /// failure mode worth spending a fixture on.
+    const CORPORATE_ACTIONS_PAGE: &str = r#"{
+        "corporate_actions": {
+            "name_changes": [
+                {"id":"n1","old_cusip":"03209R103","old_symbol":"RNA",
+                 "new_cusip":"05370B107","new_symbol":"RNAM","process_date":"2026-02-26"},
+                {"id":"n2","old_cusip":"185CNT011","old_symbol":"185CNT011",
+                 "new_cusip":"18506U302","new_symbol":"18506U302","process_date":"2026-02-05"},
+                {"id":"n3","old_cusip":"00846U101","old_symbol":"INDV",
+                 "new_cusip":"00846U101","new_symbol":"INDV","process_date":"2026-01-26"}
+            ],
+            "spin_offs": [
+                {"ex_date":"2026-06-01","id":"s1","new_cusip":"31428X106","new_rate":0.5,
+                 "new_symbol":"FDXF","process_date":"2026-06-01","source_cusip":"31428X106",
+                 "source_rate":1,"source_symbol":"FDX"},
+                {"ex_date":"2026-01-27","id":"s2","new_cusip":"898920103","new_rate":0.072996,
+                 "new_symbol":"HURA","process_date":"2026-01-27","source_cusip":"494ESC015",
+                 "source_rate":1,"source_symbol":"494ESC015"}
+            ],
+            "rights_distributions": [
+                {"ex_date":"2026-02-10","expiration_date":"2026-02-27","id":"r1",
+                 "new_cusip":"009RGT010","new_symbol":"009RGT010","payable_date":"2026-02-19",
+                 "process_date":"2026-02-19","rate":1,"record_date":"2026-02-10",
+                 "source_cusip":"00901B303","source_symbol":"AIM"}
+            ],
+            "unit_splits": [
+                {"alternate_cusip":"G0679A118","alternate_rate":0.1667,"alternate_symbol":"ACAAW",
+                 "effective_date":"2026-04-10","id":"u1","new_cusip":"G0679A100","new_rate":1,
+                 "new_symbol":"ACAA","old_cusip":"G0679A126","old_rate":1,"old_symbol":"ACAAU",
+                 "process_date":"2026-04-10"}
+            ],
+            "reorganizations": [
+                {"cash_rate":0.1,"cusip":"004ESC018","effective_date":"2026-05-06","id":"o1",
+                 "payable_date":"2026-05-11","process_date":"2026-05-11","symbol":"004ESC018"}
+            ]
+        }
+    }"#;
+
+    async fn boundaries_from(body: &str) -> Vec<SeriesBoundary> {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let fetched = client(server.url())
+            .fetch_corporate_actions(date(2026, 1, 1), date(2026, 8, 14))
+            .await
+            .expect("the page must parse");
+        mock.assert_async().await;
+        fetched
+    }
+
+    fn boundary_for<'a>(
+        boundaries: &'a [SeriesBoundary],
+        ticker: &str,
+    ) -> Option<&'a SeriesBoundary> {
+        boundaries
+            .iter()
+            .find(|boundary| boundary.ticker().as_str() == ticker)
+    }
+
+    #[tokio::test]
+    async fn test_each_category_becomes_the_boundary_it_describes() {
+        let boundaries = boundaries_from(CORPORATE_ACTIONS_PAGE).await;
+
+        assert_eq!(
+            boundary_for(&boundaries, "RNA").map(SeriesBoundary::reason),
+            Some(&BoundaryReason::Renamed {
+                to: Ticker::new("RNAM").unwrap()
+            })
+        );
+        assert_eq!(
+            boundary_for(&boundaries, "FDX").map(SeriesBoundary::reason),
+            Some(&BoundaryReason::SpunOff {
+                spin_off_company: Ticker::new("FDXF").unwrap()
+            }),
+            "a spinoff names the company whose shares were distributed"
+        );
+        assert_eq!(
+            boundary_for(&boundaries, "AIM").map(SeriesBoundary::reason),
+            Some(&BoundaryReason::RightsDistributed)
+        );
+        assert_eq!(
+            boundary_for(&boundaries, "ACAAU").map(SeriesBoundary::reason),
+            Some(&BoundaryReason::UnitSeparated),
+            "a unit separation names no successor: its price steps, so history cannot follow it"
+        );
+    }
+
+    /// A spinoff bounds the session its price steps in, which is the ex-date rather than the date
+    /// the transfer agent processed it.
+    #[tokio::test]
+    async fn test_a_spinoff_is_bounded_at_its_ex_date() {
+        let boundaries = boundaries_from(CORPORATE_ACTIONS_PAGE).await;
+
+        assert_eq!(
+            boundary_for(&boundaries, "FDX").map(SeriesBoundary::date),
+            Some(SessionDate::from_date(date(2026, 6, 1)))
+        );
+    }
+
+    /// The single most common row in the feed, and one that bounds nothing: the company's name or
+    /// CUSIP changed under an unchanged ticker. Admitting it would truncate every window spanning
+    /// a date on which nothing happened to the price.
+    #[tokio::test]
+    async fn test_a_rename_that_changes_no_symbol_is_not_a_boundary() {
+        let boundaries = boundaries_from(CORPORATE_ACTIONS_PAGE).await;
+
+        assert!(
+            boundary_for(&boundaries, "INDV").is_none(),
+            "INDV renamed to itself, so its series is continuous"
+        );
+    }
+
+    /// The feed puts CUSIPs in symbol fields for entities that never traded under a ticker. They
+    /// parse as JSON and mean nothing to a bar archive keyed by symbol.
+    #[tokio::test]
+    async fn test_placeholder_symbols_are_dropped() {
+        let boundaries = boundaries_from(CORPORATE_ACTIONS_PAGE).await;
+
+        assert_eq!(
+            boundaries.len(),
+            4,
+            "RNA, FDX, AIM and ACAAU survive; the three placeholder rows and INDV do not"
+        );
+        assert!(boundaries
+            .iter()
+            .all(|boundary| !boundary.ticker().as_str().contains(char::is_numeric)));
+    }
+
+    /// A page carrying only some categories is the normal case, not a malformed response.
+    #[tokio::test]
+    async fn test_a_page_missing_every_category_is_empty_rather_than_an_error() {
+        assert!(boundaries_from(r#"{"corporate_actions":{}}"#)
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pagination_follows_the_token_to_the_last_page() {
+        let mut server = mockito::Server::new_async().await;
+        // Registered before the tokenless page, because mockito serves the first mock whose
+        // matchers accept the request and the fallback below accepts any query at all.
+        let second = server
+            .mock("GET", mockito::Matcher::Any)
+            .match_query(mockito::Matcher::UrlEncoded(
+                "page_token".into(),
+                "page-two".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"corporate_actions":{"name_changes":[
+                    {"id":"n2","old_symbol":"SPCX","new_symbol":"SPCK","process_date":"2026-04-07"}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+        let first = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"corporate_actions":{"name_changes":[
+                    {"id":"n1","old_symbol":"RNA","new_symbol":"RNAM","process_date":"2026-02-26"}
+                ]},"next_page_token":"page-two"}"#,
+            )
+            .create_async()
+            .await;
+
+        let boundaries = client(server.url())
+            .fetch_corporate_actions(date(2026, 1, 1), date(2026, 8, 14))
+            .await
+            .expect("both pages must parse");
+
+        assert_eq!(boundaries.len(), 2, "rows from both pages are kept");
+        assert!(boundary_for(&boundaries, "SPCX").is_some());
+        first.assert_async().await;
+        second.assert_async().await;
     }
 }
