@@ -1,8 +1,6 @@
 //! The dates a symbol's price series may not be read across; nothing reads them yet.
 //!
-//! One S3 object rather than a partition per session, for the reason the splits table is one: a
-//! boundary belongs to its date, but the feed revises what it reports, so only the whole table is
-//! ever authoritative.
+//! One S3 object, refreshed over a date range and merged with what is stored.
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;
@@ -12,8 +10,7 @@ use crate::common::types::{BoundaryReason, SeriesBoundary, SessionDate};
 /// Builds the frame written to the archive, stamping every row with when this pass saw it.
 ///
 /// `related_ticker` holds whichever symbol the reason names — where a rename continues, or which
-/// company a spinoff distributed — and is null for the reasons that name none. One nullable column
-/// rather than one per variant keeps the frame flat and the schema stable as variants are added.
+/// company a spinoff distributed — and is null for the reasons that name neither.
 pub fn boundaries_to_dataframe(
     boundaries: &[SeriesBoundary],
     fetched_at: DateTime<Utc>,
@@ -21,6 +18,7 @@ pub fn boundaries_to_dataframe(
     let mut identifiers: Vec<String> = Vec::with_capacity(boundaries.len());
     let mut tickers: Vec<String> = Vec::with_capacity(boundaries.len());
     let mut dates: Vec<String> = Vec::with_capacity(boundaries.len());
+    let mut process_dates: Vec<String> = Vec::with_capacity(boundaries.len());
     let mut reasons: Vec<String> = Vec::with_capacity(boundaries.len());
     let mut related: Vec<Option<String>> = Vec::with_capacity(boundaries.len());
 
@@ -28,6 +26,13 @@ pub fn boundaries_to_dataframe(
         identifiers.push(boundary.id().to_string());
         tickers.push(boundary.ticker().as_str().to_string());
         dates.push(boundary.date().date().format("%Y-%m-%d").to_string());
+        process_dates.push(
+            boundary
+                .process_date()
+                .date()
+                .format("%Y-%m-%d")
+                .to_string(),
+        );
         reasons.push(boundary.reason().as_str().to_string());
         related.push(match boundary.reason() {
             BoundaryReason::Renamed { to } => Some(to.as_str().to_string()),
@@ -45,6 +50,7 @@ pub fn boundaries_to_dataframe(
         Column::new("id".into(), identifiers),
         Column::new("ticker".into(), tickers),
         Column::new("date".into(), dates),
+        Column::new("process_date".into(), process_dates),
         Column::new("reason".into(), reasons),
         Column::new("related_ticker".into(), related),
         Column::new("first_seen".into(), first_seen),
@@ -53,20 +59,13 @@ pub fn boundaries_to_dataframe(
 
 /// Merges a stored boundary table with one fetched over `start..=end`.
 ///
-/// Deliberately unlike [`crate::data::splits::merge_splits`], which replaces the row set outright.
-/// That is safe there because the splits feed answers with its entire history; this feed answers
-/// only for a date range, so replacing would erase every boundary outside the window that was
-/// asked for. Stored rows outside it therefore survive untouched, and only rows dated inside it are
-/// replaced — which is what lets a revised or cancelled action disappear.
+/// Unlike [`crate::data::splits::merge_splits`], which replaces the row set outright because that
+/// feed answers with its whole history, this one answers only for a range — so stored rows the
+/// refresh could not have re-reported survive, and absence within it means cancelled.
 ///
-/// An empty fetch still replaces inside the window: a range genuinely containing no corporate
-/// action is ordinary, unlike an empty all-time splits response, which is an outage.
-///
-/// The window and the stored date are not the same date. Alpaca filters a request by when it
-/// processed an action, while the boundary is stamped with when the price moved — its ex or
-/// effective date — so a June request returns rows stamped 2017. Surviving stored rows are
-/// therefore anti-joined on `id` as well as filtered by date, or a row outside the window that came
-/// back anyway would be kept twice.
+/// The range is matched on `process_date`, never on `date`. Alpaca filters a request by when it
+/// processed an action, while the boundary is stamped with when the price moved, and those differ
+/// by years: filtering survivors on the wrong one leaves a cancelled action archived forever.
 pub fn merge_boundaries(
     existing: DataFrame,
     fetched: DataFrame,
@@ -76,9 +75,8 @@ pub fn merge_boundaries(
     let start_text = start.date().format("%Y-%m-%d").to_string();
     let end_text = end.date().format("%Y-%m-%d").to_string();
 
-    // Compared as text rather than parsed dates: the column is written `%Y-%m-%d`, which orders
-    // lexicographically exactly as it orders chronologically, and parsing would import a failure
-    // mode for no gain.
+    // Compared as text: the column is written `%Y-%m-%d`, which orders lexicographically exactly as
+    // it orders chronologically.
     let outside_window = existing
         .clone()
         .lazy()
@@ -89,9 +87,9 @@ pub fn merge_boundaries(
             JoinArgs::new(JoinType::Anti),
         )
         .filter(
-            col("date")
+            col("process_date")
                 .lt(lit(start_text.clone()))
-                .or(col("date").gt(lit(end_text.clone()))),
+                .or(col("process_date").gt(lit(end_text.clone()))),
         );
 
     let previously_seen = existing
@@ -102,6 +100,14 @@ pub fn merge_boundaries(
 
     let refreshed = fetched
         .lazy()
+        // One row per identifier before the join, so a repeat across pages cannot become two rows.
+        .unique_stable(
+            Some(polars::prelude::Selector::ByName {
+                names: vec![PlSmallStr::from("id")].into(),
+                strict: false,
+            }),
+            UniqueKeepStrategy::First,
+        )
         .join(
             previously_seen,
             [col("id")],
@@ -123,6 +129,7 @@ pub fn merge_boundaries(
             col("id"),
             col("ticker"),
             col("date"),
+            col("process_date"),
             col("reason"),
             col("related_ticker"),
             col("first_seen"),
@@ -151,11 +158,24 @@ mod tests {
         SessionDate::from_date(value.parse().expect("a valid session date"))
     }
 
+    /// Processed on the day the price moved, which is the ordinary case. The tests that turn on the
+    /// two dates differing use `renamed_processed` instead.
     fn renamed(id: &str, ticker: &str, date: &str, to: &str) -> SeriesBoundary {
+        renamed_processed(id, ticker, date, date, to)
+    }
+
+    fn renamed_processed(
+        id: &str,
+        ticker: &str,
+        date: &str,
+        process_date: &str,
+        to: &str,
+    ) -> SeriesBoundary {
         SeriesBoundary::new(
             id.to_string(),
             Ticker::new(ticker).expect("a valid ticker"),
             session(date),
+            session(process_date),
             BoundaryReason::Renamed {
                 to: Ticker::new(to).expect("a valid ticker"),
             },
@@ -167,6 +187,7 @@ mod tests {
         SeriesBoundary::new(
             id.to_string(),
             Ticker::new(ticker).expect("a valid ticker"),
+            session(date),
             session(date),
             BoundaryReason::RightsDistributed,
         )
@@ -203,6 +224,37 @@ mod tests {
             related.get(1),
             None,
             "a reason that names no symbol stores none"
+        );
+    }
+
+    /// The cancellation this table exists to record, in the shape that is easiest to miss. The
+    /// action was processed inside the refreshed window but is stamped years outside it, so
+    /// matching survivors on the stored date would keep it forever and truncate real history at a
+    /// date nothing happened on.
+    #[test]
+    fn test_a_cancelled_action_processed_inside_the_window_is_dropped() {
+        let stored = boundaries_to_dataframe(
+            &[
+                renamed_processed("cancelled", "CNCL", "2017-03-01", "2026-06-10", "OTHR"),
+                renamed_processed("kept", "FB", "2022-06-09", "2022-06-09", "META"),
+            ],
+            instant("2026-08-01T02:00:00Z"),
+        )
+        .unwrap();
+        let nothing = boundaries_to_dataframe(&[], instant("2026-08-15T02:00:00Z")).unwrap();
+
+        let merged = merge_boundaries(
+            stored,
+            nothing,
+            session("2026-06-01"),
+            session("2026-06-30"),
+        )
+        .expect("the merge must succeed");
+
+        assert_eq!(
+            identifiers(&merged),
+            vec!["kept"],
+            "the refresh covered the cancelled action's processing, so its absence is authoritative"
         );
     }
 

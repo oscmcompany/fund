@@ -996,6 +996,7 @@ pub struct SeriesBoundary {
     id: String,
     ticker: Ticker,
     date: SessionDate,
+    process_date: SessionDate,
     reason: BoundaryReason,
 }
 
@@ -1005,13 +1006,18 @@ impl SeriesBoundary {
     /// A rename onto the same symbol is the case this exists for: the feed reports a company's name
     /// or CUSIP changing under an unchanged ticker far more often than a real symbol change, and
     /// such a row bounds nothing while truncating every window that spans it.
+    ///
+    /// The identifier is stored trimmed, because it is the key a refresh matches stored rows on and
+    /// whitespace either side would make one boundary look like two.
     pub fn new(
         id: String,
         ticker: Ticker,
         date: SessionDate,
+        process_date: SessionDate,
         reason: BoundaryReason,
     ) -> Result<Self, InconsistentRecordError> {
-        if id.trim().is_empty() {
+        let id = id.trim().to_string();
+        if id.is_empty() {
             return Err(reject("boundary identifier is empty"));
         }
         if reason.successor() == Some(&ticker) {
@@ -1024,6 +1030,7 @@ impl SeriesBoundary {
             id,
             ticker,
             date,
+            process_date,
             reason,
         })
     }
@@ -1036,8 +1043,17 @@ impl SeriesBoundary {
         &self.ticker
     }
 
+    /// The session the price moved: an ex-date, or an effective date.
     pub fn date(&self) -> SessionDate {
         self.date
+    }
+
+    /// The session the feed processed the action, which is what its date filter selects on.
+    ///
+    /// Carried because it is the only way a refresh can tell which stored rows it was in a position
+    /// to re-report, and therefore which absences mean an action was cancelled.
+    pub fn process_date(&self) -> SessionDate {
+        self.process_date
     }
 
     pub fn reason(&self) -> &BoundaryReason {

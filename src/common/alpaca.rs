@@ -1928,6 +1928,7 @@ struct SpinOffPayload {
     source_symbol: String,
     new_symbol: String,
     ex_date: Option<NaiveDate>,
+    process_date: Option<NaiveDate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1935,6 +1936,7 @@ struct RightsDistributionPayload {
     id: String,
     source_symbol: String,
     ex_date: Option<NaiveDate>,
+    process_date: Option<NaiveDate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1942,6 +1944,7 @@ struct UnitSplitPayload {
     id: String,
     old_symbol: String,
     effective_date: Option<NaiveDate>,
+    process_date: Option<NaiveDate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1949,6 +1952,7 @@ struct ReorganizationPayload {
     id: String,
     symbol: String,
     effective_date: Option<NaiveDate>,
+    process_date: Option<NaiveDate>,
 }
 
 /// Turns one page's categories into boundaries, dropping rows that cannot be one.
@@ -1958,12 +1962,25 @@ struct ReorganizationPayload {
 /// is dropped by [`SeriesBoundary::new`], and it is the single most common row in the feed.
 fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary> {
     let mut boundaries: Vec<SeriesBoundary> = Vec::new();
-    let mut push = |id: String, symbol: &str, date: Option<NaiveDate>, reason: BoundaryReason| {
-        let (Some(ticker), Some(date)) = (Ticker::new(symbol), date) else {
+    let mut push = |id: String,
+                    symbol: &str,
+                    date: Option<NaiveDate>,
+                    process_date: Option<NaiveDate>,
+                    reason: BoundaryReason| {
+        // The process date is required rather than defaulted: it is what a refresh matches its own
+        // window against, and a row without one could never be recognised as cancelled.
+        let (Some(ticker), Some(date), Some(process_date)) =
+            (Ticker::new(symbol), date, process_date)
+        else {
             return;
         };
-        if let Ok(boundary) = SeriesBoundary::new(id, ticker, SessionDate::from_date(date), reason)
-        {
+        if let Ok(boundary) = SeriesBoundary::new(
+            id,
+            ticker,
+            SessionDate::from_date(date),
+            SessionDate::from_date(process_date),
+            reason,
+        ) {
             boundaries.push(boundary);
         }
     };
@@ -1978,6 +1995,7 @@ fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary
             payload.id,
             &payload.old_symbol,
             payload.process_date,
+            payload.process_date,
             BoundaryReason::Renamed { to },
         );
     }
@@ -1989,6 +2007,7 @@ fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary
             payload.id,
             &payload.source_symbol,
             payload.ex_date,
+            payload.process_date,
             BoundaryReason::SpunOff { spin_off_company },
         );
     }
@@ -1997,6 +2016,7 @@ fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary
             payload.id,
             &payload.source_symbol,
             payload.ex_date,
+            payload.process_date,
             BoundaryReason::RightsDistributed,
         );
     }
@@ -2005,6 +2025,7 @@ fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary
             payload.id,
             &payload.old_symbol,
             payload.effective_date,
+            payload.process_date,
             BoundaryReason::UnitSeparated,
         );
     }
@@ -2013,6 +2034,7 @@ fn parse_boundaries(categories: CorporateActionCategories) -> Vec<SeriesBoundary
             payload.id,
             &payload.symbol,
             payload.effective_date,
+            payload.process_date,
             BoundaryReason::Reorganized,
         );
     }
@@ -3784,7 +3806,9 @@ mod tests {
                  "process_date":"2026-04-10"}
             ],
             "reorganizations": [
-                {"cash_rate":0.1,"cusip":"004ESC018","effective_date":"2026-05-06","id":"o1",
+                {"cash_rate":0.1,"cusip":"89531P105","effective_date":"2026-05-29","id":"o1",
+                 "payable_date":"2026-06-02","process_date":"2026-06-02","symbol":"TRXO"},
+                {"cash_rate":0.1,"cusip":"004ESC018","effective_date":"2026-05-06","id":"o2",
                  "payable_date":"2026-05-11","process_date":"2026-05-11","symbol":"004ESC018"}
             ]
         }
@@ -3843,6 +3867,10 @@ mod tests {
             Some(&BoundaryReason::UnitSeparated),
             "a unit separation names no successor: its price steps, so history cannot follow it"
         );
+        assert_eq!(
+            boundary_for(&boundaries, "TRXO").map(SeriesBoundary::reason),
+            Some(&BoundaryReason::Reorganized)
+        );
     }
 
     /// A spinoff bounds the session its price steps in, which is the ex-date rather than the date
@@ -3878,8 +3906,8 @@ mod tests {
 
         assert_eq!(
             boundaries.len(),
-            4,
-            "RNA, FDX, AIM and ACAAU survive; the three placeholder rows and INDV do not"
+            5,
+            "RNA, FDX, AIM, ACAAU and TRXO survive; the three placeholder rows and INDV do not"
         );
         assert!(boundaries
             .iter()

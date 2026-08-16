@@ -91,6 +91,7 @@ SELECT
     id,
     ticker,
     CAST(date AS DATE) AS boundary_date,
+    CAST(process_date AS DATE) AS process_date,
     reason,
     related_ticker,
     to_timestamp(first_seen / 1000.0) AS first_seen

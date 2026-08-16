@@ -122,8 +122,14 @@ pub enum ArchiveError {
     #[error("gave up on {key} after {attempts} concurrent writes by another pass")]
     Contended { key: String, attempts: usize },
     /// The upstream feed failed, before any bucket was touched.
-    #[error("failed to fetch from Massive: {0}")]
-    Feed(String),
+    ///
+    /// The vendor is carried because two of them supply this archive, and an operator reading the
+    /// message during an incident needs to know which one to look at.
+    #[error("failed to fetch from {vendor}: {message}")]
+    Feed {
+        vendor: &'static str,
+        message: String,
+    },
     #[error("failed to build a bar frame: {0}")]
     Frame(#[from] PolarsError),
 }
@@ -498,7 +504,10 @@ pub async fn archive_splits(
     let splits = massive
         .fetch_splits()
         .await
-        .map_err(|error| ArchiveError::Feed(error.to_string()))?;
+        .map_err(|error| ArchiveError::Feed {
+            vendor: "Massive",
+            message: error.to_string(),
+        })?;
 
     // Refused before the write rather than merged away inside it, so a cold bucket does not get an
     // empty object either. A feed that answers success with nothing is an outage, not an emptied
@@ -543,13 +552,9 @@ pub async fn archive_splits(
 
 /// Refreshes the series-boundary table over `start..=end`, merging it with what is stored.
 ///
-/// Windowed rather than whole, unlike [`archive_splits`]: the corporate-actions endpoint has no
-/// all-time form, so the caller says how far back to refresh and rows outside that range are left
-/// as they were.
-///
-/// An empty fetch is written rather than refused, again unlike the splits table. A date range
-/// containing no corporate action is an ordinary answer, so treating it as an outage would leave a
-/// cancelled action in the table forever.
+/// Windowed rather than whole, unlike [`archive_splits`]: the endpoint has no all-time form, so
+/// rows outside the range are left as they were. An empty fetch is written rather than refused,
+/// because a range with no corporate action in it is an ordinary answer here.
 pub async fn archive_boundaries(
     s3_client: &S3Client,
     market_data: &MarketDataClient,
@@ -561,7 +566,10 @@ pub async fn archive_boundaries(
     let fetched = market_data
         .fetch_corporate_actions(start.date(), end.date())
         .await
-        .map_err(|error| ArchiveError::Feed(error.to_string()))?;
+        .map_err(|error| ArchiveError::Feed {
+            vendor: "Alpaca",
+            message: error.to_string(),
+        })?;
 
     let frame = boundaries::boundaries_to_dataframe(&fetched, fetched_at)?;
     write_merged(
@@ -569,23 +577,16 @@ pub async fn archive_boundaries(
         bucket,
         BOUNDARIES_ARCHIVE_KEY.to_string(),
         frame,
-        // Falls back rather than propagating, for the reason `archive_splits` does: a stored object
-        // whose schema stopped matching would otherwise fail every future refresh too.
-        |existing, fetched, key| match boundaries::merge_boundaries(
-            existing,
-            fetched.clone(),
-            start,
-            end,
-        ) {
-            Ok(merged) => Ok(merged),
-            Err(error) => {
-                warn!(
-                    key,
-                    %error,
-                    "Could not merge the stored boundary table; replacing it with the fetched rows"
-                );
-                Ok(fetched)
-            }
+        // Fails rather than falling back, which is the opposite of `archive_splits`. Replacing with
+        // the fetch would drop every boundary outside the window, and quietly keeping the stored
+        // table would report a refresh that did not happen — a schema mismatch would then look like
+        // success on every run forever. Nothing is written, so the stored table survives either way.
+        |existing, fetched, key| {
+            boundaries::merge_boundaries(existing, fetched, start, end).map_err(|error| {
+                ArchiveError::Frame(PolarsError::ComputeError(
+                    format!("could not merge the stored boundary table at {key}: {error}").into(),
+                ))
+            })
         },
     )
     .await?;
