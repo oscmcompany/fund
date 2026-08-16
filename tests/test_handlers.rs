@@ -1416,10 +1416,21 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
     // On the trailing window, which is the only request that can reach it: a transfer is dated and
     // created the morning after, so this session's own `date=` query returns the previous one's.
     let _deposit = server
-        .mock(
-            "GET",
-            mockito::Matcher::Regex(r"^/v2/account/activities(\?|$)".into()),
-        )
+        .mock("GET", "/v2/account/activities")
+        .match_query(mockito::Matcher::AllOf(vec![
+            // Pinned to literals, not to the production constants: building the expectation from
+            // the list under test would move both sides together and assert nothing.
+            mockito::Matcher::UrlEncoded(
+                "activity_types".into(),
+                "DIV,DIVCGL,DIVCGS,DIVFEE,DIVFT,DIVNRA,DIVROC,DIVTW,DIVTXEX,CGD,INT,INTNRA,INTTW,\
+                 FEE,CSD,CSW,JNLC"
+                    .into(),
+            ),
+            mockito::Matcher::UrlEncoded(
+                "after".into(),
+                (session_date.date() - Duration::days(7)).to_string(),
+            ),
+        ]))
         .with_status(200)
         .with_body(format!(
             r#"[{{"id":"deposit-1","activity_type":"{DEPOSIT_ACTIVITY_TYPE}","date":"{}",
