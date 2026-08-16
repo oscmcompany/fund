@@ -19,6 +19,7 @@ use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
 use fund::data::calendar::TradingCalendar;
+use fund::data::truncate::BoundaryTable;
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;
@@ -200,6 +201,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -485,6 +487,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -579,6 +582,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -741,6 +745,7 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -842,6 +847,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -920,6 +926,7 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         BarInterval::OneDay,
         60,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await

@@ -18,6 +18,7 @@ use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
+use fund::data::truncate::BoundaryTable;
 
 use fund::models::tide::predict;
 use fund::portfolio::account;
@@ -388,6 +389,7 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
         BarInterval::OneDay,
         5,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -428,6 +430,7 @@ async fn test_aligned_closes_reads_only_the_requested_interval() {
         BarInterval::OneDay,
         1,
         &SplitTable::default(),
+        &BoundaryTable::default(),
         SessionDate::at(Utc::now()),
     )
     .await
@@ -750,9 +753,16 @@ async fn test_aligned_closes_are_restated_onto_todays_share_basis() {
     )
     .unwrap();
 
-    let closes = bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &splits, today)
-        .await
-        .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &splits,
+        &BoundaryTable::default(),
+        today,
+    )
+    .await
+    .expect("the load must succeed");
 
     // Ordered oldest first, so the two halved entries lead.
     assert_eq!(
@@ -787,9 +797,16 @@ async fn test_the_bar_frame_is_restated_onto_todays_share_basis() {
     )
     .unwrap();
 
-    let frame = bars::load_bars_dataframe(&pool, BarInterval::OneDay, 10, &splits, today)
-        .await
-        .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        10,
+        &splits,
+        &BoundaryTable::default(),
+        today,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.column("close_price").unwrap().f64().unwrap().get(0),
@@ -814,10 +831,16 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
     common::seed_bar(&pool, "AAAA", as_of.plus_calendar_days(1), 55.0).await;
     common::seed_bar(&pool, "AAAA", today, 99.0).await;
 
-    let frame =
-        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.height(),
@@ -829,15 +852,229 @@ async fn test_the_loaded_window_follows_as_of_rather_than_the_clock() {
         Some(10.0)
     );
 
-    let closes =
-        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         closes[&ticker("AAAA")],
         vec![10.0],
         "the aligned window is bounded above by `as_of` too, not by the latest session stored"
+    );
+}
+
+/// `None` in the third position is a boundary that stops a series; `Some` renames it onto that
+/// symbol, which is what lets the successor inherit the history.
+fn boundary_table(rows: &[(&str, SessionDate, Option<&str>)]) -> BoundaryTable {
+    use polars::prelude::*;
+    let tickers: Vec<String> = rows
+        .iter()
+        .map(|(ticker, _, _)| ticker.to_string())
+        .collect();
+    let dates: Vec<String> = rows
+        .iter()
+        .map(|(_, date, _)| date.date().format("%Y-%m-%d").to_string())
+        .collect();
+    let reasons: Vec<String> = rows
+        .iter()
+        .map(|(_, _, to)| match to {
+            Some(_) => "renamed".to_string(),
+            None => "spun_off".to_string(),
+        })
+        .collect();
+    let related: Vec<Option<String>> = rows
+        .iter()
+        .map(|(_, _, to)| to.map(str::to_string))
+        .collect();
+    let frame = DataFrame::new(vec![
+        Column::new("ticker".into(), tickers),
+        Column::new("date".into(), dates),
+        Column::new("reason".into(), reasons),
+        Column::new("related_ticker".into(), related),
+    ])
+    .expect("a frame must build");
+    BoundaryTable::from_dataframe(&frame).expect("the table must build")
+}
+
+/// The other half of a rename. `AAAA` stops trading and `BBBB` continues it, so neither symbol has
+/// a full window on its own and the screen would see two unusable series where there is one company.
+#[tokio::test]
+#[serial]
+async fn test_a_renamed_company_keeps_its_history_under_the_new_symbol() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let renamed_on = today.plus_calendar_days(-3);
+
+    for offset in 4..=6 {
+        common::seed_bar(&pool, "AAAA", today.plus_calendar_days(-offset), 10.0).await;
+    }
+    for offset in 1..=3 {
+        common::seed_bar(&pool, "BBBB", today.plus_calendar_days(-offset), 20.0).await;
+    }
+
+    let boundaries = boundary_table(&[("AAAA", renamed_on, Some("BBBB"))]);
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        6,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        closes.get(&ticker("BBBB")).map(Vec::len),
+        Some(6),
+        "the successor carries both runs, so it fills the window"
+    );
+    assert_eq!(
+        closes[&ticker("BBBB")],
+        vec![10.0, 10.0, 10.0, 20.0, 20.0, 20.0],
+        "and they arrive in session order, not in the order the query returned them"
+    );
+    assert!(
+        !closes.contains_key(&ticker("AAAA")),
+        "the symbol that stopped trading is not a candidate of its own"
+    );
+}
+
+/// Both ways a ticker leaves the aligned set, exercised together: a hole in its history, and a
+/// boundary that takes every session it has.
+///
+/// The two are reported as separate counts, which this cannot assert — they are log fields, not
+/// return values — so it covers the exclusions themselves rather than the tally.
+#[tokio::test]
+#[serial]
+async fn test_a_gap_and_a_boundary_both_exclude_a_ticker() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+
+    // Complete: three consecutive sessions, no boundary.
+    for offset in 1..=3 {
+        common::seed_bar(&pool, "GOOD", today.plus_calendar_days(-offset), 10.0).await;
+    }
+    // A hole in the middle, no boundary.
+    common::seed_bar(&pool, "GAPY", today.plus_calendar_days(-1), 10.0).await;
+    common::seed_bar(&pool, "GAPY", today.plus_calendar_days(-3), 10.0).await;
+    // Every session precedes its boundary, so nothing of it survives.
+    for offset in 1..=3 {
+        common::seed_bar(&pool, "BNDY", today.plus_calendar_days(-offset), 10.0).await;
+    }
+
+    let boundaries = boundary_table(&[("BNDY", today, None)]);
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        3,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        closes.keys().collect::<Vec<_>>(),
+        vec![&ticker("GOOD")],
+        "only the complete unbounded series survives"
+    );
+}
+
+/// A predecessor and its successor can trade at the same time — `BK` and `BNY` share about two
+/// dozen sessions — and on those the symbol still trading is the one whose price counts.
+#[tokio::test]
+#[serial]
+async fn test_an_overlapping_session_keeps_the_successors_own_price() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let renamed_on = today.plus_calendar_days(-2);
+    let shared = today.plus_calendar_days(-3);
+
+    common::seed_bar(&pool, "AAAA", today.plus_calendar_days(-4), 10.0).await;
+    common::seed_bar(&pool, "AAAA", shared, 11.0).await;
+    common::seed_bar(&pool, "BBBB", shared, 99.0).await;
+    common::seed_bar(&pool, "BBBB", today.plus_calendar_days(-2), 20.0).await;
+
+    let boundaries = boundary_table(&[("AAAA", renamed_on, Some("BBBB"))]);
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        3,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        closes[&ticker("BBBB")],
+        vec![10.0, 99.0, 20.0],
+        "the shared session takes BBBB's own close, not the one inherited from AAAA"
+    );
+}
+
+/// The case the boundary table exists for, in the shape it really occurred. `RNA` was Avidity
+/// Biosciences until 2026-02-26 and Atrium Therapeutics after it, so a window spanning that date
+/// fits a hedge ratio across two companies' prices and reports nothing unusual.
+#[tokio::test]
+#[serial]
+async fn test_a_window_is_not_read_across_a_boundary() {
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    let boundary = today.plus_calendar_days(-3);
+
+    for offset in 1..=6 {
+        common::seed_bar(
+            &pool,
+            "AAAA",
+            today.plus_calendar_days(-offset),
+            10.0 * offset as f64,
+        )
+        .await;
+    }
+
+    let boundaries = boundary_table(&[("AAAA", boundary, None)]);
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        10,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert_eq!(
+        frame.height(),
+        3,
+        "only the sessions from the boundary onward describe the company trading now"
+    );
+
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        6,
+        &SplitTable::default(),
+        &boundaries,
+        today,
+    )
+    .await
+    .expect("the load must succeed");
+
+    assert!(
+        !closes.contains_key(&ticker("AAAA")),
+        "a truncated series cannot fill a six-session window, so it is not a candidate"
     );
 }
 
@@ -864,10 +1101,16 @@ async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
     .await
     .expect("Failed to seed the boundary bar");
 
-    let frame =
-        bars::load_bars_dataframe(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let frame = bars::load_bars_dataframe(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         frame.height(),
@@ -875,10 +1118,16 @@ async fn test_a_bar_on_the_upper_bound_belongs_to_the_next_session() {
         "the upper bound is exclusive, so the next session's opening instant is outside it"
     );
 
-    let closes =
-        bars::load_aligned_closes(&pool, BarInterval::OneDay, 5, &SplitTable::default(), as_of)
-            .await
-            .expect("the load must succeed");
+    let closes = bars::load_aligned_closes(
+        &pool,
+        BarInterval::OneDay,
+        5,
+        &SplitTable::default(),
+        &BoundaryTable::default(),
+        as_of,
+    )
+    .await
+    .expect("the load must succeed");
 
     assert_eq!(
         closes[&ticker("AAAA")],

@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, SessionDate, Ticker};
 use crate::data::adjust::{self, SplitTable};
+use crate::data::truncate::{self, BoundaryTable};
 
 /// Rows per insert chunk.
 ///
@@ -250,6 +251,7 @@ pub async fn load_bars_dataframe(
     bar_interval: BarInterval,
     lookback_days: i64,
     splits: &SplitTable,
+    boundaries: &BoundaryTable,
     as_of: SessionDate,
 ) -> Result<DataFrame, BarsError> {
     // Anchored to `as_of` rather than the clock. `bounds` is half-open, so the upper comparison is
@@ -312,7 +314,12 @@ pub async fn load_bars_dataframe(
         Column::new("volume_weighted_average_price".into(), volume_weighted),
     ])?;
 
-    let dataframe = adjust::adjust_bars(dataframe, splits, as_of)?;
+    // Stitched, then truncated, then folded. The stitch moves a renamed company's bars onto the
+    // symbol it trades as now — which are exactly the bars truncation would otherwise drop — and the
+    // fold runs last because it keys on the symbol a bar carries after both.
+    let dataframe = truncate::stitch_bars(dataframe, boundaries)?;
+    let dataframe = truncate::truncate_bars(dataframe, boundaries, as_of)?;
+    let dataframe = adjust::adjust_bars(dataframe, &splits.following_renames(boundaries), as_of)?;
 
     info!(
         rows = dataframe.height(),
@@ -342,6 +349,7 @@ pub async fn load_aligned_closes(
     bar_interval: BarInterval,
     sessions: usize,
     splits: &SplitTable,
+    boundaries: &BoundaryTable,
     as_of: SessionDate,
 ) -> Result<HashMap<Ticker, Vec<f64>>, BarsError> {
     if sessions == 0 {
@@ -385,24 +393,83 @@ pub async fn load_aligned_closes(
         .collect::<HashSet<_>>()
         .len();
 
-    let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> = HashMap::new();
+    // Splits are re-filed through the same renames the bars are, so a stitched close takes its own
+    // company's factor rather than the one belonging to whoever holds its old symbol now.
+    let splits = splits.following_renames(boundaries);
+
+    // The third element records whether the bar was already filed under this symbol, which decides
+    // the overlap: a predecessor and its successor can both trade for a stretch — BK and BNY share
+    // two dozen sessions — and the symbol still trading is the one whose price is authoritative.
+    let mut dated_closes: HashMap<Ticker, Vec<(SessionDate, f64, bool)>> = HashMap::new();
+    let mut bounded: HashSet<Ticker> = HashSet::new();
     for row in rows {
-        let Some(ticker) = Ticker::new(&row.ticker) else {
+        let Some(stored) = Ticker::new(&row.ticker) else {
             continue;
         };
-        let factor = splits.factor_at(ticker.as_str(), SessionDate::at(row.timestamp), as_of);
-        closes_by_ticker
+        let session = SessionDate::at(row.timestamp);
+        // Resolved before it is bounded, so a bar moved onto its successor is judged against that
+        // symbol's boundaries rather than against the ones that sent it there.
+        let (ticker, own) = match boundaries.current_symbol(stored.as_str(), session) {
+            Some(successor) => match Ticker::new(&successor) {
+                Some(ticker) => (ticker, false),
+                None => (stored, true),
+            },
+            None => (stored, true),
+        };
+        // Dropped rather than kept short: the retain below needs a full-length series, so a ticker
+        // whose boundary falls inside this window loses its alignment and with it its candidacy.
+        if let Some(earliest) = boundaries.earliest_usable_session(ticker.as_str(), as_of) {
+            if session < earliest {
+                bounded.insert(ticker);
+                continue;
+            }
+        }
+        let factor = splits.factor_at(ticker.as_str(), session, as_of);
+        dated_closes
             .entry(ticker)
             .or_default()
-            .push(row.close_price * factor);
+            .push((session, row.close_price * factor, own));
     }
 
-    let before = closes_by_ticker.len();
+    // Sorted because a stitched series arrives in two runs — the successor's rows and the
+    // predecessor's — and the query orders within a symbol, not across a rename.
+    let mut closes_by_ticker: HashMap<Ticker, Vec<f64>> =
+        HashMap::with_capacity(dated_closes.len());
+    for (ticker, mut dated) in dated_closes {
+        // Ordered by session, and within a session the symbol's own bar first, so the deduplication
+        // below keeps it and discards the inherited one.
+        dated.sort_by(|left, right| left.0.cmp(&right.0).then(right.2.cmp(&left.2)));
+        dated.dedup_by_key(|(session, _, _)| *session);
+        closes_by_ticker.insert(
+            ticker,
+            dated.into_iter().map(|(_, close, _)| close).collect(),
+        );
+    }
+
+    // Partitioned by membership rather than counted by subtraction: a ticker truncated away
+    // entirely never reached the map, so it is missing from one count and present in the other.
+    let short: Vec<Ticker> = closes_by_ticker
+        .iter()
+        .filter(|(_, closes)| closes.len() != session_count)
+        .map(|(ticker, _)| ticker.clone())
+        .collect();
     closes_by_ticker.retain(|_, closes| closes.len() == session_count);
+
+    let dropped_at_a_boundary = bounded
+        .iter()
+        .filter(|ticker| !closes_by_ticker.contains_key(*ticker))
+        .count();
+    // A hole in a history and a history belonging to a different company are different facts, and
+    // a ticker with both is reported as the second: it is the more specific cause.
+    let dropped_for_gaps = short
+        .iter()
+        .filter(|ticker| !bounded.contains(*ticker))
+        .count();
 
     info!(
         tickers = closes_by_ticker.len(),
-        dropped_for_gaps = before - closes_by_ticker.len(),
+        dropped_for_gaps,
+        dropped_at_a_boundary,
         sessions = session_count,
         "Aligned close history loaded"
     );
@@ -440,6 +507,7 @@ impl CloseHistoryCache {
         bar_interval: BarInterval,
         sessions: usize,
         splits: &SplitTable,
+        boundaries: &BoundaryTable,
         now: DateTime<Utc>,
     ) -> Result<AlignedCloses, BarsError> {
         let today = SessionDate::at(now);
@@ -452,8 +520,9 @@ impl CloseHistoryCache {
 
         // Keyed by the Eastern date, which is also what the closes were restated onto, so a cache
         // hit can never hand back a series adjusted for a different day than it is asked about.
-        let closes =
-            Arc::new(load_aligned_closes(pool, bar_interval, sessions, splits, today).await?);
+        let closes = Arc::new(
+            load_aligned_closes(pool, bar_interval, sessions, splits, boundaries, today).await?,
+        );
         if !closes.is_empty() {
             *self.inner.lock().await = Some((today, Arc::clone(&closes)));
         }
