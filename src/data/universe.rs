@@ -184,7 +184,7 @@ pub async fn load_liquidity(
         .collect())
 }
 
-/// A [`Universe`] rebuilt at most once per Eastern date.
+/// A [`Universe`] cached per Eastern date.
 ///
 /// Warmed by the pre-open handler and refreshed on demand by anything that finds it cold, so a
 /// restart mid-session repopulates rather than trading an empty universe until the next morning.

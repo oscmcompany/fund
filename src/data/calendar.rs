@@ -160,7 +160,7 @@ impl TradingCalendar {
     }
 }
 
-/// A [`TradingCalendar`] refreshed from Alpaca at most once per Eastern date.
+/// A [`TradingCalendar`] fetched from Alpaca and cached per Eastern date.
 ///
 /// The pre-open handler warms it; anything that finds it cold or stale refreshes on demand, so a
 /// restart mid-session repopulates without waiting for the next morning. Keying on the Eastern date

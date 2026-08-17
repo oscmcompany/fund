@@ -481,7 +481,7 @@ pub async fn load_aligned_closes(
 /// Session-aligned close series, shared by reference because every caller only reads.
 pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
 
-/// The aligned close history, loaded at most once per Eastern date.
+/// The aligned close history, cached per Eastern date.
 ///
 /// Daily bars are written after the close, so this cannot change intraday, and the evaluation pass
 /// needs all of it on every screening pass — seventy-eight times a session.

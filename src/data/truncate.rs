@@ -100,17 +100,10 @@ impl BoundaryTable {
 
     /// The symbol a fact about `ticker` dated `session` belongs to now, if it moved.
     ///
-    /// Each step starts from the date of the one before it, so the walk tracks one company forward
-    /// through time. A rename at or before the floor is somebody else's: the symbol was free by
-    /// then, and whoever took it is who it means from that date on.
-    ///
-    /// Used for splits as well as bars, which is what keeps the fold correct across a rename —
-    /// otherwise a stitched bar takes the successor's splits and misses its own, or the reverse.
-    ///
-    /// Needs no cycle guard. The dates strictly increase and there are finitely many, so the walk
-    /// terminates by construction — and a symbol that leaves and returns resolves to where it ended
-    /// rather than to the midpoint a visited-set guard stops on. That is not hypothetical: a reverse
-    /// split moves a symbol to a `D` suffix for about a month and back, ten times in the last year.
+    /// A rename at or before the floor is somebody else's: the symbol was free by then, and whoever
+    /// took it is who it means from that date on. Needs no cycle guard, because each step moves the
+    /// floor strictly forward over a finite table — so a symbol that leaves and returns resolves to
+    /// itself rather than to the midpoint a visited-set guard stops on.
     pub fn current_symbol(&self, ticker: &str, session: SessionDate) -> Option<String> {
         let mut symbol = ticker.to_string();
         let mut floor = session;

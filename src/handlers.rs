@@ -100,7 +100,7 @@ pub struct ServiceState {
     calendar_cache: CalendarCache,
     universe_cache: UniverseCache,
     close_history_cache: CloseHistoryCache,
-    /// The splits every stored price is restated against, read once per Eastern date.
+    /// The splits every stored price is restated against, cached per Eastern date.
     split_table_cache: SplitTableCache,
     boundary_table_cache: BoundaryTableCache,
     sizing: SizingParameters,

@@ -29,12 +29,9 @@ use polars::prelude::*;
 
 /// Keeps each row's earliest `first_seen` when a fetched table is merged with the stored one.
 ///
-/// The column is provenance: it answers whether a corporate action was known to us when a given bar
-/// partition was written, which is the question an adjustment disagreement turns into. Taking the
-/// minimum makes it a semilattice — commutative, associative, idempotent — so re-running a refresh
-/// can never advance the date.
-///
-/// Shared because [`splits`] and [`boundaries`] carry the same column and have to agree about it.
+/// The column is provenance: whether a corporate action was known to us when a given bar partition
+/// was written, which is the question an adjustment disagreement turns into. Taking the minimum is
+/// idempotent, commutative, and associative, so re-running a refresh can never advance the date.
 pub(crate) fn keep_earliest_first_seen(fetched: LazyFrame, existing: LazyFrame) -> LazyFrame {
     let previously_seen = existing
         .select([col("id"), col("first_seen").alias("previous_first_seen")])

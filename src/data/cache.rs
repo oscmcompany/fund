@@ -1,4 +1,4 @@
-//! A value rebuilt at most once per Eastern date.
+//! A value cached per Eastern date.
 //!
 //! Five caches in this module wanted this and each hand-rolled it.
 
@@ -6,12 +6,11 @@ use std::future::Future;
 
 use crate::common::types::SessionDate;
 
-/// A value rebuilt at most once per Eastern date.
+/// A value cached per Eastern date, so the rollover invalidates it without a timer.
 ///
-/// Keying on the date rather than an elapsed duration means the rollover invalidates without a
-/// timer. The lock is released across the rebuild and re-taken only to store, so a cold cache never
-/// blocks a caller for the length of one; two callers arriving cold may both rebuild, which is
-/// harmless because every rebuild here is a deterministic read scoped to one Eastern date.
+/// Not a bound on rebuilds. The lock is released across the rebuild and re-taken only to store, so
+/// two callers arriving cold both rebuild, and a value `worth_caching` rejects is rebuilt on every
+/// call until it passes. Both are harmless because a rebuild is a deterministic read of one date.
 pub struct DailyCache<T> {
     inner: tokio::sync::Mutex<Option<(SessionDate, T)>>,
 }
