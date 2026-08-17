@@ -1,16 +1,5 @@
 //! Position sizing: fixed-fraction, equal-weight, both legs the same dollar amount.
-//!
-//! Each pair is allocated the same slice of equity whether the book holds one pair or ten, so a
-//! pair's size does not change when an unrelated pair closes. The consequence, and it is
-//! deliberate: a book holding three of ten slots runs at roughly three tenths of its exposure
-//! target rather than concentrating the full target into the pairs that happen to be open.
-//!
-//! **Both legs get equal notional, not hedge-ratio-weighted notional.** The hedge ratio decides
-//! where the spread's mean is, not how much to buy. Sizing the short at `hedge_ratio x` the long
-//! would make the book hedge-ratio-neutral rather than dollar-neutral — a larger claim about what
-//! the two legs share than this version can support.
 
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 use tracing::{debug, warn};
@@ -35,11 +24,16 @@ const LEGS_PER_PAIR: u32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SizingParameters {
     maximum_concurrent_pairs: usize,
-    gross_exposure_multiple: f64,
+    gross_exposure_multiple: Decimal,
 }
 
 impl SizingParameters {
     /// Constructs parameters, rejecting values that cannot describe a book.
+    ///
+    /// The multiple is converted to `Decimal` once, here, and stored that way. Both places that use
+    /// it multiply an equity by it, and a conversion at either would have to decide what an
+    /// unrepresentable value means — `gross_exposure_cap` answered zero, which silently refuses
+    /// every entry rather than reporting anything. Rejecting it at construction removes the choice.
     pub fn new(maximum_concurrent_pairs: usize, gross_exposure_multiple: f64) -> Option<Self> {
         if maximum_concurrent_pairs == 0 {
             return None;
@@ -49,7 +43,7 @@ impl SizingParameters {
         }
         Some(Self {
             maximum_concurrent_pairs,
-            gross_exposure_multiple,
+            gross_exposure_multiple: Decimal::from_f64_retain(gross_exposure_multiple)?,
         })
     }
 
@@ -77,21 +71,24 @@ impl SizingParameters {
         self.maximum_concurrent_pairs
     }
 
-    pub fn gross_exposure_multiple(&self) -> f64 {
+    pub fn gross_exposure_multiple(&self) -> Decimal {
         self.gross_exposure_multiple
     }
 
     /// The dollar notional allocated to one leg of one pair.
     ///
-    /// `equity x multiple / (pairs x 2)`. Returns `None` for non-positive equity, which is an
-    /// account that cannot open anything.
+    /// `equity x multiple / (pairs x 2)`. The denominator is every slot, not the vacant ones, so a
+    /// pair's size does not change when an unrelated pair closes. The consequence is deliberate: a
+    /// book holding three of ten slots runs at roughly three tenths of its exposure target rather
+    /// than concentrating the full target into whichever pairs happen to be open.
+    ///
+    /// Returns `None` for non-positive equity, which is an account that cannot open anything.
     pub fn notional_per_leg(&self, equity: Decimal) -> Option<Dollars> {
         if equity <= Decimal::ZERO {
             return None;
         }
-        let multiple = Decimal::from_f64_retain(self.gross_exposure_multiple)?;
         let slots = Decimal::from(self.maximum_concurrent_pairs as u64 * LEGS_PER_PAIR as u64);
-        Dollars::new((equity * multiple / slots).round_dp(2)).ok()
+        Dollars::new((equity * self.gross_exposure_multiple / slots).round_dp(2)).ok()
     }
 }
 
@@ -151,11 +148,16 @@ impl SizedPair {
 
 /// Sizes one candidate against a per-leg budget.
 ///
+/// **Both legs get equal notional, not hedge-ratio-weighted notional.** The hedge ratio decides
+/// where the spread's mean is, not how much to buy. Sizing the short at `hedge_ratio x` the long
+/// would make the book hedge-ratio-neutral rather than dollar-neutral — a larger claim about what
+/// the two legs share than this version can support.
+///
 /// Returns `None` when the short leg would round to zero shares — a symbol priced above the per-leg
 /// budget. That pair cannot be opened dollar-neutral at this account size, and opening the long leg
 /// alone would be a naked directional position rather than a spread.
 pub fn size_pair(candidate: &PairCandidate, notional_per_leg: Dollars) -> Option<SizedPair> {
-    let budget = notional_per_leg.value().to_f64()?;
+    let budget = notional_per_leg.value().as_f64();
     let short_price = candidate.short_price();
     if !short_price.is_finite() || short_price <= 0.0 {
         return None;
@@ -266,6 +268,20 @@ mod tests {
         assert_eq!(SizingParameters::new(0, 1.0), None);
         assert_eq!(SizingParameters::new(10, 0.0), None);
         assert_eq!(SizingParameters::new(10, f64::NAN), None);
+    }
+
+    /// A multiple past `Decimal`'s range is finite and positive, so the two other checks admit it.
+    /// It used to reach `gross_exposure_cap`, whose conversion failed and answered zero — a cap of
+    /// zero refuses every entry, and nothing said why. Rejecting it here is what makes the cap
+    /// infallible.
+    #[test]
+    fn test_parameters_reject_a_multiple_no_decimal_can_hold() {
+        assert!(
+            1e300_f64.is_finite(),
+            "the fixture must clear the other checks"
+        );
+        assert_eq!(SizingParameters::new(10, 1e300), None);
+        assert!(SizingParameters::new(10, 1.5).is_some());
     }
 
     #[test]

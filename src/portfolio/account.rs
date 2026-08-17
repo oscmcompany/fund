@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -31,7 +31,7 @@ pub fn synced_activity_types() -> Vec<ActivityType> {
     vec![ActivityType::Fill]
 }
 
-/// How far back each sync re-asks for [`windowed_activity_types`].
+/// How far back each sync re-asks for [`ActivityType::windowed`].
 ///
 /// Seven days spans a long weekend with room for a missed sync, and costs one request whose rows
 /// are already stored.
@@ -493,17 +493,13 @@ pub fn attribute(closed: &[ClosedPair], activities: &[AccountActivity]) -> Attri
     }
 }
 
-/// The instant bounds of a session date, for callers that need them alongside a sync.
-pub fn session_bounds(session_date: SessionDate) -> (DateTime<Utc>, DateTime<Utc>) {
-    session_date.bounds()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::alpaca::OrderSide;
     use crate::common::types::CloseReason;
     use crate::common::types::{PairID, Ticker};
+    use chrono::DateTime;
     use chrono::NaiveDate;
 
     fn ticker(raw: &str) -> Ticker {
@@ -628,14 +624,5 @@ mod tests {
         let attribution = attribute(std::slice::from_ref(&pair), &[fee]);
         assert_eq!(attribution.unattributed, 1);
         assert_eq!(attribution.realized[&pair.id()], Decimal::ZERO);
-    }
-
-    #[test]
-    fn test_session_bounds_are_half_open_across_the_eastern_day() {
-        let (start, end) = session_bounds(SessionDate::from_date(
-            NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
-        ));
-        assert!(start < end);
-        assert_eq!((end - start).num_hours(), 24);
     }
 }

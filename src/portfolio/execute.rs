@@ -1,11 +1,7 @@
 //! Order submission and fill confirmation. The only module that sends an order.
 //!
-//! Opening a pair is two orders that must both work or neither hold. The short leg goes first and
-//! its fill is confirmed before the long is submitted: a short can be rejected for borrow reasons a
-//! long never is, so the common failure costs nothing to recover from because nothing is held yet.
-//!
-//! Unwinding is still implemented for the uncommon case — the short fills and the long does not —
-//! which is the one that leaves an unhedged position.
+//! Opening a pair is two orders that must both work or neither hold; see [`open_pair`] for the
+//! ordering that makes the common failure free to recover from.
 
 use std::time::Duration;
 
@@ -157,6 +153,11 @@ impl CloseOutcome {
 }
 
 /// Opens both legs of a sized pair, unwinding whatever filled if either leg fails.
+///
+/// The short leg goes first and its fill is confirmed before the long is submitted: a short can be
+/// rejected for borrow reasons a long never is, so the common failure costs nothing to recover from
+/// because nothing is held yet. The unwind exists for the uncommon case — the short fills and the
+/// long does not — which is the one that leaves an unhedged position.
 ///
 /// Returns [`OpenOutcome::Abandoned`] when a leg does not fill and the unwind succeeded, and an
 /// error only when the unwind itself failed — the case where something is held that nothing knows
@@ -613,7 +614,7 @@ mod tests {
         ExecutionSettings::new(Duration::from_millis(50), Duration::from_millis(5))
     }
 
-    /// A log in a directory of this test's own. Every order path writes to one, so the tests
+    /// A journal in a directory of this test's own. Every order path writes to one, so the tests
     /// exercise the record-before-submit ordering rather than mocking it away.
     fn journal(name: &str) -> Journal {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -624,13 +625,13 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
-        Journal::new(directory).expect("the log directory must be creatable")
+        Journal::new(directory).expect("the journal directory must be creatable")
     }
 
-    /// Every record a log holds, in the order it was written.
-    fn recorded(log: &Journal) -> Vec<serde_json::Value> {
-        let mut files: Vec<_> = std::fs::read_dir(log.directory())
-            .expect("the log directory must be readable")
+    /// Every record a journal holds, in the order it was written.
+    fn recorded(journal: &Journal) -> Vec<serde_json::Value> {
+        let mut files: Vec<_> = std::fs::read_dir(journal.directory())
+            .expect("the journal directory must be readable")
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .collect();
@@ -647,11 +648,11 @@ mod tests {
             .collect()
     }
 
-    fn context<'a>(client: &'a TradingClient, log: &'a Journal) -> ExecutionContext<'a> {
+    fn context<'a>(client: &'a TradingClient, journal: &'a Journal) -> ExecutionContext<'a> {
         ExecutionContext {
             client,
             settings: settings(),
-            journal: log,
+            journal,
             correlation_id: Uuid::nil(),
         }
     }

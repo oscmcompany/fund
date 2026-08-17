@@ -1,11 +1,7 @@
 //! The five-minute pass, and the pre-close liquidation that backs it up.
 //!
-//! Two properties the implementation has to preserve, and both are easy to lose:
-//!
-//! 1. **Exits run unconditionally.** Every early return below is in the entry half.
-//! 2. **The entry half reuses the prices the exit half already fetched**, asking Alpaca only for
-//!    symbols it does not have. Re-fetching an open leg between the two decisions would make them
-//!    two opinions that can disagree; here they are one measurement used twice.
+//! Each half is observe, decide, apply, with the decision a pure function of its reading; see
+//! [`evaluate_pass`] for the two properties that arrangement exists to protect.
 
 use std::collections::{HashMap, HashSet};
 
@@ -314,6 +310,13 @@ pub async fn run_pass(
 }
 
 /// The pass itself, free to propagate: [`run_pass`] records the observation either way.
+///
+/// Two properties the body has to preserve, and both are easy to lose:
+///
+/// 1. **Exits run unconditionally.** Every early return below is in the entry half.
+/// 2. **The entry half reuses the prices the exit half already fetched**, asking Alpaca only for
+///    symbols it does not have. Re-fetching an open leg between the two decisions would make them
+///    two opinions that can disagree; here they are one measurement used twice.
 async fn evaluate_pass(
     context: &EvaluationContext<'_>,
     correlation_id: uuid::Uuid,
