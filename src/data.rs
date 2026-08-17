@@ -9,7 +9,7 @@
 //! term record of them; [`export`] owns `exports/`, the application's own tables, which the purge
 //! deletes from PostgreSQL only once they are safely written. Neither writes the other's prefix.
 //!
-//! [`export`] also seals and ships [`crate::common::session_log`], the local original that both
+//! [`export`] also seals and ships [`crate::common::journal`], the local original that both
 //! PostgreSQL and S3 are derived from.
 
 pub mod adjust;

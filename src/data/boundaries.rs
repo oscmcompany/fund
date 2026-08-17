@@ -1,6 +1,7 @@
-//! The dates a symbol's price series may not be read across; nothing reads them yet.
+//! The dates a symbol's price series may not be read across.
 //!
-//! One S3 object, refreshed over a date range and merged with what is stored.
+//! One S3 object, refreshed over a date range and merged with what is stored. Applied at read time
+//! by [`crate::data::truncate`].
 
 use chrono::{DateTime, Utc};
 use polars::prelude::*;

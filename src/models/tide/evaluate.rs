@@ -261,10 +261,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // argmin / argmax / closest_to
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn test_argmin_returns_index_of_smallest_value() {
         assert_eq!(argmin(&[0.9, 0.1, 0.5]), 1);
@@ -317,10 +313,6 @@ mod tests {
         assert_eq!(closest_to(&[], 0.5), 0);
     }
 
-    // ---------------------------------------------------------------------------
-    // EvaluationMetrics::zero
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn test_evaluation_metrics_zero_fields_are_zero() {
         let metrics = EvaluationMetrics::zero();
@@ -329,10 +321,8 @@ mod tests {
         assert_eq!(metrics.quantile_coverage, 0.0);
     }
 
-    // ---------------------------------------------------------------------------
     // metrics_from: feeds a fixed prediction table through the shipped accumulator
     // so the math can be checked without running the neural network.
-    // ---------------------------------------------------------------------------
 
     /// Runs `predictions` and `targets` through `MetricAccumulator`, the same type `evaluate` uses.
     ///
@@ -489,10 +479,6 @@ mod tests {
             metrics.quantile_coverage
         );
     }
-
-    // ---------------------------------------------------------------------------
-    // evaluate() — early-return paths that do not require model inference
-    // ---------------------------------------------------------------------------
 
     /// Construct a minimal dataset with the array shapes expected for
     /// `input_length` and `output_length` so `build_input_tensor` does not

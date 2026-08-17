@@ -26,9 +26,54 @@ use uuid::Uuid;
 pub const MINIMUM_CLOSE_PRICE: f64 = 10.0;
 pub const MINIMUM_VOLUME: f64 = 1_000_000.0;
 
-// ---------------------------------------------------------------------------
-// Validated primitives
-// ---------------------------------------------------------------------------
+/// Serializes a [`Decimal`] as a JSON number rather than a quoted string.
+///
+/// `Decimal`'s own `Serialize` writes a string, which a reader has to cast before it can do
+/// arithmetic and which shows its quotes to anyone reading a rendered payload. Used through
+/// `#[serde(with = "...")]` on every field that reaches JSON.
+///
+/// Routes through [`Decimal::as_f64`], which returns an `f64` rather than an `Option`, so there is
+/// no failure to handle. `rust_decimal::serde::float` does the same conversion through `to_f64`
+/// and unwraps it — infallible in that crate today, since `to_f64` is `Some(self.as_f64())`, but
+/// an unwrap in the journal write path is not a thing to inherit from a dependency's internals.
+pub mod decimal_number {
+    use super::Decimal;
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_f64(value.as_f64())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
+        let raw = f64::deserialize(deserializer)?;
+        Decimal::try_from(raw).map_err(de::Error::custom)
+    }
+}
+
+/// [`decimal_number`] for an optional amount, which stays `null` when absent.
+pub mod decimal_number_option {
+    use super::Decimal;
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Decimal>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(amount) => serializer.serialize_f64(amount.as_f64()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Decimal>, D::Error> {
+        match Option::<f64>::deserialize(deserializer)? {
+            Some(raw) => Decimal::try_from(raw).map(Some).map_err(de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
 
 /// Error returned when constructing a validated primitive with an out-of-range value.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +123,7 @@ impl std::error::Error for NegativeAmountError {}
 
 /// Whole share count (always positive).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct Shares(Decimal);
+pub struct Shares(#[serde(with = "decimal_number")] Decimal);
 
 impl Shares {
     /// Creates a new `Shares`, returning an error if `quantity` is not positive.
@@ -107,7 +152,7 @@ impl<'de> Deserialize<'de> for Shares {
 /// Every current use is a magnitude — fill notionals and limit prices — so the constructor rejects
 /// negative values.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize)]
-pub struct Dollars(Decimal);
+pub struct Dollars(#[serde(with = "decimal_number")] Decimal);
 
 impl Dollars {
     /// Creates a new `Dollars`, returning an error if `amount` is negative.
@@ -186,10 +231,6 @@ impl<'de> Deserialize<'de> for Notional {
         Ok(Notional::new(amount))
     }
 }
-
-// ---------------------------------------------------------------------------
-// SessionDate
-// ---------------------------------------------------------------------------
 
 /// A trading day, identified by its `America/New_York` calendar date.
 ///
@@ -294,10 +335,6 @@ impl std::fmt::Display for SessionDate {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Ticker
-// ---------------------------------------------------------------------------
-
 /// A normalized US equity ticker symbol.
 ///
 /// Enforces the Alpaca US equity ticker format: 1–5 uppercase ASCII letters, with an optional
@@ -397,10 +434,6 @@ fn is_valid_suffix(segment: &str) -> bool {
     !segment.is_empty() && segment.len() <= 3 && segment.chars().all(|c| c.is_ascii_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// PairID
-// ---------------------------------------------------------------------------
-
 /// A canonical long-short equity pair identifier.
 ///
 /// Combines two validated [`Ticker`] values into a `"LONG-SHORT"` formatted string, stored at
@@ -492,16 +525,11 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BarInterval
-// ---------------------------------------------------------------------------
-
 /// The sampling interval of an OHLCV bar.
 ///
-/// Part of the `equity_bars` primary key. The post-close sync writes only
-/// [`BarInterval::OneDay`]; [`BarInterval::OneMinute`] is equally permitted by the CHECK constraint
-/// and is what `fetch_snapshots` tags Alpaca's `minuteBar` with in memory, so "daily only" is a
-/// property of the current writer rather than of the table.
+/// Part of the `equity_bars` primary key. Nothing writes [`BarInterval::OneMinute`] today; the
+/// CHECK constraint permits it, so "daily only" is a property of the current writers rather than of
+/// the table.
 ///
 /// [`BarInterval::as_str`] must match the `bar_interval` CHECK constraint exactly. It is the
 /// snake_case of the variant name, which lets `rename_all` derive the same string for serde so what
@@ -579,9 +607,71 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for BarInterval {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Records
-// ---------------------------------------------------------------------------
+/// Why an open pair was closed.
+///
+/// These four are the `close_reason` CHECK constraint in `schema.sql`, spelled as an enum so a
+/// reason the database would reject cannot be constructed in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The spread returned through its mean. The trade worked.
+    Convergence,
+    /// The spread widened past the stop, against the position. The trade did not.
+    StopLoss,
+    /// The pre-close fail-safe flattened the book. No opinion either way.
+    EndOfDay,
+    /// Alpaca no longer reports a position for one or both legs, so there is nothing left to hold.
+    PositionMissing,
+}
+
+impl CloseReason {
+    pub const ALL: [CloseReason; 4] = [
+        CloseReason::Convergence,
+        CloseReason::StopLoss,
+        CloseReason::EndOfDay,
+        CloseReason::PositionMissing,
+    ];
+
+    /// The stored form, which must match the CHECK constraint exactly.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseReason::Convergence => "convergence",
+            CloseReason::StopLoss => "stop_loss",
+            CloseReason::EndOfDay => "end_of_day",
+            CloseReason::PositionMissing => "position_missing",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        CloseReason::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == raw)
+    }
+
+    /// Whether this exit reflects the strategy's own opinion about the spread.
+    ///
+    /// A book that only ever exits at [`CloseReason::EndOfDay`] is one whose holding period is
+    /// shorter than the horizon it forecasts. The ratio of these two answers is the interim measure
+    /// of whether the strategy is doing anything, so the distinction is worth naming rather than
+    /// recomputing from a string at each call site.
+    pub fn is_signal(self) -> bool {
+        match self {
+            CloseReason::Convergence | CloseReason::StopLoss => true,
+            CloseReason::EndOfDay | CloseReason::PositionMissing => false,
+        }
+    }
+}
+
+impl std::fmt::Display for CloseReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for CloseReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
 
 /// Error returned when a market data record's fields are not internally consistent.
 ///
@@ -1213,6 +1303,62 @@ mod tests {
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
+    }
+
+    #[derive(Serialize)]
+    struct Amount {
+        #[serde(with = "decimal_number")]
+        value: Decimal,
+        #[serde(with = "decimal_number_option")]
+        maybe: Option<Decimal>,
+    }
+
+    /// Amounts reach JSON as numbers. A quoted decimal has to be cast before a reader can do
+    /// arithmetic on it, and it shows its quotes on the dashboard's rendered payloads.
+    #[test]
+    fn test_an_amount_serializes_as_a_number() {
+        let rendered = serde_json::to_string(&Amount {
+            value: "104812.55".parse().expect("valid decimal"),
+            maybe: Some("-50000.01".parse().expect("valid decimal")),
+        })
+        .expect("an amount must serialize");
+        assert_eq!(rendered, r#"{"value":104812.55,"maybe":-50000.01}"#);
+    }
+
+    #[test]
+    fn test_an_absent_amount_stays_null() {
+        let rendered = serde_json::to_string(&Amount {
+            value: Decimal::ZERO,
+            maybe: None,
+        })
+        .expect("an amount must serialize");
+        assert_eq!(rendered, r#"{"value":0.0,"maybe":null}"#);
+    }
+
+    /// The conversion has no failure case to handle, so no journal write can panic on it. Checked
+    /// at the extremes of the type rather than on ordinary balances, which is where a fallible
+    /// conversion would give way.
+    #[test]
+    fn test_no_decimal_fails_to_render_as_a_number() {
+        for value in [
+            Decimal::MAX,
+            Decimal::MIN,
+            Decimal::ZERO,
+            Decimal::new(i64::MAX, 28),
+            "0.0000000000000000000000000001"
+                .parse()
+                .expect("valid decimal"),
+        ] {
+            let rendered = serde_json::to_value(Amount {
+                value,
+                maybe: Some(value),
+            })
+            .expect("every decimal must serialize");
+            assert!(
+                rendered["value"].is_number() && rendered["maybe"].is_number(),
+                "every amount renders as a number: {rendered}"
+            );
+        }
     }
 
     /// The Eastern date must roll at Eastern midnight. 03:00 UTC is still the previous evening in

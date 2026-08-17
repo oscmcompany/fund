@@ -494,10 +494,6 @@ pub fn validate_predictions(predictions: &[serde_json::Value]) -> Result<(), Str
     Ok(())
 }
 
-// --------------------------------------------------------------------------
-// Persistence
-// --------------------------------------------------------------------------
-
 /// Converts a pipeline prediction JSON object into a validated [`EquityPrediction`].
 ///
 /// These come from our own pipeline, so a missing or mistyped field is a bug upstream. It fails

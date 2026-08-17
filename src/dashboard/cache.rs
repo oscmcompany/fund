@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::common::events::Notification;
 use crate::common::types::{PairID, SessionDate, Ticker};
 
-use crate::portfolio::pairs::CloseReason;
+use crate::common::types::CloseReason;
 
 /// How often the background task refreshes every view from PostgreSQL.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);

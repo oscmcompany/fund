@@ -5,15 +5,21 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
+/// Where service logs are written when nothing overrides it.
+///
+/// Distinct from [`crate::common::journal::DEFAULT_JOURNAL_DIRECTORY`]: these are diagnostics and
+/// are filtered by `RUST_LOG`, so a line that never reaches this tree is a line nobody asked for.
+/// The journal is the opposite and lives on its own path for that reason.
+pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
+
 /// Initialize structured JSON tracing for a service.
 ///
 /// `service` (e.g. `"fund"`, `"tide-model-trainer"`) is included in the initial log line for
 /// correlation.
 ///
-/// Logs to stdout at `RUST_LOG` (default `info`), and to a rolling daily file under `FUND_LOG_DIR`
-/// or `/var/log/fund` when that directory is writable. `file_filter` overrides the file layer's
-/// level; `None` follows stdout. An uncreatable log directory disables file logging rather than
-/// failing.
+/// Logs to stdout at `RUST_LOG` (default `info`), and to a rolling daily file under
+/// `FUND_LOG_DIRECTORY`. `file_filter` overrides the file layer's level; `None` follows stdout. An
+/// uncreatable log directory disables file logging rather than failing.
 ///
 /// `Some` means *this call* installed the file layer, and the `WorkerGuard` MUST then be held for
 /// the process lifetime — dropping it tears down the non-blocking writer and buffered lines are
@@ -32,12 +38,13 @@ pub fn init_tracing(
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     };
 
-    let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
-    let guard = match std::fs::create_dir_all(&log_dir).and_then(|()| {
+    let log_directory =
+        env::var("FUND_LOG_DIRECTORY").unwrap_or_else(|_| DEFAULT_LOG_DIRECTORY.to_string());
+    let guard = match std::fs::create_dir_all(&log_directory).and_then(|()| {
         RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
             .filename_suffix(log_file)
-            .build(&log_dir)
+            .build(&log_directory)
             .map_err(std::io::Error::other)
     }) {
         Ok(file_appender) => {
@@ -92,12 +99,13 @@ pub fn init_tracing(
 pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
-    let log_dir = env::var("FUND_LOG_DIR").unwrap_or_else(|_| "/var/log/fund".to_string());
-    let guard = match std::fs::create_dir_all(&log_dir).and_then(|()| {
+    let log_directory =
+        env::var("FUND_LOG_DIRECTORY").unwrap_or_else(|_| DEFAULT_LOG_DIRECTORY.to_string());
+    let guard = match std::fs::create_dir_all(&log_directory).and_then(|()| {
         RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
             .filename_suffix(log_file)
-            .build(&log_dir)
+            .build(&log_directory)
             .map_err(std::io::Error::other)
     }) {
         Ok(file_appender) => {
@@ -181,22 +189,22 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_fund_log_dir_override_enables_file_logging() {
-        let log_dir = env::temp_dir().join("fund-observability-test");
-        let _ = std::fs::remove_dir_all(&log_dir);
+    fn test_the_log_directory_override_enables_file_logging() {
+        let log_directory = env::temp_dir().join("fund-log-directory-test");
+        let _ = std::fs::remove_dir_all(&log_directory);
         // Restored on unwind as well as on return. The manual restore this replaces was skipped
-        // when the assertion below failed, leaving FUND_LOG_DIR pointing at a directory this test
+        // when the assertion below failed, leaving FUND_LOG_DIRECTORY pointing at a directory this test
         // then deleted -- which every later #[serial] test in the file inherited.
-        let _restore = EnvVarRestoreGuard::save("FUND_LOG_DIR");
+        let _restore = EnvVarRestoreGuard::save("FUND_LOG_DIRECTORY");
         // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
-        unsafe { env::set_var("FUND_LOG_DIR", &log_dir) };
+        unsafe { env::set_var("FUND_LOG_DIRECTORY", &log_directory) };
 
         let guard = init_tracing("test-observability.log", None, "test");
 
-        assert!(log_dir.is_dir());
+        assert!(log_directory.is_dir());
         let _ = guard;
 
-        let _ = std::fs::remove_dir_all(&log_dir);
+        let _ = std::fs::remove_dir_all(&log_directory);
     }
 
     #[test]

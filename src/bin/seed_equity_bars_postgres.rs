@@ -16,8 +16,8 @@ use chrono::{NaiveDate, Utc};
 use tracing::{error, info, warn};
 
 use fund::common::database::connect_pool;
+use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::observability::init_tracing;
 use fund::common::types::SessionDate;
 use fund::data::bars;
 

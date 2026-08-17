@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::debug;
 
+use crate::common::journal::ExclusionReason;
 use crate::common::types::{PairID, Ticker};
 
 /// Sessions of daily closes the correlation and the spread distribution are fitted over.
@@ -116,6 +117,14 @@ impl ScreenRejection {
         match self {
             ScreenRejection::UnusableInput => "unusable_input",
             ScreenRejection::StructuralBreak { .. } => "structural_break",
+        }
+    }
+
+    /// Which funnel exit this rejection is, for the journal.
+    pub fn exclusion_reason(&self) -> ExclusionReason {
+        match self {
+            ScreenRejection::UnusableInput => ExclusionReason::UnusableInput,
+            ScreenRejection::StructuralBreak { .. } => ExclusionReason::StructuralBreak,
         }
     }
 
@@ -654,10 +663,6 @@ pub fn exit_models<'a>(
     models
 }
 
-// ---------------------------------------------------------------------------
-// Statistics
-// ---------------------------------------------------------------------------
-
 /// Takes the natural logarithm of two series, returning `None` unless both are the same usable
 /// length with no non-positive value.
 fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, Vec<f64>)> {
@@ -823,8 +828,6 @@ mod tests {
             .expect("test input must be constructible")
     }
 
-    // --- the spread model ---
-
     /// The whole point of the type. An open pair's exit is judged against the hedge ratio it was
     /// entered on, so the spread being measured now is the one the entry threshold was applied to.
     /// Refitting instead would judge the position against a line it was never above.
@@ -922,8 +925,6 @@ mod tests {
         assert_eq!(model.z_score(100.0, f64::NAN), None);
     }
 
-    // --- statistics ---
-
     #[test]
     fn test_ordinary_least_squares_recovers_a_known_slope() {
         let x_values: Vec<f64> = (0..20).map(|index| index as f64).collect();
@@ -958,8 +959,6 @@ mod tests {
         assert_eq!(returns.len(), 2);
         assert!((returns[0] - returns[1]).abs() < 1e-12);
     }
-
-    // --- the screen ---
 
     /// The fixture has to actually produce pairs, or every assertion below it passes vacuously.
     /// This is the trap recorded in `statistical_arbitrage_test_fixtures`.
@@ -1164,8 +1163,6 @@ mod tests {
         );
     }
 
-    // --- structural breaks ---
-
     /// A window holding one persistent level change, the shape a collapse or a split leaves behind.
     fn window_with_one_move(log_return: f64) -> Vec<f64> {
         let mut closes = vec![100.0; CORRELATION_WINDOW_SESSIONS];
@@ -1280,8 +1277,6 @@ mod tests {
         let move_down = worst_session_move(&[100.0, 110.0, 55.0]).expect("a move must be found");
         assert!((move_down - (55.0_f64 / 110.0).ln()).abs() < 1e-12);
     }
-
-    // --- selection ---
 
     /// Assigns every named ticker to one sector, for the selection tests.
     fn sector_map(assignments: &[(&str, &str)]) -> HashMap<Ticker, String> {

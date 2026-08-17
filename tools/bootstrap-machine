@@ -313,12 +313,18 @@ cd "$REPO_ROOT"
 devenv allow
 
 # --------------------------------------------------------------------------- #
-# 8. Create log directory
+# 8. Create the log and journal directories
 # --------------------------------------------------------------------------- #
-step "Creating log directory"
+step "Creating the log and journal directories"
 sudo mkdir -p /var/log/fund
 sudo chown "$(whoami)" /var/log/fund
 echo "Created /var/log/fund"
+
+# The journal is data, not logs. Its own tree so the retention and rotation that apply to
+# /var/log/fund never reach the only original this application owns.
+sudo mkdir -p /var/journal/fund
+sudo chown "$(whoami)" /var/journal/fund
+echo "Created /var/journal/fund"
 
 # --------------------------------------------------------------------------- #
 # 8b. Write ~/fund-cron.sh (common cron shim for both profiles)

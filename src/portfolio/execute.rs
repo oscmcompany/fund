@@ -10,15 +10,17 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use rust_decimal::prelude::ToPrimitive;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use rust_decimal::Decimal;
+
 use crate::common::alpaca::{ClientError, OrderIntent, OrderState, PositionClose, TradingClient};
-use crate::common::session_log::{
-    Observation, OrderResolved, OrderSubmitted, PositionCloseRequested, SessionLog,
+use crate::common::journal::{
+    CloseRequestReason, Journal, Observation, OrderOutcome, OrderResolved, OrderSubmitted,
+    PositionCloseRequested,
 };
-use crate::common::types::Ticker;
+use crate::common::types::{PairID, Ticker};
 use crate::portfolio::pairs::PairEntry;
 use crate::portfolio::size::SizedPair;
 
@@ -73,7 +75,7 @@ impl Default for ExecutionSettings {
 pub struct ExecutionContext<'a> {
     pub client: &'a TradingClient,
     pub settings: ExecutionSettings,
-    pub session_log: &'a SessionLog,
+    pub journal: &'a Journal,
     /// The evaluation pass this order belongs to.
     pub correlation_id: Uuid,
 }
@@ -83,8 +85,8 @@ pub struct ExecutionContext<'a> {
 pub struct LegFill {
     ticker: Ticker,
     order_id: String,
-    shares: f64,
-    average_price: f64,
+    quantity: Decimal,
+    average_price: Decimal,
 }
 
 impl LegFill {
@@ -96,11 +98,11 @@ impl LegFill {
         &self.order_id
     }
 
-    pub fn shares(&self) -> f64 {
-        self.shares
+    pub fn quantity(&self) -> Decimal {
+        self.quantity
     }
 
-    pub fn average_price(&self) -> f64 {
+    pub fn average_price(&self) -> Decimal {
         self.average_price
     }
 }
@@ -113,8 +115,11 @@ impl LegFill {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpenOutcome {
     /// Both legs filled. The pair is on the book.
+    ///
+    /// Boxed because it dwarfs the other variant, and every caller matches on the enum before it
+    /// reaches the entry.
     Opened {
-        entry: PairEntry,
+        entry: Box<PairEntry>,
         long_fill: LegFill,
         short_fill: LegFill,
     },
@@ -145,7 +150,7 @@ impl CloseOutcome {
     /// Whether Alpaca had no position for either leg.
     ///
     /// The pair is closed either way; this only decides whether the recorded reason is the one the
-    /// strategy chose or [`crate::portfolio::pairs::CloseReason::PositionMissing`].
+    /// strategy chose or [`crate::common::types::CloseReason::PositionMissing`].
     pub fn was_already_gone(self) -> bool {
         !self.long_closed && !self.short_closed
     }
@@ -171,7 +176,7 @@ pub async fn open_pair(
         context,
         &OrderIntent::OpenShort {
             ticker: short_ticker.clone(),
-            shares: pair.short_shares(),
+            quantity: pair.short_shares(),
         },
     )
     .await?
@@ -216,8 +221,8 @@ pub async fn open_pair(
             record_close(
                 context,
                 &short_ticker,
-                Some(candidate.pair_id().as_str()),
-                "entry_unwind",
+                Some(candidate.pair_id()),
+                CloseRequestReason::EntryUnwind,
                 &unwind,
             )
             .await;
@@ -225,7 +230,7 @@ pub async fn open_pair(
                 error!(
                     pair_id = %candidate.pair_id(),
                     held_ticker = %short_ticker,
-                    held_shares = short_fill.shares,
+                    held_quantity = %short_fill.quantity,
                     %error,
                     "Unwind failed; an unhedged short position is held with no pair record"
                 );
@@ -248,12 +253,12 @@ pub async fn open_pair(
 
     info!(
         pair_id = %candidate.pair_id(),
-        long_shares = long_fill.shares,
-        short_shares = short_fill.shares,
+        long_quantity = %long_fill.quantity,
+        short_quantity = %short_fill.quantity,
         "Pair opened on Alpaca"
     );
     Ok(OpenOutcome::Opened {
-        entry,
+        entry: Box::new(entry),
         long_fill,
         short_fill,
     })
@@ -267,7 +272,7 @@ pub async fn open_pair(
 /// situation where it is most likely still held. The error is reported after both attempts.
 pub async fn close_pair(
     context: &ExecutionContext<'_>,
-    pair_id: &str,
+    pair_id: &PairID,
     long_ticker: &Ticker,
     short_ticker: &Ticker,
 ) -> Result<CloseOutcome, ExecutionError> {
@@ -277,7 +282,14 @@ pub async fn close_pair(
     // Recorded before the errors are propagated. A leg whose close failed is exactly the one worth
     // having a record of, and `?` below returns without reaching any later write.
     for (ticker, result) in [(long_ticker, &long_result), (short_ticker, &short_result)] {
-        record_close(context, ticker, Some(pair_id), "pair_exit", result).await;
+        record_close(
+            context,
+            ticker,
+            Some(pair_id),
+            CloseRequestReason::PairExit,
+            result,
+        )
+        .await;
     }
 
     if let Err(error) = &long_result {
@@ -312,26 +324,26 @@ pub async fn close_pair(
 async fn record_close(
     context: &ExecutionContext<'_>,
     ticker: &Ticker,
-    pair_id: Option<&str>,
-    reason: &str,
+    pair_id: Option<&PairID>,
+    reason: CloseRequestReason,
     result: &Result<Option<PositionClose>, ClientError>,
 ) {
     let close = result.as_ref().ok().and_then(Option::as_ref);
     let error = result.as_ref().err().map(ToString::to_string);
     context
-        .session_log
+        .journal
         .record(
             context.correlation_id,
             Utc::now(),
             Observation::PositionCloseRequested(PositionCloseRequested {
-                ticker: ticker.to_string(),
-                pair_id: pair_id.map(str::to_string),
+                ticker: ticker.clone(),
+                pair_id: pair_id.cloned(),
                 alpaca_order_id: close
                     .and_then(|close| close.alpaca_order_id())
                     .map(str::to_string),
-                side: close.and_then(|close| close.side()).map(str::to_string),
+                side: close.and_then(PositionClose::side),
                 quantity: close.and_then(PositionClose::quantity),
-                reason: reason.to_string(),
+                reason,
                 accepted: close.is_some(),
                 status: None,
                 error,
@@ -354,27 +366,27 @@ async fn submit_and_confirm(
     context: &ExecutionContext<'_>,
     intent: &OrderIntent,
 ) -> Result<Filled, ExecutionError> {
-    let client_order_id = Uuid::new_v4().to_string();
-    let (shares, notional) = match intent {
-        OrderIntent::OpenShort { shares, .. } => (Some(f64::from(shares.get())), None),
-        OrderIntent::OpenLong { notional, .. } => (None, notional.value().to_f64()),
+    let client_order_id = Uuid::new_v4();
+    let (quantity, notional) = match intent {
+        OrderIntent::OpenShort { quantity, .. } => (Some(Decimal::from(quantity.get())), None),
+        OrderIntent::OpenLong { notional, .. } => (None, Some(notional.value())),
     };
     context
-        .session_log
+        .journal
         .record(
             context.correlation_id,
             Utc::now(),
             Observation::OrderSubmitted(OrderSubmitted {
-                client_order_id: client_order_id.clone(),
-                ticker: intent.ticker().to_string(),
-                side: intent.side().to_string(),
-                shares,
+                client_order_id,
+                ticker: intent.ticker().clone(),
+                side: intent.side(),
+                quantity,
                 notional,
             }),
         )
         .await;
 
-    let order_id = match context.client.submit_order(intent, &client_order_id).await {
+    let order_id = match context.client.submit_order(intent, client_order_id).await {
         Ok(order_id) => order_id,
         Err(error) => {
             // The order never reached the broker, so there is no identifier to resolve it under.
@@ -384,9 +396,9 @@ async fn submit_and_confirm(
                 OrderResolved {
                     client_order_id,
                     alpaca_order_id: None,
-                    ticker: intent.ticker().to_string(),
-                    outcome: "submit_failed".to_string(),
-                    filled_shares: None,
+                    ticker: intent.ticker().clone(),
+                    outcome: OrderOutcome::SubmitFailed,
+                    filled_quantity: None,
                     filled_average_price: None,
                     filled_after_cancel: false,
                     broker_status: None,
@@ -398,16 +410,16 @@ async fn submit_and_confirm(
         }
     };
 
-    let confirmation = confirm_fill(context, intent, &client_order_id, &order_id).await;
+    let confirmation = confirm_fill(context, intent, client_order_id, &order_id).await;
     if let Err(error) = &confirmation {
         record_resolution(
             context,
             OrderResolved {
                 client_order_id,
                 alpaca_order_id: Some(order_id),
-                ticker: intent.ticker().to_string(),
-                outcome: "broker_unreachable".to_string(),
-                filled_shares: None,
+                ticker: intent.ticker().clone(),
+                outcome: OrderOutcome::BrokerUnreachable,
+                filled_quantity: None,
                 filled_average_price: None,
                 filled_after_cancel: false,
                 broker_status: None,
@@ -426,21 +438,21 @@ async fn submit_and_confirm(
 async fn confirm_fill(
     context: &ExecutionContext<'_>,
     intent: &OrderIntent,
-    client_order_id: &str,
+    client_order_id: Uuid,
     order_id: &str,
 ) -> Result<Filled, ExecutionError> {
     let deadline = tokio::time::Instant::now() + context.settings.fill_timeout;
 
     macro_rules! resolved {
-        ($outcome:expr, $shares:expr, $price:expr, $after_cancel:expr, $broker_status:expr) => {
+        ($outcome:expr, $quantity:expr, $price:expr, $after_cancel:expr, $broker_status:expr) => {
             record_resolution(
                 context,
                 OrderResolved {
-                    client_order_id: client_order_id.to_string(),
+                    client_order_id,
                     alpaca_order_id: Some(order_id.to_string()),
-                    ticker: intent.ticker().to_string(),
+                    ticker: intent.ticker().clone(),
                     outcome: $outcome,
-                    filled_shares: $shares,
+                    filled_quantity: $quantity,
                     filled_average_price: $price,
                     filled_after_cancel: $after_cancel,
                     broker_status: $broker_status,
@@ -455,12 +467,12 @@ async fn confirm_fill(
         match context.client.fetch_order(order_id).await? {
             OrderState::Filled {
                 status,
-                filled_shares,
+                filled_quantity,
                 average_price,
             } => {
                 resolved!(
-                    "filled".to_string(),
-                    Some(filled_shares),
+                    OrderOutcome::Filled,
+                    Some(filled_quantity),
                     Some(average_price),
                     false,
                     Some(status)
@@ -468,32 +480,39 @@ async fn confirm_fill(
                 return Ok(Filled::Yes(LegFill {
                     ticker: intent.ticker().clone(),
                     order_id: order_id.to_string(),
-                    shares: filled_shares,
+                    quantity: filled_quantity,
                     average_price,
                 }));
             }
             OrderState::Abandoned {
                 status,
-                filled_shares,
+                filled_quantity,
             } => {
                 resolved!(
-                    status.clone(),
-                    Some(filled_shares),
+                    OrderOutcome::Abandoned,
+                    Some(filled_quantity),
                     None,
                     false,
                     Some(status.clone())
                 );
                 // A partial fill that then terminated leaves shares held. Close the position rather
                 // than reporting the leg cleanly unfilled.
-                if filled_shares > 0.0 {
+                if filled_quantity > Decimal::ZERO {
                     warn!(
                         ticker = %intent.ticker(),
                         order_id,
-                        filled_shares,
+                        %filled_quantity,
                         "Order terminated after a partial fill; closing the remainder"
                     );
                     let cleanup = context.client.close_position(intent.ticker()).await;
-                    record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
+                    record_close(
+                        context,
+                        intent.ticker(),
+                        None,
+                        CloseRequestReason::EntryUnwind,
+                        &cleanup,
+                    )
+                    .await;
                     cleanup?;
                 }
                 return Ok(Filled::No(status));
@@ -511,13 +530,13 @@ async fn confirm_fill(
                     let after_cancel = context.client.fetch_order(order_id).await?;
                     if let OrderState::Filled {
                         status: filled_status,
-                        filled_shares,
+                        filled_quantity,
                         average_price,
                     } = &after_cancel
                     {
                         resolved!(
-                            "filled".to_string(),
-                            Some(*filled_shares),
+                            OrderOutcome::Filled,
+                            Some(*filled_quantity),
                             Some(*average_price),
                             true,
                             Some(filled_status.clone())
@@ -525,7 +544,7 @@ async fn confirm_fill(
                         return Ok(Filled::Yes(LegFill {
                             ticker: intent.ticker().clone(),
                             order_id: order_id.to_string(),
-                            shares: *filled_shares,
+                            quantity: *filled_quantity,
                             average_price: *average_price,
                         }));
                     }
@@ -533,14 +552,21 @@ async fn confirm_fill(
                     // terminated with a partial fill reports those shares here, and recording the
                     // pre-cancel status would contradict what `broker_status` claims to be.
                     resolved!(
-                        "timed_out".to_string(),
-                        Some(after_cancel.filled_shares()),
+                        OrderOutcome::TimedOut,
+                        Some(after_cancel.filled_quantity()),
                         None,
                         false,
                         Some(after_cancel.broker_status().to_string())
                     );
                     let cleanup = context.client.close_position(intent.ticker()).await;
-                    record_close(context, intent.ticker(), None, "entry_unwind", &cleanup).await;
+                    record_close(
+                        context,
+                        intent.ticker(),
+                        None,
+                        CloseRequestReason::EntryUnwind,
+                        &cleanup,
+                    )
+                    .await;
                     cleanup?;
                     return Ok(Filled::No("timed_out".to_string()));
                 }
@@ -553,7 +579,7 @@ async fn confirm_fill(
 /// Writes how the broker settled one order.
 async fn record_resolution(context: &ExecutionContext<'_>, resolved: OrderResolved) {
     context
-        .session_log
+        .journal
         .record(
             context.correlation_id,
             Utc::now(),
@@ -579,13 +605,17 @@ mod tests {
         Ticker::new(raw).unwrap()
     }
 
+    fn pair_id(raw: &str) -> PairID {
+        PairID::parse(raw).expect("the test pair identifier must be valid")
+    }
+
     fn settings() -> ExecutionSettings {
         ExecutionSettings::new(Duration::from_millis(50), Duration::from_millis(5))
     }
 
     /// A log in a directory of this test's own. Every order path writes to one, so the tests
     /// exercise the record-before-submit ordering rather than mocking it away.
-    fn session_log(name: &str) -> SessionLog {
+    fn journal(name: &str) -> Journal {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -594,11 +624,11 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
-        SessionLog::new(directory).expect("the log directory must be creatable")
+        Journal::new(directory).expect("the log directory must be creatable")
     }
 
     /// Every record a log holds, in the order it was written.
-    fn recorded(log: &SessionLog) -> Vec<serde_json::Value> {
+    fn recorded(log: &Journal) -> Vec<serde_json::Value> {
         let mut files: Vec<_> = std::fs::read_dir(log.directory())
             .expect("the log directory must be readable")
             .filter_map(Result::ok)
@@ -617,11 +647,11 @@ mod tests {
             .collect()
     }
 
-    fn context<'a>(client: &'a TradingClient, log: &'a SessionLog) -> ExecutionContext<'a> {
+    fn context<'a>(client: &'a TradingClient, log: &'a Journal) -> ExecutionContext<'a> {
         ExecutionContext {
             client,
             settings: settings(),
-            session_log: log,
+            journal: log,
             correlation_id: Uuid::nil(),
         }
     }
@@ -665,7 +695,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("fills-both-legs");
+        let log = journal("fills-both-legs");
         let outcome = open_pair(&context(&client, &log), &pair(), Some("run-1".to_string()))
             .await
             .expect("the open must succeed");
@@ -679,7 +709,7 @@ mod tests {
                 assert_eq!(entry.model_run_id(), Some("run-1"));
                 assert_eq!(long_fill.ticker().as_str(), "AAAA");
                 assert_eq!(short_fill.ticker().as_str(), "BBBB");
-                assert_eq!(short_fill.average_price(), 100.0);
+                assert_eq!(short_fill.average_price(), Decimal::new(100, 0));
             }
             other => panic!("expected both legs to fill, got {other:?}"),
         }
@@ -707,7 +737,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("rejected-short");
+        let log = journal("rejected-short");
         let outcome = open_pair(&context(&client, &log), &pair(), None)
             .await
             .expect("an unfilled leg is not an error");
@@ -764,7 +794,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("failed-long");
+        let log = journal("failed-long");
         let outcome = open_pair(&context(&client, &log), &pair(), None)
             .await
             .expect("the unwind must succeed");
@@ -812,7 +842,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("timed-out");
+        let log = journal("timed-out");
         let outcome = open_pair(&context(&client, &log), &pair(), None)
             .await
             .expect("a timeout is not an error");
@@ -864,13 +894,13 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("timeout-after-cancel");
+        let log = journal("timeout-after-cancel");
         let context = ExecutionContext {
             client: &client,
             // No timeout at all, so the first poll is already past the deadline and the second read
             // is unambiguously the post-cancel one.
             settings: ExecutionSettings::new(Duration::from_millis(0), Duration::from_millis(5)),
-            session_log: &log,
+            journal: &log,
             correlation_id: Uuid::nil(),
         };
 
@@ -892,7 +922,7 @@ mod tests {
             "the post-cancel status, not the working one that preceded it"
         );
         assert_eq!(
-            timed_out["payload"]["filled_shares"], 12.0,
+            timed_out["payload"]["filled_quantity"], 12.0,
             "shares that filled before the cancel are not unknown"
         );
     }
@@ -923,7 +953,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("partial-fill");
+        let log = journal("partial-fill");
         let outcome = open_pair(&context(&client, &log), &pair(), None)
             .await
             .expect("a partial fill is not an error");
@@ -952,10 +982,10 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("close-both-legs");
+        let log = journal("close-both-legs");
         let outcome = close_pair(
             &context(&client, &log),
-            "AAAA-BBBB",
+            &pair_id("AAAA-BBBB"),
             &ticker("AAAA"),
             &ticker("BBBB"),
         )
@@ -991,10 +1021,10 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("close-long-errors");
+        let log = journal("close-long-errors");
         let result = close_pair(
             &context(&client, &log),
-            "AAAA-BBBB",
+            &pair_id("AAAA-BBBB"),
             &ticker("AAAA"),
             &ticker("BBBB"),
         )
@@ -1032,7 +1062,7 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("rejected-submission");
+        let log = journal("rejected-submission");
         let result = open_pair(&context(&client, &log), &pair(), None).await;
 
         assert!(result.is_err(), "the broker failure must still be reported");
@@ -1073,10 +1103,10 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("records-both-legs");
+        let log = journal("records-both-legs");
         close_pair(
             &context(&client, &log),
-            "AAAA-BBBB",
+            &pair_id("AAAA-BBBB"),
             &ticker("AAAA"),
             &ticker("BBBB"),
         )
@@ -1129,10 +1159,10 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("refused-close");
+        let log = journal("refused-close");
         let _ = close_pair(
             &context(&client, &log),
-            "AAAA-BBBB",
+            &pair_id("AAAA-BBBB"),
             &ticker("AAAA"),
             &ticker("BBBB"),
         )
@@ -1163,10 +1193,10 @@ mod tests {
             .await;
 
         let client = TradingClient::with_base_url(credentials(), server.url());
-        let log = session_log("already-gone");
+        let log = journal("already-gone");
         let outcome = close_pair(
             &context(&client, &log),
-            "AAAA-BBBB",
+            &pair_id("AAAA-BBBB"),
             &ticker("AAAA"),
             &ticker("BBBB"),
         )

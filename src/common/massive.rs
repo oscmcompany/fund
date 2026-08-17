@@ -1,21 +1,4 @@
 //! Massive market data client: whole-market daily bars, one request per session.
-//!
-//! Deliberately narrow: Massive answers only what every US stock did on a date, and Alpaca answers
-//! everything about our account and the current moment. Three properties of the grouped endpoint
-//! make that split load-bearing rather than aesthetic.
-//!
-//! **It takes no symbol list.** A backfill through Alpaca's bars endpoint can only pass Alpaca's
-//! *current* tradable set, so every symbol delisted since the start date is absent from its own
-//! history and the model trains on a universe that survived by construction.
-//!
-//! **It returns the whole market, which keeps the universe open.** `load_liquidity` reads averages
-//! out of `equity_bars`, so a sync that refreshed only the tickers already in the universe could
-//! never admit a name that became liquid — it would ratchet closed `LIQUIDITY_LOOKBACK_DAYS` after
-//! the last seed and shrink from there.
-//!
-//! **It is the consolidated tape, with no feed tiers.** Alpaca's `iex` feed carries a few percent
-//! of consolidated volume — survivable for quotes, not for bars, since `volume` and `vw` would be
-//! computed over that few percent while the liquidity thresholds assume the real numbers.
 
 use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
@@ -61,9 +44,6 @@ pub struct MassiveCredentials {
 
 impl MassiveCredentials {
     /// Constructs from explicit values, rejecting empties.
-    ///
-    /// An empty key reaches Massive as a 401, which reads like a permissions problem rather than
-    /// the configuration one it is.
     pub fn new(base_url: String, api_key: String) -> Result<Self, CredentialsError> {
         if base_url.is_empty() {
             return Err(CredentialsError::Empty { field: "base_url" });
@@ -88,11 +68,6 @@ impl MassiveCredentials {
 }
 
 /// Builds the grouped-daily URL for one date.
-///
-/// The configured base may carry a trailing slash — the `development/chris.addy` secret is
-/// `https://api.massive.com/` — and joining it naively yields a `//` that the API answers with a
-/// 404. Normalized here rather than at the call site, because there is only one right answer and a
-/// 404 from a doubled slash reads like a wrong path.
 fn grouped_bars_url(base: &str, date: NaiveDate) -> String {
     format!(
         "{}/v2/aggs/grouped/locale/us/market/stocks/{}",
@@ -227,11 +202,6 @@ fn is_common_stock_symbol(raw: &str) -> bool {
 }
 
 /// Converts an untrusted row into a validated [`EquityBar`], or `None`.
-///
-/// Returns `None` for a non-common-stock symbol, an unparseable ticker, a missing OHLCV field, a
-/// volume that does not fit an `i64`, or prices that do not form a coherent candle. All of those
-/// are conditions to drop the row over rather than fail the date: a grouped response covers the
-/// whole market, so one malformed instrument would otherwise cost every other symbol that session.
 fn parse_bar(row: &GroupedBarRow) -> Option<EquityBar> {
     if !is_common_stock_symbol(&row.ticker) {
         return None;
@@ -647,8 +617,6 @@ mod tests {
             .expect_err("malformed JSON is an error");
         assert!(matches!(error, MassiveError::Parse(_)), "{error:?}");
     }
-
-    // --- splits ---
 
     /// Two rows as the live endpoint returns them: a forward split and a reverse one, with the
     /// execution date already an Eastern calendar date and no adjustment factor to read.

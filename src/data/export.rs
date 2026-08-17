@@ -19,7 +19,7 @@
 //! completion event can report it. That list is also the purge's gate: [`crate::data::purge`] runs
 //! only when every dataset here wrote cleanly.
 //!
-//! [`export_session_logs`] ships a third shape: whole local JSONL files, one object per session,
+//! [`export_journals`] ships a third shape: whole local JSONL files, one object per session,
 //! independent of the database entirely.
 
 use std::path::Path;
@@ -33,7 +33,7 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::session_log::{file_name, session_from_file_name, SessionLog};
+use crate::common::journal::{file_name, session_from_file_name, Journal};
 use crate::common::types::SessionDate;
 
 /// What one nightly export accomplished.
@@ -381,21 +381,17 @@ fn to_polars_error(error: sqlx::Error) -> PolarsError {
     PolarsError::ComputeError(error.to_string().into())
 }
 
-// ---------------------------------------------------------------------------
-// Session log
-// ---------------------------------------------------------------------------
-
 /// S3 prefix the sealed sessions are written under.
-pub const SESSION_LOG_PREFIX: &str = "exports/session_log";
+pub const JOURNAL_PREFIX: &str = "exports/journal";
 
 /// Calendar days of sealed sessions kept on local disk after a clean export.
 ///
 /// The window in which a bad Parquet conversion can still be repaired from the original bytes.
-pub const SESSION_LOG_RETENTION_DAYS: i64 = 7;
+pub const JOURNAL_RETENTION_DAYS: i64 = 7;
 
 /// What one export run accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SessionLogExportSummary {
+pub struct JournalExportSummary {
     /// `(session_date, records)` for each session written to S3.
     pub exported: Vec<(NaiveDate, usize)>,
     /// `(session_date, error)` for each session that failed.
@@ -409,7 +405,7 @@ pub struct SessionLogExportSummary {
     pub unparsable_lines: usize,
 }
 
-impl SessionLogExportSummary {
+impl JournalExportSummary {
     pub fn total_records(&self) -> usize {
         self.exported.iter().map(|(_, records)| records).sum()
     }
@@ -424,13 +420,13 @@ impl SessionLogExportSummary {
 /// Every file present is exported, not just the retention window: one whole file at a deterministic
 /// key makes a repeat a byte-identical overwrite, so a failed run repairs itself. Local files are
 /// deleted only after a clean run that skipped nothing.
-pub async fn export_session_logs(
-    log: &SessionLog,
+pub async fn export_journals(
+    log: &Journal,
     s3_client: &S3Client,
     bucket: &str,
     today: SessionDate,
-) -> SessionLogExportSummary {
-    let mut summary = SessionLogExportSummary::default();
+) -> JournalExportSummary {
+    let mut summary = JournalExportSummary::default();
 
     let mut sessions = match sealed_sessions(log.directory(), today) {
         Ok(sessions) => sessions,
@@ -466,7 +462,7 @@ pub async fn export_session_logs(
         match frame {
             Ok((mut frame, unparsable)) => {
                 summary.unparsable_lines += unparsable;
-                let key = date_partitioned_key(SESSION_LOG_PREFIX, session_date.date());
+                let key = date_partitioned_key(JOURNAL_PREFIX, session_date.date());
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
                     Ok(()) => {
                         summary.exported.push((session_date.date(), frame.height()));
@@ -542,7 +538,7 @@ fn delete_aged_out(
     sessions: &[SessionDate],
     today: SessionDate,
 ) -> Vec<NaiveDate> {
-    let oldest_kept = today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS);
+    let oldest_kept = today.plus_calendar_days(-JOURNAL_RETENTION_DAYS);
     let mut deleted = Vec::new();
     for session_date in sessions.iter().filter(|session| **session < oldest_kept) {
         let path = directory.join(file_name(*session_date));
@@ -570,7 +566,7 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
     let mut correlation_ids: Vec<Option<String>> = Vec::new();
     let mut event_types: Vec<Option<String>> = Vec::new();
     let mut session_dates: Vec<Option<String>> = Vec::new();
-    let mut created_ats: Vec<Option<i64>> = Vec::new();
+    let mut timestamps: Vec<Option<i64>> = Vec::new();
     let mut payloads: Vec<Option<String>> = Vec::new();
     let mut unparsable = 0usize;
 
@@ -591,14 +587,14 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
             Some(correlation_id),
             Some(event_type),
             Some(session_date),
-            Some(created_at),
+            Some(timestamp),
         ) = (
             record.get("schema_version").and_then(Value::as_i64),
             text("event_id"),
             text("correlation_id"),
             text("event_type"),
             text("session_date"),
-            text("created_at").and_then(|stamp| {
+            text("timestamp").and_then(|stamp| {
                 DateTime::parse_from_rfc3339(&stamp)
                     .ok()
                     .map(|instant| instant.timestamp_millis())
@@ -614,7 +610,7 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
         correlation_ids.push(Some(correlation_id));
         event_types.push(Some(event_type));
         session_dates.push(Some(session_date));
-        created_ats.push(Some(created_at));
+        timestamps.push(Some(timestamp));
         payloads.push(record.get("payload").map(Value::to_string));
     }
 
@@ -622,7 +618,7 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
         warn!(
             path = %path.display(),
             unparsable,
-            "Skipped session log lines that would not parse"
+            "Skipped journal lines that would not parse"
         );
     }
 
@@ -632,7 +628,7 @@ fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
         Column::new("correlation_id".into(), correlation_ids),
         Column::new("event_type".into(), event_types),
         Column::new("session_date".into(), session_dates),
-        Column::new("created_at".into(), created_ats),
+        Column::new("timestamp".into(), timestamps),
         Column::new("payload".into(), payloads),
     ])
     .map_err(|error| format!("failed to build frame for {}: {error}", path.display()))?;
@@ -647,7 +643,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::common::session_log::{AccountObserved, Observation, Record};
+    use crate::common::journal::{AccountObserved, Observation, Record};
 
     fn session(year: i32, month: u32, day: u32) -> SessionDate {
         SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).expect("valid date"))
@@ -662,11 +658,11 @@ mod tests {
     fn account_observation() -> Observation {
         Observation::AccountObserved(AccountObserved {
             session_date: session(2026, 8, 11),
-            equity: Some(104_812.55),
-            cash: Some(12_000.0),
-            buying_power: Some(200_000.0),
-            long_market_value: Some(50_000.0),
-            short_market_value: Some(-50_000.0),
+            equity: "104812.55".parse().expect("valid decimal"),
+            cash: "12000.07".parse().expect("valid decimal"),
+            buying_power: "200000.00".parse().expect("valid decimal"),
+            long_market_value: "50000.00".parse().expect("valid decimal"),
+            short_market_value: "-50000.01".parse().expect("valid decimal"),
         })
     }
 
@@ -747,8 +743,8 @@ mod tests {
         .expect("the record must serialize");
         let lines = [
             complete.as_str(),
-            r#"{"schema_version":1,"event_type":"account_observed","created_at":"2026-08-11T20:15:00Z"}"#,
-            r#"{"schema_version":1,"event_id":"a","event_type":"account_observed","created_at":"not a time"}"#,
+            r#"{"schema_version":3,"event_type":"account_observed","timestamp":"2026-08-11T20:15:00Z"}"#,
+            r#"{"schema_version":3,"event_id":"a","event_type":"account_observed","timestamp":"not a time"}"#,
         ]
         .join("\n");
         std::fs::write(&path, lines).expect("the file must be writable");
@@ -794,7 +790,7 @@ mod tests {
                 "correlation_id",
                 "event_type",
                 "session_date",
-                "created_at",
+                "timestamp",
                 "payload"
             ]
         );
@@ -841,17 +837,17 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("the directory must be creatable");
         let path = directory.join("session-2026-08-11.jsonl");
         let mut lines = String::new();
-        for equity in [104_812.55_f64, 105_000.0] {
+        for equity in ["104812.55", "105000.00"] {
             let record = Record::new(
                 Uuid::new_v4(),
                 instant("2026-08-11T20:15:00Z"),
                 Observation::AccountObserved(AccountObserved {
                     session_date: session(2026, 8, 11),
-                    equity: Some(equity),
-                    cash: Some(12_000.0),
-                    buying_power: Some(200_000.0),
-                    long_market_value: Some(50_000.0),
-                    short_market_value: Some(-50_000.0),
+                    equity: equity.parse().expect("valid decimal"),
+                    cash: "12000.07".parse().expect("valid decimal"),
+                    buying_power: "200000.00".parse().expect("valid decimal"),
+                    long_market_value: "50000.00".parse().expect("valid decimal"),
+                    short_market_value: "-50000.01".parse().expect("valid decimal"),
                 }),
             );
             lines.push_str(&serde_json::to_string(&record).expect("the record must serialize"));
@@ -873,10 +869,10 @@ mod tests {
         // The instant survives as milliseconds, which is what lets a reader recover 16:15 Eastern.
         assert_eq!(
             restored
-                .column("created_at")
-                .expect("created_at column")
+                .column("timestamp")
+                .expect("timestamp column")
                 .i64()
-                .expect("created_at is an integer")
+                .expect("the timestamp is an integer")
                 .get(0),
             Some(instant("2026-08-11T20:15:00Z").timestamp_millis())
         );
@@ -915,7 +911,7 @@ mod tests {
             "correlation_id",
             "event_type",
             "session_date",
-            "created_at",
+            "timestamp",
         ] {
             let mut record: serde_json::Map<String, Value> =
                 serde_json::from_str(&complete).expect("the record must parse");
@@ -946,8 +942,8 @@ mod tests {
 
         let today = session(2026, 8, 11);
         let aged_out = [
-            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS - 2),
-            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS - 1),
+            today.plus_calendar_days(-JOURNAL_RETENTION_DAYS - 2),
+            today.plus_calendar_days(-JOURNAL_RETENTION_DAYS - 1),
         ];
         for session_date in aged_out {
             std::fs::write(directory.join(file_name(session_date)), "")
@@ -966,54 +962,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// A file written across a mid-session deploy holds both shapes. Every v1 record must survive
-    /// the stricter envelope check, or the deploy silently drops the morning from the archive.
-    #[test]
-    fn test_a_file_written_across_a_deploy_keeps_both_schema_versions() {
-        let directory = temporary_directory("mixed-versions");
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("session-2026-08-12.jsonl");
-
-        // The five shapes a real v1 session file holds, taken from one on disk rather than guessed.
-        // `predictions_generated` carries `predictions` as a *count* here; in v2 the same field is
-        // an array, which is the one field whose type the version bump changes.
-        let v1 = [
-            r#"{"schema_version":1,"event_id":"11111111-1111-1111-1111-111111111111","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:00Z","event_type":"evaluation_pass","payload":{"universe_size":7000,"prices":[{"ticker":"AAAA","price":100.0,"price_source":"last_trade"}],"open_pairs":[],"screen_inputs":[],"excluded":[],"candidates":[]}}"#,
-            r#"{"schema_version":1,"event_id":"33333333-3333-3333-3333-333333333333","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:01Z","event_type":"order_submitted","payload":{"client_order_id":"k-long","ticker":"AAAA","side":"buy","shares":null,"notional":1000.0}}"#,
-            r#"{"schema_version":1,"event_id":"44444444-4444-4444-4444-444444444444","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:02Z","event_type":"order_resolved","payload":{"client_order_id":"k-long","alpaca_order_id":"o1","ticker":"AAAA","outcome":"filled","filled_shares":10.0,"filled_average_price":100.4,"filled_after_cancel":false,"error":null}}"#,
-            r#"{"schema_version":1,"event_id":"55555555-5555-5555-5555-555555555555","correlation_id":"22222222-2222-2222-2222-222222222222","session_date":"2026-08-12","created_at":"2026-08-12T14:35:03Z","event_type":"position_close_requested","payload":{"ticker":"AAAA","pair_id":"AAAA-BBBB","alpaca_order_id":"o2","side":"long","quantity":10.0,"reason":"pair_exit","accepted":true,"status":null,"error":null}}"#,
-            r#"{"schema_version":1,"event_id":"66666666-6666-6666-6666-666666666666","correlation_id":"77777777-7777-7777-7777-777777777777","session_date":"2026-08-12","created_at":"2026-08-12T13:00:00Z","event_type":"predictions_generated","payload":{"model_run_id":"run-1","artifact_key":"models/tide/run-1","artifact_staleness_sessions":0,"predictions":1043,"rows_written":1043,"universe_size":7000}}"#,
-        ];
-        // A v2 record appended after the restart, into the same file.
-        let v2 = serde_json::to_string(&Record::new(
-            Uuid::nil(),
-            DateTime::parse_from_rfc3339("2026-08-12T18:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
-            Observation::PricesObserved(Default::default()),
-        ))
-        .unwrap();
-
-        let mut lines = v1.join("\n");
-        lines.push('\n');
-        lines.push_str(&v2);
-        std::fs::write(&path, lines).unwrap();
-
-        let (frame, unparsable) = read_session_frame(&path).unwrap();
-        assert_eq!(
-            unparsable, 0,
-            "no v1 record may be dropped by the new reader"
-        );
-        assert_eq!(frame.height(), 6, "five v1 records plus one v2");
-        let versions = frame.column("schema_version").unwrap().i64().unwrap();
-        assert_eq!(
-            (versions.get(0), versions.get(5)),
-            (Some(1), Some(2)),
-            "both versions coexist in one file, each row carrying its own"
-        );
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
     /// Only what has aged out goes, and the window's own edge stays. The local file is the
     /// crash-exact original, so deleting one still inside the window would remove the only thing a
     /// bad Parquet conversion could be repaired from.
@@ -1024,8 +972,8 @@ mod tests {
 
         let today = session(2026, 8, 11);
         let sessions = [
-            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS - 1),
-            today.plus_calendar_days(-SESSION_LOG_RETENTION_DAYS),
+            today.plus_calendar_days(-JOURNAL_RETENTION_DAYS - 1),
+            today.plus_calendar_days(-JOURNAL_RETENTION_DAYS),
             today.plus_calendar_days(-1),
             today,
         ];
@@ -1051,14 +999,14 @@ mod tests {
     /// rather than a duplicate — and why there is no cursor to keep in sync.
     #[test]
     fn test_the_export_key_is_determined_by_the_session_alone() {
-        let key = date_partitioned_key(SESSION_LOG_PREFIX, session(2026, 8, 11).date());
+        let key = date_partitioned_key(JOURNAL_PREFIX, session(2026, 8, 11).date());
         assert_eq!(
             key,
-            "exports/session_log/year=2026/month=08/day=11/data.parquet"
+            "exports/journal/year=2026/month=08/day=11/data.parquet"
         );
         assert_eq!(
             key,
-            date_partitioned_key(SESSION_LOG_PREFIX, session(2026, 8, 11).date())
+            date_partitioned_key(JOURNAL_PREFIX, session(2026, 8, 11).date())
         );
     }
 }

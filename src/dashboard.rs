@@ -18,7 +18,7 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::common::observability::init_tracing_file_only;
+use crate::common::log::init_tracing_file_only;
 
 /// Connections the dashboard pool may open: one for the poller, one for the listener, and headroom
 /// for the overlap while a dropped listener reconnects.

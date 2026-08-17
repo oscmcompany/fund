@@ -155,7 +155,7 @@ FROM read_parquet(
     hive_partitioning = true
 );
 
--- The session log is the application's own original: what it observed before it acted, appended to
+-- The journal is the application's own original: what it observed before it acted, appended to
 -- local disk as it happened and sealed to Parquet after the close. Everything above is a fold or a
 -- query over it, so this is where to go when the tables disagree with each other.
 --
@@ -163,32 +163,25 @@ FROM read_parquet(
 -- payload with the JSON operators:
 --
 --   SELECT payload->>'ticker', payload->>'outcome'
---   FROM session_log WHERE event_type = 'order_resolved';
+--   FROM journal WHERE event_type = 'order_resolved';
 --
 --   SELECT unnest(from_json(payload->'readings', '["json"]'))->>'ticker'
---   FROM session_log WHERE event_type = 'prices_observed';
+--   FROM journal WHERE event_type = 'prices_observed';
 --
 -- correlation_id threads a command to everything it did: one command_finished, the pass it ran, the
 -- prices it read, the orders it sent, the fills they produced. Joining on it is how a duration
 -- becomes an answer about where the time went.
 --
--- schema_version is 2 for anything written after 2026-08-12. Version 1 carried the pass's prices,
--- screen inputs, exclusions, and open book inline on an evaluation_pass record, and had no
--- command_finished, pair_opened, pair_closed, pair_attributed, or activity_observed.
---
--- One field changed type rather than name, which is the case a reader cannot detect on its own:
--- predictions_generated.predictions was a count in v1 and is the array of quantiles in v2. A query
--- reading it must filter on schema_version or check the type, or it silently reads a length as a
--- number of tickers. Only the single v1 session, 2026-08-12, is affected.
+-- schema_version is 3, which is the only version in this archive: v1 and v2 were development and
+-- their objects are gone. It exists so a future change can be told apart from a missing field.
 --
 -- Fields are added within a version as well as across one, and an absent key reads as NULL either
 -- way, so "the build predated this field" and "there was nothing to record" are the same answer.
--- prices_observed.readings[].trade_timestamp and universe_screened.excluded[].detail both start
--- mid-v2; anything counting them should bound the query below by the first session that has them
--- rather than treating an early NULL as a zero.
-.print 'Loading session_log...'
-DROP VIEW IF EXISTS session_log;
-CREATE OR REPLACE VIEW session_log AS
+-- Anything counting a field should bound the query by the first session that has it rather than
+-- treating an early NULL as a zero.
+.print 'Loading journal...'
+DROP VIEW IF EXISTS journal;
+CREATE OR REPLACE VIEW journal AS
 SELECT
     schema_version,
     event_id,
@@ -199,7 +192,7 @@ SELECT
     -- epoch_ms: the first returns a TIMESTAMPTZ anchored to UTC, the second a bare TIMESTAMP that
     -- reads as whatever zone the session happens to be in. An instant is always UTC here, and
     -- session_date beside it is always the Eastern trading day.
-    to_timestamp(created_at / 1000.0) AS created_at,
+    to_timestamp(timestamp / 1000.0) AS timestamp,
     payload,
     -- From the key layout rather than the file contents, so a filter on them skips whole files.
     -- session_date is inside each Parquet, so filtering on that alone opens every one, and the
@@ -208,7 +201,7 @@ SELECT
     month,
     day
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/exports/session_log/**/*.parquet',
+    's3://' || getvariable('bucket') || '/exports/journal/**/*.parquet',
     hive_partitioning = true
 );
 

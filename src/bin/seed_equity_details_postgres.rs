@@ -11,7 +11,7 @@
 //! a bucket, so PostgreSQL is the only target.
 
 use fund::common::database::connect_pool;
-use fund::common::observability::init_tracing;
+use fund::common::log::init_tracing;
 use fund::data::details;
 use tracing::{error, info};
 

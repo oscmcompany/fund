@@ -22,10 +22,6 @@ use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{FeatureMappings, Scaler};
 use crate::models::tide::model::TiDEModel;
 
-// --------------------------------------------------------------------------
-// The loaded artifact
-// --------------------------------------------------------------------------
-
 pub struct ModelState {
     /// The loaded weights, behind a mutex because the forward pass mutates them.
     ///
@@ -121,10 +117,6 @@ fn model_state_is_send_and_sync() {
     fn require<T: Send + Sync>() {}
     require::<ModelState>();
 }
-
-// --------------------------------------------------------------------------
-// Reading: resolve, download, load
-// --------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactError {
@@ -425,10 +417,6 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         load_timestamp,
     ))
 }
-
-// --------------------------------------------------------------------------
-// Writing: package and upload
-// --------------------------------------------------------------------------
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArtifactWriteError {
