@@ -16,6 +16,7 @@ use crate::models::tide::data::{
     training_cutoff, CategoryMapping, Data, FeatureMappings, Scaler, TrainingFraction,
     CATEGORICAL_COLUMNS, CONTINUOUS_COLUMNS, STATIC_CATEGORICAL_COLUMNS,
 };
+use crate::models::tide::TideError;
 
 /// Result of fitting: the preprocessed (scaled + encoded) data ready for
 /// windowing, alongside the fitted scaler and mappings.
@@ -40,10 +41,7 @@ pub struct FitResult {
 /// instrument first listed (or first clearing the liquidity floors) after the cutoff would vanish
 /// from the validation split, and, since these mappings ship in the artifact as the inference
 /// vocabulary, could not be predicted at all until it had traded the full pre-cutoff window.
-pub fn fit(
-    raw: DataFrame,
-    training_fraction: TrainingFraction,
-) -> Result<FitResult, Box<dyn std::error::Error>> {
+pub fn fit(raw: DataFrame, training_fraction: TrainingFraction) -> Result<FitResult, TideError> {
     let engineered = engineer_features(raw)?;
     let cleaned = clean_data(engineered)?;
 
@@ -71,21 +69,19 @@ pub fn fit(
 /// than fitted: `mean()` and `std()` both return `None` over no rows, every mean would fall back to
 /// `0.0` and every deviation to the `1e-8` floor, and the result passes [`Scaler::new`] while
 /// scaling by a hundred million.
-fn fit_scaler(data: &DataFrame) -> Result<Scaler, Box<dyn std::error::Error>> {
+fn fit_scaler(data: &DataFrame) -> Result<Scaler, TideError> {
     if data.height() == 0 {
-        return Err("No rows at or before the training cutoff to fit the scaler on".into());
+        return Err(TideError::Data(
+            "No rows at or before the training cutoff to fit the scaler on".to_string(),
+        ));
     }
 
     let mut means = std::collections::HashMap::new();
     let mut standard_deviations = std::collections::HashMap::new();
 
     for column in CONTINUOUS_COLUMNS {
-        let series = data
-            .column(column)
-            .map_err(|error| error.to_string())?
-            .cast(&DataType::Float64)
-            .map_err(|error| error.to_string())?;
-        let values = series.f64().map_err(|error| error.to_string())?;
+        let series = data.column(column)?.cast(&DataType::Float64)?;
+        let values = series.f64()?;
         let mean = values.mean().unwrap_or(0.0);
         let standard_deviation = values.std(1).unwrap_or(0.0);
         let standard_deviation = if standard_deviation == 0.0 {
@@ -98,13 +94,14 @@ fn fit_scaler(data: &DataFrame) -> Result<Scaler, Box<dyn std::error::Error>> {
     }
 
     Scaler::new(means, standard_deviations).map_err(|reason| {
-        format!("Fitted scaler is unusable, so training would produce a bad artifact: {reason}")
-            .into()
+        TideError::Data(format!(
+            "Fitted scaler is unusable, so training would produce a bad artifact: {reason}"
+        ))
     })
 }
 
 /// Build deterministic value->index maps for the static categorical columns.
-fn fit_mappings(data: &DataFrame) -> Result<FeatureMappings, Box<dyn std::error::Error>> {
+fn fit_mappings(data: &DataFrame) -> Result<FeatureMappings, TideError> {
     let mut mappings = FeatureMappings::new();
     for column in STATIC_CATEGORICAL_COLUMNS {
         mappings.insert((*column).to_string(), build_mapping(data, column)?);
@@ -112,15 +109,10 @@ fn fit_mappings(data: &DataFrame) -> Result<FeatureMappings, Box<dyn std::error:
     Ok(mappings)
 }
 
-fn build_mapping(
-    data: &DataFrame,
-    column: &str,
-) -> Result<CategoryMapping, Box<dyn std::error::Error>> {
+fn build_mapping(data: &DataFrame, column: &str) -> Result<CategoryMapping, TideError> {
     let mut values: Vec<String> = data
-        .column(column)
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?
+        .column(column)?
+        .str()?
         .into_no_null_iter()
         .map(|name| name.to_string())
         .collect::<HashSet<_>>()
@@ -141,24 +133,12 @@ pub fn filter_training_bars(
     data: DataFrame,
     minimum_close_price: f64,
     minimum_volume: f64,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    let close_prices = data
-        .column("close_price")
-        .map_err(|error| error.to_string())?
-        .cast(&DataType::Float64)
-        .map_err(|error| error.to_string())?;
-    let close_prices = close_prices.f64().map_err(|error| error.to_string())?;
-    let volumes = data
-        .column("volume")
-        .map_err(|error| error.to_string())?
-        .cast(&DataType::Float64)
-        .map_err(|error| error.to_string())?;
-    let volumes = volumes.f64().map_err(|error| error.to_string())?;
-    let tickers = data
-        .column("ticker")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?;
+) -> Result<DataFrame, TideError> {
+    let close_prices = data.column("close_price")?.cast(&DataType::Float64)?;
+    let close_prices = close_prices.f64()?;
+    let volumes = data.column("volume")?.cast(&DataType::Float64)?;
+    let volumes = volumes.f64()?;
+    let tickers = data.column("ticker")?.str()?;
 
     let mask: BooleanChunked = close_prices
         .into_iter()
@@ -172,7 +152,7 @@ pub fn filter_training_bars(
         })
         .collect();
 
-    let filtered = data.filter(&mask).map_err(|error| error.to_string())?;
+    let filtered = data.filter(&mask)?;
     Ok(filtered)
 }
 
@@ -193,7 +173,7 @@ pub fn write_artifact_json(
     scaler: &Scaler,
     mappings: &FeatureMappings,
     parameters: &ModelParameters,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), TideError> {
     std::fs::create_dir_all(directory)?;
 
     let scaler_json = serde_json::json!({

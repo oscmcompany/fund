@@ -301,15 +301,22 @@ pub(crate) fn unscale_and_sort_quantiles(
 /// [`crate::data::calendar::eastern_day_bounds`], and a UTC midnight sits at 20:00 the previous
 /// Eastern day under daylight time -- so a UTC-stamped prediction lands in the wrong session's
 /// window and the morning's inference run is never read by that day's passes.
-pub(crate) fn step_timestamp_milliseconds(now: chrono::DateTime<Utc>, step: usize) -> i64 {
-    let session = SessionDate::at(now).plus_calendar_days(step as i64);
-    session.midnight().timestamp_millis()
+pub(crate) fn step_timestamp(now: chrono::DateTime<Utc>, step: usize) -> DateTime<Utc> {
+    SessionDate::at(now)
+        .plus_calendar_days(step as i64)
+        .midnight()
 }
 
+/// Runs the forward pass and returns one validated prediction per ticker for the coming session.
+///
+/// Returns [`EquityPrediction`] rather than JSON. The values are typed the moment they leave the
+/// tensor, so the quantile ordering, the ticker format, and the instant are checked once, here,
+/// instead of being flattened into a map and re-parsed by the writer.
 pub fn generate_predictions(
     data: DataFrame,
     model_state: &ModelState,
-) -> Result<serde_json::Value, PredictionError> {
+    correlation_id: Uuid,
+) -> Result<Vec<EquityPrediction>, PredictionError> {
     // One `now` for the whole run. The session the synthesized future row carries and the session
     // the output is stamped with are both derived from it, so the features and the label cannot
     // describe different days -- which is the shape of the bug this replaced.
@@ -366,7 +373,6 @@ pub fn generate_predictions(
             "Expected exactly 3 quantiles (10/50/90); the loaded model has {quantile_count}"
         )));
     }
-    let mut results = Vec::new();
 
     // Indexing a `HashMap` panics on a missing key. An artifact without a `ticker` mapping is a
     // malformed artifact, which is a condition to report rather than one to abort the process on --
@@ -381,211 +387,115 @@ pub fn generate_predictions(
         .map(|(ticker, id)| (*id, ticker))
         .collect();
 
+    // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
+    // liquidation flattens every position the same session, so a prediction further out describes a
+    // holding period this strategy never has. Selected explicitly rather than as the last step, so
+    // widening `output_length` for research does not silently move the traded signal.
+    let traded_session = step_timestamp(now, 0);
+
+    let mut results = Vec::with_capacity(sample_count);
     for sample_index in 0..sample_count {
         let ticker_id = dataset.static_categorical[[sample_index, 0, 0]];
-        let ticker = reverse_ticker_map
-            .get(&ticker_id)
-            .map(|ticker| ticker.as_str())
-            .unwrap_or("UNKNOWN");
+        // Reported rather than defaulted. This used to fall back to the literal string "UNKNOWN",
+        // which is a valid ticker format -- so an unmappable id was stored as a prediction for a
+        // symbol called UNKNOWN rather than failing.
+        let raw_ticker = reverse_ticker_map.get(&ticker_id).ok_or_else(|| {
+            PredictionError::Postprocessing(format!(
+                "sample {sample_index} carries encoded ticker {ticker_id}, which the artifact's \
+                 mapping does not name"
+            ))
+        })?;
+        let ticker = Ticker::new(raw_ticker).ok_or_else(|| {
+            PredictionError::Postprocessing(format!(
+                "the artifact's ticker mapping contains {raw_ticker}, which is not a usable ticker"
+            ))
+        })?;
 
         for step in 0..output_length {
-            let base_index = (sample_index * output_length + step) * quantile_count;
+            let timestamp = step_timestamp(now, step);
+            if timestamp != traded_session {
+                continue;
+            }
 
+            let base_index = (sample_index * output_length + step) * quantile_count;
             let scaled: Vec<f64> = (0..quantile_count)
                 .map(|quantile| predictions_data[base_index + quantile] as f64)
                 .collect();
             let quantiles = unscale_and_sort_quantiles(&scaled, model_state.scaler());
 
-            results.push(serde_json::json!({
-                "ticker": ticker,
-                "timestamp": step_timestamp_milliseconds(now, step),
-                "quantile_10": quantiles[0],
-                "quantile_50": quantiles[1],
-                "quantile_90": quantiles[2],
-            }));
+            results.push(
+                EquityPrediction::new(
+                    correlation_id,
+                    model_state.run_id().to_string(),
+                    ticker.clone(),
+                    timestamp,
+                    quantiles[0],
+                    quantiles[1],
+                    quantiles[2],
+                )
+                .map_err(|error| {
+                    PredictionError::Postprocessing(format!(
+                        "prediction for {ticker} is invalid: {error}"
+                    ))
+                })?,
+            );
         }
     }
 
-    // Step 0 -- the coming close -- is the only horizon the book can act on: the pre-close
-    // liquidation flattens every position the same session, so a prediction further out describes a
-    // holding period this strategy never has. Selected explicitly rather than as the last step, so
-    // widening `output_length` for research does not silently move the traded signal.
-    let target_date = step_timestamp_milliseconds(now, 0);
-
-    let final_predictions: Vec<serde_json::Value> = results
-        .into_iter()
-        .filter(|row| row["timestamp"] == target_date)
-        .collect();
-
-    info!(count = final_predictions.len(), "Predictions generated");
-
-    Ok(serde_json::json!(final_predictions))
+    info!(count = results.len(), "Predictions generated");
+    Ok(results)
 }
 
-pub fn validate_predictions(predictions: &[serde_json::Value]) -> Result<(), String> {
-    if predictions.is_empty() {
-        return Ok(());
-    }
-
-    let mut seen_pairs: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
-    let mut timestamps_by_ticker: std::collections::HashMap<String, Vec<i64>> =
-        std::collections::HashMap::new();
+/// Checks the two invariants that are properties of the batch rather than of a row.
+///
+/// Everything about a single prediction — the quantile ordering, the finiteness, the ticker format
+/// — is already guaranteed by [`EquityPrediction`] and [`Ticker`] having been constructed. What a
+/// value cannot know is what its neighbours look like: two rows for one `(ticker, timestamp)` would
+/// be silently collapsed by the upsert's `ON CONFLICT`, and tickers stamped with different sessions
+/// would leave the book comparing forecasts for different days.
+pub fn validate_predictions(predictions: &[EquityPrediction]) -> Result<(), String> {
+    let mut seen_pairs: std::collections::HashSet<(&Ticker, DateTime<Utc>)> =
+        std::collections::HashSet::new();
+    let mut reference: Option<DateTime<Utc>> = None;
 
     for prediction in predictions {
-        let ticker = prediction["ticker"]
-            .as_str()
-            .ok_or("Missing ticker field")?;
-
-        if ticker != ticker.to_uppercase() {
-            let message = format!("Ticker not uppercase: {ticker}");
-            return Err(message);
+        if !seen_pairs.insert((prediction.ticker(), prediction.timestamp())) {
+            return Err(format!(
+                "Duplicate ticker/timestamp pair: {}/{}",
+                prediction.ticker(),
+                prediction.timestamp()
+            ));
         }
 
-        let timestamp = prediction["timestamp"]
-            .as_i64()
-            .ok_or("Missing timestamp field")?;
-
-        let q10 = prediction["quantile_10"]
-            .as_f64()
-            .ok_or("Missing quantile_10 field")?;
-        let q50 = prediction["quantile_50"]
-            .as_f64()
-            .ok_or("Missing quantile_50 field")?;
-        let q90 = prediction["quantile_90"]
-            .as_f64()
-            .ok_or("Missing quantile_90 field")?;
-
-        if q10 > q50 || q50 > q90 {
-            let message =
-                format!("Non-monotonic quantiles for {ticker}: q10={q10}, q50={q50}, q90={q90}");
-            return Err(message);
-        }
-
-        let pair = (ticker.to_string(), timestamp);
-        if !seen_pairs.insert(pair) {
-            let message = format!("Duplicate ticker/timestamp pair: {ticker}/{timestamp}");
-            return Err(message);
-        }
-
-        timestamps_by_ticker
-            .entry(ticker.to_string())
-            .or_default()
-            .push(timestamp);
-    }
-
-    let all_timestamp_sets: Vec<Vec<i64>> = timestamps_by_ticker
-        .values()
-        .map(|timestamps| {
-            let mut sorted = timestamps.clone();
-            sorted.sort();
-            sorted
-        })
-        .collect();
-
-    if let Some(reference) = all_timestamp_sets.first() {
-        for ts_set in &all_timestamp_sets[1..] {
-            if ts_set != reference {
-                let message = "Timestamps are not consistent across all tickers".to_string();
-                return Err(message);
+        match reference {
+            None => reference = Some(prediction.timestamp()),
+            Some(expected) if expected != prediction.timestamp() => {
+                return Err(format!(
+                    "Timestamps are not consistent across all tickers: {} is stamped {} where {} was expected",
+                    prediction.ticker(),
+                    prediction.timestamp(),
+                    expected
+                ));
             }
+            Some(_) => {}
         }
     }
 
     Ok(())
 }
 
-/// Converts a pipeline prediction JSON object into a validated [`EquityPrediction`].
-///
-/// These come from our own pipeline, so a missing or mistyped field is a bug upstream. It fails
-/// loudly with the offending field and ticker rather than persisting placeholders.
-///
-/// The failure is a plain message rather than a `sqlx::Error::Decode`, which is what it used to be.
-/// Nothing here came from the database — this is our own in-memory JSON — so reporting a malformed
-/// payload as a decode error sent the reader looking at the wrong machine.
-fn prediction_from_json(
-    prediction: &serde_json::Value,
-    correlation_id: Uuid,
-    model_run_id: &str,
-) -> Result<EquityPrediction, String> {
-    let ticker = prediction
-        .get("ticker")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Prediction is missing a string ticker field".to_string())?;
-
-    let timestamp_milliseconds = prediction
-        .get("timestamp")
-        .and_then(|value| value.as_i64())
-        .ok_or_else(|| {
-            format!("Prediction for ticker {ticker} is missing an integer timestamp field")
-        })?;
-    let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp_milliseconds)
-        .filter(|_| timestamp_milliseconds > 0)
-        .ok_or_else(|| {
-            format!(
-                "Prediction for ticker {ticker} has an invalid timestamp: {timestamp_milliseconds}"
-            )
-        })?;
-
-    let quantile = |field: &str| -> Result<f64, String> {
-        prediction
-            .get(field)
-            .and_then(|value| value.as_f64())
-            .ok_or_else(|| {
-                format!("Prediction for ticker {ticker} is missing a numeric {field} field")
-            })
-    };
-
-    let validated_ticker = Ticker::new(ticker)
-        .ok_or_else(|| format!("Invalid ticker in prediction payload: {ticker}"))?;
-    // `EquityPrediction::new` enforces the quantile ordering invariant, so a crossed set from the
-    // model is rejected here rather than stored. Every downstream use -- the confidence measure,
-    // the directional signal -- produces plausible nonsense from crossed quantiles rather than
-    // failing, which makes this the last place the error is cheap to catch.
-    EquityPrediction::new(
-        correlation_id,
-        model_run_id.to_string(),
-        validated_ticker,
-        timestamp,
-        quantile("quantile_10")?,
-        quantile("quantile_50")?,
-        quantile("quantile_90")?,
-    )
-    .map_err(|error| format!("Prediction for ticker {ticker} is invalid: {error}"))
-}
-
-/// Why writing a prediction batch failed.
-///
-/// Two variants because the two failures point at different machines: a malformed payload is a bug
-/// in this process's own model output, and a database error is the database. Collapsing them, as
-/// the `sqlx::Error` return did, made every model bug read as a storage problem.
-#[derive(Debug, thiserror::Error)]
-pub enum InsertPredictionsError {
-    #[error("prediction payload is malformed: {0}")]
-    Payload(String),
-    #[error("{0}")]
-    Database(#[from] sqlx::Error),
-}
-
 pub async fn insert_predictions(
     pool: &PgPool,
-    predictions: &[serde_json::Value],
-    correlation_id: Uuid,
-    model_run_id: &str,
-) -> Result<(u64, Vec<EquityPrediction>), InsertPredictionsError> {
+    predictions: &[EquityPrediction],
+) -> Result<u64, sqlx::Error> {
     if predictions.is_empty() {
-        return Ok((0, Vec::new()));
+        return Ok(0);
     }
-
-    let validated: Vec<EquityPrediction> = predictions
-        .iter()
-        .map(|prediction| prediction_from_json(prediction, correlation_id, model_run_id))
-        .collect::<Result<_, _>>()
-        .map_err(InsertPredictionsError::Payload)?;
 
     let mut rows_affected: u64 = 0;
     let mut transaction = pool.begin().await?;
 
-    for chunk in validated.chunks(1000) {
+    for chunk in predictions.chunks(1000) {
         let mut query_builder = sqlx::QueryBuilder::new(
             "INSERT INTO equity_predictions (correlation_id, model_run_id, ticker, timestamp, quantile_10, quantile_50, quantile_90) ",
         );
@@ -616,9 +526,7 @@ pub async fn insert_predictions(
 
     transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
-    // Returned rather than reparsed by the caller: these are the exact values that were written,
-    // so the journal records what the database holds and not a second reading of the payload.
-    Ok((rows_affected, validated))
+    Ok(rows_affected)
 }
 
 /// Loads the most recent prediction per ticker within a half-open instant range.
@@ -826,45 +734,65 @@ mod tests {
         assert_eq!(result.height(), 0);
     }
 
-    #[test]
-    fn test_validate_predictions_valid() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": 1000, "quantile_10": 0.05, "quantile_50": 0.06, "quantile_90": 0.07}),
-        ];
-        assert!(validate_predictions(&predictions).is_ok());
+    fn prediction(ticker: &str, timestamp: DateTime<Utc>) -> EquityPrediction {
+        EquityPrediction::new(
+            Uuid::nil(),
+            "2026-08-05-00-00-00-000".to_string(),
+            Ticker::new(ticker).expect("a valid test ticker"),
+            timestamp,
+            -0.01,
+            0.0,
+            0.01,
+        )
+        .expect("ordered quantiles must construct")
     }
 
-    #[test]
-    fn test_validate_predictions_non_monotonic() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.05, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Non-monotonic"));
+    fn instant(raw: &str) -> DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .expect("a valid test instant")
+            .with_timezone(&Utc)
     }
 
+    /// The row-level invariants moved into `EquityPrediction` and `Ticker`, so what is left to
+    /// check is what a single value cannot know about its neighbours.
     #[test]
-    fn test_validate_predictions_mixed_timestamps() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": 2000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Timestamps"));
+    fn test_a_consistent_batch_passes() {
+        let session = instant("2026-08-05T04:00:00Z");
+        assert!(validate_predictions(&[]).is_ok());
+        assert!(validate_predictions(&[prediction("AAPL", session)]).is_ok());
+        assert!(validate_predictions(&[
+            prediction("AAPL", session),
+            prediction("MSFT", session),
+            prediction("GOOG", session),
+        ])
+        .is_ok());
     }
 
+    /// The upsert's `ON CONFLICT (ticker, timestamp)` would collapse a repeated pair silently, so
+    /// the second row would overwrite the first and the batch would report a row count that does
+    /// not match what it was handed.
     #[test]
-    fn test_validate_predictions_duplicate_pair() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.04, "quantile_50": 0.05, "quantile_90": 0.06}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Duplicate"));
+    fn test_a_repeated_ticker_and_session_is_refused() {
+        let session = instant("2026-08-05T04:00:00Z");
+        let error = validate_predictions(&[
+            prediction("AAPL", session),
+            prediction("MSFT", session),
+            prediction("AAPL", session),
+        ])
+        .expect_err("a repeated pair must be refused");
+        assert!(error.contains("Duplicate"), "got: {error}");
+    }
+
+    /// Every prediction in a batch describes the same session. One stamped differently would have
+    /// the book comparing forecasts for two different days against one universe.
+    #[test]
+    fn test_a_batch_spanning_two_sessions_is_refused() {
+        let error = validate_predictions(&[
+            prediction("AAPL", instant("2026-08-05T04:00:00Z")),
+            prediction("MSFT", instant("2026-08-06T04:00:00Z")),
+        ])
+        .expect_err("a split batch must be refused");
+        assert!(error.contains("not consistent"), "got: {error}");
     }
 
     #[test]
@@ -895,8 +823,7 @@ mod tests {
             let now = chrono::DateTime::parse_from_rfc3339(&format!("{day}T13:00:00Z"))
                 .unwrap()
                 .with_timezone(&Utc);
-            let stamp = DateTime::<Utc>::from_timestamp_millis(step_timestamp_milliseconds(now, 0))
-                .unwrap();
+            let stamp = step_timestamp(now, 0);
             let (start, end) = SessionDate::at(now).bounds();
             assert!(
                 stamp >= start && stamp < end,
@@ -915,13 +842,10 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         let session = SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap());
+        assert_eq!(step_timestamp(now, 0), session.midnight());
         assert_eq!(
-            step_timestamp_milliseconds(now, 0),
-            session.midnight().timestamp_millis()
-        );
-        assert_eq!(
-            step_timestamp_milliseconds(now, 4),
-            session.plus_calendar_days(4).midnight().timestamp_millis()
+            step_timestamp(now, 4),
+            session.plus_calendar_days(4).midnight()
         );
     }
 
@@ -935,10 +859,8 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            step_timestamp_milliseconds(now, 0),
-            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap())
-                .midnight()
-                .timestamp_millis()
+            step_timestamp(now, 0),
+            SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2026, 6, 9).unwrap()).midnight()
         );
     }
 
@@ -1151,102 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_predictions_empty_is_ok() {
-        assert!(validate_predictions(&[]).is_ok());
-    }
-
-    #[test]
-    fn test_validate_predictions_lowercase_ticker_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "aapl", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not uppercase"));
-    }
-
-    #[test]
-    fn test_validate_predictions_missing_ticker_field_errors() {
-        let predictions = vec![
-            serde_json::json!({"timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing ticker"));
-    }
-
-    #[test]
-    fn test_validate_predictions_missing_timestamp_field_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing timestamp"));
-    }
-
-    #[test]
-    fn test_validate_predictions_missing_quantile_10_field_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing quantile_10"));
-    }
-
-    #[test]
-    fn test_validate_predictions_missing_quantile_50_field_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing quantile_50"));
-    }
-
-    #[test]
-    fn test_validate_predictions_missing_quantile_90_field_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing quantile_90"));
-    }
-
-    #[test]
-    fn test_validate_predictions_equal_quantiles_passes() {
-        // q10 == q50 == q90 is technically monotonic; must not error.
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.02, "quantile_50": 0.02, "quantile_90": 0.02}),
-        ];
-        assert!(validate_predictions(&predictions).is_ok());
-    }
-
-    #[test]
-    fn test_validate_predictions_q50_exceeds_q90_errors() {
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.05, "quantile_90": 0.03}),
-        ];
-        let result = validate_predictions(&predictions);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Non-monotonic"));
-    }
-
-    #[test]
-    fn test_validate_predictions_consistent_timestamps_multiple_tickers() {
-        // Both tickers must have the same set of timestamps.
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "AAPL", "timestamp": 2000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": 1000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": 2000, "quantile_10": 0.01, "quantile_50": 0.02, "quantile_90": 0.03}),
-        ];
-        assert!(validate_predictions(&predictions).is_ok());
-    }
-
-    #[test]
     fn test_unscale_and_sort_quantiles_already_sorted() {
         let scaler = daily_return_scaler(0.0, 1.0);
 
@@ -1281,11 +1107,8 @@ mod tests {
             SessionDate::from_date(chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
         for step in [0usize, 1, 7] {
             assert_eq!(
-                step_timestamp_milliseconds(now, step),
-                session
-                    .plus_calendar_days(step as i64)
-                    .midnight()
-                    .timestamp_millis(),
+                step_timestamp(now, step),
+                session.plus_calendar_days(step as i64).midnight(),
                 "step {step} did not land on its Eastern session midnight"
             );
         }
@@ -1309,8 +1132,8 @@ mod tests {
             for step in 0..5usize {
                 let expected = session.plus_calendar_days(step as i64).midnight();
                 assert_eq!(
-                    step_timestamp_milliseconds(now, step),
-                    expected.timestamp_millis(),
+                    step_timestamp(now, step),
+                    expected,
                     "{label}: step {step} did not land on {expected}"
                 );
             }
@@ -1451,29 +1274,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_predictions_single_ticker_single_timestamp_ok() {
-        let predictions = vec![serde_json::json!({
-            "ticker": "AAPL",
-            "timestamp": 1_750_000_000_000i64,
-            "quantile_10": -0.01,
-            "quantile_50": 0.0,
-            "quantile_90": 0.01,
-        })];
-        assert!(validate_predictions(&predictions).is_ok());
-    }
-
-    #[test]
-    fn test_validate_predictions_three_tickers_same_timestamps_ok() {
-        let timestamp = 1_750_000_000_000i64;
-        let predictions = vec![
-            serde_json::json!({"ticker": "AAPL", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
-            serde_json::json!({"ticker": "MSFT", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
-            serde_json::json!({"ticker": "GOOG", "timestamp": timestamp, "quantile_10": 0.0, "quantile_50": 0.01, "quantile_90": 0.02}),
-        ];
-        assert!(validate_predictions(&predictions).is_ok());
-    }
-
-    #[test]
     fn test_unscale_and_sort_quantiles_single_element() {
         let scaler = daily_return_scaler(0.0, 1.0);
 
@@ -1488,81 +1288,5 @@ mod tests {
 
         let result = unscale_and_sort_quantiles(&[], &scaler);
         assert!(result.is_empty());
-    }
-
-    fn valid_prediction_payload() -> serde_json::Value {
-        serde_json::json!({
-            "ticker": "AAPL",
-            "timestamp": 1_760_000_000_000i64,
-            "quantile_10": -0.01,
-            "quantile_50": 0.0,
-            "quantile_90": 0.01,
-        })
-    }
-
-    fn convert(payload: &serde_json::Value) -> Result<EquityPrediction, String> {
-        prediction_from_json(payload, Uuid::nil(), "2026-08-05-00-00-00-000")
-    }
-
-    #[test]
-    fn test_prediction_from_json_accepts_a_well_formed_payload() {
-        let prediction = convert(&valid_prediction_payload()).expect("the fixture must convert");
-        assert_eq!(prediction.ticker().as_str(), "AAPL");
-        assert_eq!(prediction.quantile_50(), 0.0);
-    }
-
-    /// Every field this reads comes from our own pipeline, so each of these is an upstream bug. The
-    /// message has to name the offending field and, where it can, the ticker — the payload is a
-    /// batch of thousands and "a field is missing" would not narrow it.
-    #[test]
-    fn test_prediction_from_json_names_the_field_it_rejects() {
-        for (field, expected_fragment) in [
-            ("ticker", "string ticker field"),
-            ("timestamp", "integer timestamp field"),
-            ("quantile_10", "numeric quantile_10 field"),
-            ("quantile_50", "numeric quantile_50 field"),
-            ("quantile_90", "numeric quantile_90 field"),
-        ] {
-            let mut payload = valid_prediction_payload();
-            payload.as_object_mut().unwrap().remove(field);
-
-            let Err(error) = convert(&payload) else {
-                panic!("removing {field} must leave the payload rejected");
-            };
-            assert!(
-                error.contains(expected_fragment),
-                "removing {field} produced `{error}`, which does not name the field"
-            );
-        }
-    }
-
-    #[test]
-    fn test_prediction_from_json_rejects_a_non_positive_timestamp() {
-        let mut payload = valid_prediction_payload();
-        payload["timestamp"] = serde_json::json!(0i64);
-
-        let error = convert(&payload).expect_err("a zero timestamp must be rejected");
-        assert!(error.contains("invalid timestamp"), "got `{error}`");
-    }
-
-    #[test]
-    fn test_prediction_from_json_rejects_a_ticker_the_domain_type_refuses() {
-        let mut payload = valid_prediction_payload();
-        payload["ticker"] = serde_json::json!("NOTATICKER123");
-
-        let error = convert(&payload).expect_err("an unusable ticker must be rejected");
-        assert!(error.contains("Invalid ticker"), "got `{error}`");
-    }
-
-    /// Crossed quantiles are the failure this conversion exists to stop: every downstream use of a
-    /// prediction produces plausible nonsense from them rather than failing, so a crossed set that
-    /// reaches the table is never detected again.
-    #[test]
-    fn test_prediction_from_json_rejects_crossed_quantiles() {
-        let mut payload = valid_prediction_payload();
-        payload["quantile_10"] = serde_json::json!(0.05);
-
-        let error = convert(&payload).expect_err("crossed quantiles must be rejected");
-        assert!(error.contains("AAPL"), "got `{error}`");
     }
 }

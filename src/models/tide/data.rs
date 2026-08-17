@@ -10,13 +10,10 @@ use polars::prelude::*;
 
 use crate::common::types::SessionDate;
 use crate::data::details::UNKNOWN as UNKNOWN_SECTOR_OR_INDUSTRY;
+use crate::models::tide::TideError;
 
 pub type CategoryMapping = HashMap<String, i32>;
 pub type FeatureMappings = HashMap<String, CategoryMapping>;
-
-pub fn selector_by_names(names: &[&str]) -> Vec<PlSmallStr> {
-    names.iter().map(|name| PlSmallStr::from(*name)).collect()
-}
 
 /// Per-column standardization statistics, fitted during training and reloaded at inference.
 ///
@@ -107,23 +104,24 @@ impl Scaler {
     /// then dropped. Checking them is the whole of their value: an artifact fitted on a different
     /// column set would otherwise load without complaint and scale a different set than the weights
     /// were trained on. Carrying them further served nothing — no caller read them.
-    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(path: &std::path::Path) -> Result<Self, TideError> {
         let display = path.display();
         let content = std::fs::read_to_string(path)?;
         let raw: serde_json::Value = serde_json::from_str(&content)?;
 
-        let statistics = |field: &str| -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
-            let object = raw[field]
-                .as_object()
-                .ok_or_else(|| format!("Scaler artifact at {display} has no `{field}` object"))?;
+        let statistics = |field: &str| -> Result<HashMap<String, f64>, TideError> {
+            let object = raw[field].as_object().ok_or_else(|| {
+                TideError::Artifact(format!(
+                    "Scaler artifact at {display} has no `{field}` object"
+                ))
+            })?;
             object
                 .iter()
                 .map(|(column, value)| {
                     value.as_f64().map(|number| (column.clone(), number)).ok_or_else(|| {
-                        format!(
+                        TideError::Artifact(format!(
                             "Scaler artifact at {display} has a non-numeric `{field}` entry for column `{column}`"
-                        )
-                        .into()
+                        ))
                     })
                 })
                 .collect()
@@ -137,9 +135,11 @@ impl Scaler {
             ("categorical_columns", CATEGORICAL_COLUMNS),
             ("static_categorical_columns", STATIC_CATEGORICAL_COLUMNS),
         ] {
-            let array = raw[field]
-                .as_array()
-                .ok_or_else(|| format!("Scaler artifact at {display} has no `{field}` list"))?;
+            let array = raw[field].as_array().ok_or_else(|| {
+                TideError::Artifact(format!(
+                    "Scaler artifact at {display} has no `{field}` list"
+                ))
+            })?;
             // Every element must be a string. Skipping the ones that are not would let
             // `["close_price", 42]` collapse to a list that compares equal to a shorter expected
             // one — a malformed artifact passing the check written to catch malformed artifacts.
@@ -152,13 +152,13 @@ impl Scaler {
                         )
                     })
                 })
-                .collect::<Result<_, String>>()?;
+                .collect::<Result<_, String>>()
+                .map_err(TideError::Artifact)?;
             if found != expected {
-                return Err(format!(
+                return Err(TideError::Artifact(format!(
                     "Scaler artifact at {display} was fitted on {field} {found:?}, but this build \
                      expects {expected:?}"
-                )
-                .into());
+                )));
             }
         }
 
@@ -166,25 +166,48 @@ impl Scaler {
         // and this build disagree about the feature set even though the column list matched.
         for column in CONTINUOUS_COLUMNS {
             if !means.contains_key(*column) || !standard_deviations.contains_key(*column) {
-                return Err(format!(
+                return Err(TideError::Artifact(format!(
                     "Scaler artifact at {display} has no statistics for continuous column `{column}`"
-                )
-                .into());
+                )));
             }
         }
 
-        Self::new(means, standard_deviations)
-            .map_err(|reason| format!("Scaler artifact at {display} is unusable: {reason}").into())
+        Self::new(means, standard_deviations).map_err(|reason| {
+            TideError::Artifact(format!(
+                "Scaler artifact at {display} is unusable: {reason}"
+            ))
+        })
+    }
+
+    /// The mean and deviation for `column`, falling back to the identity pair.
+    ///
+    /// The fallback is reachable only for a column outside `CONTINUOUS_COLUMNS` — [`Scaler::load`]
+    /// rejects an artifact missing any of those.
+    fn statistics_for(&self, column: &str) -> (f64, f64) {
+        (
+            self.means.get(column).copied().unwrap_or(0.0),
+            self.standard_deviations.get(column).copied().unwrap_or(1.0),
+        )
+    }
+
+    /// Standardizes a value into the units the model was trained in.
+    ///
+    /// The forward half of an invertible pair with [`Scaler::inverse_transform_value`], and it
+    /// lives here rather than inline in [`apply_scaling`] because the two halves have to compose to
+    /// the identity: the model trains on the forward image and every prediction is read back
+    /// through the inverse. Written as two expressions in two files they can drift without anything
+    /// failing, and the symptom is predictions quietly on the wrong scale — which
+    /// [`EquityPrediction::new`]'s ordering check satisfies perfectly well.
+    ///
+    /// [`EquityPrediction::new`]: crate::common::types::EquityPrediction::new
+    pub fn transform_value(&self, column: &str, value: f64) -> f64 {
+        let (mean, standard_deviation) = self.statistics_for(column);
+        (value - mean) / standard_deviation
     }
 
     /// Maps a scaled value back to its original units.
-    ///
-    /// Falls back to the identity for a column the scaler does not carry, which is reachable only
-    /// for a column outside `CONTINUOUS_COLUMNS` — [`Scaler::load`] rejects an artifact missing any
-    /// of those.
     pub fn inverse_transform_value(&self, column: &str, value: f64) -> f64 {
-        let mean = self.means.get(column).copied().unwrap_or(0.0);
-        let standard_deviation = self.standard_deviations.get(column).copied().unwrap_or(1.0);
+        let (mean, standard_deviation) = self.statistics_for(column);
         value * standard_deviation + mean
     }
 }
@@ -285,13 +308,16 @@ pub enum DatasetKind {
     Validate(TrainingFraction),
 }
 
+/// A scaled and encoded frame together with the statistics and vocabulary that produced it.
+///
+/// The column lists are deliberately not carried here, for the reason
+/// [`crate::models::tide::artifact::ModelState`] does not carry them either: a copy that is
+/// provably equal to [`CONTINUOUS_COLUMNS`] and its two siblings invites a later caller to trust
+/// the copy. Every consumer reads the constants.
 pub struct Data {
     pub data: DataFrame,
     pub scaler: Scaler,
     pub mappings: FeatureMappings,
-    pub continuous_columns: Vec<String>,
-    pub categorical_columns: Vec<String>,
-    pub static_categorical_columns: Vec<String>,
 }
 
 impl Data {
@@ -302,18 +328,6 @@ impl Data {
             data,
             scaler,
             mappings,
-            continuous_columns: CONTINUOUS_COLUMNS
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
-            categorical_columns: CATEGORICAL_COLUMNS
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
-            static_categorical_columns: STATIC_CATEGORICAL_COLUMNS
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
         }
     }
 
@@ -327,7 +341,7 @@ impl Data {
         scaler: &Scaler,
         mappings: &FeatureMappings,
         target_session: SessionDate,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, TideError> {
         let data = append_forecast_session_rows(data, target_session)?;
         let data = engineer_features(data)?;
         let data = clean_data(data)?;
@@ -342,7 +356,7 @@ impl Data {
     pub fn split_by_timestamp(
         &self,
         training_fraction: TrainingFraction,
-    ) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
+    ) -> Result<(DataFrame, DataFrame), TideError> {
         let cutoff = training_cutoff(&self.data, training_fraction)?;
         split_at_cutoff(&self.data, cutoff)
     }
@@ -353,7 +367,7 @@ impl Data {
         kind: DatasetKind,
         input_length: usize,
         output_length: usize,
-    ) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
+    ) -> Result<TrainingDataset, TideError> {
         match kind {
             DatasetKind::Predict => {
                 window_frame(&self.data, input_length, output_length, true, false)
@@ -389,17 +403,19 @@ impl Data {
 pub(crate) fn training_cutoff(
     data: &DataFrame,
     training_fraction: TrainingFraction,
-) -> Result<i64, Box<dyn std::error::Error>> {
-    let timestamps = data
-        .column("timestamp")
-        .map_err(|error| error.to_string())?;
-    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
+) -> Result<i64, TideError> {
+    let timestamps = data.column("timestamp")?;
+    let timestamps = timestamps.i64()?;
     let minimum_timestamp = timestamps.min().unwrap_or(0);
     let maximum_timestamp = timestamps.max().unwrap_or(0);
 
     let span = maximum_timestamp
         .checked_sub(minimum_timestamp)
-        .ok_or("The timestamp range is wider than i64, so no training cutoff exists")?;
+        .ok_or_else(|| {
+            TideError::Data(
+                "The timestamp range is wider than i64, so no training cutoff exists".to_string(),
+            )
+        })?;
     // Only the span needs checking. The fraction is strictly between 0 and 1 and the `as` cast
     // saturates, so the offset lands in `[0, span]` and the sum in `[minimum, maximum]`.
     let training_span = ((span as f64) * training_fraction.fraction()) as i64;
@@ -410,17 +426,11 @@ pub(crate) fn training_cutoff(
 pub(crate) fn split_at_cutoff(
     data: &DataFrame,
     cutoff: i64,
-) -> Result<(DataFrame, DataFrame), Box<dyn std::error::Error>> {
-    let timestamps = data
-        .column("timestamp")
-        .map_err(|error| error.to_string())?;
-    let timestamps = timestamps.i64().map_err(|error| error.to_string())?;
-    let train = data
-        .filter(&timestamps.lt_eq(cutoff))
-        .map_err(|error| error.to_string())?;
-    let validation = data
-        .filter(&timestamps.gt(cutoff))
-        .map_err(|error| error.to_string())?;
+) -> Result<(DataFrame, DataFrame), TideError> {
+    let timestamps = data.column("timestamp")?;
+    let timestamps = timestamps.i64()?;
+    let train = data.filter(&timestamps.lt_eq(cutoff))?;
+    let validation = data.filter(&timestamps.gt(cutoff))?;
     Ok((train, validation))
 }
 
@@ -434,7 +444,7 @@ fn window_frame(
     output_length: usize,
     predict_mode: bool,
     with_targets: bool,
-) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
+) -> Result<TrainingDataset, TideError> {
     let window_size = input_length + output_length;
     let continuous_feature_count = CONTINUOUS_COLUMNS.len();
     let categorical_feature_count = CATEGORICAL_COLUMNS.len();
@@ -447,10 +457,8 @@ fn window_frame(
     // `ticker` is integer-encoded by this point (encode_categoricals). Group by
     // the encoded id; sorted for deterministic sample ordering.
     let mut tickers: Vec<i32> = frame
-        .column("ticker")
-        .map_err(|error| error.to_string())?
-        .i32()
-        .map_err(|error| error.to_string())?
+        .column("ticker")?
+        .i32()?
         .into_no_null_iter()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -464,13 +472,8 @@ fn window_frame(
     let mut all_targets: Vec<Vec<f32>> = Vec::new();
 
     for ticker in &tickers {
-        let mask = frame
-            .column("ticker")
-            .map_err(|error| error.to_string())?
-            .i32()
-            .map_err(|error| error.to_string())?
-            .equal(*ticker);
-        let ticker_data = frame.filter(&mask).map_err(|error| error.to_string())?;
+        let mask = frame.column("ticker")?.i32()?.equal(*ticker);
+        let ticker_data = frame.filter(&mask)?;
 
         if ticker_data.height() < window_size {
             continue;
@@ -609,35 +612,29 @@ fn window_frame(
 pub(crate) fn append_forecast_session_rows(
     data: DataFrame,
     target_session: SessionDate,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
+) -> Result<DataFrame, TideError> {
     let target_milliseconds = target_session.midnight().timestamp_millis();
 
-    let sorted = data
-        .sort(
-            ["ticker", "timestamp"],
-            SortMultipleOptions::default().with_maintain_order(true),
-        )
-        .map_err(|error| error.to_string())?;
+    let sorted = data.sort(
+        ["ticker", "timestamp"],
+        SortMultipleOptions::default().with_maintain_order(true),
+    )?;
 
     let tickers: Vec<&str> = sorted
-        .column("ticker")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?
+        .column("ticker")?
+        .str()?
         .into_no_null_iter()
         .collect();
     let timestamps: Vec<i64> = sorted
-        .column("timestamp")
-        .map_err(|error| error.to_string())?
-        .i64()
-        .map_err(|error| error.to_string())?
+        .column("timestamp")?
+        .i64()?
         .into_no_null_iter()
         .collect();
 
     if tickers.len() != sorted.height() || timestamps.len() != sorted.height() {
-        return Err("Equity bars contain null ticker or timestamp values"
-            .to_string()
-            .into());
+        return Err(TideError::Data(
+            "Equity bars contain null ticker or timestamp values".to_string(),
+        ));
     }
 
     // Rows are sorted, so a ticker's last row is also its newest. Comparing that against the target
@@ -656,37 +653,27 @@ pub(crate) fn append_forecast_session_rows(
     }
 
     let source_index = IdxCa::from_vec("index".into(), source_rows);
-    let mut forecast_rows = sorted
-        .take(&source_index)
-        .map_err(|error| error.to_string())?;
-    forecast_rows
-        .with_column(Column::new(
-            "timestamp".into(),
-            vec![target_milliseconds; forecast_rows.height()],
-        ))
-        .map_err(|error| error.to_string())?;
+    let mut forecast_rows = sorted.take(&source_index)?;
+    forecast_rows.with_column(Column::new(
+        "timestamp".into(),
+        vec![target_milliseconds; forecast_rows.height()],
+    ))?;
 
     let mut combined = sorted;
-    combined
-        .vstack_mut(&forecast_rows)
-        .map_err(|error| error.to_string())?;
+    combined.vstack_mut(&forecast_rows)?;
     Ok(combined)
 }
 
-pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, TideError> {
     // Sort by [ticker, timestamp] so daily returns and the downstream windowing
     // are chronological and contiguous within each ticker, independent of the
     // order rows arrived in. Each ticker's first row gets a null return; clean_data drops it.
-    let data = data
-        .sort(
-            ["ticker", "timestamp"],
-            SortMultipleOptions::default().with_maintain_order(true),
-        )
-        .map_err(|error| error.to_string())?;
+    let data = data.sort(
+        ["ticker", "timestamp"],
+        SortMultipleOptions::default().with_maintain_order(true),
+    )?;
 
-    let timestamps = data
-        .column("timestamp")
-        .map_err(|error| error.to_string())?;
+    let timestamps = data.column("timestamp")?;
     let height = data.height();
 
     let mut day_of_week = Vec::with_capacity(height);
@@ -697,27 +684,19 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
     let mut daily_return: Vec<Option<f32>> = Vec::with_capacity(height);
 
     let close_prices: Vec<f64> = data
-        .column("close_price")
-        .map_err(|error| error.to_string())?
-        .f64()
-        .map_err(|error| error.to_string())?
+        .column("close_price")?
+        .f64()?
         .into_no_null_iter()
         .collect();
 
     let tickers: Vec<String> = data
-        .column("ticker")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?
+        .column("ticker")?
+        .str()?
         .into_no_null_iter()
         .map(|name| name.to_string())
         .collect();
 
-    let timestamp_values: Vec<i64> = timestamps
-        .i64()
-        .map_err(|error| error.to_string())?
-        .into_no_null_iter()
-        .collect();
+    let timestamp_values: Vec<i64> = timestamps.i64()?.into_no_null_iter().collect();
 
     // The no-null iterators above silently skip nulls, which would misalign
     // the per-row zip below; fail fast with a clear message instead.
@@ -730,7 +709,7 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
             timestamp_values.len(),
             close_prices.len()
         );
-        return Err(message.into());
+        return Err(TideError::Data(message));
     }
 
     for (index, &timestamp_milliseconds) in timestamp_values.iter().enumerate() {
@@ -761,44 +740,27 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, Box<dyn st
     }
 
     let mut new_data = data.clone();
-    new_data
-        .with_column(Column::new("day_of_week".into(), day_of_week))
-        .map_err(|error| error.to_string())?;
-    new_data
-        .with_column(Column::new("day_of_month".into(), day_of_month))
-        .map_err(|error| error.to_string())?;
-    new_data
-        .with_column(Column::new("day_of_year".into(), day_of_year))
-        .map_err(|error| error.to_string())?;
-    new_data
-        .with_column(Column::new("month".into(), month))
-        .map_err(|error| error.to_string())?;
-    new_data
-        .with_column(Column::new("year".into(), year))
-        .map_err(|error| error.to_string())?;
-    new_data
-        .with_column(Column::new("daily_return".into(), daily_return))
-        .map_err(|error| error.to_string())?;
+    new_data.with_column(Column::new("day_of_week".into(), day_of_week))?;
+    new_data.with_column(Column::new("day_of_month".into(), day_of_month))?;
+    new_data.with_column(Column::new("day_of_year".into(), day_of_year))?;
+    new_data.with_column(Column::new("month".into(), month))?;
+    new_data.with_column(Column::new("year".into(), year))?;
+    new_data.with_column(Column::new("daily_return".into(), daily_return))?;
 
     Ok(new_data)
 }
 
-pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, TideError> {
     // A row with no ticker cannot be attributed to an instrument, and substituting a placeholder
     // would make it indistinguishable from a real symbol of the same spelling. Reject it the way
     // `engineer_features` does rather than encoding one and filtering it back out.
-    let tickers = data
-        .column("ticker")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?;
+    let tickers = data.column("ticker")?.str()?;
     if tickers.null_count() > 0 {
-        return Err(format!(
+        return Err(TideError::Data(format!(
             "Equity bars contain {} null ticker values out of {} rows",
             tickers.null_count(),
             data.height()
-        )
-        .into());
+        )));
     }
 
     // Uppercase ticker, sector, industry columns in-place
@@ -808,29 +770,22 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         .collect();
 
     let sector_upper: Vec<String> = data
-        .column("sector")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?
+        .column("sector")?
+        .str()?
         .into_iter()
         .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
     let industry_upper: Vec<String> = data
-        .column("industry")
-        .map_err(|error| error.to_string())?
-        .str()
-        .map_err(|error| error.to_string())?
+        .column("industry")?
+        .str()?
         .into_iter()
         .map(|value| value.unwrap_or(UNKNOWN_SECTOR_OR_INDUSTRY).to_uppercase())
         .collect();
 
-    data.with_column(Column::new("ticker".into(), ticker_upper))
-        .map_err(|error| error.to_string())?;
-    data.with_column(Column::new("sector".into(), sector_upper))
-        .map_err(|error| error.to_string())?;
-    data.with_column(Column::new("industry".into(), industry_upper))
-        .map_err(|error| error.to_string())?;
+    data.with_column(Column::new("ticker".into(), ticker_upper))?;
+    data.with_column(Column::new("sector".into(), sector_upper))?;
+    data.with_column(Column::new("industry".into(), industry_upper))?;
 
     let cleaned = data;
 
@@ -840,12 +795,8 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
     // scaling and windowing iterate these columns assuming they are dense and finite.
     let mut keep_row = vec![true; cleaned.height()];
     for column in CONTINUOUS_COLUMNS {
-        let values = cleaned
-            .column(column)
-            .map_err(|error| error.to_string())?
-            .cast(&DataType::Float64)
-            .map_err(|error| error.to_string())?;
-        let values = values.f64().map_err(|error| error.to_string())?;
+        let values = cleaned.column(column)?.cast(&DataType::Float64)?;
+        let values = values.f64()?;
         for (index, value) in values.into_iter().enumerate() {
             if !value.is_some_and(f64::is_finite) {
                 keep_row[index] = false;
@@ -853,40 +804,25 @@ pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, Box<dyn std::
         }
     }
     let finite_mask: BooleanChunked = keep_row.into_iter().collect();
-    let cleaned = cleaned
-        .filter(&finite_mask)
-        .map_err(|error| error.to_string())?;
+    let cleaned = cleaned.filter(&finite_mask)?;
     Ok(cleaned)
 }
 
-pub(crate) fn apply_scaling(
-    data: DataFrame,
-    scaler: &Scaler,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
+pub(crate) fn apply_scaling(data: DataFrame, scaler: &Scaler) -> Result<DataFrame, TideError> {
     let mut result = data;
     for column_name in CONTINUOUS_COLUMNS {
-        let mean = scaler.means().get(*column_name).copied().unwrap_or(0.0);
-        // `Scaler::new` rejects a non-positive standard deviation, so no zero guard is needed here.
-        let standard_deviation = scaler
-            .standard_deviations()
-            .get(*column_name)
-            .copied()
-            .unwrap_or(1.0);
-
+        // Through the scaler's own forward transform rather than repeating the arithmetic, so it
+        // cannot drift from the inverse the predictions are read back through. `Scaler::new`
+        // rejects a non-positive standard deviation, so no zero guard is needed.
         let values: Vec<f32> = result
-            .column(column_name)
-            .map_err(|error| error.to_string())?
-            .cast(&DataType::Float64)
-            .map_err(|error| error.to_string())?
-            .f64()
-            .map_err(|error| error.to_string())?
+            .column(column_name)?
+            .cast(&DataType::Float64)?
+            .f64()?
             .into_no_null_iter()
-            .map(|value| ((value - mean) / standard_deviation) as f32)
+            .map(|value| scaler.transform_value(column_name, value) as f32)
             .collect();
 
-        result
-            .with_column(Column::new((*column_name).into(), values))
-            .map_err(|error| error.to_string())?;
+        result.with_column(Column::new((*column_name).into(), values))?;
     }
     Ok(result)
 }
@@ -894,7 +830,7 @@ pub(crate) fn apply_scaling(
 pub(crate) fn encode_categoricals(
     data: DataFrame,
     mappings: &FeatureMappings,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
+) -> Result<DataFrame, TideError> {
     let mut result = data;
 
     let all_categorical: Vec<&str> = CATEGORICAL_COLUMNS
@@ -906,8 +842,7 @@ pub(crate) fn encode_categoricals(
     for column_name in all_categorical {
         if let Some(mapping) = mappings.get(column_name) {
             let values: Vec<Option<i32>> = result
-                .column(column_name)
-                .map_err(|error| error.to_string())?
+                .column(column_name)?
                 .str()
                 .map(|chunked| {
                     chunked
@@ -917,11 +852,9 @@ pub(crate) fn encode_categoricals(
                 })
                 .or_else(|_| {
                     result
-                        .column(column_name)
-                        .map_err(|error| error.to_string())?
+                        .column(column_name)?
                         .i32()
                         .map(|chunked| chunked.into_iter().collect())
-                        .map_err(|error| error.to_string())
                 })?;
 
             // A sentinel merges every unmapped value into one id. For the static columns that
@@ -941,12 +874,10 @@ pub(crate) fn encode_categoricals(
                 .into_iter()
                 .map(|value| value.unwrap_or(-1))
                 .collect();
-            result
-                .with_column(Column::new(column_name.into(), encoded))
-                .map_err(|error| error.to_string())?;
+            result.with_column(Column::new(column_name.into(), encoded))?;
 
             if is_static && unmapped > 0 {
-                result = result.filter(&keep).map_err(|error| error.to_string())?;
+                result = result.filter(&keep)?;
                 tracing::warn!(
                     column = column_name,
                     dropped_rows = unmapped,
@@ -973,61 +904,35 @@ pub(crate) fn encode_categoricals(
 ///
 /// The same family of trap produced a real bug fixed in #1035, where a null `sector` put later rows
 /// on the wrong ticker.
-fn reject_null_column(
-    column: &Column,
-    column_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn reject_null_column(column: &Column, column_name: &str) -> Result<(), TideError> {
     let nulls = column.null_count();
     if nulls > 0 {
-        return Err(format!(
+        return Err(TideError::Data(format!(
             "Column `{column_name}` has {nulls} null value(s) in {} rows; reading it positionally \
              would substitute the raw buffer value and treat it as a real observation",
             column.len()
-        )
-        .into());
+        )));
     }
     Ok(())
 }
 
-fn get_float_columns(
-    data: &DataFrame,
-    columns: &[&str],
-) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+fn get_float_columns(data: &DataFrame, columns: &[&str]) -> Result<Vec<Vec<f32>>, TideError> {
     let mut result = Vec::new();
     for column_name in columns {
-        let cast = data
-            .column(column_name)
-            .map_err(|error| error.to_string())?
-            .cast(&DataType::Float32)
-            .map_err(|error| error.to_string())?;
+        let cast = data.column(column_name)?.cast(&DataType::Float32)?;
         reject_null_column(&cast, column_name)?;
-        let values: Vec<f32> = cast
-            .f32()
-            .map_err(|error| error.to_string())?
-            .into_no_null_iter()
-            .collect();
+        let values: Vec<f32> = cast.f32()?.into_no_null_iter().collect();
         result.push(values);
     }
     Ok(result)
 }
 
-fn get_int_columns(
-    data: &DataFrame,
-    columns: &[&str],
-) -> Result<Vec<Vec<i32>>, Box<dyn std::error::Error>> {
+fn get_int_columns(data: &DataFrame, columns: &[&str]) -> Result<Vec<Vec<i32>>, TideError> {
     let mut result = Vec::new();
     for column_name in columns {
-        let cast = data
-            .column(column_name)
-            .map_err(|error| error.to_string())?
-            .cast(&DataType::Int32)
-            .map_err(|error| error.to_string())?;
+        let cast = data.column(column_name)?.cast(&DataType::Int32)?;
         reject_null_column(&cast, column_name)?;
-        let values: Vec<i32> = cast
-            .i32()
-            .map_err(|error| error.to_string())?
-            .into_no_null_iter()
-            .collect();
+        let values: Vec<i32> = cast.i32()?.into_no_null_iter().collect();
         result.push(values);
     }
     Ok(result)
@@ -1247,24 +1152,58 @@ mod scaler_boundary_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_scaler_inverse_transform() {
-        let mut means = HashMap::new();
-        means.insert("daily_return".to_string(), 0.001);
-        let mut stds = HashMap::new();
-        stds.insert("daily_return".to_string(), 0.02);
-        let scaler = Scaler {
-            means,
-            standard_deviations: stds,
-        };
-        let result = scaler.inverse_transform_value("daily_return", 1.0);
-        assert!((result - 0.021).abs() < 1e-10);
+    fn return_scaler() -> Scaler {
+        Scaler::new(
+            HashMap::from([("daily_return".to_string(), 0.001)]),
+            HashMap::from([("daily_return".to_string(), 0.02)]),
+        )
+        .expect("the fixture statistics must be usable")
     }
 
     #[test]
-    fn test_selector_by_names() {
-        let names = selector_by_names(&["ticker", "timestamp"]);
-        assert_eq!(names.len(), 2);
+    fn test_scaler_inverse_transform() {
+        let result = return_scaler().inverse_transform_value("daily_return", 1.0);
+        assert!((result - 0.021).abs() < 1e-10);
+    }
+
+    /// The two halves must compose to the identity in both directions. They are the reason the
+    /// forward transform moved onto `Scaler`: written separately, one can change without the other
+    /// and the only symptom is predictions on the wrong scale, which every downstream check
+    /// accepts. An unknown column falls through to the identity pair and must round-trip too.
+    #[test]
+    fn test_scaling_and_unscaling_are_inverses() {
+        let scaler = return_scaler();
+        for value in [-0.05_f64, 0.0, 1e-9, 0.037, 12.5] {
+            let there_and_back = scaler.inverse_transform_value(
+                "daily_return",
+                scaler.transform_value("daily_return", value),
+            );
+            assert!(
+                (there_and_back - value).abs() < 1e-12,
+                "forward then inverse moved {value} to {there_and_back}"
+            );
+
+            let scaled = scaler.transform_value("daily_return", value);
+            let back_and_there = scaler.transform_value(
+                "daily_return",
+                scaler.inverse_transform_value("daily_return", scaled),
+            );
+            assert!(
+                (back_and_there - scaled).abs() < 1e-12,
+                "inverse then forward moved {scaled} to {back_and_there}"
+            );
+
+            assert_eq!(
+                scaler.transform_value("not_a_column", value),
+                value,
+                "an unknown column is the identity forward"
+            );
+            assert_eq!(
+                scaler.inverse_transform_value("not_a_column", value),
+                value,
+                "and the identity back"
+            );
+        }
     }
 
     #[test]
@@ -1319,13 +1258,15 @@ mod tests {
         .unwrap()
     }
 
+    /// A `Data` whose scaler carries nothing, for the windowing tests that never scale.
+    ///
+    /// Through the constructor rather than a struct literal: `Scaler` is deliberately not
+    /// `Deserialize` so every path into it is checked, and a literal here would be the hole that
+    /// closes reopened in the tests.
     fn empty_data(frame: DataFrame) -> Data {
         Data::from_parts(
             frame,
-            Scaler {
-                means: HashMap::new(),
-                standard_deviations: HashMap::new(),
-            },
+            Scaler::new(HashMap::new(), HashMap::new()).expect("an empty scaler is well formed"),
             FeatureMappings::new(),
         )
     }
@@ -1747,7 +1688,7 @@ mod tests {
         // Any instant inside the forecast session must stamp that same session.
         let noon = session.midnight() + chrono::Duration::hours(12);
         assert_eq!(
-            crate::models::tide::predict::step_timestamp_milliseconds(noon, 0),
+            crate::models::tide::predict::step_timestamp(noon, 0).timestamp_millis(),
             target_milliseconds,
             "the stamped session must be the session the appended row carries"
         );

@@ -521,22 +521,15 @@ async fn run_inference(
     let trained = predict::filter_to_trained_tickers(filtered, model_state)
         .map_err(|error| at("filter_tickers")(error.to_string()))?;
 
-    let predictions = predict::generate_predictions(trained, model_state)
+    // Typed on the way out of the forward pass, so a malformed value fails here as a `generate`
+    // failure rather than reaching the writer as an untyped map and failing as an `insert` one.
+    let predictions = predict::generate_predictions(trained, model_state, correlation_id)
         .map_err(|error| at("generate")(error.to_string()))?;
+    predict::validate_predictions(&predictions).map_err(at("validate"))?;
 
-    let array = predictions.as_array().cloned().unwrap_or_default();
-    predict::validate_predictions(&array).map_err(at("validate"))?;
-
-    // Split back apart rather than propagated as one error: a malformed payload is a bug in the
-    // model output this function just produced, and belongs with the other pipeline stages; a
-    // database failure is the database, and keeps reading as one.
-    let (rows, predictions) =
-        predict::insert_predictions(&state.pool, &array, correlation_id, model_state.run_id())
-            .await
-            .map_err(|error| match error {
-                predict::InsertPredictionsError::Payload(message) => at("insert")(message),
-                predict::InsertPredictionsError::Database(error) => HandlerError::Database(error),
-            })?;
+    let rows = predict::insert_predictions(&state.pool, &predictions)
+        .await
+        .map_err(HandlerError::Database)?;
 
     Ok((rows, predictions))
 }

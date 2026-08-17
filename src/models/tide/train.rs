@@ -127,9 +127,13 @@ impl EarlyStopping {
         }
     }
 
-    /// Observe an epoch's stopping metric. Returns `(snapshot, stop)`: whether
-    /// to checkpoint the current model and whether to stop training.
-    pub(crate) fn observe(&mut self, metric: f64, min_delta: f64, patience: usize) -> (bool, bool) {
+    /// Observe an epoch's stopping metric.
+    pub(crate) fn observe(
+        &mut self,
+        metric: f64,
+        min_delta: f64,
+        patience: usize,
+    ) -> EpochDecision {
         let snapshot = metric < self.best_checkpoint_metric;
         if snapshot {
             self.best_checkpoint_metric = metric;
@@ -144,8 +148,21 @@ impl EarlyStopping {
             self.epochs_without_improvement >= patience
         };
 
-        (snapshot, stop)
+        EpochDecision { snapshot, stop }
     }
+}
+
+/// What an epoch's stopping metric decided.
+///
+/// Two independent answers, and they disagree often enough to be worth naming: any improvement
+/// checkpoints, but only one larger than `min_delta` resets the patience counter, so `snapshot`
+/// without `stop` and `snapshot` with `stop` are both ordinary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EpochDecision {
+    /// Whether this epoch's weights are the best seen and should be checkpointed.
+    pub(crate) snapshot: bool,
+    /// Whether patience is exhausted and training should end.
+    pub(crate) stop: bool,
 }
 
 /// Train the model, returning the best-checkpoint model and the per-epoch
@@ -250,15 +267,15 @@ pub fn train(
             "Epoch complete"
         );
 
-        let (snapshot, stop) = early_stopping.observe(
+        let decision = early_stopping.observe(
             stopping_loss,
             configuration.min_delta,
             configuration.early_stopping_patience,
         );
-        if snapshot {
+        if decision.snapshot {
             best_model = model.clone();
         }
-        if stop {
+        if decision.stop {
             info!(epoch = epoch + 1, "Early stopping triggered");
             break;
         }
@@ -313,6 +330,7 @@ fn validation_loss(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::tide::data::input_feature_size;
 
     /// `batch_size` reaches `slice::chunks`, which panics on zero — so an invalid configuration
     /// aborts the training task rather than failing it. A non-positive learning rate is quieter and
@@ -357,7 +375,6 @@ mod tests {
         )
         .is_ok());
     }
-    use crate::models::tide::data::input_feature_size;
 
     /// A tiny dataset whose target is a constant the model can fit; used to prove
     /// the autodiff + optimizer + loss wiring actually reduces loss.
@@ -399,22 +416,70 @@ mod tests {
         // the patience counter — small gains keep the best weights while still counting toward
         // early stopping.
         let mut policy = EarlyStopping::new();
-        assert_eq!(policy.observe(0.5, 1e-3, 2), (true, false));
+        assert_eq!(
+            policy.observe(0.5, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: false
+            }
+        );
         // Better, but by less than min_delta: snapshot, counter advances.
-        assert_eq!(policy.observe(0.4999, 1e-3, 2), (true, false));
+        assert_eq!(
+            policy.observe(0.4999, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: false
+            }
+        );
         // Again better by a hair: snapshot, and patience 2 is now exhausted.
-        assert_eq!(policy.observe(0.4998, 1e-3, 2), (true, true));
+        assert_eq!(
+            policy.observe(0.4998, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: true
+            }
+        );
     }
 
     #[test]
     fn test_early_stopping_counter_resets_on_real_improvement() {
         let mut policy = EarlyStopping::new();
-        assert_eq!(policy.observe(0.5, 1e-3, 2), (true, false));
-        assert_eq!(policy.observe(0.4999, 1e-3, 2), (true, false));
+        assert_eq!(
+            policy.observe(0.5, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: false
+            }
+        );
+        assert_eq!(
+            policy.observe(0.4999, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: false
+            }
+        );
         // A genuine improvement resets the counter, so no stop at patience 2.
-        assert_eq!(policy.observe(0.4, 1e-3, 2), (true, false));
-        assert_eq!(policy.observe(0.4, 1e-3, 2), (false, false));
-        assert_eq!(policy.observe(0.41, 1e-3, 2), (false, true));
+        assert_eq!(
+            policy.observe(0.4, 1e-3, 2),
+            EpochDecision {
+                snapshot: true,
+                stop: false
+            }
+        );
+        assert_eq!(
+            policy.observe(0.4, 1e-3, 2),
+            EpochDecision {
+                snapshot: false,
+                stop: false
+            }
+        );
+        assert_eq!(
+            policy.observe(0.41, 1e-3, 2),
+            EpochDecision {
+                snapshot: false,
+                stop: true
+            }
+        );
     }
 
     #[test]
@@ -451,13 +516,9 @@ mod tests {
         );
         let initial = model.clone();
 
-        let configuration = TrainConfiguration {
-            learning_rate: 0.01,
-            epoch_count: 10,
-            batch_size: 16,
-            early_stopping_patience: 1000,
-            min_delta: 1e9,
-        };
+        // Through the constructor, so the tests exercise the validated path the trainer takes.
+        let configuration = TrainConfiguration::new(0.01, 10, 16, 1000, 1e9)
+            .expect("the fixture configuration must be valid");
 
         let (best, losses) = train(model, &dataset, None, &parameters, &configuration, &device);
         assert_eq!(losses.len(), 10);
@@ -501,13 +562,8 @@ mod tests {
             parameters.dropout_rate(),
         );
 
-        let configuration = TrainConfiguration {
-            learning_rate: 0.01,
-            epoch_count: 80,
-            batch_size: 16,
-            early_stopping_patience: 1000,
-            min_delta: 0.0,
-        };
+        let configuration = TrainConfiguration::new(0.01, 80, 16, 1000, 0.0)
+            .expect("the fixture configuration must be valid");
 
         let (_model, losses) = train(model, &dataset, None, &parameters, &configuration, &device);
         assert!(losses.len() >= 2);

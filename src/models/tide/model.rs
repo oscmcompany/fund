@@ -5,6 +5,8 @@ use burn::module::Module;
 use burn::nn;
 use burn::prelude::*;
 
+use crate::models::tide::TideError;
+
 #[derive(Module, Debug)]
 pub struct ResidualBlock<B: Backend> {
     linear: nn::Linear<B>,
@@ -56,7 +58,7 @@ impl TiDEModel<NdArray> {
         output_length: usize,
         quantile_count: usize,
         dropout_rate: f64,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, TideError> {
         let device = Default::default();
         let model = Self::new(
             &device,
@@ -80,11 +82,10 @@ impl TiDEModel<NdArray> {
                 &device,
             )
             .map_err(|error| {
-                format!(
+                TideError::Artifact(format!(
                     "Failed to load model weights from {}: {error}",
                     directory_path.display()
-                )
-                .into()
+                ))
             })
     }
 }
@@ -132,14 +133,20 @@ impl<B: Backend> TiDEModel<B> {
     /// Persist the model weights as a Burn record at `directory_path/tide_states`,
     /// the exact stem [`TiDEModel::<NdArray>::load`] reads back. The on-disk file
     /// gets the recorder's own extension; the loader re-derives it from the stem.
-    pub fn save(&self, directory_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save(&self, directory_path: &std::path::Path) -> Result<(), TideError> {
         std::fs::create_dir_all(directory_path)?;
         let record_path = directory_path.join("tide_states");
-        self.clone().save_file(
-            record_path,
-            &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
-        )?;
-        Ok(())
+        self.clone()
+            .save_file(
+                record_path,
+                &burn::record::DefaultFileRecorder::<burn::record::FullPrecisionSettings>::new(),
+            )
+            .map_err(|error| {
+                TideError::Artifact(format!(
+                    "Failed to save model weights to {}: {error}",
+                    directory_path.display()
+                ))
+            })
     }
 
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
