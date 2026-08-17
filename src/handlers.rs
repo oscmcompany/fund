@@ -18,11 +18,11 @@ use uuid::Uuid;
 
 use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
 use crate::common::events::{self, Command, EventError};
-use crate::common::massive::MassiveClient;
-use crate::common::session_log::{
-    CommandFinished, Observation, PredictionReading, PredictionsGenerated, SessionLog,
-    SessionLogError,
+use crate::common::journal::{
+    BarsIngested, CommandFinished, CommandOutcome, Journal, JournalError, JournalExported,
+    Observation, PredictionReading, PredictionsGenerated, SkipReason,
 };
+use crate::common::massive::MassiveClient;
 use crate::common::types::{BarInterval, SessionDate};
 use crate::data::adjust::{SplitTable, SplitTableCache};
 use crate::data::bars::{self, CloseHistoryCache, HISTORY_LOOKBACK_DAYS};
@@ -75,8 +75,8 @@ pub enum HandlerError {
         stage: &'static str,
         message: String,
     },
-    #[error("session log is unusable: {0}")]
-    SessionLog(#[from] SessionLogError),
+    #[error("journal is unusable: {0}")]
+    Journal(#[from] JournalError),
     #[error("configuration is missing or unusable: {0}")]
     Configuration(String),
 }
@@ -106,7 +106,7 @@ pub struct ServiceState {
     sizing: SizingParameters,
     execution: ExecutionSettings,
     /// The append-only record of what this process observed before it acted.
-    session_log: SessionLog,
+    journal: Journal,
     /// Cancelled when the process is asked to stop.
     ///
     /// Held here so a handler can decline to *start* more work it would not be able to finish. The
@@ -150,7 +150,7 @@ impl ServiceState {
             boundary_table_cache: BoundaryTableCache::new(),
             sizing: SizingParameters::from_env(),
             execution: ExecutionSettings::default(),
-            session_log: SessionLog::from_env()?,
+            journal: Journal::from_env()?,
             shutdown,
             in_flight: std::sync::Mutex::new(HashSet::new()),
         })
@@ -160,8 +160,8 @@ impl ServiceState {
         &self.pool
     }
 
-    pub fn session_log(&self) -> &SessionLog {
-        &self.session_log
+    pub fn journal(&self) -> &Journal {
+        &self.journal
     }
 
     /// Claims a command, or reports that one is already running.
@@ -220,7 +220,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
             Utc::now(),
             CommandFinished {
                 command: command.as_str().to_string(),
-                outcome: "dropped_in_flight".to_string(),
+                outcome: CommandOutcome::DroppedInFlight,
                 duration_milliseconds: None,
                 error: None,
                 summary: None,
@@ -276,7 +276,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
                 Utc::now(),
                 CommandFinished {
                     command: command.as_str().to_string(),
-                    outcome: "errored".to_string(),
+                    outcome: CommandOutcome::Errored,
                     duration_milliseconds: Some(duration_milliseconds),
                     error: Some(error.to_string()),
                     summary: None,
@@ -294,13 +294,22 @@ pub async fn handle(state: &ServiceState, command: Command) {
 
 /// Whether a successful run did its work or declined to.
 ///
-/// A handler that returns early names its reason under `skipped`; today the only one is
-/// `not_a_trading_day`. Reading it here rather than matching on it keeps a new skip reason from
-/// silently reading as a completed run.
-fn completion_outcome(summary: &Value) -> String {
+/// A handler that returns early names its reason under `skipped`. An unrecognized reason is a
+/// completed run rather than a panic, but it is warned about: the alternative is a new skip
+/// silently reading as work done.
+fn completion_outcome(summary: &Value) -> CommandOutcome {
     match summary.get("skipped").and_then(Value::as_str) {
-        Some(reason) => format!("skipped_{reason}"),
-        None => "completed".to_string(),
+        None => CommandOutcome::Completed,
+        Some(raw) => match SkipReason::parse(raw) {
+            Some(reason) => CommandOutcome::Skipped(reason),
+            None => {
+                warn!(
+                    reason = raw,
+                    "Unrecognized skip reason recorded as completed"
+                );
+                CommandOutcome::Completed
+            }
+        },
     }
 }
 
@@ -311,7 +320,7 @@ async fn record_command(
     finished: CommandFinished,
 ) {
     state
-        .session_log
+        .journal
         .record(correlation_id, now, Observation::CommandFinished(finished))
         .await;
 }
@@ -326,8 +335,8 @@ async fn dispatch(
         Command::PortfolioEvaluation => handle_portfolio_evaluation(state, correlation_id).await,
         Command::PortfolioLiquidation => handle_portfolio_liquidation(state, correlation_id).await,
         Command::AccountSync => handle_account_sync(state, correlation_id).await,
-        Command::MarketDataSync => handle_market_data_sync(state).await,
-        Command::DatabaseExport => handle_database_export(state).await,
+        Command::MarketDataSync => handle_market_data_sync(state, correlation_id).await,
+        Command::DatabaseExport => handle_database_export(state, correlation_id).await,
     }
 }
 
@@ -342,7 +351,10 @@ async fn handle_predictions(
     let now = Utc::now();
     let today = SessionDate::at(now);
 
-    let calendar = state.calendar_cache.get(&state.trading, now).await?;
+    let calendar = state
+        .calendar_cache
+        .get(&state.trading, &state.journal, correlation_id, now)
+        .await?;
     if !calendar.is_trading_day(today) {
         info!(%today, "Not a trading day; predictions skipped");
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
@@ -350,7 +362,13 @@ async fn handle_predictions(
 
     let universe = state
         .universe_cache
-        .get(&state.trading, &state.pool, now)
+        .get(
+            &state.trading,
+            &state.pool,
+            &state.journal,
+            correlation_id,
+            now,
+        )
         .await?;
     // An absent table blocks the entry half through the risk gate rather than being papered over
     // here; the exit half runs on what it has, because closing reduces exposure and the end-of-day
@@ -415,7 +433,7 @@ async fn handle_predictions(
     let (rows, predictions) = run_inference(state, &model_state, correlation_id, now).await?;
 
     state
-        .session_log
+        .journal
         .record(
             correlation_id,
             now,
@@ -428,7 +446,7 @@ async fn handle_predictions(
                 predictions: predictions
                     .iter()
                     .map(|prediction| PredictionReading {
-                        ticker: prediction.ticker().to_string(),
+                        ticker: prediction.ticker().clone(),
                         timestamp: prediction.timestamp(),
                         quantile_10: prediction.quantile_10(),
                         quantile_50: prediction.quantile_50(),
@@ -531,7 +549,10 @@ async fn handle_portfolio_evaluation(
     let now = Utc::now();
     let today = SessionDate::at(now);
 
-    let calendar = state.calendar_cache.get(&state.trading, now).await?;
+    let calendar = state
+        .calendar_cache
+        .get(&state.trading, &state.journal, correlation_id, now)
+        .await?;
     if !calendar.is_trading_day(today) {
         // The holiday gate moved from SQL into Rust when `market_calendar` was dropped, so a
         // holiday produces a no-op pass rather than no pass at all. Cheap enough not to fight.
@@ -540,7 +561,13 @@ async fn handle_portfolio_evaluation(
 
     let universe = state
         .universe_cache
-        .get(&state.trading, &state.pool, now)
+        .get(
+            &state.trading,
+            &state.pool,
+            &state.journal,
+            correlation_id,
+            now,
+        )
         .await?;
     // An absent table blocks the entry half through the risk gate rather than being papered over
     // here; the exit half runs on what it has, because closing reduces exposure and the end-of-day
@@ -579,7 +606,7 @@ async fn handle_portfolio_evaluation(
         close_history: &close_history,
         sizing: state.sizing,
         execution: state.execution,
-        session_log: &state.session_log,
+        journal: &state.journal,
         correlation_id,
         shutdown: &state.shutdown,
         now,
@@ -601,7 +628,7 @@ async fn handle_portfolio_liquidation(
     let summary = evaluate::run_liquidation(
         &state.pool,
         &state.trading,
-        &state.session_log,
+        &state.journal,
         correlation_id,
         Utc::now(),
     )
@@ -617,7 +644,10 @@ async fn handle_account_sync(
     let now = Utc::now();
     let today = SessionDate::at(now);
 
-    let calendar = state.calendar_cache.get(&state.trading, now).await?;
+    let calendar = state
+        .calendar_cache
+        .get(&state.trading, &state.journal, correlation_id, now)
+        .await?;
     if !calendar.is_trading_day(today) {
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
@@ -625,7 +655,7 @@ async fn handle_account_sync(
     let summary = account::sync_account(
         &state.pool,
         &state.trading,
-        &state.session_log,
+        &state.journal,
         correlation_id,
         &calendar,
         today,
@@ -638,11 +668,17 @@ async fn handle_account_sync(
 ///
 /// Chains the export rather than letting cron schedule it, so the export can never run against a
 /// half-synced database. The chain is emitted only on success for the same reason.
-async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerError> {
+async fn handle_market_data_sync(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     let now = Utc::now();
     let today = SessionDate::at(now);
 
-    let calendar = state.calendar_cache.get(&state.trading, now).await?;
+    let calendar = state
+        .calendar_cache
+        .get(&state.trading, &state.journal, correlation_id, now)
+        .await?;
     if !calendar.is_trading_day(today) {
         return Ok(json!({ "skipped": "not_a_trading_day", "session_date": today }));
     }
@@ -681,6 +717,24 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
     let fetched = bars::fetch_daily_bars(&state.massive, &sessions).await;
     let bar_rows = bars::store_bars(&state.pool, &fetched.bars).await?;
 
+    // The bar path is the one thing this application does that no provider can be re-asked about:
+    // Massive serves a session once and the archive partition freezes two sessions later.
+    state
+        .journal
+        .record(
+            correlation_id,
+            Utc::now(),
+            Observation::BarsIngested(BarsIngested {
+                session_date: today,
+                sessions_requested: sessions.len(),
+                sessions_failed: fetched.dates_failed.clone(),
+                bars_parsed: fetched.bars.len(),
+                rows_written: bar_rows,
+                error: None,
+            }),
+        )
+        .await;
+
     let detail_rows =
         details::store_details(&state.pool, &details::parse_embedded_details()?).await?;
 
@@ -710,22 +764,48 @@ async fn handle_market_data_sync(state: &ServiceState) -> Result<Value, HandlerE
     }))
 }
 
-/// Chained from a completed market data sync: seal the session log, export to S3, then purge.
+/// Chained from a completed market data sync: seal the journal, export to S3, then purge.
 ///
 /// The order is fixed and the purge is conditional on the *database* export being clean. Purging
 /// after a partial export deletes rows that never reached S3, and nothing afterwards can tell that
 /// it happened.
 ///
-/// The session log seals independently and does not gate the purge. It holds different data written
+/// The journal seals independently and does not gate the purge. It holds different data written
 /// by a different path, and letting a failure there hold PostgreSQL rows would couple two things
 /// whose only relationship is that they run on the same schedule.
-async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerError> {
+async fn handle_database_export(
+    state: &ServiceState,
+    correlation_id: Uuid,
+) -> Result<Value, HandlerError> {
     let today = SessionDate::at(Utc::now());
 
     let sessions =
-        export::export_session_logs(&state.session_log, &state.s3_client, &state.bucket, today)
-            .await;
-    let session_log_summary = json!({
+        export::export_journals(&state.journal, &state.s3_client, &state.bucket, today).await;
+    // After the export, so the seal has released. This record lands in the session the export ran
+    // in and ships on the next run, which is what lets the journal describe its own export.
+    state
+        .journal
+        .record(
+            correlation_id,
+            Utc::now(),
+            Observation::JournalExported(JournalExported {
+                sessions_exported: sessions.exported.len(),
+                records_exported: sessions.total_records(),
+                sessions_failed: sessions
+                    .failed
+                    .iter()
+                    .map(|(session_date, _)| SessionDate::from_date(*session_date))
+                    .collect(),
+                sessions_deleted: sessions
+                    .deleted
+                    .iter()
+                    .map(|session_date| SessionDate::from_date(*session_date))
+                    .collect(),
+                unparsable_lines: sessions.unparsable_lines,
+            }),
+        )
+        .await;
+    let journal_summary = json!({
         "sessions_exported": sessions.exported.len(),
         "records_exported": sessions.total_records(),
         "sessions_failed": sessions.failed.iter().map(|(session_date, error)| json!({
@@ -749,7 +829,7 @@ async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerEr
                 "dataset": dataset, "error": error.to_string()
             })).collect::<Vec<_>>(),
             "purged": Value::Null,
-            "session_log": session_log_summary,
+            "journal": journal_summary,
         }));
     }
 
@@ -760,7 +840,7 @@ async fn handle_database_export(state: &ServiceState) -> Result<Value, HandlerEr
         "total_rows_exported": export.total_rows(),
         "purged_rows": purged.total_rows(),
         "purge_clean": purged.is_clean(),
-        "session_log": session_log_summary,
+        "journal": journal_summary,
     }))
 }
 
@@ -894,16 +974,16 @@ mod tests {
             completion_outcome(
                 &json!({ "skipped": "not_a_trading_day", "session_date": "2026-08-11" })
             ),
-            "skipped_not_a_trading_day"
+            CommandOutcome::Skipped(SkipReason::NotATradingDay)
         );
         assert_eq!(
             completion_outcome(&json!({ "pairs_opened": ["AAAA-BBBB"] })),
-            "completed"
+            CommandOutcome::Completed
         );
-        // A reason this function has never seen still reads as a skip, not as a finished run.
+        // The second documented skip, which the handlers use when the exchange halts.
         assert_eq!(
             completion_outcome(&json!({ "skipped": "market_halted" })),
-            "skipped_market_halted"
+            CommandOutcome::Skipped(SkipReason::MarketHalted)
         );
     }
 

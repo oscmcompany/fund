@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, TradingClient};
 use fund::common::database::connect_pool;
-use fund::common::observability::init_tracing;
+use fund::common::log::init_tracing;
 use fund::common::types::SessionDate;
 use fund::data::calendar::TradingCalendar;
 use fund::portfolio::account;
@@ -209,7 +209,7 @@ async fn run(request: &BackfillRequest) -> Result<BackfillSummary, Box<dyn std::
         .fetch_portfolio_history(request.start.date(), request.end.date())
         .await?
         .into_iter()
-        .map(|point| (SessionDate::at(point.measured_at()), point.equity()))
+        .map(|point| (SessionDate::at(point.timestamp()), point.equity()))
         .collect();
 
     let (fills, mut summary) = plan(&trading_days, &stored, &reported);

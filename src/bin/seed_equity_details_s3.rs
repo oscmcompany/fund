@@ -12,7 +12,7 @@
 
 use tracing::{error, info};
 
-use fund::common::observability::init_tracing;
+use fund::common::log::init_tracing;
 use fund::data::archive;
 use fund::data::details;
 

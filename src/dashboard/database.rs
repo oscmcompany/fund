@@ -14,13 +14,19 @@ use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use tracing::warn;
 
-use crate::common::alpaca::TRANSFER_ACTIVITY_TYPES;
-use crate::common::types::{PairID, SessionDate, Ticker};
+use crate::common::alpaca::ActivityType;
+use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
 };
 
-use crate::portfolio::pairs::CloseReason;
+/// The stored spellings of every transfer type, for an `activity_type = ANY(...)` bind.
+fn transfer_activity_types() -> Vec<String> {
+    ActivityType::TRANSFERS
+        .iter()
+        .map(|activity_type| activity_type.as_str().to_string())
+        .collect()
+}
 
 /// Sessions of account snapshots fetched: the equity curve, and the newest row's balances.
 const ACCOUNT_HISTORY_DAYS: i64 = 365;
@@ -143,7 +149,7 @@ async fn fetch_transfer_sessions(
            AND transaction_time >= $2
            AND transaction_time < $3",
     )
-    .bind(TRANSFER_ACTIVITY_TYPES)
+    .bind(transfer_activity_types())
     .bind(start)
     .bind(end)
     .fetch_all(pool)

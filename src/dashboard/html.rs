@@ -558,12 +558,12 @@ tr:hover { background-color: rgba(255, 180, 0, 0.1); }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::CloseReason;
     use crate::common::types::{PairID, Ticker};
     use crate::dashboard::cache::{
         AccountSnapshot, ClosedPair, EventEntry, OpenPair, PeriodReturns, Prediction,
     };
     use crate::dashboard::database::compute_closed_summary;
-    use crate::portfolio::pairs::CloseReason;
     use chrono::{NaiveDate, TimeZone};
     use serde_json::json;
     use std::str::FromStr;

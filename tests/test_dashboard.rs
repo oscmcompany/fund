@@ -13,13 +13,14 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use fund::common::alpaca::AccountSnapshot;
+use fund::common::alpaca::{AccountSnapshot, ActivityType};
 use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{PairID, SessionDate, Ticker};
 use fund::dashboard::database::fetch_dashboard_data;
 
+use fund::common::types::CloseReason;
 use fund::portfolio::account;
-use fund::portfolio::pairs::{self, CloseReason, PairEntry};
+use fund::portfolio::pairs::{self, PairEntry};
 use rust_decimal::Decimal;
 use serde_json::json;
 use serial_test::serial;
@@ -318,7 +319,7 @@ async fn test_a_recorded_transfer_withholds_the_returns_it_invalidates() {
     let transfer = |id: &str, session: SessionDate| {
         AccountActivity::new(
             id.to_string(),
-            "CSD".to_string(),
+            ActivityType::CashDeposit,
             session.midnight(),
             None,
             None,

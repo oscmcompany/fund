@@ -13,76 +13,13 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::common::types::{PairID, Ticker};
+use crate::common::types::{CloseReason, PairID, Ticker};
 
 /// Errors reading or writing the pair record.
 #[derive(Debug, thiserror::Error)]
 pub enum PairsError {
     #[error("equity_pairs access failed: {0}")]
     Database(#[from] sqlx::Error),
-}
-
-/// Why an open pair was closed.
-///
-/// These four are the `close_reason` CHECK constraint in `schema.sql`, spelled as an enum so a
-/// reason the database would reject cannot be constructed in the first place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CloseReason {
-    /// The spread returned through its mean. The trade worked.
-    Convergence,
-    /// The spread widened past the stop, against the position. The trade did not.
-    StopLoss,
-    /// The pre-close fail-safe flattened the book. No opinion either way.
-    EndOfDay,
-    /// Alpaca no longer reports a position for one or both legs, so there is nothing left to hold.
-    PositionMissing,
-}
-
-impl CloseReason {
-    /// Every variant, for exhaustive iteration in tests.
-    pub const ALL: [CloseReason; 4] = [
-        CloseReason::Convergence,
-        CloseReason::StopLoss,
-        CloseReason::EndOfDay,
-        CloseReason::PositionMissing,
-    ];
-
-    /// The stored form, which must match the CHECK constraint exactly.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CloseReason::Convergence => "convergence",
-            CloseReason::StopLoss => "stop_loss",
-            CloseReason::EndOfDay => "end_of_day",
-            CloseReason::PositionMissing => "position_missing",
-        }
-    }
-
-    /// Parses the stored form. Returns `None` for anything outside the vocabulary.
-    pub fn parse(raw: &str) -> Option<Self> {
-        CloseReason::ALL
-            .into_iter()
-            .find(|reason| reason.as_str() == raw)
-    }
-
-    /// Whether this exit reflects the strategy's own opinion about the spread.
-    ///
-    /// A book that only ever exits at [`CloseReason::EndOfDay`] is one whose holding period is
-    /// shorter than the horizon it forecasts, which is the mismatch recorded in
-    /// `improvements_intraday_horizon.md`. The ratio of these two answers is the interim measure of
-    /// whether the strategy is doing anything, so the distinction is worth naming rather than
-    /// recomputing from a string at each call site.
-    pub fn is_signal(self) -> bool {
-        match self {
-            CloseReason::Convergence | CloseReason::StopLoss => true,
-            CloseReason::EndOfDay | CloseReason::PositionMissing => false,
-        }
-    }
-}
-
-impl std::fmt::Display for CloseReason {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
 }
 
 /// Why a pair entry was rejected before it could be recorded.

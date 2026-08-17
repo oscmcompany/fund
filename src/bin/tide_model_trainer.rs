@@ -20,8 +20,8 @@ use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, MarketDataClient};
 use fund::common::aws::date_partitioned_key;
+use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::observability::init_tracing;
 use fund::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use fund::data::adjust;
 use fund::data::archive;
@@ -105,7 +105,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // network round trips first and reports the failure as a sample count.
     validate_lookback_window(lookback_days, session)?;
 
-    // --- stage one: repair the archive ---
     //
     // Scanned rather than topped up: every weekday in the window with no partition is fetched, so a
     // night this did not run, a week of downtime, and an empty bucket are one case. The window is
@@ -188,8 +187,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "No Alpaca credentials; the boundary table is not refreshed"),
     }
 
-    // --- stage two: load the accumulated window ---
-
     // Fatal where the archive repair above was not: the stored bars are raw, so training without
     // this table fits a two-for-one split as a genuine fifty percent fall.
     let splits =
@@ -240,8 +237,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let consolidated = consolidate_data(equity_bars, equity_details)?;
     let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
     info!(rows = filtered.height(), "Consolidated and filtered");
-
-    // --- stage three: train and evaluate ---
 
     // The same fraction reaches preprocessing and windowing, because the scaler is fitted on the
     // rows at or before its cutoff. Passing one value here and another below would fit statistics
@@ -316,8 +311,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         quantile_coverage = metrics.quantile_coverage,
         "Evaluation metrics"
     );
-
-    // --- stage four: publish ---
 
     let staging = tempfile::tempdir()?;
     write_artifact_json(

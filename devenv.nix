@@ -11,16 +11,21 @@
     export AWS_S3_BUCKET_NAME="oscm-fund-$(echo ''${FUND_PROFILE} | tr '/.' '--')"
     export SECRETSPEC_PROFILE="''${FUND_PROFILE}"
     export AWS_S3_MODEL_ARTIFACT_PATH="models/tide/"
-    if [[ ! -w "''${FUND_LOG_DIR:-/var/log/fund}" ]]; then
-      export FUND_LOG_DIR="$HOME/.local/state/fund/log"
+    if [[ ! -w "''${FUND_LOG_DIRECTORY:-/var/log/fund}" ]]; then
+      export FUND_LOG_DIRECTORY="$HOME/.local/state/fund/log"
     else
-      export FUND_LOG_DIR="''${FUND_LOG_DIR:-/var/log/fund}"
+      export FUND_LOG_DIRECTORY="''${FUND_LOG_DIRECTORY:-/var/log/fund}"
     fi
-    mkdir -p "$FUND_LOG_DIR" 2>/dev/null || true
-    # The session log is data rather than logs, but it inherits FUND_LOG_DIR's writability
-    # fallback so it needs no provisioning of its own. Point it elsewhere to separate them.
-    export FUND_SESSION_LOG_DIR="''${FUND_SESSION_LOG_DIR:-$FUND_LOG_DIR/sessions}"
-    mkdir -p "$FUND_SESSION_LOG_DIR" 2>/dev/null || true
+    mkdir -p "$FUND_LOG_DIRECTORY" 2>/dev/null || true
+    # Its own tree, not a subdirectory of the logs. The journal is the only original this
+    # application owns, and the retention and rotation a log directory gets are the wrong ones for
+    # it. Falls back beside the logs on a machine bootstrap has not reached.
+    if [[ ! -w "''${FUND_JOURNAL_DIRECTORY:-/var/journal/fund}" ]]; then
+      export FUND_JOURNAL_DIRECTORY="$HOME/.local/state/fund/journal"
+    else
+      export FUND_JOURNAL_DIRECTORY="''${FUND_JOURNAL_DIRECTORY:-/var/journal/fund}"
+    fi
+    mkdir -p "$FUND_JOURNAL_DIRECTORY" 2>/dev/null || true
   '';
 
   applySchema = ''
@@ -65,10 +70,11 @@
     export PGUSER="''${PGUSER:-$(id -un)}"
   '';
 
-  # Log directory. VMs use /var/log/fund (provisioned by bootstrap-machine).
-  # The runtimeEnv block above detects when that path is not writable (e.g.
+  # Log and journal directories. VMs use /var/log/fund and /var/journal/fund, both provisioned by
+  # bootstrap-machine. The runtimeEnv block above detects when either path is not writable (e.g. a
   # local laptop without bootstrap) and falls back to an XDG state path.
-  fundLogDir = "/var/log/fund";
+  fundLogDirectory = "/var/log/fund";
+  fundJournalDirectory = "/var/journal/fund";
 
   # S3-compatible object store for the integration test suite. Defined here so
   # the process definition and the environment handed to the tests cannot drift
@@ -174,8 +180,9 @@ in {
     AWS_REGION = awsRegion;
     AWS_DEFAULT_REGION = awsRegion;
 
-    # Writable log directory for local file logging (see fundLogDir above)
-    FUND_LOG_DIR = fundLogDir;
+    # Writable directories for the service logs and the journal (see above)
+    FUND_LOG_DIRECTORY = fundLogDirectory;
+    FUND_JOURNAL_DIRECTORY = fundJournalDirectory;
 
     # PostgreSQL
     DATABASE_URL = "postgresql://localhost:5432/fund";

@@ -18,7 +18,10 @@ use chrono::{DateTime, NaiveTime, Utc};
 use chrono_tz::America::New_York;
 use tracing::{info, warn};
 
+use uuid::Uuid;
+
 use crate::common::alpaca::{CalendarDay, ClientError, TradingClient};
+use crate::common::journal::{CalendarObserved, EarlyClose, Journal, Observation};
 use crate::common::types::SessionDate;
 
 /// How far forward to fetch published sessions.
@@ -106,6 +109,22 @@ impl TradingCalendar {
         Some((first, last))
     }
 
+    /// Every session in the horizon that closes before the usual 16:00 Eastern bell.
+    ///
+    /// The half-days are the reason the calendar is fetched rather than assumed, so they are named
+    /// rather than left to be recovered by comparing every session against a constant.
+    pub fn early_closes(&self) -> Vec<EarlyClose> {
+        let usual_close = NaiveTime::from_hms_opt(16, 0, 0).expect("16:00 is a valid wall clock");
+        self.days
+            .iter()
+            .filter(|(_, day)| day.session_close() < usual_close)
+            .map(|(session_date, day)| EarlyClose {
+                session_date: *session_date,
+                session_close: day.session_close(),
+            })
+            .collect()
+    }
+
     /// The number of published sessions held.
     pub fn len(&self) -> usize {
         self.days.len()
@@ -183,6 +202,8 @@ impl CalendarCache {
     pub async fn get(
         &self,
         client: &TradingClient,
+        journal: &Journal,
+        correlation_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<TradingCalendar, ClientError> {
         let today = SessionDate::at(now);
@@ -210,6 +231,20 @@ impl CalendarCache {
             );
             *self.inner.lock().await = Some((today, calendar.clone()));
         }
+
+        journal
+            .record(
+                correlation_id,
+                now,
+                Observation::CalendarObserved(CalendarObserved {
+                    horizon_start: start,
+                    horizon_end: end,
+                    sessions: calendar.len(),
+                    trades_today: calendar.is_trading_day(today),
+                    early_closes: calendar.early_closes(),
+                }),
+            )
+            .await;
         Ok(calendar)
     }
 
@@ -436,7 +471,16 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
         );
         let served = cache
-            .get(&client, now)
+            .get(
+                &client,
+                &Journal::new(
+                    std::env::temp_dir()
+                        .join(format!("fund-calendar-cache-{}", std::process::id())),
+                )
+                .expect("the journal directory must be creatable"),
+                Uuid::nil(),
+                now,
+            )
             .await
             .expect("cache hit must not fetch");
         assert!(served.is_trading_day(date(2026, 11, 24)));

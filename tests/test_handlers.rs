@@ -13,7 +13,8 @@ use chrono::{Duration, NaiveTime, Utc};
 use fund::common::alpaca::{
     AlpacaCredentials, CalendarDay, DataFeed, MarketDataClient, TradingClient,
 };
-use fund::common::session_log::SessionLog;
+use fund::common::journal::Journal;
+use fund::common::types::CloseReason;
 use fund::common::types::{BarInterval, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
@@ -22,7 +23,7 @@ use fund::data::truncate::BoundaryTable;
 use fund::data::universe::{LiquidityRow, Universe};
 use fund::portfolio::evaluate::{self, EvaluationContext};
 use fund::portfolio::execute::ExecutionSettings;
-use fund::portfolio::pairs::{self, CloseReason, PairEntry};
+use fund::portfolio::pairs::{self, PairEntry};
 use fund::portfolio::size::SizingParameters;
 use serial_test::serial;
 use sqlx::PgPool;
@@ -67,11 +68,11 @@ fn calendar_for_today() -> TradingCalendar {
     TradingCalendar::from_days(days)
 }
 
-/// A session log in a directory of this test's own.
+/// A journal in a directory of this test's own.
 ///
 /// Every path under test writes one, so a shared directory would let one test's records be read as
 /// another's — and these tests already share a database.
-fn session_log(name: &str) -> SessionLog {
+fn journal(name: &str) -> Journal {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -80,11 +81,11 @@ fn session_log(name: &str) -> SessionLog {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&directory);
-    SessionLog::new(directory).expect("the log directory must be creatable")
+    Journal::new(directory).expect("the log directory must be creatable")
 }
 
 /// Every record a log holds, in the order it was written.
-fn recorded(log: &SessionLog) -> Vec<serde_json::Value> {
+fn recorded(log: &Journal) -> Vec<serde_json::Value> {
     let mut files: Vec<_> = std::fs::read_dir(log.directory())
         .expect("the log directory must be readable")
         .filter_map(Result::ok)
@@ -159,7 +160,8 @@ fn universe_of(tickers: &[&str]) -> Universe {
     use fund::common::alpaca::TradableAssets;
     use std::collections::HashSet;
 
-    let symbols: HashSet<String> = tickers.iter().map(|raw| raw.to_string()).collect();
+    let symbols: HashSet<fund::common::types::Ticker> =
+        tickers.iter().map(|raw| ticker(raw)).collect();
     let assets = TradableAssets::from_sets(symbols.clone(), symbols);
     let liquidity: Vec<LiquidityRow> = tickers
         .iter()
@@ -167,10 +169,6 @@ fn universe_of(tickers: &[&str]) -> Universe {
         .collect();
     Universe::build(&assets, &liquidity)
 }
-
-// ---------------------------------------------------------------------------
-// The evaluation pass
-// ---------------------------------------------------------------------------
 
 /// The whole entry half, end to end: history from the database, prices and orders from Alpaca, the
 /// pair recorded on the way out. This is the test that would catch a mis-wiring between the screen,
@@ -265,7 +263,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
-    let session_log = session_log("test-a-pass-opens-a-pair-and-records-it");
+    let journal = journal("test-a-pass-opens-a-pair-and-records-it");
     let dispatched_correlation_id = uuid::Uuid::new_v4();
     let context = EvaluationContext {
         prices_adjustable: true,
@@ -277,7 +275,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: dispatched_correlation_id,
         shutdown: &running,
         now: session_instant(),
@@ -307,7 +305,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
 
     // The pass is only useful to a replay if the observation reached the disk. One evaluation
     // record, and one submission and one resolution per leg, all threaded by the pass's identifier.
-    let records = recorded(&session_log);
+    let records = recorded(&journal);
     let passes = of_type(&records, "pass_evaluated");
     assert_eq!(passes.len(), 1, "one record per pass");
     let pass = &passes[0];
@@ -320,8 +318,8 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         "the pass records the identifier the dispatcher supplied, not one of its own"
     );
     assert!(
-        pass["payload"]["failure"].is_null(),
-        "a pass that completed records no failure"
+        pass["payload"]["error"].is_null(),
+        "a pass that completed records no error"
     );
 
     assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
@@ -331,7 +329,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     // gate refuses is still answerable in the dimension that caused the refusal.
     assert!(
         candidate["long_notional"].is_number()
-            && candidate["short_shares"].is_number()
+            && candidate["short_quantity"].is_number()
             && candidate["gross_exposure"].is_number(),
         "a candidate that reached the sizer carries what it was sized to"
     );
@@ -444,7 +442,7 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
     );
     // The identifier the close and the attribution will join on.
     assert_eq!(
-        opened[0]["payload"]["pair_uuid"],
+        opened[0]["payload"]["equity_pair_id"],
         open[0].id().to_string(),
         "the record names the row it wrote"
     );
@@ -574,7 +572,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
     let running = CancellationToken::new();
     running.cancel();
 
-    let session_log = session_log("test-a-pass-opens-nothing-once-shutdown-is-requested");
+    let journal = journal("test-a-pass-opens-nothing-once-shutdown-is-requested");
     let context = EvaluationContext {
         prices_adjustable: true,
         pool: &pool,
@@ -585,7 +583,7 @@ async fn test_a_pass_opens_nothing_once_shutdown_is_requested() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
@@ -699,7 +697,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     let sizing = SizingParameters::new(4, 1.0).unwrap();
 
     let running = CancellationToken::new();
-    let session_log = session_log("test-a-pass-closes-a-converged-pair-from-a-full-book");
+    let journal = journal("test-a-pass-closes-a-converged-pair-from-a-full-book");
     let context = EvaluationContext {
         prices_adjustable: true,
         pool: &pool,
@@ -710,7 +708,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         close_history: &close_history,
         sizing,
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
@@ -728,8 +726,8 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
         1,
         "the converged pair must close even though the book started full"
     );
-    assert_eq!(summary.pairs_closed[0].pair_id, "AAAA-BBBB");
-    assert_eq!(summary.pairs_closed[0].reason, "convergence");
+    assert_eq!(summary.pairs_closed[0].pair_id.as_str(), "AAAA-BBBB");
+    assert_eq!(summary.pairs_closed[0].reason, CloseReason::Convergence);
     assert!(summary.pairs_opened.is_empty());
 
     // Pin *why* nothing opened rather than only that nothing did. Closing the converged pair frees
@@ -742,7 +740,7 @@ async fn test_a_pass_closes_a_converged_pair_from_a_full_book() {
     // The exit half is recorded to the same standard as the entry half. Both legs of the pair that
     // closed, each carrying the order that will settle it — without these, realized profit and loss
     // is attributable in one direction only.
-    let records = recorded(&session_log);
+    let records = recorded(&journal);
     let closes = of_type(&records, "position_close_requested");
     assert_eq!(closes.len(), 2, "one record per leg of the closed pair");
     for record in &closes {
@@ -832,7 +830,7 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
-    let session_log = session_log("test-a-failed-pass-records-what-it-had-already-observed");
+    let journal = journal("test-a-failed-pass-records-what-it-had-already-observed");
     let context = EvaluationContext {
         prices_adjustable: true,
         pool: &pool,
@@ -843,7 +841,7 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
@@ -853,11 +851,11 @@ async fn test_a_failed_pass_records_what_it_had_already_observed() {
         .await
         .expect_err("the account call must fail the pass");
 
-    let records = recorded(&session_log);
+    let records = recorded(&journal);
     let passes = of_type(&records, "pass_evaluated");
     assert_eq!(passes.len(), 1, "a failed pass is still recorded");
     assert!(
-        passes[0]["payload"]["failure"]
+        passes[0]["payload"]["error"]
             .as_str()
             .expect("the failure is named")
             .contains("Alpaca"),
@@ -931,7 +929,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
-    let session_log = session_log("test-a-pair-that-cannot-be-priced-is-held-and-counted");
+    let journal = journal("test-a-pair-that-cannot-be-priced-is-held-and-counted");
     let context = EvaluationContext {
         prices_adjustable: true,
         pool: &pool,
@@ -942,7 +940,7 @@ async fn test_a_pair_that_cannot_be_priced_is_held_and_counted() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
@@ -1019,7 +1017,7 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
     let universe = universe_of(&["AAAA", "BBBB"]);
 
     let running = CancellationToken::new();
-    let session_log = session_log("test-a-refused-book-with-no-trade-records-what-was-refused");
+    let journal = journal("test-a-refused-book-with-no-trade-records-what-was-refused");
     let context = EvaluationContext {
         prices_adjustable: true,
         pool: &pool,
@@ -1030,7 +1028,7 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         close_history: &close_history,
         sizing: SizingParameters::default(),
         execution: settings(),
-        session_log: &session_log,
+        journal: &journal,
         correlation_id: uuid::Uuid::new_v4(),
         shutdown: &running,
         now: session_instant(),
@@ -1041,7 +1039,7 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         .expect("the pass must survive");
     assert_eq!(summary.pairs_unpriced, 1, "a refused book leaves no price");
 
-    let records = recorded(&session_log);
+    let records = recorded(&journal);
     let unavailable: Vec<&serde_json::Value> = of_type(&records, "prices_observed")
         .iter()
         .flat_map(|record| record["payload"]["unavailable"].as_array().unwrap())
@@ -1052,7 +1050,9 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         .expect("the refused symbol must be named");
 
     assert_eq!(refused["cause"], "quote_rejected");
-    assert_eq!(refused["quote_rejection"], "wide_quote");
+    assert_eq!(refused["quote_rejection"]["reason"], "wide_quote");
+    // The reading, not just the verdict: a 90/110 book is 0.20 wide around a midpoint of 100.
+    assert_eq!(refused["quote_rejection"]["relative_spread"], 0.2);
     assert_eq!(refused["bid_price"], 90.0);
     assert_eq!(refused["ask_price"], 110.0);
     assert!(refused["quote_timestamp"].is_string());
@@ -1067,10 +1067,6 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         "no book means no book, not a defaulted one"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Liquidation
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -1103,7 +1099,7 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let log = session_log("test-liquidation-flattens-the-book-and-marks-every-pair");
+    let log = journal("test-liquidation-flattens-the-book-and-marks-every-pair");
     let summary =
         evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
             .await
@@ -1117,7 +1113,7 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
     let records = recorded(&log);
     let attempted = of_type(&records, "liquidation_attempted");
     assert_eq!(attempted.len(), 1);
-    assert!(attempted[0]["payload"]["failure"].is_null());
+    assert!(attempted[0]["payload"]["error"].is_null());
     assert_eq!(attempted[0]["payload"]["pairs_closed"], 2);
 
     // The table is mutated in place; the log needs its own record of the transition.
@@ -1151,7 +1147,7 @@ async fn test_a_failed_liquidation_records_the_attempt() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let log = session_log("test-a-failed-liquidation-records-the-attempt");
+    let log = journal("test-a-failed-liquidation-records-the-attempt");
     evaluate::run_liquidation(&pool, &trading, &log, uuid::Uuid::new_v4(), Utc::now())
         .await
         .expect_err("the bulk close must fail");
@@ -1160,7 +1156,7 @@ async fn test_a_failed_liquidation_records_the_attempt() {
     let attempted = of_type(&records, "liquidation_attempted");
     assert_eq!(attempted.len(), 1, "the attempt is recorded even so");
     assert!(
-        attempted[0]["payload"]["failure"]
+        attempted[0]["payload"]["error"]
             .as_str()
             .expect("the failure is named")
             .contains("Alpaca"),
@@ -1209,7 +1205,7 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
     let summary = evaluate::run_liquidation(
         &pool,
         &trading,
-        &session_log("test-a-refused-leg-leaves-its-pair-open"),
+        &journal("test-a-refused-leg-leaves-its-pair-open"),
         uuid::Uuid::new_v4(),
         Utc::now(),
     )
@@ -1218,16 +1214,19 @@ async fn test_a_refused_leg_leaves_its_pair_open() {
 
     assert_eq!(summary.positions_refused, 1);
     assert_eq!(summary.pairs_closed, 1);
-    assert_eq!(summary.pairs_still_open, vec!["AAAA-BBBB".to_string()]);
+    assert_eq!(
+        summary
+            .pairs_still_open
+            .iter()
+            .map(|pair_id| pair_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["AAAA-BBBB"]
+    );
 
     let open = pairs::load_open_pairs(&pool).await.unwrap();
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].long_ticker().as_str(), "AAAA");
 }
-
-// ---------------------------------------------------------------------------
-// The post-close account sync
-// ---------------------------------------------------------------------------
 
 /// Balances stored, fills stored, and the round trip attributed back to the pair that made it.
 #[tokio::test]
@@ -1298,7 +1297,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let log = session_log("test-the-account-sync-stores-and-attributes-a-session");
+    let log = journal("test-the-account-sync-stores-and-attributes-a-session");
     let summary = account::sync_account(
         &pool,
         &trading,
@@ -1339,7 +1338,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     assert!(
         observed
             .iter()
-            .all(|record| record["payload"]["order_id"].is_string()),
+            .all(|record| record["payload"]["alpaca_order_id"].is_string()),
         "every fill joins back to the order that produced it"
     );
 
@@ -1347,7 +1346,7 @@ async fn test_the_account_sync_stores_and_attributes_a_session() {
     // on so the stored figure can be checked against the fills it came from.
     let attributed = of_type(&records, "pair_attributed");
     assert_eq!(attributed.len(), 1);
-    assert_eq!(attributed[0]["payload"]["pair_uuid"], id.to_string());
+    assert_eq!(attributed[0]["payload"]["equity_pair_id"], id.to_string());
     assert_eq!(attributed[0]["payload"]["realized_profit_and_loss"], 100.0);
     assert_eq!(attributed[0]["payload"]["updated"], true);
 }
@@ -1388,7 +1387,7 @@ async fn test_the_account_sync_is_idempotent() {
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
     let calendar = calendar_ending_at(session_date);
-    let log = session_log("test-the-account-sync-is-idempotent-0");
+    let log = journal("test-the-account-sync-is-idempotent-0");
     let first = account::sync_account(
         &pool,
         &trading,
@@ -1399,7 +1398,7 @@ async fn test_the_account_sync_is_idempotent() {
     )
     .await
     .unwrap();
-    let log = session_log("test-the-account-sync-is-idempotent-1");
+    let log = journal("test-the-account-sync-is-idempotent-1");
     let second = account::sync_account(
         &pool,
         &trading,
@@ -1494,7 +1493,7 @@ async fn test_the_account_sync_stores_transfers_without_attributing_them() {
     let summary = account::sync_account(
         &pool,
         &trading,
-        &session_log("test-the-account-sync-stores-transfers-without-attributing-them"),
+        &journal("test-the-account-sync-stores-transfers-without-attributing-them"),
         uuid::Uuid::new_v4(),
         &calendar_ending_at(session_date),
         session_date,
@@ -1564,7 +1563,7 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     mock_no_return_activities(&mut server).await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let log = session_log("test-the-account-sync-reports-a-missing-previous-session-2");
+    let log = journal("test-the-account-sync-reports-a-missing-previous-session-2");
     let with_gap = account::sync_account(
         &pool,
         &trading,
@@ -1604,10 +1603,6 @@ async fn test_the_account_sync_reports_a_missing_previous_session() {
     .expect("the sync must run");
     assert_eq!(repaired.previous_session_gap, None);
 }
-
-// ---------------------------------------------------------------------------
-// Fixture helpers
-// ---------------------------------------------------------------------------
 
 fn account_body(equity: i64) -> String {
     format!(
@@ -1717,7 +1712,7 @@ async fn test_a_fee_from_an_earlier_session_is_stored_as_a_cost() {
         .await;
 
     let trading = TradingClient::with_base_url(credentials(), server.url());
-    let log = session_log("test-a-fee-from-an-earlier-session-is-stored-as-a-cost");
+    let log = journal("test-a-fee-from-an-earlier-session-is-stored-as-a-cost");
     let summary = account::sync_account(
         &pool,
         &trading,

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fund::common::events::{self, Notification, Outcome};
-use fund::common::{crypto, database, observability};
+use fund::common::{crypto, database, log};
 use fund::handlers::{self, ServiceState};
 use sqlx::postgres::PgListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -47,7 +47,7 @@ const HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crypto::install_default_crypto_provider();
-    let _log_guard = observability::init_tracing("fund.log", None, "fund");
+    let _log_guard = log::init_tracing("fund.log", None, "fund");
 
     let pool = database::connect_pool().await?;
 

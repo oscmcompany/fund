@@ -14,15 +14,17 @@
 mod common;
 
 use chrono::{Duration, NaiveDate, Utc};
+use fund::common::alpaca::{ActivityType, OrderSide};
 use fund::common::events::{self, Command, EventType, Outcome};
 use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
 use fund::data::truncate::BoundaryTable;
 
+use fund::common::types::CloseReason;
 use fund::models::tide::predict;
 use fund::portfolio::account;
-use fund::portfolio::pairs::{self, CloseReason, PairEntry};
+use fund::portfolio::pairs::{self, PairEntry};
 use rust_decimal::Decimal;
 use serial_test::serial;
 use sqlx::PgPool;
@@ -52,10 +54,6 @@ async fn fresh_pool() -> PgPool {
     common::reset_tables(&pool).await;
     pool
 }
-
-// ---------------------------------------------------------------------------
-// equity_pairs
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]
@@ -184,10 +182,6 @@ async fn test_realized_profit_and_loss_is_written_only_onto_a_closed_pair() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// account tables
-// ---------------------------------------------------------------------------
-
 /// Alpaca's activity identifier is the primary key, which is what makes the post-close sync
 /// idempotent by construction: a re-run conflicts on every row and changes nothing.
 #[tokio::test]
@@ -198,10 +192,10 @@ async fn test_activities_are_idempotent_on_alpacas_identifier() {
     let pool = fresh_pool().await;
     let activity = AccountActivity::new(
         "activity-1".to_string(),
-        "FILL".to_string(),
+        ActivityType::Fill,
         Utc::now(),
         Some(ticker("AAAA")),
-        Some("buy".to_string()),
+        Some(OrderSide::Buy),
         Some(Decimal::from(10)),
         Some(Decimal::from(150)),
         None,
@@ -212,7 +206,7 @@ async fn test_activities_are_idempotent_on_alpacas_identifier() {
         account::store_activities(&pool, std::slice::from_ref(&activity))
             .await
             .unwrap(),
-        vec![activity.id().to_string()],
+        vec![activity.activity_id().to_string()],
         "the first store reports the row it inserted"
     );
     assert_eq!(
@@ -360,10 +354,6 @@ async fn test_a_backfill_never_downgrades_a_complete_snapshot() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// bars and predictions
-// ---------------------------------------------------------------------------
-
 /// Position `i` in every returned series must be the same session. Two series of equal length over
 /// different dates produce a correlation between different days, and nothing downstream carries
 /// enough information to notice.
@@ -496,10 +486,6 @@ async fn test_predictions_return_the_newest_row_per_ticker() {
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].model_run_id(), "run-late");
 }
-
-// ---------------------------------------------------------------------------
-// events
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial]

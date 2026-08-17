@@ -6,18 +6,17 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::common::alpaca::{
-    AccountActivity, AccountSnapshot, ClientError, TradingClient, FILL_ACTIVITY_TYPE,
-    RETURN_ACTIVITY_TYPES, TRANSFER_ACTIVITY_TYPES,
+    AccountActivity, AccountSnapshot, ActivityType, ClientError, Position, TradingClient,
 };
-use crate::common::session_log::{
-    AccountObserved, ActivityObserved, Observation, PairAttributed, SessionLog,
+use crate::common::journal::{
+    AccountObserved, ActivityObserved, Journal, Observation, PairAttributed, PositionReading,
+    PositionsObserved,
 };
 use crate::common::types::SessionDate;
 use crate::data::calendar::TradingCalendar;
@@ -27,22 +26,9 @@ use crate::portfolio::pairs::{self, ClosedPair, PairsError};
 ///
 /// Fills alone, because they are the only type that answers such a query: they carry a real
 /// `transaction_time`, where every other type is date-only and created the following morning, so
-/// `date=D` returns the row dated `D-1`. The rest come through [`windowed_activity_types`].
-pub fn synced_activity_types() -> Vec<&'static str> {
-    vec![FILL_ACTIVITY_TYPE]
-}
-
-/// The activity types asked for over a trailing window instead.
-///
-/// Everything Alpaca stamps with a date rather than a time. A session cannot observe its own fees
-/// or its own transfers — both are created hours after the 16:15 Eastern sync — so asking by
-/// session date would miss each one on the only run that looks for it.
-pub fn windowed_activity_types() -> Vec<&'static str> {
-    RETURN_ACTIVITY_TYPES
-        .iter()
-        .copied()
-        .chain(TRANSFER_ACTIVITY_TYPES)
-        .collect()
+/// `date=D` returns the row dated `D-1`. The rest come through [`ActivityType::windowed`].
+pub fn synced_activity_types() -> Vec<ActivityType> {
+    vec![ActivityType::Fill]
 }
 
 /// How far back each sync re-asks for [`windowed_activity_types`].
@@ -66,6 +52,7 @@ pub enum AccountError {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct AccountSyncSummary {
     pub session_date: SessionDate,
+    #[serde(with = "crate::common::types::decimal_number")]
     pub equity: Decimal,
     pub activities_stored: u64,
     pub pairs_attributed: usize,
@@ -82,6 +69,7 @@ pub struct AccountSyncSummary {
     /// sessions rather than this one.
     pub return_activities_stored: usize,
     /// Their net effect on the balance, signed: dividends and interest add, fees subtract.
+    #[serde(with = "crate::common::types::decimal_number")]
     pub return_activities_net: Decimal,
 }
 
@@ -89,7 +77,7 @@ pub struct AccountSyncSummary {
 pub async fn sync_account(
     pool: &PgPool,
     client: &TradingClient,
-    session_log: &SessionLog,
+    journal: &Journal,
     correlation_id: uuid::Uuid,
     calendar: &TradingCalendar,
     session_date: SessionDate,
@@ -100,7 +88,7 @@ pub async fn sync_account(
     // Recorded in full, not just the equity. Alpaca's portfolio history can report equity for a
     // past date and nothing can report cash, buying power, or the market values, so this is the
     // only moment they are observable at all.
-    session_log
+    journal
         .record(
             correlation_id,
             Utc::now(),
@@ -108,14 +96,15 @@ pub async fn sync_account(
                 // The session this describes, which a sync re-run after Eastern midnight would
                 // otherwise lose: the envelope files a record under the session it *happened* in.
                 session_date,
-                equity: account.equity().to_f64(),
-                cash: account.cash().to_f64(),
-                buying_power: account.buying_power().to_f64(),
-                long_market_value: account.long_market_value().to_f64(),
-                short_market_value: account.short_market_value().to_f64(),
+                equity: account.equity(),
+                cash: account.cash(),
+                buying_power: account.buying_power(),
+                long_market_value: account.long_market_value(),
+                short_market_value: account.short_market_value(),
             }),
         )
         .await;
+    record_positions(client, journal, correlation_id).await;
     let previous_session_gap = missing_previous_snapshot(pool, calendar, session_date).await;
 
     // One request per type: Alpaca puts the activity type in the URL path, and the sync already
@@ -125,7 +114,7 @@ pub async fn sync_account(
     let mut activities_undated = 0;
     for activity_type in synced_activity_types() {
         let fetched = client
-            .fetch_activities(activity_type, session_date.date())
+            .fetch_activities(&activity_type, session_date.date())
             .await?;
         activities_truncated |= fetched.truncated;
         activities_undated += fetched.undated;
@@ -136,7 +125,7 @@ pub async fn sync_account(
     // sync runs. The overlap re-reads stored rows, which the activity id absorbs.
     let windowed = client
         .fetch_activities_since(
-            &windowed_activity_types(),
+            &ActivityType::windowed(),
             session_date.date() - chrono::Duration::days(ACTIVITY_WINDOW_DAYS),
         )
         .await?;
@@ -152,8 +141,7 @@ pub async fn sync_account(
     let return_activities: Vec<&AccountActivity> = activities
         .iter()
         .filter(|activity| {
-            newly_stored.contains(activity.id())
-                && RETURN_ACTIVITY_TYPES.contains(&activity.activity_type())
+            newly_stored.contains(activity.activity_id()) && activity.activity_type().is_return()
         })
         .collect();
     let return_activities_net: Decimal = return_activities
@@ -181,22 +169,22 @@ pub async fn sync_account(
     // deposit or withdrawal moved — reaches no other store this application owns.
     for activity in activities
         .iter()
-        .filter(|activity| newly_stored.contains(activity.id()))
+        .filter(|activity| newly_stored.contains(activity.activity_id()))
     {
-        session_log
+        journal
             .record(
                 correlation_id,
                 Utc::now(),
                 Observation::ActivityObserved(ActivityObserved {
-                    activity_id: activity.id().to_string(),
-                    activity_type: activity.activity_type().to_string(),
+                    activity_id: activity.activity_id().to_string(),
+                    activity_type: activity.activity_type().clone(),
                     transaction_time: activity.transaction_time(),
-                    ticker: activity.ticker().map(|ticker| ticker.to_string()),
-                    side: activity.side().map(str::to_string),
-                    quantity: activity.shares().and_then(|shares| shares.to_f64()),
-                    price: activity.price().and_then(|price| price.to_f64()),
-                    net_amount: activity.net_amount().and_then(|amount| amount.to_f64()),
-                    order_id: activity.order_id().map(str::to_string),
+                    ticker: activity.ticker().cloned(),
+                    side: activity.side(),
+                    quantity: activity.quantity(),
+                    price: activity.price(),
+                    net_amount: activity.net_amount(),
+                    alpaca_order_id: activity.alpaca_order_id().map(str::to_string),
                 }),
             )
             .await;
@@ -208,7 +196,7 @@ pub async fn sync_account(
     // one in would count it as unattributed and warn on every session that received capital.
     let fills: Vec<AccountActivity> = activities
         .iter()
-        .filter(|activity| activity.activity_type() == FILL_ACTIVITY_TYPE)
+        .filter(|activity| *activity.activity_type() == ActivityType::Fill)
         .cloned()
         .collect();
     let attribution = attribute(&closed, &fills);
@@ -216,13 +204,13 @@ pub async fn sync_account(
     let mut pairs_attributed = 0;
     for (id, amount) in &attribution.realized {
         let updated = pairs::record_realized_profit_and_loss(pool, *id, *amount).await?;
-        session_log
+        journal
             .record(
                 correlation_id,
                 Utc::now(),
                 Observation::PairAttributed(PairAttributed {
-                    pair_uuid: id.to_string(),
-                    realized_profit_and_loss: amount.to_f64(),
+                    equity_pair_id: *id,
+                    realized_profit_and_loss: Some(*amount),
                     updated,
                 }),
             )
@@ -339,15 +327,15 @@ pub async fn store_activities(
         );
         query_builder.push_values(chunk, |mut builder, activity| {
             builder
-                .push_bind(activity.id().to_string())
+                .push_bind(activity.activity_id().to_string())
                 .push_bind(activity.activity_type().to_string())
                 .push_bind(activity.transaction_time())
                 .push_bind(activity.ticker().map(|ticker| ticker.as_str().to_string()))
-                .push_bind(activity.side().map(str::to_string))
-                .push_bind(activity.shares())
+                .push_bind(activity.side().map(|side| side.as_str().to_string()))
+                .push_bind(activity.quantity())
                 .push_bind(activity.price())
                 .push_bind(activity.net_amount())
-                .push_bind(activity.order_id().map(str::to_string));
+                .push_bind(activity.alpaca_order_id().map(str::to_string));
         });
         query_builder.push(" ON CONFLICT (id) DO NOTHING RETURNING id");
 
@@ -364,6 +352,40 @@ pub async fn store_activities(
         "Account activities stored"
     );
     Ok(inserted)
+}
+
+/// Records the position book beside the balances.
+///
+/// A failure here is warned and swallowed for the same reason a journal write is: the sync's job is
+/// the balances and the activities, and the book going unobserved must not cost them.
+async fn record_positions(client: &TradingClient, journal: &Journal, correlation_id: Uuid) {
+    let observed = match client.fetch_positions().await {
+        Ok(positions) => positions,
+        Err(error) => {
+            warn!(%error, "Positions could not be fetched; the book goes unobserved");
+            return;
+        }
+    };
+    journal
+        .record(
+            correlation_id,
+            Utc::now(),
+            Observation::PositionsObserved(PositionsObserved {
+                readings: observed.positions.iter().map(position_reading).collect(),
+                unreadable: observed.unreadable,
+            }),
+        )
+        .await;
+}
+
+fn position_reading(position: &Position) -> PositionReading {
+    PositionReading {
+        ticker: position.ticker().clone(),
+        side: position.side(),
+        quantity: position.quantity(),
+        market_value: position.market_value(),
+        unrealized_profit_and_loss: position.unrealized_profit_and_loss(),
+    }
 }
 
 /// The previous trading session, when it has no snapshot of its own.
@@ -479,8 +501,9 @@ pub fn session_bounds(session_date: SessionDate) -> (DateTime<Utc>, DateTime<Utc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::alpaca::OrderSide;
+    use crate::common::types::CloseReason;
     use crate::common::types::{PairID, Ticker};
-    use crate::portfolio::pairs::CloseReason;
     use chrono::NaiveDate;
 
     fn ticker(raw: &str) -> Ticker {
@@ -508,17 +531,17 @@ mod tests {
     fn fill(
         id: &str,
         symbol: &str,
-        side: &str,
+        side: OrderSide,
         shares: i64,
         price: i64,
         at: DateTime<Utc>,
     ) -> AccountActivity {
         AccountActivity::new(
             id.to_string(),
-            FILL_ACTIVITY_TYPE.to_string(),
+            ActivityType::Fill,
             at,
             Some(ticker(symbol)),
-            Some(side.to_string()),
+            Some(side),
             Some(Decimal::from(shares)),
             Some(Decimal::from(price)),
             None,
@@ -533,11 +556,11 @@ mod tests {
         let pair = closed_pair("AAAA", "BBBB", 14, 18);
         let activities = vec![
             // Long leg: bought 10 at 100, sold 10 at 110. +100.
-            fill("1", "AAAA", "buy", 10, 100, instant(14, 5)),
-            fill("2", "AAAA", "sell", 10, 110, instant(17, 55)),
+            fill("1", "AAAA", OrderSide::Buy, 10, 100, instant(14, 5)),
+            fill("2", "AAAA", OrderSide::Sell, 10, 110, instant(17, 55)),
             // Short leg: sold 10 at 200, bought back 10 at 195. +50.
-            fill("3", "BBBB", "sell_short", 10, 200, instant(14, 5)),
-            fill("4", "BBBB", "buy", 10, 195, instant(17, 55)),
+            fill("3", "BBBB", OrderSide::SellShort, 10, 200, instant(14, 5)),
+            fill("4", "BBBB", OrderSide::Buy, 10, 195, instant(17, 55)),
         ];
 
         let attribution = attribute(std::slice::from_ref(&pair), &activities);
@@ -558,7 +581,7 @@ mod tests {
     #[test]
     fn test_a_fill_outside_the_window_is_not_attributed() {
         let pair = closed_pair("AAAA", "BBBB", 14, 18);
-        let activities = vec![fill("1", "AAAA", "buy", 10, 100, instant(19, 0))];
+        let activities = vec![fill("1", "AAAA", OrderSide::Buy, 10, 100, instant(19, 0))];
         let attribution = attribute(std::slice::from_ref(&pair), &activities);
 
         assert_eq!(attribution.realized[&pair.id()], Decimal::ZERO);
@@ -568,7 +591,7 @@ mod tests {
     #[test]
     fn test_a_fill_in_a_symbol_the_pair_does_not_hold_is_not_attributed() {
         let pair = closed_pair("AAAA", "BBBB", 14, 18);
-        let activities = vec![fill("1", "CCCC", "buy", 10, 100, instant(15, 0))];
+        let activities = vec![fill("1", "CCCC", OrderSide::Buy, 10, 100, instant(15, 0))];
         assert_eq!(attribute(&[pair], &activities).unattributed, 1);
     }
 
@@ -578,7 +601,7 @@ mod tests {
     fn test_an_ambiguous_fill_is_attributed_to_neither_pair() {
         let first = closed_pair("AAAA", "BBBB", 14, 18);
         let second = closed_pair("AAAA", "CCCC", 15, 17);
-        let activities = vec![fill("1", "AAAA", "buy", 10, 100, instant(16, 0))];
+        let activities = vec![fill("1", "AAAA", OrderSide::Buy, 10, 100, instant(16, 0))];
 
         let attribution = attribute(&[first.clone(), second.clone()], &activities);
         assert_eq!(attribution.unattributed, 1);
@@ -593,7 +616,7 @@ mod tests {
         let pair = closed_pair("AAAA", "BBBB", 14, 18);
         let fee = AccountActivity::new(
             "f".to_string(),
-            "FEE".to_string(),
+            ActivityType::parse("FEE"),
             instant(16, 0),
             Some(ticker("AAAA")),
             None,

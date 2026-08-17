@@ -19,7 +19,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::info;
 
+use uuid::Uuid;
+
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
+use crate::common::journal::{Journal, Observation, UniverseRefreshed};
 use crate::common::types::{BarInterval, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 
 /// Trailing window over which liquidity is averaged.
@@ -85,11 +88,10 @@ impl Universe {
             if !row.is_liquid() {
                 continue;
             }
-            let symbol = row.ticker.as_str();
-            if !assets.is_tradable(symbol) {
+            if !assets.is_tradable(&row.ticker) {
                 continue;
             }
-            if assets.is_shortable(symbol) {
+            if assets.is_shortable(&row.ticker) {
                 shortable.insert(row.ticker.clone());
             }
             tickers.push(row.ticker.clone());
@@ -107,6 +109,15 @@ impl Universe {
     /// Every eligible ticker, in a stable order.
     pub fn tickers(&self) -> &[Ticker] {
         &self.tickers
+    }
+
+    /// Tickers this universe holds that `other` does not, in the stable order this one keeps.
+    pub fn difference(&self, other: &Universe) -> Vec<Ticker> {
+        self.tickers
+            .iter()
+            .filter(|ticker| !other.contains(ticker))
+            .cloned()
+            .collect()
     }
 
     /// Whether `ticker` is eligible to trade at all.
@@ -203,6 +214,8 @@ impl UniverseCache {
         &self,
         client: &TradingClient,
         pool: &PgPool,
+        journal: &Journal,
+        correlation_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Universe, UniverseError> {
         let today = SessionDate::at(now);
@@ -213,6 +226,12 @@ impl UniverseCache {
             }
         }
 
+        let previous = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|(_, universe)| universe.clone());
         let assets = client.fetch_tradable_assets().await?;
         let liquidity = load_liquidity(pool, today).await?;
         let universe = Universe::build(&assets, &liquidity);
@@ -224,6 +243,31 @@ impl UniverseCache {
             shortable = universe.shortable_count(),
             "Tradable universe built"
         );
+
+        // What entered and what fell out, rather than only the size. A universe that holds steady
+        // at seven hundred names while churning fifty of them is the case a count cannot show.
+        let (admitted, removed) = match previous {
+            Some(previous) => (
+                universe.difference(&previous),
+                previous.difference(&universe),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        journal
+            .record(
+                correlation_id,
+                now,
+                Observation::UniverseRefreshed(UniverseRefreshed {
+                    alpaca_tradable: assets.tradable_count(),
+                    alpaca_shortable: assets.shortable_count(),
+                    liquid: liquidity.iter().filter(|row| row.is_liquid()).count(),
+                    universe_size: universe.len(),
+                    admitted,
+                    removed,
+                    error: None,
+                }),
+            )
+            .await;
 
         if !universe.is_empty() {
             *self.inner.lock().await = Some((today, universe.clone()));
@@ -248,13 +292,13 @@ mod tests {
     fn assets() -> TradableAssets {
         TradableAssets::from_sets(
             HashSet::from([
-                "AAPL".to_string(),
-                "MSFT".to_string(),
-                "NVDA".to_string(),
-                "PENNY".to_string(),
-                "THIN".to_string(),
+                ticker("AAPL"),
+                ticker("MSFT"),
+                ticker("NVDA"),
+                ticker("PENNY"),
+                ticker("THIN"),
             ]),
-            HashSet::from(["AAPL".to_string(), "MSFT".to_string()]),
+            HashSet::from([ticker("AAPL"), ticker("MSFT")]),
         )
     }
 
@@ -348,8 +392,12 @@ mod tests {
         );
         let pool = sqlx::PgPool::connect_lazy("postgresql://user:pass@127.0.0.1:1/none").unwrap();
 
+        let journal = Journal::new(
+            std::env::temp_dir().join(format!("fund-universe-cache-{}", std::process::id())),
+        )
+        .expect("the journal directory must be creatable");
         let served = cache
-            .get(&client, &pool, now)
+            .get(&client, &pool, &journal, Uuid::nil(), now)
             .await
             .expect("cache hit must not fetch");
         assert_eq!(served.len(), 1);
