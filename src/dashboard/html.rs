@@ -1,31 +1,29 @@
-//! The server-rendered page.
+//! The server-rendered page: five sections in an amber CRT aesthetic, no JavaScript and no CDN.
 //!
-//! Five sections stacked vertically — account, open pairs, predictions, closed pairs, events — in
-//! an amber CRT aesthetic. The page refreshes every thirty seconds with a `<meta>` tag, matching
-//! the poll interval; no client-side JavaScript and nothing loaded from a CDN.
-//!
-//! It renders only what the database can answer. There is no benchmark curve (the universe holds no
-//! index ETF) and no training metrics (the trainer publishes those to S3, not to a table).
+//! It renders only what the database can answer — no benchmark curve (the universe holds no index
+//! ETF) and no training metrics (the trainer publishes those to S3, not to a table).
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 
-use crate::dashboard::cache::DashboardState;
+use crate::common::events::Outcome;
+use crate::dashboard::cache::{DashboardState, POLL_INTERVAL};
 
-/// Events shown on the page, out of the several hundred the buffer holds.
+/// How every unavailable figure renders. Withheld and never-recorded must read alike, so the page
+/// has one spelling of absence rather than one per formatter.
+const ABSENT: &str = "—";
+
 const EVENTS_DISPLAY_LIMIT: usize = 12;
 
 /// Closed pairs shown on the page. The summary underneath covers all of them.
 const CLOSED_PAIRS_DISPLAY_LIMIT: usize = 20;
 
-/// Predictions shown on the page.
 const PREDICTIONS_DISPLAY_LIMIT: usize = 15;
 
 /// How old daily bars may be before the freshness line turns amber, then red.
 const BARS_WARNING_AGE: Duration = Duration::hours(24);
 const BARS_STALE_AGE: Duration = Duration::hours(48);
 
-/// Renders the whole page from the current state.
 pub fn render_html(state: &DashboardState) -> String {
     render_html_at(state, Utc::now())
 }
@@ -66,6 +64,9 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
     let predictions = render_predictions_section(state);
     let closed_pairs = render_closed_pairs_section(state);
     let events = render_events_section(state);
+    // The page reloads on the same cadence the poller refreshes on, so a viewer never waits on a
+    // value that has already changed and never reloads onto an identical one.
+    let refresh_seconds = POLL_INTERVAL.as_secs();
 
     format!(
         r#"<!DOCTYPE html>
@@ -73,7 +74,7 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
+<meta http-equiv="refresh" content="{refresh_seconds}">
 <title>OSCM</title>
 <style>{CSS}</style>
 </head>
@@ -91,7 +92,7 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
 {closed_pairs}
 {events}
 <footer class="sys-footer">
-<span>AUTO-REFRESH: 30S</span>
+<span>AUTO-REFRESH: {refresh_seconds}S</span>
 <span>STATUS: NOMINAL</span>
 </footer>
 </body>
@@ -273,7 +274,7 @@ fn render_closed_pairs_section(state: &DashboardState) -> String {
                 Some(value) if value > Decimal::ZERO => (format_dollars(value), "positive"),
                 Some(value) if value < Decimal::ZERO => (format_dollars(value), "negative"),
                 Some(value) => (format_dollars(value), "dim"),
-                None => ("—".to_string(), "dim"),
+                None => (ABSENT.to_string(), "dim"),
             };
             format!(
                 r#"<tr><td>{}</td><td>{:.2}</td><td class="{class}">{realized}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
@@ -304,11 +305,11 @@ fn render_closed_pairs_section(state: &DashboardState) -> String {
         summary.total_closed,
         format_percent(summary.win_rate),
         format_ratio(summary.profit_factor),
-        format_dollars(summary.total_realized),
+        format_dollars(summary.total_realized_profit_and_loss),
         summary
             .average_holding_hours
             .map(format_holding)
-            .unwrap_or_else(|| "—".to_string()),
+            .unwrap_or_else(|| ABSENT.to_string()),
         format_percent(summary.signal_exit_share),
     );
     section("Closed pairs", body)
@@ -327,8 +328,8 @@ fn render_events_section(state: &DashboardState) -> String {
             format!(
                 r#"<tr><td>{}</td><td class="{}">{}</td><td>{}</td></tr>"#,
                 eastern_stamp(event.created_at, "%Y-%m-%d %H:%M:%S"),
-                event_css_class(&event.event_type),
-                html_escape(&event.event_type),
+                event_css_class(event.event_type.outcome()),
+                event.event_type,
                 html_escape(&truncate_payload(&event.payload)),
             )
         })
@@ -352,14 +353,12 @@ fn section(title: &str, body: String) -> String {
     )
 }
 
-/// Colours an event row by its outcome suffix, so an error is visible without reading the name.
-fn event_css_class(event_type: &str) -> &'static str {
-    if event_type.ends_with("_errored") {
-        "event-errored"
-    } else if event_type.ends_with("_completed") {
-        "event-completed"
-    } else {
-        "event-requested"
+/// Colours an event row by its outcome, so an error is visible without reading the name.
+fn event_css_class(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Errored => "event-errored",
+        Outcome::Completed => "event-completed",
+        Outcome::Requested => "event-requested",
     }
 }
 
@@ -398,12 +397,10 @@ fn format_dollars(value: Decimal) -> String {
     format!("{sign}${grouped}.{}", &fraction[..2])
 }
 
-/// Formats a dollar amount a session may not have recorded, as the dim dash [`format_return`] uses
-/// for a withheld return. Both mean unavailable rather than zero, and should read alike.
 fn format_optional_dollars(value: Option<Decimal>) -> String {
     match value {
         Some(amount) => format_dollars(amount),
-        None => r#"<span class="dim">—</span>"#.to_string(),
+        None => ABSENT.to_string(),
     }
 }
 
@@ -415,20 +412,20 @@ fn format_return(value: Option<f64>) -> String {
         }
         Some(percent) if percent < 0.0 => format!(r#"<span class="negative">{percent:.2}%</span>"#),
         Some(percent) => format!("{percent:.2}%"),
-        None => r#"<span class="dim">—</span>"#.to_string(),
+        None => ABSENT.to_string(),
     }
 }
 
 fn format_percent(value: Option<f64>) -> String {
     value
         .map(|percent| format!("{percent:.1}%"))
-        .unwrap_or_else(|| "—".to_string())
+        .unwrap_or_else(|| ABSENT.to_string())
 }
 
 fn format_ratio(value: Option<f64>) -> String {
     value
         .map(|ratio| format!("{ratio:.2}"))
-        .unwrap_or_else(|| "—".to_string())
+        .unwrap_or_else(|| ABSENT.to_string())
 }
 
 /// Formats a holding period in the largest unit that keeps it readable.
@@ -463,9 +460,9 @@ fn format_age(elapsed: Duration) -> String {
 
 /// Escapes `&`, `<`, `>`, and `"` for safe embedding.
 ///
-/// Everything that reaches the page from the database goes through this. Tickers and close reasons
-/// are validated on the way in and cannot carry markup, but the event payload is arbitrary JSON
-/// written by handlers, and an error string in it can hold anything the broker returned.
+/// Tickers, close reasons, and event types are parsed into closed vocabularies on the way in and
+/// cannot carry markup. The event payload is the exception: arbitrary JSON written by handlers, and
+/// an error string in it can hold anything the broker returned.
 fn html_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -474,7 +471,6 @@ fn html_escape(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Inline CSS. Amber CRT terminal aesthetic, carried forward unchanged.
 const CSS: &str = r#"
 :root {
     --bg: #0a0700;
@@ -558,6 +554,7 @@ tr:hover { background-color: rgba(255, 180, 0, 0.1); }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::events::{Command, EventType};
     use crate::common::types::CloseReason;
     use crate::common::types::{PairID, Ticker};
     use crate::dashboard::cache::{
@@ -627,7 +624,7 @@ mod tests {
             prediction_model_run_id: Some("run-2026-07-31".to_string()),
             prediction_timestamp: Some(now() - Duration::hours(12)),
             events: vec![EventEntry {
-                event_type: "portfolio_evaluation_completed".to_string(),
+                event_type: EventType::new(Command::PortfolioEvaluation, Outcome::Completed),
                 created_at: now() - Duration::minutes(5),
                 payload: json!({"pairs_opened": 2}),
             }]
@@ -731,7 +728,7 @@ mod tests {
     fn test_an_event_payload_containing_markup_is_escaped() {
         let mut state = populated_state();
         state.events = vec![EventEntry {
-            event_type: "portfolio_evaluation_errored".to_string(),
+            event_type: EventType::new(Command::PortfolioEvaluation, Outcome::Errored),
             created_at: now(),
             payload: json!({"error": "<script>alert(1)</script>"}),
         }]
@@ -744,9 +741,9 @@ mod tests {
 
     #[test]
     fn test_event_rows_are_coloured_by_outcome() {
-        assert_eq!(event_css_class("predictions_errored"), "event-errored");
-        assert_eq!(event_css_class("predictions_completed"), "event-completed");
-        assert_eq!(event_css_class("predictions_requested"), "event-requested");
+        assert_eq!(event_css_class(Outcome::Errored), "event-errored");
+        assert_eq!(event_css_class(Outcome::Completed), "event-completed");
+        assert_eq!(event_css_class(Outcome::Requested), "event-requested");
     }
 
     /// Truncation counts characters, not bytes. A byte slice through a multi-byte character panics,
@@ -778,7 +775,27 @@ mod tests {
     fn test_returns_carry_a_sign_and_a_colour() {
         assert!(format_return(Some(1.5)).contains(r#"class="positive">+1.50%"#));
         assert!(format_return(Some(-1.5)).contains(r#"class="negative">-1.50%"#));
-        assert!(format_return(None).contains("—"));
+        assert_eq!(format_return(None), "—");
+    }
+
+    /// Withheld and never-recorded read alike, whatever the figure was going to be. The formatters
+    /// used to disagree — two of them wrapped the dash in a dim span and three did not.
+    #[test]
+    fn test_every_unavailable_figure_renders_the_same_way() {
+        assert_eq!(format_optional_dollars(None), "—");
+        assert_eq!(format_return(None), "—");
+        assert_eq!(format_percent(None), "—");
+        assert_eq!(format_ratio(None), "—");
+    }
+
+    /// The meta refresh and the footer both come from `POLL_INTERVAL`, so a change to the poll
+    /// cadence cannot leave the page claiming the old one. Pinned to the literal on purpose: this
+    /// must fail if the interval moves.
+    #[test]
+    fn test_the_page_reloads_on_the_poll_interval() {
+        let html = render_html_at(&DashboardState::default(), now());
+        assert!(html.contains(r#"<meta http-equiv="refresh" content="30">"#));
+        assert!(html.contains("AUTO-REFRESH: 30S"));
     }
 
     #[test]

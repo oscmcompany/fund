@@ -1,9 +1,5 @@
 //! Shared in-memory state for the dashboard, and the two tasks that keep it current.
 //!
-//! A polling task refreshes everything every [`POLL_INTERVAL`] behind an `RwLock`; a listener
-//! appends `events` as they arrive. Request handlers read the lock and never touch the database, so
-//! viewer count has no bearing on the connection pool.
-//!
 //! A failed poll leaves the previous state and records the error rather than blanking the page —
 //! stale numbers with a visible "last updated" beat no numbers.
 
@@ -19,18 +15,14 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::common::events::Notification;
-use crate::common::types::{PairID, SessionDate, Ticker};
+use crate::common::events::{EventType, Notification};
+use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
 
-use crate::common::types::CloseReason;
-
-/// How often the background task refreshes every view from PostgreSQL.
+/// How often the background task refreshes every view, and how often the page reloads itself.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long to wait before reconnecting a dropped listener.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 
-/// Events retained in the ring buffer.
 const EVENT_BUFFER_CAPACITY: usize = 500;
 
 /// One session's account state.
@@ -91,7 +83,6 @@ pub struct ClosedPair {
 }
 
 impl ClosedPair {
-    /// How long the pair was held.
     pub fn holding_hours(&self) -> f64 {
         (self.closed_at - self.opened_at).num_seconds() as f64 / 3_600.0
     }
@@ -107,9 +98,12 @@ pub struct Prediction {
 }
 
 /// A row from the event log, or a live arrival from the NOTIFY channel.
+///
+/// `created_at` is the row's own column when seeded from the table, and the moment the listener
+/// received the notification when it arrives live. The two are milliseconds apart.
 #[derive(Debug, Clone)]
 pub struct EventEntry {
-    pub event_type: String,
+    pub event_type: EventType,
     pub created_at: DateTime<Utc>,
     pub payload: Value,
 }
@@ -132,8 +126,8 @@ pub struct ClosedSummary {
     pub wins: usize,
     pub losses: usize,
     pub win_rate: Option<f64>,
-    pub total_realized: Decimal,
-    pub average_realized: Option<Decimal>,
+    pub total_realized_profit_and_loss: Decimal,
+    pub average_realized_profit_and_loss: Option<Decimal>,
     pub profit_factor: Option<f64>,
     pub average_holding_hours: Option<f64>,
     /// Every [`CloseReason`] with its count, including the ones at zero.
@@ -186,7 +180,7 @@ pub async fn apply_poll(state: &SharedState, data: crate::dashboard::database::D
     guard.last_error = None;
 
     // Only seeded when empty, so the listener's live arrivals are not overwritten by a snapshot
-    // taken thirty seconds ago.
+    // taken a whole poll interval ago.
     if guard.events.is_empty() {
         guard.events = data.recent_events.into_iter().collect();
     }
@@ -250,7 +244,7 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
                                 append_event(
                                     &state,
                                     EventEntry {
-                                        event_type: parsed.event_type.as_str().to_string(),
+                                        event_type: parsed.event_type,
                                         created_at: Utc::now(),
                                         payload: parsed.payload,
                                     },
@@ -274,6 +268,7 @@ pub fn spawn_event_listener_task(state: SharedState, pool: PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::events::{Command, Outcome};
     use chrono::{NaiveDate, TimeZone};
     use std::str::FromStr;
 
@@ -335,6 +330,8 @@ mod tests {
         assert_eq!(pair.holding_hours(), 30.0);
     }
 
+    /// The event type is a closed vocabulary, so arrival order is carried in the payload instead:
+    /// the newest entry must be at the front and the oldest must be gone.
     #[tokio::test]
     async fn test_the_ring_buffer_evicts_the_oldest_and_keeps_the_newest_first() {
         let state: SharedState = Arc::new(RwLock::new(DashboardState::default()));
@@ -342,9 +339,9 @@ mod tests {
             append_event(
                 &state,
                 EventEntry {
-                    event_type: format!("event_{index}"),
+                    event_type: EventType::new(Command::Predictions, Outcome::Completed),
                     created_at: Utc::now(),
-                    payload: Value::Null,
+                    payload: serde_json::json!({ "index": index }),
                 },
             )
             .await;
@@ -353,8 +350,12 @@ mod tests {
         let guard = state.read().await;
         assert_eq!(guard.events.len(), EVENT_BUFFER_CAPACITY);
         assert_eq!(
-            guard.events.front().expect("a newest event").event_type,
-            format!("event_{}", EVENT_BUFFER_CAPACITY + 9)
+            guard.events.front().expect("a newest event").payload["index"],
+            509
+        );
+        assert_eq!(
+            guard.events.back().expect("an oldest event").payload["index"],
+            10
         );
     }
 }
