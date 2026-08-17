@@ -1,7 +1,6 @@
 //! The server-rendered page: five sections in an amber CRT aesthetic, no JavaScript and no CDN.
-//!
-//! It renders only what the database can answer — no benchmark curve (the universe holds no index
-//! ETF) and no training metrics (the trainer publishes those to S3, not to a table).
+//! It renders only what the database can answer — no benchmark curve, because the universe holds
+//! no index ETF, and no training metrics, because the trainer publishes those to S3.
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
@@ -64,8 +63,7 @@ fn render_html_at(state: &DashboardState, now: DateTime<Utc>) -> String {
     let predictions = render_predictions_section(state);
     let closed_pairs = render_closed_pairs_section(state);
     let events = render_events_section(state);
-    // The page reloads on the same cadence the poller refreshes on, so a viewer never waits on a
-    // value that has already changed and never reloads onto an identical one.
+    // The meta refresh and the footer below both read this rather than a number of their own.
     let refresh_seconds = POLL_INTERVAL.as_secs();
 
     format!(
@@ -778,8 +776,7 @@ mod tests {
         assert_eq!(format_return(None), "—");
     }
 
-    /// Withheld and never-recorded read alike, whatever the figure was going to be. The formatters
-    /// used to disagree — two of them wrapped the dash in a dim span and three did not.
+    /// Withheld and never-recorded read alike, whatever the figure was going to be.
     #[test]
     fn test_every_unavailable_figure_renders_the_same_way() {
         assert_eq!(format_optional_dollars(None), "—");
