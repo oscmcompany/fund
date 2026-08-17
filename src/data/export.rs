@@ -447,7 +447,7 @@ pub async fn export_journals(
             .map(|session_date| {
                 (
                     *session_date,
-                    read_session_frame(&journal.directory().join(file_name(*session_date))),
+                    read_journal_frame(&journal.directory().join(file_name(*session_date))),
                 )
             })
             .collect::<Vec<_>>()
@@ -567,7 +567,7 @@ fn delete_aged_out(
 /// Reads one session file into a frame, returning it with the number of lines skipped.
 ///
 /// Discarding a torn final line is why the original is JSONL rather than Parquet.
-fn read_session_frame(path: &Path) -> Result<(DataFrame, usize), String> {
+fn read_journal_frame(path: &Path) -> Result<(DataFrame, usize), String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
 
@@ -685,7 +685,7 @@ mod tests {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let directory = std::env::temp_dir().join(format!(
-            "fund-session-export-{name}-{}-{unique}",
+            "fund-journal-export-{name}-{}-{unique}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&directory);
@@ -732,7 +732,7 @@ mod tests {
         std::fs::write(&path, format!("{complete}\n{{\"schema_version\":1,\"eve"))
             .expect("the file must be writable");
 
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must still read");
+        let (frame, unparsable) = read_journal_frame(&path).expect("the session must still read");
         assert_eq!(frame.height(), 1);
         assert_eq!(unparsable, 1);
         let _ = std::fs::remove_dir_all(&directory);
@@ -749,7 +749,7 @@ mod tests {
         std::fs::write(&path, "not json at all\n{\"schema_version\":3}\n")
             .expect("the file must be writable");
 
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        let (frame, unparsable) = read_journal_frame(&path).expect("the session must read");
         assert_eq!(frame.height(), 0);
         assert_eq!(unparsable, 2);
         let _ = std::fs::remove_dir_all(&directory);
@@ -776,7 +776,7 @@ mod tests {
         .join("\n");
         std::fs::write(&path, lines).expect("the file must be writable");
 
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        let (frame, unparsable) = read_journal_frame(&path).expect("the session must read");
         assert_eq!(
             frame.height(),
             1,
@@ -808,7 +808,7 @@ mod tests {
         )
         .expect("the file must be writable");
 
-        let (frame, _) = read_session_frame(&path).expect("the session must read");
+        let (frame, _) = read_journal_frame(&path).expect("the session must read");
         assert_eq!(
             frame.get_column_names(),
             [
@@ -882,7 +882,7 @@ mod tests {
         }
         std::fs::write(&path, lines).expect("the file must be writable");
 
-        let (mut frame, _) = read_session_frame(&path).expect("the session must read");
+        let (mut frame, _) = read_journal_frame(&path).expect("the session must read");
         let mut buffer: Vec<u8> = Vec::new();
         ParquetWriter::new(&mut buffer)
             .finish(&mut frame)
@@ -947,7 +947,7 @@ mod tests {
         }
         std::fs::write(&path, lines.join("\n")).expect("the file must be writable");
 
-        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        let (frame, unparsable) = read_journal_frame(&path).expect("the session must read");
         assert_eq!(
             frame.height(),
             1,

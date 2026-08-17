@@ -51,7 +51,10 @@ pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
 /// without a model run noticing.
 pub const DETAILS_ARCHIVE_KEY: &str = "data/equity/details/details.csv";
 
-/// S3 key for the stock splits the bars will be adjusted against; nothing reads it yet.
+/// S3 key for the stock splits the bars are adjusted against.
+///
+/// Read by [`crate::data::adjust::SplitTableCache`] at read time and by the trainer before it
+/// builds a dataset, so both see the same basis.
 ///
 /// One object rather than a partition per session, unlike the bars beside it. A split belongs to
 /// its execution date, but the feed revises and cancels announced ones, so a per-date layout would
@@ -487,9 +490,6 @@ fn merge_or_replace(
 }
 
 /// Fetches the whole splits table and writes it, keeping each row's earliest `first_seen`.
-///
-/// Accumulates the history that makes the switch to unadjusted bars possible; nothing reads the
-/// result yet.
 ///
 /// Not a gap scan like [`archive_missing_sessions`], because there are no gaps to find: the feed
 /// answers with its entire current opinion in a few seconds, and that opinion is the answer. Rows

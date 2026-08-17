@@ -1,4 +1,4 @@
-//! The stock splits the bar archive will be adjusted against; nothing reads them yet.
+//! The stock splits the bar archive is adjusted against, read by [`crate::data::adjust`].
 //!
 //! One S3 object rather than a partition per session: a split belongs to its execution date, but
 //! the feed revises and cancels announced ones, so only the whole table is ever authoritative.
@@ -58,31 +58,7 @@ pub fn merge_splits(existing: DataFrame, fetched: DataFrame) -> Result<DataFrame
         return Ok(existing);
     }
 
-    let previously_seen = existing
-        .lazy()
-        .select([col("id"), col("first_seen").alias("previous_first_seen")])
-        .group_by([col("id")])
-        .agg([col("previous_first_seen").min()]);
-
-    fetched
-        .lazy()
-        .join(
-            previously_seen,
-            [col("id")],
-            [col("id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        // Defaulted before it is compared, because a row absent from the stored table joins to null
-        // and a null comparison would propagate rather than choose a branch.
-        .with_column(
-            coalesce(&[col("previous_first_seen"), col("first_seen")]).alias("previous_first_seen"),
-        )
-        .with_column(
-            when(col("previous_first_seen").lt(col("first_seen")))
-                .then(col("previous_first_seen"))
-                .otherwise(col("first_seen"))
-                .alias("first_seen"),
-        )
+    crate::data::keep_earliest_first_seen(fetched.lazy(), existing.lazy())
         // Named rather than dropped, so the merged frame is written back with the same schema
         // `splits_to_dataframe` produces and the next read finds what it expects.
         .select([

@@ -93,48 +93,24 @@ pub fn merge_boundaries(
                 .or(col("process_date").gt(lit(end_text.clone()))),
         );
 
-    let previously_seen = existing
-        .lazy()
-        .select([col("id"), col("first_seen").alias("previous_first_seen")])
-        .group_by([col("id")])
-        .agg([col("previous_first_seen").min()]);
+    // One row per identifier before the merge, so a repeat across pages cannot become two rows.
+    let deduplicated = fetched.lazy().unique_stable(
+        Some(polars::prelude::Selector::ByName {
+            names: vec![PlSmallStr::from("id")].into(),
+            strict: false,
+        }),
+        UniqueKeepStrategy::First,
+    );
 
-    let refreshed = fetched
-        .lazy()
-        // One row per identifier before the join, so a repeat across pages cannot become two rows.
-        .unique_stable(
-            Some(polars::prelude::Selector::ByName {
-                names: vec![PlSmallStr::from("id")].into(),
-                strict: false,
-            }),
-            UniqueKeepStrategy::First,
-        )
-        .join(
-            previously_seen,
-            [col("id")],
-            [col("id")],
-            JoinArgs::new(JoinType::Left),
-        )
-        // Defaulted before it is compared, because a row absent from the stored table joins to null
-        // and a null comparison would propagate rather than choose a branch.
-        .with_column(
-            coalesce(&[col("previous_first_seen"), col("first_seen")]).alias("previous_first_seen"),
-        )
-        .with_column(
-            when(col("previous_first_seen").lt(col("first_seen")))
-                .then(col("previous_first_seen"))
-                .otherwise(col("first_seen"))
-                .alias("first_seen"),
-        )
-        .select([
-            col("id"),
-            col("ticker"),
-            col("date"),
-            col("process_date"),
-            col("reason"),
-            col("related_ticker"),
-            col("first_seen"),
-        ]);
+    let refreshed = crate::data::keep_earliest_first_seen(deduplicated, existing.lazy()).select([
+        col("id"),
+        col("ticker"),
+        col("date"),
+        col("process_date"),
+        col("reason"),
+        col("related_ticker"),
+        col("first_seen"),
+    ]);
 
     concat(
         [outside_window, refreshed],
