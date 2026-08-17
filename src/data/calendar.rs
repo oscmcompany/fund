@@ -109,7 +109,6 @@ impl TradingCalendar {
         Some((first, last))
     }
 
-    /// The number of published sessions held.
     /// Every session in the horizon that closes before the usual 16:00 Eastern bell.
     ///
     /// The half-days are the reason the calendar is fetched rather than assumed, so they are named
@@ -121,11 +120,12 @@ impl TradingCalendar {
             .filter(|(_, day)| day.session_close() < usual_close)
             .map(|(session_date, day)| EarlyClose {
                 session_date: *session_date,
-                session_close: day.session_close().format("%H:%M").to_string(),
+                session_close: day.session_close(),
             })
             .collect()
     }
 
+    /// The number of published sessions held.
     pub fn len(&self) -> usize {
         self.days.len()
     }

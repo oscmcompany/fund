@@ -75,7 +75,7 @@ pub enum HandlerError {
         stage: &'static str,
         message: String,
     },
-    #[error("session log is unusable: {0}")]
+    #[error("journal is unusable: {0}")]
     Journal(#[from] JournalError),
     #[error("configuration is missing or unusable: {0}")]
     Configuration(String),
@@ -764,13 +764,13 @@ async fn handle_market_data_sync(
     }))
 }
 
-/// Chained from a completed market data sync: seal the session log, export to S3, then purge.
+/// Chained from a completed market data sync: seal the journal, export to S3, then purge.
 ///
 /// The order is fixed and the purge is conditional on the *database* export being clean. Purging
 /// after a partial export deletes rows that never reached S3, and nothing afterwards can tell that
 /// it happened.
 ///
-/// The session log seals independently and does not gate the purge. It holds different data written
+/// The journal seals independently and does not gate the purge. It holds different data written
 /// by a different path, and letting a failure there hold PostgreSQL rows would couple two things
 /// whose only relationship is that they run on the same schedule.
 async fn handle_database_export(

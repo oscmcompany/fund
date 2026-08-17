@@ -12,7 +12,7 @@
 --            accumulates for as long as the bucket keeps it.
 --   exports/ the application's nightly export of the tables only it knows
 --            about -- events, predictions, pairs, account state -- plus the
---            session log, which is the original those tables are derived from.
+--            journal, which is the original those tables are derived from.
 --            This is what the retention window would otherwise discard.
 --
 -- Bars and ticker metadata appear under data/ and nowhere else. They used to be
@@ -172,14 +172,24 @@ FROM read_parquet(
 -- prices it read, the orders it sent, the fills they produced. Joining on it is how a duration
 -- becomes an answer about where the time went.
 --
--- schema_version is 3, which is the only version in this archive: v1 and v2 were development and
--- their objects are gone. It exists so a future change can be told apart from a missing field.
+-- schema_version is 3 or 4; v1 and v2 were development and their objects are gone. Two payload
+-- fields changed shape at v4, so a query reaching into either has to branch on the version:
+--
+--   quote_rejection was the bare reason string 'stale_quote' or 'wide_quote'. It is now an object
+--   whose 'reason' key holds that same string alongside the reading that produced it --
+--   age_seconds and limit_seconds for a stale quote, relative_spread and limit for a wide one.
+--   Under v3 the reading is simply gone; there is nothing to recover it from.
+--
+--   early_closes[].session_close was 'HH:MM' and is now 'HH:MM:SS'.
 --
 -- Fields are added within a version as well as across one, and an absent key reads as NULL either
 -- way, so "the build predated this field" and "there was nothing to record" are the same answer.
 -- Anything counting a field should bound the query by the first session that has it rather than
 -- treating an early NULL as a zero.
 .print 'Loading journal...'
+-- Dropped as well as `journal`: this script runs against a persistent ~/lab.duckdb, so a view
+-- created before the rename outlives it and still points at a prefix that no longer exists.
+DROP VIEW IF EXISTS session_log;
 DROP VIEW IF EXISTS journal;
 CREATE OR REPLACE VIEW journal AS
 SELECT

@@ -957,7 +957,7 @@ fn entry_plan_actions(plan: &EntryPlan) -> Vec<PlannedAction> {
         .collect()
 }
 
-/// Writes one round's plan to the session log before any of it is attempted.
+/// Writes one round's plan to the journal before any of it is attempted.
 ///
 /// Before, not after, and that is the whole reason it is its own record: a pass that dies partway
 /// through applying leaves a plan saying what it meant to do, against orders saying what it managed.
@@ -1271,7 +1271,7 @@ pub struct ScreenedUniverse {
     /// Predictions that passed the eligibility filter, before pricing removed any.
     pub eligible: usize,
     pub model_run_id: Option<String>,
-    /// Predictions the session had before any eligibility test, for the session log. The gap
+    /// Predictions the session had before any eligibility test, for the journal. The gap
     /// between this and `inputs.len()` is how much the filters removed.
     pub predictions_available: usize,
     /// Every ticker's sector, not just the screened ones. `select_disjoint` needs the held legs

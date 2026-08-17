@@ -594,9 +594,8 @@ pub struct PositionFetch {
 
 /// One open position as Alpaca reports it.
 ///
-/// `quantity` is the absolute count; the direction lives in `side`. Alpaca signs the quantity for
-/// shorts, and carrying a signed count alongside a side means two representations of the same fact
-/// that can disagree.
+/// `quantity` is the absolute count and the direction lives in `side`; `market_value` and
+/// `unrealized_profit_and_loss` keep Alpaca's sign, so a short reports both as negative.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Position {
     ticker: Ticker,
@@ -1550,12 +1549,10 @@ fn order_state_from(order: OrderResponse) -> Result<OrderState, ClientError> {
                 average_price,
             })
         }
-        "canceled" | "expired" | "rejected" | "done_for_day" | "stopped" | "suspended" => {
-            Ok(OrderState::Abandoned {
-                status: order.status,
-                filled_quantity,
-            })
-        }
+        "canceled" | "expired" | "rejected" | "done_for_day" => Ok(OrderState::Abandoned {
+            status: order.status,
+            filled_quantity,
+        }),
         _ => Ok(OrderState::Working {
             status: order.status,
             filled_quantity,
@@ -1612,7 +1609,7 @@ struct OrderRequest {
     position_intent: &'static str,
     /// The caller's own identifier, chosen before the order is sent.
     ///
-    /// This is what makes an order recoverable after a crash between the session log write and
+    /// This is what makes an order recoverable after a crash between the journal write and
     /// Alpaca's response: the broker's identifier does not exist yet at that point, and this one
     /// does.
     client_order_id: String,
@@ -1866,7 +1863,7 @@ impl Default for QuoteLimits {
 
 /// Why a quote midpoint was not taken as the reference price.
 ///
-/// Each variant carries the reading that produced it, so the session log can say how far outside
+/// Each variant carries the reading that produced it, so the journal can say how far outside
 /// the bound the book was rather than only that it was.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QuoteRejection {
@@ -1880,7 +1877,7 @@ pub enum QuoteRejection {
 }
 
 impl QuoteRejection {
-    /// A stable short name for the session log and the structured logs.
+    /// A stable short name for the journal and the structured logs.
     pub fn as_str(&self) -> &'static str {
         match self {
             QuoteRejection::Stale { .. } => "stale_quote",
@@ -1891,7 +1888,27 @@ impl QuoteRejection {
 
 impl Serialize for QuoteRejection {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
+        use serde::ser::SerializeStruct;
+
+        let mut record = serializer.serialize_struct("QuoteRejection", 3)?;
+        record.serialize_field("reason", self.as_str())?;
+        match self {
+            QuoteRejection::Stale {
+                age_seconds,
+                limit_seconds,
+            } => {
+                record.serialize_field("age_seconds", age_seconds)?;
+                record.serialize_field("limit_seconds", limit_seconds)?;
+            }
+            QuoteRejection::Wide {
+                relative_spread,
+                limit,
+            } => {
+                record.serialize_field("relative_spread", relative_spread)?;
+                record.serialize_field("limit", limit)?;
+            }
+        }
+        record.end()
     }
 }
 
@@ -1963,7 +1980,7 @@ pub enum PriceSource {
 }
 
 impl PriceSource {
-    /// A stable short name for the session log and the structured logs.
+    /// A stable short name for the journal and the structured logs.
     pub fn as_str(self) -> &'static str {
         match self {
             PriceSource::QuoteMidpoint => "quote_midpoint",
@@ -2934,6 +2951,22 @@ mod tests {
                 order_state_from(order_response(status, "0", "0")).unwrap(),
                 OrderState::Working { .. }
             ));
+        }
+    }
+
+    /// Neither status ends an order. `stopped` means a trade is guaranteed at a stated price and
+    /// has not settled yet; `suspended` means temporarily ineligible to trade. Both were mapped to
+    /// `Abandoned`, so `is_terminal` stopped the poll on an order that could still fill and leave
+    /// an unhedged leg on the book.
+    #[test]
+    fn test_stopped_and_suspended_orders_are_still_working() {
+        for status in ["stopped", "suspended"] {
+            let state = order_state_from(order_response(status, "0", "0")).unwrap();
+            assert!(
+                matches!(state, OrderState::Working { .. }),
+                "{status} can still fill, so the caller has to keep waiting"
+            );
+            assert!(!state.is_terminal());
         }
     }
 

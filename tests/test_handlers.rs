@@ -68,7 +68,7 @@ fn calendar_for_today() -> TradingCalendar {
     TradingCalendar::from_days(days)
 }
 
-/// A session log in a directory of this test's own.
+/// A journal in a directory of this test's own.
 ///
 /// Every path under test writes one, so a shared directory would let one test's records be read as
 /// another's — and these tests already share a database.
@@ -318,8 +318,8 @@ async fn test_a_pass_opens_a_pair_and_records_it() {
         "the pass records the identifier the dispatcher supplied, not one of its own"
     );
     assert!(
-        pass["payload"]["failure"].is_null(),
-        "a pass that completed records no failure"
+        pass["payload"]["error"].is_null(),
+        "a pass that completed records no error"
     );
 
     assert_eq!(pass["payload"]["candidates"].as_array().unwrap().len(), 1);
@@ -1050,7 +1050,9 @@ async fn test_a_refused_book_with_no_trade_records_what_was_refused() {
         .expect("the refused symbol must be named");
 
     assert_eq!(refused["cause"], "quote_rejected");
-    assert_eq!(refused["quote_rejection"], "wide_quote");
+    assert_eq!(refused["quote_rejection"]["reason"], "wide_quote");
+    // The reading, not just the verdict: a 90/110 book is 0.20 wide around a midpoint of 100.
+    assert_eq!(refused["quote_rejection"]["relative_spread"], 0.2);
     assert_eq!(refused["bid_price"], 90.0);
     assert_eq!(refused["ask_price"], 110.0);
     assert!(refused["quote_timestamp"].is_string());
@@ -1111,7 +1113,7 @@ async fn test_liquidation_flattens_the_book_and_marks_every_pair() {
     let records = recorded(&log);
     let attempted = of_type(&records, "liquidation_attempted");
     assert_eq!(attempted.len(), 1);
-    assert!(attempted[0]["payload"]["failure"].is_null());
+    assert!(attempted[0]["payload"]["error"].is_null());
     assert_eq!(attempted[0]["payload"]["pairs_closed"], 2);
 
     // The table is mutated in place; the log needs its own record of the transition.

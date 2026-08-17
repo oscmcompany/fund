@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
@@ -19,7 +19,7 @@ use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
 /// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
@@ -705,12 +705,8 @@ pub struct ActivityObserved {
 
 /// The post-close account state.
 ///
-/// Recorded in full because Alpaca backfills only equity for a past date, never the rest.
-///
-/// `Decimal` rather than `f64`, so nothing between Alpaca's response and this record rounds. It is
-/// written to the archive as a JSON number, which is a double a reader has to be careful
-/// aggregating — but the field can no longer be absent, which the `Option<f64>` this replaced
-/// could be for a value that never actually failed to convert.
+/// Recorded in full because Alpaca backfills only equity for a past date, never the rest. The
+/// balances are `Decimal`, so nothing between Alpaca's response and this record rounds.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AccountObserved {
     /// The session these balances describe, which is not always the one the record was written in:
@@ -810,14 +806,13 @@ pub struct CalendarObserved {
 pub struct EarlyClose {
     pub session_date: SessionDate,
     /// The Eastern wall-clock close, as Alpaca publishes it.
-    pub session_close: String,
+    pub session_close: NaiveTime,
 }
 
 /// One run of the seal-ship-delete cycle over the journal itself.
 ///
 /// Written after the seal releases, so it lands in the session the export ran in rather than one
-/// it just shipped — this record reaches S3 on the next run, which is the price of the journal
-/// being able to describe its own export at all.
+/// it just shipped, and reaches S3 only on the next run.
 #[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct JournalExported {
     pub sessions_exported: usize,
@@ -1209,7 +1204,7 @@ mod tests {
                 trades_today: true,
                 early_closes: vec![EarlyClose {
                     session_date: session(2026, 7, 3),
-                    session_close: "13:00".to_string(),
+                    session_close: NaiveTime::from_hms_opt(13, 0, 0).expect("a valid wall clock"),
                 }],
             }),
             Observation::JournalExported(JournalExported::default()),
@@ -1279,7 +1274,7 @@ mod tests {
         );
         let value: Value = serde_json::to_value(&record).expect("record must serialize");
 
-        assert_eq!(value["schema_version"], Value::Number(3.into()));
+        assert_eq!(value["schema_version"], Value::Number(4.into()));
         assert_eq!(value["event_type"], "account_observed");
         assert_eq!(value["session_date"], "2026-08-11");
         assert_eq!(value["timestamp"], "2026-08-11T20:15:00Z");
@@ -1362,7 +1357,11 @@ mod tests {
 
         let value = serde_json::to_value(&refused).expect("a reading must serialize");
         assert_eq!(value["price_source"], "last_trade");
-        assert_eq!(value["quote_rejection"], "wide_quote");
+        assert_eq!(value["quote_rejection"]["reason"], "wide_quote");
+        // How far outside the limit, not merely that it was outside: a journal that records only
+        // the verdict cannot say where the limit should have been.
+        assert_eq!(value["quote_rejection"]["relative_spread"], 0.15);
+        assert_eq!(value["quote_rejection"]["limit"], 0.02);
         assert_eq!(value["bid_price"], 128.0);
         assert_eq!(value["ask_price"], 150.86);
         assert!(

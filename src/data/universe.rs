@@ -111,11 +111,6 @@ impl Universe {
         &self.tickers
     }
 
-    /// Whether `ticker` is eligible to trade at all.
-    ///
-    /// Backed by a set rather than a scan of [`Universe::tickers`]. The screen asks this once per
-    /// prediction, and a linear scan there turns a seven-thousand-symbol universe into forty-nine
-    /// million comparisons on a pass that runs every five minutes.
     /// Tickers this universe holds that `other` does not, in the stable order this one keeps.
     pub fn difference(&self, other: &Universe) -> Vec<Ticker> {
         self.tickers
@@ -125,6 +120,11 @@ impl Universe {
             .collect()
     }
 
+    /// Whether `ticker` is eligible to trade at all.
+    ///
+    /// Backed by a set rather than a scan of [`Universe::tickers`]. The screen asks this once per
+    /// prediction, and a linear scan there turns a seven-thousand-symbol universe into forty-nine
+    /// million comparisons on a pass that runs every five minutes.
     pub fn contains(&self, ticker: &Ticker) -> bool {
         self.eligible.contains(ticker)
     }

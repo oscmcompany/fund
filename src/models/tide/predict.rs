@@ -617,7 +617,7 @@ pub async fn insert_predictions(
     transaction.commit().await?;
     info!(rows = rows_affected, "Predictions inserted into PostgreSQL");
     // Returned rather than reparsed by the caller: these are the exact values that were written,
-    // so the session log records what the database holds and not a second reading of the payload.
+    // so the journal records what the database holds and not a second reading of the payload.
     Ok((rows_affected, validated))
 }
 

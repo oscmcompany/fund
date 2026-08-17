@@ -421,33 +421,33 @@ impl JournalExportSummary {
 /// key makes a repeat a byte-identical overwrite, so a failed run repairs itself. Local files are
 /// deleted only after a clean run that skipped nothing.
 pub async fn export_journals(
-    log: &Journal,
+    journal: &Journal,
     s3_client: &S3Client,
     bucket: &str,
     today: SessionDate,
 ) -> JournalExportSummary {
     let mut summary = JournalExportSummary::default();
 
-    let mut sessions = match sealed_sessions(log.directory(), today) {
+    let mut sessions = match sealed_sessions(journal.directory(), today) {
         Ok(sessions) => sessions,
         Err(error) => {
-            warn!(%error, "Session log directory could not be read; nothing exported");
+            warn!(%error, "Journal directory could not be read; nothing exported");
             return summary;
         }
     };
     sessions.sort();
 
     // The seal covers the reads and nothing else. Holding it across the uploads would leave a
-    // concurrent `record` waiting on S3, and a log write that blocks on the network is the one
+    // concurrent `record` waiting on S3, and a journal write that blocks on the network is the one
     // thing this module promises never to be.
     let frames = {
-        let _sealed = log.seal().await;
+        let _sealed = journal.seal().await;
         sessions
             .iter()
             .map(|session_date| {
                 (
                     *session_date,
-                    read_session_frame(&log.directory().join(file_name(*session_date))),
+                    read_session_frame(&journal.directory().join(file_name(*session_date))),
                 )
             })
             .collect::<Vec<_>>()
@@ -462,6 +462,16 @@ pub async fn export_journals(
         match frame {
             Ok((mut frame, unparsable)) => {
                 summary.unparsable_lines += unparsable;
+                // A file that yielded no rows at all has nothing to ship, and the key is
+                // deterministic: uploading the empty frame would replace a good object from an
+                // earlier run with one holding none of it.
+                if frame.height() == 0 && unparsable > 0 {
+                    summary.failed.push((
+                        session_date.date(),
+                        format!("every one of {unparsable} lines was unparsable"),
+                    ));
+                    continue;
+                }
                 let key = date_partitioned_key(JOURNAL_PREFIX, session_date.date());
                 match write_frame(s3_client, bucket, &key, &mut frame).await {
                     Ok(()) => {
@@ -481,11 +491,11 @@ pub async fn export_journals(
         }
     }
 
-    summary.deleted = delete_aged_out(log.directory(), &deletable, today);
+    summary.deleted = delete_aged_out(journal.directory(), &deletable, today);
     for session_date in &held_back {
         warn!(
             %session_date,
-            "Session log held back from deletion: its original holds lines the Parquet does not"
+            "Journal held back from deletion: its original holds lines the Parquet does not"
         );
     }
 
@@ -495,10 +505,10 @@ pub async fn export_journals(
         failed = summary.failed.len(),
         deleted = summary.deleted.len(),
         unparsable_lines = summary.unparsable_lines,
-        "Session log export finished"
+        "Journal export finished"
     );
     for (session_date, error) in &summary.failed {
-        warn!(%session_date, error, "Session log failed to export");
+        warn!(%session_date, error, "Journal failed to export");
     }
     summary
 }
@@ -521,7 +531,7 @@ fn sealed_sessions(
             continue;
         };
         if session_date > today {
-            warn!(%session_date, %today, "Session log is dated ahead of today; not sealed");
+            warn!(%session_date, %today, "Journal is dated ahead of today; not sealed");
             continue;
         }
         sessions.push(session_date);
@@ -547,7 +557,7 @@ fn delete_aged_out(
             Err(error) => warn!(
                 path = %path.display(),
                 %error,
-                "Aged-out session log could not be deleted"
+                "Aged-out journal could not be deleted"
             ),
         }
     }
@@ -725,6 +735,23 @@ mod tests {
         let (frame, unparsable) = read_session_frame(&path).expect("the session must still read");
         assert_eq!(frame.height(), 1);
         assert_eq!(unparsable, 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The state `export_journals` refuses to upload. A file whose every line is unparsable still
+    /// reads as `Ok`, and the session key is deterministic, so shipping this frame would replace a
+    /// good object from an earlier run with one holding none of it.
+    #[test]
+    fn test_a_wholly_unparsable_session_yields_an_empty_frame() {
+        let directory = temporary_directory("unreadable");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("session-2026-08-11.jsonl");
+        std::fs::write(&path, "not json at all\n{\"schema_version\":3}\n")
+            .expect("the file must be writable");
+
+        let (frame, unparsable) = read_session_frame(&path).expect("the session must read");
+        assert_eq!(frame.height(), 0);
+        assert_eq!(unparsable, 2);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

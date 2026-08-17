@@ -1305,7 +1305,7 @@ mod tests {
         SessionDate::from_date(NaiveDate::from_ymd_opt(year, month, day).unwrap())
     }
 
-    #[derive(Serialize)]
+    #[derive(Serialize, Deserialize)]
     struct Amount {
         #[serde(with = "decimal_number")]
         value: Decimal,
@@ -1358,6 +1358,34 @@ mod tests {
                 rendered["value"].is_number() && rendered["maybe"].is_number(),
                 "every amount renders as a number: {rendered}"
             );
+        }
+    }
+
+    /// The `f64` wire form is lossless over the values this system actually holds, which is what
+    /// makes it a fair trade for an unquoted JSON number. The bound is about seventeen significant
+    /// digits; a nine-figure balance and a nine-decimal share count together use ten.
+    #[test]
+    fn test_a_decimal_survives_the_round_trip_to_json_and_back() {
+        for literal in [
+            "123456789.99",   // a balance larger than this fund will hold
+            "0.000000001",    // the finest fractional share Alpaca quotes
+            "-48250.75",      // a short market value, which is signed
+            "0",              //
+            "1234.567890123", // ten significant digits
+        ] {
+            let value: Decimal = literal.parse().expect("the literal must parse");
+            let rendered = serde_json::to_string(&Amount {
+                value,
+                maybe: Some(value),
+            })
+            .expect("an amount must serialize");
+            let restored: Amount =
+                serde_json::from_str(&rendered).expect("an amount must deserialize");
+            assert_eq!(
+                restored.value, value,
+                "round trip of {literal} via {rendered}"
+            );
+            assert_eq!(restored.maybe, Some(value));
         }
     }
 
@@ -1484,6 +1512,36 @@ mod tests {
         for interval in BarInterval::ALL {
             assert_eq!(BarInterval::parse(interval.as_str()), Some(interval));
         }
+    }
+
+    /// These exact strings are the `close_reason` CHECK constraint in `schema.sql:105`, on the same
+    /// terms as [`BarInterval`] below: the column is TEXT, so a drift between the enum and the
+    /// constraint is invisible until every close fails at runtime.
+    #[test]
+    fn test_close_reason_stored_form_matches_the_check_constraint() {
+        assert_eq!(CloseReason::Convergence.as_str(), "convergence");
+        assert_eq!(CloseReason::StopLoss.as_str(), "stop_loss");
+        assert_eq!(CloseReason::EndOfDay.as_str(), "end_of_day");
+        assert_eq!(CloseReason::PositionMissing.as_str(), "position_missing");
+    }
+
+    #[test]
+    fn test_close_reason_round_trips_through_stored_form() {
+        for reason in CloseReason::ALL {
+            assert_eq!(CloseReason::parse(reason.as_str()), Some(reason));
+        }
+        assert!(CloseReason::parse("convergence ").is_none());
+        assert!(CloseReason::parse("Convergence").is_none());
+    }
+
+    /// The ratio of signal exits to end-of-day exits is the interim measure of whether the strategy
+    /// does anything, so which side each reason falls on is worth pinning rather than re-deriving.
+    #[test]
+    fn test_only_a_spread_opinion_counts_as_a_signal_exit() {
+        assert!(CloseReason::Convergence.is_signal());
+        assert!(CloseReason::StopLoss.is_signal());
+        assert!(!CloseReason::EndOfDay.is_signal());
+        assert!(!CloseReason::PositionMissing.is_signal());
     }
 
     /// These exact strings are the `bar_interval` CHECK constraint in `schema.sql`. Changing one

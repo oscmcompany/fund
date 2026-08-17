@@ -101,7 +101,7 @@ pub const MAXIMUM_SESSION_LOG_RETURN: f64 = 0.40;
 
 /// Why a symbol could not be screened.
 ///
-/// Carried out of [`ScreenInput::new`] rather than collapsed into `None`, so the session log can say
+/// Carried out of [`ScreenInput::new`] rather than collapsed into `None`, so the journal can say
 /// which test a ticker failed and — where the test is a number — by how much.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScreenRejection {
@@ -1262,7 +1262,7 @@ mod tests {
             limit: MAXIMUM_SESSION_LOG_RETURN,
         };
         assert_eq!(broken.as_str(), "structural_break");
-        // The whole string: the detail exists to be aggregated out of session logs, so the format
+        // The whole string: the detail exists to be aggregated out of the journal, so the format
         // is the contract and a `contains` check would not notice it drifting.
         assert_eq!(
             broken.detail().expect("a break reports its reading"),

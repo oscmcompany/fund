@@ -12,14 +12,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 /// The journal is the opposite and lives on its own path for that reason.
 pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 
-/// Initialize structured JSON tracing for a service.
+/// Initialize structured JSON tracing for `service`, to stdout at `RUST_LOG` (default `info`) and
+/// to a rolling daily file under `FUND_LOG_DIRECTORY`.
 ///
-/// `service` (e.g. `"fund"`, `"tide-model-trainer"`) is included in the initial log line for
-/// correlation.
-///
-/// Logs to stdout at `RUST_LOG` (default `info`), and to a rolling daily file under
-/// `FUND_LOG_DIRECTORY`. `file_filter` overrides the file layer's level; `None` follows stdout. An
-/// uncreatable log directory disables file logging rather than failing.
+/// `file_filter` overrides the file layer's level; an uncreatable directory disables file logging
+/// rather than failing.
 ///
 /// `Some` means *this call* installed the file layer, and the `WorkerGuard` MUST then be held for
 /// the process lifetime — dropping it tears down the non-blocking writer and buffered lines are
@@ -192,9 +189,8 @@ mod tests {
     fn test_the_log_directory_override_enables_file_logging() {
         let log_directory = env::temp_dir().join("fund-log-directory-test");
         let _ = std::fs::remove_dir_all(&log_directory);
-        // Restored on unwind as well as on return. The manual restore this replaces was skipped
-        // when the assertion below failed, leaving FUND_LOG_DIRECTORY pointing at a directory this test
-        // then deleted -- which every later #[serial] test in the file inherited.
+        // Restored on unwind as well as on return: the manual restore this replaces was skipped
+        // when the assertion below failed, and every later #[serial] test inherited the bad path.
         let _restore = EnvVarRestoreGuard::save("FUND_LOG_DIRECTORY");
         // SAFETY: Protected by #[serial_test::serial] — no concurrent env access.
         unsafe { env::set_var("FUND_LOG_DIRECTORY", &log_directory) };
