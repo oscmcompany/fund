@@ -185,7 +185,7 @@ async fn test_the_dashboard_reads_what_the_service_writes() {
     assert_eq!(data.recent_events.len(), 1);
     assert_eq!(
         data.recent_events[0].event_type,
-        "portfolio_evaluation_completed"
+        EventType::new(Command::PortfolioEvaluation, Outcome::Completed)
     );
     assert_eq!(data.recent_events[0].payload["pairs_opened"], json!(1));
 }

@@ -1,20 +1,15 @@
 //! Read-only queries behind the dashboard, and the aggregations computed from them.
 //!
-//! Every query uses raw `sqlx::query` rather than the compile-time macros, so the dashboard adds
-//! no entries to the `.sqlx` offline cache. It connects as `dashboard_reader`, which holds SELECT
-//! on exactly the tables below and nothing else.
-//!
-//! The aggregations are separated from the queries deliberately: each is a pure function over rows
-//! it was handed, which is what makes win rate, profit factor, and period returns testable without
-//! a database.
+//! Raw `sqlx::query` rather than the macros, so the dashboard adds no `.sqlx` cache entries. The
+//! aggregations are pure functions over rows they were handed, testable without a database.
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
 use tracing::warn;
 
 use crate::common::alpaca::ActivityType;
+use crate::common::events::EventType;
 use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
 use crate::dashboard::cache::{
     AccountSnapshot, ClosedPair, ClosedSummary, EventEntry, OpenPair, PeriodReturns, Prediction,
@@ -31,13 +26,10 @@ fn transfer_activity_types() -> Vec<String> {
 /// Sessions of account snapshots fetched: the equity curve, and the newest row's balances.
 const ACCOUNT_HISTORY_DAYS: i64 = 365;
 
-/// Closed pairs fetched for the trade table and its summary.
 const CLOSED_PAIRS_LIMIT: i64 = 200;
 
-/// Rows shown from the most recent prediction batch.
 const PREDICTIONS_LIMIT: i64 = 50;
 
-/// Events read from the table to seed the ring buffer at startup.
 const RECENT_EVENTS_LIMIT: i64 = 100;
 
 /// One poll cycle's worth of data.
@@ -313,6 +305,10 @@ async fn fetch_latest_predictions(
 }
 
 /// Seeds the event ring buffer from the table, newest first.
+///
+/// A row naming an event type outside the current vocabulary is skipped rather than failing the
+/// poll, on the same reasoning [`EventType::parse`] gives: a stale cron job or a hand-issued row
+/// from an old vocabulary should be reported, not fatal.
 async fn fetch_recent_events(pool: &PgPool) -> Result<Vec<EventEntry>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT event_type, payload, created_at
@@ -324,15 +320,20 @@ async fn fetch_recent_events(pool: &PgPool) -> Result<Vec<EventEntry>, sqlx::Err
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(EventEntry {
-                event_type: row.try_get("event_type")?,
-                payload: row.try_get("payload")?,
-                created_at: row.try_get("created_at")?,
-            })
-        })
-        .collect()
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_event_type: String = row.try_get("event_type")?;
+        let Some(event_type) = EventType::parse(&raw_event_type) else {
+            warn!(event_type = %raw_event_type, "Event has an unrecognized type, skipping");
+            continue;
+        };
+        events.push(EventEntry {
+            event_type,
+            payload: row.try_get("payload")?,
+            created_at: row.try_get("created_at")?,
+        });
+    }
+    Ok(events)
 }
 
 /// The freshness signal: when the most recent daily bar was written.
@@ -349,15 +350,14 @@ async fn fetch_latest_bars_inserted_at(
 
 /// Percentage change between two equity values.
 ///
-/// Returns `None` for a zero or negative baseline: a percentage against zero equity is a division
-/// by zero, and against negative equity it changes sign without changing meaning.
+/// `None` only ever means a zero or negative baseline: a percentage against zero equity is a
+/// division by zero, and against negative equity it changes sign without changing meaning.
 fn percentage_change(baseline: Decimal, latest: Decimal) -> Option<f64> {
     if baseline <= Decimal::ZERO {
         return None;
     }
-    let baseline = baseline.to_f64()?;
-    let latest = latest.to_f64()?;
-    Some((latest - baseline) / baseline * 100.0)
+    let baseline = baseline.as_f64();
+    Some((latest.as_f64() - baseline) / baseline * 100.0)
 }
 
 /// The last snapshot at or before `cutoff`, which is the baseline for a horizon.
@@ -379,8 +379,8 @@ fn baseline_at_or_before(
 /// **Flow-blind by construction.** Every figure here is a raw equity-to-equity change, so a deposit
 /// inside a horizon reads as performance — a $10,000 contribution into a flat $20,000 book publishes
 /// as +50%. Any horizon spanning a capital flow therefore returns `None` rather than a plausible
-/// wrong number. `nav_per_unit` replaces this calculation outright when the unit ledger lands, at
-/// which point the guard has nothing left to protect; see `.scratchpad/unit_accounting.md`.
+/// wrong number. A net-asset-value-per-unit series replaces this calculation outright once the unit
+/// ledger lands, at which point the guard has nothing left to protect.
 pub fn compute_period_returns(
     history: &[AccountSnapshot],
     transfer_sessions: &[SessionDate],
@@ -461,20 +461,17 @@ pub fn compute_closed_summary(closed: &[ClosedPair]) -> ClosedSummary {
         .sum::<Decimal>()
         .abs();
 
-    let total_realized: Decimal = realized.iter().sum();
-    let average_realized = if realized.is_empty() {
+    let total_realized_profit_and_loss: Decimal = realized.iter().sum();
+    let average_realized_profit_and_loss = if realized.is_empty() {
         None
     } else {
-        Some(total_realized / Decimal::from(realized.len()))
+        Some(total_realized_profit_and_loss / Decimal::from(realized.len()))
     };
 
     // A book with no losing trade has no profit factor rather than an infinite one. Reporting
     // infinity here would put the most flattering number on the smallest sample.
     let profit_factor = if gross_loss > Decimal::ZERO {
-        gross_profit
-            .to_f64()
-            .zip(gross_loss.to_f64())
-            .map(|(profit, loss)| profit / loss)
+        Some(gross_profit.as_f64() / gross_loss.as_f64())
     } else {
         None
     };
@@ -507,8 +504,8 @@ pub fn compute_closed_summary(closed: &[ClosedPair]) -> ClosedSummary {
         } else {
             None
         },
-        total_realized,
-        average_realized,
+        total_realized_profit_and_loss,
+        average_realized_profit_and_loss,
         profit_factor,
         average_holding_hours: Some(average_holding_hours),
         by_close_reason,
@@ -718,7 +715,7 @@ mod tests {
             (win_rate - 200.0 / 3.0).abs() < 1e-9,
             "expected two thirds, got {win_rate}"
         );
-        assert_eq!(summary.total_realized, decimal("200"));
+        assert_eq!(summary.total_realized_profit_and_loss, decimal("200"));
         assert_eq!(summary.profit_factor, Some(2.0));
         assert_eq!(summary.average_holding_hours, Some(4.0));
     }
@@ -770,6 +767,9 @@ mod tests {
         assert_eq!(summary.wins, 1);
         assert_eq!(summary.losses, 0);
         assert_eq!(summary.win_rate, Some(100.0));
-        assert_eq!(summary.average_realized, Some(decimal("100")));
+        assert_eq!(
+            summary.average_realized_profit_and_loss,
+            Some(decimal("100"))
+        );
     }
 }

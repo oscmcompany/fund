@@ -1,11 +1,7 @@
 //! The dashboard: a read-only page describing what the fund is doing.
 //!
-//! Its own process, connecting as `dashboard_reader` — SELECT on five tables and nothing else, so
-//! a bug here cannot write to the database the strategy trades from.
-//!
-//! A poller refreshes every view on a fixed interval; a listener appends events from the `events`
-//! NOTIFY channel as they arrive. Request handlers read that shared state and never query, so
-//! viewer count has no bearing on the connection pool.
+//! Its own process, connecting as `dashboard_reader` — SELECT on six tables and nothing else. A
+//! poller refreshes state on a fixed interval, a listener appends events, and handlers never query.
 
 pub mod cache;
 pub mod database;
