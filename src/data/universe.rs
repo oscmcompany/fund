@@ -32,11 +32,9 @@ pub enum UniverseError {
 
 /// One ticker's liquidity over the trailing window.
 ///
-/// Price is summarised by its minimum and volume by its average, because the two are different
-/// kinds of quantity. A price is a level: a name that traded below the floor at any point in the
-/// window was not the kind of instrument this universe is for, and averaging across the fall admits
-/// it on the strength of what it used to cost. Volume is a flow that varies session to session, and
-/// one quiet day says nothing about tradability.
+/// Price is summarised by its minimum and volume by its average. A price is a level, so one that
+/// ever fell below the floor disqualifies the name; volume is a flow, where one quiet session says
+/// nothing about tradability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiquidityRow {
     ticker: Ticker,

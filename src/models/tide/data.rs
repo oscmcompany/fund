@@ -436,14 +436,21 @@ pub(crate) fn split_at_cutoff(
 /// additionally extracts the future `daily_return` window as the target.
 /// Maps every session the frame holds to its position in the sorted set of them.
 ///
-/// Adjacency is read off the sessions present rather than a trading calendar, which is both what
-/// keeps this module free of one and what makes a session the archive never fetched count as a gap
-/// instead of a silent splice. It holds because the frame spans the whole universe: some
-/// instrument traded on every session the archive has.
+/// Adjacency is therefore relative to the sessions this frame contains, not to a trading calendar:
+/// a session missing for some tickers is a gap, and one missing across the whole universe is
+/// invisible here and belongs to whatever checks the archive's completeness.
 fn session_ranks(data: &DataFrame) -> Result<HashMap<i64, usize>, TideError> {
-    let mut sessions: Vec<i64> = data
-        .column("timestamp")?
-        .i64()?
+    let timestamps = data.column("timestamp")?.i64()?;
+    // Skipping these would leave fewer sessions than rows, and the windows are counted from the
+    // row height.
+    if timestamps.null_count() > 0 {
+        return Err(TideError::Data(format!(
+            "Equity bars contain {} null timestamp values out of {} rows",
+            timestamps.null_count(),
+            data.height()
+        )));
+    }
+    let mut sessions: Vec<i64> = timestamps
         .into_no_null_iter()
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
@@ -483,6 +490,12 @@ fn window_frame(
     with_targets: bool,
 ) -> Result<TrainingDataset, TideError> {
     let window_size = input_length + output_length;
+    // An empty window has no last row for the span check below to read.
+    if window_size == 0 {
+        return Err(TideError::Data(
+            "A window needs a non-zero input or output length".to_string(),
+        ));
+    }
     let ranks = session_ranks(frame)?;
     let continuous_feature_count = CONTINUOUS_COLUMNS.len();
     let categorical_feature_count = CATEGORICAL_COLUMNS.len();
@@ -522,10 +535,8 @@ fn window_frame(
         let static_column_values = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
 
         let sessions = ticker_sessions(&ticker_data, &ranks)?;
-        // Session positions rise strictly within a ticker, so a window spans exactly its own
-        // length only when every step inside it is one session. A window that fails this teaches
-        // a transition that never happened -- in the archive the widest such splice covers 462
-        // sessions -- and in predict mode it would forecast from one.
+        // Positions rise strictly within a ticker, so spanning exactly the window's own length is
+        // the same as every step inside it being one session.
         let is_contiguous = |start: usize| {
             sessions[start + window_size - 1].saturating_sub(sessions[start]) == window_size - 1
         };
@@ -712,11 +723,8 @@ pub(crate) fn append_forecast_session_rows(
 }
 
 pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, TideError> {
-    // Sort by [ticker, timestamp] so daily returns and the downstream windowing are chronological
-    // within each ticker, independent of the order rows arrived in. Chronological is not
-    // contiguous: sorting cannot conjure a session the frame does not hold, which is why the
-    // return below is measured against `session_ranks` and not against the previous row.
-    // Each ticker's first row gets a null return; clean_data drops it.
+    // Sort by [ticker, timestamp] so the return below is chronological whatever order rows arrived
+    // in. Chronological is not contiguous, which is why it is measured against `session_ranks`.
     let data = data.sort(
         ["ticker", "timestamp"],
         SortMultipleOptions::default().with_maintain_order(true),
@@ -1464,6 +1472,46 @@ mod tests {
     ///
     /// The dense ticker is what makes the gap visible: session adjacency is read off the sessions
     /// the frame contains, so a gap is only a gap when some instrument traded through it.
+    /// Both lengths zero makes the window empty, and an empty window has no contiguity to check.
+    /// Refused rather than indexed: the span check reads the window's last row.
+    #[test]
+    fn test_a_zero_length_window_is_refused_rather_than_indexed() {
+        let data = Data::from_parts(
+            prepared_and_encoded(raw_gapped_frame()),
+            return_scaler(),
+            FeatureMappings::new(),
+        );
+        let result = data.get_dataset(DatasetKind::Predict, 0, 0);
+        assert!(
+            matches!(result, Err(TideError::Data(_))),
+            "a zero-length window must be an error, not a panic"
+        );
+    }
+
+    /// `session_ranks` skips nulls while the windows are counted from the row height, so one null
+    /// timestamp leaves fewer sessions than rows and the span check reads past the end.
+    #[test]
+    fn test_a_null_timestamp_is_refused_rather_than_skipped() {
+        let mut frame = prepared_and_encoded(raw_gapped_frame());
+        let height = frame.height();
+        let mut timestamps: Vec<Option<i64>> = frame
+            .column("timestamp")
+            .unwrap()
+            .i64()
+            .unwrap()
+            .into_iter()
+            .collect();
+        timestamps[height - 1] = None;
+        frame
+            .with_column(Column::new("timestamp".into(), timestamps))
+            .unwrap();
+
+        assert!(
+            matches!(session_ranks(&frame), Err(TideError::Data(_))),
+            "a null timestamp must be an error, not a silently shorter session list"
+        );
+    }
+
     fn raw_gapped_frame() -> DataFrame {
         const DAY: i64 = 86_400_000;
         let gapped_days: Vec<i64> = vec![0, 1, 2, 3, 8, 9, 10];

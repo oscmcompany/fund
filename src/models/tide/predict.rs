@@ -182,11 +182,10 @@ fn duplicated_tickers(bars: &DataFrame) -> Result<Vec<String>, PredictionError> 
 
 /// Drops tickers whose trailing averages fall below the liquidity thresholds.
 ///
-/// **Both bounds are inclusive**, matching [`crate::models::tide::fit::filter_training_bars`] and
-/// [`crate::data::universe::LiquidityRow`]'s liquidity test. The three read the same two constants, so a
-/// difference in the comparison alone is enough to reopen the train/serve gap those constants were
-/// introduced to close: an exclusive test here would admit a ticker to the universe, train on it,
-/// and then refuse to predict for it at exactly the threshold.
+/// **Both bounds are inclusive**, matching [`crate::models::tide::fit::filter_training_bars`]: an
+/// exclusive test here would train on a ticker and then refuse to predict for it at exactly the
+/// threshold. [`crate::data::universe::LiquidityRow`] screens price on the window's *minimum*, which
+/// is the stricter test, so every name the universe admits still reaches this one.
 pub fn filter_equity_bars(
     data: DataFrame,
     minimum_average_close_price: f64,
