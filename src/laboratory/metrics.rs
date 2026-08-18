@@ -1,7 +1,6 @@
 //! Forecast quality, measured across one session's names and then across sessions.
 //!
-//! Cross-sectional throughout: pooling every (ticker, session) pair into one figure measures
-//! market-wide time variation, which a dollar-neutral book cannot trade.
+//! Cross-sectional throughout: pooling sessions measures time variation a neutral book cannot trade.
 
 use serde::Serialize;
 
@@ -44,15 +43,13 @@ pub fn measure_session(scores: &[f64], realized: &[f64]) -> SessionMetrics {
 /// Ranks rather than values because the book acts on the ordering: a forecast that gets every
 /// magnitude wrong and every ordering right is worth everything, and the reverse is worth nothing.
 pub fn information_coefficient(scores: &[f64], realized: &[f64]) -> Option<f64> {
-    let score_ranks = average_ranks(scores)?;
-    let realized_ranks = average_ranks(realized)?;
     if scores.len() != realized.len() {
         return None;
     }
-    pearson_correlation(&score_ranks, &realized_ranks)
+    pearson_correlation(&average_ranks(scores)?, &average_ranks(realized)?)
 }
 
-/// Mean realized return of the best-scored tenth less that of the worst-scored tenth.
+/// Mean realized return of the best-scored tenth less than that of the worst-scored tenth.
 ///
 /// The rank correlation says whether the ordering is right; this says whether acting on it pays,
 /// which is not the same question when the signal lives only in the extremes.
@@ -65,7 +62,6 @@ pub fn decile_spread(scores: &[f64], realized: &[f64]) -> Option<f64> {
     }
 
     let mut order: Vec<usize> = (0..scores.len()).collect();
-    // Index breaks ties, so the same cross-section always splits the same way.
     order.sort_by(|left, right| {
         scores[*left]
             .partial_cmp(&scores[*right])
@@ -74,6 +70,14 @@ pub fn decile_spread(scores: &[f64], realized: &[f64]) -> Option<f64> {
     });
 
     let decile = scores.len() / 10;
+    // Both boundaries have to fall between distinct scores. A name tied with the one just outside
+    // its tenth is in it only because of where the sort put it, and a cross-section of equal scores
+    // would otherwise report the gap between two alphabetical slices as forecast performance.
+    let boundary_is_arbitrary = |edge: usize| scores[order[edge]] == scores[order[edge + 1]];
+    if boundary_is_arbitrary(decile - 1) || boundary_is_arbitrary(order.len() - decile - 1) {
+        return None;
+    }
+
     let bottom: f64 = order[..decile].iter().map(|index| realized[*index]).sum();
     let top: f64 = order[order.len() - decile..]
         .iter()
@@ -241,6 +245,18 @@ mod tests {
         assert_eq!(information_coefficient(&scores, &realized), None);
     }
 
+    /// Two sides of different lengths are not a cross-section, so nothing is ranked.
+    #[test]
+    fn test_sides_of_different_lengths_are_refused() {
+        assert_eq!(information_coefficient(&[1.0, 2.0], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(decile_spread(&[1.0, 2.0], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(directional_accuracy(&[1.0, 2.0], &[1.0, 2.0, 3.0]), None);
+        assert_eq!(
+            measure_session(&[1.0, 2.0], &[1.0, 2.0, 3.0]),
+            SessionMetrics::default()
+        );
+    }
+
     #[test]
     fn test_a_non_finite_reading_is_refused_rather_than_ranked() {
         let realized = [10.0, 20.0, 30.0, 40.0];
@@ -261,6 +277,27 @@ mod tests {
         let scores: Vec<f64> = (1..=20).map(f64::from).collect();
         let realized = scores.clone();
         assert_eq!(decile_spread(&scores, &realized), Some(18.0));
+    }
+
+    /// The same failure the rank correlation already refuses. Equal scores leave the sort to break
+    /// ties by position, so the two tenths are alphabetical slices of an unordered set and the gap
+    /// between their outcomes is not forecast performance.
+    #[test]
+    fn test_a_cross_section_of_equal_scores_has_no_spread() {
+        let scores = [1.0_f64; 20];
+        let realized: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(decile_spread(&scores, &realized), None);
+    }
+
+    /// A tie straddling a boundary is arbitrary for the same reason, even though the rest of the
+    /// cross-section is ordered: which of the equal names lands in the tenth is down to the sort.
+    #[test]
+    fn test_a_tie_across_a_decile_boundary_has_no_spread() {
+        // Twenty names, deciles of two. The two lowest scores tie with the third.
+        let mut scores: Vec<f64> = (1..=20).map(f64::from).collect();
+        scores[2] = scores[1];
+        let realized: Vec<f64> = (1..=20).map(f64::from).collect();
+        assert_eq!(decile_spread(&scores, &realized), None);
     }
 
     #[test]
