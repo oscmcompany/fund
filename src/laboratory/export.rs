@@ -21,7 +21,9 @@ use crate::laboratory::journal::{date_from_file_name, file_name, Journal};
 /// would mean two producers overwriting each other's object for the same day.
 pub const EXPERIMENT_PREFIX: &str = "exports/laboratory/experiments";
 
-/// Days a local file is kept once it has been shipped.
+/// Age, in days, past which a shipped file is deleted.
+///
+/// A file exactly this old is kept, matching `data::export::JOURNAL_RETENTION_DAYS`.
 pub const RETENTION_DAYS: i64 = 7;
 
 /// What one export run shipped, and what it could not.
@@ -76,6 +78,12 @@ pub async fn export_journals(
 
         let mut day_written = true;
         for (experiment_type, mut frame) in frames {
+            // Every run re-exports the sealed days inside the retention window, so writing a frame
+            // whose records were all rejected would replace a complete object with an empty one.
+            if frame.is_empty() {
+                day_written = false;
+                continue;
+            }
             let prefix = format!("{EXPERIMENT_PREFIX}/experiment_type={experiment_type}");
             let key = date_partitioned_key(&prefix, date);
             match write_frame(s3_client, bucket, &key, &mut frame).await {
@@ -265,8 +273,8 @@ mod tests {
                     tickers: 2,
                     first_timestamp: DateTime::from_timestamp_millis(0),
                     last_timestamp: DateTime::from_timestamp_millis(86_400_000),
-                    splits: 12,
-                    boundaries: 3,
+                    splits_digest: 0xAB,
+                    boundaries_digest: 0xCD,
                 },
                 revision: None,
             }),
@@ -318,6 +326,69 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames["dataset_built"].height(), 2);
         assert_eq!(frames["model_trained"].height(), 1);
+
+        // The reader rebuilds the envelope from JSON keys the producer names, so this is what
+        // catches a field renamed on `Record` — without it the failure is only a row count.
+        for column in [
+            "schema_version",
+            "event_id",
+            "run_id",
+            "timestamp",
+            "payload",
+        ] {
+            assert_eq!(
+                frames["dataset_built"].column(column).unwrap().null_count(),
+                0,
+                "{column} did not survive the round trip from Record"
+            );
+        }
+    }
+
+    /// Pinned to literal dates rather than to `RETENTION_DAYS`: an expectation derived from the
+    /// constant under test moves with it and can never fail.
+    #[test]
+    fn test_only_files_older_than_the_retention_window_are_deleted() {
+        let directory = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        let too_old = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        let exactly_at_the_edge = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let recent = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        for date in [too_old, exactly_at_the_edge, recent] {
+            write_day(directory.path(), date, &[]);
+        }
+
+        let deleted = delete_aged_out(
+            directory.path(),
+            &[too_old, exactly_at_the_edge, recent],
+            today,
+        );
+
+        assert_eq!(deleted, 1);
+        assert!(!directory.path().join(file_name(too_old)).exists());
+        assert!(directory
+            .path()
+            .join(file_name(exactly_at_the_edge))
+            .exists());
+        assert!(directory.path().join(file_name(recent)).exists());
+    }
+
+    /// A day whose records were all rejected must not ship. Every run re-exports the sealed days in
+    /// the window, so writing that frame would replace a complete object with an empty one.
+    #[test]
+    fn test_a_type_whose_records_were_all_rejected_yields_an_empty_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        // A well-formed experiment_type over an envelope missing run_id: grouped, then rejected.
+        let mut broken: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&record(Uuid::new_v4(), 1)).unwrap())
+                .unwrap();
+        broken.as_object_mut().unwrap().remove("run_id");
+        write_day(directory.path(), date, &[broken.to_string()]);
+
+        let (frames, unparsable) = read_day(&directory.path().join(file_name(date))).unwrap();
+
+        assert_eq!(unparsable, 1);
+        assert!(frames["dataset_built"].is_empty());
     }
 
     #[test]

@@ -217,10 +217,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Some(journal) = laboratory_journal.as_ref() {
+        // Stamped when it is recorded, not when the run began. Preparation takes minutes, and a run
+        // that crosses UTC midnight would otherwise file this into a day the exporter has sealed.
         journal
             .record(
                 run_id,
-                now,
+                Utc::now(),
                 laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt {
                     fingerprint,
                     revision: std::env::var("FUND_REVISION").ok(),

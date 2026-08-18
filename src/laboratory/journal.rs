@@ -1,7 +1,6 @@
 //! The laboratory's own append-only record of what it ran.
 //!
-//! Separate from the application's journal because an experiment happens at an instant, not on a
-//! trading day, so it is keyed by run and partitioned by the UTC date.
+//! Keyed by run and rolled on the UTC date: an experiment happens at an instant, not on a session.
 
 use std::path::{Path, PathBuf};
 
@@ -217,8 +216,8 @@ mod tests {
             tickers: 2,
             first_timestamp: DateTime::from_timestamp_millis(0),
             last_timestamp: DateTime::from_timestamp_millis(86_400_000),
-            splits: 12,
-            boundaries: 3,
+            splits_digest: 0xAB,
+            boundaries_digest: 0xCD,
         }
     }
 
@@ -234,6 +233,19 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         assert_eq!(file_name(date), "laboratory-2026-08-17.jsonl");
         assert_eq!(date_from_file_name(&file_name(date)), Some(date));
+    }
+
+    /// `experiment_type()` restates what `rename_all` generates for the variant. Left unpinned, a
+    /// rename would move the export partition while the logged name kept the old spelling.
+    #[test]
+    fn test_the_reported_experiment_type_is_the_tag_that_serializes() {
+        let value: serde_json::Value = serde_json::to_value(observation()).unwrap();
+        assert_eq!(value["experiment_type"], serde_json::json!("dataset_built"));
+        assert_eq!(observation().experiment_type(), "dataset_built");
+        assert_eq!(
+            value["experiment_type"].as_str(),
+            Some(observation().experiment_type())
+        );
     }
 
     /// The application's journal names its files by session date. Reading one of those as a
@@ -262,8 +274,8 @@ mod tests {
             serde_json::json!(10)
         );
         assert_eq!(
-            value["payload"]["fingerprint"]["splits"],
-            serde_json::json!(12)
+            value["payload"]["fingerprint"]["splits_digest"],
+            serde_json::json!(0xAB)
         );
         assert!(
             value.get("session_date").is_none(),
