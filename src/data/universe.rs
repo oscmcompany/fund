@@ -213,11 +213,14 @@ impl UniverseCache {
     ) -> Result<Universe, UniverseError> {
         let today = SessionDate::at(now);
 
+        // Read before the call rather than inside the rebuild, which would re-enter the cache and
+        // hold only because the lock happens to be released across it. `get` writes nothing until
+        // the rebuild returns, so the answer is the same either way.
+        let previous = self.inner.previous().await;
         self.inner
             .get(
                 today,
                 || async {
-                    let previous = self.inner.previous().await;
                     let assets = client.fetch_tradable_assets().await?;
                     let liquidity = load_liquidity(pool, today).await?;
                     let universe = Universe::build(&assets, &liquidity);

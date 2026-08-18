@@ -8,17 +8,29 @@ use crate::common::types::SessionDate;
 
 /// A value cached per Eastern date, so the rollover invalidates it without a timer.
 ///
-/// Not a bound on rebuilds. The lock is released across the rebuild and re-taken only to store, so
-/// two callers arriving cold both rebuild, and a value `worth_caching` rejects is rebuilt on every
-/// call until it passes. Both are harmless because a rebuild is a deterministic read of one date.
+/// Not a bound on rebuilds. The lock is released across the rebuild, so two callers arriving cold
+/// both rebuild, and a value `worth_caching` rejects is rebuilt on every call until it passes.
 pub struct DailyCache<T> {
-    inner: tokio::sync::Mutex<Option<(SessionDate, T)>>,
+    inner: tokio::sync::Mutex<Slot<T>>,
+}
+
+/// The cached value beside a counter of every write that has landed on it.
+///
+/// The counter is what lets a rebuild tell whether it was superseded while the lock was released.
+/// It lives inside the mutex rather than beside it as an atomic so that the value and the count
+/// cannot be read out of step with each other.
+struct Slot<T> {
+    value: Option<(SessionDate, T)>,
+    writes: u64,
 }
 
 impl<T> Default for DailyCache<T> {
     fn default() -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(None),
+            inner: tokio::sync::Mutex::new(Slot {
+                value: None,
+                writes: 0,
+            }),
         }
     }
 }
@@ -34,6 +46,10 @@ impl<T: Clone> DailyCache<T> {
     /// yes. An empty universe or an empty close history is a failed read, and storing one would
     /// answer "nothing is there" for the rest of the Eastern date; an empty splits table is a real
     /// answer that should be kept.
+    ///
+    /// A rebuild that finds the slot written since it started discards its own result rather than
+    /// storing it. Otherwise an [`DailyCache::invalidate`] landing mid-rebuild would be undone by
+    /// the rebuild it was meant to invalidate, pinning the superseded value until the date rolls.
     pub async fn get<Error, Rebuild, Rebuilding>(
         &self,
         today: SessionDate,
@@ -44,20 +60,28 @@ impl<T: Clone> DailyCache<T> {
         Rebuild: FnOnce() -> Rebuilding,
         Rebuilding: Future<Output = Result<T, Error>>,
     {
-        if let Some(fresh) = self.get_if_fresh(today).await {
-            return Ok(fresh);
-        }
+        let writes_before = {
+            let slot = self.inner.lock().await;
+            match &slot.value {
+                Some((cached_date, value)) if *cached_date == today => return Ok(value.clone()),
+                _ => slot.writes,
+            }
+        };
 
         let value = rebuild().await?;
         if worth_caching(&value) {
-            *self.inner.lock().await = Some((today, value.clone()));
+            let mut slot = self.inner.lock().await;
+            if slot.writes == writes_before {
+                slot.value = Some((today, value.clone()));
+                slot.writes += 1;
+            }
         }
         Ok(value)
     }
 
     /// The cached value when it was filled on `today`, without rebuilding.
     pub async fn get_if_fresh(&self, today: SessionDate) -> Option<T> {
-        match self.inner.lock().await.as_ref() {
+        match &self.inner.lock().await.value {
             Some((cached_date, value)) if *cached_date == today => Some(value.clone()),
             _ => None,
         }
@@ -71,13 +95,16 @@ impl<T: Clone> DailyCache<T> {
         self.inner
             .lock()
             .await
+            .value
             .as_ref()
             .map(|(_, value)| value.clone())
     }
 
     /// Replaces the cached value. Used by tests and by the pre-open warm path.
     pub async fn install(&self, today: SessionDate, value: T) {
-        *self.inner.lock().await = Some((today, value));
+        let mut slot = self.inner.lock().await;
+        slot.value = Some((today, value));
+        slot.writes += 1;
     }
 
     /// Drops the cached value so the next caller rebuilds.
@@ -85,7 +112,9 @@ impl<T: Clone> DailyCache<T> {
     /// Not the same as installing an empty one: an empty value keyed to today would answer "nothing
     /// is there" for the rest of the Eastern date rather than reloading.
     pub async fn invalidate(&self) {
-        *self.inner.lock().await = None;
+        let mut slot = self.inner.lock().await;
+        slot.value = None;
+        slot.writes += 1;
     }
 }
 
@@ -179,6 +208,47 @@ mod tests {
         cache.invalidate().await;
         assert_eq!(counted(&cache, today, &rebuilds, 1, |_| true).await, 1);
         assert_eq!(rebuilds.load(Ordering::Relaxed), 1);
+    }
+
+    /// An invalidation that lands while a rebuild is in flight must survive it.
+    ///
+    /// The post-close bar sync invalidates the close history because the cached window predates the
+    /// rows it just wrote. A pass already loading that window read the old rows, so storing its
+    /// result would undo the invalidation and serve pre-sync closes until the date rolled over.
+    #[tokio::test]
+    async fn test_an_invalidation_during_a_rebuild_is_not_undone_by_it() {
+        let cache: DailyCache<usize> = DailyCache::new();
+        let today = session("2026-08-17");
+        let reading = tokio::sync::Notify::new();
+        let invalidated = tokio::sync::Notify::new();
+
+        let rebuilding = cache.get::<(), _, _>(
+            today,
+            || async {
+                reading.notify_one();
+                invalidated.notified().await;
+                Ok(1)
+            },
+            |_| true,
+        );
+
+        let invalidating = async {
+            reading.notified().await;
+            cache.invalidate().await;
+            invalidated.notify_one();
+        };
+
+        let (rebuilt, ()) = tokio::join!(rebuilding, invalidating);
+        assert_eq!(
+            rebuilt,
+            Ok(1),
+            "the caller still gets the value it asked for"
+        );
+        assert_eq!(
+            cache.get_if_fresh(today).await,
+            None,
+            "the invalidation stands, so the next caller reloads"
+        );
     }
 
     /// `previous` ignores the date, which is what makes a day-over-day difference possible.
