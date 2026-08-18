@@ -1,13 +1,8 @@
-//! The risk gate: four conditions, all of which only ever stop an *entry*.
+//! The risk gate: every condition here only ever stops an *entry*.
 //!
-//! Nothing here can block an exit. The book is flat overnight without exception, so a gate that
-//! could refuse to close a position would be a way to carry one. Exits run first and
-//! unconditionally in [`crate::portfolio::evaluate`]; this is consulted only afterwards.
-//!
-//! Deliberately small: everything modelling overnight exposure went with the requirement to hold
-//! overnight, and the beta-neutral optimizer went with the machinery that estimated the betas.
+//! Nothing can block an exit. The book is flat overnight without exception, so a gate that could
+//! refuse to close a position would be a way to carry one.
 
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 
@@ -151,9 +146,7 @@ impl RiskGate {
 
     /// The gross exposure ceiling: equity times the configured multiple.
     pub fn gross_exposure_cap(&self) -> Decimal {
-        Decimal::from_f64_retain(self.parameters.gross_exposure_multiple())
-            .map(|multiple| self.equity * multiple)
-            .unwrap_or(Decimal::ZERO)
+        self.equity * self.parameters.gross_exposure_multiple()
     }
 
     /// Realized drawdown against the previous session, as a fraction in `[0, 1]`.
@@ -166,14 +159,15 @@ impl RiskGate {
             return None;
         }
         let fall = (previous - self.equity) / previous;
-        fall.to_f64().map(|value| value.max(0.0))
+        Some(fall.as_f64().max(0.0))
     }
 
     /// Conditions that stop the pass opening anything at all.
     ///
     /// Checked once, before any screening, because each of them makes the whole entry half of the
     /// pass pointless — screening seven thousand symbols to then refuse every result is the
-    /// expensive way to do nothing.
+    /// expensive way to do nothing. Exits run first and unconditionally in
+    /// [`crate::portfolio::evaluate`]; this is consulted only afterwards.
     pub fn session_block(&self) -> Option<RiskBlock> {
         if let Some(drawdown) = self.drawdown() {
             if drawdown >= DRAWDOWN_THRESHOLD {

@@ -1,13 +1,7 @@
 //! Pair selection: which two symbols, which way round, and how strong the signal.
 //!
-//! The screen is quadratic in the eligible universe, so everything cheap runs first: the confidence
-//! floor and the shortable check shrink the input before a single correlation is computed.
-//!
-//! Sector is not one of those tests. It constrains the *book* rather than the pair, so it is applied
-//! during selection — see [`MAXIMUM_LEGS_PER_SECTOR`].
-//!
-//! [`SpreadModel`] is load-bearing. An open pair's model is rebuilt from its *stored* hedge ratio
-//! rather than refitted, so entry and exit measure the same spread.
+//! Quadratic in the eligible universe, so the cheap tests come first: the confidence floor shrinks
+//! the input, and a pair with no shortable leg is skipped before its correlation is computed.
 
 use std::collections::{HashMap, HashSet};
 
