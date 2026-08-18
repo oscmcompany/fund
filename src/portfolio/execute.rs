@@ -155,9 +155,7 @@ impl CloseOutcome {
 /// Opens both legs of a sized pair, unwinding whatever filled if either leg fails.
 ///
 /// The short leg goes first and its fill is confirmed before the long is submitted: a short can be
-/// rejected for borrow reasons a long never is, so the common failure costs nothing to recover from
-/// because nothing is held yet. The unwind exists for the uncommon case — the short fills and the
-/// long does not — which is the one that leaves an unhedged position.
+/// rejected for borrow reasons a long never is, so the common failure holds nothing yet.
 ///
 /// Returns [`OpenOutcome::Abandoned`] when a leg does not fill and the unwind succeeded, and an
 /// error only when the unwind itself failed — the case where something is held that nothing knows

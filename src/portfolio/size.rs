@@ -16,6 +16,14 @@ pub const MAXIMUM_CONCURRENT_PAIRS: usize = 10;
 /// the strategy does not ask for it.
 pub const GROSS_EXPOSURE_MULTIPLE: f64 = 1.0;
 
+/// The largest multiple a configuration may ask for.
+///
+/// Reg T allows two and portfolio margin about six, so a hundred is far past anything this book
+/// would run. It is a bound rather than a preference: `equity x multiple` is a bare `Decimal`
+/// product in two places, and a multiple `Decimal` can hold but the product cannot would panic
+/// mid-session — reachable from `GROSS_EXPOSURE_MULTIPLE` in the environment.
+const MAXIMUM_GROSS_EXPOSURE_MULTIPLE: f64 = 100.0;
+
 /// Legs per pair. Named because it is what turns a per-pair budget into a per-leg one, and a stray
 /// factor of two in a sizing calculation is not visible in the result.
 const LEGS_PER_PAIR: u32 = 2;
@@ -30,15 +38,17 @@ pub struct SizingParameters {
 impl SizingParameters {
     /// Constructs parameters, rejecting values that cannot describe a book.
     ///
-    /// The multiple is converted to `Decimal` once, here, and stored that way. Both places that use
-    /// it multiply an equity by it, and a conversion at either would have to decide what an
-    /// unrepresentable value means — `gross_exposure_cap` answered zero, which silently refuses
-    /// every entry rather than reporting anything. Rejecting it at construction removes the choice.
+    /// The multiple is converted to `Decimal` once here and stored that way, so that neither place
+    /// that multiplies an equity by it has to decide what an unrepresentable or overflowing value
+    /// means.
     pub fn new(maximum_concurrent_pairs: usize, gross_exposure_multiple: f64) -> Option<Self> {
         if maximum_concurrent_pairs == 0 {
             return None;
         }
-        if !gross_exposure_multiple.is_finite() || gross_exposure_multiple <= 0.0 {
+        if !gross_exposure_multiple.is_finite()
+            || gross_exposure_multiple <= 0.0
+            || gross_exposure_multiple > MAXIMUM_GROSS_EXPOSURE_MULTIPLE
+        {
             return None;
         }
         Some(Self {
@@ -77,12 +87,9 @@ impl SizingParameters {
 
     /// The dollar notional allocated to one leg of one pair.
     ///
-    /// `equity x multiple / (pairs x 2)`. The denominator is every slot, not the vacant ones, so a
-    /// pair's size does not change when an unrelated pair closes. The consequence is deliberate: a
-    /// book holding three of ten slots runs at roughly three tenths of its exposure target rather
-    /// than concentrating the full target into whichever pairs happen to be open.
-    ///
-    /// Returns `None` for non-positive equity, which is an account that cannot open anything.
+    /// `equity x multiple / (pairs x 2)`, where the denominator counts every slot rather than the
+    /// vacant ones, so a book holding three of ten runs at roughly three tenths of its exposure
+    /// target instead of concentrating it. `None` for non-positive equity.
     pub fn notional_per_leg(&self, equity: Decimal) -> Option<Dollars> {
         if equity <= Decimal::ZERO {
             return None;
@@ -148,14 +155,9 @@ impl SizedPair {
 
 /// Sizes one candidate against a per-leg budget.
 ///
-/// **Both legs get equal notional, not hedge-ratio-weighted notional.** The hedge ratio decides
-/// where the spread's mean is, not how much to buy. Sizing the short at `hedge_ratio x` the long
-/// would make the book hedge-ratio-neutral rather than dollar-neutral — a larger claim about what
-/// the two legs share than this version can support.
-///
-/// Returns `None` when the short leg would round to zero shares — a symbol priced above the per-leg
-/// budget. That pair cannot be opened dollar-neutral at this account size, and opening the long leg
-/// alone would be a naked directional position rather than a spread.
+/// **Both legs get equal notional, not hedge-ratio-weighted notional**, which makes the book
+/// dollar-neutral rather than hedge-ratio-neutral. `None` when the short leg would round to zero
+/// shares, since opening the long alone would be a directional position rather than a spread.
 pub fn size_pair(candidate: &PairCandidate, notional_per_leg: Dollars) -> Option<SizedPair> {
     let budget = notional_per_leg.value().as_f64();
     let short_price = candidate.short_price();
@@ -282,6 +284,27 @@ mod tests {
         );
         assert_eq!(SizingParameters::new(10, 1e300), None);
         assert!(SizingParameters::new(10, 1.5).is_some());
+    }
+
+    /// The window between the two: `Decimal` holds 1e25 comfortably, so it survived construction,
+    /// and then `equity x multiple` overflowed and the bare product panicked mid-session. Reachable
+    /// from `GROSS_EXPOSURE_MULTIPLE` in the environment, which is why the ceiling is a bound at
+    /// construction rather than a checked multiply at each of the two use sites.
+    #[test]
+    fn test_parameters_reject_a_multiple_that_would_overflow_against_equity() {
+        let equity = Decimal::from_str_exact("20097.84").expect("a representable equity");
+        let admitted_by_decimal =
+            Decimal::from_f64_retain(1e25).expect("Decimal holds 1e25 on its own");
+        assert_eq!(
+            equity.checked_mul(admitted_by_decimal),
+            None,
+            "the product is what overflows, not the multiple"
+        );
+
+        assert_eq!(SizingParameters::new(10, 1e25), None);
+        assert_eq!(SizingParameters::new(10, 101.0), None);
+        assert!(SizingParameters::new(10, 100.0).is_some());
+        assert!(SizingParameters::new(10, 6.0).is_some());
     }
 
     #[test]

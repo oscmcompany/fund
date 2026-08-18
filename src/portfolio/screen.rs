@@ -1,7 +1,7 @@
 //! Pair selection: which two symbols, which way round, and how strong the signal.
 //!
-//! Quadratic in the eligible universe, so everything cheap runs first: the confidence floor and the
-//! shortable check shrink the input before a single correlation is computed.
+//! Quadratic in the eligible universe, so the cheap tests come first: the confidence floor shrinks
+//! the input, and a pair with no shortable leg is skipped before its correlation is computed.
 
 use std::collections::{HashMap, HashSet};
 
