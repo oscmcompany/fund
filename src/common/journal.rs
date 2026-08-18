@@ -20,7 +20,7 @@ use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
 /// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
@@ -1322,7 +1322,7 @@ mod tests {
         );
         let value: Value = serde_json::to_value(&record).expect("record must serialize");
 
-        assert_eq!(value["schema_version"], Value::Number(4.into()));
+        assert_eq!(value["schema_version"], Value::Number(5.into()));
         assert_eq!(value["event_type"], "account_observed");
         assert_eq!(value["session_date"], "2026-08-11");
         assert_eq!(value["timestamp"], "2026-08-11T20:15:00Z");

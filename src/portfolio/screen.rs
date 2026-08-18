@@ -129,13 +129,11 @@ impl ScreenRejection {
     pub fn detail(&self) -> Option<String> {
         match self {
             ScreenRejection::UnusableInput => None,
-            // `log_return` on the wire, not `logarithmic_return`: the string reaches the journal
-            // and is aggregated out of it, so the stored spelling outlives the identifier's.
             ScreenRejection::StructuralBreak {
                 logarithmic_return,
                 limit,
             } => Some(format!(
-                "log_return={logarithmic_return:.4} limit={limit:.4}"
+                "logarithmic_return={logarithmic_return:.4} limit={limit:.4}"
             )),
         }
     }
@@ -1282,7 +1280,7 @@ mod tests {
         // is the contract and a `contains` check would not notice it drifting.
         assert_eq!(
             broken.detail().expect("a break reports its reading"),
-            format!("log_return=-2.2800 limit={MAXIMUM_SESSION_LOGARITHMIC_RETURN:.4}")
+            format!("logarithmic_return=-2.2800 limit={MAXIMUM_SESSION_LOGARITHMIC_RETURN:.4}")
         );
     }
 
