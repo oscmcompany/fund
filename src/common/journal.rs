@@ -839,12 +839,15 @@ pub struct JournalExported {
 pub struct LogsExported {
     pub files_exported: usize,
     pub lines_exported: usize,
-    /// Services whose upload failed, which stay on local disk for the next run.
+    /// How many files did not upload; each stays on local disk for the next run.
     pub files_failed: usize,
-    /// Dates deleted from local disk, which had uploaded cleanly and aged out.
-    pub dates_deleted: Vec<NaiveDate>,
+    /// How many aged out and were deleted, counted per file rather than per date — one service
+    /// ageing out does not carry another's away.
+    pub files_deleted: usize,
     /// Lines the Parquet does not hold, which keep their file from being deleted.
     pub unparsable_lines: usize,
+    /// Set when the log directory could not be listed at all, which a count of zero cannot express.
+    pub directory_error: Option<String>,
 }
 
 /// One run of the nightly database export and the purge chained behind it.

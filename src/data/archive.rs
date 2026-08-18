@@ -235,16 +235,11 @@ async fn present_sessions(
 
 /// Fetches and writes every session in `[window_start, window_end]` the archive is missing.
 ///
-/// **A set difference, not a lookback.** The archive is asked what it already has and everything
-/// expected and absent is fetched, so a missed night, a week of downtime, and an empty bucket are
-/// one case; a fixed lookback repairs only the first and leaves the rest as permanent holes.
-///
-/// **Expected means "worth requesting", not "the market traded".** The trainer holds no broker
-/// credentials and so cannot consult [`crate::data::calendar::TradingCalendar`], which is why this
-/// bounds the range with [`SessionDate::is_weekend`] and lets a holiday be requested, answered with
-/// nothing, and requested again. The partition that exists is the evidence; the request set is only
-/// a guess about where to look, and the roughly ten empty requests a year are reported rather than
-/// hidden.
+/// **A set difference, not a lookback**, so a missed night, a week of downtime, and an empty bucket
+/// are one case where a fixed lookback repairs only the first. Expected means "worth requesting"
+/// rather than "the market traded", since the trainer holds no broker credentials to consult a
+/// calendar with: a holiday is requested, answered with nothing, and requested again, at a cost of
+/// roughly ten empty requests a year that [`ArchiveSummary`] reports rather than hides.
 ///
 /// Idempotent: a second pass over an unchanged window requests only the correction window and
 /// writes the same rows back. Safe to interrupt, because partitions are written as each chunk

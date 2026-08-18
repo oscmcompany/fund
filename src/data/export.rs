@@ -489,10 +489,7 @@ pub async fn export_journals(
 /// S3 prefix the diagnostic logs are written under, partitioned by service.
 pub const LOG_PREFIX: &str = "exports/logs";
 
-/// Calendar days of exported logs kept on local disk.
-///
-/// The same window the journal keeps, for the same reason: long enough that a bad conversion can
-/// still be repaired from the original bytes.
+/// Calendar days of exported logs kept on local disk, matching the journal's window.
 pub const LOG_RETENTION_DAYS: i64 = 7;
 
 /// What one log export run accomplished.
@@ -502,10 +499,14 @@ pub struct LogExportSummary {
     pub exported: Vec<(NaiveDate, String, usize)>,
     /// `(date, service, error)` for each file that did not write.
     pub failed: Vec<(NaiveDate, String, String)>,
-    /// Files deleted from local disk, which had uploaded cleanly and aged out.
-    pub deleted: Vec<NaiveDate>,
+    /// `(date, service)` for each file deleted from local disk, having uploaded cleanly and aged
+    /// out. One service ageing out does not carry another's file with it.
+    pub deleted: Vec<(NaiveDate, String)>,
     /// Lines the Parquet does not hold, across every file this run read.
     pub unparsable_lines: usize,
+    /// Set when the directory itself could not be listed, which is not the same answer as finding
+    /// it empty and must not read as a clean run.
+    pub directory_error: Option<String>,
 }
 
 impl LogExportSummary {
@@ -516,11 +517,10 @@ impl LogExportSummary {
 
 /// Converts every rolled log file on disk to Parquet in S3, then deletes what has aged out.
 ///
-/// Follows [`export_journals`] — one whole file at a deterministic key, so a repeat is an
-/// overwrite and a failed run repairs itself — with one difference it cannot avoid. The journal is
-/// sealed across its reads and the log has no seal: the appender owns the file and keeps writing.
-/// Today's object is therefore a snapshot that the next run replaces, and a line torn mid-write is
-/// counted unparsable exactly as a torn journal line is.
+/// Follows [`export_journals`], except that the log has no seal: the appender owns the file and
+/// keeps writing, so today's object is a snapshot the next run replaces and a line torn mid-write
+/// is counted unparsable. The unit throughout is one file, not one date, because a date holds a
+/// file per service and they succeed independently.
 pub async fn export_logs(
     directory: &Path,
     s3_client: &S3Client,
@@ -533,12 +533,13 @@ pub async fn export_logs(
         Ok(files) => files,
         Err(error) => {
             warn!(%error, "Log directory could not be read; nothing exported");
+            summary.directory_error = Some(error);
             return summary;
         }
     };
     files.sort();
 
-    let mut deletable: Vec<NaiveDate> = Vec::new();
+    let mut deletable: Vec<(NaiveDate, String, PathBuf)> = Vec::new();
     for (date, service, path) in files {
         let (mut frame, unparsable) = match read_log_frame(&path) {
             Ok(read) => read,
@@ -563,9 +564,11 @@ pub async fn export_logs(
         let key = date_partitioned_key(&format!("{LOG_PREFIX}/service={service}"), date);
         match write_frame(s3_client, bucket, &key, &mut frame).await {
             Ok(()) => {
-                summary.exported.push((date, service, frame.height()));
+                summary
+                    .exported
+                    .push((date, service.clone(), frame.height()));
                 if unparsable == 0 {
-                    deletable.push(date);
+                    deletable.push((date, service, path));
                 }
             }
             Err(error) => summary.failed.push((date, service, error)),
@@ -573,7 +576,7 @@ pub async fn export_logs(
     }
 
     let oldest_kept = today.plus_calendar_days(-LOG_RETENTION_DAYS).date();
-    summary.deleted = delete_aged_out_logs(directory, &deletable, oldest_kept);
+    summary.deleted = delete_aged_out_logs(&deletable, oldest_kept);
 
     info!(
         files = summary.exported.len(),
@@ -611,14 +614,19 @@ fn rolled_log_files(directory: &Path) -> Result<Vec<(NaiveDate, String, PathBuf)
 }
 
 /// Splits `2026-08-17.fund.log` into its date and service.
+///
+/// The service becomes a Hive partition in the S3 key, so it is restricted to what a service name
+/// is actually made of. A `=` or a `.` would otherwise read as partition syntax and put the object
+/// somewhere no query looks for it.
 fn split_log_file_name(name: &str) -> Option<(NaiveDate, String)> {
     let remainder = name.strip_suffix(".log")?;
     let (date, service) = remainder.split_once('.')?;
     let date = date.parse::<NaiveDate>().ok()?;
-    match service.is_empty() {
-        true => None,
-        false => Some((date, service.to_string())),
-    }
+    let usable = !service.is_empty()
+        && service
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-');
+    usable.then(|| (date, service.to_string()))
 }
 
 /// Reads one log file into a frame, returning it with the number of lines skipped.
@@ -689,30 +697,20 @@ fn read_log_frame(path: &Path) -> Result<(DataFrame, usize), String> {
     Ok((frame, unparsable))
 }
 
-/// Removes local log files older than the retention window.
+/// Removes exactly the files given, and only those past the retention window.
 ///
-/// The window is what keeps the appender's own file safe: `oldest_kept` is a whole retention period
-/// behind today, so a file still open for writing is never old enough to qualify.
+/// Takes the files rather than re-listing the directory, so a service whose upload failed keeps its
+/// only retryable copy even when another service aged out on the same date. The window is also what
+/// keeps the appender's open file safe: `oldest_kept` is a whole retention period behind today, so a
+/// file still being written to can never be old enough to qualify.
 fn delete_aged_out_logs(
-    directory: &Path,
-    dates: &[NaiveDate],
+    exported: &[(NaiveDate, String, PathBuf)],
     oldest_kept: NaiveDate,
-) -> Vec<NaiveDate> {
+) -> Vec<(NaiveDate, String)> {
     let mut deleted = Vec::new();
-    let aged_out: std::collections::BTreeSet<NaiveDate> = dates
-        .iter()
-        .filter(|date| **date < oldest_kept)
-        .copied()
-        .collect();
-    let Ok(files) = rolled_log_files(directory) else {
-        return deleted;
-    };
-    for (date, _, path) in files
-        .into_iter()
-        .filter(|(date, _, _)| aged_out.contains(date))
-    {
-        match std::fs::remove_file(&path) {
-            Ok(()) => deleted.push(date),
+    for (date, service, path) in exported.iter().filter(|(date, _, _)| *date < oldest_kept) {
+        match std::fs::remove_file(path) {
+            Ok(()) => deleted.push((*date, service.clone())),
             Err(error) => warn!(
                 path = %path.display(),
                 %error,
@@ -720,8 +718,6 @@ fn delete_aged_out_logs(
             ),
         }
     }
-    deleted.sort();
-    deleted.dedup();
     deleted
 }
 
@@ -973,6 +969,59 @@ mod tests {
         assert_eq!(split_log_file_name("2026-08-17.log"), None);
         assert_eq!(split_log_file_name("not-a-date.fund.log"), None);
         assert_eq!(split_log_file_name("2026-08-17.fund.txt"), None);
+        // The service becomes a Hive partition, so anything that reads as partition syntax or a
+        // path separator is refused rather than shaping the S3 key.
+        assert_eq!(split_log_file_name("2026-08-17.a=b.log"), None);
+        assert_eq!(split_log_file_name("2026-08-17.a.b.log"), None);
+        assert_eq!(split_log_file_name("2026-08-17.year=2020.log"), None);
+    }
+
+    /// Two services share a date and succeed independently. Deleting by date rather than by file
+    /// would take the failed service's only retryable copy along with the successful one's.
+    #[test]
+    fn test_one_service_ageing_out_does_not_delete_anothers_file() {
+        let directory = temporary_directory("logs-per-service");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let stale: NaiveDate = "2026-08-01".parse().expect("a valid date");
+        let shipped = directory.join(format!("{stale}.fund.log"));
+        let held_back = directory.join(format!("{stale}.tide-model-trainer.log"));
+        for path in [&shipped, &held_back] {
+            std::fs::write(path, "{}\n").expect("the file must be writable");
+        }
+
+        // Only the first uploaded cleanly, so only it is offered for deletion.
+        let exported = vec![(stale, "fund".to_string(), shipped.clone())];
+        let deleted = delete_aged_out_logs(&exported, "2026-08-10".parse().expect("a valid date"));
+
+        assert_eq!(deleted, vec![(stale, "fund".to_string())]);
+        assert!(!shipped.exists(), "the shipped file ages out");
+        assert!(
+            held_back.exists(),
+            "the other service's file is its only copy and must survive"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An unreadable directory is not an empty one, and a summary that cannot tell them apart
+    /// reports a clean run over storage that was never reached.
+    #[tokio::test]
+    async fn test_an_unreadable_log_directory_is_reported_rather_than_read_as_empty() {
+        let directory = temporary_directory("logs-missing");
+        let _ = std::fs::remove_dir_all(&directory);
+        let configuration = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let s3_client = S3Client::new(&configuration);
+
+        let summary = export_logs(
+            &directory,
+            &s3_client,
+            "unused-bucket",
+            session(2026, 8, 17),
+        )
+        .await;
+
+        assert!(summary.directory_error.is_some(), "the failure is carried");
+        assert!(summary.exported.is_empty());
+        assert!(summary.deleted.is_empty());
     }
 
     /// The log directory is shared with whatever else writes there, so a name this does not
@@ -1088,20 +1137,23 @@ mod tests {
         let stale = today.plus_calendar_days(-LOG_RETENTION_DAYS - 1).date();
         // The boundary date itself is kept, so the window is half-open: `<=` would take a file the
         // retention period still covers.
-        let dates = [today.date(), oldest_kept, stale];
-        for date in dates {
-            std::fs::write(directory.join(format!("{date}.fund.log")), "{}\n")
-                .expect("the file must be writable");
-        }
+        let exported: Vec<(NaiveDate, String, PathBuf)> = [today.date(), oldest_kept, stale]
+            .into_iter()
+            .map(|date| {
+                let path = directory.join(format!("{date}.fund.log"));
+                std::fs::write(&path, "{}\n").expect("the file must be writable");
+                (date, "fund".to_string(), path)
+            })
+            .collect();
         assert!(
             oldest_kept < today.date(),
             "the window is what does the work"
         );
 
-        let deleted = delete_aged_out_logs(&directory, &dates, oldest_kept);
+        let deleted = delete_aged_out_logs(&exported, oldest_kept);
         assert_eq!(
             deleted,
-            vec![stale],
+            vec![(stale, "fund".to_string())],
             "only the file past the window ages out"
         );
         assert!(directory

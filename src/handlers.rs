@@ -827,8 +827,9 @@ async fn handle_database_export(
                 files_exported: logs.exported.len(),
                 lines_exported: logs.total_lines(),
                 files_failed: logs.failed.len(),
-                dates_deleted: logs.deleted.clone(),
+                files_deleted: logs.deleted.len(),
                 unparsable_lines: logs.unparsable_lines,
+                directory_error: logs.directory_error.clone(),
             }),
         )
         .await;
@@ -871,15 +872,19 @@ async fn handle_database_export(
             "dataset": dataset, "error": error.to_string()
         })).collect::<Vec<_>>(),
         "total_rows_exported": export.total_rows(),
-        "purged_rows": purged.total_rows(),
-        "purge_clean": purged.is_clean(),
+        // Null rather than zero-and-clean when skipped: a purge that did not run has no verdict,
+        // and `is_clean` on an empty summary would report one.
+        "purged_rows": match purge_skipped { true => Value::Null, false => json!(purged.total_rows()) },
+        "purge_clean": match purge_skipped { true => Value::Null, false => json!(purged.is_clean()) },
         "purge_skipped": purge_skipped,
         "journal": journal_summary,
         "logs": json!({
             "files_exported": logs.exported.len(),
             "lines_exported": logs.total_lines(),
             "files_failed": logs.failed.len(),
+            "files_deleted": logs.deleted.len(),
             "unparsable_lines": logs.unparsable_lines,
+            "directory_error": logs.directory_error,
         }),
     }))
 }

@@ -14,9 +14,8 @@ use crate::common::types::Dataset;
 /// noticed. `i32` because it binds directly to `make_interval(days => ...)`, an `int4`.
 pub const RETENTION_DAYS: i32 = 7;
 
-/// Retention must leave enough nights that a silently failed export is noticed before the rows it
-/// missed become unrecoverable. Enforced at compile time rather than in a test, because the failure
-/// mode is someone tuning the constant down, not the code drifting.
+/// Enforced at compile time because the failure mode is someone tuning the constant down, not the
+/// code drifting: too short a window and a silently failed export goes unnoticed.
 const _: () = assert!(RETENTION_DAYS >= 3);
 
 /// Tables the purge owns, in the order it visits them.

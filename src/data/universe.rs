@@ -68,11 +68,9 @@ pub struct Universe {
 impl Universe {
     /// Composes the three filters, all of which are necessary.
     ///
-    /// Alpaca must permit it — active and tradable, and shortable and easy to borrow for anything
-    /// taking the short leg. We must hold bars for it, since a ticker with no history can be neither
-    /// screened for correlation nor hedged. And it must clear the same liquidity thresholds the
-    /// model trained on, because a universe wider than the training population means predicting on
-    /// names the scaler never saw.
+    /// Alpaca must permit it, we must hold bars for it, and it must clear the same liquidity
+    /// thresholds the model trained on — a universe wider than the training population means
+    /// predicting on names the scaler never saw.
     pub fn build(assets: &TradableAssets, liquidity: &[LiquidityRow]) -> Self {
         let mut tickers = Vec::new();
         let mut shortable = HashSet::new();
