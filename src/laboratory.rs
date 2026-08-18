@@ -5,3 +5,5 @@
 pub mod dataset;
 pub mod export;
 pub mod journal;
+pub mod metrics;
+pub mod predictor;
