@@ -183,6 +183,14 @@ impl History<'_> {
 pub trait Predictor {
     fn name(&self) -> &str;
     fn score(&self, history: &History) -> Vec<Option<f64>>;
+
+    /// Whether a score is a return rather than only a place in an ordering.
+    ///
+    /// Directional accuracy compares the two signs, so a score that merely orders names has no
+    /// sign to be right about and the statistic is withheld rather than computed.
+    fn scores_are_returns(&self) -> bool {
+        true
+    }
 }
 
 /// Predicts the previous session's cross-sectional mean for every name alike.
@@ -279,6 +287,13 @@ impl Predictor for RandomRanking {
         "random_ranking"
     }
 
+    /// A uniform draw is positive everywhere, so its directional accuracy would be the share of
+    /// names that rose — a fact about the market reported in the column where the other baselines
+    /// report a forecast, and the highest number in it.
+    fn scores_are_returns(&self) -> bool {
+        false
+    }
+
     fn score(&self, history: &History) -> Vec<Option<f64>> {
         // Abstains where the others do, so every baseline is measured over the same sessions and
         // their coefficients are comparable, which is the only reason a baseline exists.
@@ -319,7 +334,11 @@ pub fn evaluate(predictor: &dyn Predictor, panel: &Panel) -> Evaluation {
             .zip(realized)
             .filter_map(|(score, outcome)| score.zip(*outcome))
             .unzip();
-        sessions.push(metrics::measure_session(&scores, &outcomes));
+        let mut measured = metrics::measure_session(&scores, &outcomes);
+        if !predictor.scores_are_returns() {
+            measured.directional_accuracy = None;
+        }
+        sessions.push(measured);
     }
 
     Evaluation {
@@ -601,6 +620,77 @@ mod tests {
         assert_eq!(
             Panel::from_frame(&narrow).unwrap().returns_at(0),
             &[Some(2.0)]
+        );
+    }
+
+    /// The whole measurement end to end, on a cross-section whose answer can be read off by hand.
+    ///
+    /// Persistence scores each session with the one before it, so a session that exactly reverses
+    /// its predecessor's order must come back at -1 and one that repeats it at +1. This is the
+    /// contract the DuckDB cross-check compares against: same pairing, same per-session correlation,
+    /// same refusal to measure a session with nothing before it.
+    #[test]
+    fn test_persistence_scores_a_reversal_at_minus_one_and_a_repeat_at_plus_one() {
+        let names = ["AAA", "BBB", "CCC", "DDD"];
+        let by_session = [
+            [0.01, 0.02, 0.03, 0.04],
+            // Reversed against the session before it.
+            [0.04, 0.03, 0.02, 0.01],
+            // And in the same order as the session before it.
+            [0.05, 0.04, 0.03, 0.02],
+        ];
+
+        let mut tickers: Vec<&str> = Vec::new();
+        let mut timestamps: Vec<i64> = Vec::new();
+        let mut returns: Vec<f64> = Vec::new();
+        for (session, row) in by_session.iter().enumerate() {
+            for (name, value) in names.iter().zip(row) {
+                tickers.push(name);
+                timestamps.push(session as i64 * DAY);
+                returns.push(*value);
+            }
+        }
+        let frame = DataFrame::new(vec![
+            Column::new("ticker".into(), tickers),
+            Column::new("timestamp".into(), timestamps),
+            Column::new("daily_return".into(), returns),
+        ])
+        .unwrap();
+
+        let evaluation = evaluate(&Persistence, &Panel::from_frame(&frame).unwrap());
+
+        assert_eq!(evaluation.sessions[0].information_coefficient, None);
+        assert_eq!(evaluation.sessions[1].information_coefficient, Some(-1.0));
+        assert_eq!(evaluation.sessions[2].information_coefficient, Some(1.0));
+        let summarized = evaluation.information_coefficient.unwrap();
+        assert_eq!(summarized.sessions, 2, "the first session has no forecast");
+        assert!(summarized.mean.abs() < 1e-12, "{summarized:?}");
+    }
+
+    /// Measured over the real archive, `random_ranking` reported the highest directional accuracy
+    /// of the four baselines — because a uniform draw is positive everywhere, so the statistic was
+    /// the share of names that rose and had nothing to do with the forecast. It still ranks, so its
+    /// rank correlation stands; only the statistic that reads a sign is withheld.
+    #[test]
+    fn test_a_ranking_score_reports_no_directional_accuracy() {
+        let panel = panel();
+
+        let ranking = evaluate(&RandomRanking { seed: 3 }, &panel);
+        assert!(ranking
+            .sessions
+            .iter()
+            .all(|session| session.directional_accuracy.is_none()));
+        assert_eq!(ranking.directional_accuracy, None);
+        assert!(
+            ranking.sessions[3].information_coefficient.is_some(),
+            "a ranking score still orders names"
+        );
+
+        assert!(
+            evaluate(&Persistence, &panel).sessions[3]
+                .directional_accuracy
+                .is_some(),
+            "a score in return units does have a sign to be right about"
         );
     }
 

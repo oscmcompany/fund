@@ -11,6 +11,8 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::laboratory::dataset::DatasetFingerprint;
+use crate::laboratory::metrics::Distribution;
+use crate::laboratory::predictor::Evaluation;
 
 /// The shape of a laboratory record, versioned independently of the application journal.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -43,6 +45,7 @@ pub enum JournalError {
 )]
 pub enum Observation {
     DatasetBuilt(DatasetBuilt),
+    ForecastScored(ForecastScored),
 }
 
 impl Observation {
@@ -50,6 +53,7 @@ impl Observation {
     pub fn experiment_type(&self) -> &'static str {
         match self {
             Observation::DatasetBuilt(_) => "dataset_built",
+            Observation::ForecastScored(_) => "forecast_scored",
         }
     }
 }
@@ -63,6 +67,31 @@ pub struct DatasetBuilt {
     pub fingerprint: DatasetFingerprint,
     /// The commit this ran from, so a number can be traced to the code that produced it.
     pub revision: Option<String>,
+}
+
+/// What one forecast was worth over one dataset.
+///
+/// Summarized rather than per session: `sessions` is what the panel held and each distribution
+/// counts what it could measure, so a forecast that never ranked reads as absent and not as zero.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ForecastScored {
+    pub predictor: String,
+    pub sessions: usize,
+    pub information_coefficient: Option<Distribution>,
+    pub decile_spread: Option<Distribution>,
+    pub directional_accuracy: Option<Distribution>,
+}
+
+impl From<&Evaluation> for ForecastScored {
+    fn from(evaluation: &Evaluation) -> Self {
+        Self {
+            predictor: evaluation.predictor.clone(),
+            sessions: evaluation.sessions.len(),
+            information_coefficient: evaluation.information_coefficient,
+            decile_spread: evaluation.decile_spread,
+            directional_accuracy: evaluation.directional_accuracy,
+        }
+    }
 }
 
 /// One line of the laboratory journal: an observation with the envelope that addresses it.
@@ -207,6 +236,7 @@ pub fn date_from_file_name(name: &str) -> Option<NaiveDate> {
 mod tests {
     use super::*;
     use crate::common::types::SessionDate;
+    use crate::laboratory::metrics::SessionMetrics;
 
     fn fingerprint() -> DatasetFingerprint {
         DatasetFingerprint {
@@ -226,6 +256,62 @@ mod tests {
             fingerprint: fingerprint(),
             revision: Some("abc1234".to_string()),
         })
+    }
+
+    /// The export partitions on this name, so the two variants must not collide and neither may
+    /// drift from the tag `rename_all` generates for it.
+    #[test]
+    fn test_each_observation_exports_under_its_own_partition() {
+        let forecast = Observation::ForecastScored(ForecastScored {
+            predictor: "persistence".to_string(),
+            sessions: 4,
+            information_coefficient: None,
+            decile_spread: None,
+            directional_accuracy: None,
+        });
+        let value: serde_json::Value = serde_json::to_value(&forecast).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("forecast_scored")
+        );
+        assert_eq!(forecast.experiment_type(), "forecast_scored");
+        assert_ne!(forecast.experiment_type(), observation().experiment_type());
+    }
+
+    /// Two different counts, and conflating them would read a forecast that ranked twice out of
+    /// five hundred sessions as one that ranked throughout.
+    #[test]
+    fn test_a_scored_forecast_separates_the_panel_from_what_it_could_measure() {
+        let measurable = SessionMetrics {
+            information_coefficient: Some(0.02),
+            ..SessionMetrics::default()
+        };
+        let evaluation = Evaluation {
+            predictor: "persistence".to_string(),
+            sessions: vec![
+                SessionMetrics::default(),
+                SessionMetrics::default(),
+                measurable,
+                measurable,
+            ],
+            information_coefficient: Some(Distribution {
+                mean: 0.02,
+                standard_error: 0.0,
+                sessions: 2,
+            }),
+            decile_spread: None,
+            directional_accuracy: None,
+        };
+
+        let record = ForecastScored::from(&evaluation);
+
+        assert_eq!(record.sessions, 4, "every session the panel held");
+        assert_eq!(
+            record.information_coefficient.unwrap().sessions,
+            2,
+            "and only the ones that yielded a reading"
+        );
     }
 
     #[test]
