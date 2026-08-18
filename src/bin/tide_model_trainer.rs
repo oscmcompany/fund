@@ -15,19 +15,16 @@
 use burn::module::AutodiffModule;
 use burn::tensor::backend::Backend;
 use chrono::Utc;
-use polars::prelude::*;
 use tracing::{error, info, warn};
 
 use fund::common::alpaca::{AlpacaCredentials, MarketDataClient};
-use fund::common::aws::date_partitioned_key;
 use fund::common::log::init_tracing;
 use fund::common::massive::MassiveClient;
-use fund::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
-use fund::data::adjust;
+use fund::common::types::SessionDate;
 use fund::data::archive;
-use fund::data::bars;
 use fund::data::details;
-use fund::data::truncate;
+use fund::laboratory::dataset;
+use fund::laboratory::journal as laboratory;
 use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
@@ -35,9 +32,8 @@ use fund::models::tide::configuration::ModelParameters;
 use fund::models::tide::data::{input_feature_size, DatasetKind, TrainingFraction};
 use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
-use fund::models::tide::fit::{filter_training_bars, fit, write_artifact_json};
+use fund::models::tide::fit::write_artifact_json;
 use fund::models::tide::model::TiDEModel;
-use fund::models::tide::predict::consolidate_data;
 use fund::models::tide::train::{train, TrainBackend, TrainConfiguration};
 
 const INPUT_LENGTH: usize = 35;
@@ -93,11 +89,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let now = Utc::now();
     let session = SessionDate::at(now);
 
+    // One identity for every record this run emits, so a later result can be joined back to the
+    // frame it was measured on. A journal that will not open is warned about, never fatal.
+    let run_id = uuid::Uuid::new_v4();
+    let laboratory_journal = match laboratory::Journal::from_env() {
+        Ok(journal) => Some(journal),
+        Err(error) => {
+            warn!(%error, "No laboratory journal; this run is not recorded");
+            None
+        }
+    };
+
     info!(
         bucket,
         artifact_prefix,
         lookback_days,
         %session,
+        %run_id,
         "Starting tide training"
     );
 
@@ -187,63 +195,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => warn!(%error, "No Alpaca credentials; the boundary table is not refreshed"),
     }
 
-    // Fatal where the archive repair above was not: the stored bars are raw, so training without
-    // this table fits a two-for-one split as a genuine fifty percent fall.
-    let splits =
-        match archive::read_partition(&s3_client, &bucket, archive::SPLITS_ARCHIVE_KEY).await? {
-            Some(frame) => adjust::SplitTable::from_dataframe(&frame)?,
-            None => {
-                return Err(format!(
-                    "no splits table at {}; refusing to train on unadjusted prices",
-                    archive::SPLITS_ARCHIVE_KEY
-                )
-                .into())
-            }
-        };
-
-    // Not fatal where the splits table is: an absent boundary table costs a guard on a handful of
-    // names, where an absent splits table makes every price wrong by whole factors.
-    let boundaries = match archive::read_partition(
-        &s3_client,
-        &bucket,
-        archive::BOUNDARIES_ARCHIVE_KEY,
-    )
-    .await?
-    {
-        Some(frame) => truncate::BoundaryTable::from_dataframe(&frame)?,
-        None => {
-            warn!(
-                key = archive::BOUNDARIES_ARCHIVE_KEY,
-                "No boundary table in the archive; training on unbounded series"
-            );
-            truncate::BoundaryTable::default()
-        }
-    };
-
-    let equity_bars = load_archived_bars(
-        &s3_client,
-        &bucket,
-        lookback_days,
-        session,
-        &splits,
-        &boundaries,
-    )
-    .await?;
-    info!(rows = equity_bars.height(), "Loaded equity bars from S3");
-
-    let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
-    info!(rows = equity_details.height(), "Loaded equity details");
-
-    let consolidated = consolidate_data(equity_bars, equity_details)?;
-    let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
-    info!(rows = filtered.height(), "Consolidated and filtered");
-
     // The same fraction reaches preprocessing and windowing, because the scaler is fitted on the
     // rows at or before its cutoff. Passing one value here and another below would fit statistics
     // over a window other than the one the model trains on.
     let training_fraction = TrainingFraction::new(TRAINING_FRACTION)?;
 
-    let fit_result = fit(filtered, training_fraction)?;
+    let prepared = dataset::build(
+        &s3_client,
+        &bucket,
+        lookback_days,
+        session,
+        training_fraction,
+    )
+    .await?;
+    let fingerprint = prepared.fingerprint;
+    let fit_result = prepared.fit;
+    info!(
+        rows = fingerprint.rows,
+        tickers = fingerprint.tickers,
+        "Prepared the training frame"
+    );
+
+    if let Some(journal) = laboratory_journal.as_ref() {
+        journal
+            .record(
+                run_id,
+                now,
+                laboratory::Observation::DatasetBuilt(laboratory::DatasetBuilt {
+                    fingerprint,
+                    revision: std::env::var("FUND_REVISION").ok(),
+                }),
+            )
+            .await;
+    }
 
     let train_dataset = fit_result.data.get_dataset(
         DatasetKind::Train(training_fraction),
@@ -542,75 +526,6 @@ fn training_configuration() -> Result<TrainConfiguration, Box<dyn std::error::Er
 /// a request for one is a guaranteed 404 — about a hundred of them per run. Skipping them here uses
 /// the same predicate the archive scan does, which is what keeps reader and writer agreeing about
 /// which days the archive can hold at all.
-async fn load_archived_bars(
-    s3_client: &aws_sdk_s3::Client,
-    bucket: &str,
-    lookback_days: i64,
-    session: SessionDate,
-    splits: &adjust::SplitTable,
-    boundaries: &truncate::BoundaryTable,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    let end_date = session;
-    let start_date = end_date.plus_calendar_days(-lookback_days);
-
-    let mut frames: Vec<LazyFrame> = Vec::new();
-    let mut unreadable = 0usize;
-    let mut date = start_date;
-    while date <= end_date {
-        if date.is_weekend() {
-            date = date.plus_calendar_days(1);
-            continue;
-        }
-        let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
-        if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
-            match bars::project_bar_frame(frame) {
-                Ok(projected) => frames.push(projected.lazy()),
-                Err(error) => {
-                    unreadable += 1;
-                    warn!(key, %error, "Skipping a partition the training schema cannot read");
-                }
-            }
-        }
-        date = date.plus_calendar_days(1);
-    }
-
-    if frames.is_empty() {
-        return Err("No equity-bar parquet files found in the lookback window".into());
-    }
-    if unreadable > 0 {
-        warn!(
-            unreadable,
-            loaded = frames.len(),
-            "Some partitions were skipped; training on the rest"
-        );
-    }
-    // Stepping over a bad partition is the point of the projection, but stepping over most of them
-    // is a different event wearing the same clothes. The sample-count guards downstream only catch a
-    // window that collapsed entirely; this catches one that quietly lost half its history and would
-    // otherwise publish a model trained on the remainder.
-    if unreadable > frames.len() {
-        return Err(format!(
-            "{unreadable} partitions could not be read against {} that could; refusing to train on \
-             the remainder",
-            frames.len()
-        )
-        .into());
-    }
-    // Folded once over the concatenated window rather than per partition: the factor depends on
-    // where a bar sits relative to today, not on which file it came out of.
-    // Stitched, bounded, then folded, in the order the PostgreSQL loader uses and for the same
-    // reasons: the stitch rescues the bars truncation would drop, and the fold keys on the symbol a
-    // bar carries after both.
-    let stitched =
-        truncate::stitch_bars(concat(frames, UnionArgs::default())?.collect()?, boundaries)?;
-    let bounded = truncate::truncate_bars(stitched, boundaries, session)?;
-    Ok(adjust::adjust_bars(
-        bounded,
-        &splits.following_renames(boundaries),
-        session,
-    )?)
-}
-
 /// The bar columns training consumes, in the types [`fund::data::bars::bars_to_dataframe`] writes.
 ///
 /// Deliberately a subset of what the archive holds: `bar_interval` and `transactions` are written
@@ -802,78 +717,5 @@ mod tests {
             .and_then(|(_, tail)| tail.trim_end_matches('.').parse().ok())
             .expect("the rejection must end with a suggested day count");
         assert!(validate_lookback_window(suggested, session).is_ok());
-    }
-
-    /// A partition written before `bar_interval` joined the frame, and one written after. Both must
-    /// project to the same schema, because `concat` rejects the window when one member differs.
-    #[test]
-    fn test_partitions_from_either_writer_project_to_one_schema() {
-        let legacy = df![
-            "ticker" => ["AAPL"],
-            "timestamp" => [1_724_000_000_000i64],
-            "open_price" => [100.0],
-            "high_price" => [101.0],
-            "low_price" => [99.0],
-            "close_price" => [100.5],
-            "volume" => [1_000i64],
-            "volume_weighted_average_price" => [100.2],
-        ]
-        .unwrap();
-        let current = df![
-            "ticker" => ["AAPL"],
-            "bar_interval" => ["one_day"],
-            "timestamp" => [1_724_086_400_000i64],
-            "open_price" => [100.5],
-            "high_price" => [102.0],
-            "low_price" => [100.0],
-            "close_price" => [101.5],
-            "volume" => [1_100i64],
-            "volume_weighted_average_price" => [101.0],
-            "transactions" => [42i64],
-        ]
-        .unwrap();
-
-        let legacy = bars::project_bar_frame(legacy).unwrap();
-        let current = bars::project_bar_frame(current).unwrap();
-        assert_eq!(legacy.schema(), current.schema());
-
-        let combined = concat([legacy.lazy(), current.lazy()], UnionArgs::default())
-            .unwrap()
-            .collect()
-            .unwrap();
-        assert_eq!(combined.height(), 2);
-    }
-
-    /// A column of the right name but the wrong type is refused rather than nulled.
-    ///
-    /// The non-strict cast would accept this and leave `clean_data` to drop the rows much later,
-    /// reporting a thin session instead of a corrupt partition.
-    #[test]
-    fn test_a_partition_with_an_uncastable_column_is_refused() {
-        let frame = df![
-            "ticker" => ["AAPL"],
-            "timestamp" => [1_724_000_000_000i64],
-            "open_price" => ["not a number"],
-            "high_price" => [101.0],
-            "low_price" => [99.0],
-            "close_price" => [100.5],
-            "volume" => [1_000i64],
-            "volume_weighted_average_price" => [100.2],
-        ]
-        .unwrap();
-        assert!(bars::project_bar_frame(frame).is_err());
-    }
-
-    /// A partition genuinely missing a price column is skipped, not silently null-filled — the
-    /// caller counts the skip and trains on the rest.
-    #[test]
-    fn test_a_partition_missing_a_price_column_is_refused() {
-        let frame = df![
-            "ticker" => ["AAPL"],
-            "timestamp" => [1_724_000_000_000i64],
-            "open_price" => [100.0],
-        ]
-        .unwrap();
-        assert!(bars::project_bar_frame(frame).is_err());
     }
 }
