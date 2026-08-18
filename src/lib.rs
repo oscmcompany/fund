@@ -8,5 +8,6 @@ pub mod common;
 pub mod dashboard;
 pub mod data;
 pub mod handlers;
+pub mod laboratory;
 pub mod models;
 pub mod portfolio;
