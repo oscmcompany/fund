@@ -434,6 +434,47 @@ pub(crate) fn split_at_cutoff(
 ///
 /// `predict_mode` keeps only the final window per ticker; `with_targets`
 /// additionally extracts the future `daily_return` window as the target.
+/// Maps every session the frame holds to its position in the sorted set of them.
+///
+/// Adjacency is read off the sessions present rather than a trading calendar, which is both what
+/// keeps this module free of one and what makes a session the archive never fetched count as a gap
+/// instead of a silent splice. It holds because the frame spans the whole universe: some
+/// instrument traded on every session the archive has.
+fn session_ranks(data: &DataFrame) -> Result<HashMap<i64, usize>, TideError> {
+    let mut sessions: Vec<i64> = data
+        .column("timestamp")?
+        .i64()?
+        .into_no_null_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    sessions.sort_unstable();
+    Ok(sessions
+        .into_iter()
+        .enumerate()
+        .map(|(rank, timestamp)| (timestamp, rank))
+        .collect())
+}
+
+/// One ticker's rows as session positions, in row order.
+fn ticker_sessions(
+    ticker_data: &DataFrame,
+    ranks: &HashMap<i64, usize>,
+) -> Result<Vec<usize>, TideError> {
+    ticker_data
+        .column("timestamp")?
+        .i64()?
+        .into_no_null_iter()
+        .map(|timestamp| {
+            ranks.get(&timestamp).copied().ok_or_else(|| {
+                TideError::Data(format!(
+                    "timestamp {timestamp} is not a session of this frame"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn window_frame(
     frame: &DataFrame,
     input_length: usize,
@@ -442,6 +483,7 @@ fn window_frame(
     with_targets: bool,
 ) -> Result<TrainingDataset, TideError> {
     let window_size = input_length + output_length;
+    let ranks = session_ranks(frame)?;
     let continuous_feature_count = CONTINUOUS_COLUMNS.len();
     let categorical_feature_count = CATEGORICAL_COLUMNS.len();
     let static_feature_count = STATIC_CATEGORICAL_COLUMNS.len();
@@ -479,13 +521,22 @@ fn window_frame(
         let categorical_column_values = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
         let static_column_values = get_int_columns(&ticker_data, STATIC_CATEGORICAL_COLUMNS)?;
 
+        let sessions = ticker_sessions(&ticker_data, &ranks)?;
+        // Session positions rise strictly within a ticker, so a window spans exactly its own
+        // length only when every step inside it is one session. A window that fails this teaches
+        // a transition that never happened -- in the archive the widest such splice covers 462
+        // sessions -- and in predict mode it would forecast from one.
+        let is_contiguous = |start: usize| {
+            sessions[start + window_size - 1].saturating_sub(sessions[start]) == window_size - 1
+        };
+
         let windows: Vec<usize> = if predict_mode {
             vec![ticker_data.height() - window_size]
         } else {
             (0..=ticker_data.height() - window_size).collect()
         };
 
-        for start in windows {
+        for start in windows.into_iter().filter(|start| is_contiguous(*start)) {
             let mut past_continuous_window =
                 Vec::with_capacity(input_length * continuous_feature_count);
             for row in start..start + input_length {
@@ -661,13 +712,16 @@ pub(crate) fn append_forecast_session_rows(
 }
 
 pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, TideError> {
-    // Sort by [ticker, timestamp] so daily returns and the downstream windowing
-    // are chronological and contiguous within each ticker, independent of the
-    // order rows arrived in. Each ticker's first row gets a null return; clean_data drops it.
+    // Sort by [ticker, timestamp] so daily returns and the downstream windowing are chronological
+    // within each ticker, independent of the order rows arrived in. Chronological is not
+    // contiguous: sorting cannot conjure a session the frame does not hold, which is why the
+    // return below is measured against `session_ranks` and not against the previous row.
+    // Each ticker's first row gets a null return; clean_data drops it.
     let data = data.sort(
         ["ticker", "timestamp"],
         SortMultipleOptions::default().with_maintain_order(true),
     )?;
+    let ranks = session_ranks(&data)?;
 
     let timestamps = data.column("timestamp")?;
     let height = data.height();
@@ -725,8 +779,15 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, TideError>
         month.push(date.month() as i32);
         year.push(date.year());
 
-        let same_ticker = index > 0 && tickers[index] == tickers[index - 1];
-        if same_ticker && close_prices[index - 1] != 0.0 {
+        // A *daily* return or nothing. Measured across a gap it is a multi-session return wearing
+        // a one-session label, and it is the column the model is trained to predict.
+        let follows_previous_session = index > 0
+            && tickers[index] == tickers[index - 1]
+            && ranks
+                .get(&timestamp_milliseconds)
+                .zip(ranks.get(&timestamp_values[index - 1]))
+                .is_some_and(|(current, previous)| *current == previous + 1);
+        if follows_previous_session && close_prices[index - 1] != 0.0 {
             daily_return.push(Some(
                 ((close_prices[index] / close_prices[index - 1]) - 1.0) as f32,
             ));
@@ -1399,6 +1460,91 @@ mod tests {
 
     /// Two tickers, two days each, unsorted on input; close prices chosen so
     /// each ticker's second-day return is 0.1.
+    /// One ticker missing four sessions in the middle, alongside one that trades every session.
+    ///
+    /// The dense ticker is what makes the gap visible: session adjacency is read off the sessions
+    /// the frame contains, so a gap is only a gap when some instrument traded through it.
+    fn raw_gapped_frame() -> DataFrame {
+        const DAY: i64 = 86_400_000;
+        let gapped_days: Vec<i64> = vec![0, 1, 2, 3, 8, 9, 10];
+        let dense_days: Vec<i64> = (0..=10).collect();
+
+        let mut tickers: Vec<&str> = vec!["GAPPY"; gapped_days.len()];
+        tickers.extend(vec!["DENSE"; dense_days.len()]);
+
+        let mut timestamps: Vec<i64> = gapped_days.iter().map(|day| day * DAY).collect();
+        timestamps.extend(dense_days.iter().map(|day| day * DAY));
+
+        // Distinct per row, so a window's contents identify the rows it drew from.
+        let closes: Vec<f64> = (0..timestamps.len())
+            .map(|row| 100.0 + row as f64)
+            .collect();
+        let height = timestamps.len();
+
+        DataFrame::new(vec![
+            Column::new("ticker".into(), tickers),
+            Column::new("timestamp".into(), timestamps),
+            Column::new("open_price".into(), vec![1.0_f64; height]),
+            Column::new("high_price".into(), vec![1.0_f64; height]),
+            Column::new("low_price".into(), vec![1.0_f64; height]),
+            Column::new("close_price".into(), closes),
+            Column::new("volume".into(), vec![1.0_f64; height]),
+            Column::new(
+                "volume_weighted_average_price".into(),
+                vec![1.0_f64; height],
+            ),
+            Column::new("sector".into(), vec!["S"; height]),
+            Column::new("industry".into(), vec!["I"; height]),
+        ])
+        .unwrap()
+    }
+
+    /// A return is a *daily* return or it is not the target. Measured across a gap it is a
+    /// multi-session return wearing a one-session label, and the model is trained to predict it.
+    #[test]
+    fn test_engineer_features_nulls_a_return_measured_across_a_session_gap() {
+        let engineered = engineer_features(raw_gapped_frame()).unwrap();
+        let tickers: Vec<String> = engineered
+            .column("ticker")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_no_null_iter()
+            .map(str::to_string)
+            .collect();
+        let returns: Vec<Option<f32>> = engineered
+            .column("daily_return")
+            .unwrap()
+            .f32()
+            .unwrap()
+            .into_iter()
+            .collect();
+
+        // Sorted by [ticker, timestamp]: DENSE days 0..10 occupy rows 0..10, then GAPPY days
+        // 0, 1, 2, 3, 8, 9, 10 occupy rows 11..17. GAPPY's day 8 is row 15.
+        assert_eq!(tickers[15], "GAPPY");
+        assert_eq!(
+            returns[15], None,
+            "GAPPY's day 8 follows its day 3, so its return spans five sessions"
+        );
+        // The rows on either side of the gap are ordinary and must survive.
+        assert!(returns[14].is_some(), "GAPPY day 3 follows day 2");
+        assert!(returns[16].is_some(), "GAPPY day 9 follows day 8");
+    }
+
+    /// A window is 36 consecutive sessions or it teaches a transition that never happened.
+    #[test]
+    fn test_window_frame_skips_a_window_spanning_a_session_gap() {
+        let encoded = prepared_and_encoded(raw_gapped_frame());
+        let dataset = window_frame(&encoded, 2, 1, false, true).unwrap();
+
+        // DENSE keeps days 1..10 after its first row is nulled and dropped: 10 rows, 8 windows of
+        // three, every one contiguous. GAPPY keeps days 1, 2, 3, 9, 10 -- day 0 is its first row
+        // and day 8 is nulled by the gap -- which is 3 windows by index, of which only [1, 2, 3]
+        // is contiguous. [2, 3, 9] and [3, 9, 10] both cross the gap.
+        assert_eq!(dataset.past_continuous.shape()[0], 9);
+    }
+
     fn raw_two_ticker_frame() -> DataFrame {
         DataFrame::new(vec![
             Column::new("ticker".into(), vec!["BBB", "AAA", "BBB", "AAA"]),
