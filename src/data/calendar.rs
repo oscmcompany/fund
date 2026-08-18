@@ -1,16 +1,6 @@
-//! The trading calendar, as Alpaca publishes it.
+//! The trading calendar, as Alpaca publishes it, in Eastern local time throughout.
 //!
-//! Two questions get asked constantly — does the market trade today, and when does it close — and
-//! both are answered from a calendar fetched once and held in memory for the Eastern date. It is
-//! deliberately not persisted: the calendar is reference data Alpaca owns, and a stored copy is
-//! just a second source that can disagree.
-//!
-//! There is deliberately no hardcoded holiday fallback: one cannot express a half-day, and it
-//! would make an unreachable Alpaca look like a normal trading day. **An absent calendar means "do
-//! not trade", not "assume open"** — [`TradingCalendar::is_trading_day`] answers `false` outside
-//! its horizon.
-//!
-//! Everything here is Eastern local time, because that is the timezone the trading day actually has.
+//! Never persisted: it is reference data Alpaca owns, and a stored copy is a second source.
 
 use std::collections::BTreeMap;
 

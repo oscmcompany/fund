@@ -1,11 +1,6 @@
 //! TiDE model artifacts: written on the trainer, read on the application.
 //!
-//! Nothing orders the write against the read — the trainer has no database. Running a session
-//! against yesterday's model is normal, reported as the artifact age in the `predictions_completed`
-//! payload rather than as a failure.
-//!
-//! The tar is flat: one entry per file, no directory prefix. Both sides live here because that
-//! format is the only contract between them.
+//! Both sides live here because the flat tar between them is their only contract.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};

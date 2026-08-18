@@ -91,7 +91,7 @@ const MINIMUM_SPREAD_OBSERVATIONS: usize = 2;
 /// the fit identically, and only one of them is fixable by re-fetching.
 ///
 /// Provisional, on the same terms as [`crate::common::alpaca::MAXIMUM_QUOTE_AGE_SECONDS`].
-pub const MAXIMUM_SESSION_LOG_RETURN: f64 = 0.40;
+pub const MAXIMUM_SESSION_LOGARITHMIC_RETURN: f64 = 0.40;
 
 /// Why a symbol could not be screened.
 ///
@@ -102,7 +102,7 @@ pub enum ScreenRejection {
     /// Too short a history, or a close, live price, or prediction that is not a usable number.
     UnusableInput,
     /// One session's move is large enough to dominate the window it sits in.
-    StructuralBreak { log_return: f64, limit: f64 },
+    StructuralBreak { logarithmic_return: f64, limit: f64 },
 }
 
 impl ScreenRejection {
@@ -129,9 +129,12 @@ impl ScreenRejection {
     pub fn detail(&self) -> Option<String> {
         match self {
             ScreenRejection::UnusableInput => None,
-            ScreenRejection::StructuralBreak { log_return, limit } => {
-                Some(format!("log_return={log_return:.4} limit={limit:.4}"))
-            }
+            ScreenRejection::StructuralBreak {
+                logarithmic_return,
+                limit,
+            } => Some(format!(
+                "logarithmic_return={logarithmic_return:.4} limit={limit:.4}"
+            )),
         }
     }
 }
@@ -183,10 +186,12 @@ impl ScreenInput {
         // the spread model, so excluding on it would refuse a name whose history has since settled.
         let window = &closes[closes.len() - CORRELATION_WINDOW_SESSIONS..];
         match worst_session_move(window) {
-            Some(log_return) if log_return.abs() > MAXIMUM_SESSION_LOG_RETURN => {
+            Some(logarithmic_return)
+                if logarithmic_return.abs() > MAXIMUM_SESSION_LOGARITHMIC_RETURN =>
+            {
                 return Err(ScreenRejection::StructuralBreak {
-                    log_return,
-                    limit: MAXIMUM_SESSION_LOG_RETURN,
+                    logarithmic_return,
+                    limit: MAXIMUM_SESSION_LOGARITHMIC_RETURN,
                 });
             }
             Some(_) | None => {}
@@ -479,8 +484,10 @@ pub fn score_candidates(inputs: &[ScreenInput]) -> Vec<PairCandidate> {
                 continue;
             }
 
-            let correlation =
-                pearson_correlation(&log_returns(first.window()), &log_returns(second.window()));
+            let correlation = pearson_correlation(
+                &logarithmic_returns(first.window()),
+                &logarithmic_returns(second.window()),
+            );
             let Some(correlation) = correlation else {
                 continue;
             };
@@ -676,7 +683,7 @@ fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, 
 ///
 /// Signed so the recorded detail says which way the series jumped, and largest rather than first so
 /// the number a bound gets calibrated against is the worst one present. Iterates rather than reusing
-/// [`log_returns`], which would collect a vector per ticker on a pass that screens over a thousand.
+/// [`logarithmic_returns`], which would collect a vector per ticker on a pass that screens over a thousand.
 fn worst_session_move(window: &[f64]) -> Option<f64> {
     window
         .windows(2)
@@ -686,7 +693,7 @@ fn worst_session_move(window: &[f64]) -> Option<f64> {
 }
 
 /// Period-over-period log returns. One shorter than its input.
-fn log_returns(prices: &[f64]) -> Vec<f64> {
+fn logarithmic_returns(prices: &[f64]) -> Vec<f64> {
     prices
         .windows(2)
         .filter(|window| window[0] > 0.0 && window[1] > 0.0)
@@ -809,8 +816,11 @@ mod tests {
     #[test]
     fn test_the_fixture_correlates_within_the_screened_band() {
         let (leader, follower) = cointegrated_series(CORRELATION_WINDOW_SESSIONS);
-        let correlation = pearson_correlation(&log_returns(&leader), &log_returns(&follower))
-            .expect("the fixture must correlate");
+        let correlation = pearson_correlation(
+            &logarithmic_returns(&leader),
+            &logarithmic_returns(&follower),
+        )
+        .expect("the fixture must correlate");
         assert!(
             (CORRELATION_MINIMUM..=CORRELATION_MAXIMUM).contains(&correlation),
             "fixture correlation {correlation} is outside [{CORRELATION_MINIMUM}, {CORRELATION_MAXIMUM}]"
@@ -948,8 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn test_log_returns_is_one_shorter_than_its_input() {
-        let returns = log_returns(&[100.0, 110.0, 121.0]);
+    fn test_logarithmic_returns_is_one_shorter_than_its_input() {
+        let returns = logarithmic_returns(&[100.0, 110.0, 121.0]);
         assert_eq!(returns.len(), 2);
         assert!((returns[0] - returns[1]).abs() < 1e-12);
     }
@@ -1062,8 +1072,11 @@ mod tests {
         let first = follower[0];
         let mirrored: Vec<f64> = follower.iter().map(|price| first * first / price).collect();
 
-        let correlation = pearson_correlation(&log_returns(&leader), &log_returns(&mirrored))
-            .expect("the mirrored fixture must correlate");
+        let correlation = pearson_correlation(
+            &logarithmic_returns(&leader),
+            &logarithmic_returns(&mirrored),
+        )
+        .expect("the mirrored fixture must correlate");
         assert!(
             correlation < -CORRELATION_MINIMUM,
             "the fixture must be anti-correlated inside the band's magnitude, got {correlation}"
@@ -1158,10 +1171,10 @@ mod tests {
     }
 
     /// A window holding one persistent level change, the shape a collapse or a split leaves behind.
-    fn window_with_one_move(log_return: f64) -> Vec<f64> {
+    fn window_with_one_move(logarithmic_return: f64) -> Vec<f64> {
         let mut closes = vec![100.0; CORRELATION_WINDOW_SESSIONS];
         for close in closes.iter_mut().skip(CORRELATION_WINDOW_SESSIONS / 2) {
-            *close = 100.0 * log_return.exp();
+            *close = 100.0 * logarithmic_return.exp();
         }
         closes
     }
@@ -1190,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_screen_input_rejects_a_window_containing_a_structural_break() {
-        let breached = MAXIMUM_SESSION_LOG_RETURN + 0.01;
+        let breached = MAXIMUM_SESSION_LOGARITHMIC_RETURN + 0.01;
         let rejection = ScreenInput::new(
             ticker("AAAA"),
             window_with_one_move(-breached),
@@ -1203,11 +1216,18 @@ mod tests {
 
         // The payload, not only the variant: the recorded number is the entire reason the rejection
         // is written down, and a sign flip or a swapped pair reads as a pass against `matches!`.
-        let ScreenRejection::StructuralBreak { log_return, limit } = rejection else {
+        let ScreenRejection::StructuralBreak {
+            logarithmic_return,
+            limit,
+        } = rejection
+        else {
             panic!("expected a structural break, got {rejection:?}");
         };
-        assert!((log_return + breached).abs() < 1e-9, "got {log_return}");
-        assert_eq!(limit, MAXIMUM_SESSION_LOG_RETURN);
+        assert!(
+            (logarithmic_return + breached).abs() < 1e-9,
+            "got {logarithmic_return}"
+        );
+        assert_eq!(limit, 0.40, "the limit reported is the one in schema terms");
     }
 
     /// At the limit exactly, not merely inside it. The comparison is strict, so a move equal to the
@@ -1216,7 +1236,7 @@ mod tests {
     fn test_screen_input_accepts_a_move_at_the_limit() {
         assert!(ScreenInput::new(
             ticker("AAAA"),
-            window_with_one_move(MAXIMUM_SESSION_LOG_RETURN),
+            window_with_one_move(MAXIMUM_SESSION_LOGARITHMIC_RETURN),
             100.0,
             0.01,
             0.9,
@@ -1252,15 +1272,15 @@ mod tests {
         assert_eq!(ScreenRejection::UnusableInput.detail(), None);
 
         let broken = ScreenRejection::StructuralBreak {
-            log_return: -2.28,
-            limit: MAXIMUM_SESSION_LOG_RETURN,
+            logarithmic_return: -2.28,
+            limit: MAXIMUM_SESSION_LOGARITHMIC_RETURN,
         };
         assert_eq!(broken.as_str(), "structural_break");
         // The whole string: the detail exists to be aggregated out of the journal, so the format
         // is the contract and a `contains` check would not notice it drifting.
         assert_eq!(
             broken.detail().expect("a break reports its reading"),
-            format!("log_return=-2.2800 limit={MAXIMUM_SESSION_LOG_RETURN:.4}")
+            format!("logarithmic_return=-2.2800 limit={MAXIMUM_SESSION_LOGARITHMIC_RETURN:.4}")
         );
     }
 

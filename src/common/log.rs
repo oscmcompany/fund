@@ -12,6 +12,16 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 /// The journal is the opposite and lives on its own path for that reason.
 pub const DEFAULT_LOG_DIRECTORY: &str = "/var/log/fund";
 
+/// Where the rolling daily files are written.
+///
+/// Read here rather than at each call site so the writer and [`crate::data::export::export_logs`]
+/// cannot disagree about which directory holds the files being shipped.
+pub fn log_directory() -> std::path::PathBuf {
+    env::var("FUND_LOG_DIRECTORY")
+        .unwrap_or_else(|_| DEFAULT_LOG_DIRECTORY.to_string())
+        .into()
+}
+
 /// Initialize structured JSON tracing for `service`, to stdout at `RUST_LOG` (default `info`) and
 /// to a rolling daily file under `FUND_LOG_DIRECTORY`.
 ///
@@ -35,8 +45,7 @@ pub fn init_tracing(
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     };
 
-    let log_directory =
-        env::var("FUND_LOG_DIRECTORY").unwrap_or_else(|_| DEFAULT_LOG_DIRECTORY.to_string());
+    let log_directory = log_directory();
     let guard = match std::fs::create_dir_all(&log_directory).and_then(|()| {
         RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
@@ -96,8 +105,7 @@ pub fn init_tracing(
 pub fn init_tracing_file_only(log_file: &str, service: &str) -> Option<WorkerGuard> {
     let fund_profile = env::var("FUND_PROFILE").unwrap_or_else(|_| "unknown".to_string());
 
-    let log_directory =
-        env::var("FUND_LOG_DIRECTORY").unwrap_or_else(|_| DEFAULT_LOG_DIRECTORY.to_string());
+    let log_directory = log_directory();
     let guard = match std::fs::create_dir_all(&log_directory).and_then(|()| {
         RollingFileAppender::builder()
             .rotation(Rotation::DAILY)

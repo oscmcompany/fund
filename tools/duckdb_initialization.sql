@@ -172,15 +172,20 @@ FROM read_parquet(
 -- prices it read, the orders it sent, the fills they produced. Joining on it is how a duration
 -- becomes an answer about where the time went.
 --
--- schema_version is 3 or 4; v1 and v2 were development and their objects are gone. Two payload
--- fields changed shape at v4, so a query reaching into either has to branch on the version:
+-- schema_version is 3, 4, or 5; v1 and v2 were development and their objects are gone. Three
+-- payload fields have changed shape, so a query reaching into any of them must branch on the
+-- version:
 --
---   quote_rejection was the bare reason string 'stale_quote' or 'wide_quote'. It is now an object
---   whose 'reason' key holds that same string alongside the reading that produced it --
+--   quote_rejection, at v4, was the bare reason string 'stale_quote' or 'wide_quote'. It is now an
+--   object whose 'reason' key holds that same string alongside the reading that produced it --
 --   age_seconds and limit_seconds for a stale quote, relative_spread and limit for a wide one.
 --   Under v3 the reading is simply gone; there is nothing to recover it from.
 --
---   early_closes[].session_close was 'HH:MM' and is now 'HH:MM:SS'.
+--   early_closes[].session_close, at v4, was 'HH:MM' and is now 'HH:MM:SS'.
+--
+--   The structural-break detail, at v5, spelled its first key 'log_return' and now spells it
+--   'logarithmic_return'. The format is otherwise unchanged, so a query wanting both versions can
+--   match either spelling; the value and the limit beside it mean exactly what they did.
 --
 -- Fields are added within a version as well as across one, and an absent key reads as NULL either
 -- way, so "the build predated this field" and "there was nothing to record" are the same answer.

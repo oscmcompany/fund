@@ -1,11 +1,6 @@
-//! Ticker metadata: sector and industry.
+//! Ticker metadata: sector and industry, which is what makes the screen's sector cap bind.
 //!
-//! The pair screen caps how many legs the book may hold in one sector, so without this every ticker
-//! is uncategorized, the cap binds on nothing, and ten pairs can be one industry bet held ten times.
-//!
-//! Seeded from `data/equity_details.csv`, embedded at compile time so a fresh database needs no
-//! network. Alpaca does not publish sector or industry, so the post-close sync refreshes only
-//! tickers that have appeared or been delisted.
+//! Seeded from a CSV embedded at compile time, because Alpaca publishes neither field.
 
 use std::collections::HashMap;
 

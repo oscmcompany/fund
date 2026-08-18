@@ -13,13 +13,14 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, QuoteRejection};
-use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
+use crate::common::events::Command;
+use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 
 /// Version stamped on every record written by this build.
 ///
 /// Readers map old versions forward rather than rewriting files, so this only ever goes up. What
 /// each version held is documented beside the DuckDB view in `tools/duckdb_initialization.sql`.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Anything that stops a record reaching the disk.
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +65,8 @@ pub enum Observation {
     UniverseRefreshed(UniverseRefreshed),
     CalendarObserved(CalendarObserved),
     JournalExported(JournalExported),
+    DatabaseExported(DatabaseExported),
+    LogsExported(LogsExported),
 }
 
 impl Observation {
@@ -91,6 +94,8 @@ impl Observation {
             Observation::UniverseRefreshed(_) => "universe_refreshed",
             Observation::CalendarObserved(_) => "calendar_observed",
             Observation::JournalExported(_) => "journal_exported",
+            Observation::DatabaseExported(_) => "database_exported",
+            Observation::LogsExported(_) => "logs_exported",
         }
     }
 }
@@ -155,7 +160,7 @@ impl Serialize for CommandOutcome {
 /// the command did, which is what makes the duration attributable.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CommandFinished {
-    pub command: String,
+    pub command: Command,
     pub outcome: CommandOutcome,
     /// Absent for a command that never ran.
     pub duration_milliseconds: Option<u64>,
@@ -826,6 +831,42 @@ pub struct JournalExported {
     pub unparsable_lines: usize,
 }
 
+/// One run of the seal-free ship-delete cycle over the diagnostic logs.
+///
+/// Unlike [`JournalExported`], today's files are still open: what ships is a snapshot the next run
+/// replaces, so a count here rising for the same date is ordinary rather than a duplicate.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct LogsExported {
+    pub files_exported: usize,
+    pub lines_exported: usize,
+    /// How many files did not upload; each stays on local disk for the next run.
+    pub files_failed: usize,
+    /// How many aged out and were deleted, counted per file rather than per date — one service
+    /// ageing out does not carry another's away.
+    pub files_deleted: usize,
+    /// Lines the Parquet does not hold, which keep their file from being deleted.
+    pub unparsable_lines: usize,
+    /// Set when the log directory could not be listed at all, which a count of zero cannot express.
+    pub directory_error: Option<String>,
+}
+
+/// One run of the nightly database export and the purge chained behind it.
+///
+/// The purge is gated on the export being clean, so `rows_purged` being absent while datasets
+/// exported is the skip rather than a failure — `purge_skipped` is what tells the two apart.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DatabaseExported {
+    pub session_date: SessionDate,
+    /// `(dataset, rows)` for each table written to S3.
+    pub exported: Vec<(Dataset, usize)>,
+    /// `(dataset, error)` for each table that did not write.
+    pub failed: Vec<(Dataset, String)>,
+    /// `(dataset, rows)` deleted from PostgreSQL once S3 held them.
+    pub purged: Vec<(Dataset, u64)>,
+    /// True when the export was incomplete and the purge was therefore not attempted.
+    pub purge_skipped: bool,
+}
+
 /// One line of the journal: an observation with the envelope that makes it addressable.
 ///
 /// `session_date` is derived from `timestamp`, so a record cannot be filed under a session it did
@@ -1059,6 +1100,8 @@ mod tests {
                 Observation::UniverseRefreshed(_) => "universe_refreshed",
                 Observation::CalendarObserved(_) => "calendar_observed",
                 Observation::JournalExported(_) => "journal_exported",
+                Observation::DatabaseExported(_) => "database_exported",
+                Observation::LogsExported(_) => "logs_exported",
             }
         }
 
@@ -1084,7 +1127,7 @@ mod tests {
     fn every_observation() -> Vec<Observation> {
         vec![
             Observation::CommandFinished(CommandFinished {
-                command: "portfolio_evaluation".to_string(),
+                command: Command::PortfolioEvaluation,
                 outcome: CommandOutcome::Completed,
                 duration_milliseconds: Some(12),
                 error: None,
@@ -1208,6 +1251,14 @@ mod tests {
                 }],
             }),
             Observation::JournalExported(JournalExported::default()),
+            Observation::DatabaseExported(DatabaseExported {
+                session_date: session(2026, 8, 17),
+                exported: vec![(Dataset::Events, 240)],
+                failed: Vec::new(),
+                purged: vec![(Dataset::Events, 180)],
+                purge_skipped: false,
+            }),
+            Observation::LogsExported(LogsExported::default()),
         ]
     }
 
@@ -1274,7 +1325,7 @@ mod tests {
         );
         let value: Value = serde_json::to_value(&record).expect("record must serialize");
 
-        assert_eq!(value["schema_version"], Value::Number(4.into()));
+        assert_eq!(value["schema_version"], Value::Number(5.into()));
         assert_eq!(value["event_type"], "account_observed");
         assert_eq!(value["session_date"], "2026-08-11");
         assert_eq!(value["timestamp"], "2026-08-11T20:15:00Z");

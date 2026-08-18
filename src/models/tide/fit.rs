@@ -1,9 +1,7 @@
 //! Fit the scaler and categorical mappings from training data, and serialize the artifact JSON
 //! files the inference path loads.
 //!
-//! Categoricals are encoded over sorted-unique values so the mapping is deterministic across runs.
-//!
-//! The scaler and the mappings are deliberately fitted over different row sets; see [`fit`].
+//! Categoricals encode over sorted-unique values, so the mapping is deterministic across runs.
 
 use std::collections::HashSet;
 use std::path::Path;

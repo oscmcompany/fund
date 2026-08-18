@@ -1,17 +1,6 @@
-//! The day's tradable universe.
+//! The day's tradable universe: roughly seven thousand symbols enter and a few hundred survive.
 //!
-//! Three filters compose to produce it, and all three are necessary:
-//!
-//! 1. **Alpaca says we can trade it.** Active, tradable, and — for anything that can take the short
-//!    leg — both shortable and easy to borrow.
-//! 2. **We have price history for it.** A ticker with no bars cannot be screened for correlation or
-//!    hedged, so it cannot enter a pair regardless of what Alpaca allows.
-//! 3. **It is liquid enough to model.** The same thresholds the model trains on, applied per ticker
-//!    average. A universe wider than the training population means predicting on names the scaler
-//!    never saw.
-//!
-//! Roughly seven thousand symbols enter and a few hundred survive, so it is computed once at
-//! pre-open and held for the Eastern date. The universe does not change intraday.
+//! Computed once at pre-open and held for the Eastern date, because it cannot change intraday.
 
 use std::collections::HashSet;
 
@@ -77,10 +66,11 @@ pub struct Universe {
 }
 
 impl Universe {
-    /// Composes the three filters.
+    /// Composes the three filters, all of which are necessary.
     ///
-    /// `assets` is what Alpaca permits, `liquidity` is what our own bar history supports. A ticker
-    /// must appear in both, and clear the thresholds, to survive.
+    /// Alpaca must permit it, we must hold bars for it, and it must clear the same liquidity
+    /// thresholds the model trained on — a universe wider than the training population means
+    /// predicting on names the scaler never saw.
     pub fn build(assets: &TradableAssets, liquidity: &[LiquidityRow]) -> Self {
         let mut tickers = Vec::new();
         let mut shortable = HashSet::new();

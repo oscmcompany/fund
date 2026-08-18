@@ -1,8 +1,7 @@
 //! Evaluation metrics for a trained TiDE model, computed on the validation set in scaled space.
 //!
-//! CRPS here **sums** pinball loss over quantiles with a non-strict `error >= 0` split, where the
-//! training loss in [`crate::models::tide::loss`] averages with a strict split. The two are
-//! deliberately different.
+//! CRPS here sums pinball loss with a non-strict split where [`crate::models::tide::loss`]
+//! averages with a strict one — deliberately different, not a bug to reconcile.
 
 use burn::backend::NdArray;
 
