@@ -11,15 +11,10 @@ use tracing::warn;
 
 use crate::common::types::{SessionDate, Ticker};
 use crate::data::archive::{read_partition, ArchiveError, BOUNDARIES_ARCHIVE_KEY};
+use crate::data::cache::DailyCache;
 
 /// Column the join threshold is carried on, dropped before the frame is returned.
 const THRESHOLD_COLUMN: &str = "earliest_usable_millis";
-
-/// Renames followed before a chain is declared circular.
-///
-/// A symbol changing hands eight times inside one lookback is not something the feed describes; a
-/// table that pointed a symbol back at itself is, and would otherwise loop forever.
-const RENAME_CHAIN_LIMIT: usize = 8;
 
 /// The boundary dates indexed for lookup, as read from the archive.
 ///
@@ -105,36 +100,21 @@ impl BoundaryTable {
 
     /// The symbol a fact about `ticker` dated `session` belongs to now, if it moved.
     ///
-    /// Follows every rename dated after the session, so a company renamed twice is reached in two
-    /// steps. A rename dated at or before the session is somebody else's: the symbol was free by
-    /// then, and whoever took it is who `ticker` means from that date on.
-    ///
-    /// Used for splits as well as bars, which is what keeps the fold correct across a rename —
-    /// otherwise a stitched bar takes the successor's splits and misses its own, or the reverse.
-    /// A chain that revisits a symbol stops there rather than going round again, keeping the last
-    /// symbol reached: the table is malformed at that point, and the walk so far is still the best
-    /// answer available.
+    /// A rename at or before the floor is somebody else's: the symbol was free by then, and whoever
+    /// took it is who it means from that date on. Needs no cycle guard, because each step moves the
+    /// floor strictly forward over a finite table — so a symbol that leaves and returns resolves to
+    /// itself rather than to the midpoint a visited-set guard stops on.
     pub fn current_symbol(&self, ticker: &str, session: SessionDate) -> Option<String> {
         let mut symbol = ticker.to_string();
-        let mut visited: HashSet<String> = HashSet::from([symbol.clone()]);
-        for _ in 0..RENAME_CHAIN_LIMIT {
-            let Some(successor) = self
-                .renames
-                .get(&symbol)
-                .and_then(|renames| {
-                    renames
-                        .iter()
-                        .filter(|(date, _)| *date > session)
-                        .min_by_key(|(date, _)| *date)
-                })
-                .map(|(_, successor)| successor.clone())
-            else {
-                break;
-            };
-            if !visited.insert(successor.clone()) {
-                break;
-            }
-            symbol = successor;
+        let mut floor = session;
+        while let Some((date, successor)) = self.renames.get(&symbol).and_then(|renames| {
+            renames
+                .iter()
+                .filter(|(date, _)| *date > floor)
+                .min_by_key(|(date, _)| *date)
+        }) {
+            floor = *date;
+            symbol = successor.clone();
         }
 
         (symbol != ticker).then_some(symbol)
@@ -152,7 +132,7 @@ impl BoundaryTable {
 /// falls on a session, so it cannot start applying part-way through one.
 #[derive(Default)]
 pub struct BoundaryTableCache {
-    inner: tokio::sync::Mutex<Option<(SessionDate, Arc<BoundaryTable>)>>,
+    inner: DailyCache<Option<Arc<BoundaryTable>>>,
 }
 
 impl BoundaryTableCache {
@@ -164,32 +144,31 @@ impl BoundaryTableCache {
     ///
     /// Absent is reported rather than flattened to an empty table, because the two mean opposite
     /// things: empty says no symbol changed hands, missing says nothing is known about whether one
-    /// did. An absent object is not cached, so the next pass retries it.
+    /// did. Only the absence is refused by the cache — an empty table is a real answer.
     pub async fn get(
         &self,
         s3_client: &aws_sdk_s3::Client,
         bucket: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<Arc<BoundaryTable>>, ArchiveError> {
-        let today = SessionDate::at(now);
-
-        if let Some((cached_date, table)) = self.inner.lock().await.as_ref() {
-            if *cached_date == today {
-                return Ok(Some(Arc::clone(table)));
-            }
-        }
-
-        let Some(frame) = read_partition(s3_client, bucket, BOUNDARIES_ARCHIVE_KEY).await? else {
-            warn!(
-                key = BOUNDARIES_ARCHIVE_KEY,
-                "No boundary table in the archive; series cannot be bounded"
-            );
-            return Ok(None);
-        };
-
-        let table = Arc::new(BoundaryTable::from_dataframe(&frame)?);
-        *self.inner.lock().await = Some((today, Arc::clone(&table)));
-        Ok(Some(table))
+        self.inner
+            .get(
+                SessionDate::at(now),
+                || async {
+                    let Some(frame) =
+                        read_partition(s3_client, bucket, BOUNDARIES_ARCHIVE_KEY).await?
+                    else {
+                        warn!(
+                            key = BOUNDARIES_ARCHIVE_KEY,
+                            "No boundary table in the archive; series cannot be bounded"
+                        );
+                        return Ok(None);
+                    };
+                    Ok(Some(Arc::new(BoundaryTable::from_dataframe(&frame)?)))
+                },
+                |table| table.is_some(),
+            )
+            .await
     }
 }
 
@@ -485,19 +464,69 @@ mod tests {
         );
     }
 
-    /// A table pointing a symbol back at itself is malformed rather than impossible, and would
-    /// otherwise be followed forever.
+    /// Each step moves the date floor strictly forward over a finite table, so the walk terminates
+    /// on its own and needs no length bound. Nine links is past the fixed limit this used to carry,
+    /// which stopped one short and returned a symbol the company had already left.
     #[test]
-    fn test_a_circular_rename_terminates() {
+    fn test_a_chain_longer_than_the_old_bound_reaches_its_end() {
+        let rows = [
+            ("TA", "2026-01-01", Some("TB")),
+            ("TB", "2026-02-01", Some("TC")),
+            ("TC", "2026-03-01", Some("TD")),
+            ("TD", "2026-04-01", Some("TE")),
+            ("TE", "2026-05-01", Some("TF")),
+            ("TF", "2026-06-01", Some("TG")),
+            ("TG", "2026-07-01", Some("TH")),
+            ("TH", "2026-08-01", Some("TI")),
+            ("TI", "2026-09-01", Some("TJ")),
+        ];
+
+        assert_eq!(
+            renamed_table(&rows).current_symbol("TA", session("2025-01-01")),
+            Some("TJ".to_string()),
+            "nine links, one past the bound this used to carry"
+        );
+    }
+
+    /// A symbol that leaves and comes back belongs to itself, not to the symbol it passed through.
+    ///
+    /// The live shape, taken from the boundary table: a reverse split moves `LGMK` to `LGMKD` on
+    /// 2025-10-28 and back on 2025-11-25, and nine other pairs did the same in the last year. A
+    /// visited-set guard stopped on `LGMKD` — a symbol that has not traded since — and every bar
+    /// before the split was relabelled onto it and then truncated away.
+    #[test]
+    fn test_a_symbol_that_leaves_and_returns_resolves_to_itself() {
+        let table = renamed_table(&[
+            ("LGMK", "2025-10-28", Some("LGMKD")),
+            ("LGMKD", "2025-11-25", Some("LGMK")),
+        ]);
+
+        assert_eq!(
+            table.current_symbol("LGMK", session("2025-10-01")),
+            None,
+            "the company ended where it started, so the bar does not move"
+        );
+        assert_eq!(
+            table.current_symbol("LGMKD", session("2025-11-01")),
+            Some("LGMK".to_string()),
+            "a bar stamped while it traded as LGMKD does move"
+        );
+    }
+
+    /// Termination is the date order, not a guard: a table pointing a symbol back at itself with no
+    /// later rename simply runs out of steps.
+    #[test]
+    fn test_a_rename_back_to_the_origin_terminates() {
         let table = renamed_table(&[
             ("AAA", "2026-03-01", Some("BBB")),
             ("BBB", "2026-05-01", Some("AAA")),
         ]);
 
+        assert_eq!(table.current_symbol("AAA", session("2026-01-05")), None);
         assert_eq!(
-            table.current_symbol("AAA", session("2026-01-05")),
-            Some("BBB".to_string()),
-            "the walk stops where the cycle closes rather than going round again"
+            table.current_symbol("AAA", session("2026-04-01")),
+            None,
+            "the outbound rename is already behind the floor"
         );
     }
 
@@ -610,12 +639,16 @@ mod tests {
         let followed = splits.following_renames(&boundaries);
 
         assert_eq!(
-            followed.factor_at("RNAM", session("2026-02-01"), session("2026-08-15")),
+            followed
+                .factor_at("RNAM", session("2026-02-01"), session("2026-08-15"))
+                .value(),
             0.5,
             "the pre-rename split follows the company onto its new symbol"
         );
         assert_eq!(
-            followed.factor_at("RNA", session("2026-03-01"), session("2026-08-15")),
+            followed
+                .factor_at("RNA", session("2026-03-01"), session("2026-08-15"))
+                .value(),
             0.25,
             "the post-rename split stays with whoever holds the old symbol now"
         );

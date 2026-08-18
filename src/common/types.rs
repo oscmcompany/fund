@@ -309,9 +309,8 @@ impl SessionDate {
     /// This session shifted by whole **calendar** days.
     ///
     /// Named for the distinction it must not lose: this steps over weekends and holidays, unlike
-    /// [`crate::data::calendar::TradingCalendar::previous_trading_day`] and
-    /// [`crate::data::calendar::TradingCalendar::next_trading_day`], which land on published
-    /// sessions. Used to bound fetch ranges, where overshooting is free.
+    /// [`crate::data::calendar::TradingCalendar::previous_trading_day`], which lands on a published
+    /// session. Used to bound fetch ranges, where overshooting is free.
     pub fn plus_calendar_days(self, days: i64) -> Self {
         Self(self.0 + Duration::days(days))
     }

@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::common::massive::{MassiveClient, MassiveError};
 use crate::common::types::{BarInterval, EquityBar, SessionDate, Ticker};
 use crate::data::adjust::{self, SplitTable};
+use crate::data::cache::DailyCache;
 use crate::data::truncate::{self, BoundaryTable};
 
 /// Rows per insert chunk.
@@ -425,10 +426,11 @@ pub async fn load_aligned_closes(
             }
         }
         let factor = splits.factor_at(ticker.as_str(), session, as_of);
-        dated_closes
-            .entry(ticker)
-            .or_default()
-            .push((session, row.close_price * factor, own));
+        dated_closes.entry(ticker).or_default().push((
+            session,
+            factor.apply_to_price(row.close_price),
+            own,
+        ));
     }
 
     // Sorted because a stitched series arrives in two runs — the successor's rows and the
@@ -479,7 +481,7 @@ pub async fn load_aligned_closes(
 /// Session-aligned close series, shared by reference because every caller only reads.
 pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
 
-/// The aligned close history, loaded at most once per Eastern date.
+/// The aligned close history, cached per Eastern date.
 ///
 /// Daily bars are written after the close, so this cannot change intraday, and the evaluation pass
 /// needs all of it on every screening pass — seventy-eight times a session.
@@ -488,7 +490,7 @@ pub type AlignedCloses = Arc<HashMap<Ticker, Vec<f64>>>;
 /// universe caches.
 #[derive(Default)]
 pub struct CloseHistoryCache {
-    inner: tokio::sync::Mutex<Option<(SessionDate, AlignedCloses)>>,
+    inner: DailyCache<AlignedCloses>,
 }
 
 impl CloseHistoryCache {
@@ -498,9 +500,9 @@ impl CloseHistoryCache {
 
     /// Returns today's aligned close history, loading it if the cache is cold or stale.
     ///
-    /// Behind an `Arc` because the map is large and every caller only reads it. The lock is
-    /// released before the query and re-taken to store, which lets two cold callers both load; both
-    /// reads are deterministic, so the second store is a harmless overwrite.
+    /// Behind an `Arc` because the map is large and every caller only reads it. Keyed by the Eastern
+    /// date, which is also what the closes were restated onto, so a cache hit can never hand back a
+    /// series adjusted for a different day than it is asked about.
     pub async fn get(
         &self,
         pool: &PgPool,
@@ -511,36 +513,39 @@ impl CloseHistoryCache {
         now: DateTime<Utc>,
     ) -> Result<AlignedCloses, BarsError> {
         let today = SessionDate::at(now);
-
-        if let Some((cached_date, closes)) = self.inner.lock().await.as_ref() {
-            if *cached_date == today {
-                return Ok(Arc::clone(closes));
-            }
-        }
-
-        // Keyed by the Eastern date, which is also what the closes were restated onto, so a cache
-        // hit can never hand back a series adjusted for a different day than it is asked about.
-        let closes = Arc::new(
-            load_aligned_closes(pool, bar_interval, sessions, splits, boundaries, today).await?,
-        );
-        if !closes.is_empty() {
-            *self.inner.lock().await = Some((today, Arc::clone(&closes)));
-        }
-        Ok(closes)
+        self.inner
+            .get(
+                today,
+                || async {
+                    Ok(Arc::new(
+                        load_aligned_closes(
+                            pool,
+                            bar_interval,
+                            sessions,
+                            splits,
+                            boundaries,
+                            today,
+                        )
+                        .await?,
+                    ))
+                },
+                |closes| !closes.is_empty(),
+            )
+            .await
     }
 
     /// Replaces the cached history. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, closes: HashMap<Ticker, Vec<f64>>) {
-        *self.inner.lock().await = Some((SessionDate::at(now), Arc::new(closes)));
+        self.inner
+            .install(SessionDate::at(now), Arc::new(closes))
+            .await;
     }
 
     /// Drops the cached history so the next caller reloads it.
     ///
-    /// Used after the post-close bar sync, whose new rows the cached window predates. Clearing is
-    /// not the same as installing an empty map: an empty map keyed to today would answer "no
-    /// history" for the rest of the Eastern date rather than reloading.
+    /// Used after the post-close bar sync, whose new rows the cached window predates.
     pub async fn invalidate(&self) {
-        *self.inner.lock().await = None;
+        self.inner.invalidate().await;
     }
 }
 

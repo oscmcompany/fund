@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{CalendarDay, ClientError, TradingClient};
 use crate::common::journal::{CalendarObserved, EarlyClose, Journal, Observation};
 use crate::common::types::SessionDate;
+use crate::data::cache::DailyCache;
 
 /// How far forward to fetch published sessions.
 ///
@@ -37,7 +38,7 @@ const HORIZON_DAYS_FORWARD: i64 = 90;
 const HORIZON_DAYS_BACKWARD: i64 = 30;
 
 /// The Eastern wall-clock time at an instant.
-pub fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
+fn eastern_time(instant: DateTime<Utc>) -> NaiveTime {
     instant.with_timezone(&New_York).time()
 }
 
@@ -90,25 +91,6 @@ impl TradingCalendar {
         self.days.get(&date)
     }
 
-    /// Whether the calendar has an opinion about `date` at all.
-    ///
-    /// Distinct from [`TradingCalendar::is_trading_day`]: a date inside the horizon with no session
-    /// is a holiday, while a date outside it is unknown. Both answer `false` to "does it trade",
-    /// but only the second means the calendar needs refreshing.
-    pub fn covers(&self, date: SessionDate) -> bool {
-        match self.horizon() {
-            Some((first, last)) => date >= first && date <= last,
-            None => false,
-        }
-    }
-
-    /// The first and last published dates, if any.
-    pub fn horizon(&self) -> Option<(SessionDate, SessionDate)> {
-        let first = *self.days.keys().next()?;
-        let last = *self.days.keys().next_back()?;
-        Some((first, last))
-    }
-
     /// Every session in the horizon that closes before the usual 16:00 Eastern bell.
     ///
     /// The half-days are the reason the calendar is fetched rather than assumed, so they are named
@@ -141,11 +123,6 @@ impl TradingCalendar {
         self.days.range(..date).next_back().map(|(day, _)| *day)
     }
 
-    /// The next trading day on or after `date`.
-    pub fn next_trading_day(&self, date: SessionDate) -> Option<SessionDate> {
-        self.days.range(date..).next().map(|(day, _)| *day)
-    }
-
     /// Every trading day in an inclusive range.
     pub fn trading_days_in_range(&self, start: SessionDate, end: SessionDate) -> Vec<SessionDate> {
         self.days.range(start..=end).map(|(day, _)| *day).collect()
@@ -168,6 +145,10 @@ impl TradingCalendar {
     }
 
     /// Whether the regular session is open at `instant`.
+    ///
+    /// The only thing that answers this. Alpaca's `/v2/clock` was removed because this calendar
+    /// already knew, and `minutes_until_close` is not a substitute — it says nothing about whether
+    /// the open has happened yet.
     pub fn is_open_at(&self, instant: DateTime<Utc>) -> bool {
         match self.session(SessionDate::at(instant)) {
             Some(session) => {
@@ -179,14 +160,14 @@ impl TradingCalendar {
     }
 }
 
-/// A [`TradingCalendar`] refreshed from Alpaca at most once per Eastern date.
+/// A [`TradingCalendar`] fetched from Alpaca and cached per Eastern date.
 ///
 /// The pre-open handler warms it; anything that finds it cold or stale refreshes on demand, so a
 /// restart mid-session repopulates without waiting for the next morning. Keying on the Eastern date
 /// rather than an elapsed duration means the rollover invalidates without a timer.
 #[derive(Default)]
 pub struct CalendarCache {
-    inner: tokio::sync::Mutex<Option<(SessionDate, TradingCalendar)>>,
+    inner: DailyCache<TradingCalendar>,
 }
 
 impl CalendarCache {
@@ -196,9 +177,8 @@ impl CalendarCache {
 
     /// Returns today's calendar, fetching it if the cache is cold or was filled on an earlier date.
     ///
-    /// The lock is released before the Alpaca call and re-taken only to store the result, so a cold
-    /// fetch does not block every other caller for its duration. Two callers arriving cold may both
-    /// fetch; the request is read-only and the result deterministic, so the duplicate is harmless.
+    /// An empty calendar is returned but never stored: caching one would pin "nothing trades" for
+    /// the rest of the Eastern date, and the next caller should get a real attempt.
     pub async fn get(
         &self,
         client: &TradingClient,
@@ -207,50 +187,50 @@ impl CalendarCache {
         now: DateTime<Utc>,
     ) -> Result<TradingCalendar, ClientError> {
         let today = SessionDate::at(now);
-
-        if let Some((cached_date, calendar)) = self.inner.lock().await.as_ref() {
-            if *cached_date == today {
-                return Ok(calendar.clone());
-            }
-        }
-
         let start = today.plus_calendar_days(-HORIZON_DAYS_BACKWARD);
         let end = today.plus_calendar_days(HORIZON_DAYS_FORWARD);
-        let calendar =
-            TradingCalendar::from_days(client.fetch_calendar(start.date(), end.date()).await?);
 
-        if calendar.is_empty() {
-            // Reported rather than cached: an empty calendar would otherwise pin "nothing trades"
-            // for the rest of the day, and the next caller should get a real attempt.
-            warn!(start = %start, end = %end, "Alpaca published no trading days for the horizon");
-        } else {
-            info!(
-                sessions = calendar.len(),
-                trades_today = calendar.is_trading_day(today),
-                "Trading calendar cached"
-            );
-            *self.inner.lock().await = Some((today, calendar.clone()));
-        }
+        self.inner
+            .get(
+                today,
+                || async {
+                    let calendar = TradingCalendar::from_days(
+                        client.fetch_calendar(start.date(), end.date()).await?,
+                    );
 
-        journal
-            .record(
-                correlation_id,
-                now,
-                Observation::CalendarObserved(CalendarObserved {
-                    horizon_start: start,
-                    horizon_end: end,
-                    sessions: calendar.len(),
-                    trades_today: calendar.is_trading_day(today),
-                    early_closes: calendar.early_closes(),
-                }),
+                    if calendar.is_empty() {
+                        warn!(start = %start, end = %end, "Alpaca published no trading days for the horizon");
+                    } else {
+                        info!(
+                            sessions = calendar.len(),
+                            trades_today = calendar.is_trading_day(today),
+                            "Trading calendar cached"
+                        );
+                    }
+
+                    journal
+                        .record(
+                            correlation_id,
+                            now,
+                            Observation::CalendarObserved(CalendarObserved {
+                                horizon_start: start,
+                                horizon_end: end,
+                                sessions: calendar.len(),
+                                trades_today: calendar.is_trading_day(today),
+                                early_closes: calendar.early_closes(),
+                            }),
+                        )
+                        .await;
+                    Ok(calendar)
+                },
+                |calendar| !calendar.is_empty(),
             )
-            .await;
-        Ok(calendar)
+            .await
     }
 
     /// Replaces the cached calendar. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, calendar: TradingCalendar) {
-        *self.inner.lock().await = Some((SessionDate::at(now), calendar));
+        self.inner.install(SessionDate::at(now), calendar).await;
     }
 }
 
@@ -310,7 +290,6 @@ mod tests {
     #[test]
     fn test_unknown_date_does_not_trade() {
         assert!(!calendar().is_trading_day(date(2030, 1, 2)));
-        assert!(!calendar().covers(date(2030, 1, 2)));
     }
 
     /// An empty calendar must refuse every date rather than defaulting to open.
@@ -318,8 +297,8 @@ mod tests {
     fn test_empty_calendar_refuses_everything() {
         let empty = TradingCalendar::default();
         assert!(!empty.is_trading_day(date(2026, 11, 24)));
-        assert!(!empty.covers(date(2026, 11, 24)));
-        assert_eq!(empty.horizon(), None);
+        assert!(!empty.is_open_at("2026-11-24T16:00:00Z".parse::<DateTime<Utc>>().unwrap()));
+        assert_eq!(empty.previous_trading_day(date(2026, 11, 24)), None);
         assert!(empty.is_empty());
     }
 
@@ -337,19 +316,6 @@ mod tests {
             calendar.previous_trading_day(date(2026, 11, 30)),
             Some(date(2026, 11, 27)),
             "the weekend must be skipped"
-        );
-    }
-
-    #[test]
-    fn test_next_trading_day_is_inclusive_of_today() {
-        let calendar = calendar();
-        assert_eq!(
-            calendar.next_trading_day(date(2026, 11, 26)),
-            Some(date(2026, 11, 27))
-        );
-        assert_eq!(
-            calendar.next_trading_day(date(2026, 11, 27)),
-            Some(date(2026, 11, 27))
         );
     }
 

@@ -100,7 +100,7 @@ pub struct ServiceState {
     calendar_cache: CalendarCache,
     universe_cache: UniverseCache,
     close_history_cache: CloseHistoryCache,
-    /// The splits every stored price is restated against, read once per Eastern date.
+    /// The splits every stored price is restated against, cached per Eastern date.
     split_table_cache: SplitTableCache,
     boundary_table_cache: BoundaryTableCache,
     sizing: SizingParameters,
@@ -684,7 +684,7 @@ async fn handle_market_data_sync(
     }
 
     // Deliberately no universe load. `load_liquidity` builds the universe from averages over
-    // `equity_bars`, so fetching only `universe.symbols()` would mean the sole tickers getting
+    // `equity_bars`, so fetching only the universe's own tickers would mean the sole ones getting
     // fresh bars are the ones already in it. Past `LIQUIDITY_LOOKBACK_DAYS`, nothing outside would
     // have bars in the window and a stock that became liquid could never enter — the universe
     // ratchets closed and can only shrink. Massive's grouped endpoint takes a date rather than a

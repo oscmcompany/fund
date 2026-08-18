@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::common::alpaca::{ClientError, TradableAssets, TradingClient};
 use crate::common::journal::{Journal, Observation, UniverseRefreshed};
 use crate::common::types::{BarInterval, SessionDate, Ticker, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use crate::data::cache::DailyCache;
 
 /// Trailing window over which liquidity is averaged.
 ///
@@ -145,11 +146,6 @@ impl Universe {
     pub fn shortable_count(&self) -> usize {
         self.shortable.len()
     }
-
-    /// The symbols as plain strings, for passing to the snapshot fetch.
-    pub fn symbols(&self) -> Vec<String> {
-        self.tickers.iter().map(Ticker::to_string).collect()
-    }
 }
 
 /// Reads per-ticker average close and volume over the trailing window.
@@ -188,13 +184,13 @@ pub async fn load_liquidity(
         .collect())
 }
 
-/// A [`Universe`] rebuilt at most once per Eastern date.
+/// A [`Universe`] cached per Eastern date.
 ///
 /// Warmed by the pre-open handler and refreshed on demand by anything that finds it cold, so a
 /// restart mid-session repopulates rather than trading an empty universe until the next morning.
 #[derive(Default)]
 pub struct UniverseCache {
-    inner: tokio::sync::Mutex<Option<(SessionDate, Universe)>>,
+    inner: DailyCache<Universe>,
 }
 
 impl UniverseCache {
@@ -205,11 +201,8 @@ impl UniverseCache {
     /// Returns today's universe, rebuilding it if the cache is cold or was filled on an earlier
     /// date.
     ///
-    /// The lock is released before the Alpaca call and the liquidity query, and re-taken only to
-    /// store, so two callers on a cold cache may both rebuild and the later completion wins. Both
-    /// reads are read-only and scoped to one Eastern date, over which the universe does not change,
-    /// so the two rebuilds agree in practice — cheaper than blocking every caller for the duration
-    /// of a cold rebuild. Single-flight coordination would be the fix if that ever stopped holding.
+    /// An empty universe is returned but never stored: it means the Alpaca read or the liquidity
+    /// query came back with nothing, and caching that would leave the session untradable.
     pub async fn get(
         &self,
         client: &TradingClient,
@@ -220,64 +213,62 @@ impl UniverseCache {
     ) -> Result<Universe, UniverseError> {
         let today = SessionDate::at(now);
 
-        if let Some((cached_date, universe)) = self.inner.lock().await.as_ref() {
-            if *cached_date == today {
-                return Ok(universe.clone());
-            }
-        }
+        // Read before the call rather than inside the rebuild, which would re-enter the cache and
+        // hold only because the lock happens to be released across it. `get` writes nothing until
+        // the rebuild returns, so the answer is the same either way.
+        let previous = self.inner.previous().await;
+        self.inner
+            .get(
+                today,
+                || async {
+                    let assets = client.fetch_tradable_assets().await?;
+                    let liquidity = load_liquidity(pool, today).await?;
+                    let universe = Universe::build(&assets, &liquidity);
 
-        let previous = self
-            .inner
-            .lock()
-            .await
-            .as_ref()
-            .map(|(_, universe)| universe.clone());
-        let assets = client.fetch_tradable_assets().await?;
-        let liquidity = load_liquidity(pool, today).await?;
-        let universe = Universe::build(&assets, &liquidity);
+                    info!(
+                        alpaca_tradable = assets.tradable_count(),
+                        with_history = liquidity.len(),
+                        eligible = universe.len(),
+                        shortable = universe.shortable_count(),
+                        "Tradable universe built"
+                    );
 
-        info!(
-            alpaca_tradable = assets.tradable_count(),
-            with_history = liquidity.len(),
-            eligible = universe.len(),
-            shortable = universe.shortable_count(),
-            "Tradable universe built"
-        );
+                    // What entered and what fell out, rather than only the size. A universe that
+                    // holds steady at seven hundred names while churning fifty of them is the case
+                    // a count cannot show.
+                    let (admitted, removed) = match previous {
+                        Some(previous) => (
+                            universe.difference(&previous),
+                            previous.difference(&universe),
+                        ),
+                        None => (Vec::new(), Vec::new()),
+                    };
+                    journal
+                        .record(
+                            correlation_id,
+                            now,
+                            Observation::UniverseRefreshed(UniverseRefreshed {
+                                alpaca_tradable: assets.tradable_count(),
+                                alpaca_shortable: assets.shortable_count(),
+                                liquid: liquidity.iter().filter(|row| row.is_liquid()).count(),
+                                universe_size: universe.len(),
+                                admitted,
+                                removed,
+                                error: None,
+                            }),
+                        )
+                        .await;
 
-        // What entered and what fell out, rather than only the size. A universe that holds steady
-        // at seven hundred names while churning fifty of them is the case a count cannot show.
-        let (admitted, removed) = match previous {
-            Some(previous) => (
-                universe.difference(&previous),
-                previous.difference(&universe),
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        journal
-            .record(
-                correlation_id,
-                now,
-                Observation::UniverseRefreshed(UniverseRefreshed {
-                    alpaca_tradable: assets.tradable_count(),
-                    alpaca_shortable: assets.shortable_count(),
-                    liquid: liquidity.iter().filter(|row| row.is_liquid()).count(),
-                    universe_size: universe.len(),
-                    admitted,
-                    removed,
-                    error: None,
-                }),
+                    Ok(universe)
+                },
+                |universe| !universe.is_empty(),
             )
-            .await;
-
-        if !universe.is_empty() {
-            *self.inner.lock().await = Some((today, universe.clone()));
-        }
-        Ok(universe)
+            .await
     }
 
     /// Replaces the cached universe. Used by tests and by the pre-open warm path.
     pub async fn install(&self, now: DateTime<Utc>, universe: Universe) {
-        *self.inner.lock().await = Some((SessionDate::at(now), universe));
+        self.inner.install(SessionDate::at(now), universe).await;
     }
 }
 
@@ -366,10 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn test_symbols_are_sorted_and_stable() {
+    fn test_tickers_are_sorted_and_stable() {
         let universe =
             Universe::build(&assets(), &[liquid("NVDA"), liquid("AAPL"), liquid("MSFT")]);
-        assert_eq!(universe.symbols(), vec!["AAPL", "MSFT", "NVDA"]);
+        assert_eq!(
+            universe.tickers(),
+            &[ticker("AAPL"), ticker("MSFT"), ticker("NVDA")]
+        );
     }
 
     #[test]

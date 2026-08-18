@@ -11,15 +11,61 @@ use tracing::warn;
 
 use crate::common::types::SessionDate;
 use crate::data::archive::{read_partition, ArchiveError, SPLITS_ARCHIVE_KEY};
+use crate::data::cache::DailyCache;
 use crate::data::truncate::BoundaryTable;
+
+/// A multiplicative factor restating a price onto another session's share basis.
+///
+/// A group under multiplication: [`AdjustmentFactor::IDENTITY`] is the unit, factors over adjacent
+/// intervals compose, and every one is invertible. Construction admits only a finite, strictly
+/// positive value, so a factor in scope is proof it is safe to multiply and divide by rather than a
+/// number the caller has to re-check.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct AdjustmentFactor(f64);
+
+impl AdjustmentFactor {
+    /// The factor that restates nothing, and the answer for a ticker with no split.
+    pub const IDENTITY: AdjustmentFactor = AdjustmentFactor(1.0);
+
+    /// Returns `None` unless `value` is finite and strictly positive.
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(AdjustmentFactor(value))
+    }
+
+    /// The two factors applied in succession.
+    ///
+    /// The group law holds in the reals but `f64` is a partial view of it, so a product of two
+    /// ordinary factors can still leave the representable range. That is the one place composition
+    /// can fail, and it fails here rather than at the divisor.
+    pub fn compose(self, other: Self) -> Option<Self> {
+        AdjustmentFactor::new(self.0 * other.0)
+    }
+
+    /// A price restated onto this basis.
+    pub fn apply_to_price(self, price: f64) -> f64 {
+        price * self.0
+    }
+
+    /// A share count restated onto this basis.
+    ///
+    /// Against the factor rather than with it: a two-for-one halves the price and doubles the
+    /// shares, so a frame that moved both the same way is internally inconsistent.
+    pub fn apply_to_volume(self, volume: i64) -> i64 {
+        (volume as f64 / self.0).round() as i64
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
 
 /// The splits table indexed for lookup, as read from the archive.
 ///
-/// Holds only the ratio and the date, because that is all an adjustment needs — the identifier and
+/// Holds only the factor and the date, because that is all an adjustment needs — the identifier and
 /// provenance answer other questions.
 #[derive(Debug, Clone, Default)]
 pub struct SplitTable {
-    by_ticker: HashMap<String, Vec<(SessionDate, f64)>>,
+    by_ticker: HashMap<String, Vec<(SessionDate, AdjustmentFactor)>>,
 }
 
 impl SplitTable {
@@ -33,7 +79,7 @@ impl SplitTable {
         let splits_from = frame.column("split_from")?.f64()?;
         let splits_to = frame.column("split_to")?.f64()?;
 
-        let mut by_ticker: HashMap<String, Vec<(SessionDate, f64)>> = HashMap::new();
+        let mut by_ticker: HashMap<String, Vec<(SessionDate, AdjustmentFactor)>> = HashMap::new();
         for row in 0..frame.height() {
             let (Some(ticker), Some(execution_date), Some(split_from), Some(split_to)) = (
                 tickers.get(row),
@@ -48,22 +94,19 @@ impl SplitTable {
             };
             // Guarded rather than assumed, because a frame can be read from an object this build
             // did not write. Both sides *and* the quotient: two negatives divide to a plausible
-            // ratio, and two positives can still overflow or underflow to one that is not.
-            if !split_from.is_finite()
-                || !split_to.is_finite()
-                || split_from <= 0.0
-                || split_to <= 0.0
+            // factor, and two positives can still overflow or underflow to one that is not.
+            if AdjustmentFactor::new(split_from).is_none()
+                || AdjustmentFactor::new(split_to).is_none()
             {
                 continue;
             }
-            let ratio = split_from / split_to;
-            if !ratio.is_finite() || ratio <= 0.0 {
+            let Some(factor) = AdjustmentFactor::new(split_from / split_to) else {
                 continue;
-            }
+            };
             by_ticker
                 .entry(ticker.to_string())
                 .or_default()
-                .push((SessionDate::from_date(execution_date), ratio));
+                .push((SessionDate::from_date(execution_date), factor));
         }
 
         Ok(Self { by_ticker })
@@ -77,29 +120,27 @@ impl SplitTable {
     /// carries them months ahead, and applying one would restate today's history onto a basis the
     /// market has not moved to, leaving it incomparable with the live quote it gets screened against.
     ///
-    /// Always a usable factor. Each ratio is finite and positive, but a product of them need not
-    /// be, and an unusable one falls back to 1.0 — the same answer an unknown ticker gets — so no
-    /// caller has to re-check a number it is about to divide by.
-    pub fn factor_at(&self, ticker: &str, session: SessionDate, as_of: SessionDate) -> f64 {
-        let factor: f64 = self
-            .by_ticker
+    /// A composition that leaves the representable range falls back to
+    /// [`AdjustmentFactor::IDENTITY`] — the same answer an unknown ticker gets.
+    pub fn factor_at(
+        &self,
+        ticker: &str,
+        session: SessionDate,
+        as_of: SessionDate,
+    ) -> AdjustmentFactor {
+        self.by_ticker
             .get(ticker)
-            .map(|splits| {
+            .and_then(|splits| {
                 splits
                     .iter()
                     .filter(|(execution_date, _)| {
                         *execution_date > session && *execution_date <= as_of
                     })
-                    .map(|(_, ratio)| ratio)
-                    .product()
+                    .try_fold(AdjustmentFactor::IDENTITY, |accumulated, (_, factor)| {
+                        accumulated.compose(*factor)
+                    })
             })
-            .unwrap_or(1.0);
-
-        if factor.is_finite() && factor > 0.0 {
-            factor
-        } else {
-            1.0
-        }
+            .unwrap_or(AdjustmentFactor::IDENTITY)
     }
 
     /// Re-files each split under the symbol its company trades as now.
@@ -113,16 +154,16 @@ impl SplitTable {
             return self.clone();
         }
 
-        let mut by_ticker: HashMap<String, Vec<(SessionDate, f64)>> = HashMap::new();
+        let mut by_ticker: HashMap<String, Vec<(SessionDate, AdjustmentFactor)>> = HashMap::new();
         for (ticker, splits) in &self.by_ticker {
-            for (execution_date, ratio) in splits {
+            for (execution_date, factor) in splits {
                 let symbol = boundaries
                     .current_symbol(ticker, *execution_date)
                     .unwrap_or_else(|| ticker.clone());
                 by_ticker
                     .entry(symbol)
                     .or_default()
-                    .push((*execution_date, *ratio));
+                    .push((*execution_date, *factor));
             }
         }
 
@@ -141,7 +182,7 @@ impl SplitTable {
 /// start applying part-way through a session.
 #[derive(Default)]
 pub struct SplitTableCache {
-    inner: tokio::sync::Mutex<Option<(SessionDate, Arc<SplitTable>)>>,
+    inner: DailyCache<Option<Arc<SplitTable>>>,
 }
 
 impl SplitTableCache {
@@ -153,36 +194,30 @@ impl SplitTableCache {
     ///
     /// Absent is reported rather than flattened to an empty table, because the two mean opposite
     /// things: empty says no split affects these prices, missing says nothing is known about whether
-    /// one does. An absent object is also not cached, so the next pass retries it.
-    ///
-    /// The lock is released before the S3 read and re-taken to store, like
-    /// [`crate::data::bars::CloseHistoryCache`], so two cold callers may both read; both reads are
-    /// deterministic, and the second store is a harmless overwrite.
+    /// one does. Only the absence is refused by the cache — an empty table is a real answer.
     pub async fn get(
         &self,
         s3_client: &aws_sdk_s3::Client,
         bucket: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<Arc<SplitTable>>, ArchiveError> {
-        let today = SessionDate::at(now);
-
-        if let Some((cached_date, table)) = self.inner.lock().await.as_ref() {
-            if *cached_date == today {
-                return Ok(Some(Arc::clone(table)));
-            }
-        }
-
-        let Some(frame) = read_partition(s3_client, bucket, SPLITS_ARCHIVE_KEY).await? else {
-            warn!(
-                key = SPLITS_ARCHIVE_KEY,
-                "No splits table in the archive; prices cannot be adjusted"
-            );
-            return Ok(None);
-        };
-
-        let table = Arc::new(SplitTable::from_dataframe(&frame)?);
-        *self.inner.lock().await = Some((today, Arc::clone(&table)));
-        Ok(Some(table))
+        self.inner
+            .get(
+                SessionDate::at(now),
+                || async {
+                    let Some(frame) = read_partition(s3_client, bucket, SPLITS_ARCHIVE_KEY).await?
+                    else {
+                        warn!(
+                            key = SPLITS_ARCHIVE_KEY,
+                            "No splits table in the archive; prices cannot be adjusted"
+                        );
+                        return Ok(None);
+                    };
+                    Ok(Some(Arc::new(SplitTable::from_dataframe(&frame)?)))
+                },
+                |table| table.is_some(),
+            )
+            .await
     }
 }
 
@@ -222,18 +257,17 @@ pub fn adjust_bars(
             .f64()?
             .into_iter()
             .zip(&factors)
-            .map(|(price, factor)| price.map(|price| price * factor))
+            .map(|(price, factor)| price.map(|price| factor.apply_to_price(price)))
             .collect();
         adjusted.with_column(scaled.into_series().with_name(name.into()))?;
     }
 
     if let Ok(column) = adjusted.column("volume") {
-        // Against the factor, not with it: a two-for-one halves the price and doubles the shares.
         let scaled: Int64Chunked = column
             .i64()?
             .into_iter()
             .zip(&factors)
-            .map(|(volume, factor)| volume.map(|volume| (volume as f64 / factor).round() as i64))
+            .map(|(volume, factor)| volume.map(|volume| factor.apply_to_volume(volume)))
             .collect();
         adjusted.with_column(scaled.into_series().with_name("volume".into()))?;
     }
@@ -246,17 +280,17 @@ fn bar_factors(
     frame: &DataFrame,
     table: &SplitTable,
     as_of: SessionDate,
-) -> Result<Vec<f64>, PolarsError> {
+) -> Result<Vec<AdjustmentFactor>, PolarsError> {
     let tickers = frame.column("ticker")?.str()?;
     let timestamps = frame.column("timestamp")?.i64()?;
 
     Ok((0..frame.height())
         .map(|row| {
             let (Some(ticker), Some(timestamp)) = (tickers.get(row), timestamps.get(row)) else {
-                return 1.0;
+                return AdjustmentFactor::IDENTITY;
             };
             let Some(instant) = chrono::DateTime::from_timestamp_millis(timestamp) else {
-                return 1.0;
+                return AdjustmentFactor::IDENTITY;
             };
             table.factor_at(ticker, SessionDate::at(instant), as_of)
         })
@@ -299,7 +333,10 @@ mod tests {
 
         let factor = table.factor_at("MNST", session("2026-06-26"), session("2026-08-14"));
 
-        assert!((96.38 * factor - 48.19).abs() < 1e-9, "factor was {factor}");
+        assert!(
+            (factor.apply_to_price(96.38) - 48.19).abs() < 1e-9,
+            "factor was {factor:?}"
+        );
     }
 
     /// `NVDA`'s ten-for-one, the largest recent factor, checked against the same feed. A ratio this
@@ -310,7 +347,10 @@ mod tests {
 
         let factor = table.factor_at("NVDA", session("2024-06-07"), session("2024-08-14"));
 
-        assert!((factor - 0.1).abs() < 1e-12, "factor was {factor}");
+        assert!(
+            (factor.value() - 0.1).abs() < 1e-12,
+            "factor was {factor:?}"
+        );
     }
 
     /// A split executes at the open, so the bar stamped that day already reflects it and applying
@@ -321,11 +361,11 @@ mod tests {
 
         assert_eq!(
             table.factor_at("MNST", session("2026-08-11"), session("2026-08-14")),
-            1.0
+            AdjustmentFactor::IDENTITY
         );
         assert_eq!(
             table.factor_at("MNST", session("2026-08-12"), session("2026-08-14")),
-            1.0,
+            AdjustmentFactor::IDENTITY,
             "a bar after the split needs no restating either"
         );
     }
@@ -339,11 +379,13 @@ mod tests {
 
         assert_eq!(
             table.factor_at("DPU", session("2026-08-01"), session("2026-08-13")),
-            1.0,
+            AdjustmentFactor::IDENTITY,
             "a split that has not executed yet must not touch anything"
         );
         assert_eq!(
-            table.factor_at("DPU", session("2026-08-01"), session("2026-12-18")),
+            table
+                .factor_at("DPU", session("2026-08-01"), session("2026-12-18"))
+                .value(),
             50.0,
             "and must apply once it has"
         );
@@ -359,7 +401,10 @@ mod tests {
 
         let factor = table.factor_at("AAAA", session("2026-01-05"), session("2026-08-13"));
 
-        assert!((factor - 1.0 / 6.0).abs() < 1e-12, "factor was {factor}");
+        assert!(
+            (factor.value() - 1.0 / 6.0).abs() < 1e-12,
+            "factor was {factor:?}"
+        );
     }
 
     #[test]
@@ -368,7 +413,7 @@ mod tests {
 
         let factor = table.factor_at("TGOSY", session("2026-09-01"), session("2026-10-06"));
 
-        assert_eq!(factor, 5.0);
+        assert_eq!(factor.value(), 5.0);
     }
 
     #[test]
@@ -377,7 +422,7 @@ mod tests {
 
         assert_eq!(
             table.factor_at("AAPL", session("2026-06-26"), session("2026-08-14")),
-            1.0
+            AdjustmentFactor::IDENTITY
         );
     }
 
@@ -491,14 +536,16 @@ mod tests {
         let table = SplitTable::from_dataframe(&frame).expect("the table must index");
 
         assert_eq!(
-            table.factor_at("AAAA", session("2026-07-02"), session("2026-08-13")),
+            table
+                .factor_at("AAAA", session("2026-07-02"), session("2026-08-13"))
+                .value(),
             0.5,
             "an ordinary ratio still indexes"
         );
         for skipped in ["BBBB", "CCCC", "DDDD", "EEEE", "FFFF"] {
             assert_eq!(
                 table.factor_at(skipped, session("2026-07-02"), session("2026-08-13")),
-                1.0,
+                AdjustmentFactor::IDENTITY,
                 "{skipped}"
             );
         }
@@ -515,7 +562,7 @@ mod tests {
 
         assert_eq!(
             overflowing.factor_at("AAAA", session("2026-07-02"), session("2026-08-13")),
-            1.0,
+            AdjustmentFactor::IDENTITY,
             "a product past f64 is not a factor to scale prices by"
         );
     }
