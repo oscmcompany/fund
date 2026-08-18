@@ -10,6 +10,7 @@ use crate::models::tide::batch::build_input_tensor;
 use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::TrainingDataset;
 use crate::models::tide::model::TiDEModel;
+use crate::models::tide::TideError;
 
 const EVALUATION_BATCH_SIZE: usize = 4096;
 
@@ -118,7 +119,7 @@ pub fn evaluate(
     model: &TiDEModel<NdArray>,
     dataset: &TrainingDataset,
     parameters: &ModelParameters,
-) -> Result<EvaluationMetrics, Box<dyn std::error::Error>> {
+) -> Result<EvaluationMetrics, TideError> {
     let sample_count = dataset.len();
     let targets = match dataset.targets.as_ref() {
         Some(targets) if sample_count > 0 => targets,
@@ -132,7 +133,8 @@ pub fn evaluate(
         return Ok(EvaluationMetrics::zero());
     }
 
-    crate::models::tide::batch::validate_input_shape(dataset, parameters)?;
+    crate::models::tide::batch::validate_input_shape(dataset, parameters)
+        .map_err(TideError::Artifact)?;
 
     let indices = QuantileIndices::locate(quantiles);
 
@@ -152,7 +154,7 @@ pub fn evaluate(
         let mut values: Vec<f32> = output
             .to_data()
             .to_vec()
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| TideError::Artifact(format!("{error:?}")))?;
         predictions.append(&mut values);
     }
 
@@ -163,15 +165,14 @@ pub fn evaluate(
     // an error the trainer can log rather than as a crash mid-run.
     let expected_predictions = sample_count * output_length * quantile_count;
     if predictions.len() < expected_predictions {
-        return Err(format!(
+        return Err(TideError::Artifact(format!(
             "model returned {} prediction values, expected {} for {} samples x {} horizon x {} quantiles",
             predictions.len(),
             expected_predictions,
             sample_count,
             output_length,
             quantile_count
-        )
-        .into());
+        )));
     }
 
     let mut accumulator = MetricAccumulator::default();

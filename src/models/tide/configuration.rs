@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::models::tide::TideError;
+
 /// The quantile levels `equity_predictions` has columns for, ascending.
 ///
 /// This is a storage contract rather than a modelling preference: the table names its three columns
@@ -35,7 +37,10 @@ impl Default for ModelParameters {
             output_length: 1,
             input_length: 35,
             dropout_rate: 0.1,
-            quantiles: vec![0.1, 0.5, 0.9],
+            // From the constant, not a literal: `validate_quantiles` rejects anything that is not
+            // the served set, so a default spelled separately would make every artifact trained on
+            // it unloadable the moment the two drifted.
+            quantiles: SERVED_QUANTILES.to_vec(),
             huber_delta: 0.5,
         }
     }
@@ -86,21 +91,20 @@ impl ModelParameters {
     /// A zero `output_length` produces no horizon steps, so inference returns an empty set and a
     /// corrupt artifact is indistinguishable from a session with nothing to forecast. Refusing it
     /// here keeps the failure at the boundary where the untrusted file is read.
-    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn load(path: &std::path::Path) -> Result<Self, TideError> {
         let content = std::fs::read_to_string(path)?;
         let parameters: Self = serde_json::from_str(&content)?;
         if parameters.output_length == 0 || parameters.input_length == 0 {
-            return Err(format!(
+            return Err(TideError::Artifact(format!(
                 "Model parameters at {} have a zero window length (input_length {}, output_length {})",
                 path.display(),
                 parameters.input_length,
                 parameters.output_length
-            )
-            .into());
+            )));
         }
-        parameters
-            .validate_quantiles()
-            .map_err(|reason| format!("Model parameters at {}: {reason}", path.display()))?;
+        parameters.validate_quantiles().map_err(|reason| {
+            TideError::Artifact(format!("Model parameters at {}: {reason}", path.display()))
+        })?;
         Ok(parameters)
     }
 
@@ -197,6 +201,9 @@ impl ModelParameters {
 mod tests {
     use super::*;
 
+    /// The default's quantiles must be the served set, or every artifact trained on the default
+    /// fails `validate_quantiles` at load. Pinned to the literal rather than to `SERVED_QUANTILES`,
+    /// so a change to the constant fails here instead of propagating silently.
     #[test]
     fn test_default_parameters() {
         let params = ModelParameters::default();

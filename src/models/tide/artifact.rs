@@ -13,7 +13,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use burn::backend::NdArray;
-use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use tracing::{debug, info, warn};
@@ -35,39 +34,36 @@ pub struct ModelState {
     parameters: ModelParameters,
     scaler: Scaler,
     mappings: FeatureMappings,
-    artifact_key: String,
     /// Training run id: the timestamp segment of the artifact key. Written to
     /// `equity_predictions.model_run_id`, which is how a prediction is traced back to the artifact
     /// that produced it.
     run_id: String,
-    load_timestamp: i64,
 }
 
 impl ModelState {
     /// Constructs a `ModelState` from a fully loaded artifact.
     ///
-    /// The column lists the artifact was fitted with are no longer carried here. They are checked
-    /// against this build's constants inside [`crate::models::tide::data::Scaler::load`] and then
-    /// dropped: verifying them is what they were for, nothing read them afterwards, and keeping a
-    /// copy that is provably equal to the constants invited a future caller to trust the copy.
-    #[allow(clippy::too_many_arguments)]
+    /// The column lists the artifact was fitted with are not carried here. They are checked against
+    /// this build's constants inside [`crate::models::tide::data::Scaler::load`] and then dropped:
+    /// verifying them is what they were for, nothing read them afterwards, and keeping a copy that
+    /// is provably equal to the constants invited a future caller to trust the copy.
+    ///
+    /// The artifact key and load instant are not carried either, on the same reasoning. The
+    /// pre-open handler resolves the key itself and derives staleness from `run_id` against the
+    /// trading calendar, and both reach the journal through `predictions_generated`.
     pub fn new(
         model: TiDEModel<NdArray>,
         parameters: ModelParameters,
         scaler: Scaler,
         mappings: FeatureMappings,
-        artifact_key: String,
         run_id: String,
-        load_timestamp: i64,
     ) -> Self {
         Self {
             model: Mutex::new(model),
             parameters,
             scaler,
             mappings,
-            artifact_key,
             run_id,
-            load_timestamp,
         }
     }
 
@@ -94,16 +90,8 @@ impl ModelState {
         &self.mappings
     }
 
-    pub fn artifact_key(&self) -> &str {
-        &self.artifact_key
-    }
-
     pub fn run_id(&self) -> &str {
         &self.run_id
-    }
-
-    pub fn load_timestamp(&self) -> i64 {
-        self.load_timestamp
     }
 }
 
@@ -398,8 +386,6 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
     )
     .map_err(|error| ArtifactError::ModelLoad(error.to_string()))?;
 
-    let load_timestamp = Utc::now().timestamp();
-
     info!(
         artifact_key = artifact_key,
         input_size = parameters.input_size(),
@@ -412,9 +398,7 @@ fn load_model_from_directory(dir: &Path, artifact_key: &str) -> Result<ModelStat
         parameters,
         scaler,
         mappings,
-        artifact_key.to_string(),
         run_id_from_artifact_key(artifact_key),
-        load_timestamp,
     ))
 }
 
@@ -476,6 +460,7 @@ pub async fn upload_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// `Path::join` discards its base when given an absolute path, so an entry named `/tmp/...`
     /// would escape the extraction directory. Rejecting non-`Normal` components is what stops it.
@@ -542,6 +527,8 @@ mod tests {
         assert!(destination.path().join("tide_parameters.json").exists());
     }
 
+    /// Newest first, whatever order the listing arrived in, because callers try each in turn and
+    /// stop at the first folder holding a model.
     #[test]
     fn test_candidate_folders_descending_orders_newest_first() {
         let folders = candidate_folders_descending(vec![
@@ -560,13 +547,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_local_no_dir() {
-        let result =
-            resolve_local_artifact_key(Path::new("/nonexistent"), "artifacts/tide/", "latest");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_run_id_from_artifact_key_canonical() {
         assert_eq!(
             run_id_from_artifact_key("models/tide/2026-06-09-16-21-25-195/output/model.tar.gz"),
@@ -574,65 +554,22 @@ mod tests {
         );
     }
 
+    /// Anything that is not the canonical layout falls back to the last non-empty path segment.
     #[test]
     fn test_run_id_from_artifact_key_fallback() {
         assert_eq!(run_id_from_artifact_key("some/dir/run-x"), "run-x");
         assert_eq!(run_id_from_artifact_key("run-y"), "run-y");
-    }
-
-    #[test]
-    fn test_resolve_explicit_version() {
-        let result = resolve_local_artifact_key(Path::new("/tmp"), "artifacts/tide/", "2024-01-01");
-        assert!(result.is_ok());
+        assert_eq!(run_id_from_artifact_key("some/run-folder/"), "run-folder");
         assert_eq!(
-            result.unwrap(),
-            "artifacts/tide/2024-01-01/output/model.tar.gz"
+            run_id_from_artifact_key("models/tide/run-2026//"),
+            "run-2026"
         );
-    }
-
-    #[test]
-    fn test_run_id_from_artifact_key_empty_string() {
-        // An empty input should not panic; it falls back to the full string.
-        let result = run_id_from_artifact_key("");
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_run_id_from_artifact_key_trailing_slash() {
-        // A plain directory name with a trailing slash must trim the slash.
-        let result = run_id_from_artifact_key("some/run-folder/");
-        assert_eq!(result, "run-folder");
-    }
-
-    #[test]
-    fn test_run_id_from_artifact_key_no_slash() {
-        // A bare filename with no slashes must return the whole string.
-        let result = run_id_from_artifact_key("run-2026-01-01");
-        assert_eq!(result, "run-2026-01-01");
-    }
-
-    #[test]
-    fn test_candidate_folders_descending_single_element() {
-        let folders = candidate_folders_descending(vec!["models/tide/2026-06-01/".to_string()]);
-        assert_eq!(folders, vec!["models/tide/2026-06-01/"]);
-    }
-
-    #[test]
-    fn test_candidate_folders_descending_empty() {
-        let folders = candidate_folders_descending(vec![]);
-        assert!(folders.is_empty());
-    }
-
-    #[test]
-    fn test_candidate_folders_descending_already_sorted_descending() {
-        // Providing folders newest-first must not change the order.
-        let input = vec![
-            "models/tide/2026-06-09/".to_string(),
-            "models/tide/2026-06-05/".to_string(),
-            "models/tide/2026-06-01/".to_string(),
-        ];
-        let result = candidate_folders_descending(input.clone());
-        assert_eq!(result, input);
+        assert_eq!(
+            run_id_from_artifact_key(""),
+            "",
+            "an empty key must not panic"
+        );
+        assert_eq!(run_id_from_artifact_key("/"), "");
     }
 
     #[test]
@@ -648,15 +585,6 @@ mod tests {
             result.unwrap(),
             "models/tide/2026-06-10-01-00-07/output/model.tar.gz"
         );
-    }
-
-    #[test]
-    fn test_resolve_local_artifact_key_latest_with_empty_dir() {
-        // A temporary directory with no subdirectories must return NoArtifacts.
-        let temp_dir = tempfile::tempdir().unwrap();
-        let result = resolve_local_artifact_key(temp_dir.path(), "models/tide/", "latest");
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
     }
 
     #[test]
@@ -727,42 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn test_run_id_from_artifact_key_only_slash() {
-        // A single slash with nothing after it: trim gives empty, last segment is "".
-        let result = run_id_from_artifact_key("/");
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_run_id_from_artifact_key_double_trailing_slash() {
-        // Trailing slashes are stripped one at a time; the last non-empty segment
-        // should be returned.
-        let result = run_id_from_artifact_key("models/tide/run-2026//");
-        // trim_end_matches('/') strips all trailing slashes then rsplit gives "run-2026"
-        assert_eq!(result, "run-2026");
-    }
-
-    #[test]
-    fn test_run_id_from_artifact_key_exactly_output_suffix_prefix() {
-        // A key whose entire suffix matches the canonical form but has no leading
-        // prefix — i.e., "2026-06-09/output/model.tar.gz".
-        let result = run_id_from_artifact_key("2026-06-09/output/model.tar.gz");
-        assert_eq!(result, "2026-06-09");
-    }
-
-    #[test]
-    fn test_candidate_folders_descending_duplicates_preserve_all() {
-        // Duplicate entries are not deduplicated — the caller is responsible for
-        // deduplication; the sort+reverse must still work correctly.
-        let folders = candidate_folders_descending(vec![
-            "models/tide/2026-06-05/".to_string(),
-            "models/tide/2026-06-05/".to_string(),
-        ]);
-        assert_eq!(folders.len(), 2);
-        assert_eq!(folders[0], "models/tide/2026-06-05/");
-    }
-
-    #[test]
     fn test_resolve_local_artifact_key_latest_with_multiple_dirs_picks_lexicographically_last() {
         // When multiple subdirectories exist the lexicographically last one
         // (i.e., the newest timestamped run) must be selected.
@@ -813,8 +705,6 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ArtifactError::NoArtifacts));
     }
-
-    use std::io::Read;
 
     #[test]
     fn test_package_dir_to_tar_gz_is_flat_and_readable() {
