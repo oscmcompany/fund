@@ -20,6 +20,7 @@ use fund::common::types::{BarInterval, PairID, SessionDate, Ticker};
 use fund::data::adjust::SplitTable;
 use fund::data::bars;
 use fund::data::truncate::BoundaryTable;
+use fund::data::universe;
 
 use fund::common::types::CloseReason;
 use fund::models::tide::predict;
@@ -396,6 +397,31 @@ async fn test_aligned_closes_drops_a_ticker_with_a_gap() {
 
 /// The interval is part of the primary key, so a daily and a one-minute bar for the same ticker and
 /// instant coexist. A query that ignored the interval would mix sampling rates into one series.
+#[tokio::test]
+#[serial]
+async fn test_liquidity_reports_the_window_low_not_its_average() {
+    // A name that fell from $13.00 to $1.38 averages $10.68 and clears a $10 floor on the strength
+    // of what it used to cost. The minimum is what says where it trades now. This lives here
+    // because the difference is the aggregate the query asks for, which no unit test can see.
+    let pool = fresh_pool().await;
+    let today = SessionDate::at(Utc::now());
+    for (offset, close) in [(-4, 13.0), (-3, 13.0), (-2, 13.0), (-1, 13.0), (0, 1.38)] {
+        common::seed_bar(&pool, "AAAA", today.plus_calendar_days(offset), close).await;
+    }
+
+    let liquidity = universe::load_liquidity(&pool, today).await.unwrap();
+
+    assert_eq!(
+        liquidity,
+        vec![universe::LiquidityRow::new(
+            ticker("AAAA"),
+            1.38,
+            5_000_000.0
+        )],
+        "the averaged close would have reported 10.676 and passed the floor"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_aligned_closes_reads_only_the_requested_interval() {

@@ -30,26 +30,30 @@ pub enum UniverseError {
     Database(#[from] sqlx::Error),
 }
 
-/// One ticker's average liquidity over the trailing window.
+/// One ticker's liquidity over the trailing window.
+///
+/// Price is summarised by its minimum and volume by its average. A price is a level, so one that
+/// ever fell below the floor disqualifies the name; volume is a flow, where one quiet session says
+/// nothing about tradability.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiquidityRow {
     ticker: Ticker,
-    average_close_price: f64,
+    minimum_close_price: f64,
     average_volume: f64,
 }
 
 impl LiquidityRow {
-    pub fn new(ticker: Ticker, average_close_price: f64, average_volume: f64) -> Self {
+    pub fn new(ticker: Ticker, minimum_close_price: f64, average_volume: f64) -> Self {
         Self {
             ticker,
-            average_close_price,
+            minimum_close_price,
             average_volume,
         }
     }
 
     /// Whether this ticker clears both liquidity thresholds.
     fn is_liquid(&self) -> bool {
-        self.average_close_price >= MINIMUM_CLOSE_PRICE && self.average_volume >= MINIMUM_VOLUME
+        self.minimum_close_price >= MINIMUM_CLOSE_PRICE && self.average_volume >= MINIMUM_VOLUME
     }
 }
 
@@ -138,11 +142,11 @@ impl Universe {
     }
 }
 
-/// Reads per-ticker average close and volume over the trailing window.
+/// Reads per-ticker minimum close and average volume over the trailing window.
 ///
-/// Averaged over daily bars specifically: the liquidity thresholds are calibrated on daily
-/// dynamics, and averaging intraday bars would compare a per-minute volume against a per-day
-/// threshold and reject the entire universe.
+/// Read over daily bars specifically: the liquidity thresholds are calibrated on daily dynamics,
+/// and averaging intraday bars would compare a per-minute volume against a per-day threshold and
+/// reject the entire universe.
 pub async fn load_liquidity(
     pool: &PgPool,
     as_of: SessionDate,
@@ -151,7 +155,7 @@ pub async fn load_liquidity(
     let rows = sqlx::query!(
         r#"
         SELECT ticker AS "ticker!",
-               AVG(close_price) AS "average_close_price!",
+               MIN(close_price) AS "minimum_close_price!",
                AVG(volume::double precision) AS "average_volume!"
         FROM equity_bars
         WHERE bar_interval = $1
@@ -168,7 +172,7 @@ pub async fn load_liquidity(
         .into_iter()
         .filter_map(|row| {
             Ticker::new(&row.ticker).map(|ticker| {
-                LiquidityRow::new(ticker, row.average_close_price, row.average_volume)
+                LiquidityRow::new(ticker, row.minimum_close_price, row.average_volume)
             })
         })
         .collect())
