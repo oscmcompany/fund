@@ -1,16 +1,6 @@
-//! Market data and storage.
+//! Market data and storage, across two S3 prefixes with one owner each.
 //!
-//! [`calendar`] and [`universe`] are fetched once and held for the Eastern date; neither changes
-//! intraday. [`bars`] is shared with the trainer, which has no database and writes the same frames
-//! to S3 — that shared path keeps the training and inference datasets structurally identical.
-//! [`export`] and [`purge`] run in that order and never the reverse.
-//!
-//! Two S3 prefixes with one owner each. [`archive`] owns `data/`, the trainer's bars and the long-
-//! term record of them; [`export`] owns `exports/`, the application's own tables, which the purge
-//! deletes from PostgreSQL only once they are safely written. Neither writes the other's prefix.
-//!
-//! [`export`] also seals and ships [`crate::common::journal`], the local original that both
-//! PostgreSQL and S3 are derived from.
+//! [`archive`] owns `data/`; [`export`] owns `exports/`. Neither writes the other's prefix.
 
 pub mod adjust;
 pub mod archive;

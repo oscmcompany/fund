@@ -1,11 +1,6 @@
 //! The domain vocabulary every module speaks.
 //!
-//! **Validated primitives** wrap standard Rust types so a unit mismatch is a compile error and
-//! sign and range constraints are enforced by the constructor. **Record types** mirror the
-//! PostgreSQL tables and Alpaca payloads.
-//!
-//! Both keep fields private and validate in the constructor, so a value in scope is proof its
-//! invariants held and downstream code never re-checks.
+//! Fields are private and constructors validate, so a value in scope is proof its invariants held.
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use chrono_tz::America::New_York;
@@ -72,6 +67,57 @@ pub mod decimal_number_option {
             Some(raw) => Decimal::try_from(raw).map(Some).map_err(de::Error::custom),
             None => Ok(None),
         }
+    }
+}
+
+/// A PostgreSQL table the nightly export ships to S3.
+///
+/// The stored name and the S3 prefix travel together because they are one decision: a dataset
+/// written under another's prefix is a silent overwrite, and neither half is checkable from the
+/// other. [`crate::data::purge`] deletes from a subset of these, which is what makes deleting safe — a table it
+/// could name but the export could not would have no copy anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Dataset {
+    Events,
+    EquityPredictions,
+    EquityPairs,
+    AccountSnapshots,
+    AccountActivities,
+}
+
+impl Dataset {
+    /// The PostgreSQL table name, which is also how the dataset is reported.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dataset::Events => "events",
+            Dataset::EquityPredictions => "equity_predictions",
+            Dataset::EquityPairs => "equity_pairs",
+            Dataset::AccountSnapshots => "account_snapshots",
+            Dataset::AccountActivities => "account_activities",
+        }
+    }
+
+    /// The S3 prefix this dataset is written under.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Dataset::Events => "exports/events",
+            Dataset::EquityPredictions => "exports/equity/predictions",
+            Dataset::EquityPairs => "exports/equity/pairs",
+            Dataset::AccountSnapshots => "exports/account/snapshots",
+            Dataset::AccountActivities => "exports/account/activities",
+        }
+    }
+}
+
+impl std::fmt::Display for Dataset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for Dataset {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
     }
 }
 

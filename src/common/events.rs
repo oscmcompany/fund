@@ -1,14 +1,6 @@
 //! The event bus: six commands, three outcomes, and the scan that recovers missed work.
 //!
-//! pg_cron writes `<command>_requested` rows into the `events` table. A trigger fires `pg_notify`,
-//! the service's listener wakes, dispatches, and writes back `<command>_completed` or
-//! `<command>_errored` with a payload describing what happened. That is the entire coordination
-//! mechanism — there is no queue, no offset table, and no in-memory scheduling.
-//!
-//! There is deliberately no `started` outcome — nothing would read it that the logs do not answer.
-//!
-//! The table doubles as the restart recovery mechanism: a `_requested` row with no terminal outcome
-//! is work issued and never finished. See [`recover_missed_commands`].
+//! The `events` table is the entire coordination mechanism. There is no queue and no scheduler.
 
 use serde_json::Value;
 use sqlx::PgPool;
@@ -37,6 +29,12 @@ pub enum Command {
     MarketDataSync,
     /// Chained from a completed market data sync: export to S3 parquet, then purge.
     DatabaseExport,
+}
+
+impl serde::Serialize for Command {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// How a command reached its end state.
@@ -244,9 +242,10 @@ pub async fn emit_errored(pool: &PgPool, command: Command, error: &str) -> Resul
 /// Finds commands requested during the current Eastern trading date that never reached a terminal
 /// outcome, and which should be re-run.
 ///
-/// This replaces a consumer offset table. A `_requested` row with no terminal outcome is work
-/// issued and never finished — what a process killed mid-handler leaves behind, and equally what a
-/// process not running when cron fired leaves behind. Both want the same response.
+/// This replaces a consumer offset table, and is why the `events` table needs no queue beside it.
+/// A `_requested` row with no terminal outcome is work issued and never finished — what a process
+/// killed mid-handler leaves behind, and equally what a process not running when cron fired leaves
+/// behind. Both want the same response.
 ///
 /// [`Recovery::Skip`] commands are found and dropped, so the caller receives only work worth doing.
 ///

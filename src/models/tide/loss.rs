@@ -1,8 +1,6 @@
 //! Quantile (pinball) loss for the TiDE model, optionally Huber-smoothed.
 //!
-//! This averages over quantiles with a strict `error > 0` split. The evaluation CRPS in
-//! [`crate::models::tide::evaluate`] sums instead, with a non-strict split — a deliberate
-//! difference, not a bug to reconcile.
+//! Averages with a strict `error > 0` split, where [`crate::models::tide::evaluate`] sums.
 
 use burn::prelude::*;
 

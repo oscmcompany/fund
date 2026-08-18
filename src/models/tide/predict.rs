@@ -1,8 +1,7 @@
 //! Running the TiDE model: from stored market history to rows in `equity_predictions`.
 //!
-//! Training and inference must apply the same liquidity thresholds — training per row, inference
-//! per ticker average. Both read them from [`crate::common::types`] so they cannot drift; a
-//! mismatch trains the scaler on dynamics the service never predicts.
+//! Applies the same liquidity thresholds training does, read from [`crate::common::types`] so a
+//! drift cannot train the scaler on dynamics the service never predicts.
 
 use burn::backend::NdArray;
 use chrono::{DateTime, Utc};

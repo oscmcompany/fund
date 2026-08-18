@@ -1,11 +1,6 @@
 //! One function per [`Command`], and the state they share.
 //!
-//! This is the only place that knows how a command name turns into work. The listener parses a
-//! notification and calls [`handle`]; everything else is a module doing one thing.
-//!
-//! Every handler returns a JSON summary, which becomes the `_completed` payload. That is what
-//! makes the nightly export of `events` worth reading — a row carrying the pairs opened and closed,
-//! rows synced, and the model run used is the record of the trading day.
+//! The only place that knows how a command name turns into work. Everything else does one thing.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,8 +14,9 @@ use uuid::Uuid;
 use crate::common::alpaca::{AlpacaCredentials, ClientError, MarketDataClient, TradingClient};
 use crate::common::events::{self, Command, EventError};
 use crate::common::journal::{
-    BarsIngested, CommandFinished, CommandOutcome, Journal, JournalError, JournalExported,
-    Observation, PredictionReading, PredictionsGenerated, SkipReason,
+    BarsIngested, CommandFinished, CommandOutcome, DatabaseExported, Journal, JournalError,
+    JournalExported, LogsExported, Observation, PredictionReading, PredictionsGenerated,
+    SkipReason,
 };
 use crate::common::massive::MassiveClient;
 use crate::common::types::{BarInterval, SessionDate};
@@ -219,7 +215,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
             correlation_id,
             Utc::now(),
             CommandFinished {
-                command: command.as_str().to_string(),
+                command,
                 outcome: CommandOutcome::DroppedInFlight,
                 duration_milliseconds: None,
                 error: None,
@@ -251,7 +247,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
                 correlation_id,
                 Utc::now(),
                 CommandFinished {
-                    command: command.as_str().to_string(),
+                    command,
                     outcome: completion_outcome(&summary),
                     duration_milliseconds: Some(duration_milliseconds),
                     error: None,
@@ -275,7 +271,7 @@ pub async fn handle(state: &ServiceState, command: Command) {
                 correlation_id,
                 Utc::now(),
                 CommandFinished {
-                    command: command.as_str().to_string(),
+                    command,
                     outcome: CommandOutcome::Errored,
                     duration_milliseconds: Some(duration_milliseconds),
                     error: Some(error.to_string()),
@@ -325,6 +321,11 @@ async fn record_command(
         .await;
 }
 
+/// Routes a command to its handler.
+///
+/// Every arm returns a JSON summary that becomes the `_completed` payload, which is what makes the
+/// nightly export of `events` worth reading: one row carrying the pairs opened and closed, the rows
+/// synced, and the model run used is the record of the trading day.
 async fn dispatch(
     state: &ServiceState,
     command: Command,
@@ -808,32 +809,78 @@ async fn handle_database_export(
         "unparsable_lines": sessions.unparsable_lines,
     });
 
+    // Shipped beside the journal because the two answer different halves of one question: the
+    // journal says what the application observed, the logs say what it was doing while it observed.
+    let logs = export::export_logs(
+        &crate::common::log::log_directory(),
+        &state.s3_client,
+        &state.bucket,
+        today,
+    )
+    .await;
+    state
+        .journal
+        .record(
+            correlation_id,
+            Utc::now(),
+            Observation::LogsExported(LogsExported {
+                files_exported: logs.exported.len(),
+                lines_exported: logs.total_lines(),
+                files_failed: logs.failed.len(),
+                dates_deleted: logs.deleted.clone(),
+                unparsable_lines: logs.unparsable_lines,
+            }),
+        )
+        .await;
+
     let export = export::export_database(&state.pool, &state.s3_client, &state.bucket, today).await;
 
-    if !export.is_clean() {
-        warn!(
-            failed = export.failed.len(),
-            "Export was incomplete; the purge is skipped"
-        );
-        return Ok(json!({
-            "session_date": today,
-            "exported": export.exported,
-            "failed": export.failed.iter().map(|(dataset, error)| json!({
-                "dataset": dataset, "error": error.to_string()
-            })).collect::<Vec<_>>(),
-            "purged": Value::Null,
-            "journal": journal_summary,
-        }));
-    }
+    // Skipped rather than attempted, because the purge deletes rows on the strength of S3 holding
+    // them. `purge_skipped` on the record below is what separates this from a purge of zero rows.
+    let purge_skipped = !export.is_clean();
+    let purged = match purge_skipped {
+        true => {
+            warn!(
+                failed = export.failed.len(),
+                "Export was incomplete; the purge is skipped"
+            );
+            purge::PurgeSummary::default()
+        }
+        false => purge::purge_exported_tables(&state.pool).await,
+    };
 
-    let purged = purge::purge_exported_tables(&state.pool).await;
+    state
+        .journal
+        .record(
+            correlation_id,
+            Utc::now(),
+            Observation::DatabaseExported(DatabaseExported {
+                session_date: today,
+                exported: export.exported.clone(),
+                failed: export.failed.clone(),
+                purged: purged.purged.clone(),
+                purge_skipped,
+            }),
+        )
+        .await;
+
     Ok(json!({
         "session_date": today,
         "exported": export.exported,
+        "failed": export.failed.iter().map(|(dataset, error)| json!({
+            "dataset": dataset, "error": error.to_string()
+        })).collect::<Vec<_>>(),
         "total_rows_exported": export.total_rows(),
         "purged_rows": purged.total_rows(),
         "purge_clean": purged.is_clean(),
+        "purge_skipped": purge_skipped,
         "journal": journal_summary,
+        "logs": json!({
+            "files_exported": logs.exported.len(),
+            "lines_exported": logs.total_lines(),
+            "files_failed": logs.failed.len(),
+            "unparsable_lines": logs.unparsable_lines,
+        }),
     }))
 }
 

@@ -1,25 +1,6 @@
 //! The S3 bar archive: the trainer's data, repaired to a window rather than topped up by a night.
 //!
-//! One partition per session under `data/equity/bars/year=/month=/day=/data.parquet`, written by
-//! whoever holds Massive credentials — the seeder on a cold bucket, the trainer every night. Both
-//! call [`archive_missing_sessions`], because two implementations of this would drift the way the
-//! trainer's fetch and load stages once did over Eastern versus UTC dates.
-//!
-//! **What gets fetched is a set difference, not a lookback.** The archive is asked what it already
-//! has; everything expected and absent is fetched. A missed night, a week of downtime, and an empty
-//! bucket are then the same case handled the same way, where a fixed lookback repairs only the
-//! first of the three and leaves the others as permanent holes.
-//!
-//! **Expected means "worth requesting", not "the market traded".** [`TradingCalendar`] is fetched
-//! from Alpaca, and the trainer deliberately holds no broker credentials, so this uses
-//! [`SessionDate::is_weekend`] — which its own documentation blesses for exactly this, bounding a
-//! fetch range before a calendar is available. Nothing here concludes a date traded: a holiday is
-//! requested, Massive answers with nothing, no partition is written, and it is requested again next
-//! run. The partition that exists is the evidence; the request set is only a guess about where to
-//! look. The cost is roughly ten empty requests a year, which [`ArchiveSummary`] reports rather
-//! than hides.
-//!
-//! [`TradingCalendar`]: crate::data::calendar::TradingCalendar
+//! One partition per session under `data/equity/bars/year=/month=/day=/data.parquet`.
 
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -253,6 +234,17 @@ async fn present_sessions(
 }
 
 /// Fetches and writes every session in `[window_start, window_end]` the archive is missing.
+///
+/// **A set difference, not a lookback.** The archive is asked what it already has and everything
+/// expected and absent is fetched, so a missed night, a week of downtime, and an empty bucket are
+/// one case; a fixed lookback repairs only the first and leaves the rest as permanent holes.
+///
+/// **Expected means "worth requesting", not "the market traded".** The trainer holds no broker
+/// credentials and so cannot consult [`crate::data::calendar::TradingCalendar`], which is why this
+/// bounds the range with [`SessionDate::is_weekend`] and lets a holiday be requested, answered with
+/// nothing, and requested again. The partition that exists is the evidence; the request set is only
+/// a guess about where to look, and the roughly ten empty requests a year are reported rather than
+/// hidden.
 ///
 /// Idempotent: a second pass over an unchanged window requests only the correction window and
 /// writes the same rows back. Safe to interrupt, because partitions are written as each chunk

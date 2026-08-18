@@ -13,7 +13,8 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::common::alpaca::{ActivityType, OrderSide, PositionSide, PriceSource, QuoteRejection};
-use crate::common::types::{CloseReason, PairID, SessionDate, Ticker};
+use crate::common::events::Command;
+use crate::common::types::{CloseReason, Dataset, PairID, SessionDate, Ticker};
 
 /// Version stamped on every record written by this build.
 ///
@@ -64,6 +65,8 @@ pub enum Observation {
     UniverseRefreshed(UniverseRefreshed),
     CalendarObserved(CalendarObserved),
     JournalExported(JournalExported),
+    DatabaseExported(DatabaseExported),
+    LogsExported(LogsExported),
 }
 
 impl Observation {
@@ -91,6 +94,8 @@ impl Observation {
             Observation::UniverseRefreshed(_) => "universe_refreshed",
             Observation::CalendarObserved(_) => "calendar_observed",
             Observation::JournalExported(_) => "journal_exported",
+            Observation::DatabaseExported(_) => "database_exported",
+            Observation::LogsExported(_) => "logs_exported",
         }
     }
 }
@@ -155,7 +160,7 @@ impl Serialize for CommandOutcome {
 /// the command did, which is what makes the duration attributable.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CommandFinished {
-    pub command: String,
+    pub command: Command,
     pub outcome: CommandOutcome,
     /// Absent for a command that never ran.
     pub duration_milliseconds: Option<u64>,
@@ -826,6 +831,39 @@ pub struct JournalExported {
     pub unparsable_lines: usize,
 }
 
+/// One run of the seal-free ship-delete cycle over the diagnostic logs.
+///
+/// Unlike [`JournalExported`], today's files are still open: what ships is a snapshot the next run
+/// replaces, so a count here rising for the same date is ordinary rather than a duplicate.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct LogsExported {
+    pub files_exported: usize,
+    pub lines_exported: usize,
+    /// Services whose upload failed, which stay on local disk for the next run.
+    pub files_failed: usize,
+    /// Dates deleted from local disk, which had uploaded cleanly and aged out.
+    pub dates_deleted: Vec<NaiveDate>,
+    /// Lines the Parquet does not hold, which keep their file from being deleted.
+    pub unparsable_lines: usize,
+}
+
+/// One run of the nightly database export and the purge chained behind it.
+///
+/// The purge is gated on the export being clean, so `rows_purged` being absent while datasets
+/// exported is the skip rather than a failure — `purge_skipped` is what tells the two apart.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DatabaseExported {
+    pub session_date: SessionDate,
+    /// `(dataset, rows)` for each table written to S3.
+    pub exported: Vec<(Dataset, usize)>,
+    /// `(dataset, error)` for each table that did not write.
+    pub failed: Vec<(Dataset, String)>,
+    /// `(dataset, rows)` deleted from PostgreSQL once S3 held them.
+    pub purged: Vec<(Dataset, u64)>,
+    /// True when the export was incomplete and the purge was therefore not attempted.
+    pub purge_skipped: bool,
+}
+
 /// One line of the journal: an observation with the envelope that makes it addressable.
 ///
 /// `session_date` is derived from `timestamp`, so a record cannot be filed under a session it did
@@ -1059,6 +1097,8 @@ mod tests {
                 Observation::UniverseRefreshed(_) => "universe_refreshed",
                 Observation::CalendarObserved(_) => "calendar_observed",
                 Observation::JournalExported(_) => "journal_exported",
+                Observation::DatabaseExported(_) => "database_exported",
+                Observation::LogsExported(_) => "logs_exported",
             }
         }
 
@@ -1084,7 +1124,7 @@ mod tests {
     fn every_observation() -> Vec<Observation> {
         vec![
             Observation::CommandFinished(CommandFinished {
-                command: "portfolio_evaluation".to_string(),
+                command: Command::PortfolioEvaluation,
                 outcome: CommandOutcome::Completed,
                 duration_milliseconds: Some(12),
                 error: None,
@@ -1208,6 +1248,14 @@ mod tests {
                 }],
             }),
             Observation::JournalExported(JournalExported::default()),
+            Observation::DatabaseExported(DatabaseExported {
+                session_date: session(2026, 8, 17),
+                exported: vec![(Dataset::Events, 240)],
+                failed: Vec::new(),
+                purged: vec![(Dataset::Events, 180)],
+                purge_skipped: false,
+            }),
+            Observation::LogsExported(LogsExported::default()),
         ]
     }
 

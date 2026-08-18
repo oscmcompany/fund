@@ -1,8 +1,7 @@
 //! The strategy: which pairs to hold, how large, and when to let them go.
 //!
-//! [`execute`] is the only module that sends an order; [`evaluate`] is the five-minute pass that
-//! drives the rest. [`account`] is the post-close half, writing back what Alpaca says actually
-//! happened as the reference the next session's drawdown gate reads.
+//! [`execute`] is the only module that sends an order and [`evaluate`] is the pass driving it;
+//! [`account`] is the post-close half that writes back what Alpaca says actually happened.
 
 pub mod account;
 pub mod evaluate;

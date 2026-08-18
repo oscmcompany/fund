@@ -1,11 +1,6 @@
-//! Equity bars: one fetch from Massive, three destinations.
+//! Equity bars, from Massive rather than Alpaca; see [`crate::common::massive`] for why.
 //!
-//! The application writes bars to PostgreSQL after the close; the trainer writes the same bars to
-//! S3 parquet. Both go through [`fetch_daily_bars`] and [`bars_to_dataframe`] — if the two
-//! diverged, the model would train on columns the inference path does not produce and it would
-//! surface as bad predictions rather than a build error.
-//!
-//! Bars come from Massive rather than Alpaca; see [`crate::common::massive`].
+//! The application writes them to PostgreSQL and the trainer to S3, through one shared path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

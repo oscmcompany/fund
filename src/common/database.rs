@@ -1,8 +1,7 @@
 //! PostgreSQL connection handling.
 //!
-//! The service cannot do anything useful without a database — every command arrives through it and
-//! every result is written back to it — so connecting is fallible at startup rather than optional
-//! at runtime. There is no degraded mode to fall back to.
+//! Connecting is fallible at startup rather than optional at runtime: every command arrives
+//! through the database, so there is no degraded mode to fall back to.
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;

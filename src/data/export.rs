@@ -1,28 +1,8 @@
-//! Nightly export of the application's own tables to S3 as Parquet.
+//! Nightly export of what only this application knows: its own tables, its journal, and its logs.
 //!
-//! Chained from a completed market data sync rather than scheduled, so it can never run against a
-//! half-synced database. Everything it writes is archival: the trainer fetches its own data from
-//! Massive, so a failed export costs a backup rather than the next day's model.
-//!
-//! **Bars and ticker metadata are deliberately absent.** Both used to be exported here and both are
-//! written by the trainer under `data/`, from the same Massive grouped endpoint this application
-//! syncs from — the same rows by two paths, and two writers of one fact is one too many. The
-//! archive under [`crate::data::archive`] owns them and is their long-term record; what remains
-//! here is what only this application knows.
-//!
-//! Two shapes. **Incremental** tables — events, predictions, account activities — are written per
-//! session date under a Hive-partitioned key. **Snapshot** tables — pairs, account state — are
-//! written whole each night, because a row can change after the day it was created (a pair opened
-//! Monday closes Tuesday, and the closing is the interesting part).
-//!
-//! A failure on one table is logged and the rest continue; the caller receives the list so the
-//! completion event can report it. That list is also the purge's gate: [`crate::data::purge`] runs
-//! only when every dataset here wrote cleanly.
-//!
-//! [`export_journals`] ships a third shape: whole local JSONL files, one object per session,
-//! independent of the database entirely.
+//! Chained from a completed market data sync rather than scheduled, so it never runs mid-sync.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
@@ -34,15 +14,15 @@ use tracing::{info, warn};
 
 use crate::common::aws::date_partitioned_key;
 use crate::common::journal::{file_name, session_from_file_name, Journal};
-use crate::common::types::SessionDate;
+use crate::common::types::{Dataset, SessionDate};
 
 /// What one nightly export accomplished.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExportSummary {
     /// `(dataset, rows)` for each table that exported cleanly.
-    pub exported: Vec<(String, usize)>,
+    pub exported: Vec<(Dataset, usize)>,
     /// `(dataset, error)` for each table that failed.
-    pub failed: Vec<(String, String)>,
+    pub failed: Vec<(Dataset, String)>,
 }
 
 impl ExportSummary {
@@ -59,8 +39,11 @@ impl ExportSummary {
 
 /// Exports every table to S3 for `date`.
 ///
-/// Never returns `Err`: a per-table failure belongs in the summary, where the completion event can
-/// report it, rather than aborting the remaining tables and the purge that follows.
+/// Two shapes: the incremental tables are written per session date under a Hive-partitioned key,
+/// while pairs and account state are written whole each night, because a row can change after the
+/// day it was created — a pair opened Monday closes Tuesday, and the closing is the interesting
+/// part. Never returns `Err`: a per-table failure belongs in the summary, which is also the purge's
+/// gate, rather than aborting the tables behind it.
 pub async fn export_database(
     pool: &PgPool,
     s3_client: &S3Client,
@@ -70,20 +53,16 @@ pub async fn export_database(
     let mut summary = ExportSummary::default();
 
     macro_rules! export {
-        ($dataset:expr, $prefix:expr, $frame:expr) => {
+        ($dataset:expr, $frame:expr) => {
             match $frame.await {
                 Ok(mut frame) => {
-                    let key = date_partitioned_key($prefix, date.date());
+                    let key = date_partitioned_key($dataset.prefix(), date.date());
                     match write_frame(s3_client, bucket, &key, &mut frame).await {
-                        Ok(()) => summary
-                            .exported
-                            .push(($dataset.to_string(), frame.height())),
-                        Err(error) => summary.failed.push(($dataset.to_string(), error)),
+                        Ok(()) => summary.exported.push(($dataset, frame.height())),
+                        Err(error) => summary.failed.push(($dataset, error)),
                     }
                 }
-                Err(error) => summary
-                    .failed
-                    .push(($dataset.to_string(), error.to_string())),
+                Err(error) => summary.failed.push(($dataset, error.to_string())),
             }
         };
     }
@@ -92,21 +71,15 @@ pub async fn export_database(
     // keeps the predicate sargable; see `eastern_day_bounds`.
     let (start, end) = date.bounds();
 
-    export!("events", "exports/events", events_frame(pool, start, end));
+    export!(Dataset::Events, events_frame(pool, start, end));
     export!(
-        "equity_predictions",
-        "exports/equity/predictions",
+        Dataset::EquityPredictions,
         predictions_frame(pool, start, end)
     );
-    export!("equity_pairs", "exports/equity/pairs", pairs_frame(pool));
+    export!(Dataset::EquityPairs, pairs_frame(pool));
+    export!(Dataset::AccountSnapshots, account_snapshots_frame(pool));
     export!(
-        "account_snapshots",
-        "exports/account/snapshots",
-        account_snapshots_frame(pool)
-    );
-    export!(
-        "account_activities",
-        "exports/account/activities",
+        Dataset::AccountActivities,
         account_activities_frame(pool, start, end)
     );
 
@@ -118,7 +91,7 @@ pub async fn export_database(
         "Database export finished"
     );
     for (dataset, error) in &summary.failed {
-        warn!(dataset, error, "Dataset failed to export");
+        warn!(%dataset, error, "Dataset failed to export");
     }
     summary
 }
@@ -513,6 +486,245 @@ pub async fn export_journals(
     summary
 }
 
+/// S3 prefix the diagnostic logs are written under, partitioned by service.
+pub const LOG_PREFIX: &str = "exports/logs";
+
+/// Calendar days of exported logs kept on local disk.
+///
+/// The same window the journal keeps, for the same reason: long enough that a bad conversion can
+/// still be repaired from the original bytes.
+pub const LOG_RETENTION_DAYS: i64 = 7;
+
+/// What one log export run accomplished.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LogExportSummary {
+    /// `(date, service, lines)` for each file written to S3.
+    pub exported: Vec<(NaiveDate, String, usize)>,
+    /// `(date, service, error)` for each file that did not write.
+    pub failed: Vec<(NaiveDate, String, String)>,
+    /// Files deleted from local disk, which had uploaded cleanly and aged out.
+    pub deleted: Vec<NaiveDate>,
+    /// Lines the Parquet does not hold, across every file this run read.
+    pub unparsable_lines: usize,
+}
+
+impl LogExportSummary {
+    pub fn total_lines(&self) -> usize {
+        self.exported.iter().map(|(_, _, lines)| lines).sum()
+    }
+}
+
+/// Converts every rolled log file on disk to Parquet in S3, then deletes what has aged out.
+///
+/// Follows [`export_journals`] — one whole file at a deterministic key, so a repeat is an
+/// overwrite and a failed run repairs itself — with one difference it cannot avoid. The journal is
+/// sealed across its reads and the log has no seal: the appender owns the file and keeps writing.
+/// Today's object is therefore a snapshot that the next run replaces, and a line torn mid-write is
+/// counted unparsable exactly as a torn journal line is.
+pub async fn export_logs(
+    directory: &Path,
+    s3_client: &S3Client,
+    bucket: &str,
+    today: SessionDate,
+) -> LogExportSummary {
+    let mut summary = LogExportSummary::default();
+
+    let mut files = match rolled_log_files(directory) {
+        Ok(files) => files,
+        Err(error) => {
+            warn!(%error, "Log directory could not be read; nothing exported");
+            return summary;
+        }
+    };
+    files.sort();
+
+    let mut deletable: Vec<NaiveDate> = Vec::new();
+    for (date, service, path) in files {
+        let (mut frame, unparsable) = match read_log_frame(&path) {
+            Ok(read) => read,
+            Err(error) => {
+                summary.failed.push((date, service, error));
+                continue;
+            }
+        };
+        summary.unparsable_lines += unparsable;
+
+        // Nothing to ship and nothing readable, so uploading would replace a good object from an
+        // earlier run with one holding none of it -- the guard `export_journals` carries.
+        if frame.height() == 0 && unparsable > 0 {
+            summary.failed.push((
+                date,
+                service,
+                format!("every one of {unparsable} lines was unparsable"),
+            ));
+            continue;
+        }
+
+        let key = date_partitioned_key(&format!("{LOG_PREFIX}/service={service}"), date);
+        match write_frame(s3_client, bucket, &key, &mut frame).await {
+            Ok(()) => {
+                summary.exported.push((date, service, frame.height()));
+                if unparsable == 0 {
+                    deletable.push(date);
+                }
+            }
+            Err(error) => summary.failed.push((date, service, error)),
+        }
+    }
+
+    let oldest_kept = today.plus_calendar_days(-LOG_RETENTION_DAYS).date();
+    summary.deleted = delete_aged_out_logs(directory, &deletable, oldest_kept);
+
+    info!(
+        files = summary.exported.len(),
+        lines = summary.total_lines(),
+        failed = summary.failed.len(),
+        deleted = summary.deleted.len(),
+        unparsable_lines = summary.unparsable_lines,
+        "Log export finished"
+    );
+    for (date, service, error) in &summary.failed {
+        warn!(%date, service, error, "Log failed to export");
+    }
+    summary
+}
+
+/// Every `<date>.<service>.log` in the directory, as its date, service, and path.
+///
+/// A name that does not parse is skipped rather than failing the run: the directory is shared with
+/// whatever else writes there, and an unrecognised file is not this function's to interpret.
+fn rolled_log_files(directory: &Path) -> Result<Vec<(NaiveDate, String, PathBuf)>, String> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("failed to read {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("failed to read a directory entry: {error}"))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some((date, service)) = split_log_file_name(&name) else {
+            continue;
+        };
+        files.push((date, service, entry.path()));
+    }
+    Ok(files)
+}
+
+/// Splits `2026-08-17.fund.log` into its date and service.
+fn split_log_file_name(name: &str) -> Option<(NaiveDate, String)> {
+    let remainder = name.strip_suffix(".log")?;
+    let (date, service) = remainder.split_once('.')?;
+    let date = date.parse::<NaiveDate>().ok()?;
+    match service.is_empty() {
+        true => None,
+        false => Some((date, service.to_string())),
+    }
+}
+
+/// Reads one log file into a frame, returning it with the number of lines skipped.
+///
+/// `fields` stays a JSON string rather than becoming columns: every call site puts different keys
+/// in it, so a fixed schema would either lose them or grow a column per message.
+fn read_log_frame(path: &Path) -> Result<(DataFrame, usize), String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+
+    let mut timestamps: Vec<Option<i64>> = Vec::new();
+    let mut levels: Vec<Option<String>> = Vec::new();
+    let mut targets: Vec<Option<String>> = Vec::new();
+    let mut messages: Vec<Option<String>> = Vec::new();
+    let mut field_blobs: Vec<Option<String>> = Vec::new();
+    let mut unparsable = 0usize;
+
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(Value::Object(record)) = serde_json::from_str::<Value>(line) else {
+            unparsable += 1;
+            continue;
+        };
+        let text = |key: &str| record.get(key).and_then(Value::as_str).map(str::to_string);
+
+        // The timestamp and the level are what every query filters on, so a line missing either is
+        // unreachable rather than merely thin.
+        let (Some(timestamp), Some(level)) = (
+            text("timestamp").and_then(|stamp| {
+                DateTime::parse_from_rfc3339(&stamp)
+                    .ok()
+                    .map(|instant| instant.timestamp_millis())
+            }),
+            text("level"),
+        ) else {
+            unparsable += 1;
+            continue;
+        };
+
+        timestamps.push(Some(timestamp));
+        levels.push(Some(level));
+        targets.push(text("target"));
+        messages.push(
+            record
+                .get("fields")
+                .and_then(|fields| fields.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        );
+        field_blobs.push(record.get("fields").map(Value::to_string));
+    }
+
+    if unparsable > 0 {
+        warn!(
+            path = %path.display(),
+            unparsable,
+            "Skipped log lines that would not parse"
+        );
+    }
+
+    let frame = DataFrame::new(vec![
+        Column::new("timestamp".into(), timestamps),
+        Column::new("level".into(), levels),
+        Column::new("target".into(), targets),
+        Column::new("message".into(), messages),
+        Column::new("fields".into(), field_blobs),
+    ])
+    .map_err(|error| format!("failed to build a log frame: {error}"))?;
+    Ok((frame, unparsable))
+}
+
+/// Removes local log files older than the retention window.
+///
+/// The window is what keeps the appender's own file safe: `oldest_kept` is a whole retention period
+/// behind today, so a file still open for writing is never old enough to qualify.
+fn delete_aged_out_logs(
+    directory: &Path,
+    dates: &[NaiveDate],
+    oldest_kept: NaiveDate,
+) -> Vec<NaiveDate> {
+    let mut deleted = Vec::new();
+    let aged_out: std::collections::BTreeSet<NaiveDate> = dates
+        .iter()
+        .filter(|date| **date < oldest_kept)
+        .copied()
+        .collect();
+    let Ok(files) = rolled_log_files(directory) else {
+        return deleted;
+    };
+    for (date, _, path) in files
+        .into_iter()
+        .filter(|(date, _, _)| aged_out.contains(date))
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => deleted.push(date),
+            Err(error) => warn!(
+                path = %path.display(),
+                %error,
+                "Aged-out log could not be deleted"
+            ),
+        }
+    }
+    deleted.sort();
+    deleted.dedup();
+    deleted
+}
+
 /// Sessions on disk whose trading day has finished.
 ///
 /// Today counts, because this runs after the close; a future-dated file does not, and exporting one
@@ -695,8 +907,8 @@ mod tests {
     #[test]
     fn test_summary_totals_only_successful_datasets() {
         let summary = ExportSummary {
-            exported: vec![("events".into(), 12), ("equity_pairs".into(), 3)],
-            failed: vec![("account_activities".into(), "boom".into())],
+            exported: vec![(Dataset::Events, 12), (Dataset::EquityPairs, 3)],
+            failed: vec![(Dataset::AccountActivities, "boom".into())],
         };
         assert_eq!(summary.total_rows(), 15);
         assert!(!summary.is_clean());
@@ -735,6 +947,167 @@ mod tests {
         let (frame, unparsable) = read_journal_frame(&path).expect("the session must still read");
         assert_eq!(frame.height(), 1);
         assert_eq!(unparsable, 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The appender names files `<date>.<service>.log`, and the service is what keys the S3
+    /// partition — two services on one date would otherwise write the same object.
+    #[test]
+    fn test_a_log_file_name_splits_into_its_date_and_service() {
+        assert_eq!(
+            split_log_file_name("2026-08-17.fund.log"),
+            Some((
+                "2026-08-17".parse::<NaiveDate>().expect("a valid date"),
+                "fund".to_string()
+            ))
+        );
+        assert_eq!(
+            split_log_file_name("2026-08-17.tide-model-trainer.log"),
+            Some((
+                "2026-08-17".parse::<NaiveDate>().expect("a valid date"),
+                "tide-model-trainer".to_string()
+            ))
+        );
+        // Anything else in the directory belongs to somebody else.
+        assert_eq!(split_log_file_name("fund.log"), None);
+        assert_eq!(split_log_file_name("2026-08-17.log"), None);
+        assert_eq!(split_log_file_name("not-a-date.fund.log"), None);
+        assert_eq!(split_log_file_name("2026-08-17.fund.txt"), None);
+    }
+
+    /// The log directory is shared with whatever else writes there, so a name this does not
+    /// recognise is skipped rather than guessed at or fatal.
+    #[test]
+    fn test_only_recognisable_log_names_are_collected() {
+        let directory = temporary_directory("logs-foreign");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        for name in [
+            "2026-08-17.fund.log",
+            "portfolio-manager-errors.log",
+            "sessions",
+            "2026-08-17.fund.log.gz",
+        ] {
+            std::fs::write(directory.join(name), "{}\n").expect("the file must be writable");
+        }
+
+        let mut collected: Vec<String> = rolled_log_files(&directory)
+            .expect("the directory must read")
+            .into_iter()
+            .map(|(date, service, _)| format!("{date}.{service}"))
+            .collect();
+        collected.sort();
+        assert_eq!(collected, vec!["2026-08-17.fund"]);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The log has no seal, so the file is live while it is read: the last line can be half-written.
+    #[test]
+    fn test_a_torn_log_line_is_skipped_rather_than_failing_the_file() {
+        let directory = temporary_directory("logs-torn");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-08-17.fund.log");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-17T20:15:00Z\",\"level\":\"INFO\",\"target\":\"fund\",\
+             \"fields\":{\"message\":\"Starting data sync\"}}\n{\"timestamp\":\"2026-08-1",
+        )
+        .expect("the file must be writable");
+
+        let (frame, unparsable) = read_log_frame(&path).expect("the file must read");
+        assert_eq!(frame.height(), 1);
+        assert_eq!(unparsable, 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A line with no timestamp or no level cannot be filtered on, so it is unreachable by every
+    /// query the archive exists to answer rather than merely thin.
+    #[test]
+    fn test_a_log_line_without_a_timestamp_or_level_is_counted_unparsable() {
+        let directory = temporary_directory("logs-envelope");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-08-17.fund.log");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-17T20:15:00Z\",\"level\":\"WARN\",\"fields\":{}}\n\
+             {\"level\":\"INFO\",\"fields\":{}}\n\
+             {\"timestamp\":\"2026-08-17T20:16:00Z\",\"fields\":{}}\n",
+        )
+        .expect("the file must be writable");
+
+        let (frame, unparsable) = read_log_frame(&path).expect("the file must read");
+        assert_eq!(frame.height(), 1);
+        assert_eq!(
+            unparsable, 2,
+            "one missing a level, one missing a timestamp"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The message is lifted out of `fields` into its own column because it is what a human scans,
+    /// while the rest of `fields` stays a JSON string — every call site puts different keys there.
+    #[test]
+    fn test_the_log_message_is_lifted_out_of_its_fields() {
+        let directory = temporary_directory("logs-message");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let path = directory.join("2026-08-17.fund.log");
+        std::fs::write(
+            &path,
+            "{\"timestamp\":\"2026-08-17T20:15:00Z\",\"level\":\"INFO\",\"target\":\"fund::data\",\
+             \"fields\":{\"message\":\"Journal export finished\",\"sessions\":3}}\n",
+        )
+        .expect("the file must be writable");
+
+        let (frame, _) = read_log_frame(&path).expect("the file must read");
+        let message = frame.column("message").expect("the column must exist");
+        assert_eq!(
+            message.str().expect("a string column").get(0),
+            Some("Journal export finished")
+        );
+        let fields = frame.column("fields").expect("the column must exist");
+        assert!(
+            fields
+                .str()
+                .expect("a string column")
+                .get(0)
+                .expect("a value")
+                .contains("\"sessions\":3"),
+            "the rest of the fields survive as JSON"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The file the appender still holds open must survive. The retention window is what protects
+    /// it — `oldest_kept` is a whole period behind today, so today can never be old enough — which
+    /// is why there is no separate guard against deleting it.
+    #[test]
+    fn test_the_retention_window_leaves_the_open_log_alone() {
+        let directory = temporary_directory("logs-retention");
+        std::fs::create_dir_all(&directory).expect("the directory must be creatable");
+        let today = session(2026, 8, 17);
+        let oldest_kept = today.plus_calendar_days(-LOG_RETENTION_DAYS).date();
+        let stale = today.plus_calendar_days(-LOG_RETENTION_DAYS - 1).date();
+        // The boundary date itself is kept, so the window is half-open: `<=` would take a file the
+        // retention period still covers.
+        let dates = [today.date(), oldest_kept, stale];
+        for date in dates {
+            std::fs::write(directory.join(format!("{date}.fund.log")), "{}\n")
+                .expect("the file must be writable");
+        }
+        assert!(
+            oldest_kept < today.date(),
+            "the window is what does the work"
+        );
+
+        let deleted = delete_aged_out_logs(&directory, &dates, oldest_kept);
+        assert_eq!(
+            deleted,
+            vec![stale],
+            "only the file past the window ages out"
+        );
+        assert!(directory
+            .join(format!("{}.fund.log", today.date()))
+            .exists());
+        assert!(directory.join(format!("{oldest_kept}.fund.log")).exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 
