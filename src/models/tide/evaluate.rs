@@ -134,7 +134,7 @@ pub fn evaluate(
     }
 
     crate::models::tide::batch::validate_input_shape(dataset, parameters)
-        .map_err(TideError::Data)?;
+        .map_err(TideError::Artifact)?;
 
     let indices = QuantileIndices::locate(quantiles);
 
@@ -154,7 +154,7 @@ pub fn evaluate(
         let mut values: Vec<f32> = output
             .to_data()
             .to_vec()
-            .map_err(|error| TideError::Data(format!("{error:?}")))?;
+            .map_err(|error| TideError::Artifact(format!("{error:?}")))?;
         predictions.append(&mut values);
     }
 

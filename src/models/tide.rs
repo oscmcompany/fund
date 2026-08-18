@@ -4,10 +4,8 @@
 
 /// What went wrong building, fitting, or loading a TiDE model.
 ///
-/// One enum across the pipeline rather than one per file, because the stages compose: `fit` runs
-/// the same `engineer_features` inference does, and a per-file error would be converted at every
-/// hand-off. The two prose variants are prose on purpose — they describe an untrusted file or a
-/// malformed frame to an operator, and no caller branches on the reason.
+/// [`TideError::Artifact`] and [`TideError::Data`] split by which machine is at fault, and carry
+/// prose because no caller branches on the reason — only an operator reads it.
 #[derive(Debug, thiserror::Error)]
 pub enum TideError {
     #[error("dataframe operation failed: {0}")]

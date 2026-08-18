@@ -192,14 +192,10 @@ impl Scaler {
 
     /// Standardizes a value into the units the model was trained in.
     ///
-    /// The forward half of an invertible pair with [`Scaler::inverse_transform_value`], and it
-    /// lives here rather than inline in [`apply_scaling`] because the two halves have to compose to
-    /// the identity: the model trains on the forward image and every prediction is read back
-    /// through the inverse. Written as two expressions in two files they can drift without anything
-    /// failing, and the symptom is predictions quietly on the wrong scale — which
-    /// [`EquityPrediction::new`]'s ordering check satisfies perfectly well.
-    ///
-    /// [`EquityPrediction::new`]: crate::common::types::EquityPrediction::new
+    /// The forward half of an invertible pair with [`Scaler::inverse_transform_value`]: the model
+    /// trains on the forward image and every prediction is read back through the inverse, so the
+    /// two must compose to the identity. Drift between them leaves predictions on the wrong scale,
+    /// which every ordering check downstream still accepts.
     pub fn transform_value(&self, column: &str, value: f64) -> f64 {
         let (mean, standard_deviation) = self.statistics_for(column);
         (value - mean) / standard_deviation

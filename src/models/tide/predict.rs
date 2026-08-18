@@ -412,10 +412,10 @@ pub fn generate_predictions(
         })?;
 
         for step in 0..output_length {
-            let timestamp = step_timestamp(now, step);
-            if timestamp != traded_session {
+            if step != 0 {
                 continue;
             }
+            let timestamp = traded_session;
 
             let base_index = (sample_index * output_length + step) * quantile_count;
             let scaled: Vec<f64> = (0..quantile_count)
