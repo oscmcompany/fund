@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::metrics::Distribution;
 use crate::laboratory::predictor::Evaluation;
+use crate::laboratory::stability::{Autocorrelation, SignAgreement};
 
 /// The shape of a laboratory record, versioned independently of the application journal.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -47,6 +48,7 @@ pub enum Observation {
     DatasetBuilt(DatasetBuilt),
     ForecastScored(ForecastScored),
     FeatureTriaged(FeatureTriaged),
+    StabilityMeasured(StabilityMeasured),
 }
 
 impl Observation {
@@ -56,8 +58,23 @@ impl Observation {
             Observation::DatasetBuilt(_) => "dataset_built",
             Observation::ForecastScored(_) => "forecast_scored",
             Observation::FeatureTriaged(_) => "feature_triaged",
+            Observation::StabilityMeasured(_) => "stability_measured",
         }
     }
+}
+
+/// Whether one forecast's per-session readings carry into the sessions after them.
+///
+/// Both statistics are recorded because they answer the same question at different bluntness: a
+/// series can co-move in magnitude while its sign is a coin, and only the sign is tradeable.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StabilityMeasured {
+    pub predictor: String,
+    /// Which per-session statistic was followed through time.
+    pub statistic: String,
+    pub sessions: usize,
+    pub autocorrelations: Vec<Autocorrelation>,
+    pub sign_agreements: Vec<SignAgreement>,
 }
 
 /// How much one feature says about the session it precedes.
@@ -309,6 +326,24 @@ mod tests {
         assert_eq!(triaged.experiment_type(), "feature_triaged");
         assert_ne!(triaged.experiment_type(), forecast.experiment_type());
         assert_ne!(triaged.experiment_type(), observation().experiment_type());
+
+        let stability = Observation::StabilityMeasured(StabilityMeasured {
+            predictor: "persistence".to_string(),
+            statistic: "information_coefficient".to_string(),
+            sessions: 498,
+            autocorrelations: Vec::new(),
+            sign_agreements: Vec::new(),
+        });
+        let value: serde_json::Value = serde_json::to_value(&stability).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("stability_measured")
+        );
+        assert_eq!(stability.experiment_type(), "stability_measured");
+        for other in [&forecast, &triaged, &observation()] {
+            assert_ne!(stability.experiment_type(), other.experiment_type());
+        }
     }
 
     /// Two different counts, and conflating them would read a forecast that ranked twice out of
