@@ -925,14 +925,9 @@ pub enum Target {
 
 /// Subtracts each session's equal-weighted mean return from every row in it.
 ///
-/// The mean over a session's cross-section approximates the market's move, because most betas are
-/// near one, so what is left is the part of a return that is specific to the name. A dollar-neutral
-/// book cancels the market out of its profit and loss, so that component of the label is noise with
-/// respect to what is actually traded — and a pointwise loss is minimised by forecasting it.
-///
-/// Equal-weighted, and over every row of the session rather than a subset: weighting by size would
-/// track the largest names instead of the market, and any subset chosen by what is currently held
-/// would put portfolio state into the label.
+/// One constant per session, so it cannot reorder a session's names — only what a pointwise loss
+/// rewards. The mean is taken over every row rather than a subset, because a subset chosen by what
+/// is currently held would put portfolio state into the label.
 pub(crate) fn demean_target(data: DataFrame) -> Result<DataFrame, TideError> {
     let timestamps: Vec<i64> = data
         .column("timestamp")?
@@ -951,8 +946,8 @@ pub(crate) fn demean_target(data: DataFrame) -> Result<DataFrame, TideError> {
 
     let mut totals: HashMap<i64, (f64, usize)> = HashMap::new();
     for (timestamp, value) in timestamps.iter().zip(returns) {
-        // A row with no return contributes nothing to the mean and takes nothing from it. It cannot
-        // be demeaned either, so it stays null and `clean_data` removes it as it always has.
+        // Skipped, so a row with no return neither moves the mean nor draws one. `fit` cleans
+        // before it demeans, so this only bites a caller that demeans an uncleaned frame.
         if let Some(value) = value.filter(|number| number.is_finite()) {
             let entry = totals.entry(*timestamp).or_insert((0.0, 0));
             entry.0 += value;

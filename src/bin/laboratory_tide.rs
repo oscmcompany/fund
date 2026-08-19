@@ -424,6 +424,27 @@ mod tests {
 
         let parameters = Parameters::parse(&arguments(&["400", "2", "9"])).unwrap();
         assert_eq!(parameters.seed, 9);
+        assert_eq!(parameters.target, Target::Raw);
+    }
+
+    /// The argument that selects the arm, so a regression here would silently compare one target
+    /// against itself — and comparing the two arms is the whole point of running this.
+    #[test]
+    fn test_both_targets_are_accepted_and_raw_is_the_default() {
+        assert_eq!(Parameters::parse(&[]).unwrap().target, Target::Raw);
+        assert_eq!(
+            Parameters::parse(&arguments(&["400", "2", "9", "raw"]))
+                .unwrap()
+                .target,
+            Target::Raw
+        );
+        assert_eq!(
+            Parameters::parse(&arguments(&["400", "2", "9", "demeaned"]))
+                .unwrap()
+                .target,
+            Target::CrossSectionallyDemeaned
+        );
+        assert!(Parameters::parse(&arguments(&["400", "2", "9", "Demeaned"])).is_err());
     }
 
     /// The seed is the whole reason a run is repeatable: initialisation moves the reported
