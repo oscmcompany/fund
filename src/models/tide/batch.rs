@@ -25,9 +25,9 @@ pub fn validate_input_shape(
     let input_length = parameters.input_length();
     let output_length = parameters.output_length();
 
-    let continuous_feature_count = dataset.past_continuous.shape()[2];
-    let categorical_feature_count = dataset.past_categorical.shape()[2];
-    let static_feature_count = dataset.static_categorical.shape()[2];
+    let continuous_feature_count = dataset.past_continuous().shape()[2];
+    let categorical_feature_count = dataset.past_categorical().shape()[2];
+    let static_feature_count = dataset.static_categorical().shape()[2];
 
     let derived = input_length * continuous_feature_count
         + input_length * categorical_feature_count
@@ -49,17 +49,17 @@ pub fn validate_input_shape(
     for (name, available, required) in [
         (
             "past continuous",
-            dataset.past_continuous.shape()[1],
+            dataset.past_continuous().shape()[1],
             input_length,
         ),
         (
             "past categorical",
-            dataset.past_categorical.shape()[1],
+            dataset.past_categorical().shape()[1],
             input_length,
         ),
         (
             "known-future categorical",
-            dataset.future_categorical.shape()[1],
+            dataset.future_categorical().shape()[1],
             output_length,
         ),
         // Always one by construction, and read as `[sample, 0, feature]` regardless — so a dataset
@@ -67,7 +67,7 @@ pub fn validate_input_shape(
         // never looks at.
         (
             "static categorical",
-            dataset.static_categorical.shape()[1],
+            dataset.static_categorical().shape()[1],
             1,
         ),
     ] {
@@ -89,9 +89,9 @@ pub fn build_input_tensor<B: Backend>(
     output_length: usize,
     device: &B::Device,
 ) -> Tensor<B, 2> {
-    let continuous_feature_count = dataset.past_continuous.shape()[2];
-    let categorical_feature_count = dataset.past_categorical.shape()[2];
-    let static_feature_count = dataset.static_categorical.shape()[2];
+    let continuous_feature_count = dataset.past_continuous().shape()[2];
+    let categorical_feature_count = dataset.past_categorical().shape()[2];
+    let static_feature_count = dataset.static_categorical().shape()[2];
     let input_size = input_length * continuous_feature_count
         + input_length * categorical_feature_count
         + output_length * categorical_feature_count
@@ -101,21 +101,21 @@ pub fn build_input_tensor<B: Backend>(
     for &sample in indices {
         for step in 0..input_length {
             for feature in 0..continuous_feature_count {
-                buffer.push(dataset.past_continuous[[sample, step, feature]]);
+                buffer.push(dataset.past_continuous()[[sample, step, feature]]);
             }
         }
         for step in 0..input_length {
             for feature in 0..categorical_feature_count {
-                buffer.push(dataset.past_categorical[[sample, step, feature]] as f32);
+                buffer.push(dataset.past_categorical()[[sample, step, feature]] as f32);
             }
         }
         for step in 0..output_length {
             for feature in 0..categorical_feature_count {
-                buffer.push(dataset.future_categorical[[sample, step, feature]] as f32);
+                buffer.push(dataset.future_categorical()[[sample, step, feature]] as f32);
             }
         }
         for feature in 0..static_feature_count {
-            buffer.push(dataset.static_categorical[[sample, 0, feature]] as f32);
+            buffer.push(dataset.static_categorical()[[sample, 0, feature]] as f32);
         }
     }
 
@@ -132,8 +132,7 @@ pub fn build_target_tensor<B: Backend>(
     device: &B::Device,
 ) -> Tensor<B, 2> {
     let targets = dataset
-        .targets
-        .as_ref()
+        .targets()
         .expect("targets are required to build a target tensor");
     let mut buffer = Vec::with_capacity(indices.len() * output_length);
     for &sample in indices {
@@ -151,13 +150,30 @@ mod tests {
     /// A dataset with the given per-step feature widths. With `input_length` 2 and `output_length`
     /// 1, the derived input size is `2*continuous + 2*categorical + 1*categorical + static`.
     fn dataset(continuous: usize, categorical: usize, static_features: usize) -> TrainingDataset {
-        TrainingDataset {
-            past_continuous: ndarray::Array3::zeros((4, 2, continuous)),
-            past_categorical: ndarray::Array3::zeros((4, 2, categorical)),
-            future_categorical: ndarray::Array3::zeros((4, 1, categorical)),
-            static_categorical: ndarray::Array3::zeros((4, 1, static_features)),
-            targets: None,
-        }
+        blocks(
+            ndarray::Array3::zeros((4, 2, continuous)),
+            ndarray::Array3::zeros((4, 1, categorical)),
+            ndarray::Array3::zeros((4, 1, static_features)),
+            categorical,
+        )
+    }
+
+    /// The same four samples with the past, known-future and static blocks given explicitly, so the
+    /// short-window cases below are built rather than mutated into existence.
+    fn blocks(
+        past_continuous: ndarray::Array3<f32>,
+        future_categorical: ndarray::Array3<i32>,
+        static_categorical: ndarray::Array3<i32>,
+        categorical: usize,
+    ) -> TrainingDataset {
+        TrainingDataset::new(
+            past_continuous,
+            ndarray::Array3::zeros((4, 2, categorical)),
+            future_categorical,
+            static_categorical,
+            None,
+        )
+        .unwrap()
     }
 
     fn parameters(input_size: usize) -> ModelParameters {
@@ -189,9 +205,13 @@ mod tests {
 
     #[test]
     fn test_a_window_shorter_than_the_artifact_needs_is_refused() {
-        let mut short = dataset(7, 5, 3);
         // One past step where the parameters ask for two: indexing step 1 would be out of bounds.
-        short.past_continuous = ndarray::Array3::zeros((4, 1, 7));
+        let short = blocks(
+            ndarray::Array3::zeros((4, 1, 7)),
+            ndarray::Array3::zeros((4, 1, 5)),
+            ndarray::Array3::zeros((4, 1, 3)),
+            5,
+        );
         let error = validate_input_shape(&short, &parameters(32))
             .expect_err("a short window must be refused");
         assert!(error.contains("past continuous"), "got: {error}");
@@ -201,8 +221,12 @@ mod tests {
     /// a zero-length time axis panics on an index the other three checks never look at.
     #[test]
     fn test_a_zero_length_static_axis_is_refused() {
-        let mut degenerate = dataset(7, 5, 3);
-        degenerate.static_categorical = ndarray::Array3::zeros((4, 0, 3));
+        let degenerate = blocks(
+            ndarray::Array3::zeros((4, 2, 7)),
+            ndarray::Array3::zeros((4, 1, 5)),
+            ndarray::Array3::zeros((4, 0, 3)),
+            5,
+        );
         let error = validate_input_shape(&degenerate, &parameters(32))
             .expect_err("a static block with no time axis must be refused");
         assert!(error.contains("static categorical"), "got: {error}");
@@ -210,8 +234,12 @@ mod tests {
 
     #[test]
     fn test_a_short_known_future_window_is_refused() {
-        let mut short = dataset(7, 5, 3);
-        short.future_categorical = ndarray::Array3::zeros((4, 0, 5));
+        let short = blocks(
+            ndarray::Array3::zeros((4, 2, 7)),
+            ndarray::Array3::zeros((4, 0, 5)),
+            ndarray::Array3::zeros((4, 1, 3)),
+            5,
+        );
         assert!(validate_input_shape(&short, &parameters(32)).is_err());
     }
 }

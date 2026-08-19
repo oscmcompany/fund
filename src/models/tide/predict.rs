@@ -393,7 +393,7 @@ pub fn generate_predictions(
 
     let mut results = Vec::with_capacity(sample_count);
     for sample_index in 0..sample_count {
-        let ticker_id = dataset.static_categorical[[sample_index, 0, 0]];
+        let ticker_id = dataset.static_categorical()[[sample_index, 0, 0]];
         // Reported rather than defaulted. This used to fall back to the literal string "UNKNOWN",
         // which is a valid ticker format -- so an unmappable id was stored as a prediction for a
         // symbol called UNKNOWN rather than failing.
