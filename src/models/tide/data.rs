@@ -211,7 +211,7 @@ impl Scaler {
 /// Windowed samples, every block indexed by sample on axis zero.
 ///
 /// The blocks are separate arrays describing one list of samples, so `len()` can only speak for all
-/// of them if they agree — which is why they are private and reached through [`TrainingDataset::new`].
+/// of them if they agree: [`TrainingDataset::new`] assembles them, and the accessors read them.
 pub struct TrainingDataset {
     past_continuous: ndarray::Array3<f32>,
     past_categorical: ndarray::Array3<i32>,
@@ -1349,10 +1349,8 @@ mod tests {
         assert_eq!(dataset.len(), 0);
     }
 
-    /// The whole reason the blocks are private. A shorter block than the sample count implies is an
-    /// out-of-bounds index deep inside batching, and the identity vector task 3b adds would be
-    /// worse still: it would attribute predictions to the wrong tickers and report a rank
-    /// correlation near zero, which is indistinguishable from the answer that experiment expects.
+    /// The whole reason the blocks are private: a block shorter than the sample count implies is an
+    /// out-of-bounds index deep inside batching rather than a refusal at the boundary.
     #[test]
     fn test_blocks_that_disagree_about_the_sample_count_are_refused() {
         let block = |samples: usize| ndarray::Array3::<i32>::zeros((samples, 1, 3));
