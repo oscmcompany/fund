@@ -98,7 +98,7 @@ pub struct PreparedDataset {
 
 /// One session's returns per name, and the identity of the window they came from.
 pub struct ReturnsDataset {
-    /// `ticker`, `timestamp`, and an unscaled `daily_return`.
+    /// Every engineered feature alongside `ticker` and `timestamp`, cleaned and unscaled.
     pub returns: DataFrame,
     pub fingerprint: DatasetFingerprint,
 }
@@ -138,10 +138,9 @@ pub async fn returns(
     // non-finite value in any continuous column, so skipping it would measure names the model never
     // sees — a missing vendor VWAP costs a row there and none here.
     let cleaned = clean_data(engineer_features(filtered)?)?;
-    let returns = cleaned.select(["ticker", "timestamp", "daily_return"])?;
 
     Ok(ReturnsDataset {
-        returns,
+        returns: cleaned,
         fingerprint,
     })
 }

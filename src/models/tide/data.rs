@@ -515,7 +515,7 @@ pub(crate) fn split_at_cutoff(
 /// Adjacency is therefore relative to the sessions this frame contains, not to a trading calendar:
 /// a session missing for some tickers is a gap, and one missing across the whole universe is
 /// invisible here and belongs to whatever checks the archive's completeness.
-fn session_ranks(data: &DataFrame) -> Result<HashMap<i64, usize>, TideError> {
+pub(crate) fn session_ranks(data: &DataFrame) -> Result<HashMap<i64, usize>, TideError> {
     let timestamps = data.column("timestamp")?.i64()?;
     // Skipping these would leave fewer sessions than rows, and the windows are counted from the
     // row height.

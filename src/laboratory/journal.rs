@@ -46,6 +46,7 @@ pub enum JournalError {
 pub enum Observation {
     DatasetBuilt(DatasetBuilt),
     ForecastScored(ForecastScored),
+    FeatureTriaged(FeatureTriaged),
 }
 
 impl Observation {
@@ -54,8 +55,22 @@ impl Observation {
         match self {
             Observation::DatasetBuilt(_) => "dataset_built",
             Observation::ForecastScored(_) => "forecast_scored",
+            Observation::FeatureTriaged(_) => "feature_triaged",
         }
     }
+}
+
+/// How much one feature says about the session it precedes.
+///
+/// `excess_bits` is the answer and the other two are why it should be believed: the raw estimate is
+/// biased upward at this sample size, and `null_bits` is that bias measured on the same rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FeatureTriaged {
+    pub feature: String,
+    pub sessions: usize,
+    pub bits: Option<Distribution>,
+    pub null_bits: Option<Distribution>,
+    pub excess_bits: Option<Distribution>,
 }
 
 /// One frame prepared for an experiment to read.
