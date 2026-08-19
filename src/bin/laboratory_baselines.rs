@@ -1,7 +1,6 @@
 //! Measures the forecasts a model has to beat, over the archive and nothing else.
 //!
-//! Trains nothing: every forecast here is a rule, so a run is one archive read and some arithmetic.
-//! That is what makes it the thing to run first — it says what the data alone is worth.
+//! Trains nothing, so a run is one archive read and some arithmetic: what the data alone is worth.
 
 use chrono::Utc;
 use tracing::{error, info, warn};
@@ -52,7 +51,11 @@ impl Parameters {
         };
         Ok(Self {
             lookback_days,
-            momentum_sessions: momentum_sessions as usize,
+            // Checked rather than cast: `as usize` truncates a value past the pointer width, and a
+            // momentum window that truncated to zero would abstain on every session in silence.
+            momentum_sessions: usize::try_from(momentum_sessions).map_err(|_| {
+                format!("MOMENTUM_SESSIONS is larger than this platform can index\n{USAGE}")
+            })?,
         })
     }
 }

@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use crate::data::{adjust, archive, bars, details, truncate};
-use crate::models::tide::data::{engineer_features, TrainingFraction};
+use crate::models::tide::data::{clean_data, engineer_features, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
 use crate::models::tide::predict::consolidate_data;
 use crate::models::tide::TideError;
@@ -123,9 +123,9 @@ pub async fn build(
 
 /// Reads the same window as [`build`] and engineers returns from it, fitting nothing.
 ///
-/// Returns are unscaled because a baseline is measured in the units a book earns. Standardizing is
-/// monotone, so it would leave the rank correlation alone and quietly denominate the decile spread
-/// in standard deviations of a window that has not happened yet.
+/// The rows are the rows the model would train on, because a baseline measured over a wider
+/// universe is not a baseline for it. Returns stay unscaled: standardizing is monotone, so it would
+/// leave the rank correlation alone and denominate the decile spread in units nobody earns.
 pub async fn returns(
     s3_client: &S3Client,
     bucket: &str,
@@ -133,10 +133,11 @@ pub async fn returns(
     session: SessionDate,
 ) -> Result<ReturnsDataset, DatasetError> {
     let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
-    // The model's own feature step, so a baseline and the model it is a baseline for are measured
-    // against the same target — including its refusal to call a return across a session gap daily.
-    let engineered = engineer_features(filtered)?;
-    let returns = engineered.select(["ticker", "timestamp", "daily_return"])?;
+    // The model's own two steps, not just the first: `clean_data` drops any row holding a null or
+    // non-finite value in any continuous column, so skipping it would measure names the model never
+    // sees — a missing vendor VWAP costs a row there and none here.
+    let cleaned = clean_data(engineer_features(filtered)?)?;
+    let returns = cleaned.select(["ticker", "timestamp", "daily_return"])?;
 
     Ok(ReturnsDataset {
         returns,
