@@ -10,9 +10,9 @@ use polars::prelude::*;
 
 use crate::models::tide::configuration::ModelParameters;
 use crate::models::tide::data::{
-    apply_scaling, clean_data, encode_categoricals, engineer_features, split_at_cutoff,
-    training_cutoff, CategoryMapping, Data, FeatureMappings, Scaler, TrainingFraction,
-    CATEGORICAL_COLUMNS, CONTINUOUS_COLUMNS, STATIC_CATEGORICAL_COLUMNS,
+    apply_scaling, clean_data, demean_target, encode_categoricals, engineer_features,
+    split_at_cutoff, training_cutoff, CategoryMapping, Data, FeatureMappings, Scaler, Target,
+    TrainingFraction, CATEGORICAL_COLUMNS, CONTINUOUS_COLUMNS, STATIC_CATEGORICAL_COLUMNS,
 };
 use crate::models::tide::TideError;
 
@@ -39,9 +39,20 @@ pub struct FitResult {
 /// instrument first listed (or first clearing the liquidity floors) after the cutoff would vanish
 /// from the validation split, and, since these mappings ship in the artifact as the inference
 /// vocabulary, could not be predicted at all until it had traded the full pre-cutoff window.
-pub fn fit(raw: DataFrame, training_fraction: TrainingFraction) -> Result<FitResult, TideError> {
+///
+/// `target` selects what the model learns to predict. Demeaning happens after cleaning and before
+/// the scaler is fitted, so the statistics describe the label the model is actually given.
+pub fn fit(
+    raw: DataFrame,
+    training_fraction: TrainingFraction,
+    target: Target,
+) -> Result<FitResult, TideError> {
     let engineered = engineer_features(raw)?;
     let cleaned = clean_data(engineered)?;
+    let cleaned = match target {
+        Target::Raw => cleaned,
+        Target::CrossSectionallyDemeaned => demean_target(cleaned)?,
+    };
 
     let cutoff = training_cutoff(&cleaned, training_fraction)?;
     let (training_rows, _) = split_at_cutoff(&cleaned, cutoff)?;
@@ -295,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_fit_mappings_are_sorted_and_deterministic() {
-        let result = fit(raw_frame(), training_fraction()).unwrap();
+        let result = fit(raw_frame(), training_fraction(), Target::Raw).unwrap();
         let tickers = &result.mappings["ticker"];
         // Uppercased and sorted: AAPL -> 0, GOOG -> 1.
         assert_eq!(tickers["AAPL"], 0);
@@ -309,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_fit_scaler_has_all_continuous_columns() {
-        let result = fit(raw_frame(), training_fraction()).unwrap();
+        let result = fit(raw_frame(), training_fraction(), Target::Raw).unwrap();
         for column in CONTINUOUS_COLUMNS {
             assert!(result.scaler.means().contains_key(*column));
             assert!(result.scaler.standard_deviations().contains_key(*column));
@@ -321,7 +332,7 @@ mod tests {
     /// row, so the held-out period set the scale its own predictions were later measured on.
     #[test]
     fn test_the_scaler_is_fitted_only_on_rows_at_or_before_the_training_cutoff() {
-        let result = fit(scale_shifted_frame(), training_fraction()).unwrap();
+        let result = fit(scale_shifted_frame(), training_fraction(), Target::Raw).unwrap();
 
         // Close prices 101 through 108 over the eight training days: mean 104.5, sample standard
         // deviation sqrt(6). Fitted over every row the mean would be 1093.6 instead, dragged there
@@ -355,7 +366,7 @@ mod tests {
     /// mean 0 and sample deviation 1 exactly, so a disagreement of even one session shows up here.
     #[test]
     fn test_the_scaler_window_matches_the_rows_the_training_split_yields() {
-        let result = fit(scale_shifted_frame(), training_fraction()).unwrap();
+        let result = fit(scale_shifted_frame(), training_fraction(), Target::Raw).unwrap();
         let (train, validation) = result.data.split_by_timestamp(training_fraction()).unwrap();
 
         assert_eq!(train.height(), 8, "days 1 through 8 train");
@@ -395,7 +406,7 @@ mod tests {
         rows.push(("ZZZZ", "ENERGY", "SOLAR", 9, 50.0));
         rows.push(("ZZZZ", "ENERGY", "SOLAR", 10, 51.0));
 
-        let result = fit(frame_from_rows(&rows), training_fraction()).unwrap();
+        let result = fit(frame_from_rows(&rows), training_fraction(), Target::Raw).unwrap();
 
         assert!(
             result.mappings["ticker"].contains_key("ZZZZ"),
@@ -480,7 +491,7 @@ mod tests {
     /// exactly the mixed-artifact state the staging exists to prevent.
     #[test]
     fn test_write_artifact_json_leaves_no_staging_files_behind() {
-        let result = fit(raw_frame(), training_fraction()).unwrap();
+        let result = fit(raw_frame(), training_fraction(), Target::Raw).unwrap();
         let parameters = ModelParameters::new(448, 35, 5);
         let directory = tempfile::tempdir().unwrap();
 
@@ -510,7 +521,7 @@ mod tests {
 
     #[test]
     fn test_write_artifact_json_round_trips_via_loader() {
-        let result = fit(raw_frame(), training_fraction()).unwrap();
+        let result = fit(raw_frame(), training_fraction(), Target::Raw).unwrap();
         let parameters = ModelParameters::new(448, 35, 5);
         let directory = tempfile::tempdir().unwrap();
         write_artifact_json(

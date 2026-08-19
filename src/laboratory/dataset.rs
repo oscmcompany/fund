@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use crate::data::{adjust, archive, bars, details, truncate};
-use crate::models::tide::data::{clean_data, engineer_features, TrainingFraction};
+use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
 use crate::models::tide::predict::consolidate_data;
 use crate::models::tide::TideError;
@@ -114,9 +114,10 @@ pub async fn build(
     lookback_days: i64,
     session: SessionDate,
     training_fraction: TrainingFraction,
+    target: Target,
 ) -> Result<PreparedDataset, DatasetError> {
     let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
-    let fit = fit(filtered, training_fraction)?;
+    let fit = fit(filtered, training_fraction, target)?;
 
     Ok(PreparedDataset { fit, fingerprint })
 }
