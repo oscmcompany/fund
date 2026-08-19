@@ -4,6 +4,7 @@
 
 pub mod dataset;
 pub mod export;
+pub mod forecast;
 pub mod journal;
 pub mod metrics;
 pub mod predictor;

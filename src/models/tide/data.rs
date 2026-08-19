@@ -218,6 +218,7 @@ pub struct TrainingDataset {
     future_categorical: ndarray::Array3<i32>,
     static_categorical: ndarray::Array3<i32>,
     targets: Option<ndarray::Array3<f32>>,
+    forecast_sessions: Vec<i64>,
 }
 
 impl TrainingDataset {
@@ -232,12 +233,14 @@ impl TrainingDataset {
         future_categorical: ndarray::Array3<i32>,
         static_categorical: ndarray::Array3<i32>,
         targets: Option<ndarray::Array3<f32>>,
+        forecast_sessions: Vec<i64>,
     ) -> Result<Self, TideError> {
         let samples = past_continuous.shape()[0];
         let blocks = [
             ("past categorical", past_categorical.shape()[0]),
             ("known-future categorical", future_categorical.shape()[0]),
             ("static categorical", static_categorical.shape()[0]),
+            ("forecast session", forecast_sessions.len()),
         ];
         for (name, count) in blocks
             .into_iter()
@@ -257,6 +260,7 @@ impl TrainingDataset {
             future_categorical,
             static_categorical,
             targets,
+            forecast_sessions,
         })
     }
 
@@ -278,6 +282,14 @@ impl TrainingDataset {
 
     pub fn targets(&self) -> Option<&ndarray::Array3<f32>> {
         self.targets.as_ref()
+    }
+
+    /// The session each sample forecasts, as a millisecond timestamp.
+    ///
+    /// The encoded ticker is already reachable at `static_categorical[[sample, 0, 0]]`, so this is
+    /// the other half of a sample's identity and the half a cross-section cannot be grouped without.
+    pub fn forecast_sessions(&self) -> &[i64] {
+        &self.forecast_sessions
     }
 
     /// How many samples every block carries, which the constructor has already made one number.
@@ -560,6 +572,15 @@ fn window_frame(
             "A window needs a non-zero input or output length".to_string(),
         ));
     }
+    // A window that forecasts nothing has no session to name, and the row it would read for one is
+    // the first past the ticker's own rows. `ModelParameters::load` refuses a zero output length on
+    // the same grounds, at the other end of the same pipeline.
+    if output_length == 0 {
+        return Err(TideError::Data(
+            "A window needs a non-zero output length; one with no future step forecasts nothing"
+                .to_string(),
+        ));
+    }
     let ranks = session_ranks(frame)?;
     let continuous_feature_count = CONTINUOUS_COLUMNS.len();
     let categorical_feature_count = CATEGORICAL_COLUMNS.len();
@@ -585,6 +606,7 @@ fn window_frame(
     let mut all_future_categorical: Vec<Vec<i32>> = Vec::new();
     let mut all_static_categorical: Vec<Vec<i32>> = Vec::new();
     let mut all_targets: Vec<Vec<f32>> = Vec::new();
+    let mut all_forecast_sessions: Vec<i64> = Vec::new();
 
     for ticker in &tickers {
         let mask = frame.column("ticker")?.i32()?.equal(*ticker);
@@ -593,6 +615,12 @@ fn window_frame(
         if ticker_data.height() < window_size {
             continue;
         }
+
+        let timestamps: Vec<i64> = ticker_data
+            .column("timestamp")?
+            .i64()?
+            .into_no_null_iter()
+            .collect();
 
         let continuous_column_values = get_float_columns(&ticker_data, CONTINUOUS_COLUMNS)?;
         let categorical_column_values = get_int_columns(&ticker_data, CATEGORICAL_COLUMNS)?;
@@ -645,6 +673,9 @@ fn window_frame(
             all_past_categorical.push(past_categorical_window);
             all_future_categorical.push(future_categorical_window);
             all_static_categorical.push(static_categorical_window);
+            // The first future step, which is the session the sample forecasts. Taken here rather
+            // than derived later, because this loop is what decides which windows exist.
+            all_forecast_sessions.push(timestamps[start + input_length]);
 
             if with_targets {
                 let returns = &continuous_column_values[target_index];
@@ -711,6 +742,7 @@ fn window_frame(
         future_categorical,
         static_categorical,
         targets,
+        all_forecast_sessions,
     )
 }
 
@@ -1343,6 +1375,7 @@ mod tests {
             ndarray::Array3::zeros((0, 5, 5)),
             ndarray::Array3::zeros((0, 1, 3)),
             None,
+            Vec::new(),
         )
         .unwrap();
         assert!(dataset.is_empty());
@@ -1361,6 +1394,7 @@ mod tests {
                 ndarray::Array3::zeros((4, 1, 5)),
                 block(static_samples),
                 targets,
+                vec![0; 4],
             )
         };
 
@@ -1373,6 +1407,31 @@ mod tests {
             build(4, Some(ndarray::Array3::zeros((3, 1, 1)))).is_err(),
             "targets are optional, but a present one still describes the same samples"
         );
+    }
+
+    /// The session a sample forecasts is the first *future* step, not the last past one. Off by one
+    /// the wrong way, every prediction would be scored against the outcome it was given as input,
+    /// and the rank correlation would read as a signal nobody could trade.
+    #[test]
+    fn test_a_sample_names_the_session_it_forecasts() {
+        const DAY: i64 = 86_400_000;
+        let data = empty_data(make_encoded_frame(1, 6));
+        // Input 3, output 1: the windows start at rows 0, 1 and 2, so they forecast rows 3, 4, 5.
+        let dataset = data.get_dataset(DatasetKind::Predict, 3, 1).unwrap();
+
+        // Predict mode keeps only the last window per ticker, which forecasts the final row.
+        assert_eq!(dataset.forecast_sessions(), &[5 * DAY]);
+
+        let training = data
+            .get_dataset(DatasetKind::Train(fraction_of(0.8)), 3, 1)
+            .unwrap();
+        assert_eq!(training.forecast_sessions().len(), training.len());
+        for session in training.forecast_sessions() {
+            assert!(
+                *session >= 3 * DAY,
+                "a window of three past steps cannot forecast earlier than row three, got {session}"
+            );
+        }
     }
 
     /// Build a minimal, already engineered/scaled/encoded frame (ticker and the
@@ -1577,6 +1636,28 @@ mod tests {
             matches!(result, Err(TideError::Data(_))),
             "a zero-length window must be an error, not a panic"
         );
+    }
+
+    /// A window with past steps but no future one is the case the guard above misses: the sum is
+    /// non-zero, so it passes, and the last window then reads one position past the ticker's final
+    /// row to name the session it forecasts. A window that forecasts nothing has no such session.
+    #[test]
+    fn test_a_window_with_no_future_step_is_refused_rather_than_indexed() {
+        let data = Data::from_parts(
+            prepared_and_encoded(raw_gapped_frame()),
+            return_scaler(),
+            FeatureMappings::new(),
+        );
+        for kind in [
+            DatasetKind::Predict,
+            DatasetKind::Train(fraction_of(0.8)),
+            DatasetKind::Validate(fraction_of(0.8)),
+        ] {
+            assert!(
+                matches!(data.get_dataset(kind, 3, 0), Err(TideError::Data(_))),
+                "an output length of zero must be an error, not a panic"
+            );
+        }
     }
 
     /// `session_ranks` skips nulls while the windows are counted from the row height, so one null

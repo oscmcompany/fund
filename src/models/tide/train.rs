@@ -407,6 +407,7 @@ mod tests {
             future_categorical,
             static_categorical,
             Some(targets),
+            vec![0; sample_count],
         )
         .unwrap()
     }

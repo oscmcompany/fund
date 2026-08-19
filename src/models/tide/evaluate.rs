@@ -43,14 +43,14 @@ impl EvaluationMetrics {
 /// The quantiles arrive from the artifact in whatever order training wrote them, so "lowest",
 /// "highest", and "the median" are positions to be found rather than indices 0, 1, and 2.
 #[derive(Debug, Clone, Copy)]
-struct QuantileIndices {
+pub(crate) struct QuantileIndices {
     lower: usize,
-    median: usize,
+    pub(crate) median: usize,
     upper: usize,
 }
 
 impl QuantileIndices {
-    fn locate(quantiles: &[f64]) -> Self {
+    pub(crate) fn locate(quantiles: &[f64]) -> Self {
         Self {
             lower: argmin(quantiles),
             median: closest_to(quantiles, 0.5),
@@ -495,6 +495,7 @@ mod tests {
             ndarray::Array3::zeros((sample_count, output_length, 5)),
             ndarray::Array3::zeros((sample_count, 1, 3)),
             with_targets.then(|| ndarray::Array3::zeros((sample_count, output_length, 1))),
+            vec![0; sample_count],
         )
         .unwrap()
     }

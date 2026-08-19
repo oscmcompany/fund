@@ -172,6 +172,7 @@ mod tests {
             future_categorical,
             static_categorical,
             None,
+            vec![0; 4],
         )
         .unwrap()
     }
