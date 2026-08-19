@@ -29,7 +29,7 @@ use fund::models::tide::artifact::{
     candidate_folders_descending, list_run_folders, package_dir_to_tar_gz, upload_artifact,
 };
 use fund::models::tide::configuration::ModelParameters;
-use fund::models::tide::data::{input_feature_size, DatasetKind, TrainingFraction};
+use fund::models::tide::data::{input_feature_size, DatasetKind, Target, TrainingFraction};
 use fund::models::tide::drift::{check_drift, DriftStatus};
 use fund::models::tide::evaluate::evaluate;
 use fund::models::tide::fit::write_artifact_json;
@@ -206,6 +206,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         lookback_days,
         session,
         training_fraction,
+        // The published artifact keeps the raw target; the demeaned one is a laboratory experiment
+        // until it is shown to produce a model that ranks.
+        Target::Raw,
     )
     .await?;
     let fingerprint = prepared.fingerprint;

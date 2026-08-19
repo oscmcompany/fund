@@ -911,6 +911,70 @@ pub(crate) fn engineer_features(data: DataFrame) -> Result<DataFrame, TideError>
     Ok(new_data)
 }
 
+/// What the model is trained to predict.
+///
+/// The two differ by a per-session constant, which is invisible to a cross-sectional rank
+/// correlation and decisive for what a pointwise loss rewards — see [`demean_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The one-session return as the archive reports it.
+    Raw,
+    /// That return less its own session's equal-weighted cross-sectional mean.
+    CrossSectionallyDemeaned,
+}
+
+/// Subtracts each session's equal-weighted mean return from every row in it.
+///
+/// The mean over a session's cross-section approximates the market's move, because most betas are
+/// near one, so what is left is the part of a return that is specific to the name. A dollar-neutral
+/// book cancels the market out of its profit and loss, so that component of the label is noise with
+/// respect to what is actually traded — and a pointwise loss is minimised by forecasting it.
+///
+/// Equal-weighted, and over every row of the session rather than a subset: weighting by size would
+/// track the largest names instead of the market, and any subset chosen by what is currently held
+/// would put portfolio state into the label.
+pub(crate) fn demean_target(data: DataFrame) -> Result<DataFrame, TideError> {
+    let timestamps: Vec<i64> = data
+        .column("timestamp")?
+        .i64()?
+        .into_no_null_iter()
+        .collect();
+    let returns = data.column(TARGET_COLUMN)?.cast(&DataType::Float64)?;
+    let returns = returns.f64()?;
+    if timestamps.len() != data.height() {
+        return Err(TideError::Data(format!(
+            "Equity bars contain null timestamps ({} rows, {} timestamps)",
+            data.height(),
+            timestamps.len()
+        )));
+    }
+
+    let mut totals: HashMap<i64, (f64, usize)> = HashMap::new();
+    for (timestamp, value) in timestamps.iter().zip(returns) {
+        // A row with no return contributes nothing to the mean and takes nothing from it. It cannot
+        // be demeaned either, so it stays null and `clean_data` removes it as it always has.
+        if let Some(value) = value.filter(|number| number.is_finite()) {
+            let entry = totals.entry(*timestamp).or_insert((0.0, 0));
+            entry.0 += value;
+            entry.1 += 1;
+        }
+    }
+
+    let demeaned: Vec<Option<f32>> = timestamps
+        .iter()
+        .zip(returns)
+        .map(|(timestamp, value)| {
+            let value = value.filter(|number| number.is_finite())?;
+            let (sum, count) = totals.get(timestamp)?;
+            (*count > 0).then(|| (value - sum / *count as f64) as f32)
+        })
+        .collect();
+
+    let mut demeaned_data = data;
+    demeaned_data.with_column(Column::new(TARGET_COLUMN.into(), demeaned))?;
+    Ok(demeaned_data)
+}
+
 pub(crate) fn clean_data(mut data: DataFrame) -> Result<DataFrame, TideError> {
     // A row with no ticker cannot be attributed to an instrument, and substituting a placeholder
     // would make it indistinguishable from a real symbol of the same spelling. Reject it the way
@@ -1432,6 +1496,135 @@ mod tests {
                 "a window of three past steps cannot forecast earlier than row three, got {session}"
             );
         }
+    }
+
+    /// Three names over two sessions, with a null return that must survive as one.
+    fn demean_frame() -> DataFrame {
+        const DAY: i64 = 86_400_000;
+        DataFrame::new(vec![
+            Column::new(
+                "ticker".into(),
+                vec!["AAA", "BBB", "CCC", "AAA", "BBB", "CCC"],
+            ),
+            Column::new("timestamp".into(), vec![0_i64, 0, 0, DAY, DAY, DAY]),
+            Column::new(
+                "daily_return".into(),
+                vec![
+                    Some(0.01_f32),
+                    Some(0.02),
+                    Some(0.06),
+                    Some(-0.04),
+                    None,
+                    Some(0.02),
+                ],
+            ),
+        ])
+        .unwrap()
+    }
+
+    fn demeaned_returns(frame: &DataFrame) -> Vec<Option<f32>> {
+        frame
+            .column("daily_return")
+            .unwrap()
+            .f32()
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    /// Compares returns within a tolerance three orders below the smallest difference these
+    /// fixtures care about, so f32 rounding passes and a mean taken from the wrong session does not.
+    fn assert_returns_close(actual: &[Option<f32>], expected: &[Option<f32>], context: &str) {
+        assert_eq!(actual.len(), expected.len(), "{context}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            match (actual, expected) {
+                (Some(actual), Some(expected)) => assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "{context}: expected {expected}, got {actual}"
+                ),
+                (None, None) => {}
+                _ => panic!("{context}: expected {expected:?}, got {actual:?}"),
+            }
+        }
+    }
+
+    /// Session one holds 0.01, 0.02 and 0.06, whose mean is 0.03. Session two holds -0.04 and 0.02
+    /// with one absent, so its mean is -0.01 over the two that traded.
+    #[test]
+    fn test_each_session_is_centred_on_its_own_mean() {
+        let demeaned = demeaned_returns(&demean_target(demean_frame()).unwrap());
+        let expected = [
+            Some(-0.02_f32),
+            Some(-0.01),
+            Some(0.03),
+            Some(-0.03),
+            None,
+            Some(0.03),
+        ];
+
+        assert_returns_close(&demeaned, &expected, "each session centred on its own mean");
+    }
+
+    /// The invariant the whole experiment rests on. Demeaning subtracts one constant from every
+    /// name in a session, so it cannot change their order — which is why a cross-sectional rank
+    /// correlation measures the same thing either side of the change, and only what the model is
+    /// trained to predict differs.
+    #[test]
+    fn test_demeaning_cannot_reorder_a_session() {
+        let raw = demean_frame();
+        let demeaned = demean_target(raw.clone()).unwrap();
+
+        let order = |frame: &DataFrame, session: i64| {
+            let timestamps: Vec<i64> = frame
+                .column("timestamp")
+                .unwrap()
+                .i64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect();
+            let returns = demeaned_returns(frame);
+            let mut rows: Vec<(usize, f32)> = timestamps
+                .iter()
+                .zip(&returns)
+                .enumerate()
+                .filter(|(_, (stamp, value))| **stamp == session && value.is_some())
+                .map(|(index, (_, value))| (index, value.unwrap()))
+                .collect();
+            rows.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap());
+            rows.into_iter().map(|(index, _)| index).collect::<Vec<_>>()
+        };
+
+        for session in [0, 86_400_000] {
+            assert_eq!(
+                order(&raw, session),
+                order(&demeaned, session),
+                "session {session} was reordered"
+            );
+        }
+    }
+
+    /// A session is centred on itself and nothing else, so a session that moved as a whole does not
+    /// drag its neighbour's rows with it.
+    #[test]
+    fn test_a_sessions_mean_is_taken_from_that_session_alone() {
+        let mut shifted = demean_frame();
+        let returns = shifted.column("daily_return").unwrap().f32().unwrap();
+        let timestamps = shifted.column("timestamp").unwrap().i64().unwrap();
+        // Move every row of the first session up by a whole point, leaving the second untouched.
+        let rewritten: Vec<Option<f32>> = returns
+            .into_iter()
+            .zip(timestamps.into_no_null_iter())
+            .map(|(value, stamp)| value.map(|value| if stamp == 0 { value + 1.0 } else { value }))
+            .collect();
+        shifted
+            .with_column(Column::new("daily_return".into(), rewritten))
+            .unwrap();
+
+        assert_returns_close(
+            &demeaned_returns(&demean_target(shifted).unwrap()),
+            &demeaned_returns(&demean_target(demean_frame()).unwrap()),
+            "a constant added to one session must vanish from it and reach no other",
+        );
     }
 
     /// Build a minimal, already engineered/scaled/encoded frame (ticker and the

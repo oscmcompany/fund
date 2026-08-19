@@ -19,11 +19,12 @@ use fund::laboratory::predictor::{
 };
 use fund::laboratory::{dataset, forecast};
 use fund::models::tide::configuration::ModelParameters;
-use fund::models::tide::data::{input_feature_size, DatasetKind, TrainingFraction};
+use fund::models::tide::data::{input_feature_size, DatasetKind, Target, TrainingFraction};
 use fund::models::tide::model::TiDEModel;
 use fund::models::tide::train::{train, TrainBackend, TrainConfiguration};
 
-const USAGE: &str = "Usage: laboratory_tide [LOOKBACK_DAYS] [EPOCHS] [SEED]";
+const USAGE: &str = "Usage: laboratory_tide [LOOKBACK_DAYS] [EPOCHS] [SEED] [TARGET]\n\
+                     TARGET is raw (default) or demeaned";
 
 const INPUT_LENGTH: usize = 35;
 const OUTPUT_LENGTH: usize = 1;
@@ -50,6 +51,7 @@ struct Parameters {
     lookback_days: i64,
     epochs: usize,
     seed: u64,
+    target: Target,
 }
 
 impl Parameters {
@@ -71,13 +73,31 @@ impl Parameters {
                 positive(epochs, "EPOCHS")?,
                 positive(seed, "SEED")?,
             ),
+            [lookback, epochs, seed, _] => (
+                positive(lookback, "LOOKBACK_DAYS")?,
+                positive(epochs, "EPOCHS")?,
+                positive(seed, "SEED")?,
+            ),
             _ => return Err(format!("Too many arguments\n{USAGE}")),
+        };
+        let target = match arguments {
+            [_, _, _, target] => match target.trim() {
+                "raw" => Target::Raw,
+                "demeaned" => Target::CrossSectionallyDemeaned,
+                other => {
+                    return Err(format!(
+                        "TARGET must be raw or demeaned, got {other:?}\n{USAGE}"
+                    ))
+                }
+            },
+            _ => Target::Raw,
         };
         Ok(Self {
             lookback_days,
             epochs: usize::try_from(epochs)
                 .map_err(|_| format!("EPOCHS is larger than this platform can index\n{USAGE}"))?,
             seed: seed as u64,
+            target,
         })
     }
 }
@@ -149,6 +169,7 @@ async fn run(
         lookback_days = parameters.lookback_days,
         epochs = parameters.epochs,
         seed = parameters.seed,
+        target = format!("{:?}", parameters.target),
         %session,
         %run_id,
         "Training a model to score it"
@@ -161,6 +182,7 @@ async fn run(
         parameters.lookback_days,
         session,
         training_fraction,
+        parameters.target,
     )
     .await?;
     let fingerprint = prepared.fingerprint;
@@ -238,8 +260,12 @@ async fn run(
         "Training complete"
     );
 
+    // Named for the arm, so two runs over one window are distinguishable in the journal.
     let scored_model = forecast::score(
-        "tide",
+        match parameters.target {
+            Target::Raw => "tide",
+            Target::CrossSectionallyDemeaned => "tide_demeaned",
+        },
         &best_model.valid(),
         &validation_data,
         &model_parameters,
