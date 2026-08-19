@@ -46,6 +46,7 @@ pub enum JournalError {
 pub enum Observation {
     DatasetBuilt(DatasetBuilt),
     ForecastScored(ForecastScored),
+    FeatureTriaged(FeatureTriaged),
 }
 
 impl Observation {
@@ -54,8 +55,22 @@ impl Observation {
         match self {
             Observation::DatasetBuilt(_) => "dataset_built",
             Observation::ForecastScored(_) => "forecast_scored",
+            Observation::FeatureTriaged(_) => "feature_triaged",
         }
     }
+}
+
+/// How much one feature says about the session it precedes.
+///
+/// `excess_bits` is the answer and the other two are why it should be believed: the raw estimate is
+/// biased upward at this sample size, and `null_bits` is that bias measured on the same rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FeatureTriaged {
+    pub feature: String,
+    pub sessions: usize,
+    pub bits: Option<Distribution>,
+    pub null_bits: Option<Distribution>,
+    pub excess_bits: Option<Distribution>,
 }
 
 /// One frame prepared for an experiment to read.
@@ -258,8 +273,8 @@ mod tests {
         })
     }
 
-    /// The export partitions on this name, so the two variants must not collide and neither may
-    /// drift from the tag `rename_all` generates for it.
+    /// The export partitions on this name, so no two variants may collide and none may drift from
+    /// the tag `rename_all` generates for it.
     #[test]
     fn test_each_observation_exports_under_its_own_partition() {
         let forecast = Observation::ForecastScored(ForecastScored {
@@ -277,6 +292,23 @@ mod tests {
         );
         assert_eq!(forecast.experiment_type(), "forecast_scored");
         assert_ne!(forecast.experiment_type(), observation().experiment_type());
+
+        let triaged = Observation::FeatureTriaged(FeatureTriaged {
+            feature: "daily_return".to_string(),
+            sessions: 499,
+            bits: None,
+            null_bits: None,
+            excess_bits: None,
+        });
+        let value: serde_json::Value = serde_json::to_value(&triaged).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("feature_triaged")
+        );
+        assert_eq!(triaged.experiment_type(), "feature_triaged");
+        assert_ne!(triaged.experiment_type(), forecast.experiment_type());
+        assert_ne!(triaged.experiment_type(), observation().experiment_type());
     }
 
     /// Two different counts, and conflating them would read a forecast that ranked twice out of
