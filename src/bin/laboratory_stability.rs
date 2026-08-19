@@ -269,7 +269,7 @@ fn render(measured: &[laboratory::StabilityMeasured]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fund::laboratory::stability::{Autocorrelation, SignAgreement};
+    use fund::laboratory::stability::{Association, SignAgreement};
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -310,7 +310,7 @@ mod tests {
             predictor: "persistence".to_string(),
             statistic: STATISTIC.to_string(),
             sessions: 498,
-            autocorrelations: vec![Autocorrelation {
+            autocorrelations: vec![Association {
                 lag: 1,
                 correlation: -0.0731,
                 standard_error: 0.0448,

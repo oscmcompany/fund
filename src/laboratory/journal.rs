@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::metrics::Distribution;
 use crate::laboratory::predictor::Evaluation;
-use crate::laboratory::stability::{Autocorrelation, SignAgreement};
+use crate::laboratory::stability::{Association, SignAgreement};
 
 /// The shape of a laboratory record, versioned independently of the application journal.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -49,6 +49,7 @@ pub enum Observation {
     ForecastScored(ForecastScored),
     FeatureTriaged(FeatureTriaged),
     StabilityMeasured(StabilityMeasured),
+    RegimeMeasured(RegimeMeasured),
 }
 
 impl Observation {
@@ -59,8 +60,27 @@ impl Observation {
             Observation::ForecastScored(_) => "forecast_scored",
             Observation::FeatureTriaged(_) => "feature_triaged",
             Observation::StabilityMeasured(_) => "stability_measured",
+            Observation::RegimeMeasured(_) => "regime_measured",
         }
     }
+}
+
+/// Whether one forecast's per-session readings follow from the state of the market.
+///
+/// `lag` separates the two answers this can give: at zero the state describes the session being
+/// read, which explains without anticipating, and only a positive lag is something a book could act
+/// on before the session it speaks about.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RegimeMeasured {
+    pub predictor: String,
+    /// Which per-session statistic was explained.
+    pub statistic: String,
+    /// Which description of the market it was explained by.
+    pub state: String,
+    /// Which stretch of the window it was measured over, so a figure can be asked to appear twice.
+    pub segment: String,
+    pub sessions: usize,
+    pub associations: Vec<Association>,
 }
 
 /// Whether one forecast's per-session readings carry into the sessions after them.
@@ -73,7 +93,7 @@ pub struct StabilityMeasured {
     /// Which per-session statistic was followed through time.
     pub statistic: String,
     pub sessions: usize,
-    pub autocorrelations: Vec<Autocorrelation>,
+    pub autocorrelations: Vec<Association>,
     pub sign_agreements: Vec<SignAgreement>,
 }
 

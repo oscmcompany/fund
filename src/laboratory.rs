@@ -9,4 +9,5 @@ pub mod information;
 pub mod journal;
 pub mod metrics;
 pub mod predictor;
+pub mod regime;
 pub mod stability;
