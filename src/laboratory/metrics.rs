@@ -165,7 +165,7 @@ fn average_ranks(values: &[f64]) -> Option<Vec<f64>> {
 }
 
 /// Correlation of two equal-length series, or `None` where either cannot vary.
-fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+pub(crate) fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
     if left.len() != right.len() || left.len() < 2 {
         return None;
     }
