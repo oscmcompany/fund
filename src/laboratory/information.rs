@@ -13,8 +13,11 @@ use crate::models::tide::TideError;
 /// Bins each side is cut into. Ten matches the decile language the rest of the laboratory uses.
 pub const DEFAULT_BINS: usize = 10;
 
-/// Names a cross-section needs before a hundred-cell table means anything.
-pub const MINIMUM_CROSS_SECTION: usize = 100;
+/// Names a cross-section needs for every cell of the table before a count means anything.
+///
+/// One apiece, so the ten-by-ten table the continuous features use asks for a hundred names, and a
+/// feature naming more groups than that asks for proportionally more.
+pub const NAMES_PER_CELL: usize = 1;
 
 /// What one session's cross-section says about a feature.
 ///
@@ -71,6 +74,78 @@ pub fn category_bins(values: &[&str]) -> Vec<usize> {
         .collect()
 }
 
+/// Renumbers an already-grouped column so its bins run from zero with no gaps.
+///
+/// Every distinct value keeps a bin of its own however many there are, which is the whole point:
+/// quantile-cutting a hundred and fifty industries into ten would merge them by their numbering.
+fn nominal_bins(values: &[usize]) -> Option<Vec<usize>> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut distinct = values.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+
+    Some(
+        values
+            .iter()
+            .map(|value| distinct.partition_point(|other| other < value))
+            .collect(),
+    )
+}
+
+/// A feature's values for one cross-section, carrying how they are cut into bins.
+///
+/// The two travel together because separating them is what lets a sector be quantile-cut: nothing
+/// downstream can tell an ordered scale from a numbering once the values are bare.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Feature {
+    /// Values ordering names on a scale, cut into equal-count groups within each session.
+    Continuous(Vec<f64>),
+    /// Values naming groups, already numbered, each group its own bin.
+    Nominal(Vec<usize>),
+}
+
+impl Feature {
+    /// How many names the column covers.
+    pub fn len(&self) -> usize {
+        match self {
+            Feature::Continuous(values) => values.len(),
+            Feature::Nominal(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The values at `indices`, cut the same way this column is.
+    fn select(&self, indices: &[usize]) -> Self {
+        match self {
+            Feature::Continuous(values) => {
+                Feature::Continuous(indices.iter().map(|index| values[*index]).collect())
+            }
+            Feature::Nominal(values) => {
+                Feature::Nominal(indices.iter().map(|index| values[*index]).collect())
+            }
+        }
+    }
+
+    /// The bin each name falls in, `bins` of them for a continuous column and one per group for a
+    /// nominal one.
+    fn bins(&self, bins: usize) -> Option<Vec<usize>> {
+        match self {
+            Feature::Continuous(values) => quantile_bins(values, bins),
+            Feature::Nominal(values) => nominal_bins(values),
+        }
+    }
+}
+
+/// How many bins a column actually occupies, which is what sets the size of the table.
+fn occupied(bins: &[usize]) -> usize {
+    bins.iter().collect::<std::collections::BTreeSet<_>>().len()
+}
+
 /// Mutual information between two binned variables, in bits.
 ///
 /// Zero when the two are independent, and at most the entropy of the coarser side. The estimate is
@@ -81,11 +156,14 @@ pub fn mutual_information(feature: &[usize], target: &[usize]) -> Option<f64> {
     }
     let total = feature.len() as f64;
 
-    let mut joint: std::collections::HashMap<(usize, usize), f64> =
-        std::collections::HashMap::new();
-    let mut feature_counts: std::collections::HashMap<usize, f64> =
-        std::collections::HashMap::new();
-    let mut target_counts: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    // Ordered rather than hashed: a hundred cells cost nothing to keep sorted, and the sum below
+    // is over floats, so a randomly seeded iteration order would move its last digits every run.
+    let mut joint: std::collections::BTreeMap<(usize, usize), f64> =
+        std::collections::BTreeMap::new();
+    let mut feature_counts: std::collections::BTreeMap<usize, f64> =
+        std::collections::BTreeMap::new();
+    let mut target_counts: std::collections::BTreeMap<usize, f64> =
+        std::collections::BTreeMap::new();
     for (left, right) in feature.iter().zip(target) {
         *joint.entry((*left, *right)).or_default() += 1.0;
         *feature_counts.entry(*left).or_default() += 1.0;
@@ -108,16 +186,23 @@ pub fn mutual_information(feature: &[usize], target: &[usize]) -> Option<f64> {
 /// exactly the bias — reporting the raw figure without subtracting it is how this technique
 /// produces confident nonsense.
 pub fn measure_session(
-    feature: &[f64],
+    feature: &Feature,
     target: &[f64],
     bins: usize,
     seed: u64,
 ) -> Option<SessionInformation> {
-    if feature.len() != target.len() || feature.len() < MINIMUM_CROSS_SECTION {
+    if feature.len() != target.len() {
         return None;
     }
-    let feature_bins = quantile_bins(feature, bins)?;
+    let feature_bins = feature.bins(bins)?;
     let target_bins = quantile_bins(target, bins)?;
+
+    // A nominal feature sets its own width, so the table can outgrow the cross-section: a hundred
+    // and fifty industries against ten return bins wants more names than a session holds.
+    let cells = occupied(&feature_bins) * occupied(&target_bins);
+    if target.len() < cells * NAMES_PER_CELL {
+        return None;
+    }
     let bits = mutual_information(&feature_bins, &target_bins)?;
 
     let mut shuffled = feature_bins;
@@ -128,7 +213,7 @@ pub fn measure_session(
 }
 
 /// One session's cross-section: a feature read before the session, and what it forecasts.
-pub type Paired = std::collections::BTreeMap<i64, (Vec<f64>, Vec<f64>)>;
+pub type Paired = std::collections::BTreeMap<i64, (Feature, Vec<f64>)>;
 
 /// Which part of the next session's return is being asked about.
 ///
@@ -147,21 +232,32 @@ pub enum Outcome {
 /// Pairs each name's feature at one session with its own return in the next.
 ///
 /// Keyed by the session being forecast, and only where that session immediately follows the one the
-/// feature was read in — a pair spanning a gap would call a multi-session move a forecast. `binned`
-/// receives the feature column already numbered when the feature names groups rather than ordering
-/// them.
+/// feature was read in — a pair spanning a gap would call a multi-session move a forecast. `read`
+/// returns the whole sorted column, and which [`Feature`] it returns is what decides how the column
+/// is binned.
 pub fn pair_with_next_session(
     frame: &DataFrame,
     feature: &str,
     outcome: Outcome,
-    binned: impl Fn(&DataFrame) -> Result<Vec<f64>, TideError>,
+    read: impl Fn(&DataFrame) -> Result<Feature, TideError>,
 ) -> Result<Paired, TideError> {
     let sorted = frame.sort(
         ["ticker", "timestamp"],
         SortMultipleOptions::default().with_maintain_order(true),
     )?;
-    let ranks = session_ranks(&sorted)?;
 
+    // Checked here rather than by counting values back: the readers below take the physical slot
+    // whether or not it holds one, so a null arrives as whatever the slot happened to contain.
+    for name in ["ticker", "timestamp", TARGET_COLUMN, feature] {
+        let nulls = sorted.column(name)?.null_count();
+        if nulls > 0 {
+            return Err(TideError::Data(format!(
+                "column `{name}` holds {nulls} nulls the pairing cannot align"
+            )));
+        }
+    }
+
+    let ranks = session_ranks(&sorted)?;
     let tickers: Vec<&str> = sorted
         .column("ticker")?
         .str()?
@@ -172,7 +268,7 @@ pub fn pair_with_next_session(
         .i64()?
         .into_no_null_iter()
         .collect();
-    let features = binned(&sorted)?;
+    let features = read(&sorted)?;
     let targets: Vec<f64> = sorted
         .column(TARGET_COLUMN)?
         .cast(&DataType::Float64)?
@@ -181,25 +277,23 @@ pub fn pair_with_next_session(
         .map(|value| match outcome {
             Outcome::Signed => value,
             Outcome::Magnitude => value.abs(),
+            // Signum calls both zeroes a move, so a name that closed unchanged would be recorded
+            // as a rise in the one outcome a directional book can act on.
+            Outcome::Direction if value == 0.0 => 0.0,
             Outcome::Direction => value.signum(),
         })
         .collect();
 
-    if [
-        tickers.len(),
-        timestamps.len(),
-        features.len(),
-        targets.len(),
-    ]
-    .iter()
-    .any(|length| *length != sorted.height())
-    {
+    if features.len() != sorted.height() {
         return Err(TideError::Data(format!(
-            "column `{feature}` or its neighbours hold nulls the pairing cannot align"
+            "column `{feature}` read {} values for {} rows",
+            features.len(),
+            sorted.height()
         )));
     }
 
-    let mut paired = Paired::new();
+    let mut rows: std::collections::BTreeMap<i64, (Vec<usize>, Vec<f64>)> =
+        std::collections::BTreeMap::new();
     for index in 0..sorted.height().saturating_sub(1) {
         let next = index + 1;
         let follows = tickers[index] == tickers[next]
@@ -210,12 +304,15 @@ pub fn pair_with_next_session(
         if !follows {
             continue;
         }
-        let entry = paired.entry(timestamps[next]).or_default();
-        entry.0.push(features[index]);
+        let entry = rows.entry(timestamps[next]).or_default();
+        entry.0.push(index);
         entry.1.push(targets[next]);
     }
 
-    Ok(paired)
+    Ok(rows
+        .into_iter()
+        .map(|(session, (indices, targets))| (session, (features.select(&indices), targets)))
+        .collect())
 }
 
 #[cfg(test)]
@@ -224,9 +321,9 @@ mod tests {
 
     /// A cross-section large enough to clear the floor, with the target a stated function of the
     /// feature so the answer is known in advance.
-    fn paired(names: usize, map: impl Fn(usize) -> f64) -> (Vec<f64>, Vec<f64>) {
+    fn paired(names: usize, map: impl Fn(usize) -> f64) -> (Feature, Vec<f64>) {
         (
-            (0..names).map(|index| index as f64).collect(),
+            Feature::Continuous((0..names).map(|index| index as f64).collect()),
             (0..names).map(map).collect(),
         )
     }
@@ -270,7 +367,13 @@ mod tests {
             .map(|value| (value - names as f64 / 2.0).abs())
             .collect();
 
-        let measured = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
+        let measured = measure_session(
+            &Feature::Continuous(feature.clone()),
+            &target,
+            DEFAULT_BINS,
+            1,
+        )
+        .unwrap();
         assert!(
             measured.excess() > 1.0,
             "a fold carries real information: {measured:?}"
@@ -296,7 +399,8 @@ mod tests {
             .map(|index| ((index * 104_729) % names) as f64)
             .collect();
 
-        let measured = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
+        let measured =
+            measure_session(&Feature::Continuous(feature), &target, DEFAULT_BINS, 1).unwrap();
         assert!(
             measured.bits > 0.0,
             "the raw estimate is biased upward: {measured:?}"
@@ -318,7 +422,8 @@ mod tests {
         let bins = quantile_bins(&feature, DEFAULT_BINS).unwrap();
         assert!(bins.iter().all(|bin| *bin == 0));
 
-        let measured = measure_session(&feature, &target, DEFAULT_BINS, 1).unwrap();
+        let measured =
+            measure_session(&Feature::Continuous(feature), &target, DEFAULT_BINS, 1).unwrap();
         assert!(measured.bits.abs() < 1e-12, "{measured:?}");
         assert!(measured.excess().abs() < 1e-12, "{measured:?}");
     }
@@ -382,14 +487,16 @@ mod tests {
         .unwrap()
     }
 
-    fn continuous(column: &'static str) -> impl Fn(&DataFrame) -> Result<Vec<f64>, TideError> {
+    fn continuous(column: &'static str) -> impl Fn(&DataFrame) -> Result<Feature, TideError> {
         move |frame: &DataFrame| {
-            Ok(frame
-                .column(column)?
-                .cast(&DataType::Float64)?
-                .f64()?
-                .into_no_null_iter()
-                .collect())
+            Ok(Feature::Continuous(
+                frame
+                    .column(column)?
+                    .cast(&DataType::Float64)?
+                    .f64()?
+                    .into_no_null_iter()
+                    .collect(),
+            ))
         }
     }
 
@@ -408,7 +515,7 @@ mod tests {
         // Session one is forecast by session zero: AAA's 10.0 against its own next return, and
         // BBB's 50.0 against its own.
         let (features, targets) = &paired[&DAY];
-        assert_eq!(features, &vec![10.0, 50.0]);
+        assert_eq!(features, &Feature::Continuous(vec![10.0, 50.0]));
         assert_eq!(targets, &vec![0.02, 0.06]);
     }
 
@@ -424,10 +531,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(paired[&(2 * DAY)].0, vec![20.0], "AAA alone");
+        assert_eq!(
+            paired[&(2 * DAY)].0,
+            Feature::Continuous(vec![20.0]),
+            "AAA alone"
+        );
         assert_eq!(
             paired[&(3 * DAY)].0,
-            vec![30.0],
+            Feature::Continuous(vec![30.0]),
             "BBB's jump over session two is refused"
         );
     }
@@ -462,10 +573,87 @@ mod tests {
         assert!((plain.excess() - moved.excess()).abs() < 1e-12);
     }
 
+    /// Ten bins a side is a hundred cells, so ninety-nine names is one short of the floor and a
+    /// hundred clears it. Pinned to literals: built from the rule, the input would move with it.
     #[test]
     fn test_a_cross_section_too_thin_to_fill_the_table_is_refused() {
-        let (feature, target) = paired(MINIMUM_CROSS_SECTION - 1, |index| index as f64);
+        let (feature, target) = paired(99, |index| index as f64);
         assert_eq!(measure_session(&feature, &target, DEFAULT_BINS, 1), None);
+
+        let (feature, target) = paired(100, |index| index as f64);
+        assert!(measure_session(&feature, &target, DEFAULT_BINS, 1).is_some());
+    }
+
+    /// A nominal feature sets the width of the table itself, so the floor rises with the number of
+    /// groups rather than sitting at the hundred a ten-by-ten table asks for.
+    #[test]
+    fn test_a_nominal_feature_wider_than_the_cross_section_is_refused() {
+        let names = 1000;
+        let target: Vec<f64> = (0..names).map(|index| index as f64).collect();
+
+        // A hundred groups against ten return bins is a thousand cells, which a thousand names
+        // fills exactly.
+        let hundred = Feature::Nominal((0..names).map(|index| index % 100).collect());
+        assert!(measure_session(&hundred, &target, DEFAULT_BINS, 1).is_some());
+
+        // A hundred and one does not.
+        let hundred_and_one = Feature::Nominal((0..names).map(|index| index % 101).collect());
+        assert_eq!(
+            measure_session(&hundred_and_one, &target, DEFAULT_BINS, 1),
+            None
+        );
+    }
+
+    /// The defect this replaced: a nominal column cut into ten quantiles merges its groups by
+    /// nothing but their numbering, and the data has thirteen sectors and a hundred and fifty-one
+    /// industries.
+    #[test]
+    fn test_more_groups_than_bins_stay_apart() {
+        let values: Vec<usize> = (0..40).map(|index| index % 20).collect();
+
+        let quantiles = quantile_bins(
+            &values.iter().map(|value| *value as f64).collect::<Vec<_>>(),
+            DEFAULT_BINS,
+        )
+        .unwrap();
+        assert_eq!(
+            quantiles[0], quantiles[1],
+            "groups zero and one share a quantile bin"
+        );
+
+        let nominal = nominal_bins(&values).unwrap();
+        assert_ne!(nominal[0], nominal[1], "and stay apart when numbered");
+        assert_eq!(occupied(&nominal), 20, "one bin per group");
+        assert_eq!(nominal[0], nominal[20], "and one bin for each group");
+    }
+
+    /// A feature that determines the target is worth more measured as groups than merged into ten
+    /// bins, which is the size of what the quantile cut was throwing away.
+    ///
+    /// The target is scrambled across the groups deliberately: neighbouring group numbers mean
+    /// nothing to each other, which is the property a sector has and a price does not.
+    #[test]
+    fn test_merging_groups_costs_information() {
+        let names = 1000;
+        let groups: Vec<usize> = (0..names).map(|index| index % 25).collect();
+        let target: Vec<f64> = groups
+            .iter()
+            .map(|group| ((group * 7) % 25) as f64)
+            .collect();
+
+        let merged = measure_session(
+            &Feature::Continuous(groups.iter().map(|group| *group as f64).collect()),
+            &target,
+            DEFAULT_BINS,
+            1,
+        )
+        .unwrap();
+        let kept = measure_session(&Feature::Nominal(groups), &target, DEFAULT_BINS, 1).unwrap();
+
+        assert!(
+            kept.excess() > merged.excess() + 1.0,
+            "merging unrelated groups throws information away: {kept:?} {merged:?}"
+        );
     }
 
     #[test]
@@ -474,5 +662,63 @@ mod tests {
         assert_eq!(mutual_information(&[], &[]), None);
         assert_eq!(quantile_bins(&[1.0, f64::NAN], DEFAULT_BINS), None);
         assert_eq!(quantile_bins(&[1.0, 2.0], 0), None);
+        assert_eq!(nominal_bins(&[]), None);
+    }
+
+    /// `into_no_null_iter` takes the physical slot whether or not it holds a value, so a null read
+    /// through it arrives as whatever the slot contained rather than as a missing row.
+    #[test]
+    fn test_a_null_is_refused_rather_than_read_as_a_value() {
+        let mut frame = gapped_frame();
+        let mut prices: Vec<Option<f64>> = frame
+            .column("close_price")
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_iter()
+            .collect();
+        prices[2] = None;
+        frame
+            .with_column(Column::new("close_price".into(), prices))
+            .unwrap();
+
+        let error = pair_with_next_session(
+            &frame,
+            "close_price",
+            Outcome::Signed,
+            continuous("close_price"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("close_price"),
+            "the column is named: {error}"
+        );
+    }
+
+    /// A name that closed unchanged did not rise, and `f64::signum` says it did.
+    #[test]
+    fn test_an_unchanged_close_is_not_a_direction() {
+        let mut frame = gapped_frame();
+        let mut returns: Vec<f64> = frame
+            .column(TARGET_COLUMN)
+            .unwrap()
+            .f64()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        // AAA's session-one return, which is the one session zero forecasts.
+        returns[1] = 0.0;
+        frame
+            .with_column(Column::new(TARGET_COLUMN.into(), returns))
+            .unwrap();
+
+        let paired = pair_with_next_session(
+            &frame,
+            "close_price",
+            Outcome::Direction,
+            continuous("close_price"),
+        )
+        .unwrap();
+        assert_eq!(paired[&DAY].1, vec![0.0, 1.0], "flat is neither way");
     }
 }

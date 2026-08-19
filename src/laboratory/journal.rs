@@ -273,8 +273,8 @@ mod tests {
         })
     }
 
-    /// The export partitions on this name, so the two variants must not collide and neither may
-    /// drift from the tag `rename_all` generates for it.
+    /// The export partitions on this name, so no two variants may collide and none may drift from
+    /// the tag `rename_all` generates for it.
     #[test]
     fn test_each_observation_exports_under_its_own_partition() {
         let forecast = Observation::ForecastScored(ForecastScored {
@@ -292,6 +292,23 @@ mod tests {
         );
         assert_eq!(forecast.experiment_type(), "forecast_scored");
         assert_ne!(forecast.experiment_type(), observation().experiment_type());
+
+        let triaged = Observation::FeatureTriaged(FeatureTriaged {
+            feature: "daily_return".to_string(),
+            sessions: 499,
+            bits: None,
+            null_bits: None,
+            excess_bits: None,
+        });
+        let value: serde_json::Value = serde_json::to_value(&triaged).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("feature_triaged")
+        );
+        assert_eq!(triaged.experiment_type(), "feature_triaged");
+        assert_ne!(triaged.experiment_type(), forecast.experiment_type());
+        assert_ne!(triaged.experiment_type(), observation().experiment_type());
     }
 
     /// Two different counts, and conflating them would read a forecast that ranked twice out of

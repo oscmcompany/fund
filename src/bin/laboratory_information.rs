@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use fund::common::log::init_tracing;
 use fund::common::types::SessionDate;
-use fund::laboratory::information::{self, Outcome, DEFAULT_BINS};
+use fund::laboratory::information::{self, Feature, Outcome, DEFAULT_BINS};
 use fund::laboratory::journal as laboratory;
 use fund::laboratory::metrics::{self, Distribution};
 use fund::laboratory::{dataset, information::Paired};
@@ -45,8 +45,7 @@ const CATEGORICAL_FEATURES: &[&str] = &["sector", "industry"];
 /// A feature with nothing in it, triaged alongside the real ones.
 ///
 /// The null is subtracted from every figure below, and this is the row that shows the subtraction
-/// works: a uniform draw must score zero excess bits. Reading a table of positive numbers without
-/// it would leave no way to tell a real dependence from a null that is set too low.
+/// works: a uniform draw must score zero excess bits.
 const CONTROL_FEATURE: &str = "uniform_control";
 
 struct Parameters {
@@ -201,12 +200,14 @@ async fn run(
             column,
             parameters.outcome,
             move |frame| {
-                Ok(frame
-                    .column(column)?
-                    .cast(&DataType::Float64)?
-                    .f64()?
-                    .into_no_null_iter()
-                    .collect())
+                Ok(Feature::Continuous(
+                    frame
+                        .column(column)?
+                        .cast(&DataType::Float64)?
+                        .f64()?
+                        .into_no_null_iter()
+                        .collect(),
+                ))
             },
         )?;
         triaged.push(triage(column, &paired, parameters.seed));
@@ -219,10 +220,7 @@ async fn run(
             parameters.outcome,
             move |frame| {
                 let values: Vec<&str> = frame.column(column)?.str()?.into_no_null_iter().collect();
-                Ok(information::category_bins(&values)
-                    .into_iter()
-                    .map(|bin| bin as f64)
-                    .collect())
+                Ok(Feature::Nominal(information::category_bins(&values)))
             },
         )?;
         triaged.push(triage(column, &paired, parameters.seed));
@@ -333,7 +331,7 @@ mod tests {
     fn test_arguments_default_from_the_right() {
         let parameters = Parameters::parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 730);
-        assert_eq!(parameters.seed, DEFAULT_SEED as u64);
+        assert_eq!(parameters.seed, 19_985);
 
         let parameters = Parameters::parse(&arguments(&["365", "3"])).unwrap();
         assert_eq!(parameters.lookback_days, 365);
