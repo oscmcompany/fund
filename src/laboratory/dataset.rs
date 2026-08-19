@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::common::aws::date_partitioned_key;
 use crate::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use crate::data::{adjust, archive, bars, details, truncate};
-use crate::models::tide::data::TrainingFraction;
+use crate::models::tide::data::{clean_data, engineer_features, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
 use crate::models::tide::predict::consolidate_data;
 use crate::models::tide::TideError;
@@ -96,6 +96,13 @@ pub struct PreparedDataset {
     pub fingerprint: DatasetFingerprint,
 }
 
+/// One session's returns per name, and the identity of the window they came from.
+pub struct ReturnsDataset {
+    /// `ticker`, `timestamp`, and an unscaled `daily_return`.
+    pub returns: DataFrame,
+    pub fingerprint: DatasetFingerprint,
+}
+
 /// Reads the archive for `lookback_days` back from `session` and prepares it for windowing.
 ///
 /// The splits table is fatal where the boundary table is not: stored prices are raw, so training
@@ -108,6 +115,46 @@ pub async fn build(
     session: SessionDate,
     training_fraction: TrainingFraction,
 ) -> Result<PreparedDataset, DatasetError> {
+    let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
+    let fit = fit(filtered, training_fraction)?;
+
+    Ok(PreparedDataset { fit, fingerprint })
+}
+
+/// Reads the same window as [`build`] and engineers returns from it, fitting nothing.
+///
+/// The rows are the rows the model would train on, because a baseline measured over a wider
+/// universe is not a baseline for it. Returns stay unscaled: standardizing is monotone, so it would
+/// leave the rank correlation alone and denominate the decile spread in units nobody earns.
+pub async fn returns(
+    s3_client: &S3Client,
+    bucket: &str,
+    lookback_days: i64,
+    session: SessionDate,
+) -> Result<ReturnsDataset, DatasetError> {
+    let (filtered, fingerprint) = read_window(s3_client, bucket, lookback_days, session).await?;
+    // The model's own two steps, not just the first: `clean_data` drops any row holding a null or
+    // non-finite value in any continuous column, so skipping it would measure names the model never
+    // sees — a missing vendor VWAP costs a row there and none here.
+    let cleaned = clean_data(engineer_features(filtered)?)?;
+    let returns = cleaned.select(["ticker", "timestamp", "daily_return"])?;
+
+    Ok(ReturnsDataset {
+        returns,
+        fingerprint,
+    })
+}
+
+/// Everything both paths share: the archive read, the folds applied to it, and its identity.
+///
+/// The fingerprint is taken here rather than in either caller, so a baseline run and a training run
+/// over the same window report the same one and their journal records join.
+async fn read_window(
+    s3_client: &S3Client,
+    bucket: &str,
+    lookback_days: i64,
+    session: SessionDate,
+) -> Result<(DataFrame, DatasetFingerprint), DatasetError> {
     let splits_frame = archive::read_partition(s3_client, bucket, archive::SPLITS_ARCHIVE_KEY)
         .await?
         .ok_or_else(|| {
@@ -158,9 +205,8 @@ pub async fn build(
         splits_digest,
         boundaries_digest,
     )?;
-    let fit = fit(filtered, training_fraction)?;
 
-    Ok(PreparedDataset { fit, fingerprint })
+    Ok((filtered, fingerprint))
 }
 
 /// Describes the frame the model will be fitted on, before fitting consumes it.
