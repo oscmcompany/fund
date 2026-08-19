@@ -401,13 +401,14 @@ mod tests {
                 targets[[sample_index, step_index, 0]] = 0.5;
             }
         }
-        TrainingDataset {
+        TrainingDataset::new(
             past_continuous,
             past_categorical,
             future_categorical,
             static_categorical,
-            targets: Some(targets),
-        }
+            Some(targets),
+        )
+        .unwrap()
     }
 
     #[test]

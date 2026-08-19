@@ -120,7 +120,7 @@ pub fn evaluate(
     parameters: &ModelParameters,
 ) -> Result<EvaluationMetrics, TideError> {
     let sample_count = dataset.len();
-    let targets = match dataset.targets.as_ref() {
+    let targets = match dataset.targets() {
         Some(targets) if sample_count > 0 => targets,
         _ => return Ok(EvaluationMetrics::zero()),
     };
@@ -489,17 +489,14 @@ mod tests {
     fn make_tiny_dataset(sample_count: usize, with_targets: bool) -> TrainingDataset {
         let input_length = 2_usize;
         let output_length = 1_usize;
-        TrainingDataset {
-            past_continuous: ndarray::Array3::zeros((sample_count, input_length, 7)),
-            past_categorical: ndarray::Array3::zeros((sample_count, input_length, 5)),
-            future_categorical: ndarray::Array3::zeros((sample_count, output_length, 5)),
-            static_categorical: ndarray::Array3::zeros((sample_count, 1, 3)),
-            targets: if with_targets {
-                Some(ndarray::Array3::zeros((sample_count, output_length, 1)))
-            } else {
-                None
-            },
-        }
+        TrainingDataset::new(
+            ndarray::Array3::zeros((sample_count, input_length, 7)),
+            ndarray::Array3::zeros((sample_count, input_length, 5)),
+            ndarray::Array3::zeros((sample_count, output_length, 5)),
+            ndarray::Array3::zeros((sample_count, 1, 3)),
+            with_targets.then(|| ndarray::Array3::zeros((sample_count, output_length, 1))),
+        )
+        .unwrap()
     }
 
     /// Build a TiDEModel that matches `make_tiny_dataset`: input_size=32,

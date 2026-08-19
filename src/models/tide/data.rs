@@ -208,15 +208,79 @@ impl Scaler {
     }
 }
 
+/// Windowed samples, every block indexed by sample on axis zero.
+///
+/// The blocks are separate arrays describing one list of samples, so `len()` can only speak for all
+/// of them if they agree — which is why they are private and reached through [`TrainingDataset::new`].
 pub struct TrainingDataset {
-    pub past_continuous: ndarray::Array3<f32>,
-    pub past_categorical: ndarray::Array3<i32>,
-    pub future_categorical: ndarray::Array3<i32>,
-    pub static_categorical: ndarray::Array3<i32>,
-    pub targets: Option<ndarray::Array3<f32>>,
+    past_continuous: ndarray::Array3<f32>,
+    past_categorical: ndarray::Array3<i32>,
+    future_categorical: ndarray::Array3<i32>,
+    static_categorical: ndarray::Array3<i32>,
+    targets: Option<ndarray::Array3<f32>>,
 }
 
 impl TrainingDataset {
+    /// Assembles the blocks, refusing any set whose sample counts disagree.
+    ///
+    /// Only axis zero: the per-step widths are checked against the artifact by
+    /// [`crate::models::tide::batch::validate_input_shape`], which is a different question and
+    /// needs the model parameters this does not have.
+    pub fn new(
+        past_continuous: ndarray::Array3<f32>,
+        past_categorical: ndarray::Array3<i32>,
+        future_categorical: ndarray::Array3<i32>,
+        static_categorical: ndarray::Array3<i32>,
+        targets: Option<ndarray::Array3<f32>>,
+    ) -> Result<Self, TideError> {
+        let samples = past_continuous.shape()[0];
+        let blocks = [
+            ("past categorical", past_categorical.shape()[0]),
+            ("known-future categorical", future_categorical.shape()[0]),
+            ("static categorical", static_categorical.shape()[0]),
+        ];
+        for (name, count) in blocks
+            .into_iter()
+            .chain(targets.as_ref().map(|block| ("targets", block.shape()[0])))
+        {
+            if count != samples {
+                return Err(TideError::Data(format!(
+                    "the {name} block carries {count} samples against {samples} past continuous; \
+                     every block describes the same list of samples"
+                )));
+            }
+        }
+
+        Ok(Self {
+            past_continuous,
+            past_categorical,
+            future_categorical,
+            static_categorical,
+            targets,
+        })
+    }
+
+    pub fn past_continuous(&self) -> &ndarray::Array3<f32> {
+        &self.past_continuous
+    }
+
+    pub fn past_categorical(&self) -> &ndarray::Array3<i32> {
+        &self.past_categorical
+    }
+
+    pub fn future_categorical(&self) -> &ndarray::Array3<i32> {
+        &self.future_categorical
+    }
+
+    pub fn static_categorical(&self) -> &ndarray::Array3<i32> {
+        &self.static_categorical
+    }
+
+    pub fn targets(&self) -> Option<&ndarray::Array3<f32>> {
+        self.targets.as_ref()
+    }
+
+    /// How many samples every block carries, which the constructor has already made one number.
     pub fn len(&self) -> usize {
         self.past_continuous.shape()[0]
     }
@@ -641,13 +705,13 @@ fn window_frame(
         None
     };
 
-    Ok(TrainingDataset {
+    TrainingDataset::new(
         past_continuous,
         past_categorical,
         future_categorical,
         static_categorical,
         targets,
-    })
+    )
 }
 
 /// Append one row per ticker carrying `target_session`, so the windowing has a future step to spend
@@ -1273,15 +1337,44 @@ mod tests {
 
     #[test]
     fn test_training_dataset_empty() {
-        let dataset = TrainingDataset {
-            past_continuous: ndarray::Array3::zeros((0, 35, 7)),
-            past_categorical: ndarray::Array3::zeros((0, 35, 5)),
-            future_categorical: ndarray::Array3::zeros((0, 5, 5)),
-            static_categorical: ndarray::Array3::zeros((0, 1, 3)),
-            targets: None,
-        };
+        let dataset = TrainingDataset::new(
+            ndarray::Array3::zeros((0, 35, 7)),
+            ndarray::Array3::zeros((0, 35, 5)),
+            ndarray::Array3::zeros((0, 5, 5)),
+            ndarray::Array3::zeros((0, 1, 3)),
+            None,
+        )
+        .unwrap();
         assert!(dataset.is_empty());
         assert_eq!(dataset.len(), 0);
+    }
+
+    /// The whole reason the blocks are private. A shorter block than the sample count implies is an
+    /// out-of-bounds index deep inside batching, and the identity vector task 3b adds would be
+    /// worse still: it would attribute predictions to the wrong tickers and report a rank
+    /// correlation near zero, which is indistinguishable from the answer that experiment expects.
+    #[test]
+    fn test_blocks_that_disagree_about_the_sample_count_are_refused() {
+        let block = |samples: usize| ndarray::Array3::<i32>::zeros((samples, 1, 3));
+        let build = |static_samples: usize, targets: Option<ndarray::Array3<f32>>| {
+            TrainingDataset::new(
+                ndarray::Array3::zeros((4, 2, 7)),
+                ndarray::Array3::zeros((4, 2, 5)),
+                ndarray::Array3::zeros((4, 1, 5)),
+                block(static_samples),
+                targets,
+            )
+        };
+
+        assert!(build(4, None).is_ok());
+        assert!(
+            build(3, None).is_err(),
+            "a static block one sample short must be refused"
+        );
+        assert!(
+            build(4, Some(ndarray::Array3::zeros((3, 1, 1)))).is_err(),
+            "targets are optional, but a present one still describes the same samples"
+        );
     }
 
     /// Build a minimal, already engineered/scaled/encoded frame (ticker and the
