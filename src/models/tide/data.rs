@@ -572,6 +572,15 @@ fn window_frame(
             "A window needs a non-zero input or output length".to_string(),
         ));
     }
+    // A window that forecasts nothing has no session to name, and the row it would read for one is
+    // the first past the ticker's own rows. `ModelParameters::load` refuses a zero output length on
+    // the same grounds, at the other end of the same pipeline.
+    if output_length == 0 {
+        return Err(TideError::Data(
+            "A window needs a non-zero output length; one with no future step forecasts nothing"
+                .to_string(),
+        ));
+    }
     let ranks = session_ranks(frame)?;
     let continuous_feature_count = CONTINUOUS_COLUMNS.len();
     let categorical_feature_count = CATEGORICAL_COLUMNS.len();
@@ -1627,6 +1636,28 @@ mod tests {
             matches!(result, Err(TideError::Data(_))),
             "a zero-length window must be an error, not a panic"
         );
+    }
+
+    /// A window with past steps but no future one is the case the guard above misses: the sum is
+    /// non-zero, so it passes, and the last window then reads one position past the ticker's final
+    /// row to name the session it forecasts. A window that forecasts nothing has no such session.
+    #[test]
+    fn test_a_window_with_no_future_step_is_refused_rather_than_indexed() {
+        let data = Data::from_parts(
+            prepared_and_encoded(raw_gapped_frame()),
+            return_scaler(),
+            FeatureMappings::new(),
+        );
+        for kind in [
+            DatasetKind::Predict,
+            DatasetKind::Train(fraction_of(0.8)),
+            DatasetKind::Validate(fraction_of(0.8)),
+        ] {
+            assert!(
+                matches!(data.get_dataset(kind, 3, 0), Err(TideError::Data(_))),
+                "an output length of zero must be an error, not a panic"
+            );
+        }
     }
 
     /// `session_ranks` skips nulls while the windows are counted from the row height, so one null

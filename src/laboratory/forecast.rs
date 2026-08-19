@@ -1,7 +1,6 @@
 //! Scores a trained model the way a baseline is scored: by the order it puts names in.
 //!
-//! Cross-sectional, so it answers a different question than CRPS — not how close each prediction
-//! lands, but whether the ranking a dollar-neutral book would act on is the right one.
+//! Cross-sectional, so it asks what CRPS cannot: is the ranking a neutral book acts on the right one?
 
 use std::collections::BTreeMap;
 
@@ -124,7 +123,9 @@ fn forward(
 ) -> Result<Vec<f32>, TideError> {
     let device = Default::default();
     let indices: Vec<usize> = (0..dataset.len()).collect();
-    let mut predictions: Vec<f32> = Vec::new();
+    let mut predictions: Vec<f32> = Vec::with_capacity(
+        dataset.len() * parameters.output_length() * parameters.quantiles().len(),
+    );
     for chunk in indices.chunks(BATCH_SIZE) {
         let input = build_input_tensor::<NdArray>(
             dataset,
@@ -254,6 +255,48 @@ mod tests {
             upper.decile_spread, None,
             "the spread is in return units and does move"
         );
+    }
+
+    /// A dataset shaped for a different artifact is refused before the forward pass, where burn
+    /// would otherwise raise a tensor-dimension panic naming neither the artifact nor the columns.
+    #[test]
+    fn test_a_dataset_the_artifact_cannot_read_is_refused() {
+        let device = Default::default();
+        let model = TiDEModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0);
+        // The fixture carries two past steps of seven continuous features; these parameters expect
+        // an input the fixture cannot produce.
+        let parameters =
+            ModelParameters::for_tests(64, 8, 1, 1, 1, 2, 0.0, vec![0.1, 0.5, 0.9], 0.5);
+        assert!(matches!(
+            score(
+                "mismatched",
+                &model,
+                &dataset(2, 12),
+                &parameters,
+                &scaler()
+            ),
+            Err(TideError::Artifact(_))
+        ));
+    }
+
+    /// Unreachable in production — `ModelParameters::new` installs the served quantiles and `load`
+    /// validates them, so only `for_tests` can build this. Kept because a model that emits no
+    /// quantiles has nothing to rank names by, and the alternative is indexing into an empty row.
+    #[test]
+    fn test_a_model_emitting_no_quantiles_has_nothing_to_rank_by() {
+        let device = Default::default();
+        let model = TiDEModel::<NdArray>::new(&device, 32, 8, 1, 1, 1, 3, 0.0);
+        let parameters = ModelParameters::for_tests(32, 8, 1, 1, 1, 2, 0.0, Vec::new(), 0.5);
+        assert!(matches!(
+            score(
+                "quantile-less",
+                &model,
+                &dataset(2, 12),
+                &parameters,
+                &scaler()
+            ),
+            Err(TideError::Artifact(_))
+        ));
     }
 
     #[test]

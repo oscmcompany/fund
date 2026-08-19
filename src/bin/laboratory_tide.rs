@@ -1,7 +1,6 @@
 //! Trains one model and scores it against the baselines, over the same sessions.
 //!
-//! Publishes nothing. The artifact exists for the length of the run, because the question is what
-//! the model orders rather than what it should trade.
+//! Publishes nothing: the question is what the model orders, not what it should trade.
 
 use std::collections::BTreeSet;
 
@@ -24,7 +23,7 @@ use fund::models::tide::data::{input_feature_size, DatasetKind, TrainingFraction
 use fund::models::tide::model::TiDEModel;
 use fund::models::tide::train::{train, TrainBackend, TrainConfiguration};
 
-const USAGE: &str = "Usage: laboratory_tide [LOOKBACK_DAYS] [EPOCHS]";
+const USAGE: &str = "Usage: laboratory_tide [LOOKBACK_DAYS] [EPOCHS] [SEED]";
 
 const INPUT_LENGTH: usize = 35;
 const OUTPUT_LENGTH: usize = 1;
@@ -40,19 +39,37 @@ const DEFAULT_EPOCHS: i64 = 5;
 const MOMENTUM_SESSIONS: usize = 20;
 const RANDOM_SEED: u64 = 0x5EED;
 
+/// Seeds the weight initialiser, so two runs of one configuration produce one model.
+///
+/// `train` already seeds its own batch shuffle; the weights went through the backend's global
+/// generator, and two runs of the same configuration scored 0.008 apart — a whole standard error.
+/// Settable, because one seed measures one model and the question is about the architecture.
+const DEFAULT_TRAINING_SEED: i64 = 0x7A1D;
+
 struct Parameters {
     lookback_days: i64,
     epochs: usize,
+    seed: u64,
 }
 
 impl Parameters {
     fn parse(arguments: &[String]) -> Result<Self, String> {
-        let (lookback_days, epochs) = match arguments {
-            [] => (DEFAULT_LOOKBACK_DAYS, DEFAULT_EPOCHS),
-            [lookback] => (positive(lookback, "LOOKBACK_DAYS")?, DEFAULT_EPOCHS),
+        let (lookback_days, epochs, seed) = match arguments {
+            [] => (DEFAULT_LOOKBACK_DAYS, DEFAULT_EPOCHS, DEFAULT_TRAINING_SEED),
+            [lookback] => (
+                positive(lookback, "LOOKBACK_DAYS")?,
+                DEFAULT_EPOCHS,
+                DEFAULT_TRAINING_SEED,
+            ),
             [lookback, epochs] => (
                 positive(lookback, "LOOKBACK_DAYS")?,
                 positive(epochs, "EPOCHS")?,
+                DEFAULT_TRAINING_SEED,
+            ),
+            [lookback, epochs, seed] => (
+                positive(lookback, "LOOKBACK_DAYS")?,
+                positive(epochs, "EPOCHS")?,
+                positive(seed, "SEED")?,
             ),
             _ => return Err(format!("Too many arguments\n{USAGE}")),
         };
@@ -60,6 +77,7 @@ impl Parameters {
             lookback_days,
             epochs: usize::try_from(epochs)
                 .map_err(|_| format!("EPOCHS is larger than this platform can index\n{USAGE}"))?,
+            seed: seed as u64,
         })
     }
 }
@@ -130,6 +148,7 @@ async fn run(
         bucket,
         lookback_days = parameters.lookback_days,
         epochs = parameters.epochs,
+        seed = parameters.seed,
         %session,
         %run_id,
         "Training a model to score it"
@@ -180,6 +199,8 @@ async fn run(
     let input_size = input_feature_size(INPUT_LENGTH, OUTPUT_LENGTH);
     let model_parameters = ModelParameters::new(input_size, INPUT_LENGTH, OUTPUT_LENGTH);
     let device = <TrainBackend as Backend>::Device::default();
+    // Before the weights are drawn, not after.
+    <TrainBackend as Backend>::seed(parameters.seed);
     let model = TiDEModel::<TrainBackend>::new(
         &device,
         input_size,
@@ -238,7 +259,21 @@ async fn run(
         "Scored the model over its validation window"
     );
 
+    // A second read of the same window, because `build` consumed the first into the fit. The
+    // archive is written nightly, so a partition landing between the two would measure the
+    // baselines over a snapshot the model never saw — which is the one comparison this binary is for.
     let returns = dataset::returns(&s3_client, &bucket, parameters.lookback_days, session).await?;
+    if returns.fingerprint != fingerprint {
+        return Err(format!(
+            "the archive moved between the two reads of this window: the model was fitted on {} \
+             rows over {} tickers and the baselines would be measured on {} over {}",
+            fingerprint.rows,
+            fingerprint.tickers,
+            returns.fingerprint.rows,
+            returns.fingerprint.tickers
+        )
+        .into());
+    }
     let panel = Panel::from_frame(&returns.returns)?;
     let baselines: Vec<Box<dyn Predictor>> = vec![
         Box::new(CrossSectionalMean),
@@ -354,10 +389,25 @@ mod tests {
         let parameters = Parameters::parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.epochs, 5);
+        assert_eq!(parameters.seed, DEFAULT_TRAINING_SEED as u64);
 
         let parameters = Parameters::parse(&arguments(&["400", "2"])).unwrap();
         assert_eq!(parameters.lookback_days, 400);
         assert_eq!(parameters.epochs, 2);
+        assert_eq!(parameters.seed, DEFAULT_TRAINING_SEED as u64);
+
+        let parameters = Parameters::parse(&arguments(&["400", "2", "9"])).unwrap();
+        assert_eq!(parameters.seed, 9);
+    }
+
+    /// The seed is the whole reason a run is repeatable: initialisation moves the reported
+    /// coefficient by more than the tradeable threshold, so a run that did not name its seed would
+    /// report a number nobody could get back.
+    #[test]
+    fn test_the_seed_is_read_and_refused_like_the_others() {
+        assert!(Parameters::parse(&arguments(&["365", "5", "0"])).is_err());
+        assert!(Parameters::parse(&arguments(&["365", "5", "x"])).is_err());
+        assert!(Parameters::parse(&arguments(&["365", "5", "9", "1"])).is_err());
     }
 
     #[test]

@@ -484,25 +484,22 @@ async fn test_predictions_are_bounded_to_the_session_window() {
 
 /// One row per ticker, the newest. A re-run leaves two predictions for the same symbol, and feeding
 /// both into the screen would let one ticker appear on both legs of the same pair.
+///
+/// Both rows are placed relative to the session's own start rather than to the clock. Offsets back
+/// from `now` land in the *previous* session whenever the suite runs within that many hours of
+/// Eastern midnight, and the window query then returns nothing.
 #[tokio::test]
 #[serial]
 async fn test_predictions_return_the_newest_row_per_ticker() {
     let pool = fresh_pool().await;
-    let now = Utc::now();
-    let (start, end) = SessionDate::at(now).bounds();
+    let (start, end) = SessionDate::at(Utc::now()).bounds();
 
-    common::seed_predictions(
-        &pool,
-        "run-early",
-        &[("AAAA", 0.01)],
-        now - Duration::hours(2),
-    )
-    .await;
+    common::seed_predictions(&pool, "run-early", &[("AAAA", 0.01)], start).await;
     common::seed_predictions(
         &pool,
         "run-late",
         &[("AAAA", 0.05)],
-        now - Duration::minutes(5),
+        start + Duration::hours(1),
     )
     .await;
 
