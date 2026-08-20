@@ -18,14 +18,12 @@ use crate::common::massive::MassiveClient;
 use crate::common::types::{BarInterval, SessionDate};
 use crate::data::{bars, boundaries, splits};
 
-/// S3 prefix for the bar archive.
+/// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
+/// cadence, and a key built without one collides with every other cadence of the same session.
 ///
 /// Deliberately not under `exports/`, which is where the application's nightly database export
 /// lands. The two datasets live in one bucket and describe overlapping facts, and giving them one
 /// prefix would make whichever job ran second the one that mattered.
-///
-/// Never used directly as a partition prefix — [`bar_archive_prefix`] adds the cadence, and a key
-/// built without it would collide with every other cadence of the same session.
 pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
 
 /// The archive prefix for one bar cadence.
