@@ -37,12 +37,16 @@ SET VARIABLE bucket = getenv('AWS_S3_BUCKET_NAME');
 -- Trainer archive (data/) -- the model's training input
 -- ---------------------------------------------------------------------------
 
+-- Scoped to one cadence rather than globbing the whole bar tree. The archive is partitioned on
+-- interval, so an unscoped glob would union daily and intraday bars into one view and every query
+-- against it would silently double-count. hive_partitioning still surfaces interval as a column,
+-- which is what makes the scoping visible in a result rather than only here.
 .print 'Loading training_bars...'
 DROP VIEW IF EXISTS training_bars;
 CREATE OR REPLACE VIEW training_bars AS
 SELECT *
 FROM read_parquet(
-    's3://' || getvariable('bucket') || '/data/equity/bars/**/*.parquet',
+    's3://' || getvariable('bucket') || '/data/equity/bars/interval=one_day/**/*.parquet',
     hive_partitioning = true
 );
 

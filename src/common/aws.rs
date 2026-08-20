@@ -11,7 +11,7 @@ pub async fn s3_client() -> aws_sdk_s3::Client {
 }
 
 /// Build the Hive-partitioned S3 key for one day of parquet data, e.g.
-/// `data/equity/bars/year=2026/month=06/day=10/data.parquet`. The single
+/// `data/equity/bars/interval=one_day/year=2026/month=06/day=10/data.parquet`. The single
 /// source of truth for the date-partition layout: the data manager's daily
 /// writers and exports, the historical backfill, and the tide trainer's
 /// reader all derive their keys here so they can never diverge.

@@ -9,7 +9,7 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::common::aws::date_partitioned_key;
-use crate::common::types::{SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
+use crate::common::types::{BarInterval, SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use crate::data::{adjust, archive, bars, details, truncate};
 use crate::models::tide::data::{clean_data, engineer_features, Target, TrainingFraction};
 use crate::models::tide::fit::{filter_training_bars, fit, FitResult};
@@ -247,6 +247,7 @@ async fn load_archived_bars(
     splits: &adjust::SplitTable,
     boundaries: &truncate::BoundaryTable,
 ) -> Result<DataFrame, DatasetError> {
+    let daily_prefix = archive::bar_archive_prefix(BarInterval::OneDay);
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut unreadable = 0usize;
     let mut date = session.plus_calendar_days(-lookback_days);
@@ -255,7 +256,7 @@ async fn load_archived_bars(
             date = date.plus_calendar_days(1);
             continue;
         }
-        let key = date_partitioned_key(archive::BAR_ARCHIVE_PREFIX, date.date());
+        let key = date_partitioned_key(&daily_prefix, date.date());
         if let Some(frame) = archive::read_partition(s3_client, bucket, &key).await? {
             match bars::project_bar_frame(frame) {
                 Ok(projected) => frames.push(projected.lazy()),
