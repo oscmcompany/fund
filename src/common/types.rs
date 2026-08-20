@@ -583,12 +583,17 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PairID {
 #[serde(rename_all = "snake_case")]
 pub enum BarInterval {
     OneMinute,
+    FiveMinute,
     OneDay,
 }
 
 impl BarInterval {
     /// Every variant, for exhaustive iteration in tests and validation.
-    pub const ALL: [BarInterval; 2] = [BarInterval::OneMinute, BarInterval::OneDay];
+    pub const ALL: [BarInterval; 3] = [
+        BarInterval::OneMinute,
+        BarInterval::FiveMinute,
+        BarInterval::OneDay,
+    ];
 
     /// The canonical stored form, matching the `bar_interval` CHECK constraint.
     ///
@@ -597,7 +602,20 @@ impl BarInterval {
     pub fn as_str(self) -> &'static str {
         match self {
             BarInterval::OneMinute => "one_minute",
+            BarInterval::FiveMinute => "five_minute",
             BarInterval::OneDay => "one_day",
+        }
+    }
+
+    /// The multiplier and timespan Massive's aggregates route spells this interval with.
+    ///
+    /// Separate from [`BarInterval::as_str`] because the two vocabularies answer to different
+    /// owners: one is the stored form a CHECK constraint pins, the other is a vendor's URL.
+    pub fn massive_timespan(self) -> (u32, &'static str) {
+        match self {
+            BarInterval::OneMinute => (1, "minute"),
+            BarInterval::FiveMinute => (5, "minute"),
+            BarInterval::OneDay => (1, "day"),
         }
     }
 
@@ -1596,6 +1614,23 @@ mod tests {
     fn test_bar_interval_stored_form_matches_the_check_constraint() {
         assert_eq!(BarInterval::OneDay.as_str(), "one_day");
         assert_eq!(BarInterval::OneMinute.as_str(), "one_minute");
+        assert_eq!(BarInterval::FiveMinute.as_str(), "five_minute");
+    }
+
+    /// Massive's aggregates route spells an interval as a multiplier and a timespan, and the two
+    /// minute cadences differ only in the multiplier — so a copied arm is invisible until every
+    /// five-minute request silently returns one-minute bars.
+    #[test]
+    fn test_each_interval_maps_to_a_distinct_massive_timespan() {
+        assert_eq!(BarInterval::OneMinute.massive_timespan(), (1, "minute"));
+        assert_eq!(BarInterval::FiveMinute.massive_timespan(), (5, "minute"));
+        assert_eq!(BarInterval::OneDay.massive_timespan(), (1, "day"));
+
+        let spellings: std::collections::BTreeSet<(u32, &str)> = BarInterval::ALL
+            .iter()
+            .map(|i| i.massive_timespan())
+            .collect();
+        assert_eq!(spellings.len(), 3);
     }
 
     /// The serde derive and the stored form must produce the same string. They did not before the

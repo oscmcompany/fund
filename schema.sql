@@ -18,7 +18,7 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 --
 -- One retention policy covers every interval, which is the accepted cost of a single table.
 --
--- The post-close sync writes only 'one_day'. 'one_minute' is equally legal and the constraint is
+-- The post-close sync writes only 'one_day'. 'one_minute' and 'five_minute' are equally legal and
 -- what is enforced: it is the tag fetch_snapshots applies to Alpaca's minuteBar in memory, and the
 -- second value the primary-key tests need. These are the snake_case of the BarInterval variants in
 -- common::types, which is what lets the enum derive the same strings for serde, and they must match
@@ -26,7 +26,7 @@ CREATE EXTENSION IF NOT EXISTS pg_cron;
 CREATE TABLE IF NOT EXISTS equity_bars (
     ticker                        TEXT             NOT NULL,
     bar_interval                  TEXT             NOT NULL
-        CHECK (bar_interval IN ('one_minute', 'one_day')),
+        CHECK (bar_interval IN ('one_minute', 'five_minute', 'one_day')),
     timestamp                     TIMESTAMPTZ      NOT NULL,
     open_price                    DOUBLE PRECISION NOT NULL,
     high_price                    DOUBLE PRECISION NOT NULL,

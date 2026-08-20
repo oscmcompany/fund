@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, NaiveDate};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::common::types::{BarInterval, EquityBar, EquitySplit, SessionDate, Ticker};
 
@@ -76,6 +76,29 @@ fn grouped_bars_url(base: &str, date: NaiveDate) -> String {
     )
 }
 
+/// Builds the aggregates URL for one symbol over an inclusive date range.
+///
+/// `adjusted=false` because the archive stores raw prices and folds splits at read time; the route
+/// adjusts by default, and an adjusted bar written into a raw archive is a silent restatement.
+fn aggregates_url(
+    base: &str,
+    ticker: &Ticker,
+    interval: BarInterval,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> String {
+    let (multiplier, timespan) = interval.massive_timespan();
+    format!(
+        "{}/v2/aggs/ticker/{}/range/{}/{}/{}/{}?adjusted=false&limit={AGGREGATES_PAGE_SIZE}",
+        base.trim_end_matches('/'),
+        ticker,
+        multiplier,
+        timespan,
+        from.format("%Y-%m-%d"),
+        to.format("%Y-%m-%d")
+    )
+}
+
 /// Builds the first splits URL, on the same normalization as [`grouped_bars_url`].
 ///
 /// Unfiltered by date, because the whole table is 29 pages and three seconds.
@@ -100,6 +123,15 @@ fn same_origin(base: &str, cursor: &str) -> bool {
         _ => false,
     }
 }
+
+/// Rows per aggregates page.
+///
+/// The documented and measured maximum. A five-minute cadence is a few hundred rows per session
+/// including extended hours, so this covers years of one symbol in a single response.
+const AGGREGATES_PAGE_SIZE: usize = 50_000;
+
+/// Pages followed before an aggregates fetch gives up, bounding a cursor that never terminates.
+const AGGREGATES_PAGE_LIMIT: usize = 200;
 
 /// Rows per splits page.
 ///
@@ -160,6 +192,16 @@ fn parse_split(row: &SplitRow) -> Option<EquitySplit> {
 struct GroupedBarRow {
     #[serde(rename = "T")]
     ticker: String,
+    #[serde(flatten)]
+    bar: AggregateBarRow,
+}
+
+/// One bar, without the symbol it belongs to.
+///
+/// The per-ticker aggregates route names the symbol in the URL rather than repeating it on every
+/// row, so the ticker arrives from the caller there and from the `T` field on the grouped route.
+#[derive(Deserialize, Debug)]
+struct AggregateBarRow {
     c: Option<f64>,
     h: Option<f64>,
     l: Option<f64>,
@@ -168,6 +210,13 @@ struct GroupedBarRow {
     t: u64,
     v: Option<f64>,
     vw: Option<f64>,
+}
+
+/// The aggregates envelope. `next_url` is absent on the last page, as on the splits route.
+#[derive(Deserialize)]
+struct AggregatesResponse {
+    results: Option<Vec<AggregateBarRow>>,
+    next_url: Option<String>,
 }
 
 /// The grouped-daily envelope. Unknown fields (`adjusted`, `queryCount`, `request_id`, `status`)
@@ -202,11 +251,11 @@ fn is_common_stock_symbol(raw: &str) -> bool {
 }
 
 /// Converts an untrusted row into a validated [`EquityBar`], or `None`.
-fn parse_bar(row: &GroupedBarRow) -> Option<EquityBar> {
-    if !is_common_stock_symbol(&row.ticker) {
+fn parse_bar(raw_ticker: &str, interval: BarInterval, row: &AggregateBarRow) -> Option<EquityBar> {
+    if !is_common_stock_symbol(raw_ticker) {
         return None;
     }
-    let ticker = Ticker::new(&row.ticker)?;
+    let ticker = Ticker::new(raw_ticker)?;
     let timestamp = DateTime::from_timestamp_millis(i64::try_from(row.t).ok()?)?;
 
     let volume = row
@@ -219,7 +268,7 @@ fn parse_bar(row: &GroupedBarRow) -> Option<EquityBar> {
 
     EquityBar::new(
         ticker,
-        BarInterval::OneDay,
+        interval,
         timestamp,
         row.o?,
         row.h?,
@@ -233,6 +282,9 @@ fn parse_bar(row: &GroupedBarRow) -> Option<EquityBar> {
 }
 
 /// Fetches whole-market daily bars from Massive.
+/// Cloneable so a fan-out can hand one to each task. `reqwest::Client` is a handle over a shared
+/// pool, so a clone shares the connections rather than opening its own.
+#[derive(Clone)]
 pub struct MassiveClient {
     http_client: reqwest::Client,
     credentials: MassiveCredentials,
@@ -317,7 +369,10 @@ impl MassiveClient {
         };
 
         let received = rows.len();
-        let bars: Vec<EquityBar> = rows.iter().filter_map(parse_bar).collect();
+        let bars: Vec<EquityBar> = rows
+            .iter()
+            .filter_map(|row| parse_bar(&row.ticker, BarInterval::OneDay, &row.bar))
+            .collect();
 
         let dropped = received.saturating_sub(bars.len());
         if dropped > 0 {
@@ -340,6 +395,81 @@ impl MassiveClient {
     /// The response covers announced-but-unexecuted splits as well as historical ones, so a caller
     /// holding the result has the feed's whole current opinion rather than a window of it — which is
     /// what makes replacing the stored table safe when a split is cancelled and disappears.
+    /// Fetches one symbol's bars at an intraday cadence over an inclusive date range.
+    ///
+    /// **Refuses [`BarInterval::OneDay`].** This route stamps a daily bar at midnight Eastern where
+    /// the grouped route stamps it at the session close — sixteen hours apart for the same bar — so
+    /// a daily series taken from here and joined to the archive yields every session twice. The
+    /// symbol is a [`Ticker`] because it lands in a URL path on a request carrying the bearer token.
+    pub async fn fetch_intraday(
+        &self,
+        ticker: &Ticker,
+        interval: BarInterval,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<EquityBar>, MassiveError> {
+        match interval {
+            BarInterval::OneMinute | BarInterval::FiveMinute => {}
+            BarInterval::OneDay => {
+                return Err(MassiveError::Parse(
+                    "the aggregates route stamps a daily bar at midnight where the grouped route \
+                     stamps it at the close; use fetch_grouped_daily"
+                        .to_string(),
+                ))
+            }
+        }
+
+        let mut url = aggregates_url(&self.credentials.base_url, ticker, interval, from, to);
+        let mut bars: Vec<EquityBar> = Vec::new();
+        let mut received = 0usize;
+
+        for _ in 1..=AGGREGATES_PAGE_LIMIT {
+            let response = self.authorized(&url).send().await?;
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                return Err(MassiveError::Api { status, body });
+            }
+
+            let payload: AggregatesResponse = response.json().await.map_err(|error| {
+                MassiveError::Parse(format!("Failed to parse {ticker} aggregates: {error}"))
+            })?;
+
+            let rows = payload.results.unwrap_or_default();
+            received += rows.len();
+            bars.extend(
+                rows.iter()
+                    .filter_map(|row| parse_bar(ticker.as_str(), interval, row)),
+            );
+
+            let Some(next_url) = payload.next_url else {
+                let dropped = received.saturating_sub(bars.len());
+                if dropped > 0 {
+                    debug!(
+                        %ticker,
+                        dropped, received, "Dropped aggregate rows that failed validation"
+                    );
+                }
+                return Ok(bars);
+            };
+            // Checked before it is followed, for the reason `fetch_splits` gives: the request that
+            // follows re-attaches the bearer token and this URL came out of the response body.
+            if !same_origin(&self.credentials.base_url, &next_url) {
+                return Err(MassiveError::Cursor {
+                    host: reqwest::Url::parse(&next_url)
+                        .ok()
+                        .and_then(|cursor| cursor.host_str().map(str::to_string))
+                        .unwrap_or_else(|| "an unparseable URL".to_string()),
+                });
+            }
+            url = next_url;
+        }
+
+        Err(MassiveError::Parse(format!(
+            "{ticker} aggregates pagination did not end within {AGGREGATES_PAGE_LIMIT} pages"
+        )))
+    }
+
     pub async fn fetch_splits(&self) -> Result<Vec<EquitySplit>, MassiveError> {
         let mut url = splits_url(&self.credentials.base_url);
         let mut splits: Vec<EquitySplit> = Vec::new();
@@ -398,6 +528,11 @@ impl MassiveClient {
 mod tests {
     use super::*;
 
+    /// A validated symbol, which is what the aggregates route now takes.
+    fn symbol(raw: &str) -> Ticker {
+        Ticker::new(raw).expect("a valid test symbol")
+    }
+
     fn date(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("a valid test date")
     }
@@ -426,6 +561,164 @@ mod tests {
                 "{base}"
             );
         }
+    }
+
+    /// The two minute cadences differ only in the multiplier, so a copied arm would silently fetch
+    /// one-minute bars for a five-minute request. `adjusted=false` is pinned here too: the route
+    /// adjusts by default, and an adjusted bar in a raw archive is a silent restatement.
+    #[test]
+    fn test_the_aggregates_url_carries_the_cadence_and_refuses_adjustment() {
+        let url = aggregates_url(
+            "https://api.massive.com/",
+            &symbol("AAPL"),
+            BarInterval::FiveMinute,
+            date("2026-08-18"),
+            date("2026-08-20"),
+        );
+        assert!(
+            url.starts_with(
+                "https://api.massive.com/v2/aggs/ticker/AAPL/range/5/minute/2026-08-18/2026-08-20"
+            ),
+            "{url}"
+        );
+        assert!(url.contains("adjusted=false"), "{url}");
+
+        let minute = aggregates_url(
+            "https://api.massive.com",
+            &symbol("AAPL"),
+            BarInterval::OneMinute,
+            date("2026-08-18"),
+            date("2026-08-20"),
+        );
+        assert!(minute.contains("/range/1/minute/"), "{minute}");
+    }
+
+    /// The route stamps a daily bar at midnight Eastern where the grouped route stamps it at the
+    /// close. A daily series taken from here and joined to the archive yields every session twice,
+    /// sixteen hours apart, with neither copy obviously wrong.
+    #[tokio::test]
+    async fn test_a_daily_interval_is_refused_by_the_intraday_route() {
+        let server = mockito::Server::new_async().await;
+        let result = MassiveClient::for_tests(&server.url())
+            .fetch_intraday(
+                &symbol("AAPL"),
+                BarInterval::OneDay,
+                date("2026-08-18"),
+                date("2026-08-20"),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(MassiveError::Parse(ref message)) if message.contains("grouped")),
+            "a daily interval must be refused with a message naming the right route"
+        );
+    }
+
+    /// The per-ticker route names the symbol in the URL and not on each row, so the ticker has to
+    /// come from the caller. Reading it off the row would leave every bar unattributed.
+    #[tokio::test]
+    async fn test_the_ticker_and_interval_come_from_the_caller() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[
+                    {"v":2153,"vw":316.9,"o":316.96,"c":317.0,"h":317.0,"l":316.83,"t":1787183940000,"n":42}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        let bars = MassiveClient::for_tests(&server.url())
+            .fetch_intraday(
+                &symbol("MSFT"),
+                BarInterval::FiveMinute,
+                date("2026-08-18"),
+                date("2026-08-20"),
+            )
+            .await
+            .expect("the fetch must succeed");
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].ticker().as_str(), "MSFT");
+        assert_eq!(bars[0].bar_interval(), BarInterval::FiveMinute);
+        mock.assert_async().await;
+    }
+
+    /// A cursor is followed to the end and the pages accumulate, which is what makes a multi-year
+    /// range of one symbol a single call rather than the caller's problem.
+    #[tokio::test]
+    async fn test_an_aggregates_cursor_is_followed_to_the_end() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let first = server
+            .mock(
+                "GET",
+                "/v2/aggs/ticker/AAPL/range/5/minute/2026-08-18/2026-08-20",
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"status":"OK","results":[
+                    {{"v":10,"vw":1.0,"o":1.0,"c":1.0,"h":1.0,"l":1.0,"t":1787183940000,"n":1}}
+                ],"next_url":"{base}/page-two"}}"#
+            ))
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/page-two")
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[
+                    {"v":20,"vw":2.0,"o":2.0,"c":2.0,"h":2.0,"l":2.0,"t":1787184240000,"n":2}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+
+        let bars = MassiveClient::for_tests(&base)
+            .fetch_intraday(
+                &symbol("AAPL"),
+                BarInterval::FiveMinute,
+                date("2026-08-18"),
+                date("2026-08-20"),
+            )
+            .await
+            .expect("the fetch must succeed");
+
+        assert_eq!(bars.len(), 2, "both pages, not just the first");
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    /// A cursor pointing somewhere else must not receive the bearer token. The URL arrives in a
+    /// response body, so following it blindly lets the response choose where the credential goes.
+    #[tokio::test]
+    async fn test_an_aggregates_cursor_off_origin_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"{"status":"OK","results":[],"next_url":"https://elsewhere.example/page-two"}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = MassiveClient::for_tests(&server.url())
+            .fetch_intraday(
+                &symbol("AAPL"),
+                BarInterval::FiveMinute,
+                date("2026-08-18"),
+                date("2026-08-20"),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(MassiveError::Cursor { .. })),
+            "{result:?}"
+        );
     }
 
     /// `matches!` rather than `assert_eq!`, because `MassiveCredentials` deliberately has no
