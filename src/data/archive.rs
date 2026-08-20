@@ -1,4 +1,5 @@
 //! The S3 bar archive: the trainer's data, repaired to a window rather than topped up by a night.
+//! EXPERIMENT: this line exists only to make the paths filter run the Rust checks.
 //!
 //! One partition per session under `data/equity/bars/year=/month=/day=/data.parquet`.
 
