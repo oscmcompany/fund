@@ -353,10 +353,9 @@ fn count_sessions_without_data(
 
 /// Chunk sessions that will leave no partition behind, counted once each.
 ///
-/// A session goes unwritten either because the daily archive could not describe it or because the
-/// vendor returned no bars for it, and the two overlap: an undescribed session is skipped before a
-/// fetch, so it is also unanswered. Counting the reasons separately counted those sessions twice.
-/// Taken with the written and failed counts, this partitions the chunk.
+/// A session is unwritten when the daily archive cannot describe it or the vendor returns no bars,
+/// and an undescribed session is skipped before any fetch, so the two conditions overlap rather
+/// than partition. Taken with the written and failed counts, this partitions the chunk.
 fn count_intraday_sessions_without_data(
     chunk: &[SessionDate],
     described: &BTreeSet<SessionDate>,
