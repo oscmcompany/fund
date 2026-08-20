@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, error};
 use uuid::Uuid;
 
+use crate::laboratory::convergence::Curve;
 use crate::laboratory::dataset::DatasetFingerprint;
 use crate::laboratory::metrics::Distribution;
 use crate::laboratory::predictor::Evaluation;
@@ -50,6 +51,7 @@ pub enum Observation {
     FeatureTriaged(FeatureTriaged),
     StabilityMeasured(StabilityMeasured),
     RegimeMeasured(RegimeMeasured),
+    ConvergenceMeasured(ConvergenceMeasured),
 }
 
 impl Observation {
@@ -61,8 +63,30 @@ impl Observation {
             Observation::FeatureTriaged(_) => "feature_triaged",
             Observation::StabilityMeasured(_) => "stability_measured",
             Observation::RegimeMeasured(_) => "regime_measured",
+            Observation::ConvergenceMeasured(_) => "convergence_measured",
         }
     }
+}
+
+/// Whether a dislocated spread closes, which is the premise the pair book rests on.
+///
+/// `selection` carries the control and `segment` the replication, so an arm that only converges over
+/// one half of the window says so in the record rather than in a follow-up nobody runs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConvergenceMeasured {
+    /// How the pair was admitted: the screen's correlation band, or the population without it.
+    pub selection: String,
+    /// Which stretch of the window the entries were opened in.
+    pub segment: String,
+    pub sessions: usize,
+    pub universe: usize,
+    pub entries: usize,
+    /// Over the entries that converged, so no convergence is absent rather than zero.
+    pub median_sessions_to_convergence: Option<f64>,
+    /// What the shares are worth: a convergence earns roughly this many deviations and a stop loses
+    /// [`crate::portfolio::screen::STOP_LOSS_WIDENING`], so the curves alone cannot say which wins.
+    pub mean_entry_z_score: Option<f64>,
+    pub curves: Vec<Curve>,
 }
 
 /// Whether one forecast's per-session readings follow from the state of the market.
@@ -382,6 +406,27 @@ mod tests {
         assert_eq!(regime.experiment_type(), "regime_measured");
         for other in [&forecast, &triaged, &stability, &observation()] {
             assert_ne!(regime.experiment_type(), other.experiment_type());
+        }
+
+        let convergence = Observation::ConvergenceMeasured(ConvergenceMeasured {
+            selection: "screened".to_string(),
+            segment: "whole".to_string(),
+            sessions: 499,
+            universe: 200,
+            entries: 1_284,
+            median_sessions_to_convergence: None,
+            mean_entry_z_score: None,
+            curves: Vec::new(),
+        });
+        let value: serde_json::Value = serde_json::to_value(&convergence).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("convergence_measured")
+        );
+        assert_eq!(convergence.experiment_type(), "convergence_measured");
+        for other in [&forecast, &triaged, &stability, &regime, &observation()] {
+            assert_ne!(convergence.experiment_type(), other.experiment_type());
         }
     }
 
