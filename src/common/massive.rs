@@ -82,7 +82,7 @@ fn grouped_bars_url(base: &str, date: NaiveDate) -> String {
 /// adjusts by default, and an adjusted bar written into a raw archive is a silent restatement.
 fn aggregates_url(
     base: &str,
-    ticker: &str,
+    ticker: &Ticker,
     interval: BarInterval,
     from: NaiveDate,
     to: NaiveDate,
@@ -399,10 +399,11 @@ impl MassiveClient {
     ///
     /// **Refuses [`BarInterval::OneDay`].** This route stamps a daily bar at midnight Eastern where
     /// the grouped route stamps it at the session close — sixteen hours apart for the same bar — so
-    /// a daily series taken from here and joined to the archive yields every session twice.
+    /// a daily series taken from here and joined to the archive yields every session twice. The
+    /// symbol is a [`Ticker`] because it lands in a URL path on a request carrying the bearer token.
     pub async fn fetch_intraday(
         &self,
-        ticker: &str,
+        ticker: &Ticker,
         interval: BarInterval,
         from: NaiveDate,
         to: NaiveDate,
@@ -438,14 +439,14 @@ impl MassiveClient {
             received += rows.len();
             bars.extend(
                 rows.iter()
-                    .filter_map(|row| parse_bar(ticker, interval, row)),
+                    .filter_map(|row| parse_bar(ticker.as_str(), interval, row)),
             );
 
             let Some(next_url) = payload.next_url else {
                 let dropped = received.saturating_sub(bars.len());
                 if dropped > 0 {
                     debug!(
-                        ticker,
+                        %ticker,
                         dropped, received, "Dropped aggregate rows that failed validation"
                     );
                 }
@@ -527,6 +528,11 @@ impl MassiveClient {
 mod tests {
     use super::*;
 
+    /// A validated symbol, which is what the aggregates route now takes.
+    fn symbol(raw: &str) -> Ticker {
+        Ticker::new(raw).expect("a valid test symbol")
+    }
+
     fn date(value: &str) -> NaiveDate {
         NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("a valid test date")
     }
@@ -564,7 +570,7 @@ mod tests {
     fn test_the_aggregates_url_carries_the_cadence_and_refuses_adjustment() {
         let url = aggregates_url(
             "https://api.massive.com/",
-            "AAPL",
+            &symbol("AAPL"),
             BarInterval::FiveMinute,
             date("2026-08-18"),
             date("2026-08-20"),
@@ -579,7 +585,7 @@ mod tests {
 
         let minute = aggregates_url(
             "https://api.massive.com",
-            "AAPL",
+            &symbol("AAPL"),
             BarInterval::OneMinute,
             date("2026-08-18"),
             date("2026-08-20"),
@@ -595,7 +601,7 @@ mod tests {
         let server = mockito::Server::new_async().await;
         let result = MassiveClient::for_tests(&server.url())
             .fetch_intraday(
-                "AAPL",
+                &symbol("AAPL"),
                 BarInterval::OneDay,
                 date("2026-08-18"),
                 date("2026-08-20"),
@@ -626,7 +632,7 @@ mod tests {
 
         let bars = MassiveClient::for_tests(&server.url())
             .fetch_intraday(
-                "MSFT",
+                &symbol("MSFT"),
                 BarInterval::FiveMinute,
                 date("2026-08-18"),
                 date("2026-08-20"),
@@ -673,7 +679,7 @@ mod tests {
 
         let bars = MassiveClient::for_tests(&base)
             .fetch_intraday(
-                "AAPL",
+                &symbol("AAPL"),
                 BarInterval::FiveMinute,
                 date("2026-08-18"),
                 date("2026-08-20"),
@@ -702,7 +708,7 @@ mod tests {
 
         let result = MassiveClient::for_tests(&server.url())
             .fetch_intraday(
-                "AAPL",
+                &symbol("AAPL"),
                 BarInterval::FiveMinute,
                 date("2026-08-18"),
                 date("2026-08-20"),

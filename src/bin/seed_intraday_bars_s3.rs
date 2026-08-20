@@ -44,9 +44,8 @@ impl Parameters {
             return Err(format!("START_DATE must not be after END_DATE\n{USAGE}"));
         }
 
-        // Refused rather than silently redirected: the aggregates route stamps a daily bar sixteen
-        // hours from where the grouped route stamps it, so a daily backfill taken here would not
-        // line up with the archive it landed beside.
+        // Refused rather than redirected: the aggregates route stamps a daily bar sixteen hours
+        // from where the grouped route does, so it would not line up with the archive beside it.
         let interval = match cadence.map(String::as_str) {
             None => DEFAULT_CADENCE,
             Some("five_minute") => BarInterval::FiveMinute,
@@ -165,6 +164,12 @@ mod tests {
         let parameters =
             Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "one_minute"])).unwrap();
         assert_eq!(parameters.interval, BarInterval::OneMinute);
+
+        // The documented spelling, passed explicitly. Without this a typo in that arm sends a user
+        // who followed the usage text to the "CADENCE must be" error and the default test still passes.
+        let parameters =
+            Parameters::parse(&arguments(&["2026-08-01", "2026-08-20", "five_minute"])).unwrap();
+        assert_eq!(parameters.interval, BarInterval::FiveMinute);
     }
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
