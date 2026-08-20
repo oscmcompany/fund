@@ -792,6 +792,10 @@ mod tests {
             date_partitioned_key(&bar_archive_prefix(BarInterval::OneMinute), date),
             "data/equity/bars/interval=one_minute/year=2026/month=08/day=19/data.parquet"
         );
+        assert_eq!(
+            date_partitioned_key(&bar_archive_prefix(BarInterval::FiveMinute), date),
+            "data/equity/bars/interval=five_minute/year=2026/month=08/day=19/data.parquet"
+        );
     }
 
     /// Two cadences of one session must not collide, which is the whole reason the segment exists.
@@ -804,9 +808,10 @@ mod tests {
             .map(|interval| date_partitioned_key(&bar_archive_prefix(*interval), date))
             .collect();
 
-        // Two, the cadences that exist today. Pinned rather than taken from `BarInterval::ALL`, so
-        // adding a variant has to come here and say what its key is rather than passing silently.
-        assert_eq!(keys.len(), 2);
+        // Three, the cadences that exist today. Pinned rather than taken from `BarInterval::ALL`,
+        // so adding a variant has to come here and say what its key is rather than passing
+        // silently — which is what caught `five_minute` arriving.
+        assert_eq!(keys.len(), 3);
     }
 
     /// The cadence segment sits before the date partition, so the date inverse still reads the tail
