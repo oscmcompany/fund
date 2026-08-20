@@ -44,15 +44,10 @@ jobs:
               - '.sqlfluff'
               - '.sqlfluffignore'
               - 'devenv.lock'
-      # Reports the headroom either side, because nothing here records whether the
-      # removal is still load-bearing. It costs 35-70s of every run, and if the
-      # runner turns out to have room to spare the step can go rather than be
-      # optimized.
-      - name: Free disk space
-        run: |
-          echo "before: $(df -h --output=avail / | tail -1 | tr -d ' ') available on /"
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          echo "after:  $(df -h --output=avail / | tail -1 | tr -d ' ') available on /"
+      # Deliberately no disk-freeing step either. Removing dotnet, ghc and boost
+      # cost 35-70s of every run; measured on run 32382969223 the runner starts
+      # with 87G free and the removal recovers 11G nothing asks for.
+      #
       # Deliberately no Nix binary cache action here. devenv pins nixpkgs to
       # `cachix/devenv-nixpkgs/rolling` and configures `devenv.cachix.org` as a
       # substituter, so that cache and `cache.nixos.org` already serve the whole
