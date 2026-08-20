@@ -351,6 +351,22 @@ fn count_sessions_without_data(
         .count()
 }
 
+/// Chunk sessions that will leave no partition behind, counted once each.
+///
+/// A session is unwritten when the daily archive cannot describe it or the vendor returns no bars,
+/// and an undescribed session is skipped before any fetch, so the two conditions overlap rather
+/// than partition. Taken with the written and failed counts, this partitions the chunk.
+fn count_intraday_sessions_without_data(
+    chunk: &[SessionDate],
+    described: &BTreeSet<SessionDate>,
+    answered: &BTreeSet<SessionDate>,
+) -> usize {
+    chunk
+        .iter()
+        .filter(|session| !described.contains(session) || !answered.contains(session))
+        .count()
+}
+
 /// Fetches one chunk of sessions and writes their partitions, accumulating into `summary`.
 async fn archive_chunk(
     s3_client: &S3Client,
@@ -548,9 +564,10 @@ async fn archive_intraday_chunk(
             %first, %last,
             "Some sessions have no daily partition to screen against; leaving them unwritten"
         );
-        summary.sessions_without_data += undescribed;
     }
     if universe.symbols.is_empty() {
+        // Nothing to fetch, so nothing in the chunk gets written.
+        summary.sessions_without_data += chunk.len();
         return Ok(());
     }
     info!(
@@ -628,7 +645,8 @@ async fn archive_intraday_chunk(
     }
 
     let answered: BTreeSet<SessionDate> = by_session.keys().copied().collect();
-    summary.sessions_without_data += chunk.iter().filter(|s| !answered.contains(s)).count();
+    summary.sessions_without_data +=
+        count_intraday_sessions_without_data(chunk, &universe.described, &answered);
     if symbols_failed > 0 {
         summary.symbols_failed += symbols_failed;
         // Loud, because the partitions below are about to be written *without* these names and
@@ -1337,6 +1355,30 @@ mod tests {
             answered.len() + failed.len() + without_data,
             requested.len()
         );
+    }
+
+    /// A session with no daily universe to screen against is skipped before any fetch, so it is
+    /// also unanswered. Counting both reasons inflated the five-year backfill's figure to exactly
+    /// twice the sessions it left unwritten.
+    #[test]
+    fn test_a_session_missing_its_universe_is_counted_once_not_twice() {
+        let chunk = vec![
+            session(2026, 6, 1),
+            session(2026, 6, 2),
+            session(2026, 6, 3),
+        ];
+        // 06-01 has no daily partition, so it is never fetched and never answers.
+        let described: BTreeSet<SessionDate> = [session(2026, 6, 2), session(2026, 6, 3)].into();
+        let answered: BTreeSet<SessionDate> = [session(2026, 6, 2)].into();
+
+        let without_data = count_intraday_sessions_without_data(&chunk, &described, &answered);
+
+        assert_eq!(
+            without_data, 2,
+            "06-01 lacks a universe and 06-03 lacks bars; neither may be counted twice"
+        );
+        // One written session (06-02) plus the two above accounts for the whole chunk.
+        assert_eq!(without_data + 1, 3);
     }
 
     /// A response can be grouped under a session that was never requested — the bar's own timestamp
