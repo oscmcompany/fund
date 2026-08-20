@@ -255,7 +255,7 @@ aws s3 ls s3://<ARTIFACTS_BUCKET>/models/tide/ --profile <PROFILE> --region us-e
 List recent equity bar exports:
 
 ```bash
-aws s3 ls s3://<DATA_BUCKET>/data/equity/bars/ --profile <PROFILE> --region us-east-1 | sort | tail -5
+aws s3 ls s3://<DATA_BUCKET>/data/equity/bars/interval=one_day/ --profile <PROFILE> --region us-east-1 | sort | tail -5
 ```
 
 Compare timestamps with model run and equity bar data from Group A. Flag discrepancies.

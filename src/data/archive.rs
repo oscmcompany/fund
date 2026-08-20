@@ -1,6 +1,6 @@
 //! The S3 bar archive: the trainer's data, repaired to a window rather than topped up by a night.
 //!
-//! One partition per session under `data/equity/bars/year=/month=/day=/data.parquet`.
+//! One partition per session and cadence under `data/equity/bars/interval=/year=/month=/day=/`.
 
 use std::collections::BTreeSet;
 use std::io::Cursor;
@@ -15,15 +15,26 @@ use tracing::{info, warn};
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
-use crate::common::types::SessionDate;
+use crate::common::types::{BarInterval, SessionDate};
 use crate::data::{bars, boundaries, splits};
 
-/// S3 prefix for the bar archive.
+/// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
+/// cadence, and a key built without one collides with every other cadence of the same session.
 ///
 /// Deliberately not under `exports/`, which is where the application's nightly database export
 /// lands. The two datasets live in one bucket and describe overlapping facts, and giving them one
 /// prefix would make whichever job ran second the one that mattered.
 pub const BAR_ARCHIVE_PREFIX: &str = "data/equity/bars";
+
+/// The archive prefix for one bar cadence.
+///
+/// Hive-partitioned on the interval, so a reader that scans the tree gets the cadence as a column
+/// and a second cadence costs one more value rather than a parallel tree. Daily and intraday bars
+/// describe overlapping facts — a daily bar is the aggregate of its own intraday bars — and one
+/// partition holding both would make whichever job wrote last the one that mattered.
+pub fn bar_archive_prefix(interval: BarInterval) -> String {
+    format!("{BAR_ARCHIVE_PREFIX}/interval={interval}")
+}
 
 /// S3 key for the ticker metadata that accompanies the archive.
 ///
@@ -206,18 +217,21 @@ async fn present_sessions(
     start: SessionDate,
     end: SessionDate,
 ) -> Result<BTreeSet<SessionDate>, ArchiveError> {
+    // Scoped to the cadence being repaired. Listing the whole bar tree would count an intraday
+    // partition as a daily session already present, and the gap scan would stop fetching it.
+    let prefix = bar_archive_prefix(BarInterval::OneDay);
     let mut present = BTreeSet::new();
     let mut pages = s3_client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(format!("{BAR_ARCHIVE_PREFIX}/"))
+        .prefix(format!("{prefix}/"))
         .into_paginator()
         .send();
 
     while let Some(page) = pages.next().await {
         let page = page.map_err(|error| ArchiveError::List {
             bucket: bucket.to_string(),
-            prefix: BAR_ARCHIVE_PREFIX.to_string(),
+            prefix: prefix.clone(),
             message: error.to_string(),
         })?;
         for object in page.contents() {
@@ -388,7 +402,7 @@ async fn write_partition(
     session: SessionDate,
     fetched: DataFrame,
 ) -> Result<(), ArchiveError> {
-    let key = date_partitioned_key(BAR_ARCHIVE_PREFIX, session.date());
+    let key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
     write_merged(s3_client, bucket, key, fetched, |existing, fetched, key| {
         merge_or_replace(existing, fetched, key)
     })
@@ -761,6 +775,49 @@ mod tests {
         SessionDate::from_date(
             NaiveDate::from_ymd_opt(year, month, day).expect("test date must be valid"),
         )
+    }
+
+    /// The stored layout, pinned to literals. Everything already written lives at these keys, and a
+    /// silent change to either the segment name or its position orphans the whole archive — the gap
+    /// scan would report every session missing and refetch five years over an intact bucket.
+    #[test]
+    fn test_the_partition_key_carries_its_cadence() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 19).expect("test date must be valid");
+
+        assert_eq!(
+            date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), date),
+            "data/equity/bars/interval=one_day/year=2026/month=08/day=19/data.parquet"
+        );
+        assert_eq!(
+            date_partitioned_key(&bar_archive_prefix(BarInterval::OneMinute), date),
+            "data/equity/bars/interval=one_minute/year=2026/month=08/day=19/data.parquet"
+        );
+    }
+
+    /// Two cadences of one session must not collide, which is the whole reason the segment exists.
+    /// A shared key would make whichever job wrote last the one that mattered.
+    #[test]
+    fn test_two_cadences_of_one_session_do_not_share_a_key() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 19).expect("test date must be valid");
+        let keys: std::collections::BTreeSet<String> = BarInterval::ALL
+            .iter()
+            .map(|interval| date_partitioned_key(&bar_archive_prefix(*interval), date))
+            .collect();
+
+        // Two, the cadences that exist today. Pinned rather than taken from `BarInterval::ALL`, so
+        // adding a variant has to come here and say what its key is rather than passing silently.
+        assert_eq!(keys.len(), 2);
+    }
+
+    /// The cadence segment sits before the date partition, so the date inverse still reads the tail
+    /// of the key. Without this the gap scan cannot recover a session from a listing.
+    #[test]
+    fn test_the_cadence_segment_does_not_break_the_date_inverse() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 19).expect("test date must be valid");
+        for interval in BarInterval::ALL {
+            let key = date_partitioned_key(&bar_archive_prefix(interval), date);
+            assert_eq!(date_from_partitioned_key(&key), Some(date), "key: {key}");
+        }
     }
 
     /// 2026-06-01 is a Monday, so the week runs Mon-Fri 1..=5 and the weekend is 6-7.
