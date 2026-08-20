@@ -282,6 +282,9 @@ fn parse_bar(raw_ticker: &str, interval: BarInterval, row: &AggregateBarRow) -> 
 }
 
 /// Fetches whole-market daily bars from Massive.
+/// Cloneable so a fan-out can hand one to each task. `reqwest::Client` is a handle over a shared
+/// pool, so a clone shares the connections rather than opening its own.
+#[derive(Clone)]
 pub struct MassiveClient {
     http_client: reqwest::Client,
     credentials: MassiveCredentials,

@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use crate::common::alpaca::MarketDataClient;
 use crate::common::aws::{date_from_partitioned_key, date_partitioned_key};
 use crate::common::massive::MassiveClient;
-use crate::common::types::{BarInterval, SessionDate};
+use crate::common::types::{BarInterval, SessionDate, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME};
 use crate::data::{bars, boundaries, splits};
 
 /// Root of the bar archive, never a partition prefix on its own — [`bar_archive_prefix`] adds the
@@ -170,6 +170,12 @@ pub struct ArchiveSummary {
     pub sessions_failed: Vec<SessionDate>,
     /// Bars written across every partition this pass touched.
     pub bars_written: usize,
+    /// Symbols an intraday pass could not fetch after every attempt.
+    ///
+    /// Reported because nothing downstream can detect one. A session-level gap scan sees the
+    /// partition and moves on, so a symbol missing from it stays missing until someone re-runs the
+    /// window deliberately. Always zero on the daily path, which fetches the market in one call.
+    pub symbols_failed: usize,
 }
 
 /// Every weekday in `[start, end]` that the archive should be able to answer for.
@@ -214,12 +220,13 @@ fn sessions_to_request(
 async fn present_sessions(
     s3_client: &S3Client,
     bucket: &str,
+    interval: BarInterval,
     start: SessionDate,
     end: SessionDate,
 ) -> Result<BTreeSet<SessionDate>, ArchiveError> {
     // Scoped to the cadence being repaired. Listing the whole bar tree would count an intraday
     // partition as a daily session already present, and the gap scan would stop fetching it.
-    let prefix = bar_archive_prefix(BarInterval::OneDay);
+    let prefix = bar_archive_prefix(interval);
     let mut present = BTreeSet::new();
     let mut pages = s3_client
         .list_objects_v2()
@@ -271,7 +278,14 @@ pub async fn archive_missing_sessions(
     window_end: SessionDate,
 ) -> Result<ArchiveSummary, ArchiveError> {
     let expected = expected_sessions(window_start, window_end);
-    let present = present_sessions(s3_client, bucket, window_start, window_end).await?;
+    let present = present_sessions(
+        s3_client,
+        bucket,
+        BarInterval::OneDay,
+        window_start,
+        window_end,
+    )
+    .await?;
     let requested = sessions_to_request(&expected, &present);
 
     info!(
@@ -366,7 +380,15 @@ async fn archive_chunk(
         let fetched_frame = bars::bars_to_dataframe(&bars_for_session)?;
         let fetched_rows = fetched_frame.height();
 
-        match write_partition(s3_client, bucket, session, fetched_frame).await {
+        match write_partition(
+            s3_client,
+            bucket,
+            BarInterval::OneDay,
+            session,
+            fetched_frame,
+        )
+        .await
+        {
             Ok(()) => {
                 // The rows this pass contributed, not the partition's height. Counting the merged
                 // total reported the archive's size as though every pass had just written it.
@@ -386,6 +408,230 @@ async fn archive_chunk(
     Ok(())
 }
 
+/// Sessions held in memory before an intraday pass writes its partitions and releases the buffer.
+///
+/// A month. Requests are ticker-major and partitions are session-major, so a chunk has to hold every
+/// name before any one session can be written — a quarter of five-minute bars over this universe is
+/// several hundred megabytes, where a month is a fifth of that. Smaller chunks cost requests rather
+/// than memory: the request count is the universe times the number of chunks.
+const INTRADAY_CHUNK_SESSIONS: usize = 21;
+
+/// Attempts per symbol before a chunk gives up on it.
+///
+/// Load-bearing rather than defensive. A session-level gap scan cannot see a *symbol*-level hole:
+/// the partition exists, so the next pass never re-requests it, and one dropped response becomes a
+/// name permanently missing from that month. A single transient failure was observed in the first
+/// twenty-two sessions and the same request succeeded immediately afterward.
+const INTRADAY_SYMBOL_ATTEMPTS: usize = 3;
+
+/// Symbols fetched at once.
+///
+/// The vendor imposes no rate limit worth pacing against — 25 sequential requests measured at
+/// roughly twelve a second with no throttling — so this bounds our own concurrency rather than
+/// respecting theirs, and keeps a failure to a handful of symbols rather than the whole chunk.
+const INTRADAY_CONCURRENCY: usize = 8;
+
+/// Fetches and writes every intraday partition in `[window_start, window_end]` the archive lacks.
+///
+/// A set difference like [`archive_missing_sessions`], and scoped to `interval` throughout, so a
+/// five-minute pass neither sees nor writes the daily partitions beside it.
+pub async fn archive_intraday_sessions(
+    s3_client: &S3Client,
+    massive: &MassiveClient,
+    bucket: &str,
+    interval: BarInterval,
+    window_start: SessionDate,
+    window_end: SessionDate,
+) -> Result<ArchiveSummary, ArchiveError> {
+    let expected = expected_sessions(window_start, window_end);
+    let present = present_sessions(s3_client, bucket, interval, window_start, window_end).await?;
+    // No correction window: an intraday bar is not restated after the close the way a daily one is,
+    // and re-fetching a month to find that out would cost the universe in requests.
+    let requested: Vec<SessionDate> = expected
+        .iter()
+        .copied()
+        .filter(|session| !present.contains(session))
+        .collect();
+
+    info!(
+        %window_start,
+        %window_end,
+        interval = %interval,
+        expected = expected.len(),
+        present = present.len(),
+        requested = requested.len(),
+        "Scanned the intraday archive for gaps"
+    );
+
+    let mut summary = ArchiveSummary {
+        sessions_requested: requested.len(),
+        ..Default::default()
+    };
+    for chunk in requested.chunks(INTRADAY_CHUNK_SESSIONS) {
+        archive_intraday_chunk(s3_client, massive, bucket, interval, chunk, &mut summary).await?;
+    }
+
+    info!(
+        sessions_requested = summary.sessions_requested,
+        sessions_written = summary.sessions_written,
+        sessions_without_data = summary.sessions_without_data,
+        sessions_failed = summary.sessions_failed.len(),
+        bars_written = summary.bars_written,
+        "Intraday archive updated"
+    );
+    Ok(summary)
+}
+
+/// One chunk: derive the universe, fan out over it, then write a partition per session.
+async fn archive_intraday_chunk(
+    s3_client: &S3Client,
+    massive: &MassiveClient,
+    bucket: &str,
+    interval: BarInterval,
+    chunk: &[SessionDate],
+    summary: &mut ArchiveSummary,
+) -> Result<(), ArchiveError> {
+    let (Some(first), Some(last)) = (chunk.first(), chunk.last()) else {
+        return Ok(());
+    };
+    let universe = universe_over(s3_client, bucket, chunk).await?;
+    if universe.is_empty() {
+        // The daily archive has nothing to say about these sessions, so there is no universe to
+        // fetch. Counted as answered-with-nothing rather than failed, which is what it is.
+        summary.sessions_without_data += chunk.len();
+        return Ok(());
+    }
+    info!(
+        %first,
+        %last,
+        universe = universe.len(),
+        "Fetching an intraday chunk"
+    );
+
+    let mut pending: Vec<String> = universe.into_iter().collect();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut bars: Vec<crate::common::types::EquityBar> = Vec::new();
+    let mut symbols_failed = 0usize;
+
+    loop {
+        while tasks.len() < INTRADAY_CONCURRENCY {
+            let Some(ticker) = pending.pop() else { break };
+            let client = massive.clone();
+            let (from, to) = (first.date(), last.date());
+            tasks.spawn(async move {
+                let mut last_error = None;
+                for _ in 0..INTRADAY_SYMBOL_ATTEMPTS {
+                    match client.fetch_intraday(&ticker, interval, from, to).await {
+                        Ok(bars) => return Ok(bars),
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                Err(last_error.expect("a failed attempt records its error"))
+            });
+        }
+        let Some(finished) = tasks.join_next().await else {
+            break;
+        };
+        match finished {
+            Ok(Ok(fetched)) => bars.extend(fetched),
+            // One symbol's failure costs that symbol, not the chunk. The session stays absent from
+            // the archive only if every symbol in it failed, and the next pass requests it again.
+            Ok(Err(error)) => {
+                symbols_failed += 1;
+                warn!(%error, "A symbol's intraday fetch failed; continuing the chunk");
+            }
+            Err(error) => {
+                symbols_failed += 1;
+                warn!(%error, "An intraday fetch task did not complete");
+            }
+        }
+    }
+
+    // Keyed by the bar's own timestamp rather than by the session requested, on the same reasoning
+    // as the daily path: a response that answers for a neighbouring session must not land under the
+    // wrong key. An extended-hours bar is still its own Eastern date, which is what makes this safe.
+    let mut by_session: std::collections::BTreeMap<SessionDate, Vec<_>> =
+        std::collections::BTreeMap::new();
+    for bar in bars {
+        by_session
+            .entry(SessionDate::at(bar.timestamp()))
+            .or_default()
+            .push(bar);
+    }
+
+    let answered: BTreeSet<SessionDate> = by_session.keys().copied().collect();
+    summary.sessions_without_data += chunk.iter().filter(|s| !answered.contains(s)).count();
+    if symbols_failed > 0 {
+        summary.symbols_failed += symbols_failed;
+        // Loud, because the partitions below are about to be written *without* these names and
+        // nothing downstream can tell that from a complete one.
+        warn!(
+            symbols_failed,
+            attempts = INTRADAY_SYMBOL_ATTEMPTS,
+            %first,
+            %last,
+            "Some symbols could not be fetched; their bars are absent from this chunk's partitions"
+        );
+    }
+
+    for (session, bars_for_session) in by_session {
+        // A bar dated outside the chunk is a vendor answering beyond the range asked for. Writing it
+        // would put rows in a partition this pass never claimed and never verified.
+        if !chunk.contains(&session) {
+            continue;
+        }
+        let frame = bars::bars_to_dataframe(&bars_for_session)?;
+        let rows = frame.height();
+        match write_partition(s3_client, bucket, interval, session, frame).await {
+            Ok(()) => {
+                summary.sessions_written += 1;
+                summary.bars_written += rows;
+            }
+            Err(ArchiveError::Contended { key, attempts }) => {
+                warn!(key, attempts, %session, "Partition contended; the next pass will retry it");
+                summary.sessions_failed.push(session);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// The names that traded across `sessions`, read from the daily archive and screened as the model
+/// screens them.
+///
+/// **Survivorship-free by construction.** The daily partitions are whole-market and were written on
+/// the day, so a name that has since delisted is still present in the sessions it traded. Taking the
+/// list from today's market instead would sample only the survivors — and a pair that blew up is
+/// exactly the one a convergence study must not drop.
+async fn universe_over(
+    s3_client: &S3Client,
+    bucket: &str,
+    sessions: &[SessionDate],
+) -> Result<BTreeSet<String>, ArchiveError> {
+    let daily = bar_archive_prefix(BarInterval::OneDay);
+    let mut universe = BTreeSet::new();
+
+    for session in sessions {
+        let key = date_partitioned_key(&daily, session.date());
+        let Some(frame) = read_partition(s3_client, bucket, &key).await? else {
+            continue;
+        };
+        let screened = frame
+            .lazy()
+            .filter(
+                col("close_price")
+                    .gt_eq(lit(MINIMUM_CLOSE_PRICE))
+                    .and(col("volume").gt_eq(lit(MINIMUM_VOLUME))),
+            )
+            .select([col("ticker")])
+            .collect()?;
+        let tickers = screened.column("ticker")?.str()?;
+        universe.extend(tickers.into_iter().flatten().map(str::to_string));
+    }
+    Ok(universe)
+}
+
 /// Merges `fetched` into the partition for `session` and writes it back, conditional on what it read.
 ///
 /// The read-merge-write is a compare-and-swap. S3 returns the object's `ETag` on read, and the write
@@ -399,10 +645,11 @@ async fn archive_chunk(
 async fn write_partition(
     s3_client: &S3Client,
     bucket: &str,
+    interval: BarInterval,
     session: SessionDate,
     fetched: DataFrame,
 ) -> Result<(), ArchiveError> {
-    let key = date_partitioned_key(&bar_archive_prefix(BarInterval::OneDay), session.date());
+    let key = date_partitioned_key(&bar_archive_prefix(interval), session.date());
     write_merged(s3_client, bucket, key, fetched, |existing, fetched, key| {
         merge_or_replace(existing, fetched, key)
     })
@@ -823,6 +1070,38 @@ mod tests {
             let key = date_partitioned_key(&bar_archive_prefix(interval), date);
             assert_eq!(date_from_partitioned_key(&key), Some(date), "key: {key}");
         }
+    }
+
+    /// The intraday pass deliberately has no correction window, unlike the daily one. A daily bar
+    /// gets restated after the close; an intraday bar does not, and re-requesting a month to learn
+    /// that would cost the whole universe in requests rather than one grouped call.
+    #[test]
+    fn test_the_intraday_scan_requests_only_what_is_absent() {
+        let expected = expected_sessions(session(2026, 6, 1), session(2026, 6, 5));
+        // The two most recent sessions are held, which is where the daily correction window bites.
+        let present: BTreeSet<SessionDate> = [session(2026, 6, 4), session(2026, 6, 5)]
+            .into_iter()
+            .collect();
+
+        let requested: Vec<SessionDate> = expected
+            .iter()
+            .copied()
+            .filter(|s| !present.contains(s))
+            .collect();
+        assert_eq!(
+            requested,
+            vec![
+                session(2026, 6, 1),
+                session(2026, 6, 2),
+                session(2026, 6, 3)
+            ],
+            "nothing already held is re-requested"
+        );
+
+        // The daily path re-requests the two held sessions on top, to pick up restatements.
+        let daily = sessions_to_request(&expected, &present);
+        assert_eq!(daily.len(), 5, "{daily:?}");
+        assert!(daily.contains(&session(2026, 6, 5)), "{daily:?}");
     }
 
     /// 2026-06-01 is a Monday, so the week runs Mon-Fri 1..=5 and the weekend is 6-7.
