@@ -12,7 +12,7 @@ use fund::laboratory::journal as laboratory;
 use fund::laboratory::predictor::{
     evaluate, CrossSectionalMean, Momentum, Panel, Persistence, Predictor, RandomRanking,
 };
-use fund::laboratory::regime::{self, STATES};
+use fund::laboratory::regime::{self, FIRST_HALF, SECOND_HALF, STATES, WHOLE};
 use fund::laboratory::stability;
 
 const USAGE: &str = "Usage: laboratory_regime [LOOKBACK_DAYS] [MOMENTUM_SESSIONS]";
@@ -176,6 +176,13 @@ async fn run(
         Box::new(RandomRanking { seed: RANDOM_SEED }),
     ];
 
+    // The market does not depend on which forecast is being read against it, so describe each
+    // state once rather than once per baseline.
+    let states: Vec<(&str, Vec<Option<f64>>)> = STATES
+        .iter()
+        .map(|(name, read)| (*name, described.iter().map(read).collect()))
+        .collect();
+
     let mut measured = Vec::new();
     for baseline in &baselines {
         let evaluation = evaluate(baseline.as_ref(), &panel);
@@ -185,8 +192,7 @@ async fn run(
             .map(|session| session.information_coefficient)
             .collect();
 
-        for (name, read) in STATES {
-            let state: Vec<Option<f64>> = described.iter().map(read).collect();
+        for (name, state) in &states {
             // Both series cut with the same range, or a lag would pair a reading against the state
             // of a session outside the stretch being measured.
             for (segment, range) in regime::segments(panel.sessions()) {
@@ -258,7 +264,7 @@ fn render(measured: &[laboratory::RegimeMeasured]) -> String {
                 "second half"
             ));
         }
-        if record.segment != "whole" {
+        if record.segment != WHOLE {
             continue;
         }
         for lag in LAGS {
@@ -266,9 +272,9 @@ fn render(measured: &[laboratory::RegimeMeasured]) -> String {
                 "{:<24}{:>6}{:>26}{:>26}{:>26}\n",
                 record.state,
                 lag,
-                correlation(measured, record, "whole", *lag),
-                correlation(measured, record, "first_half", *lag),
-                correlation(measured, record, "second_half", *lag),
+                correlation(measured, record, WHOLE, *lag),
+                correlation(measured, record, FIRST_HALF, *lag),
+                correlation(measured, record, SECOND_HALF, *lag),
             ));
         }
     }
@@ -286,6 +292,7 @@ fn correlation(
         .iter()
         .find(|other| {
             other.predictor == record.predictor
+                && other.statistic == record.statistic
                 && other.state == record.state
                 && other.segment == segment
         })
@@ -319,6 +326,10 @@ mod tests {
     fn test_arguments_default_from_the_right() {
         let parameters = Parameters::parse(&[]).unwrap();
         assert_eq!(parameters.lookback_days, 730);
+        assert_eq!(parameters.momentum_sessions, 20);
+
+        let parameters = Parameters::parse(&arguments(&["365"])).unwrap();
+        assert_eq!(parameters.lookback_days, 365);
         assert_eq!(parameters.momentum_sessions, 20);
 
         let parameters = Parameters::parse(&arguments(&["365", "5"])).unwrap();
@@ -365,9 +376,9 @@ mod tests {
     #[test]
     fn test_a_state_shows_its_whole_beside_its_halves() {
         let rendered = render(&[
-            measurement("breadth", "whole", 0.1494, 1),
-            measurement("breadth", "first_half", 0.1702, 1),
-            measurement("breadth", "second_half", 0.1301, 1),
+            measurement("breadth", WHOLE, 0.1494, 1),
+            measurement("breadth", FIRST_HALF, 0.1702, 1),
+            measurement("breadth", SECOND_HALF, 0.1301, 1),
         ]);
 
         assert!(rendered.contains("first half"), "{rendered}");
@@ -385,7 +396,7 @@ mod tests {
     /// replication that was run and failed rather than one that could not be run.
     #[test]
     fn test_an_unmeasured_half_is_not_rendered_as_zero() {
-        let rendered = render(&[measurement("breadth", "whole", 0.1494, 1)]);
+        let rendered = render(&[measurement("breadth", WHOLE, 0.1494, 1)]);
         assert!(rendered.contains("unmeasurable"), "{rendered}");
         assert!(!rendered.contains("+0.0000"), "{rendered}");
     }
@@ -394,8 +405,8 @@ mod tests {
     /// forecasts is unreadable.
     #[test]
     fn test_each_forecast_is_headed_once() {
-        let first = measurement("dispersion", "whole", 0.1, 1);
-        let mut second = measurement("breadth", "whole", 0.1, 1);
+        let first = measurement("dispersion", WHOLE, 0.1, 1);
+        let mut second = measurement("breadth", WHOLE, 0.1, 1);
         second.predictor = "random_ranking".to_string();
 
         let rendered = render(&[first, second]);
@@ -412,17 +423,17 @@ mod tests {
     #[test]
     fn test_a_state_opens_one_row_per_lag_and_not_one_per_segment() {
         let rendered = render(&[
-            measurement("breadth", "whole", 0.1494, 1),
-            measurement("breadth", "first_half", 0.1702, 1),
-            measurement("breadth", "second_half", 0.1301, 1),
+            measurement("breadth", WHOLE, 0.1494, 1),
+            measurement("breadth", FIRST_HALF, 0.1702, 1),
+            measurement("breadth", SECOND_HALF, 0.1301, 1),
         ]);
         assert_eq!(
             rendered
                 .lines()
                 .filter(|line| line.starts_with("breadth"))
                 .count(),
-            LAGS.len(),
-            "{rendered}"
+            2,
+            "one row per lag, not one per segment: {rendered}"
         );
     }
 }

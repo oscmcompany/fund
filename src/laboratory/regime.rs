@@ -72,20 +72,31 @@ pub const STATES: &[(&str, fn(&MarketState) -> Option<f64>)] = &[
     ("breadth", |state| state.breadth),
 ];
 
+/// The label each stretch is reported under.
+///
+/// Shared with whatever renders them, which matches on the label: one changed here and not there
+/// would drop every row or report every half as unmeasurable, in silence.
+pub const WHOLE: &str = "whole";
+pub const FIRST_HALF: &str = "first_half";
+pub const SECOND_HALF: &str = "second_half";
+
 /// The stretches of a window a measurement is repeated over, so a finding can be asked to appear
 /// twice rather than once.
 ///
-/// Split by time rather than at random: two halves drawn from the same sessions would share whatever
-/// made the whole look significant, and it is the second half's independence that is worth having.
-/// Every series must be cut with the same range or a lag would pair a reading against the state of a
-/// session outside its own stretch.
+/// Split by time rather than at random: halves drawn from the same sessions would share whatever
+/// made the whole look significant. Every series must be cut with the same range or a lag would
+/// pair a reading against the state of a session outside its own stretch.
 pub fn segments(sessions: usize) -> Vec<(&'static str, std::ops::Range<usize>)> {
+    let mut segments = vec![(WHOLE, 0..sessions)];
+    // A window of one halves into an empty stretch and a copy of itself, and reporting that copy as
+    // the second half would show one measurement twice where the whole point is to show two.
+    if sessions < 2 {
+        return segments;
+    }
     let middle = sessions / 2;
-    vec![
-        ("whole", 0..sessions),
-        ("first_half", 0..middle),
-        ("second_half", middle..sessions),
-    ]
+    segments.push((FIRST_HALF, 0..middle));
+    segments.push((SECOND_HALF, middle..sessions));
+    segments
 }
 
 #[cfg(test)]
@@ -155,7 +166,7 @@ mod tests {
     fn test_the_halves_are_disjoint_and_cover_the_window() {
         let segments = segments(499);
         let names: Vec<&str> = segments.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["whole", "first_half", "second_half"]);
+        assert_eq!(names, vec![WHOLE, FIRST_HALF, SECOND_HALF]);
 
         let (_, whole) = &segments[0];
         let (_, first) = &segments[1];
@@ -169,14 +180,23 @@ mod tests {
         assert!(first.len().abs_diff(second.len()) <= 1);
     }
 
-    /// A window too short to halve still reports the whole rather than two empty stretches that
-    /// would read as a replication that was attempted and found nothing.
+    /// A window too short to halve reports only itself. Halving one session gives an empty stretch
+    /// and a copy of the whole, and labelling that copy the second half would show one measurement
+    /// twice where the point of the split is to show two.
     #[test]
-    fn test_a_window_too_short_to_halve_still_reports_itself() {
-        let segments = segments(1);
-        assert_eq!(segments[0].1, 0..1);
-        assert!(segments[1].1.is_empty());
-        assert_eq!(segments[2].1, 0..1);
+    fn test_a_window_too_short_to_halve_reports_no_halves() {
+        for sessions in [0, 1] {
+            let segments = segments(sessions);
+            assert_eq!(segments.len(), 1, "{sessions} sessions");
+            assert_eq!(segments[0].0, WHOLE);
+            assert_eq!(segments[0].1, 0..sessions);
+        }
+
+        // Two sessions is the shortest window with two stretches, one session apiece.
+        let segments = segments(2);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[1].1, 0..1);
+        assert_eq!(segments[2].1, 1..2);
     }
 
     #[test]

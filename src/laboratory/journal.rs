@@ -364,6 +364,25 @@ mod tests {
         for other in [&forecast, &triaged, &observation()] {
             assert_ne!(stability.experiment_type(), other.experiment_type());
         }
+
+        let regime = Observation::RegimeMeasured(RegimeMeasured {
+            predictor: "persistence".to_string(),
+            statistic: "information_coefficient".to_string(),
+            state: "breadth".to_string(),
+            segment: "whole".to_string(),
+            sessions: 499,
+            associations: Vec::new(),
+        });
+        let value: serde_json::Value = serde_json::to_value(&regime).unwrap();
+
+        assert_eq!(
+            value["experiment_type"],
+            serde_json::json!("regime_measured")
+        );
+        assert_eq!(regime.experiment_type(), "regime_measured");
+        for other in [&forecast, &triaged, &stability, &observation()] {
+            assert_ne!(regime.experiment_type(), other.experiment_type());
+        }
     }
 
     /// Two different counts, and conflating them would read a forecast that ranked twice out of
