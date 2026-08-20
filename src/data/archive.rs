@@ -804,7 +804,9 @@ mod tests {
             .map(|interval| date_partitioned_key(&bar_archive_prefix(*interval), date))
             .collect();
 
-        assert_eq!(keys.len(), BarInterval::ALL.len());
+        // Two, the cadences that exist today. Pinned rather than taken from `BarInterval::ALL`, so
+        // adding a variant has to come here and say what its key is rather than passing silently.
+        assert_eq!(keys.len(), 2);
     }
 
     /// The cadence segment sits before the date partition, so the date inverse still reads the tail
