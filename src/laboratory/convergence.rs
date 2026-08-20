@@ -160,11 +160,8 @@ pub const HORIZONS: usize = 20;
 
 /// How a pair is admitted, which is the whole of the control.
 ///
-/// The two differ in one test and share everything else — the same fit window, the same entry
-/// threshold, the same fixed model, the same forward walk. An extreme z is extreme partly because
-/// the mean and dispersion it is measured against were *estimated* on sixty sessions, so it is less
-/// extreme next session under a pure random walk. That regression to the mean is arithmetic rather
-/// than economics and it lands on both arms equally, which is what makes the difference readable.
+/// The two differ in one test and share everything else, so the regression to the mean that an
+/// estimated dispersion produces lands on both equally. That is what makes the difference readable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
     /// The screen's band on log-return correlation, which is what makes two names a pair.
@@ -196,11 +193,42 @@ pub enum Resolution {
     Unresolved,
 }
 
+/// Which forward horizons an entry could be priced at, one bit per horizon.
+///
+/// A horizon neither leg traded in is *unobserved* rather than open: the position existed, but a
+/// session with no price cannot say whether it had already terminated. A single count of horizons
+/// reached would carry across such a gap and report it as an entry seen still open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Observed(u32);
+
+impl Observed {
+    const _FITS: () = assert!(HORIZONS <= u32::BITS as usize);
+
+    fn mark(&mut self, horizon: usize) {
+        if (1..=HORIZONS).contains(&horizon) {
+            self.0 |= 1 << (horizon - 1);
+        }
+    }
+
+    /// Whether this entry was priced at `horizon`.
+    pub fn contains(self, horizon: usize) -> bool {
+        (1..=HORIZONS).contains(&horizon) && self.0 & (1 << (horizon - 1)) != 0
+    }
+
+    /// The furthest horizon priced, which is how long the pair was occupied.
+    pub fn last(self) -> usize {
+        u32::BITS.saturating_sub(self.0.leading_zeros()) as usize
+    }
+
+    pub fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+}
+
 /// One pair opened at one session, and what became of it.
 ///
-/// `observed` is the last horizon both legs could be priced at, and it is what separates an entry
-/// that survived twenty sessions without resolving from one the archive ran out under. Folding the
-/// second into the first would report a truncated entry as a pair that failed to converge.
+/// `observed` separates an entry that survived twenty sessions without resolving from one the
+/// archive ran out under, and from one whose legs stopped printing partway.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub session: usize,
@@ -208,17 +236,17 @@ pub struct Entry {
     pub short: String,
     pub entry_z_score: f64,
     pub resolution: Resolution,
-    pub observed: usize,
+    pub observed: Observed,
 }
 
 impl Entry {
-    /// Where this entry stands at `horizon`, or `None` if it was never followed that far.
+    /// Where this entry stands at `horizon`, or `None` if it could not be read there.
     fn at(&self, horizon: usize) -> Option<Resolution> {
         match self.resolution {
             Resolution::Converged(step) | Resolution::Stopped(step) if step <= horizon => {
                 Some(self.resolution)
             }
-            _ if self.observed >= horizon => Some(Resolution::Unresolved),
+            _ if self.observed.contains(horizon) => Some(Resolution::Unresolved),
             _ => None,
         }
     }
@@ -240,9 +268,8 @@ pub struct Curve {
 /// Every entry `session` admits under `selection`, each followed forward until it resolves.
 ///
 /// The fit window ends at the session *before* the one entry is judged at, mirroring production,
-/// where the window is closed daily bars and the observation is a live price. Scoring an
-/// observation against a distribution it belongs to bounds the z-score by the sample size, and a
-/// bounded z cannot reach the threshold it is compared against.
+/// where the window is closed daily bars and the observation is a live price. A window containing
+/// the observation inflates its own dispersion by the very move being scored.
 pub fn entries_at(
     closes: &Closes,
     universe: &[&str],
@@ -338,7 +365,7 @@ fn follow(
     session: usize,
     entry_z_score: f64,
 ) -> Entry {
-    let mut observed = 0;
+    let mut observed = Observed::default();
     let mut resolution = Resolution::Unresolved;
 
     for step in 1..=HORIZONS {
@@ -346,8 +373,9 @@ fn follow(
         if index >= closes.sessions() {
             break;
         }
-        // A leg that did not trade leaves this horizon unobserved and the walk continues: the
-        // horizon counts sessions elapsed, which a missing bar does not change.
+        // A leg that did not trade leaves this horizon unmarked and the walk continues: the horizon
+        // counts sessions elapsed, which a missing bar does not change, but nothing can be read off
+        // a session with no price.
         let (Some(long_price), Some(short_price)) =
             (closes.close_at(long, index), closes.close_at(short, index))
         else {
@@ -356,7 +384,7 @@ fn follow(
         let Some(z_score) = model.z_score(long_price, short_price) else {
             continue;
         };
-        observed = step;
+        observed.mark(step);
 
         match exit_reason(z_score, entry_z_score) {
             Some(CloseReason::Convergence) => {
@@ -391,13 +419,9 @@ fn breaks(window: &[f64]) -> bool {
 
 /// Drops every entry taken on a pair that was already open, which production cannot take.
 ///
-/// A spread stays dislocated for days, so the same episode is admitted on each of them and ten
-/// correlated outcomes read as ten independent ones. [`crate::portfolio::screen::select_disjoint`]
-/// excludes every held ticker, so the book opens an episode once.
-///
-/// Per pair rather than per ticker, which is the weaker of the two guarantees production gives.
-/// Matching the stronger one means simulating the book's ranking and its position limit, which is a
-/// replay and not a measurement of prices.
+/// A spread stays dislocated for days, so without this one episode is admitted on each of them and
+/// ten correlated outcomes read as ten independent ones. Keyed per pair rather than per ticker,
+/// which is the weaker of the two guarantees [`crate::portfolio::screen::select_disjoint`] gives.
 pub fn without_reentry(mut entries: Vec<Entry>) -> Vec<Entry> {
     entries.sort_by(|left, right| {
         left.session
@@ -427,7 +451,7 @@ pub fn without_reentry(mut entries: Vec<Entry>) -> Vec<Entry> {
         let until = entry.session
             + match entry.resolution {
                 Resolution::Converged(step) | Resolution::Stopped(step) => step,
-                Resolution::Unresolved => entry.observed,
+                Resolution::Unresolved => entry.observed.last(),
             };
         held_through.insert(pair, until);
         kept.push(entry);
@@ -466,10 +490,9 @@ pub fn curves(entries: &[Entry]) -> Vec<Curve> {
 
 /// The average z-score entries were opened at, which is what a convergence is worth.
 ///
-/// The curves count outcomes and the two outcomes are not the same size: converging travels the
-/// whole way back to the mean, and stopping travels
-/// [`crate::portfolio::screen::STOP_LOSS_WIDENING`]. Without this the shares cannot be turned into
-/// a statement about money in either direction.
+/// Converging travels the whole way back to the mean and stopping travels
+/// [`crate::portfolio::screen::STOP_LOSS_WIDENING`], so without this the shares cannot be turned
+/// into a statement about money in either direction.
 pub fn mean_entry_z_score(entries: &[Entry]) -> Option<f64> {
     if entries.is_empty() {
         return None;
@@ -630,10 +653,9 @@ mod tests {
 
     /// A pair whose spread path is written directly rather than inferred from two price series.
     ///
-    /// `AAA` is a common factor and `BBB` is that factor plus `spread`, so the fitted spread *is*
-    /// `spread` up to a constant and a dislocation can be placed at a chosen number of standard
-    /// deviations. `direction` flips `BBB`'s exposure to the factor, which is how an anti-correlated
-    /// pair is built without disturbing the spread.
+    /// `AAA` is a common factor and `BBB` is that factor plus `spread`, so a dislocation can be
+    /// placed at a chosen number of standard deviations. `direction` flips `BBB`'s exposure to the
+    /// factor, which builds an anti-correlated pair without disturbing the spread.
     fn pair(direction: f64, spread: impl Fn(usize) -> f64) -> DataFrame {
         let mut rows: Vec<(&str, i64, f64)> = Vec::new();
         let mut factor = 0.0;
@@ -776,7 +798,17 @@ mod tests {
         assert!(entries_at(&closes, &["AAA", "BBB"], 0, Selection::Screened).is_empty());
     }
 
+    /// An entry priced at every horizon up to `observed`, which is the gapless case.
     fn entry(resolution: Resolution, observed: usize) -> Entry {
+        priced(resolution, &(1..=observed).collect::<Vec<_>>())
+    }
+
+    /// An entry priced at exactly `horizons`, so a gap can be placed where a test needs one.
+    fn priced(resolution: Resolution, horizons: &[usize]) -> Entry {
+        let mut observed = Observed::default();
+        for horizon in horizons {
+            observed.mark(*horizon);
+        }
         Entry {
             session: 10,
             long: "AAA".to_string(),
@@ -866,9 +898,16 @@ mod tests {
             short: short.to_string(),
             entry_z_score: 2.5,
             resolution,
-            observed: match resolution {
-                Resolution::Converged(step) | Resolution::Stopped(step) => step,
-                Resolution::Unresolved => HORIZONS,
+            observed: {
+                let mut observed = Observed::default();
+                let reached = match resolution {
+                    Resolution::Converged(step) | Resolution::Stopped(step) => step,
+                    Resolution::Unresolved => HORIZONS,
+                };
+                for horizon in 1..=reached {
+                    observed.mark(horizon);
+                }
+                observed
             },
         }
     }
@@ -909,6 +948,62 @@ mod tests {
             opened("CCC", "DDD", 11, Resolution::Unresolved),
         ]);
         assert_eq!(kept.len(), 2, "{kept:?}");
+    }
+
+    /// A horizon neither leg printed in is unobserved, not open. Carrying across the gap would
+    /// report a session that could not be read as one where the pair was seen still open, and it
+    /// biases every curve toward "open" by exactly the entries with holes in them.
+    #[test]
+    fn test_a_horizon_that_could_not_be_priced_is_not_counted_as_open() {
+        // Priced at one, two and four; three is a session one leg did not trade.
+        let entries = vec![priced(Resolution::Unresolved, &[1, 2, 4])];
+        let curves = curves(&entries);
+
+        assert_eq!(curves[1].entries, 1, "horizon two was priced");
+        assert_eq!(curves[2].entries, 0, "horizon three was not");
+        assert_eq!(curves[3].entries, 1, "and horizon four was priced again");
+    }
+
+    /// A resolution still carries to every later horizon across a gap: once the spread has been
+    /// seen to converge, no later missing price makes that unknown again.
+    #[test]
+    fn test_a_resolution_carries_across_a_gap() {
+        let entries = vec![priced(Resolution::Converged(2), &[1, 2])];
+        let curves = curves(&entries);
+
+        assert_eq!(
+            curves[9].entries, 1,
+            "horizon ten, long after the last price"
+        );
+        assert!((curves[9].converged - 1.0).abs() < 1e-12);
+    }
+
+    /// The pair is occupied until the furthest horizon it was priced at, so a gap does not free it
+    /// early and admit a second entry from the same unresolved episode.
+    #[test]
+    fn test_a_gap_does_not_free_the_pair_early() {
+        let mut first = priced(Resolution::Unresolved, &[1, 2, 8]);
+        first.session = 10;
+        let mut second = priced(Resolution::Converged(1), &[1]);
+        second.session = 15;
+
+        assert_eq!(
+            without_reentry(vec![first, second]).len(),
+            1,
+            "session 15 falls inside the first entry's occupancy, which runs to 18"
+        );
+    }
+
+    /// The average is over every entry, and no entry is an absent average rather than zero.
+    #[test]
+    fn test_the_mean_entry_z_score_is_absent_without_entries() {
+        let mut low = entry(Resolution::Converged(2), 2);
+        low.entry_z_score = 2.0;
+        let mut high = entry(Resolution::Stopped(3), 3);
+        high.entry_z_score = 4.5;
+
+        assert_eq!(mean_entry_z_score(&[low, high]), Some(3.25));
+        assert_eq!(mean_entry_z_score(&[]), None);
     }
 
     /// The sample is reproducible from its seed, drawn without replacement, and a different seed

@@ -61,14 +61,14 @@ pub fn describe(panel: &Panel) -> Vec<MarketState> {
         .collect()
 }
 
-/// Reads one field of a session's state, so [`STATES`] can name the field beside its label.
-pub type StateReader = fn(&MarketState) -> Option<f64>;
-
 /// The state variables this module reports, each with the field it reads.
 ///
 /// Named here rather than at the call site so the count is fixed in one place: reading the largest
 /// of several figures without saying how many were looked at is how a table manufactures a finding.
-pub const STATES: &[(&str, StateReader)] = &[
+// A label paired with the field it reads is the whole table; naming the function pointer would add
+// public API for one use, which the repository guidelines refuse.
+#[allow(clippy::type_complexity)]
+pub const STATES: &[(&str, fn(&MarketState) -> Option<f64>)] = &[
     ("dispersion", |state| state.dispersion),
     ("market_move", |state| state.market_move),
     ("absolute_market_move", |state| state.absolute_market_move),

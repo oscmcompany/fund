@@ -272,14 +272,14 @@ fn render(measured: &[laboratory::ConvergenceMeasured]) -> String {
         for horizon in 1..=HORIZONS {
             rendered.push_str(&format!("{horizon:>8}"));
             for arm in &arms {
+                // A horizon no entry was priced at prints as absent rather than as three zeros,
+                // which would read as a cohort that was followed and did nothing.
                 match arm.curves.iter().find(|curve| curve.horizon == horizon) {
-                    Some(curve) => rendered.push_str(&format!(
+                    Some(curve) if curve.entries > 0 => rendered.push_str(&format!(
                         "{:>9.4}{:>9.4}{:>9.4}{:>7}",
                         curve.converged, curve.stopped, curve.open, curve.entries
                     )),
-                    // A horizon nothing reached is absent, not a row of zeros: zeros read as a
-                    // cohort that was followed and did nothing.
-                    None => rendered.push_str(&format!("{:>34}", "unmeasured")),
+                    Some(_) | None => rendered.push_str(&format!("{:>34}", "unmeasured")),
                 }
             }
             rendered.push('\n');
@@ -387,6 +387,22 @@ mod tests {
             rendered.contains("0.1100") && rendered.contains("0.7300"),
             "{rendered}"
         );
+    }
+
+    /// A horizon no entry was priced at prints as absent, not as three zeros — which would read as
+    /// a cohort that was followed and stayed open rather than one that could not be read.
+    #[test]
+    fn test_a_horizon_with_no_entries_is_not_rendered_as_zero() {
+        let mut record = measurement("screened", "whole", 0.42);
+        record.curves[4].entries = 0;
+
+        let rendered = render(&[record]);
+        let row = rendered
+            .lines()
+            .find(|line| line.trim_start().starts_with("5 "))
+            .unwrap_or_else(|| panic!("{rendered}"));
+        assert!(row.contains("unmeasured"), "{row}");
+        assert!(!row.contains("0.0000"), "{row}");
     }
 
     /// A cohort that never converged reports no median rather than a zero, which would read as
