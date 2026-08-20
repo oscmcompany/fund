@@ -22,14 +22,37 @@ jobs:
         uses: dorny/paths-filter@v3
         id: changes
         with:
+          # `.sqlx/` is Rust's: the build runs with SQLX_OFFLINE, so a wrong cache
+          # fails compilation and nothing else would catch it. devenv defines the
+          # toolchain both halves run under, so it triggers both rather than
+          # picking one.
           filters: |
             rust:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - '.sqlx/**'
+              - 'devenv.nix'
+              - 'devenv.lock'
+            base:
+              - '**/*.nix'
+              - '**/*.md'
+              - '**/*.yaml'
+              - '**/*.yml'
+              - '**/*.toml'
+              - '**/*.sql'
+              - '.sqlfluff'
+              - '.sqlfluffignore'
+              - 'devenv.lock'
+      # Reports the headroom either side, because nothing here records whether the
+      # removal is still load-bearing. It costs 35-70s of every run, and if the
+      # runner turns out to have room to spare the step can go rather than be
+      # optimized.
       - name: Free disk space
         run: |
+          echo "before: $(df -h --output=avail / | tail -1 | tr -d ' ') available on /"
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          echo "after:  $(df -h --output=avail / | tail -1 | tr -d ' ') available on /"
       # Deliberately no Nix binary cache action here. devenv pins nixpkgs to
       # `cachix/devenv-nixpkgs/rolling` and configures `devenv.cachix.org` as a
       # substituter, so that cache and `cache.nixos.org` already serve the whole
@@ -56,7 +79,13 @@ jobs:
           key: llvm-cov-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             llvm-cov-${{ runner.os }}-
+      # Gated because it lints nix, markdown, yaml, toml and sql and none of those
+      # are in most pull requests here: nineteen of the last twenty-five merged
+      # were Rust-only, and each paid two and a half minutes to lint files they
+      # did not touch. `Cargo.toml` matches both filters, so a dependency bump
+      # still gets its toml linted.
       - name: Run base checks
+        if: steps.changes.outputs.base == 'true'
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:base
       # The integration test targets need a database and an S3-compatible
       # object store. Only those two are started, not the fund services: those
