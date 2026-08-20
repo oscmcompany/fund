@@ -22,14 +22,32 @@ jobs:
         uses: dorny/paths-filter@v3
         id: changes
         with:
+          # `.sqlx/` is Rust's: the build runs with SQLX_OFFLINE, so a wrong cache
+          # fails compilation and nothing else would catch it. devenv defines the
+          # toolchain both halves run under, so it triggers both rather than
+          # picking one.
           filters: |
             rust:
               - '**/*.rs'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+              - '.sqlx/**'
+              - 'devenv.nix'
+              - 'devenv.lock'
+            base:
+              - '**/*.nix'
+              - '**/*.md'
+              - '**/*.yaml'
+              - '**/*.yml'
+              - '**/*.toml'
+              - '**/*.sql'
+              - '.sqlfluff'
+              - '.sqlfluffignore'
+              - 'devenv.lock'
+      # Deliberately no disk-freeing step. Removing dotnet, ghc and boost
+      # cost 35-70s of every run; measured on run 32382969223 the runner starts
+      # with 87G free and the removal recovers 11G nothing asks for.
+      #
       # Deliberately no Nix binary cache action here. devenv pins nixpkgs to
       # `cachix/devenv-nixpkgs/rolling` and configures `devenv.cachix.org` as a
       # substituter, so that cache and `cache.nixos.org` already serve the whole
@@ -48,15 +66,19 @@ jobs:
           shared-key: rust-continuous-integration
           save-if: true
           add-rust-environment-hash-key: false
-      - name: Cache llvm-cov artifacts
-        if: steps.changes.outputs.rust == 'true'
-        uses: actions/cache@v4
-        with:
-          path: target/llvm-cov-target
-          key: llvm-cov-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            llvm-cov-${{ runner.os }}-
+      # Deliberately no llvm-cov cache. It restored target/llvm-cov-target at a
+      # cost of 117-180s on every Rust pull request and bought nothing: measured
+      # across runs 32381409920 and 32383074109, the Rust checks took 370s with
+      # it and 369s without. Swatinem/rust-cache above already covers ~/.cargo
+      # and target/, which is why the second cache was redundant.
+
+      # Gated because it lints nix, markdown, yaml, toml and sql and none of those
+      # are in most pull requests here: nineteen of the last twenty-five merged
+      # were Rust-only, and each paid two and a half minutes to lint files they
+      # did not touch. `Cargo.toml` matches both filters, so a dependency bump
+      # still gets its toml linted.
       - name: Run base checks
+        if: steps.changes.outputs.base == 'true'
         run: devenv --secretspec-provider env --secretspec-profile development tasks run checks:base
       # The integration test targets need a database and an S3-compatible
       # object store. Only those two are started, not the fund services: those
