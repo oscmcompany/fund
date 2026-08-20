@@ -23,8 +23,8 @@ pub const CORRELATION_WINDOW_SESSIONS: usize = 60;
 /// hedge ratio, turning `ln(short) - hedge_ratio * ln(long)` into a sum that hedges nothing, and
 /// sizing is dollar-neutral regardless — so admitting one is a directional bet wearing a
 /// market-neutral name.
-const CORRELATION_MINIMUM: f64 = 0.5;
-const CORRELATION_MAXIMUM: f64 = 0.95;
+pub const CORRELATION_MINIMUM: f64 = 0.5;
+pub const CORRELATION_MAXIMUM: f64 = 0.95;
 
 /// Spread z-score at which a pair is worth opening.
 pub const ENTRY_Z_SCORE: f64 = 2.0;
@@ -684,7 +684,7 @@ fn aligned_logs(long_closes: &[f64], short_closes: &[f64]) -> Option<(Vec<f64>, 
 /// Signed so the recorded detail says which way the series jumped, and largest rather than first so
 /// the number a bound gets calibrated against is the worst one present. Iterates rather than reusing
 /// [`logarithmic_returns`], which would collect a vector per ticker on a pass that screens over a thousand.
-fn worst_session_move(window: &[f64]) -> Option<f64> {
+pub(crate) fn worst_session_move(window: &[f64]) -> Option<f64> {
     window
         .windows(2)
         .filter(|pair| pair[0] > 0.0 && pair[1] > 0.0)
@@ -693,7 +693,7 @@ fn worst_session_move(window: &[f64]) -> Option<f64> {
 }
 
 /// Period-over-period log returns. One shorter than its input.
-fn logarithmic_returns(prices: &[f64]) -> Vec<f64> {
+pub(crate) fn logarithmic_returns(prices: &[f64]) -> Vec<f64> {
     prices
         .windows(2)
         .filter(|window| window[0] > 0.0 && window[1] > 0.0)
@@ -720,7 +720,7 @@ fn standard_deviation(values: &[f64], mean: f64) -> Option<f64> {
 }
 
 /// Pearson correlation. `None` when either series has no dispersion to correlate.
-fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
+pub(crate) fn pearson_correlation(left: &[f64], right: &[f64]) -> Option<f64> {
     let count = left.len().min(right.len());
     if count < 2 {
         return None;
