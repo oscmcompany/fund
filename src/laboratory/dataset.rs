@@ -122,6 +122,86 @@ pub async fn build(
     Ok(PreparedDataset { fit, fingerprint })
 }
 
+/// One intraday window, folded for splits and otherwise raw.
+pub struct IntradayDataset {
+    /// Every bar in the window at the requested cadence, split-folded and bounded.
+    pub bars: DataFrame,
+    pub fingerprint: DatasetFingerprint,
+}
+
+/// Reads the intraday partitions in the window and folds splits into them.
+///
+/// **Deliberately stops short of the daily path's universe screen.** The intraday universe was
+/// already decided at ingestion from each session's *daily* bar, and re-applying a daily volume
+/// floor to a five-minute bar — whose volume is a fraction of the session's — would empty the
+/// window rather than screen it.
+pub async fn intraday(
+    s3_client: &S3Client,
+    bucket: &str,
+    interval: BarInterval,
+    lookback_days: i64,
+    session: SessionDate,
+) -> Result<IntradayDataset, DatasetError> {
+    match interval {
+        BarInterval::OneMinute | BarInterval::FiveMinute => {}
+        // The daily partitions are a different shape and a different screen; `returns` reads those.
+        BarInterval::OneDay => {
+            return Err(DatasetError::Window(
+                "intraday reads an intraday cadence; use returns for daily bars".to_string(),
+            ))
+        }
+    }
+
+    let splits_frame = archive::read_partition(s3_client, bucket, archive::SPLITS_ARCHIVE_KEY)
+        .await?
+        .ok_or_else(|| {
+            DatasetError::Window(format!(
+                "no splits table at {}; refusing to build on unadjusted prices",
+                archive::SPLITS_ARCHIVE_KEY
+            ))
+        })?;
+    let splits_digest = digest_of(&splits_frame)?;
+    let splits = adjust::SplitTable::from_dataframe(&splits_frame)?;
+
+    let boundaries_frame =
+        archive::read_partition(s3_client, bucket, archive::BOUNDARIES_ARCHIVE_KEY).await?;
+    let boundaries_digest = boundaries_frame
+        .as_ref()
+        .map(digest_of)
+        .transpose()?
+        .unwrap_or(0);
+    let boundaries = match boundaries_frame {
+        Some(frame) => truncate::BoundaryTable::from_dataframe(&frame)?,
+        None => {
+            warn!(
+                key = archive::BOUNDARIES_ARCHIVE_KEY,
+                "No boundary table in the archive; building on unbounded series"
+            );
+            truncate::BoundaryTable::default()
+        }
+    };
+
+    let bars = load_archived_bars(
+        s3_client,
+        bucket,
+        interval,
+        lookback_days,
+        session,
+        &splits,
+        &boundaries,
+    )
+    .await?;
+    let fingerprint = fingerprint_of(
+        &bars,
+        session,
+        lookback_days,
+        splits_digest,
+        boundaries_digest,
+    )?;
+
+    Ok(IntradayDataset { bars, fingerprint })
+}
+
 /// Reads the same window as [`build`] and engineers returns from it, fitting nothing.
 ///
 /// The rows are the rows the model would train on, because a baseline measured over a wider
@@ -187,6 +267,7 @@ async fn read_window(
     let equity_bars = load_archived_bars(
         s3_client,
         bucket,
+        BarInterval::OneDay,
         lookback_days,
         session,
         &splits,
@@ -242,12 +323,13 @@ fn fingerprint_of(
 async fn load_archived_bars(
     s3_client: &S3Client,
     bucket: &str,
+    interval: BarInterval,
     lookback_days: i64,
     session: SessionDate,
     splits: &adjust::SplitTable,
     boundaries: &truncate::BoundaryTable,
 ) -> Result<DataFrame, DatasetError> {
-    let daily_prefix = archive::bar_archive_prefix(BarInterval::OneDay);
+    let daily_prefix = archive::bar_archive_prefix(interval);
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut unreadable = 0usize;
     let mut date = session.plus_calendar_days(-lookback_days);
@@ -393,6 +475,34 @@ mod tests {
             Column::new("timestamp".into(), timestamps),
         ])
         .unwrap()
+    }
+
+    #[test]
+    fn test_the_intraday_reader_refuses_a_daily_cadence() {
+        // No network: the guard runs before anything is read, which is the point of it being a
+        // guard. `returns` is the daily path and applies a screen this one deliberately does not.
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime")
+            .block_on(async {
+                let client = crate::common::aws::s3_client().await;
+                intraday(
+                    &client,
+                    "bucket-that-is-never-read",
+                    BarInterval::OneDay,
+                    730,
+                    SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("a valid test date"),
+                    ),
+                )
+                .await
+            });
+
+        assert!(
+            matches!(refused, Err(DatasetError::Window(ref message)) if message.contains("returns")),
+            "a daily cadence must be refused, naming the path that serves it"
+        );
     }
 
     #[test]
