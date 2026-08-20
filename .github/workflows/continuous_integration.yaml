@@ -44,7 +44,7 @@ jobs:
               - '.sqlfluff'
               - '.sqlfluffignore'
               - 'devenv.lock'
-      # Deliberately no disk-freeing step either. Removing dotnet, ghc and boost
+      # Deliberately no disk-freeing step. Removing dotnet, ghc and boost
       # cost 35-70s of every run; measured on run 32382969223 the runner starts
       # with 87G free and the removal recovers 11G nothing asks for.
       #
@@ -71,6 +71,7 @@ jobs:
       # across runs 32381409920 and 32383074109, the Rust checks took 370s with
       # it and 369s without. Swatinem/rust-cache above already covers ~/.cargo
       # and target/, which is why the second cache was redundant.
+
       # Gated because it lints nix, markdown, yaml, toml and sql and none of those
       # are in most pull requests here: nineteen of the last twenty-five merged
       # were Rust-only, and each paid two and a half minutes to lint files they
