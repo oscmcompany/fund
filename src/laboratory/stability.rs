@@ -1,6 +1,6 @@
-//! Whether a per-session reading carries into the sessions after it.
+//! Whether a per-session reading is anticipated by something `lag` sessions before it.
 //!
-//! The cross-sectional statistics say nothing about time; this asks whether their sign holds.
+//! The cross-sectional statistics say nothing about time; this asks what a reading follows from.
 
 use serde::Serialize;
 
@@ -9,12 +9,12 @@ use crate::laboratory::metrics::pearson_correlation;
 /// Lags reported by default. Ten sessions is two trading weeks, far enough for a decay to show.
 pub const DEFAULT_LAGS: usize = 10;
 
-/// How a session's reading relates to the reading `lag` sessions later.
+/// How a session's reading relates to a value `lag` sessions before it.
 ///
-/// The error is taken under the null that the series has no memory, which is the hypothesis being
-/// tested — so a correlation inside twice its error is a series that forgets.
+/// The error is taken under the null that the two are unrelated, which is the hypothesis being
+/// tested — so a correlation inside twice its error is nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-pub struct Autocorrelation {
+pub struct Association {
     pub lag: usize,
     pub correlation: f64,
     pub standard_error: f64,
@@ -33,33 +33,55 @@ pub struct SignAgreement {
     pub pairs: usize,
 }
 
-/// Pairs each session's reading with the one `lag` sessions later, where both exist.
+/// Pairs each session's value in `earlier` with the value `lag` sessions later in `later`.
 ///
-/// A session the statistic could not measure breaks the run rather than closing it: pairing across
+/// A session either side could not measure breaks the run rather than closing it: pairing across
 /// the gap would call a longer step a shorter one, which is what session contiguity already forbids
 /// on the other side of the measurement.
-fn paired_by_lag(values: &[Option<f64>], lag: usize) -> (Vec<f64>, Vec<f64>) {
-    if lag == 0 || lag >= values.len() {
+fn paired_by_lag(
+    earlier: &[Option<f64>],
+    later: &[Option<f64>],
+    lag: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    if earlier.len() != later.len() || lag >= later.len() {
         return (Vec::new(), Vec::new());
     }
-    values
+    earlier
         .iter()
-        .zip(&values[lag..])
-        .filter_map(|(current, later)| current.zip(*later))
-        .filter(|(current, later)| current.is_finite() && later.is_finite())
+        .zip(&later[lag..])
+        .filter_map(|(before, after)| before.zip(*after))
+        .filter(|(before, after)| before.is_finite() && after.is_finite())
         .unzip()
 }
 
-/// Correlation between each session's reading and the reading `lag` sessions later.
-pub fn autocorrelation(values: &[Option<f64>], lag: usize) -> Option<Autocorrelation> {
-    let (current, later) = paired_by_lag(values, lag);
-    let correlation = pearson_correlation(&current, &later)?;
-    Some(Autocorrelation {
+/// Correlation between each session's reading and a value `lag` sessions before it.
+///
+/// At a lag of zero the two describe the same session, which explains a reading without being able
+/// to anticipate one — only a positive lag names something known before the session it speaks about.
+pub fn association(
+    earlier: &[Option<f64>],
+    readings: &[Option<f64>],
+    lag: usize,
+) -> Option<Association> {
+    let (before, after) = paired_by_lag(earlier, readings, lag);
+    let correlation = pearson_correlation(&before, &after)?;
+    Some(Association {
         lag,
         correlation,
-        standard_error: 1.0 / (current.len() as f64).sqrt(),
-        pairs: current.len(),
+        standard_error: 1.0 / (before.len() as f64).sqrt(),
+        pairs: before.len(),
     })
+}
+
+/// Correlation between each session's reading and the reading `lag` sessions later.
+///
+/// A series against itself, so a lag of zero is refused: every series correlates with itself
+/// perfectly and reports nothing.
+pub fn autocorrelation(values: &[Option<f64>], lag: usize) -> Option<Association> {
+    if lag == 0 {
+        return None;
+    }
+    association(values, values, lag)
 }
 
 /// Share of pairs whose two readings share a sign.
@@ -68,7 +90,10 @@ pub fn autocorrelation(values: &[Option<f64>], lag: usize) -> Option<Autocorrela
 /// that held, below is one that flipped. A reading of exactly zero points nowhere and takes its
 /// pair with it.
 pub fn sign_agreement(values: &[Option<f64>], lag: usize) -> Option<SignAgreement> {
-    let (current, later) = paired_by_lag(values, lag);
+    if lag == 0 {
+        return None;
+    }
+    let (current, later) = paired_by_lag(values, values, lag);
     let agreed: Vec<bool> = current
         .iter()
         .zip(&later)
@@ -136,6 +161,53 @@ mod tests {
             (agreement.rate - 0.5).abs() < 2.0 * agreement.standard_error,
             "{agreement:?}"
         );
+    }
+
+    /// The lag runs from the state to the reading, not the other way. Reversed, the measurement
+    /// would report a reading explained by a session that had not happened yet and read as a gate.
+    #[test]
+    fn test_the_lag_reaches_back_from_the_reading_to_the_state() {
+        // Scrambled rather than counting, so a shift of one is not still a straight line.
+        let state = readings((0..200).map(|index| ((index * 37) % 200) as f64));
+        let mut following = vec![None];
+        following.extend(state.iter().take(199).copied());
+
+        // Each reading is the state of the session before it, so a lag of one is exact.
+        let anticipated = association(&state, &following, 1).unwrap();
+        assert!(
+            (anticipated.correlation - 1.0).abs() < 1e-9,
+            "{anticipated:?}"
+        );
+
+        // And the same session says nothing, which is what makes the two columns worth printing.
+        let same = association(&state, &following, 0).unwrap();
+        assert!(same.correlation.abs() < 0.2, "{same:?}");
+    }
+
+    /// A state describing the session it is read against is a legitimate question — it explains
+    /// without anticipating — so unlike an autocorrelation it must not be refused.
+    #[test]
+    fn test_a_state_may_describe_the_session_it_explains() {
+        let state = readings((0..100).map(|index| index as f64));
+        let doubled = readings((0..100).map(|index| 2.0 * index as f64));
+
+        let same = association(&state, &doubled, 0).unwrap();
+        assert!((same.correlation - 1.0).abs() < 1e-9, "{same:?}");
+        assert_eq!(same.pairs, 100);
+
+        // But a series against itself at no lag is the trivial answer, and is refused.
+        assert_eq!(autocorrelation(&state, 0), None);
+        assert_eq!(sign_agreement(&state, 0), None);
+    }
+
+    /// Two series measured over different windows cannot be aligned by index, and quietly pairing
+    /// the overlap would put each reading against the wrong session's state.
+    #[test]
+    fn test_series_of_different_lengths_are_refused() {
+        let state = readings((0..100).map(|index| index as f64));
+        let shorter = readings((0..40).map(|index| index as f64));
+        assert_eq!(association(&state, &shorter, 0), None);
+        assert_eq!(association(&shorter, &state, 1), None);
     }
 
     /// A session that could not be measured is a hole, not a join. Closing it would pair readings
