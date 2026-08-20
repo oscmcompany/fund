@@ -122,6 +122,59 @@ pub async fn build(
     Ok(PreparedDataset { fit, fingerprint })
 }
 
+/// One intraday window, folded for splits and otherwise raw.
+pub struct IntradayDataset {
+    /// Every bar in the window at the requested cadence, split-folded and bounded.
+    pub bars: DataFrame,
+    pub fingerprint: DatasetFingerprint,
+}
+
+/// Reads the intraday partitions in the window and folds splits into them.
+///
+/// **Deliberately stops short of the daily path's universe screen.** The intraday universe was
+/// already decided at ingestion from each session's *daily* bar, and re-applying a daily volume
+/// floor to a five-minute bar — whose volume is a fraction of the session's — would empty the
+/// window rather than screen it.
+pub async fn intraday(
+    s3_client: &S3Client,
+    bucket: &str,
+    interval: BarInterval,
+    lookback_days: i64,
+    session: SessionDate,
+) -> Result<IntradayDataset, DatasetError> {
+    match interval {
+        BarInterval::OneMinute | BarInterval::FiveMinute => {}
+        // The daily partitions are a different shape and a different screen; `returns` reads those.
+        BarInterval::OneDay => {
+            return Err(DatasetError::Window(
+                "intraday reads an intraday cadence; use returns for daily bars".to_string(),
+            ))
+        }
+    }
+
+    let adjustments = read_adjustments(s3_client, bucket).await?;
+
+    let bars = load_archived_bars(
+        s3_client,
+        bucket,
+        interval,
+        lookback_days,
+        session,
+        &adjustments.splits,
+        &adjustments.boundaries,
+    )
+    .await?;
+    let fingerprint = fingerprint_of(
+        &bars,
+        session,
+        lookback_days,
+        adjustments.splits_digest,
+        adjustments.boundaries_digest,
+    )?;
+
+    Ok(IntradayDataset { bars, fingerprint })
+}
+
 /// Reads the same window as [`build`] and engineers returns from it, fitting nothing.
 ///
 /// The rows are the rows the model would train on, because a baseline measured over a wider
@@ -155,6 +208,50 @@ async fn read_window(
     lookback_days: i64,
     session: SessionDate,
 ) -> Result<(DataFrame, DatasetFingerprint), DatasetError> {
+    let adjustments = read_adjustments(s3_client, bucket).await?;
+
+    let equity_bars = load_archived_bars(
+        s3_client,
+        bucket,
+        BarInterval::OneDay,
+        lookback_days,
+        session,
+        &adjustments.splits,
+        &adjustments.boundaries,
+    )
+    .await?;
+
+    let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
+    let consolidated = consolidate_data(equity_bars, equity_details)?;
+    let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
+
+    let fingerprint = fingerprint_of(
+        &filtered,
+        session,
+        lookback_days,
+        adjustments.splits_digest,
+        adjustments.boundaries_digest,
+    )?;
+
+    Ok((filtered, fingerprint))
+}
+
+/// The tables every archive window is folded through, and the digests that identify them.
+///
+/// The two digests are carried in named fields rather than returned as a pair because both are
+/// `u64`: swapping them would compile, and would silently join two runs' journal records wrongly.
+struct Adjustments {
+    splits: adjust::SplitTable,
+    boundaries: truncate::BoundaryTable,
+    splits_digest: u64,
+    boundaries_digest: u64,
+}
+
+/// Reads the split and boundary tables that both the daily and the intraday path fold through.
+///
+/// A missing boundary table warns and leaves the series unbounded, but a missing splits table is
+/// refused: unadjusted prices carry a false return across every split in the window.
+async fn read_adjustments(s3_client: &S3Client, bucket: &str) -> Result<Adjustments, DatasetError> {
     let splits_frame = archive::read_partition(s3_client, bucket, archive::SPLITS_ARCHIVE_KEY)
         .await?
         .ok_or_else(|| {
@@ -184,29 +281,12 @@ async fn read_window(
         }
     };
 
-    let equity_bars = load_archived_bars(
-        s3_client,
-        bucket,
-        lookback_days,
-        session,
-        &splits,
-        &boundaries,
-    )
-    .await?;
-
-    let equity_details = details::details_to_dataframe(&details::parse_embedded_details()?)?;
-    let consolidated = consolidate_data(equity_bars, equity_details)?;
-    let filtered = filter_training_bars(consolidated, MINIMUM_CLOSE_PRICE, MINIMUM_VOLUME)?;
-
-    let fingerprint = fingerprint_of(
-        &filtered,
-        session,
-        lookback_days,
+    Ok(Adjustments {
+        splits,
+        boundaries,
         splits_digest,
         boundaries_digest,
-    )?;
-
-    Ok((filtered, fingerprint))
+    })
 }
 
 /// Describes the frame the model will be fitted on, before fitting consumes it.
@@ -242,12 +322,13 @@ fn fingerprint_of(
 async fn load_archived_bars(
     s3_client: &S3Client,
     bucket: &str,
+    interval: BarInterval,
     lookback_days: i64,
     session: SessionDate,
     splits: &adjust::SplitTable,
     boundaries: &truncate::BoundaryTable,
 ) -> Result<DataFrame, DatasetError> {
-    let daily_prefix = archive::bar_archive_prefix(BarInterval::OneDay);
+    let daily_prefix = archive::bar_archive_prefix(interval);
     let mut frames: Vec<LazyFrame> = Vec::new();
     let mut unreadable = 0usize;
     let mut date = session.plus_calendar_days(-lookback_days);
@@ -393,6 +474,47 @@ mod tests {
             Column::new("timestamp".into(), timestamps),
         ])
         .unwrap()
+    }
+
+    /// A client that resolves nothing: no profile, no environment, no instance metadata.
+    ///
+    /// The default chain would run all of those before the first request, which is discovery a test
+    /// that never sends a request has no reason to pay for.
+    fn unused_s3_client() -> S3Client {
+        S3Client::new(
+            &aws_config::SdkConfig::builder()
+                .region(aws_config::Region::new("us-east-1"))
+                .behavior_version(aws_config::BehaviorVersion::latest())
+                .build(),
+        )
+    }
+
+    #[test]
+    fn test_the_intraday_reader_refuses_a_daily_cadence() {
+        // No network: the guard runs before anything is read, which is the point of it being a
+        // guard. `returns` is the daily path and applies a screen this one deliberately does not.
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a test runtime")
+            .block_on(async {
+                let client = unused_s3_client();
+                intraday(
+                    &client,
+                    "bucket-that-is-never-read",
+                    BarInterval::OneDay,
+                    730,
+                    SessionDate::from_date(
+                        chrono::NaiveDate::from_ymd_opt(2026, 8, 20).expect("a valid test date"),
+                    ),
+                )
+                .await
+            });
+
+        assert!(
+            matches!(refused, Err(DatasetError::Window(ref message)) if message.contains("returns")),
+            "a daily cadence must be refused, naming the path that serves it"
+        );
     }
 
     #[test]
